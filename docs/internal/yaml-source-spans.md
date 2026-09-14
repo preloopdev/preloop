@@ -1,8 +1,15 @@
 # ADR: YAML source spans in the workflow parser
 
-Status: **proposed** (design only — no code in `crates/` was modified for this ADR)
-Date: 2026-09-12
-Scope: `preloop-gha-parser`, `preloop-gha-protocol` (`azdo`), `preloop-runner-server` (`runs.rs` fileTable)
+Status: **proposed** for the span work (§2–§5). The three independent bugs
+this investigation turned up (§6.4) are **fixed and landed**; they needed no
+span infrastructure.
+Date: 2026-09-12 (fixes and official-runner verification: 2026-09-13)
+Scope: `preloop-gha-parser`, `preloop-gha-protocol` (`azdo`), `preloop-runner-server` (`runs.rs` fileTable), `runner-watch` (conformance gate)
+
+Verified against the **official runner v2.337.0** source (latest release,
+commit `397b032`, extracted to `/tmp/runner-v2.337.0`). Note `versions.toml`
+still pins `runner_version = "2.336.0"`; bumping that pin is a separate change
+with golden-recapture consequences and is deliberately not part of this work.
 
 ---
 
@@ -610,35 +617,39 @@ own workflows through preloop's parser, with no Python/`uvx` dependency.
 
 ### 6.2 Tests that pin synthetic coordinates (these break in phase 3)
 
-- `crates/preloop-gha-protocol/src/azdo/azdo_tests.rs:50-52` — helper forcing
-  `file:1,line:0,col:0`.
-- `azdo_tests.rs:61` — key token `{"type":0,"lit":key,"col":0,"file":1,"line":0}`.
-- `azdo_tests.rs:73`, `:79` — map tokens with `col:0,file:1,line:0`.
-- `azdo_tests.rs:217` — `continueOnError` `{"type":5,"file":1,"line":0,"col":0,…}`.
-- `azdo_tests.rs:794` — `assert_eq!(json["timeoutInMinutes"], Value::Null)`.
-- `azdo_tests.rs:1016` — proptest round-trip on `timeout_in_minutes`.
-- Two proptest regression seeds encode the current `TaskStep` shape, including
+The `azdo_tests.rs` wire oracle (`expected_template_token`,
+`expected_template_map`) hard-coded `file: 1`. The §6.4 fixes made it take the
+step's `file_id`, so it now asserts the *emitted* index rather than a
+constant, and the `arb_literal_step` strategy generates ids in `1..=3` so the
+round-trip covers callee-indexed steps. Its `line: 0` / `col: 0` are still
+synthetic and will need revisiting in phase 3.
+
+Still pinned to synthetic or placeholder values:
+
+- `azdo_tests.rs` — `timeoutInMinutes` asserted as `Value::Null` and
+  round-tripped as `Option<u32>`; becomes a type-6 token in phase 3.
+- Two proptest regression seeds encode the pre-fix `TaskStep` shape, including
   `display_name_token: Some(Object {"lit": …, "type": Number(1)})`:
   `crates/preloop-gha-protocol/proptest-regressions/azdo_tests.txt:7` and
-  `proptest-regressions/azdo/azdo_tests.txt:7-8`.
+  `proptest-regressions/azdo/azdo_tests.txt:7-8`. These are replay seeds, not
+  assertions — they still load, but the quoted shape is now stale.
 
-Per the project's testing bar, the ones that pin *synthetic* coordinates are
+Per the project's testing bar, anything pinning a *synthetic* coordinate is
 pinning an implementation artefact and should be deleted rather than re-pinned
-to new synthetic values; the ones that assert token *shape* (type tag, key
-presence) should be updated to the real GitHub shape evidenced in §1.4.
+to a new synthetic value; assertions about token *shape* (type tag, key
+presence) should track the real GitHub shape evidenced in §1.4.
 
 ### 6.3 Remaining unverified items
 
 The three uncertainties called out in the original handoff are resolved:
 
-- **Schema-gate matching:** resolved from source. `group_flows` constructs
-  `METHOD <normalized path>` (`compare.rs:193-199`); the golden
-  `/190/acquirejob` (`.runner-watch/golden/v2.336.0/103-composite-nested-post/flows.jsonl:23`)
-  becomes `POST /{n}/acquirejob`, which cannot contain the default gate's
-  `/broker/{n}/acquirejob` substring (`compare.rs:481`, gate at 563-569).
-  The acquirejob response-schema gate therefore misses this golden endpoint.
-  Targeted endpoint-normalization tests passed (`cargo test --locked -p
-  runner-watch --lib normalize_ --quiet`, 8 passed).
+- **Schema-gate matching:** resolved from source, then **fixed** (§6.4).
+  `group_flows` constructs `METHOD <normalized path>` (`compare.rs:193-199`);
+  the golden `/190/acquirejob`
+  (`.runner-watch/golden/v2.336.0/103-composite-nested-post/flows.jsonl:23`)
+  becomes `POST /{n}/acquirejob`, which never contained the old
+  `/broker/{n}/acquirejob` substring, so the only schema gate in the default
+  policy was inert on every committed golden.
 - **`serde-saphyr` model boundary:** the isolated copy of the complete
   `preloop-gha-parser` compiled with a direct `serde-saphyr` workflow/action
   frontend and its parser library tests passed: **154 passed, 0 failed**.
@@ -654,14 +665,50 @@ The three uncertainties called out in the original handoff are resolved:
   the boolean spellings → strings but `0755` → numeric `755`. This is now a
   compatibility requirement in phase 0, not an unknown.
 
-Three risks remain open:
+Two risks remain open:
 1. **Final no-`serde_yaml` cutover has not been compiled.** The isolated probe
    retained it for `MatrixValue` and the dead `normalize_yaml_keys` helpers.
    Replace those paths and compile before removing the workspace dependency.
 2. **Runtime cost of `serde-saphyr` vs `serde_yaml` on this corpus.** No
    benchmark was run. Parse time is on the submission path (`runs.rs`), so
    phase 0 should carry a before/after measurement.
-3. **Whether the official runner reads `file`/`line`/`col` for anything.** I did
-   not read the `actions/runner` C# sources at `/tmp/runner-v2.336.0`. If it
-   only echoes them into error messages, phase 3 is diagnostic; if the template
-   evaluator uses them, correctness matters more.
+
+**Resolved:** the official runner *does* consume token coordinates.
+`TemplateContext.Error` routes every template error through
+`GetErrorPrefix(fileId, line, column)`
+(`/tmp/runner-v2.337.0/src/Sdk/DTObjectTemplating/ObjectTemplating/TemplateContext.cs:154-168,203-228`),
+which renders `"{fileName} (Line: {line}, Col: {col}): {message}"` after
+resolving the name through `GetFileName` (`:193-196`). Coordinates are
+therefore diagnostic, not load-bearing for evaluation — but `fileId` is a
+1-based index (`GetFileId` returns `count + 1`, `:180-191`) and `GetFileName`
+indexes `FileNames[fileId - 1]`, so an out-of-range id like the `file: 0` we
+used to emit is a latent fault on the error path, not merely cosmetic.
+
+### 6.4 Fixes landed alongside this ADR
+
+Three independent defects surfaced during the investigation. None needed span
+infrastructure, so they were fixed directly rather than folded into phase 3.
+
+1. **`displayNameToken` used the wrong token type.** We emitted `type: 1` with
+   a `lit` (`job_builder.rs`). `TokenType` is authoritative at
+   `/tmp/runner-v2.337.0/src/Sdk/DTObjectTemplating/ObjectTemplating/Tokens/TokenType.cs:7-9`:
+   `String = 0`, `Sequence = 1`. `TemplateTokenJsonConverter.ReadJson`
+   (`Tokens/TemplateTokenJsonConverter.cs:66-108`) switches on `type`, so 1
+   built a `SequenceToken` — which has no `lit` — and
+   `ActionRunner.GenerateDisplayName`'s `as ScalarToken` cast
+   (`src/Runner.Worker/ActionRunner.cs:374-376`, null-guarded at `:421-424`)
+   then dropped the step name. All 43 `displayNameToken`s across the goldens
+   are `type: 0`. Fixed, plus `file: 0` → a valid 1-based id.
+2. **`fileTable` discarded callee provenance.** `runs.rs` overwrote it with the
+   caller path alone, throwing away `JobPlan.workflow_file` that
+   `expand.rs:1103` had already resolved. Real GitHub ships
+   `[caller.yml, owner/repo/path.yml@sha]` and indexes per job: in
+   `.runner-watch/golden/v2.337.0/gh-official/205-reusable-workflow-chain/`
+   the callee job `ci / build` carries `file: 2` on 8 tokens while the
+   caller-defined `post` job carries `file: 1`, against the same table. Now
+   modelled by `job_builder::job_file_id` and `TaskStep.file_id`; a
+   reusable-call *placeholder* stays on 1 because its `workflow_file` names the
+   callee it is about, not the file its own tokens came from.
+3. **The conformance response-schema gate was dead.** Fixed as described above;
+   the regression test asserts a dropped acquirejob field is caught on the
+   golden path shape, and fails against the old substring with `failures: []`.

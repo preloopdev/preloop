@@ -2048,6 +2048,22 @@ pub(crate) struct BuiltJobArtifacts {
     pub(crate) github_token_request: Option<GitHubTokenRequest>,
 }
 
+/// The `fileTable` entry naming the reusable workflow a job was inlined from.
+///
+/// `None` for jobs defined in the caller, which need no second entry. Remote
+/// callees render as `owner/repo/path@sha` (GitHub's shape, e.g.
+/// `Bnjoroge1/conformance-v2337/.github/workflows/reusable-build.yml@eafe8a9`);
+/// a local callee has no repository or sha of its own, so the path stands alone.
+fn reusable_file_table_entry(job: &preloop_gha_protocol::JobPlan) -> Option<String> {
+    let file = job.workflow_file.as_deref()?;
+    let entry = match (&job.workflow_repository, &job.workflow_sha) {
+        (Some(repository), Some(sha)) => format!("{repository}/{file}@{sha}"),
+        (Some(repository), None) => format!("{repository}/{file}"),
+        (None, _) => file.to_owned(),
+    };
+    Some(entry)
+}
+
 /// Build one job's runner message and correlation records.
 ///
 /// Pure computation shared by the submission prebuild and the scheduler's
@@ -2273,7 +2289,15 @@ pub(crate) fn build_job_artifacts(
         "actions_uses_cache_service_v2".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::new("true"),
     );
+    // `fileTable` names every workflow file this job's tokens can reference,
+    // caller first. A job inlined from a reusable workflow contributes a
+    // second entry and its tokens carry `file: 2` (see
+    // `job_builder::job_file_id`) — matching GitHub, whose callee jobs emit
+    // `[caller.yml, owner/repo/path.yml@sha]` and index the callee.
     agent_msg.file_table = vec![workflow_path.to_owned()];
+    if let Some(callee) = reusable_file_table_entry(job) {
+        agent_msg.file_table.push(callee);
+    }
     if let Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(job_dict)) =
         agent_msg.context_data.get_mut("job")
     {
@@ -3242,6 +3266,73 @@ mod tests {
                 .get(".github/workflows/build.yml"),
             Some(&1),
             "a replay that reused the run must not advance the counter"
+        );
+    }
+    /// GitHub ships `[caller.yml, owner/repo/path.yml@sha]` for a job inlined
+    /// from a reusable workflow, and that job's tokens index the callee entry.
+    /// Overwriting the table with the caller path alone erased the callee's
+    /// provenance that `expand_reusable_call` had already resolved.
+    #[test]
+    fn reusable_file_table_entry_names_the_callee_workflow() {
+        let mut job = preloop_gha_protocol::JobPlan {
+            id: JobId("call/inner".to_owned()),
+            base_id: "call/inner".to_owned(),
+            name: "ci / build".to_owned(),
+            runner_group: None,
+            runs_on: vec!["ubuntu-latest".to_owned()],
+            needs: Vec::new(),
+            matrix: Default::default(),
+            matrix_index: None,
+            matrix_total: None,
+            deferred_matrix: None,
+            env: BTreeMap::new(),
+            steps: Vec::new(),
+            if_condition: None,
+            fail_fast: true,
+            continue_on_error: false,
+            max_parallel: None,
+            secrets_inherit: false,
+            container: None,
+            services: None,
+            inputs: BTreeMap::new(),
+            workflow_file: None,
+            workflow_ref: None,
+            workflow_sha: None,
+            workflow_repository: None,
+            secrets_map: BTreeMap::new(),
+            job_outputs: BTreeMap::new(),
+            oidc_id_token_granted: false,
+            permissions: None,
+            oidc_environment: None,
+            oidc_job_workflow_ref: None,
+            environment: None,
+            defaults: Vec::new(),
+            concurrency_group: None,
+            concurrency_cancel_in_progress: None,
+            concurrency_queue: None,
+            reusable_call: None,
+        };
+
+        // A job defined in the caller contributes no second entry.
+        assert_eq!(reusable_file_table_entry(&job), None);
+
+        // Remote callee: `owner/repo/path@sha`, GitHub's shape.
+        job.workflow_file = Some(".github/workflows/reusable-build.yml".to_owned());
+        job.workflow_repository = Some("Bnjoroge1/conformance-v2337".to_owned());
+        job.workflow_sha = Some("eafe8a907569a41d38fed3ffd9ed8302f247a920".to_owned());
+        assert_eq!(
+            reusable_file_table_entry(&job).as_deref(),
+            Some(
+                "Bnjoroge1/conformance-v2337/.github/workflows/reusable-build.yml@eafe8a907569a41d38fed3ffd9ed8302f247a920"
+            )
+        );
+
+        // Local callee: no repository or sha of its own, so the path stands alone.
+        job.workflow_repository = None;
+        job.workflow_sha = None;
+        assert_eq!(
+            reusable_file_table_entry(&job).as_deref(),
+            Some(".github/workflows/reusable-build.yml")
         );
     }
     /// The broadcast channel fans out every run's events, so a stalled run's

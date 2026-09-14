@@ -342,8 +342,10 @@ pub struct TaskStep {
     /// Serialized as `contextName` to match GitHub's wire format.
     pub context_name: Option<String>,
     pub display_name: Option<String>,
-    /// TemplateToken for the display name — `{type:1, lit:"...", col, file, line}`.
+    /// TemplateToken for the display name — `{type:0, lit:"...", col, file, line}`.
     /// Serialized as `displayNameToken` to match GitHub's wire format.
+    /// `type` is `TokenType.String` (0); `1` is `TokenType.Sequence` and would
+    /// deserialize runner-side into a `SequenceToken` that drops `lit`.
     pub display_name_token: Option<serde_json::Value>,
     pub condition: Option<String>,
     pub script: Option<String>,
@@ -357,6 +359,12 @@ pub struct TaskStep {
     pub shell: Option<String>,
     pub working_directory: Option<String>,
     pub timeout_in_minutes: Option<u32>,
+    /// 1-based index into the job message's `fileTable` naming the workflow
+    /// file this step's tokens came from. Steps inlined from a reusable
+    /// workflow point at the callee entry, not the caller
+    /// (`GetFileId` in the official runner's `TemplateContext` allocates ids
+    /// as `count + 1`, and `GetFileName` indexes `FileNames[fileId - 1]`).
+    pub file_id: u32,
 }
 
 impl Serialize for TaskStep {
@@ -388,14 +396,20 @@ impl Serialize for TaskStep {
         map.serialize_entry("type", "action")?;
         map.serialize_entry("reference", &SerializedActionReference { step: self })?;
         if !self.env.is_empty() {
-            map.serialize_entry("environment", &TemplateStringMap(&self.env, true))?;
+            map.serialize_entry(
+                "environment",
+                &TemplateStringMap(&self.env, true, self.file_id),
+            )?;
         }
         if !inputs.is_empty() {
             let inputs_with_loc = self
                 .reference
                 .as_ref()
                 .is_some_and(|r| r.reference_type.as_deref() != Some("script"));
-            map.serialize_entry("inputs", &TemplateStringMap(&inputs, inputs_with_loc))?;
+            map.serialize_entry(
+                "inputs",
+                &TemplateStringMap(&inputs, inputs_with_loc, self.file_id),
+            )?;
         }
         map.serialize_entry("id", &self.id)?;
         let name = self.context_name.as_ref().or(self.name.as_ref());
@@ -412,7 +426,7 @@ impl Serialize for TaskStep {
         let continue_on_error = self.continue_on_error.map(|value| {
             serde_json::json!({
                 "type": 5,
-                "file": 1,
+                "file": self.file_id,
                 "line": 0,
                 "col": 0,
                 "bool": value
@@ -511,8 +525,26 @@ impl<'de> Deserialize<'de> for TaskStep {
                     })
                 })
                 .transpose()?,
+            // Recovered from whichever emitted token carries coordinates, so a
+            // wire round-trip preserves the callee's fileTable index.
+            file_id: token_file_id(obj).unwrap_or(1),
         })
     }
+}
+
+/// Recover the `fileTable` index a serialized step's tokens point at.
+///
+/// Every coordinate-bearing token a step emits carries the same `file`, so the
+/// first one found wins. Absent on steps that emit no located token (empty
+/// env, empty inputs, no `continueOnError`), in which case the caller's
+/// default of 1 is both correct and lossless for a re-serialize.
+fn token_file_id(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
+    ["environment", "inputs", "continueOnError"]
+        .iter()
+        .filter_map(|key| obj.get(*key))
+        .filter_map(|token| token.get("file"))
+        .find_map(serde_json::Value::as_u64)
+        .map(|file| file as u32)
 }
 
 /// Extract a BTreeMap<String, String> from either a plain JSON object or a
@@ -636,7 +668,7 @@ impl Serialize for SerializedActionReference<'_> {
     }
 }
 
-struct TemplateStringMap<'a>(&'a BTreeMap<String, String>, bool);
+struct TemplateStringMap<'a>(&'a BTreeMap<String, String>, bool, u32);
 
 impl Serialize for TemplateStringMap<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -655,7 +687,7 @@ impl Serialize for TemplateStringMap<'_> {
         map.serialize_entry("type", &2)?;
         if with_loc {
             map.serialize_entry("col", &0)?;
-            map.serialize_entry("file", &1)?;
+            map.serialize_entry("file", &self.2)?;
             map.serialize_entry("line", &0)?;
         }
         if !self.0.is_empty() {
@@ -666,6 +698,7 @@ impl Serialize for TemplateStringMap<'_> {
                     key,
                     value,
                     with_loc,
+                    file_id: self.2,
                 })
                 .collect();
             map.serialize_entry("map", &pairs)?;
@@ -678,6 +711,7 @@ struct TemplateStringMapPair<'a> {
     key: &'a str,
     value: &'a str,
     with_loc: bool,
+    file_id: u32,
 }
 
 impl Serialize for TemplateStringMapPair<'_> {
@@ -688,12 +722,12 @@ impl Serialize for TemplateStringMapPair<'_> {
         use serde::ser::SerializeMap;
         let mut value = template_string_token(self.value);
         if let Some(token) = value.as_object_mut() {
-            token.insert("file".to_owned(), serde_json::json!(1));
+            token.insert("file".to_owned(), serde_json::json!(self.file_id));
             token.insert("line".to_owned(), serde_json::json!(0));
             token.insert("col".to_owned(), serde_json::json!(0));
         }
         let key_token = if self.with_loc {
-            serde_json::json!({"type": 0, "lit": self.key, "col": 0, "file": 1, "line": 0})
+            serde_json::json!({"type": 0, "lit": self.key, "col": 0, "file": self.file_id, "line": 0})
         } else {
             serde_json::json!({"type": 0, "lit": self.key})
         };
@@ -842,6 +876,7 @@ mod tests {
             continue_on_error: None,
             shell: None,
             working_directory: None,
+            file_id: 1,
             timeout_in_minutes: None,
         };
 

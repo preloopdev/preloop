@@ -38,7 +38,7 @@ fn arb_non_script_inputs() -> impl Strategy<Value = BTreeMap<String, String>> {
     )
 }
 
-fn expected_template_token(value: &str) -> Value {
+fn expected_template_token(value: &str, file_id: u32) -> Value {
     let mut token = if let Some(expression) = value
         .strip_prefix("${{")
         .and_then(|rest| rest.strip_suffix("}}"))
@@ -47,39 +47,37 @@ fn expected_template_token(value: &str) -> Value {
     } else {
         json!({"type": 0, "lit": value})
     };
-    token["file"] = json!(1);
+    token["file"] = json!(file_id);
     token["line"] = json!(0);
     token["col"] = json!(0);
     token
 }
 
-fn expected_template_map(values: &BTreeMap<String, String>, with_loc: bool) -> Value {
+fn expected_template_map(values: &BTreeMap<String, String>, with_loc: bool, file_id: u32) -> Value {
     let pairs: Vec<Value> = values
         .iter()
         .map(|(key, value)| {
             let key_token = if with_loc {
-                json!({"type": 0, "lit": key, "col": 0, "file": 1, "line": 0})
+                json!({"type": 0, "lit": key, "col": 0, "file": file_id, "line": 0})
             } else {
                 json!({"type": 0, "lit": key})
             };
             json!({
                 "Key": key_token,
-                "Value": expected_template_token(value),
+                "Value": expected_template_token(value, file_id),
             })
         })
         .collect();
     if pairs.is_empty() {
         if with_loc {
-            json!({"type": 2, "col": 0, "file": 1, "line": 0})
+            json!({"type": 2, "col": 0, "file": file_id, "line": 0})
         } else {
             json!({"type": 2})
         }
+    } else if with_loc {
+        json!({"type": 2, "col": 0, "file": file_id, "line": 0, "map": pairs})
     } else {
-        if with_loc {
-            json!({"type": 2, "col": 0, "file": 1, "line": 0, "map": pairs})
-        } else {
-            json!({"type": 2, "map": pairs})
-        }
+        json!({"type": 2, "map": pairs})
     }
 }
 // Independent AgentJobRequest oracle derived from the official v2.335.1
@@ -184,7 +182,7 @@ fn expected_step_wire(step: &TaskStep) -> Value {
     if !step.env.is_empty() {
         object.insert(
             "environment".to_owned(),
-            expected_template_map(&step.env, true),
+            expected_template_map(&step.env, true, step.file_id),
         );
     }
     if !inputs.is_empty() {
@@ -194,7 +192,7 @@ fn expected_step_wire(step: &TaskStep) -> Value {
             .is_some_and(|r| r.reference_type.as_deref() != Some("script"));
         object.insert(
             "inputs".to_owned(),
-            expected_template_map(&inputs, inputs_with_loc),
+            expected_template_map(&inputs, inputs_with_loc, step.file_id),
         );
     }
     object.insert("id".to_owned(), json!(step.id));
@@ -214,7 +212,7 @@ fn expected_step_wire(step: &TaskStep) -> Value {
     object.insert(
         "continueOnError".to_owned(),
         step.continue_on_error
-            .map(|value| json!({"type": 5, "file": 1, "line": 0, "col": 0, "bool": value}))
+            .map(|value| json!({"type": 5, "file": step.file_id, "line": 0, "col": 0, "bool": value}))
             .unwrap_or(Value::Null),
     );
     if let Some(value) = &step.working_directory {
@@ -628,6 +626,7 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
         prop::option::of(arb_text()),
         prop::option::of(arb_text()),
         prop::option::of(0u32..=1000),
+        1u32..=3,
     )
         .prop_map(
             |(
@@ -640,9 +639,10 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
                 display_name,
                 condition,
                 timeout_in_minutes,
+                file_id,
             )| {
                 let display_name_token = Some(json!({
-                    "type": 1,
+                    "type": 0,
                     "lit": display_name.clone().unwrap_or_default()
                 }));
                 TaskStep {
@@ -660,6 +660,7 @@ fn arb_literal_step() -> impl Strategy<Value = TaskStep> {
                     shell: None,
                     working_directory: None,
                     timeout_in_minutes,
+                    file_id,
                 }
             },
         )
@@ -801,6 +802,7 @@ fn task_step_serializes_as_runner_action_step() {
         continue_on_error: None,
         working_directory: None,
         timeout_in_minutes: None,
+        file_id: 1,
     };
 
     let json = serde_json::to_value(&step).unwrap();
@@ -840,6 +842,7 @@ fn task_step_serializes_expression_as_format_token() {
         continue_on_error: None,
         working_directory: None,
         timeout_in_minutes: None,
+        file_id: 1,
     };
     let value = serde_json::to_value(step).unwrap();
     let token = &value["inputs"]["map"][0]["Value"];
@@ -1000,13 +1003,13 @@ proptest! {
         if step.env.is_empty() {
             prop_assert!(encoded.get("environment").is_none());
         } else {
-            prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env, true));
+            prop_assert_eq!(&encoded["environment"], &expected_template_map(&step.env, true, step.file_id));
         }
         if expected_inputs.is_empty() {
             prop_assert!(encoded.get("inputs").is_none());
         } else {
             let inputs_with_loc = step.reference.as_ref().is_some_and(|r| r.reference_type.as_deref() != Some("script"));
-            prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs, inputs_with_loc));
+            prop_assert_eq!(&encoded["inputs"], &expected_template_map(&expected_inputs, inputs_with_loc, step.file_id));
         }
         prop_assert_eq!(&encoded["id"], &json!(step.id));
         prop_assert_eq!(encoded.get("contextName").is_some(), step.context_name.is_some());
@@ -1046,7 +1049,7 @@ proptest! {
             .find(|pair| pair["Key"]["lit"] == "script")
             .map(|pair| pair["Value"].clone())
             .unwrap();
-        prop_assert_eq!(&script_token, &expected_template_token(&format!("${{{{ {expression} }}}}")));
+        prop_assert_eq!(&script_token, &expected_template_token(&format!("${{{{ {expression} }}}}"), step.file_id));
     }
 
     #[test]
@@ -1135,7 +1138,7 @@ fn tier2_codec_task_step_environment_aliases() {
         let encoded = serde_json::to_value(&decoded).unwrap();
         assert_eq!(
             encoded["environment"],
-            expected_template_map(&decoded.env, true)
+            expected_template_map(&decoded.env, true, decoded.file_id)
         );
         assert!(encoded.get("env").is_none());
     }

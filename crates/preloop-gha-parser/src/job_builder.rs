@@ -24,7 +24,24 @@ fn runner_condition(condition: &str) -> String {
         .map_or_else(|| condition.to_owned(), |value| value.trim().to_owned())
 }
 
-fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
+/// The 1-based `fileTable` index naming the workflow file a job's tokens came
+/// from. A job inlined from a reusable workflow is emitted second in the
+/// table, after the caller — matching GitHub, whose callee-job tokens carry
+/// `file: 2` against a `[caller, callee@sha]` table while the same run's
+/// caller-only jobs carry `file: 1`.
+///
+/// A reusable-call placeholder (`reusable_call: Some(_)`) also carries
+/// `workflow_file`, but it names the callee it is *about*, not the file its
+/// own tokens came from — that node is declared in the caller, so it stays 1.
+pub fn job_file_id(plan: &JobPlan) -> u32 {
+    if plan.workflow_file.is_some() && plan.reusable_call.is_none() {
+        2
+    } else {
+        1
+    }
+}
+
+fn job_outputs_token(outputs: &BTreeMap<String, String>, file_id: u32) -> Option<Value> {
     if outputs.is_empty() {
         return None;
     }
@@ -38,43 +55,43 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>) -> Option<Value> {
             let value = match expression {
                 Some(expr) => json!({
                     "type": 3,
-                    "file": 1,
+                    "file": file_id,
                     "line": 1,
                     "col": 1,
                     "expr": expr,
                 }),
                 None => json!({
                     "type": 0,
-                    "file": 1,
+                    "file": file_id,
                     "line": 1,
                     "col": 1,
                     "lit": raw,
                 }),
             };
             json!({
-                "Key": {"type": 0, "file": 1, "line": 1, "col": 1, "lit": key},
+                "Key": {"type": 0, "file": file_id, "line": 1, "col": 1, "lit": key},
                 "Value": value,
             })
         })
         .collect::<Vec<_>>();
     Some(json!({
         "type": 2,
-        "file": 1,
+        "file": file_id,
         "line": 1,
         "col": 1,
         "map": map,
     }))
 }
 
-pub(crate) fn template_string_token(raw: &str) -> Value {
-    let location = || json!({"file": 1, "line": 1, "col": 1});
+pub(crate) fn template_string_token(raw: &str, file_id: u32) -> Value {
+    let location = || json!({"file": file_id, "line": 1, "col": 1});
     let trimmed = raw.trim();
     if let Some(expression_source) = trimmed.strip_prefix("${{") {
         if let Some(end) = crate::eval::find_expression_end(expression_source) {
             if end + 2 == expression_source.len() {
                 return json!({
                     "type": 3,
-                    "file": 1,
+                    "file": file_id,
                     "line": 1,
                     "col": 1,
                     "expr": expression_source[..end].trim(),
@@ -117,15 +134,15 @@ pub(crate) fn template_string_token(raw: &str) -> Value {
     expression.push(')');
     json!({
         "type": 3,
-        "file": 1,
+        "file": file_id,
         "line": 1,
         "col": 1,
         "expr": expression,
     })
 }
 
-pub(crate) fn template_token(value: &Value) -> Value {
-    let location = || json!({"file": 1, "line": 1, "col": 1});
+pub(crate) fn template_token(value: &Value, file_id: u32) -> Value {
+    let location = || json!({"file": file_id, "line": 1, "col": 1});
     match value {
         Value::Object(object) => {
             let map = object
@@ -134,34 +151,37 @@ pub(crate) fn template_token(value: &Value) -> Value {
                     json!({
                         "Key": {
                             "type": 0,
-                            "file": 1,
+                            "file": file_id,
                             "line": 1,
                             "col": 1,
                             "lit": key,
                         },
-                        "Value": template_token(value),
+                        "Value": template_token(value, file_id),
                     })
                 })
                 .collect::<Vec<_>>();
             json!({
                 "type": 2,
-                "file": 1,
+                "file": file_id,
                 "line": 1,
                 "col": 1,
                 "map": map,
             })
         }
         Value::Array(values) => {
-            let seq = values.iter().map(template_token).collect::<Vec<_>>();
+            let seq = values
+                .iter()
+                .map(|value| template_token(value, file_id))
+                .collect::<Vec<_>>();
             json!({
                 "type": 1,
-                "file": 1,
+                "file": file_id,
                 "line": 1,
                 "col": 1,
                 "seq": seq,
             })
         }
-        Value::String(raw) => template_string_token(raw),
+        Value::String(raw) => template_string_token(raw, file_id),
         Value::Bool(value) => {
             let mut token = location();
             token["type"] = json!(0);
@@ -304,6 +324,7 @@ pub fn build_agent_job_message_with_normalized_context(
 ) -> Result<AgentJobRequestMessage, String> {
     let timeline_id = uuid::Uuid::new_v4();
     let job_id = uuid::Uuid::new_v4();
+    let file_id = job_file_id(plan);
 
     // Build expression evaluation context
     let strategy = plan
@@ -390,7 +411,7 @@ pub fn build_agent_job_message_with_normalized_context(
             context_name
         };
         used_names.insert(final_name.clone());
-        let mut task_step = build_task_step(step, &job_expr_context);
+        let mut task_step = build_task_step(step, &job_expr_context, file_id);
         task_step.context_name = Some(final_name);
         steps.push(task_step);
     }
@@ -477,8 +498,8 @@ pub fn build_agent_job_message_with_normalized_context(
                 "line": 1,
                 "col": 1,
                 "map": [{
-                    "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": k },
-                    "Value": template_string_token(v)
+                    "Key": { "type": 0, "file": file_id, "line": 1, "col": 1, "lit": k },
+                    "Value": template_string_token(v, file_id)
                 }]
             })
         })
@@ -669,9 +690,12 @@ pub fn build_agent_job_message_with_normalized_context(
         retry_count: None,
         pre_job_timeout: None,
         job_timeout: None,
-        job_container: plan.container.as_ref().map(template_token),
-        job_service_containers: non_empty_services(plan.services.as_ref()),
-        job_outputs: job_outputs_token(&plan.job_outputs),
+        job_container: plan
+            .container
+            .as_ref()
+            .map(|value| template_token(value, file_id)),
+        job_service_containers: non_empty_services(plan.services.as_ref(), file_id),
+        job_outputs: job_outputs_token(&plan.job_outputs, file_id),
         actions_environment,
         enable_debugger: false,
         debugger_tunnel: None,
@@ -705,10 +729,13 @@ fn resolve_environment_name(
 }
 
 /// Omit empty `services: {}` to match `EmitDefaultValue=false` behavior.
-fn non_empty_services(services: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+fn non_empty_services(
+    services: Option<&serde_json::Value>,
+    file_id: u32,
+) -> Option<serde_json::Value> {
     match services {
         Some(serde_json::Value::Object(m)) if m.is_empty() => None,
-        Some(value) => Some(template_token(value)),
+        Some(value) => Some(template_token(value, file_id)),
         None => None,
     }
 }
@@ -891,7 +918,7 @@ fn pascal_case(scope: &str) -> String {
 }
 
 /// Build a `TaskStep` from a `StepPlan`.
-fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
+fn build_task_step(step: &crate::StepPlan, context: &Context, file_id: u32) -> TaskStep {
     let step_id = uuid::Uuid::new_v4();
 
     // Do NOT pre-resolve env or the run script here.
@@ -927,14 +954,18 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .unwrap_or_else(|| "success()".to_owned()),
     );
 
-    // Build displayNameToken — TemplateToken literal matching GitHub's wire format.
-    // type=1 is a literal token; lit contains the human-readable step name.
+    // Build displayNameToken — TemplateToken literal matching GitHub's wire
+    // format. `type` must be 0 (`TokenType.String`): the official runner's
+    // `TemplateTokenJsonConverter` switches on it, and 1 (`TokenType.Sequence`)
+    // builds a `SequenceToken`, which has no `lit` and silently drops the name.
+    // `file` is a 1-based `fileTable` index; 0 is out of range for the
+    // runner's `FileNames[fileId - 1]` lookup.
     let display_name_token = step.name.as_ref().map(|n| {
         serde_json::json!({
-            "type": 1,
+            "type": 0,
             "lit": n,
             "col": 0,
-            "file": 0,
+            "file": file_id,
             "line": 0
         })
     });
@@ -992,6 +1023,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context) -> TaskStep {
             .as_ref()
             .map(|wd| resolve_string(wd, context).unwrap_or_else(|_| wd.clone())),
         timeout_in_minutes: step.timeout_in_minutes,
+        file_id,
     }
 }
 
@@ -1536,7 +1568,7 @@ jobs:
 
     #[test]
     fn container_specs_use_official_template_tokens() {
-        let literal = template_token(&serde_json::json!("node:20"));
+        let literal = template_token(&serde_json::json!("node:20"), 1);
         assert_eq!(literal["type"], 0);
         assert_eq!(literal["lit"], "node:20");
 
@@ -1582,9 +1614,10 @@ jobs:
 
     #[test]
     fn mixed_container_strings_use_format_expression_tokens() {
-        let token = template_token(&serde_json::json!(
-            "ghcr.io/acme/${{ matrix.image }}:${{ matrix.tag }}"
-        ));
+        let token = template_token(
+            &serde_json::json!("ghcr.io/acme/${{ matrix.image }}:${{ matrix.tag }}"),
+            1,
+        );
         assert_eq!(token["type"], 3);
         assert_eq!(
             token["expr"],
@@ -1594,9 +1627,10 @@ jobs:
 
     #[test]
     fn expression_prefixed_container_strings_use_format_tokens() {
-        let token = template_token(&serde_json::json!(
-            "${{ matrix.registry }}/acme:${{ matrix.tag }}"
-        ));
+        let token = template_token(
+            &serde_json::json!("${{ matrix.registry }}/acme:${{ matrix.tag }}"),
+            1,
+        );
         assert_eq!(token["type"], 3);
         assert_eq!(
             token["expr"],
@@ -1737,5 +1771,106 @@ jobs:
         .unwrap();
 
         assert!(!msg.steps.is_empty());
+    }
+
+    /// `displayNameToken` must be `TokenType.String` (0). The official
+    /// runner's `TemplateTokenJsonConverter.ReadJson` switches on `type`, and
+    /// 1 is `TokenType.Sequence`: it builds a `SequenceToken`, which has no
+    /// `lit`, so `ActionRunner.GenerateDisplayName`'s `as ScalarToken` cast
+    /// yields null and the step name is lost.
+    #[test]
+    fn display_name_token_is_a_string_token_with_an_in_range_file_id() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: echo hi
+"#,
+        )
+        .unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        let msg = build_agent_job_message(
+            &plans[0],
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let token = msg.steps[0]
+            .display_name_token
+            .as_ref()
+            .expect("named step carries a displayNameToken");
+        assert_eq!(token["type"], 0, "0 is TokenType.String; 1 is Sequence");
+        assert_eq!(token["lit"], "Say hello");
+        // `GetFileName` indexes `FileNames[fileId - 1]`, so 0 is out of range.
+        assert_eq!(token["file"], 1);
+    }
+
+    /// A job inlined from a reusable workflow is the second `fileTable` entry,
+    /// so its tokens must index 2 — GitHub emits exactly this split, with the
+    /// caller's own jobs still on 1 against the same table.
+    #[test]
+    fn reusable_callee_job_tokens_index_the_callee_file() {
+        let caller = parse_workflow(
+            r#"
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+"#,
+        )
+        .unwrap();
+        let mut reusable = BTreeMap::new();
+        reusable.insert(
+            ".github/workflows/reusable.yml".to_owned(),
+            r#"
+on:
+  workflow_call:
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inner step
+        run: echo hi
+        env:
+          GREETING: hello
+"#
+            .to_owned(),
+        );
+        let caller_plan = &crate::expand_jobs_with_reusables(&caller, &reusable)
+            .unwrap()
+            .jobs[0];
+        let callee_plan = &crate::expand_reusable_call(
+            &parse_workflow(reusable[".github/workflows/reusable.yml"].as_str()).unwrap(),
+            caller_plan,
+            &reusable,
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .jobs[0];
+
+        assert_eq!(job_file_id(caller_plan), 1, "caller job stays on file 1");
+        assert_eq!(job_file_id(callee_plan), 2, "callee job moves to file 2");
+
+        let msg = build_agent_job_message(
+            callee_plan,
+            &serde_json::json!({"event_name": "push"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let step = &msg.steps[0];
+        assert_eq!(step.file_id, 2);
+        let wire = serde_json::to_value(step).unwrap();
+        assert_eq!(wire["displayNameToken"]["file"], 2);
+        assert_eq!(wire["environment"]["file"], 2);
+        assert_eq!(wire["environment"]["map"][0]["Key"]["file"], 2);
     }
 }
