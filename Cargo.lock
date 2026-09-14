@@ -2498,6 +2498,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "rpassword",
+ "rsa",
  "self-replace",
  "semver",
  "serde",
