@@ -14384,7 +14384,8 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let claims = json!({
         "sub": client_id,
         "iss": client_id,
-        "aud": "https://preloop.local/oauth",
+        // R1-9: aud must identify this server (the called token endpoint).
+        "aud": "http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token",
         "jti": uuid::Uuid::new_v4().to_string(),
         "nbf": now,
         "exp": now + 300,
@@ -14488,6 +14489,109 @@ async fn runner_oauth2_token_client_assertion_verification() {
         .unwrap();
 
     assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── R1-9: client_assertion expiry / audience validation ───
+
+fn r1_9_test_uri() -> axum::http::Uri {
+    "/runner/server/_apis/v1/oauth2/token".parse().unwrap()
+}
+
+fn r1_9_claims(now: i64, aud: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "sub": "test-client",
+        "iss": "test-client",
+        "aud": aud,
+        "nbf": now,
+        "exp": now + 300,
+    })
+}
+
+#[test]
+fn r1_9_accepts_valid_assertion_claims() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    // Exact endpoint URL.
+    let claims = r1_9_claims(
+        now,
+        serde_json::json!("http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token"),
+    );
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    // Base URL alone is also accepted.
+    let claims = r1_9_claims(now, serde_json::json!("http://127.0.0.1:9090"));
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    // Array form.
+    let claims = r1_9_claims(
+        now,
+        serde_json::json!(["https://other.example", "http://127.0.0.1:9090"]),
+    );
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+}
+
+#[test]
+fn r1_9_rejects_expired_assertion() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now - 600,
+        "exp": now - 1,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+}
+
+#[test]
+fn r1_9_rejects_wrong_audience() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    // Assertion addressed to a different server must not validate here.
+    let claims = r1_9_claims(now, serde_json::json!("https://preloop.local/oauth"));
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    // Missing aud is also rejected.
+    let claims = serde_json::json!({"sub": "test-client", "nbf": now, "exp": now + 300});
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+}
+
+#[test]
+fn r1_9_rejects_missing_exp_and_excessive_lifetime() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    // Missing exp.
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    // Lifetime over the 600s cap.
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now,
+        "exp": now + 3600,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    // Future-dated nbf beyond skew.
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now + 3600,
+        "exp": now + 3900,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
 }
 
 #[test]

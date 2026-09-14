@@ -110,9 +110,83 @@ pub(crate) fn token_ttl_secs() -> u64 {
         .unwrap_or(2999)
 }
 
+/// Maximum accepted client-assertion lifetime (RFC 7523 recommends short
+/// lifetimes; 10 minutes bounds the replay window of a captured assertion).
+const MAX_ASSERTION_LIFETIME_SECS: i64 = 600;
+/// Clock-skew allowance for iat/nbf future-dating.
+const ASSERTION_CLOCK_SKEW_SECS: i64 = 60;
+
+/// Validate the RFC 7523 §3 claims of a client_assertion JWT (R1-9).
+///
+/// Requires `exp` and rejects expired assertions; requires the assertion to
+/// be addressed to this server (`aud` matches the called token endpoint or
+/// the server base URL, string or array form); requires `iat` or `nbf` and
+/// rejects not-yet-valid assertions; caps the assertion lifetime so a
+/// captured assertion cannot replay indefinitely.
+pub(crate) fn validate_client_assertion_claims(
+    claims: &serde_json::Value,
+    uri: &axum::http::Uri,
+) -> Result<(), ApiError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ApiError::unauthorized(format!("clock error: {e}")))?
+        .as_secs() as i64;
+
+    // exp is REQUIRED (RFC 7523 §3.1).
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ApiError::unauthorized("client_assertion missing exp claim"))?;
+    if now >= exp {
+        return Err(ApiError::unauthorized("client_assertion has expired"));
+    }
+
+    // iat or nbf bounds the start of validity; reject future-dated assertions
+    // beyond clock skew.
+    let start = claims
+        .get("nbf")
+        .or_else(|| claims.get("iat"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ApiError::unauthorized("client_assertion missing iat/nbf claim"))?;
+    if start > now + ASSERTION_CLOCK_SKEW_SECS {
+        return Err(ApiError::unauthorized(
+            "client_assertion not yet valid (iat/nbf in the future)",
+        ));
+    }
+
+    // Cap the lifetime: exp - start must be positive and bounded.
+    let lifetime = exp.saturating_sub(start);
+    if lifetime <= 0 || lifetime > MAX_ASSERTION_LIFETIME_SECS {
+        return Err(ApiError::unauthorized(
+            "client_assertion lifetime exceeds maximum (600s)",
+        ));
+    }
+
+    // aud is REQUIRED (RFC 7523 §3.2) and must identify this server. Accept
+    // the called token endpoint URL or the server base URL, in string or
+    // array form.
+    let base = crate::broker::runner_base_url();
+    let endpoint = format!("{base}{}", uri.path());
+    let aud_ok = match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => aud == &base || aud == &endpoint,
+        Some(serde_json::Value::Array(auds)) => auds
+            .iter()
+            .any(|aud| aud.as_str().is_some_and(|s| s == base || s == endpoint)),
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(ApiError::unauthorized(
+            "client_assertion aud does not match this server",
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn oauth2_token(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     body: bytes::Bytes,
 ) -> Result<Json<TokenResponse>, ApiError> {
     // Try JSON first (mock flow from existing tests)
@@ -226,6 +300,12 @@ pub(crate) async fn oauth2_token(
             )));
         }
     }
+
+    // R1-9: validate the assertion claims (RFC 7523 §3). The signature alone
+    // does not bind the assertion to this server or to a time window: without
+    // exp/aud checks a captured assertion replays indefinitely against any
+    // preloop server holding the runner's public key.
+    validate_client_assertion_claims(&_claims_val, &uri)?;
 
     let token = shared.state.local_jwt(json!({
         "sub": format!("preloop-runner-listen-{runner_id}"),
