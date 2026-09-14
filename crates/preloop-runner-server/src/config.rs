@@ -49,6 +49,11 @@ pub struct GitHubConfig {
     /// PAT used as the fallback when App minting fails under the `pat`
     /// policy. Also the credential for the `--via pat` setup path.
     /// Stored inline (legacy); see [`Self::legacy_app_pem`].
+    ///
+    /// H3: a static PAT cannot be narrowed per job. When no GitHub App is
+    /// configured, submission introspects the PAT's classic OAuth scopes and
+    /// refuses runs whose declared `permissions:` are narrower than the PAT.
+    /// Prefer a GitHub App so installation tokens are minted least-privilege.
     #[serde(default, rename = "pat")]
     pub legacy_pat: Option<String>,
     /// OS credential-store reference for the PAT.

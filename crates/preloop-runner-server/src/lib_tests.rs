@@ -10524,6 +10524,18 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     );
 }
 
+/// Point PAT scope introspection (H3) at a dead local address so tests that
+/// submit runs with a configured PAT stay hermetic: the probe fails fast
+/// with connection-refused (`Unverifiable` → loud warning, run proceeds)
+/// instead of reaching api.github.com, where a fake PAT would 401 and fail
+/// the run.
+fn dead_pat_scope_api() -> crate::state::TestEnvVar {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead API port");
+    let port = listener.local_addr().expect("dead API local addr").port();
+    drop(listener);
+    crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"))
+}
+
 /// A PAT-only deployment embeds the static PAT into job messages at build
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this
@@ -10535,6 +10547,10 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     // asserted token flips under parallelism.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    // H3: PAT scope introspection must stay hermetic — without this the probe
+    // would reach api.github.com, where the fake PAT 401s and the run is
+    // refused.
+    let _dead_api = dead_pat_scope_api();
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
@@ -15208,6 +15224,8 @@ async fn pat_only_config_supplies_job_github_token() {
     // it, and a leaked value would win env-then-config and break the assert.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    // H3: keep PAT scope introspection hermetic (see `dead_pat_scope_api`).
+    let _dead_api = dead_pat_scope_api();
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
@@ -15238,6 +15256,217 @@ async fn pat_only_config_supplies_job_github_token() {
         .expect("job message carries a GitHub token variable");
     assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
     assert_eq!(token.is_secret, Some(true));
+}
+
+/// H3: scope-mismatch matrix for the static-PAT permission check. A classic
+/// PAT carrying write authority must never back a job whose effective
+/// `permissions:` are read-only (or empty); a PAT no broader than declared
+/// passes. Unknown classic scopes count as write-capable — the safe direction
+/// for a security check.
+#[test]
+fn pat_exceeds_declared_scope_matrix() {
+    use std::collections::BTreeMap;
+    fn declared(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(scope, level)| ((*scope).to_owned(), (*level).to_owned()))
+            .collect()
+    }
+    fn scopes(list: &[&str]) -> Vec<String> {
+        list.iter().map(|scope| (*scope).to_owned()).collect()
+    }
+    let read_only = || declared(&[("contents", "read"), ("metadata", "read")]);
+
+    // Full `repo` scope against read-only and empty declarations: exceeds.
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["repo"]),
+        &read_only()
+    ));
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["repo"]),
+        &BTreeMap::new()
+    ));
+    // Terse classic scopes that hide write grants: exceed a read-only job.
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["public_repo", "read:org"]),
+        &read_only()
+    ));
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["repo:status"]),
+        &read_only()
+    ));
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["gist"]),
+        &read_only()
+    ));
+    // Any PAT authority at all against `permissions: {}`: exceeds.
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["read:org"]),
+        &BTreeMap::new()
+    ));
+    // Provably read-only scopes against a read-only job: no mismatch.
+    assert!(!crate::runs::pat_exceeds_declared(
+        &scopes(&["read:org", "read:user", "user:email"]),
+        &read_only()
+    ));
+    // A read-only PAT never exceeds, even against a write-declaring job.
+    assert!(!crate::runs::pat_exceeds_declared(
+        &scopes(&["read:org"]),
+        &declared(&[("contents", "write")])
+    ));
+    // Declared `write` absorbs a write-capable PAT.
+    assert!(!crate::runs::pat_exceeds_declared(
+        &scopes(&["repo"]),
+        &declared(&[("contents", "write")])
+    ));
+    // `id-token`/`models` are platform-granted, not token authority: they
+    // don't absorb a write PAT the way a real `write` grant does.
+    assert!(crate::runs::pat_exceeds_declared(
+        &scopes(&["repo"]),
+        &declared(&[("id-token", "write")])
+    ));
+    // A scopeless PAT exceeds nothing.
+    assert!(!crate::runs::pat_exceeds_declared(
+        &scopes(&[]),
+        &read_only()
+    ));
+}
+
+/// H3 end-to-end: a static PAT whose OAuth scopes exceed the workflow's
+/// declared `permissions:` refuses the run instead of silently embedding the
+/// broader PAT as the job's `GITHUB_TOKEN`.
+#[tokio::test]
+async fn static_pat_broader_than_declared_permissions_rejects_run() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    // Distinct PAT string per H3 test: introspected scopes are cached by PAT
+    // hash process-wide, so sharing one value across tests would leak cached
+    // scopes between them.
+    std::fs::write(&config_path, "[github]\npat = \"h3-broad-pat\"\n").unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert!(
+        state.github_app.is_none(),
+        "config declares no app id or pem"
+    );
+
+    // Hermetic scope introspection: the mock API root answers the PAT probe
+    // with broad classic scopes.
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            (
+                [("X-OAuth-Scopes", "repo, workflow")],
+                axum::Json(serde_json::json!({})),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let yaml = "on: push\npermissions:\n  contents: read\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let error = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("a PAT broader than declared permissions must refuse the run");
+    let message = error.message().to_owned();
+    assert!(
+        message.contains("refusing run") && message.contains("OAuth scopes"),
+        "rejection explains itself, got: {message}"
+    );
+}
+
+/// H3: a static PAT whose OAuth scopes are no broader than the workflow's
+/// declared `permissions:` still reaches the job — but
+/// `system.github.token.permissions` must advertise the PAT's actual scopes,
+/// not the declared set the token does not honor.
+#[tokio::test]
+async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "[github]\npat = \"h3-narrow-pat\"\n").unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    assert!(
+        state.github_app.is_none(),
+        "config declares no app id or pem"
+    );
+
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            (
+                [("X-OAuth-Scopes", "read:org, read:user")],
+                axum::Json(serde_json::json!({})),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    // No declared permissions: the read-only default applies, which the
+    // read-only PAT does not exceed.
+    let yaml =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let accepted = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a PAT no broader than declared permissions is accepted");
+    let run_id = accepted.run_id.to_string();
+
+    let inner = state.inner.lock().await;
+    let message = queued_message_for(&inner, &run_id);
+    assert_eq!(
+        variable_value(&message, "system.github.token"),
+        Some("h3-narrow-pat"),
+        "the narrow PAT still reaches the job"
+    );
+    let wire = variable_value(&message, "system.github.token.permissions")
+        .expect("PAT mode restates the permissions wire variable");
+    assert!(
+        wire.contains("static PAT OAuth scopes"),
+        "wire variable admits the declared set is not honored, got: {wire}"
+    );
+    assert!(
+        !wire.contains("contents"),
+        "wire variable must not echo the declared set, got: {wire}"
+    );
 }
 
 /// The App-manifest setup flow receives the webhook secret from GitHub and

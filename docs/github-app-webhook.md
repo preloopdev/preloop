@@ -89,13 +89,14 @@ The system is configured using the following environment variables:
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
 | `PRELOOP_WEBHOOK_SECRET`            | Secret key configured on the GitHub App to verify payload signatures.                                                                        | `my-secure-webhook-secret`                 |
 | `PRELOOP_LOCAL_WORKSPACE`           | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts.                                         | `/path/to/my-repo`                         |
-| `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available.                  | `ghp_...`                                  |
+| `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available. When no App is configured the PAT is also embedded as every non-fork job's `GITHUB_TOKEN`; submission then introspects the PAT's classic OAuth scopes and refuses runs whose declared `permissions:` are narrower than the PAT. Prefer a GitHub App so tokens are minted least-privilege. | `ghp_...`                                  |
 | `PRELOOP_GITHUB_APPS_JSON`          | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
 | `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`.                                         | `push,pull_request`                        |
 
 
 ### Security Best Practices
 
+- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: a static PAT cannot be narrowed per job, so in PAT mode workflow `permissions:` blocks are not enforced — submission refuses runs whose declared permissions are narrower than the PAT's OAuth scopes, and the PAT is embedded verbatim otherwise. A GitHub App mints least-privilege installation tokens per job.
 - **Git-Ignore Credentials**: Never check `.env`, `*.pem`, or `*.key` files into Git. These files are excluded in the root `.gitignore`.
 - **Production Key Management**: In production, do not write private keys or secrets to plaintext files on the server disk. Instead:
   - Load them directly into memory at runtime using a Secrets Manager (e.g. HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secrets).
