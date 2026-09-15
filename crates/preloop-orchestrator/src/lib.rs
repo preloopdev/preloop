@@ -7,8 +7,7 @@ mod keys;
 pub mod node_externals;
 
 use crate::environment::{
-    curated_toolchains, is_official_runner_image, is_stock_base_image, EnvironmentSpec,
-    ToolchainLayer,
+    curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -38,13 +37,13 @@ use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
-const GUEST_FAILURE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-failed";
+const GUEST_FAILURE_MARKER: &str = "/home/runner/.preloop-job-failed";
 /// Written by the worker while a job is paused in a debug session and removed
 /// when the session closes. The pool probes it to release the slot's
 /// concurrency permit for the pause's duration — without it a paused job
 /// pins a permit (and with `max_concurrent` permits total, eventually the
 /// whole pool) until the session ends or the pause credit expires.
-const GUEST_PAUSE_MARKER: &str = "/var/lib/preloop-runner/.preloop-job-paused";
+const GUEST_PAUSE_MARKER: &str = "/home/runner/.preloop-job-paused";
 /// Guest variable `preloop-runner configure` reads a pre-generated keypair from.
 /// Must match `preloop_runner::configure::RSA_PARAMS_ENV`.
 const RUNNER_RSA_PARAMS_ENV: &str = "PRELOOP_RUNNER_RSA_PARAMS";
@@ -1109,7 +1108,12 @@ const DOCKER_DATA_ROOT: &str = "/storage/docker";
 /// Standard loopback entries for `/etc/hosts`.
 /// Runner root inside the guest. Must match the `--runner-root` argument
 /// passed to configure at provision time.
-const RUNNER_ROOT: &str = "/var/lib/preloop-runner";
+/// Lives under the runner user's home, matching the GitHub-hosted layout
+/// (`/home/runner/...`). A `/var/lib/...` root tripped path-assuming
+/// workflows: jekyll's profiler regex carries an unanchored `/lib`
+/// alternative that matches `var/lib` and mis-normalizes every theme path,
+/// while hosted runners have no `/lib` prefix to catch on.
+const RUNNER_ROOT: &str = "/home/runner";
 
 /// Standard loopback entries for `/etc/hosts`.
 ///
@@ -2788,13 +2792,13 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         building: Arc<AtomicUsize>,
     ) -> Result<(), OrchestratorError> {
         let max_concurrent = {
-            // Leave one runner's CPU share for the golden fork base and the
-            // host itself: filling every core with runner VMs starves the
-            // clone agents on fork readiness probes (EAGAIN), which rolls
-            // the fork back and spends the golden's retained checkpoint.
+            // The memory term below reserves the golden and host headroom.
+            // Do not subtract another CPU slot here: with four vCPUs on an
+            // eight-thread host that forced max_concurrent=1, serializing
+            // matrix jobs even though a second 1.15.0 CoW fork is cheap.
             let parallelism = std::thread::available_parallelism().map_or(2, |value| value.get());
             let per_runner = usize::from(self.config.cpus.max(1));
-            let by_cpu = (parallelism / per_runner).saturating_sub(1).max(1);
+            let by_cpu = (parallelism / per_runner).max(1);
             // memory term: every on-demand fork inherits the golden's
             // committed footprint and grows toward `memory_mib` as the guest
             // runs. On a small host (the production 6-core/22 GiB machine)
@@ -2985,17 +2989,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         self.provider.create(&spec).await?;
         self.provider.start(&name).await?;
         // Plain Ubuntu needs the hosted-runner package baseline. Official
-        // runner snapshots already contain it. Both receive the small,
-        // repository-pinned toolchain layer once while the artifact is built.
+        // runner snapshots already contain it and workflow setup actions own
+        // language-toolchain selection.
         let stock_base = is_stock_base_image(&self.config.base_image);
-        let official_base = is_official_runner_image(&self.config.base_image);
         if stock_base {
             if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
                 let _ = self.provider.delete(&name).await;
                 return Err(error);
             }
         }
-        if stock_base || official_base {
+        if stock_base {
             for layer in curated_toolchains() {
                 for command in layer.install_commands() {
                     let output = self.provider.exec(&name, &command).await?;
@@ -4608,12 +4611,13 @@ async fn provision_runner<P: VmProvider + 'static>(
         // bakes via guest `exec`, and SmolVM's forkable snapshot does NOT
         // carry post-create exec writes into clones (verified empirically),
         // so an env-golden fork boots the bare stock base image. Install the
-        // apt baseline and toolchains into the fork itself — it is the job's
-        // single-use machine, so the writes persist for its lifetime.
+        // apt baseline into the fork itself — it is the job's single-use
+        // machine, so the writes persist for its lifetime. Language versions
+        // remain the workflow's setup action responsibility.
         // Only the plain `{prefix}-golden` fork base is created from the
         // packed artifact (`prepare_packed_golden` at pool startup), whose
-        // rootfs already carries the apt baseline and toolchains that forks
-        // inherit. Fingerprint-suffixed goldens are baked by
+        // rootfs already carries the apt baseline that forks inherit.
+        // Fingerprint-suffixed goldens are baked by
         // `prepare_golden_for_env` from the job's OCI image via guest exec,
         // and SmolVM's forkable snapshot does NOT carry post-create exec
         // writes into clones — so those forks must install the baseline
@@ -4632,33 +4636,6 @@ async fn provision_runner<P: VmProvider + 'static>(
                         %error, "apt list refresh failed; workflow apt installs may not resolve"
                     );
                 }
-            }
-            // A pack is only as baked as whoever produced it: `prepare_artifact`
-            // bakes the workspace toolchains, but `download_prebaked_golden`
-            // short-circuits that path, and a published pack can predate (or
-            // simply omit) the toolchain the workspace now asks for. Probing
-            // beats assuming — a fork missing cargo runs the job anyway and
-            // cargo-dist dies with "you don't appear to have cargo installed",
-            // blaming the workflow for a broken machine. A fully baked pack
-            // pays one `command -v` per layer.
-            for layer in &environment.toolchains {
-                if verify_toolchain_installed(provider.as_ref(), name, layer)
-                    .await
-                    .is_ok()
-                {
-                    continue;
-                }
-                warn!(
-                    machine = name.as_str(),
-                    toolchain = %layer,
-                    "packed golden lacks toolchain; installing into the fork"
-                );
-                for command in layer.install_commands() {
-                    if let Err(error) = provider.exec(name, &command).await {
-                        return Err(error.into());
-                    }
-                }
-                verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
         } else if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
@@ -4773,7 +4750,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         "--labels".into(),
         labels,
         "--runner-root".into(),
-        "/var/lib/preloop-runner".into(),
+        RUNNER_ROOT.into(),
         "--unattended".into(),
         "--replace".into(),
         "--ephemeral".into(),
@@ -4883,7 +4860,7 @@ async fn provision_runner<P: VmProvider + 'static>(
         "run".into(),
         "--once".into(),
         "--runner-root".into(),
-        "/var/lib/preloop-runner".into(),
+        RUNNER_ROOT.into(),
     ]);
     Ok(as_runner_user(config, &run))
 }
@@ -4934,12 +4911,20 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
          printf '%s\\n' '{user} ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/preloop-{user} \
            && chmod 0440 /etc/sudoers.d/preloop-{user}; \
          mkdir -p /run/user/{uid} /opt/hostedtoolcache; \
-         chown {uid}:{uid} /run/user/{uid} /var/lib/preloop-runner 2>/dev/null; \
+         chown -R {uid}:{uid} /home/runner 2>/dev/null; \
+         chown {uid}:{uid} /run/user/{uid} 2>/dev/null; \
+         if [ -d /usr/local/rustup ]; then chown -R {uid}:{uid} /usr/local/rustup; fi; \
+         if [ -d /usr/local/cargo ]; then chown -R {uid}:{uid} /usr/local/cargo; fi; \
          chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
            printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          chmod 777 /run/preloop-control 2>/dev/null; \
-         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null"
+         getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null; \
+         if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /tmp 2>/dev/null && \
+            [ \"$(stat -f -c %T /tmp 2>/dev/null)\" = tmpfs ]; then \
+           umount /tmp 2>/dev/null || mount -o remount,size=75% /tmp 2>/dev/null || true; \
+         fi; \
+         mkdir -p /tmp && chmod 1777 /tmp 2>/dev/null || true"
     );
     // setpriv requires a groups mode: --init-groups (setgroups) only works
     // as root, so the exec-as-image-user branch (official golden: USER
@@ -5173,8 +5158,6 @@ mod lifecycle_tests {
         /// When set, `exec_with_secret_env` (the configure step) blocks until
         /// notified, so a test can observe the pool mid-provision.
         configure_gate: Option<Arc<tokio::sync::Notify>>,
-        /// Binary that `command -v` cannot find until its toolchain installs.
-        absent_binary: Mutex<Option<&'static str>>,
         /// Guest pause marker state: when set, the exec probe for the debug
         /// pause marker succeeds, so `watch_guest_pause` sees a paused job.
         pause_marker: std::sync::atomic::AtomicBool,
@@ -5207,7 +5190,6 @@ mod lifecycle_tests {
                 fail_delete,
                 announce_busy: false,
                 configure_gate: None,
-                absent_binary: Mutex::new(None),
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
             }
@@ -5250,15 +5232,6 @@ mod lifecycle_tests {
         fn drain_live_forks_after(mut self, n: u32) -> Self {
             *self.drain_live_forks_after.get_mut() = n;
             self
-        }
-
-        /// A provider whose guests lack `binary` until an install command for
-        /// it runs — a pack baked without the workspace's toolchain.
-        fn without_binary(binary: &'static str) -> Self {
-            Self {
-                absent_binary: Mutex::new(Some(binary)),
-                ..Self::new(false, false, false, false, false)
-            }
         }
 
         async fn has_machine(&self, name: &MachineName) -> bool {
@@ -6275,18 +6248,6 @@ chmod +x "$dest/bin/node"
                     message: "test -f: marker absent".to_owned(),
                 });
             }
-            let mut absent = self.absent_binary.lock().await;
-            if let Some(binary) = *absent {
-                let probe = format!("command -v {binary}");
-                if argv.iter().any(|arg| arg.contains(&probe)) {
-                    return Err(test_error("binary-not-found"));
-                }
-                // An install command that names the binary lands it on PATH.
-                if argv.iter().any(|arg| arg.contains(binary)) {
-                    *absent = None;
-                }
-            }
-            drop(absent);
             if self.fail_install && argv.iter().any(|arg| arg.contains("apt-get")) {
                 return Err(test_error("install-failure"));
             }
@@ -6891,51 +6852,6 @@ chmod +x "$dest/bin/node"
         );
     }
 
-    /// A published pack can be older than the workspace's toolchain pin, so a
-    /// fork of the packed golden must not be trusted to already have cargo:
-    /// cargo-dist's plan job installs no toolchain of its own and fails with
-    /// "you don't appear to have cargo installed" on a bare machine.
-    #[tokio::test]
-    async fn packed_golden_fork_installs_a_toolchain_the_pack_lacks() {
-        let provider = Arc::new(TestProvider::without_binary("cargo"));
-        let config = packed_fork_config();
-        let golden = MachineName::new("lifecycle-test-golden").unwrap();
-        let name = MachineName::new("lifecycle-test-0-1").unwrap();
-
-        provision_runner(
-            &provider,
-            &config,
-            &name,
-            Some(&golden),
-            &Arc::new(KeyPool::new()),
-            &test_runner_environment(
-                config.base_image.clone(),
-                vec![ToolchainLayer::Rust("1.97".to_owned())],
-                true,
-            ),
-        )
-        .await
-        .expect("the fork installs the toolchain its pack lacks");
-
-        let events = provider.events().await;
-        assert!(
-            events
-                .iter()
-                .any(|event| event.contains("command -v cargo")),
-            "the fork must probe for the toolchain: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| event.contains("rustup-init")),
-            "a probe miss must install the toolchain: {events:?}"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| event.contains("--no-install-recommends")),
-            "the pack already carries the apt baseline: {events:?}"
-        );
-    }
-
     /// A pack published before the baseline stopped wiping `/var/lib/apt/lists`
     /// boots without apt indices, and `sudo apt-get install <pkg>` — how real
     /// workflows install system packages — then resolves nothing.
@@ -6964,42 +6880,6 @@ chmod +x "$dest/bin/node"
                 && event.contains("update")
                 && event.contains("timeout 120")),
             "the fork must restore apt indices when the pack has none: {events:?}"
-        );
-    }
-
-    /// The probe is the whole cost on a pack that is already baked: no reinstall.
-    #[tokio::test]
-    async fn packed_golden_fork_keeps_a_baked_toolchain() {
-        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
-        let config = packed_fork_config();
-        let golden = MachineName::new("lifecycle-test-golden").unwrap();
-        let name = MachineName::new("lifecycle-test-0-2").unwrap();
-
-        provision_runner(
-            &provider,
-            &config,
-            &name,
-            Some(&golden),
-            &Arc::new(KeyPool::new()),
-            &test_runner_environment(
-                config.base_image.clone(),
-                vec![ToolchainLayer::Rust("1.97".to_owned())],
-                true,
-            ),
-        )
-        .await
-        .expect("provisioning succeeds");
-
-        let events = provider.events().await;
-        assert!(
-            events
-                .iter()
-                .any(|event| event.contains("command -v cargo")),
-            "the fork must probe for the toolchain: {events:?}"
-        );
-        assert!(
-            !events.iter().any(|event| event.contains("rustup-init")),
-            "a baked toolchain must not be reinstalled: {events:?}"
         );
     }
 

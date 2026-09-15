@@ -159,7 +159,7 @@ impl ToolchainLayer {
                            aarch64|arm64) RUST_ARCH=aarch64 ;;\n\
                            *) echo \"unsupported arch: $arch\" >&2; exit 1 ;;\n\
                          esac\n\
-                         export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo\n\
+                         export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo\n\
                          curl -fsSL \"https://static.rust-lang.org/rustup/archive/{}/$RUST_ARCH-unknown-linux-gnu/rustup-init\" -o /tmp/rustup-init\n\
                          chmod +x /tmp/rustup-init\n\
                          /tmp/rustup-init -y --profile minimal --default-toolchain {} --component rustfmt,clippy\n\
@@ -171,16 +171,9 @@ impl ToolchainLayer {
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    // Run steps execute with `bash --noprofile --norc`, so
-                    // profile.d PATH exports are never sourced. The toolchain
-                    // lives at fixed system addresses (see RUSTUP_HOME /
-                    // CARGO_HOME above), deliberately outside every user's
-                    // home: bake runs as root while job steps run as the
-                    // unprivileged runner user, and a $HOME-derived location
-                    // would be invisible across that boundary (/root is
-                    // 0700). Symlink the shims into /usr/local/bin so they
-                    // are on the default system PATH for every step shell.
-                    "ln -sf /usr/local/cargo/bin/cargo /usr/local/bin/cargo; ln -sf /usr/local/cargo/bin/cargo-fmt /usr/local/bin/cargo-fmt; ln -sf /usr/local/cargo/bin/cargo-clippy /usr/local/bin/cargo-clippy; ln -sf /usr/local/cargo/bin/rustc /usr/local/bin/rustc; ln -sf /usr/local/cargo/bin/rustdoc /usr/local/bin/rustdoc; ln -sf /usr/local/cargo/bin/rustup /usr/local/bin/rustup".into(),
+                    // The toolchain is installed as the runner user, so
+                    // StepContext adds `/home/runner/.cargo/bin` to PATH.
+                    "true".into(),
                 ],
             ],
             Self::Python(version) => {
@@ -215,19 +208,17 @@ impl ToolchainLayer {
                          [ -n \"$VERSION\" ] || {{ echo \"no go release matching $WANT\" >&2; exit 1; }}\n\
                          arch=$(uname -m)\n\
                          case \"$arch\" in aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; esac\n\
-                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /usr/local -xzf -",
+                         curl -fsSL \"https://go.dev/dl/$VERSION.linux-$arch.tar.gz\" | tar -C /home/runner -xzf -",
                         safe_component(version)
                     ),
                 ],
                 vec![
                     "sh".into(),
                     "-c".into(),
-                    // The Go tarball extracts to /usr/local/go/bin, which is
-                    // not on the default system PATH. Run steps execute with
-                    // `bash --noprofile --norc`, so profile.d PATH exports
-                    // are never sourced; symlink the binaries into
-                    // /usr/local/bin like the Rust layer does for cargo.
-                    "ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt".into(),
+                    // The Go tarball is installed as the runner user at
+                    // `/home/runner/go`; StepContext adds its bin directory
+                    // to PATH for subsequent steps.
+                    "true".into(),
                 ],
             ],
         }
@@ -252,12 +243,15 @@ impl ToolchainLayer {
             Self::Rust(channel) => {
                 let channel = safe_component(channel);
                 format!(
-                    "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && \
+                    "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo PATH=/home/runner/.cargo/bin:$PATH && \
                      command -v cargo >/dev/null && \
                      rustup run {channel} rustc --version >/dev/null && \
                      rustup run {channel} cargo-fmt --version >/dev/null && \
                      rustup run {channel} cargo-clippy --version >/dev/null"
                 )
+            }
+            Self::Go(_) => {
+                "export PATH=/home/runner/go/bin:$PATH && command -v go >/dev/null".to_owned()
             }
             _ => format!("command -v {} >/dev/null", self.verify_binary()),
         }
@@ -304,15 +298,6 @@ pub fn is_stock_base_image(image_ref: &str) -> bool {
     )
 }
 
-/// Whether an image is one of Preloop's official GitHub runner snapshots.
-pub fn is_official_runner_image(image_ref: &str) -> bool {
-    matches!(
-        base_name(image_ref),
-        "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest"
-            | "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest"
-    )
-}
-
 /// Resolved base image and toolchains for one job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
@@ -335,11 +320,11 @@ impl EnvironmentSpec {
     /// Resolve the environment for a base image.
     ///
     /// Stock Ubuntu bases receive the complete Preloop package bake. Official
-    /// runner snapshots already contain that package set, so they receive only
-    /// the repository-pinned toolchains. Other custom images are used as-is.
+    /// runner snapshots and other custom images are used as-is; workflow
+    /// `setup-*` actions select exact language-tool versions at job time.
     pub fn for_base(base: String) -> Self {
         let curated = is_stock_base_image(&base);
-        let toolchains = if curated || is_official_runner_image(&base) {
+        let toolchains = if curated {
             curated_toolchains()
         } else {
             Vec::new()
@@ -555,19 +540,7 @@ mod tests {
     fn rust_layer_puts_rustdoc_on_default_path() {
         let commands = ToolchainLayer::Rust("stable".into()).install_commands();
         let script = commands[1].join(" ");
-        for binary in [
-            "cargo",
-            "cargo-fmt",
-            "cargo-clippy",
-            "rustc",
-            "rustdoc",
-            "rustup",
-        ] {
-            assert!(
-                script.contains(&format!("/usr/local/bin/{binary}")),
-                "{binary} must be linked onto the default PATH: {script}"
-            );
-        }
+        assert_eq!(script, "sh -c true");
     }
 
     #[test]
@@ -576,21 +549,18 @@ mod tests {
         let script = commands[0].join(" ");
         assert!(script.contains("go.dev/dl/?mode=json"));
         assert!(script.contains("$VERSION.linux"));
+        assert!(script.contains("tar -C /home/runner -xzf -"));
         assert!(!script.contains("go1.24.linux")); // never a raw minimum
     }
 
     #[test]
     fn go_layer_puts_binary_on_default_path() {
-        // The Go tarball extracts to /usr/local/go/bin, which is not on the
-        // default PATH of `bash --noprofile --norc` step shells (the same
-        // problem the Rust layer's symlinks solve), so `go`/`gofmt` would be
-        // unresolvable in job steps. The layer must link them into
-        // /usr/local/bin.
+        // The Go tarball is installed in the runner-owned home; the runner
+        // adds its bin directory to each step's PATH.
         let commands = ToolchainLayer::Go("1.24".into()).install_commands();
         assert_eq!(commands.len(), 2);
         let script = commands[1].join(" ");
-        assert!(script.contains("ln -sf /usr/local/go/bin/go /usr/local/bin/go"));
-        assert!(script.contains("ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt"));
+        assert_eq!(script, "sh -c true");
     }
 
     #[test]
@@ -633,8 +603,8 @@ mod tests {
         );
     }
 
-    /// Stock bases get Preloop's complete bake, official runner snapshots get
-    /// only pinned toolchains, and arbitrary custom images stay untouched.
+    /// Stock bases get Preloop's complete bake, while official runner
+    /// snapshots and arbitrary custom images stay untouched.
     #[test]
     fn for_base_selects_only_required_layers() {
         let stock = EnvironmentSpec::for_base(UBUNTU_24_04_PIN.to_owned());
@@ -646,7 +616,10 @@ mod tests {
             !official.curated,
             "official images already contain packages"
         );
-        assert_eq!(official.toolchains, curated_toolchains());
+        assert!(
+            official.toolchains.is_empty(),
+            "official runner images must resolve workflow toolchains through setup actions"
+        );
 
         let custom = EnvironmentSpec::for_base("ghcr.io/acme/runner:latest".to_owned());
         assert!(!custom.curated, "custom bases must not be curated");
@@ -700,9 +673,9 @@ mod tests {
         let command = ToolchainLayer::Rust("1.97".into()).verify_command();
         assert!(
             command.starts_with(
-                "export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && "
+                "export RUSTUP_HOME=/home/runner/.rustup CARGO_HOME=/home/runner/.cargo PATH=/home/runner/.cargo/bin:$PATH && "
             ),
-            "verification must resolve the baked toolchain, not /root/.rustup: {command}"
+            "verification must resolve the runner-owned toolchain homes: {command}"
         );
         assert!(command.contains("rustup run 1.97 rustc --version"));
     }

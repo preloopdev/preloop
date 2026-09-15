@@ -2759,6 +2759,7 @@ dependencies = [
  "clap",
  "cron",
  "filetime",
+ "flate2",
  "futures",
  "hkdf 0.12.4",
  "hmac 0.12.1",

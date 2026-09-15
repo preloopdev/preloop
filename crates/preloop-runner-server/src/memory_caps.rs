@@ -66,9 +66,10 @@ pub(crate) const MAX_TIMELINE_KEYS: usize = 4096;
 /// per-run event buckets (each itself capped by [`MAX_TIMELINE_EVENTS`]).
 pub(crate) const MAX_TIMELINE_EVENT_KEYS: usize = 4096;
 
-/// F5 — per-block cap for staged blob blocks (matches the official runner's
-/// 4 MiB Azure SDK block size; larger blocks are rejected with 413).
-pub(crate) const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+/// F5 — per-block cap for staged blob blocks. upload-artifact v4 stages
+/// 8 MiB blocks (observed Content-Length 8388608 from actions/upload-artifact
+/// against the nushell build); larger blocks are rejected with 413.
+pub(crate) const MAX_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 
 /// F5 — cap on the number of block IDs in a blocklist commit request.
 pub(crate) const MAX_BLOCKLIST_BLOCKS: usize = 10_000;

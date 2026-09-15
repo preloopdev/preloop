@@ -16,14 +16,34 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
         .get("fileTable")
         .and_then(|ft| ft.get("workDirectory"))
         .and_then(|v| v.as_str())
+        .map(str::to_owned)
         .or_else(|| {
             job_message
                 .get("contextData")
                 .and_then(|cd| cd.get("github"))
                 .and_then(|gh| gh.get("workspace"))
                 .and_then(|v| v.as_str())
+                .map(str::to_owned)
         })
-        .unwrap_or("_work/default/default");
+        .or_else(|| {
+            // GitHub-hosted parity (`<work>/<repo>/<repo>`): the claim
+            // message carries no work directory, but
+            // `contextData.github.repository` ("owner/repo", AzDO
+            // typed-dict `{"t": 2, "d": [...]}` encoding like the rest of
+            // the message) is always present — derive the layout from its
+            // basename so
+            // path-assuming workflows (hugo codegen) see official paths.
+            let raw_github = job_message
+                .get("contextData")
+                .and_then(|cd| cd.get("github"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let github = decode_typed_value(&raw_github);
+            let repository = github.get("repository").and_then(|v| v.as_str());
+            preloop_gha_protocol::workspace_dir_for_repository(repository)
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "_work/default/default".to_owned());
 
     // The runner owns everything below its working directory — its root,
     // where `_work` and `.runner` live (the worker is spawned with
@@ -33,7 +53,7 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
     // path and require it to stay strictly inside the runner root, rejecting
     // absolute paths and `..` traversal that escape it.
     let runner_root = std::env::current_dir()?;
-    let work_path = Path::new(work_dir);
+    let work_path = Path::new(work_dir.as_str());
     let work_path = if work_path.is_absolute() {
         work_path.to_path_buf()
     } else {
@@ -163,6 +183,34 @@ fn resolve_workspace_contained(path: &Path, root: &Path) -> std::io::Result<std:
     Ok(canonical)
 }
 
+/// Directory tool installers (setup-python/node/ruby/go) unpack into.
+///
+/// GitHub-hosted runners — and our own provisioning, which `mkdir -p`s and
+/// `chmod 777`s it every boot — use `/opt/hostedtoolcache`. The version
+/// tarballs bake an absolute RUNPATH there, and actions that opt out of
+/// environment updates (`update-environment: false`, e.g. hynek's
+/// build-and-inspect-python-package composite) rely on the interpreter
+/// loading without `LD_LIBRARY_PATH`. Prefer it when present and writable;
+/// otherwise keep the workspace-local `_tool` default.
+fn tool_cache_dir(workspace: &str) -> String {
+    tool_cache_dir_for(workspace, Path::new("/opt/hostedtoolcache"))
+}
+
+fn tool_cache_dir_for(workspace: &str, hosted: &Path) -> String {
+    let writable = hosted.is_dir()
+        && std::fs::metadata(hosted)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false);
+    if writable {
+        return hosted.to_string_lossy().into_owned();
+    }
+    Path::new(workspace)
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("_tool").to_string_lossy().to_string())
+        .unwrap_or_else(|| "/tmp".to_string())
+}
+
 /// Inject GITHUB_* and RUNNER_* environment variables into the job context.
 pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
     let raw_github = msg
@@ -258,14 +306,10 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                 .map(|p| p.join("_temp").to_string_lossy().to_string())
                 .unwrap_or_else(|| "/tmp".to_string()),
         ),
-        (
-            "RUNNER_TOOL_CACHE",
-            Path::new(workspace)
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("_tool").to_string_lossy().to_string())
-                .unwrap_or_else(|| "/tmp".to_string()),
-        ),
+        ("RUNNER_TOOL_CACHE", tool_cache_dir(workspace)),
+        // The tool-cache library falls back to the agent directory when
+        // RUNNER_TOOL_CACHE is absent; export both like the official runner.
+        ("AGENT_TOOLSDIRECTORY", tool_cache_dir(workspace)),
         // P1.9: Missing GITHUB_*/RUNNER_* env vars (F034)
         (
             "GITHUB_REF_PROTECTED",

@@ -1930,6 +1930,44 @@ pub(crate) fn redirect_primary_checkout(
 }
 
 /// Serve a snapshot bare repository through Git's read-only smart HTTP CGI.
+/// Decode a smart-HTTP request body per its `Content-Encoding`.
+///
+/// Git gzip-encodes large POST bodies (observed on full-history fetches:
+/// thousands of want lines, ~6 KB). `git http-backend` expects decoded
+/// pkt-lines on stdin — a real front-end gunzips first — so without this
+/// the backend dies with `bad line length character` and the client reports
+/// `fatal: expected 'packfile'`. Small bodies (ls-refs, single-want fetches)
+/// arrive plain and pass through untouched.
+fn decode_git_request_body(
+    body: &[u8],
+    content_encoding: Option<&str>,
+) -> Result<Vec<u8>, ApiError> {
+    let gzipped = content_encoding
+        .unwrap_or_default()
+        .split(',')
+        .any(|value| value.trim().eq_ignore_ascii_case("gzip"));
+    if !gzipped {
+        return Ok(body.to_vec());
+    }
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
+    let mut decoded = Vec::new();
+    // Bound decoded output, not the compressed wire size. Git already caps
+    // the request at MAX_GIT_REQUEST_BYTES before this runs; without a
+    // second cap a tiny gzip expands past the same budget in RAM.
+    let mut decoder = GzDecoder::new(body).take(MAX_GIT_REQUEST_BYTES as u64 + 1);
+    decoder.read_to_end(&mut decoded).map_err(|error| {
+        ApiError::bad_request(format!("invalid gzip Git request body: {error}"))
+    })?;
+    if decoded.len() > MAX_GIT_REQUEST_BYTES {
+        return Err(ApiError::payload_too_large(
+            "gzip Git request body exceeded size limit",
+        ));
+    }
+    Ok(decoded)
+}
+
+/// Serve a snapshot bare repository through Git's read-only smart HTTP CGI.
 pub(crate) async fn snapshot_git_http(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, path)): Path<(RunId, String)>,
@@ -2002,9 +2040,15 @@ pub(crate) async fn snapshot_git_http(
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned)
         });
+    let content_encoding = request
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let request_body = to_bytes(request.into_body(), MAX_GIT_REQUEST_BYTES)
         .await
         .map_err(|error| ApiError::bad_request(format!("invalid Git request body: {error}")))?;
+    let request_body = decode_git_request_body(&request_body, content_encoding.as_deref())?;
     if path == "info/lfs/objects/batch" || path == ".git/info/lfs/objects/batch" {
         let body = lfs_batch_response(
             &repository,
@@ -2233,6 +2277,51 @@ fn snapshot_authorization_token(value: &str) -> Option<String> {
 #[cfg(test)]
 mod auth_scoping_tests {
     use super::*;
+
+    #[test]
+    fn gzipped_git_body_decodes_and_plain_passes_through() {
+        // Full-history fetches arrive gzip-encoded (thousands of want
+        // lines); piping them raw to http-backend died with
+        // `bad line length character` and the client saw
+        // `fatal: expected 'packfile'`.
+        let plain = b"0014command=ls-refs\n0000".to_vec();
+        assert_eq!(decode_git_request_body(&plain, None).unwrap(), plain);
+        assert_eq!(
+            decode_git_request_body(&plain, Some("identity")).unwrap(),
+            plain
+        );
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&plain).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        assert!(gzipped.starts_with(&[0x1f, 0x8b]));
+        assert_eq!(
+            decode_git_request_body(&gzipped, Some("gzip")).unwrap(),
+            plain
+        );
+        assert!(decode_git_request_body(&gzipped, None).unwrap() != plain);
+        assert!(decode_git_request_body(b"not-gzip", Some("gzip")).is_err());
+    }
+
+    #[test]
+    fn gzipped_git_body_rejects_decoded_over_limit() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let chunk = [0u8; 64 * 1024];
+        let mut remaining = MAX_GIT_REQUEST_BYTES + 1;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            encoder.write_all(&chunk[..n]).unwrap();
+            remaining -= n;
+        }
+        let gzipped = encoder.finish().unwrap();
+        let error = decode_git_request_body(&gzipped, Some("gzip")).unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     #[test]
     fn github_remote_gets_scoped_basic_header() {

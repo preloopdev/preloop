@@ -15,6 +15,10 @@ pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError
         Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
             validate_function_calls(inner)
         }
+        Expr::Index { base, key } => {
+            validate_function_calls(base)?;
+            validate_function_calls(key)
+        }
         Expr::Binary { left, right, .. } => {
             validate_function_calls(left)?;
             validate_function_calls(right)
@@ -58,6 +62,10 @@ pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections
         Expr::Literal(_) => {}
         Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
             collect_contexts_from_expr(inner, out);
+        }
+        Expr::Index { base, key } => {
+            collect_contexts_from_expr(base, out);
+            collect_contexts_from_expr(key, out);
         }
         Expr::Binary { left, right, .. } => {
             collect_contexts_from_expr(left, out);
@@ -145,6 +153,7 @@ pub(super) fn eval(
         Expr::Binary { .. } => eval_binary(expr, context, budget),
         Expr::Call { name, args } => eval_call(name, args, context, budget),
         Expr::MemberAccess { expr, path } => eval_member(expr, path, context, budget),
+        Expr::Index { base, key } => eval_index(base, key, context, budget),
     }?;
     budget.charge(&value)?;
     Ok(value)
@@ -166,6 +175,25 @@ fn eval_member(
 ) -> Result<Value, ExpressionError> {
     let base = eval(expr, context, budget)?;
     Ok(Context::resolve_value(base, path))
+}
+
+fn eval_index(
+    base: &Expr,
+    key: &Expr,
+    context: &Context,
+    budget: &mut EvalBudget,
+) -> Result<Value, ExpressionError> {
+    let base = eval(base, context, budget)?;
+    let key = string_value(&eval(key, context, budget)?);
+    match &base {
+        Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Null)),
+        Value::Array(items) => Ok(key
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| items.get(index).cloned())
+            .unwrap_or(Value::Null)),
+        _ => Ok(Value::Null),
+    }
 }
 
 fn eval_binary(

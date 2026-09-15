@@ -248,12 +248,16 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
     // provisioning cannot protect an unschedulable job forever.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
     // Absolute backstop, measured from ready-enqueue, on how long
-    // provisioning/preparing may protect a job from starvation failure. It
-    // protects a job whose runner is genuinely on the way, but keeps
-    // continuous successor prebuilds or a provision that fails and retries
-    // forever from masking an unschedulable job (bad `runs-on`, or a
-    // persistently broken provision) indefinitely.
-    const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
+    // provisioning/preparing may pause a job's starvation clock. It protects
+    // a job whose runner is genuinely on the way, but keeps continuous
+    // successor prebuilds or a provision that fails and retries forever from
+    // masking an unschedulable job (bad `runs-on`, or a persistently broken
+    // provision) indefinitely.
+    // A fresh CoW runner may need to install a missing toolchain before it
+    // registers. With two concurrent forks, a large matrix can spend several
+    // minutes in that warm-up; the old ten-minute cap killed legitimate
+    // queued jobs while their runners were already booting.
+    const MAX_QUEUED_GRACE: Duration = Duration::from_secs(1800);
     let pool_status = shared.state.pool_status.snapshot();
     let pool_preparing = shared
         .state
