@@ -36,9 +36,9 @@ just dogfood    # E2E with real runner
 - **Wire compatibility**: `/_apis/…` is the source of truth. Validate protocol changes against the **official runner**, not only unit tests.
 - **Broker path only**: all work targets the modern broker + Twirp results-service protocol (v2.329.0+).
 - **VM substrates**: two backends behind `preloop_vm::VmProvider` — SmolVM
-  (libkrun; the only option on macOS/Apple Silicon) and AgentENV (Firecracker
-  over `/dev/kvm`; the default on a Linux host that has `aenv`). Selected by
-  `PRELOOP_VM_BACKEND`; capability differences are declared by
+  (libkrun; the default everywhere) and AgentENV (Firecracker over `/dev/kvm`;
+  opt-in via `PRELOOP_VM_BACKEND=agentenv`). Selected by `PRELOOP_VM_BACKEND`;
+  capability differences are declared by
   `VmProvider::capabilities()` and the orchestrator branches on them. See
   `docs/vm-substrates.md` before touching pool or provider code.
 - **Store backends**: the `Store` trait (`store.rs`, async, object-safe) is the only surface the server sees; backends are SQLite (`store.rs`, default, `<state_dir>/preloop.db`) and Postgres (`store_pg.rs`), selected via `PRELOOP_STORE_URL` (`sqlite://<path>` / bare path / `postgres://…`). Both are single-writer: one connection behind a mutex. Two servers on the same SQLite file (or same PG database) still diverge in-memory — the DB is a restart source, not a shared bus.

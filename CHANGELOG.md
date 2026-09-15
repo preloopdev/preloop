@@ -11,10 +11,10 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
-- **AgentENV is now a first-class VM substrate, and the default on KVM hosts.**
+- **AgentENV is now a first-class VM substrate, opt-in on KVM hosts.**
   `crates/preloop-vm/src/agentenv.rs` implements `VmProvider` over the `aenv`
-  CLI (Firecracker + overlaybd + ublk), so any host with Linux ≥ 6.8,
-  `/dev/kvm`, and `aenv` on `PATH` selects it automatically;
+  CLI (Firecracker + overlaybd + ublk), selected with
+  `PRELOOP_VM_BACKEND=agentenv` on a host with Linux ≥ 6.8 and `/dev/kvm`;
   `PRELOOP_VM_BACKEND=smolvm|agentenv` overrides, and an unrecognized value is
   a hard error rather than a silent fallback. macOS is unchanged (SmolVM is the
   only libkrun-capable runtime there). AgentENV is faster at every VM lifecycle
@@ -28,6 +28,12 @@ Releases before v0.27.0 predate the changelog.
   it instead of assuming: a backend whose packs are not host files no longer
   builds, downloads, or relocates an artifact — it prepares its golden directly
   from the base image and forks per job.
+- The engine manages its own AgentENV egress exception: with the AgentENV
+  backend selected, pool startup reconciles the surgical node deny-list
+  complement and the ordered host firewall rules from `PRELOOP_RUNNER_URL`
+  (verify-first, mutate only on drift, restart `aenv` only on config change).
+  Narrow `sudoers` scope, `PRELOOP_AENV_MANAGE_EGRESS=0|dry-run` escape hatches,
+  and `PRELOOP_AENV_ENGINE_IP` override in `docs/vm-substrates.md`.
 
 ### Changed
 
@@ -101,6 +107,19 @@ Releases before v0.27.0 predate the changelog.
   run no longer appends a duplicate deny-list complement, and the engine-port
   `ACCEPT` rules are re-inserted at the head of `INPUT` after the service
   re-adds its blanket veth `REJECT`.
+- Debug attach no longer strands a live heartbeat when the guest resume fails:
+  `DebugAttach::claim` resumes before writing ACTIVE, and `preloop debug
+  --export` holds the same attach guard as every other controller path.
+- The AgentENV provider no longer leaks sandboxes on partial startup (the id
+  is recorded before readiness probes run), orphans clones on retried forks
+  (duplicate names are rejected), or lets a failed pause cancel the TTL
+  keepalive out from under a live session (cancelled only on success; transient
+  keepalive failures retry). Unenforceable specs (`Restricted` network,
+  per-sandbox `dns`, zero storage) are rejected at create time instead of
+  silently substituted.
+- On-demand pool slots honor the packed-golden fallback like warm slots, and a
+  loopback `PRELOOP_RUNNER_URL` with the AgentENV backend fails pool startup
+  with the fix — loopback is the guest itself there, so every job would starve.
 
 ## [0.32.9] - 2026-09-15
 

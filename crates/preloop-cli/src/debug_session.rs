@@ -55,6 +55,14 @@ impl DebugAttach {
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Resume before claiming: the ACTIVE marker tells the engine's watcher
+        // to resume a suspended sandbox, and `resume_guest_if_needed` is the
+        // fallback for an engine that is not watching (restart, different
+        // host). Either way a failed resume must not leave a heartbeat
+        // rewriting ACTIVE for a controller that never attached: the guard
+        // below is never constructed on error, and a dropped JoinHandle
+        // detaches rather than cancels.
+        crate::resume_guest_if_needed(machine)?;
         std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
         let heartbeat_marker = marker.clone();
         let heartbeat = tokio::spawn(async move {
@@ -67,10 +75,6 @@ impl DebugAttach {
                 }
             }
         });
-        // The ACTIVE marker also tells the engine's watcher to resume a
-        // suspended sandbox; resume_guest_if_needed is the fallback for an
-        // engine that is not watching (restart, different host).
-        crate::resume_guest_if_needed(machine)?;
         Ok(Some(Self {
             marker,
             heartbeat: Some(heartbeat),
@@ -205,9 +209,16 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&session)?);
         return Ok(());
     }
-
     if args.export {
-        return export_from_guest(&session, !args.patch_only);
+        // A suspended sandbox cannot be reached, and an unattached one may be
+        // suspended mid-export: hold the same attach guard as every other
+        // controller path for the duration of the guest diff.
+        let attach = DebugAttach::claim(session.machine.as_deref()).await?;
+        let outcome = export_from_guest(&session, !args.patch_only);
+        if let Some(attach) = attach {
+            attach.release().await;
+        }
+        return outcome;
     }
 
     if let Some(verdict) = &args.verdict {

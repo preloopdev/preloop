@@ -474,10 +474,11 @@ impl AgentEnvProvider {
                 args.extend(["--cpu".into(), spec.cpus.to_string()]);
                 args.extend(["--memory".into(), spec.memory_mib.to_string()]);
                 if with_disk {
-                    // AgentENV requires whole-GiB steps.
+                    // AgentENV requires whole-GiB steps. Zero is rejected by
+                    // `validate_spec` at create time, so no substitution here.
                     args.extend([
                         "--disk-size-mb".into(),
-                        (spec.storage_gib.max(1) * 1024).to_string(),
+                        (spec.storage_gib * 1024).to_string(),
                     ]);
                 }
             } else {
@@ -559,6 +560,10 @@ impl AgentEnvProvider {
         let sandbox = sandbox.to_owned();
         let ttl = self.ttl_secs.to_string();
         let handle = tokio::spawn(async move {
+            // Consecutive renewal failures. A missing sandbox fails every
+            // probe, so it still exits quickly; a transient daemon hiccup
+            // gets two more chances before the sandbox is left to its TTL.
+            let mut consecutive_failures = 0u32;
             loop {
                 tokio::time::sleep(interval).await;
                 let result = Command::new(&binary)
@@ -569,14 +574,21 @@ impl AgentEnvProvider {
                     .kill_on_drop(true)
                     .status()
                     .await;
-                match result {
-                    Ok(status) if status.success() => {}
-                    // The sandbox is gone (deleted, or its TTL already
-                    // expired): nothing left to keep alive.
-                    Ok(_) => break,
-                    Err(error) => {
-                        warn!(%error, sandbox, "AgentENV TTL keepalive could not run");
-                        break;
+                match &result {
+                    Ok(status) if status.success() => {
+                        consecutive_failures = 0;
+                    }
+                    outcome => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            warn!(
+                                sandbox,
+                                failures = consecutive_failures,
+                                ?outcome,
+                                "AgentENV TTL keepalive giving up; sandbox left to its TTL"
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -685,6 +697,25 @@ impl AgentEnvProvider {
         .await
         .map(|_| ())
     }
+
+    /// Materialize volume mounts unless a previous start already did.
+    async fn ensure_volumes(
+        &self,
+        name: &MachineName,
+        record: &MachineRecord,
+        sandbox: &str,
+    ) -> Result<(), VmError> {
+        if record.spec.volumes.is_empty() || record.volumes_materialized {
+            return Ok(());
+        }
+        self.materialize_volumes(sandbox, &record.spec.volumes)
+            .await?;
+        self.update(name, |record| {
+            record.volumes_materialized = true;
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 /// Quote `value` for POSIX `sh`.
@@ -783,10 +814,24 @@ fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
             )));
         }
     }
-    if matches!(spec.network, NetworkPolicy::Disabled) {
+    if matches!(
+        spec.network,
+        NetworkPolicy::Disabled | NetworkPolicy::Restricted { .. }
+    ) {
         return Err(VmError::InvalidSpec(
-            "AgentENV sandboxes are always networked; NetworkPolicy::Disabled cannot be honoured"
+            "AgentENV sandboxes are always networked with the node deny-list; \
+             NetworkPolicy::Disabled and NetworkPolicy::Restricted cannot be honoured"
                 .into(),
+        ));
+    }
+    if spec.dns.is_some() {
+        return Err(VmError::InvalidSpec(
+            "AgentENV exposes no per-sandbox resolver setting; `dns` cannot be honoured".into(),
+        ));
+    }
+    if spec.storage_gib == 0 {
+        return Err(VmError::InvalidSpec(
+            "image, CPU, memory, and storage must be non-zero".into(),
         ));
     }
     Ok(())
@@ -846,6 +891,7 @@ impl VmProvider for AgentEnvProvider {
             let states = self.live_sandboxes().await?;
             match states.get(sandbox).map(String::as_str) {
                 Some("running") => {
+                    self.ensure_volumes(name, &record, sandbox).await?;
                     self.spawn_keepalive(name, sandbox).await;
                     return Ok(());
                 }
@@ -861,6 +907,7 @@ impl VmProvider for AgentEnvProvider {
                     )
                     .await?;
                     self.await_guest(sandbox).await?;
+                    self.ensure_volumes(name, &record, sandbox).await?;
                     self.spawn_keepalive(name, sandbox).await;
                     return Ok(());
                 }
@@ -881,18 +928,18 @@ impl VmProvider for AgentEnvProvider {
                     .await?
             }
         };
-        self.await_guest(&sandbox).await?;
-        self.prepare_guest_dirs(&sandbox).await?;
-        if !record.spec.volumes.is_empty() && !record.volumes_materialized {
-            self.materialize_volumes(&sandbox, &record.spec.volumes)
-                .await?;
-        }
+        // Record the id before anything else can fail: readiness, dir prep,
+        // and volume setup below all run against a live sandbox, and the
+        // orchestrator's provisioning-error cleanup (`delete`) can only tear
+        // down a sandbox it knows about. An unrecorded id leaks the VM.
         let sandbox_for_record = sandbox.clone();
         self.update(name, move |record| {
             record.sandbox = Some(sandbox_for_record);
-            record.volumes_materialized = true;
         })
         .await?;
+        self.await_guest(&sandbox).await?;
+        self.prepare_guest_dirs(&sandbox).await?;
+        self.ensure_volumes(name, &record, &sandbox).await?;
         self.spawn_keepalive(name, &sandbox).await;
         Ok(())
     }
@@ -958,6 +1005,18 @@ impl VmProvider for AgentEnvProvider {
                 }
             }
         };
+        // A retry with an already-used clone name must not silently orphan the
+        // previous sandbox: the insert below would drop its id without ever
+        // deleting it. Mirror `create` and reject instead.
+        if let Ok(existing) = self.record(clone).await {
+            if existing.sandbox.is_some() {
+                return Err(VmError::Command {
+                    operation: "fork",
+                    exit_code: 1,
+                    message: format!("machine `{}` already exists", clone.as_str()),
+                });
+            }
+        }
         let sandbox = self.start_sandbox(&snapshot, None, "fork").await?;
         {
             let mut registry = self.registry.lock().await;
@@ -985,21 +1044,29 @@ impl VmProvider for AgentEnvProvider {
     }
 
     /// Pause the sandbox, keeping its identity for a later resume.
+    ///
+    /// The keepalive is cancelled only once the sandbox is actually parked:
+    /// a failed pause leaves a live, unrenewed sandbox behind, and with a
+    /// short TTL AgentENV would delete it mid-session.
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
-        self.cancel_keepalive(name).await;
         let record = self.record(name).await?;
         let Some(sandbox) = record.sandbox else {
+            self.cancel_keepalive(name).await;
             return Ok(());
         };
         match self
             .checked("stop", &["pause".into(), sandbox.clone()])
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.cancel_keepalive(name).await;
+                Ok(())
+            }
             // Already gone or already paused: `stop` is idempotent.
             Err(VmError::Command { message, .. })
                 if is_absent(&message) || message.to_ascii_lowercase().contains("paused") =>
             {
+                self.cancel_keepalive(name).await;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1438,6 +1505,42 @@ mod tests {
             matches!(&error, VmError::InvalidSpec(message) if message.contains("control_socket")),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn unenforceable_network_dns_and_storage_are_rejected() {
+        let base = || MachineSpec {
+            name: MachineName::new("runner").unwrap(),
+            image: "ubuntu:24.04".into(),
+            cpus: 2,
+            memory_mib: 2048,
+            storage_gib: 8,
+            overlay_gib: None,
+            network: NetworkPolicy::Unrestricted,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+        };
+        assert!(validate_spec(&base()).is_ok());
+        let mut restricted = base();
+        restricted.network = NetworkPolicy::Restricted {
+            hosts: Vec::new(),
+            cidrs: vec!["10.0.0.0/8".to_owned()],
+        };
+        assert!(matches!(
+            validate_spec(&restricted),
+            Err(VmError::InvalidSpec(_))
+        ));
+        let mut dns = base();
+        dns.dns = Some("192.168.1.1".to_owned());
+        assert!(matches!(validate_spec(&dns), Err(VmError::InvalidSpec(_))));
+        let mut zero_storage = base();
+        zero_storage.storage_gib = 0;
+        assert!(matches!(
+            validate_spec(&zero_storage),
+            Err(VmError::InvalidSpec(_))
+        ));
     }
 
     #[test]

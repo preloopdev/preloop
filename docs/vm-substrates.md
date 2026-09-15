@@ -5,20 +5,26 @@ one trait, [`preloop_vm::VmProvider`]:
 
 | Backend | Runtime | Hosts | Selected by |
 |---|---|---|---|
-| `smolvm` | [SmolVM](https://github.com/smol-machines/smolvm) — libkrun (Hypervisor.framework on macOS, KVM on Linux) | macOS arm64, Linux arm64/x86_64 | default off Linux, or `PRELOOP_VM_BACKEND=smolvm` |
-| `agentenv` | [AgentENV](https://github.com/kvcache-ai/AgentENV) — a Firecracker control plane with overlaybd images and ublk storage | Linux ≥ 6.8 with `/dev/kvm` | default on such a host when `aenv` is on `PATH`, or `PRELOOP_VM_BACKEND=agentenv` |
+| `smolvm` | [SmolVM](https://github.com/smol-machines/smolvm) — libkrun (Hypervisor.framework on macOS, KVM on Linux) | macOS arm64, Linux arm64/x86_64 | default everywhere; `PRELOOP_VM_BACKEND` unset or `smolvm` |
+| `agentenv` | [AgentENV](https://github.com/kvcache-ai/AgentENV) — a Firecracker control plane with overlaybd images and ublk storage | Linux ≥ 6.8 with `/dev/kvm` and `aenv` on `PATH` | opt-in only: `PRELOOP_VM_BACKEND=agentenv` |
 
 `PRELOOP_VM_BACKEND` is authoritative; an unrecognized value is a hard error
 rather than a silent fallback, because booting jobs on a substrate the operator
 did not ask for is exactly the surprise a typo must not cause. The engine logs
 `VM substrate selected` with the resolved backend at startup.
 
-## Why AgentENV is the default on KVM
+## Why AgentENV stays opt-in on KVM for now
 
 On a KVM host, AgentENV is the faster substrate for the runner-pool lifecycle
 — boot, fork, pause, and resume — because a snapshot restore replaces a boot
 and its snapshots are immutable, so concurrent forks do not serialize on a
 single retained checkpoint the way SmolVM's do.
+
+Lifecycle speed is not the whole job, though: the end-to-end campaign found
+per-job wall time on AgentENV *worse* than SmolVM because of a preloop-side
+provisioning interaction, not the substrate (REPORT.md §4). Until that is
+closed, SmolVM stays the default and AgentENV is opt-in via
+`PRELOOP_VM_BACKEND=agentenv`.
 
 Guest CPU is equivalent in the controlled same-host measurements. Guest I/O is
 workload- and path-specific rather than a general AgentENV win: the same-host
@@ -181,6 +187,32 @@ under-provisioning or failing a spec that is merely smaller than the base.
    `benchmarks/substrates/verify-egress.sh`, which asserts the intended
    posture from inside a sandbox: engine reachable, other LAN hosts blocked,
    internet reachable.
+
+   The engine can own both steps instead: with the AgentENV backend selected,
+   pool startup reconciles the exception from `PRELOOP_RUNNER_URL` automatically
+   — verify first, rewrite the deny-list complement and re-order the firewall
+   rules only on drift, restart `aenv` only when its config actually changed.
+   It needs privilege for exactly four commands; grant it narrowly (visudo):
+
+   ```text
+   preloop ALL=(root) NOPASSWD: /usr/bin/cp /var/lib/aenv/config/config.toml *
+   preloop ALL=(root) NOPASSWD: /bin/mv /var/lib/aenv/config/.preloop-egress.*
+   preloop ALL=(root) NOPASSWD: /usr/sbin/iptables -C INPUT *
+   preloop ALL=(root) NOPASSWD: /usr/sbin/iptables -D INPUT *
+   preloop ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT *
+   preloop ALL=(root) NOPASSWD: /usr/bin/systemctl restart aenv
+   ```
+   (Paths are Debian/Ubuntu's; adjust `iptables`/`systemctl` locations per distro.
+   Reads — config, `iptables -S`, `systemctl is-active` — run unprivileged.)
+
+   Knobs: `PRELOOP_AENV_MANAGE_EGRESS=0` skips reconciliation (loud warning —
+   manage the exception by hand, or nothing registers);
+   `PRELOOP_AENV_MANAGE_EGRESS=dry-run` logs the planned actions and changes
+   nothing; `PRELOOP_AENV_ENGINE_IP` pins the engine address when the runner
+   URL carries a hostname instead of an IP literal; `PRELOOP_AENV_CONFIG`
+   overrides the node config path. A loopback runner URL with no control
+   upstream fails pool startup outright — on AgentENV loopback is the guest
+   itself, so every job would starve.
 
    SmolVM needs none of this — its guests can reach host services by default —
    so this is a real operational difference, and arguably AgentENV's is the

@@ -3639,6 +3639,14 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
     semaphore: Arc<tokio::sync::Semaphore>,
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
 ) -> Result<(), OrchestratorError> {
+    // Mirror `run_slot`: once the packed golden is known-unusable, on-demand
+    // slots must not attempt another environment-golden bake either — fall
+    // back to direct per-runner creation the same way.
+    let mut config = config;
+    if golden_registry.is_packed_disabled() {
+        config.use_packed_artifact = false;
+        config.use_fork = false;
+    }
     let provisioning = handles.provisioning.clone();
     let preparing = PreparingGuard::enter(
         provisioning.clone(),
@@ -6075,11 +6083,11 @@ chmod +x "$dest/bin/node"
             },
             "the sudoers write must tolerate a missing directory, got: {script}"
         );
-        // The chown that hands the runner root to the account is the step
+        // The chown that hands the runtime dirs to the account is the step
         // whose loss silently broke configure on the live host; it must be
         // best-effort too, and must run before the inner script.
         assert!(
-            script.contains("chown 1001:1001 /run/user/1001 /var/lib/preloop-runner"),
+            script.contains("chown 1001:1001 /run/user/1001 2>/dev/null || true"),
             "{script}"
         );
     }

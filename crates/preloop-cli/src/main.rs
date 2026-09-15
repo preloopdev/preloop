@@ -14,6 +14,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod aenv_egress;
 mod app_manifest;
 mod dap_client;
 mod debug_session;
@@ -55,6 +56,27 @@ fn mounted_control_origin(public_url: &str) -> Option<String> {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback());
     loopback.then(|| public_url.trim_end_matches('/').to_owned())
+}
+
+/// Whether `url` addresses this host's loopback interface. Unparseable URLs
+/// are not loopback — they fail loudly at their own use site, not here.
+fn url_is_loopback(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // `host_str` keeps the brackets on IPv6 literals (`[::1]`), which never
+    // parse as an address.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 // ── Pre-push hook ──────────────────────────────────────────────────────────
@@ -416,11 +438,11 @@ impl VmBackend {
 
 /// Resolve the VM backend for this process.
 ///
-/// `PRELOOP_VM_BACKEND=smolvm|agentenv` is authoritative. Without it, AgentENV
-/// is selected on a Linux host that can actually run it — `/dev/kvm` present
-/// and an `aenv` CLI resolvable — because that is the faster substrate there
-/// (snapshot fork instead of a fresh boot); every other host keeps SmolVM,
-/// which is the only option on macOS.
+/// `PRELOOP_VM_BACKEND=smolvm|agentenv` is authoritative. Without it, SmolVM
+/// is selected everywhere: AgentENV stays available as an opt-in
+/// (`PRELOOP_VM_BACKEND=agentenv`) for KVM hosts that have an `aenv` CLI,
+/// but it is not the default until the end-to-end pool interaction is proven
+/// out (see `benchmarks/substrates/REPORT.md` §4).
 ///
 /// An unrecognized value is an error rather than a silent fallback: booting
 /// jobs on a substrate the operator did not ask for is exactly the kind of
@@ -441,23 +463,10 @@ pub(crate) fn vm_backend() -> anyhow::Result<VmBackend> {
     }
 }
 
-/// The backend chosen when the operator expressed no preference.
+/// The backend chosen when the operator expressed no preference: SmolVM on
+/// every host. AgentENV is strictly opt-in via `PRELOOP_VM_BACKEND`.
 fn default_vm_backend() -> VmBackend {
-    if cfg!(target_os = "linux")
-        && std::path::Path::new("/dev/kvm").exists()
-        && which_on_path("aenv").is_some()
-    {
-        VmBackend::Agentenv
-    } else {
-        VmBackend::Smolvm
-    }
-}
-
-/// The first `PATH` entry holding an executable named `program`.
-fn which_on_path(program: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
+    VmBackend::Smolvm
 }
 
 /// The VM provider for the resolved backend, boxed so the pool's type does
@@ -2096,6 +2105,27 @@ fn local_runner_pool_config(
         .filter(|path| linux_runner_bundle(path))
         .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
     let backend = vm_backend()?;
+    // AgentENV has no socket relay: the guest dials the runner URL over plain
+    // TCP, so a loopback URL points at the guest itself and no job can ever
+    // register. Fail here with the fix instead of timing jobs out one by one.
+    // An explicit control upstream is the exception: the guest then reaches
+    // the engine over virtio-net at that address instead.
+    if backend == VmBackend::Agentenv && control_upstream.is_none() && url_is_loopback(&server_url)
+    {
+        anyhow::bail!(
+            "PRELOOP_RUNNER_URL is loopback ({server_url}) but the AgentENV backend \
+             reaches the engine over TCP from inside the guest, where loopback is \
+             the guest itself: set PRELOOP_RUNNER_URL to a host-reachable address \
+             (e.g. http://<lan-ip>:<port>), or set PRELOOP_CONTROL_UPSTREAM"
+        );
+    }
+    // With a reachable URL in hand, reconcile the host-side exception that
+    // lets sandboxes actually dial it: the node deny-list complement plus the
+    // ordered firewall rules. No-op on drift-free hosts; loud failure
+    // otherwise (a half-open egress reads as jobs queueing forever).
+    if backend == VmBackend::Agentenv {
+        aenv_egress::ensure_engine_egress(&server_url)?;
+    }
     // AgentENV keeps packs as server-side snapshots, so there is no artifact
     // file to build or reuse: its golden is prepared straight from the base
     // image and forked per job, which is its fast path anyway.
@@ -5851,6 +5881,16 @@ mod tests {
             "http://127.0.0.1:9090",
             true
         ));
+    }
+
+    #[test]
+    fn loopback_detection_covers_names_and_addresses() {
+        assert!(url_is_loopback("http://127.0.0.1:9090"));
+        assert!(url_is_loopback("http://localhost:9090/"));
+        assert!(url_is_loopback("http://[::1]:9090"));
+        assert!(!url_is_loopback("http://192.168.8.174:9491"));
+        assert!(!url_is_loopback("https://preloop.preloop.dev"));
+        assert!(!url_is_loopback("not a url"));
     }
 
     #[test]
