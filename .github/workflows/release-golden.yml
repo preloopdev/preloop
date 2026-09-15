@@ -520,6 +520,7 @@ jobs:
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-aarch64"
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
+          attempts=3
           for attempt in $(seq 1 "$attempts"); do
             smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
             # A deleted VM's disks can stay open until its processes fully
