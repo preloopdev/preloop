@@ -33,12 +33,12 @@ jobs:
           git fetch --no-tags --depth=1 origin "$base"
           diff_files="$(git diff --name-only "$base" HEAD)"
 
-          policy_files="$(echo "$diff_files" | grep -E '^(deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' || true)"
-          non_policy_files="$(echo "$diff_files" | grep -vE '^(deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' | grep -v '^$' || true)"
+          policy_files="$(echo "$diff_files" | grep -E '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' || true)"
+          non_policy_files="$(echo "$diff_files" | grep -vE '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' | grep -v '^$' || true)"
 
           if [[ -n "$policy_files" && -n "$non_policy_files" ]]; then
             echo "ERROR: PR touches both supply-chain policy files and non-policy files." >&2
-            echo "Policy updates (deny.toml, .cargo/audit.toml, supply-chain/*) must be isolated in a dedicated PR." >&2
+            echo "Policy updates (Cargo.lock, deny.toml, .cargo/audit.toml, supply-chain/*) must be isolated in a dedicated PR." >&2
             echo "Modified policy files:" >&2
             echo "$policy_files" >&2
             echo "Modified non-policy files:" >&2
