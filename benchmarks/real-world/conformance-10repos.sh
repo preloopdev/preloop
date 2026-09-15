@@ -41,6 +41,7 @@ OFFICIAL_GOLDEN_BASE="ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-lar
 OFFICIAL_GOLDEN_NAME="preloop-ghcr.io-preloopdev-runner-images-ubuntu24-arm64-runner-large-latest-sha256-a58990d6b6f8ca5861f33d77e1d3f0732d7d14261caacd6fba8c8f707c05b40e-aarch64"
 OFFICIAL_GOLDEN_ARTIFACT="${PRELOOP_GOLDEN_ARTIFACT:-$HOME/.config/preloop/vms/${OFFICIAL_GOLDEN_NAME}.smolmachine}"
 SERVER_PID=""
+FAILED_TARGETS=""
 HOST_HOME="${HOME:-}"
 SMOLVM_HOME_DIR="${SMOLVM_HOME_DIR:-$HOST_HOME/.smolvm/1.15.0}"
 if [ "$(uname -s)" = Darwin ]; then
@@ -167,10 +168,9 @@ start_server() {
   hash -r 2>/dev/null || true
   command -v smolvm
   smolvm --version
-  if [ -z "${PRELOOP_GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
-    PRELOOP_GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"
-    export PRELOOP_GITHUB_TOKEN
-  fi
+  # Do not mint PRELOOP_GITHUB_TOKEN from `gh auth token`. These campaigns
+  # execute foreign public workflows; an operator PAT must be supplied
+  # explicitly (short-lived, narrowly scoped) or omitted.
   PRELOOP_HOME="$CAMPAIGN_HOME" \
   HOME="$SMOLVM_PROCESS_HOME" \
   SMOLVM_DATA_DIR="${SMOLVM_DATA_DIR:-$CAMPAIGN_HOME/smolvm}" \

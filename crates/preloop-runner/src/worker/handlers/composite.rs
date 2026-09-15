@@ -140,19 +140,19 @@ fn run_composite_action_inner<'a>(
             .context("composite action missing runs.steps")?;
 
         let saved_env = ctx.env.clone();
+        // Nested run steps resolve `${{ github.action_path }}` against
+        // the running composite's directory (junit's testlens setup
+        // builds `$action_path/setup-testlens.sh`; empty here produced
+        // `/setup-testlens.sh` and exit 127). Save/restore outside the
+        // inner future so `?` (file commands, output writes) cannot leak
+        // the inner directory into later steps.
+        let previous_action_status = ctx.job.github_context_value("action_status");
+        let previous_action_path = ctx.job.github_context_value("action_path");
+        ctx.job.set_github_context_value(
+            "action_path",
+            Some(serde_json::json!(action_dir.to_string_lossy())),
+        );
         let result = async {
-            let previous_action_status = ctx.job.github_context_value("action_status");
-            // Nested run steps resolve `${{ github.action_path }}` against
-            // the running composite's directory (junit's testlens setup
-            // builds `$action_path/setup-testlens.sh`; empty here produced
-            // `/setup-testlens.sh` and exit 127). Save/restore like
-            // action_status so nesting resolves innermost-first.
-            let previous_action_path = ctx.job.github_context_value("action_path");
-            ctx.job.set_github_context_value(
-                "action_path",
-                Some(serde_json::json!(action_dir.to_string_lossy())),
-            );
-
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
         let expr_ctx_for_inputs = ctx.job.build_expression_context();
@@ -624,10 +624,6 @@ fn run_composite_action_inner<'a>(
                 }
             }
         }
-            ctx.job
-                .set_github_context_value("action_status", previous_action_status);
-            ctx.job
-                .set_github_context_value("action_path", previous_action_path);
             if let Some(error) = composite_failed {
                 // The composite ran every step; its merged result is a
                 // failure, so the outer step fails too (official semantics).
@@ -637,6 +633,10 @@ fn run_composite_action_inner<'a>(
         }
         .await;
 
+        ctx.job
+            .set_github_context_value("action_status", previous_action_status);
+        ctx.job
+            .set_github_context_value("action_path", previous_action_path);
         ctx.env = saved_env;
         result
     }) // end Box::pin
@@ -1359,6 +1359,59 @@ mod action_path_tests {
                 .contains(&action_dir.to_string_lossy().into_owned()),
             "nested step must see action dir, log: {}",
             ctx.log_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn action_path_restored_after_composite_failure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().to_string_lossy().to_string();
+        let action_dir = workspace.path().join("failing-action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        let manifest = ActionManifest {
+            name: "t".to_string(),
+            description: String::new(),
+            inputs: None,
+            outputs: None,
+            runs_using: "composite".to_string(),
+            runs_main: None,
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: Some(vec![serde_json::json!({
+                "run": "exit 1",
+                "shell": "bash",
+            })]),
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+        };
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": ws}}),
+        );
+        job.workspace = Some(ws.clone());
+        job.set_github_context_value("action_path", Some(serde_json::json!("/outer/action")));
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let err = run_composite_action(
+            &manifest,
+            &action_dir,
+            &serde_json::json!({}),
+            &ws,
+            &mut ctx,
+            cancel_rx,
+        )
+        .await;
+        assert!(err.is_err(), "inner step must fail");
+        assert_eq!(
+            ctx.job.github_context_value("action_path"),
+            Some(serde_json::json!("/outer/action")),
+            "failed composite must restore the outer action_path"
         );
     }
 }

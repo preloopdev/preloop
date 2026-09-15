@@ -1952,11 +1952,18 @@ fn decode_git_request_body(
     use flate2::read::GzDecoder;
     use std::io::Read as _;
     let mut decoded = Vec::new();
-    GzDecoder::new(body)
-        .read_to_end(&mut decoded)
-        .map_err(|error| {
-            ApiError::bad_request(format!("invalid gzip Git request body: {error}"))
-        })?;
+    // Bound decoded output, not the compressed wire size. Git already caps
+    // the request at MAX_GIT_REQUEST_BYTES before this runs; without a
+    // second cap a tiny gzip expands past the same budget in RAM.
+    let mut decoder = GzDecoder::new(body).take(MAX_GIT_REQUEST_BYTES as u64 + 1);
+    decoder.read_to_end(&mut decoded).map_err(|error| {
+        ApiError::bad_request(format!("invalid gzip Git request body: {error}"))
+    })?;
+    if decoded.len() > MAX_GIT_REQUEST_BYTES {
+        return Err(ApiError::payload_too_large(
+            "gzip Git request body exceeded size limit",
+        ));
+    }
     Ok(decoded)
 }
 
@@ -2296,6 +2303,24 @@ mod auth_scoping_tests {
         );
         assert!(decode_git_request_body(&gzipped, None).unwrap() != plain);
         assert!(decode_git_request_body(b"not-gzip", Some("gzip")).is_err());
+    }
+
+    #[test]
+    fn gzipped_git_body_rejects_decoded_over_limit() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let chunk = [0u8; 64 * 1024];
+        let mut remaining = MAX_GIT_REQUEST_BYTES + 1;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            encoder.write_all(&chunk[..n]).unwrap();
+            remaining -= n;
+        }
+        let gzipped = encoder.finish().unwrap();
+        let error = decode_git_request_body(&gzipped, Some("gzip")).unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
