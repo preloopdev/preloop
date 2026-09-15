@@ -2057,11 +2057,24 @@ pub(crate) struct BuiltJobArtifacts {
 fn reusable_file_table_entry(job: &preloop_gha_protocol::JobPlan) -> Option<String> {
     let file = job.workflow_file.as_deref()?;
     let entry = match (&job.workflow_repository, &job.workflow_sha) {
-        (Some(repository), Some(sha)) => format!("{repository}/{file}@{sha}"),
-        (Some(repository), None) => format!("{repository}/{file}"),
+        (Some(repository), Some(sha)) => {
+            format!("{repository}/{}@{sha}", strip_repo_prefix(file, repository))
+        }
+        (Some(repository), None) => {
+            format!("{repository}/{}", strip_repo_prefix(file, repository))
+        }
         (None, _) => file.to_owned(),
     };
     Some(entry)
+}
+
+/// `expand.rs::normalize_reusable_path` stores remote `uses:` as
+/// `owner/repo/path.yml`, while `workflow_repository` is `owner/repo`.
+/// Concatenating them raw would emit `owner/repo/owner/repo/path.yml@sha`.
+fn strip_repo_prefix<'a>(file: &'a str, repository: &str) -> &'a str {
+    file.strip_prefix(repository)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(file)
 }
 
 /// Build one job's runner message and correlation records.
@@ -3327,7 +3340,19 @@ mod tests {
             )
         );
 
+        // `normalize_reusable_path` stores remote uses as owner/repo/path.yml.
+        job.workflow_file =
+            Some("Bnjoroge1/conformance-v2337/.github/workflows/reusable-build.yml".to_owned());
+        job.workflow_repository = Some("Bnjoroge1/conformance-v2337".to_owned());
+        job.workflow_sha = Some("eafe8a907569a41d38fed3ffd9ed8302f247a920".to_owned());
+        assert_eq!(
+            reusable_file_table_entry(&job).as_deref(),
+            Some(
+                "Bnjoroge1/conformance-v2337/.github/workflows/reusable-build.yml@eafe8a907569a41d38fed3ffd9ed8302f247a920"
+            )
+        );
         // Local callee: no repository or sha of its own, so the path stands alone.
+        job.workflow_file = Some(".github/workflows/reusable-build.yml".to_owned());
         job.workflow_repository = None;
         job.workflow_sha = None;
         assert_eq!(

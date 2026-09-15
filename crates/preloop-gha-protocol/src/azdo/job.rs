@@ -534,17 +534,32 @@ impl<'de> Deserialize<'de> for TaskStep {
 
 /// Recover the `fileTable` index a serialized step's tokens point at.
 ///
-/// Every coordinate-bearing token a step emits carries the same `file`, so the
-/// first one found wins. Absent on steps that emit no located token (empty
-/// env, empty inputs, no `continueOnError`), in which case the caller's
-/// default of 1 is both correct and lossless for a re-serialize.
+/// Script-step `inputs` omit the map-level `file` (`with_loc = false`); the
+/// id lives on nested `Value` tokens and usually on `displayNameToken`.
+/// Walk those before defaulting to 1 so a restart round-trip keeps the
+/// callee index.
 fn token_file_id(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
-    ["environment", "inputs", "continueOnError"]
-        .iter()
-        .filter_map(|key| obj.get(*key))
-        .filter_map(|token| token.get("file"))
-        .find_map(serde_json::Value::as_u64)
-        .map(|file| file as u32)
+    [
+        "displayNameToken",
+        "environment",
+        "inputs",
+        "continueOnError",
+    ]
+    .iter()
+    .filter_map(|key| obj.get(*key))
+    .find_map(file_id_in_token)
+}
+
+fn file_id_in_token(value: &serde_json::Value) -> Option<u32> {
+    match value {
+        serde_json::Value::Object(map) => map
+            .get("file")
+            .and_then(serde_json::Value::as_u64)
+            .map(|file| file as u32)
+            .or_else(|| map.values().find_map(file_id_in_token)),
+        serde_json::Value::Array(items) => items.iter().find_map(file_id_in_token),
+        _ => None,
+    }
 }
 
 /// Extract a BTreeMap<String, String> from either a plain JSON object or a
@@ -950,6 +965,43 @@ mod tests {
             error.to_string().contains("4294967296"),
             "error must name the offending value: {error}"
         );
+    }
+
+    #[test]
+    fn script_step_without_env_keeps_callee_file_id_on_round_trip() {
+        let step = TaskStep {
+            id: uuid::Uuid::nil(),
+            name: None,
+            context_name: None,
+            display_name: None,
+            display_name_token: None,
+            condition: None,
+            script: Some("echo hi".to_owned()),
+            shell: None,
+            reference: Some(TaskReference {
+                id: None,
+                name: None,
+                path: None,
+                version: None,
+                reference_type: Some("script".to_owned()),
+            }),
+            inputs: BTreeMap::new(),
+            env: BTreeMap::new(),
+            continue_on_error: None,
+            working_directory: None,
+            timeout_in_minutes: None,
+            file_id: 2,
+        };
+        let wire = serde_json::to_value(&step).unwrap();
+        assert!(wire.get("environment").is_none());
+        assert!(wire["continueOnError"].is_null());
+        assert!(wire["inputs"].get("file").is_none());
+        assert_eq!(wire["inputs"]["map"][0]["Value"]["file"], 2);
+
+        let decoded: TaskStep = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.file_id, 2);
+        let again = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(again["inputs"]["map"][0]["Value"]["file"], 2);
     }
 
     /// The snapshot credential must never appear in Debug output of the job

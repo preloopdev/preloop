@@ -169,19 +169,21 @@ with `type` + one of `lit|expr|map|seq|bool|num`):
 | type 5 (`bool`) with coordinates | 1 |
 
 `displayNameToken`: **43/43 are `type: 0`** with `file: 1` and a real line. We
-emit `type: 1` (`job_builder.rs:884`). That is an independent fidelity bug,
-discovered while gathering evidence for this ADR, and it is *not* fixed by spans.
+used to emit `type: 1` (`job_builder.rs`). That was an independent fidelity
+bug, discovered while gathering evidence for this ADR; it is fixed in §6.4
+and does not need spans.
 
-### 1.5 fileTable
+### 1.5 fileTable *(pre-fix diagnosis; corrected in §6.4)*
 
 - Field: `azdo/job.rs:59-61`, `#[serde(rename="fileTable", default)] pub file_table: Vec<String>`.
 - Serialized unconditionally: `azdo/azdo_tests.rs:269` (`object.insert("fileTable", json!(job.file_table))`) mirrors the production serializer.
-- Populated **only** at `runs.rs:2116` — `agent_msg.file_table = vec![workflow_path.to_owned()]`, where `workflow_path` is the `&str` parameter of `build_job_artifacts` (`runs.rs:1886-1899`, param at 1890).
-- Consequence: for a reusable-workflow callee job, `JobPlan.workflow_file`
-  (set at `expand.rs:1103`) is **ignored**; every token in that job claims
+- **Before the §6.4 fix**, populated **only** at `runs.rs` —
+  `agent_msg.file_table = vec![workflow_path.to_owned()]`, where `workflow_path` is the `&str` parameter of `build_job_artifacts`.
+- Consequence *then*: for a reusable-workflow callee job, `JobPlan.workflow_file`
+  (set at `expand.rs:1103`) was **ignored**; every token in that job claimed
   `file: 1` = the caller's path. Real GitHub indexes callee-origin values into
-  additional fileTable slots. This is the "fileTable indices matter" case in the
-  brief, and it is already broken independent of spans.
+  additional fileTable slots. Production now appends a callee entry and
+  `job_file_id` indexes it; this section is the historical finding.
 
 ### 1.6 Errors
 
@@ -236,12 +238,13 @@ Facts below are from docs.rs as read on 2026-09-12, not from memory.
 
 **Why not `marked-yaml`.** Its documented constraints: top level must be a
 mapping or sequence (fine for workflows), mapping keys must be scalars (fine),
-and **"Aliases and anchors MAY NOT be used."** No workflow in this repo uses
-anchors (`grep` for `&anchor` / `*alias` / `<<:` over `fixtures/workflows` and
-`.github/workflows` — no matches), and GitHub Actions itself rejects them, but
-`serde_yaml` accepts them today and "drop-in workflows" is a stated project goal
-(`AGENTS.md`). Trading a documented capability for spans is the wrong direction
-when `serde-saphyr` gives both.
+and **"Aliases and anchors MAY NOT be used."** GitHub Actions *does* accept
+YAML anchors and aliases. No workflow in this repo uses them (`grep` for
+`&anchor` / `*alias` / `<<:` over `fixtures/workflows` and `.github/workflows`
+— no matches), but `serde_yaml` accepts them today and "drop-in workflows" is
+a stated project goal (`AGENTS.md`). A valid GitHub Actions workflow that
+uses anchors would be rejected by `marked-yaml`. Trading that for spans is
+the wrong direction when `serde-saphyr` gives both.
 
 **Why `serde-saphyr`.**
 
@@ -404,11 +407,15 @@ pub struct SpanArena {
    deserializer immediately interns each location into the arena and stores only
    a `NodeId` on the model. Model fields therefore grow by **4 bytes**, not by
    two `Location`s.
-3. **One `origin: Option<NodeId>` on `StepPlan` and `JobPlan`.** Add
-   `StepPlan.origin: Option<NodeId>` (`protocol/lib.rs:546-576`, `#[serde(default,
-   skip_serializing_if="Option::is_none")]`) and `JobPlan.origin` similarly. Set
-   in `step_plan` (`expand.rs:1196-1218`) and `job_plan_from_job`
-   (`expand.rs:518-559`).
+3. **One `origin: Option<NodeId>` on `StepPlan` and `JobPlan`, in-memory only.**
+   Add `StepPlan.origin: Option<NodeId>` (`protocol/lib.rs:546-576`,
+   `#[serde(skip)]`) and `JobPlan.origin` similarly. Set in `step_plan`
+   (`expand.rs:1196-1218`) and `job_plan_from_job` (`expand.rs:518-559`).
+   **Do not serialize `origin`.** `NodeId` indexes the per-workflow
+   `SpanArena.spans`. Plans already round-trip through golden fixtures and
+   `RunRecord::caller_plans` without an arena; a restored id cannot resolve
+   and must not be persisted until the arena (and reusable-workflow remap)
+   is persisted with it.
 
 Judged on the same four axes:
 
@@ -432,12 +439,15 @@ Judged on the same four axes:
 - **Reusable-workflow survival:** each parsed file gets its own arena. Inlining
   (`expand_reusable_call`, `expand.rs:1048-1138`) must merge the callee arena
   into the caller's, remapping `FileId` and offsetting `NodeId`s — a mechanical
-  `Vec` concat plus `+base` on the ids it rewrote. Because `FileId` **is** the
-  wire `fileTable` index, this is also exactly the data structure phase 3 needs
-  to fix `runs.rs:2116`. Values with no source (the conjoined `if:` from
-  `merge_job_conditions`, `expand.rs:1152-1162`; job defaults folded into a step
-  at `expand.rs:1184-1195`) get `origin: None` or the *defaults'* node — the
-  representation can express both, which A and B cannot without extra rules.
+  `Vec` concat plus `+base` on the ids it rewrote. Internal `FileId` is
+  **zero-based** (`files[0]`). The runner's `fileTable` index is **one-based**
+  (`GetFileId` returns `count + 1`). Phase 3 serializes as `Span.file.0 + 1`
+  and must test caller=`1` / callee=`2` after inlining. Values with no source
+  (the conjoined `if:` from `merge_job_conditions`, `expand.rs:1152-1162`;
+  job defaults folded into a step at `expand.rs:1184-1195`) get `origin: None`
+  or the *defaults'* node — the representation can express both, which A and B
+  cannot without extra rules. The synthetic `file: 0` we used to emit is a
+  separate pre-fix bug (§6.4), not this conversion.
 
 **Decision: Option C.**
 
@@ -555,7 +565,8 @@ Input, `.github/workflows/pr.yml`:
    expression-crate offset work noted in §1.6; until then the span points at the
    scalar start, which is already actionable.
 
-**User-visible output** (`preloop lint .github/workflows/pr.yml`):
+**User-visible output** (`preloop lint .github/workflows/pr.yml`), Phase 1
+(scalar start — the whole `run:` value):
 
 ```
 error[template-injection]: untrusted `github.event.pull_request.title` is
@@ -563,7 +574,7 @@ interpolated into a `run:` script
   --> .github/workflows/pr.yml:10:14
    |
 10 |         run: echo "Hello ${{ github.event.pull_request.title }}"
-   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expands to attacker-controlled text
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: workflow trigger `pull_request_target` (line 1) runs with the base
            repository's secrets and a write-scoped GITHUB_TOKEN
@@ -572,6 +583,9 @@ interpolated into a `run:` script
 
 1 error
 ```
+
+After expression-internal offsets land, the caret can shrink to just
+`${{ github.event.pull_request.title }}`. That is not Phase 1.
 
 Exit non-zero, so it drops into `just test-ci` next to the existing `zizmor`
 recipe (`justfile:52-53`) — the difference being that this one runs on the user's
@@ -602,15 +616,16 @@ own workflows through preloop's parser, with no Python/`uvx` dependency.
 
 1. Changing `timeoutInMinutes` from `number` to `object` is a **type change**,
    which `schema_drops_fields` does flag (`compare.rs:393`, asserted at
-   `compare.rs:1378-1379`) — but only for endpoints whose key contains
-   `"/broker/{n}/acquirejob"` (`compare.rs:481`, gate at 563-569). The
-   endpoint key construction is verified at `compare.rs:193-199`:
-   `format!("{method} {}", normalize_path(path))`. The golden path
-   `.runner-watch/golden/v2.336.0/103-composite-nested-post/flows.jsonl:23`
-   is `/190/acquirejob`, which normalizes to `POST /{n}/acquirejob`
-   (`compare.rs:66-90`), so it does **not** contain the `/broker/` prefix.
-   Therefore the default response-schema gate does not fire for this golden
-   endpoint. This is a gate-coverage bug, not an unresolved question.
+   `compare.rs:1378-1379`) — and **`just conform` does see it**.
+   `replay_flows_to_preloop_inner` runs the golden path through
+   `normalize_request_path` (`main.rs:2810-2867`), which prefixes
+   `/broker` onto any path ending in `/acquirejob`. The rewritten capture
+   is what `compare::analyze` / `group_flows` then keys as
+   `POST /broker/{n}/acquirejob`. The old `/broker/{n}/acquirejob`
+   substring therefore **already matched the live conform path**. A unit
+   test that feeds raw `/190/acquirejob` dirs bypasses that rewrite; gating
+   on `acquirejob` covers both shapes. Coordinate *value* changes remain
+   schema-invisible; token *type* changes on acquirejob are not free.
 2. Anyone running `runner-watch conform --value-gate-strict` (`main.rs:141`,
    `1881-1890`) *would* see every coordinate change. That mode is not part of
    `just conform` today.
@@ -643,13 +658,14 @@ presence) should track the real GitHub shape evidenced in §1.4.
 
 The three uncertainties called out in the original handoff are resolved:
 
-- **Schema-gate matching:** resolved from source, then **fixed** (§6.4).
-  `group_flows` constructs `METHOD <normalized path>` (`compare.rs:193-199`);
-  the golden `/190/acquirejob`
-  (`.runner-watch/golden/v2.336.0/103-composite-nested-post/flows.jsonl:23`)
-  becomes `POST /{n}/acquirejob`, which never contained the old
-  `/broker/{n}/acquirejob` substring, so the only schema gate in the default
-  policy was inert on every committed golden.
+- **Schema-gate matching:** two paths. `group_flows` keys
+  `METHOD <normalize_path>` (`compare.rs:193-199`). Raw goldens
+  `/190/acquirejob` become `POST /{n}/acquirejob` and never contained
+  `/broker/`. Live `conform` replay prefixes `/broker` first
+  (`normalize_request_path`), so the old substring **did** fire there.
+  The default gate now matches `acquirejob` so both shapes are covered
+  (§6.4). Token *type* changes on acquirejob therefore have a default
+  conform cost; coordinate *value* changes still do not.
 - **`serde-saphyr` model boundary:** the isolated copy of the complete
   `preloop-gha-parser` compiled with a direct `serde-saphyr` workflow/action
   frontend and its parser library tests passed: **154 passed, 0 failed**.
@@ -709,6 +725,8 @@ infrastructure, so they were fixed directly rather than folded into phase 3.
    modelled by `job_builder::job_file_id` and `TaskStep.file_id`; a
    reusable-call *placeholder* stays on 1 because its `workflow_file` names the
    callee it is about, not the file its own tokens came from.
-3. **The conformance response-schema gate was dead.** Fixed as described above;
-   the regression test asserts a dropped acquirejob field is caught on the
-   golden path shape, and fails against the old substring with `failures: []`.
+3. **The response-schema gate missed un-rewritten acquirejob paths.** Raw
+   goldens are `POST /{n}/acquirejob`; live conform rewrite is
+   `POST /broker/{n}/acquirejob`. The old `/broker/` substring only covered
+   the latter. Now gated on `acquirejob`. The regression test asserts a
+   dropped field is caught on the raw golden path shape.

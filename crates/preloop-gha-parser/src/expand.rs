@@ -70,13 +70,13 @@ fn defaults_run_token(run: &crate::DefaultsRun) -> Value {
     if let Some(shell) = &run.shell {
         map.push(serde_json::json!({
             "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "shell" },
-            "Value": crate::job_builder::template_token(&Value::String(shell.clone()))
+            "Value": crate::job_builder::template_token(&Value::String(shell.clone()), 1)
         }));
     }
     if let Some(wd) = &run.working_directory {
         map.push(serde_json::json!({
             "Key": { "type": 0, "file": 1, "line": 1, "col": 1, "lit": "working-directory" },
-            "Value": crate::job_builder::template_token(&Value::String(wd.clone()))
+            "Value": crate::job_builder::template_token(&Value::String(wd.clone()), 1)
         }));
     }
     serde_json::json!({

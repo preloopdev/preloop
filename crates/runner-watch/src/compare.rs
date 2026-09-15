@@ -471,10 +471,11 @@ pub struct GatePolicy {
     /// Endpoint substrings whose response-schema removals are gated.
     ///
     /// Matched against the normalized endpoint key built by `group_flows`
-    /// (`"{method} {normalize_path(path)}"`). Golden acquirejob paths are
-    /// `/{pool}/acquirejob`, which normalize to `POST /{n}/acquirejob` — a
-    /// `/broker/`-qualified substring never matches them and silently
-    /// disables the only schema gate in the default policy.
+    /// (`"{method} {normalize_path(path)}"`). Raw golden acquirejob paths are
+    /// `/{pool}/acquirejob` → `POST /{n}/acquirejob`. Live `conform` replay
+    /// first prefixes `/broker` (`normalize_request_path`), so the same
+    /// endpoint becomes `POST /broker/{n}/acquirejob`. Gating on `acquirejob`
+    /// matches both shapes.
     pub response_schema_gate: Vec<String>,
     /// Value-gate mode (finding #4).
     pub value_gate: ValueGate,
@@ -1421,10 +1422,10 @@ mod tests {
         assert!(fails.iter().any(|f| f.kind == FailureKind::ResponseSchema));
     }
 
-    /// The committed goldens record acquirejob as `/<pool>/acquirejob`, which
-    /// normalizes to `POST /{n}/acquirejob` — not the `/broker/`-qualified
-    /// form the helper above uses. Gating on a `/broker/` substring therefore
-    /// matched only synthetic captures and left every real golden ungated.
+    /// Raw goldens record `/<pool>/acquirejob` (`POST /{n}/acquirejob` after
+    /// `normalize_path`). `conform` replay rewrites that to `/broker/{n}/…`
+    /// first, so a `/broker/` substring *does* fire there — but `analyze` on
+    /// un-rewritten captures would miss it. Gating on `acquirejob` covers both.
     #[test]
     fn gate_catches_field_drop_on_golden_shaped_acquirejob_path() {
         let golden_flow = |response: Value| {

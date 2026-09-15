@@ -649,7 +649,7 @@ pub fn build_agent_job_message_with_normalized_context(
                 name: resolve_environment_name(name, &job_expr_context, &plan.name)?,
                 // The URL is evaluated by the runner after the job's steps
                 // produce it, so it ships as an unevaluated template token.
-                url: map.get("url").map(template_token),
+                url: map.get("url").map(|value| template_token(value, file_id)),
             }),
             None => None,
         },
