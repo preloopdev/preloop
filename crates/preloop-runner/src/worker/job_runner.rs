@@ -32,8 +32,9 @@ use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
 /// AzDO-specific reporting state threaded into [`ReportingContext`] when
-/// `--via azdo` is active.  Contains only what the timeline and log endpoints
-/// need; `pool_id` is intentionally absent (not required for those URLs).
+/// `--via azdo` is active.  Contains only what the timeline and log
+/// endpoints need; `pool_id` is intentionally absent (not required for those URLs).
+#[derive(Clone)]
 pub struct AzdoReportingContext {
     pub client: AzdoClient,
     pub timeline_id: String,
@@ -116,6 +117,7 @@ pub(crate) async fn refresh_worker_oauth_token() -> Option<(String, Option<std::
 }
 
 /// Shared reporting context for step updates and log uploads.
+#[derive(Clone)]
 pub struct ReportingContext {
     pub results: ResultsClient,
     pub run_service: RunServiceClient,
@@ -662,7 +664,7 @@ pub async fn run_job(
             &workspace,
             job_cancel_rx,
             queue.clone(),
-            reporting.as_deref(),
+            reporting.clone(),
             job_container_spec.as_ref(),
             &service_specs,
             debug_client.as_ref(),

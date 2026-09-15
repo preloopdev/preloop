@@ -7,6 +7,8 @@ use std::sync::{Arc, RwLock};
 use crate::worker::execution_types::Annotation;
 use crate::worker::matchers::MatcherRegistry;
 
+pub(crate) type SharedSteps = Arc<RwLock<IndexMap<String, StepResult>>>;
+
 /// The top-level job context holding all sub-contexts and accumulated state.
 #[derive(Clone)]
 pub struct JobContext {
@@ -22,6 +24,10 @@ pub struct JobContext {
     pub extra_path: Vec<String>,
     /// Per-step results: step_id → StepResult.
     pub steps: IndexMap<String, StepResult>,
+    /// Live global steps scope read by background execution contexts.
+    /// Background writes remain private in `steps` until a control step
+    /// flushes them.
+    pub(crate) live_steps: Option<SharedSteps>,
     /// Secret values to mask in logs.
     pub masks: HashSet<String>,
     /// Shared read-view of masks for live-log callbacks that need to see
@@ -88,7 +94,7 @@ impl std::fmt::Debug for JobContext {
 }
 
 /// v2.336.0 (#4527): Artifact subject declared via $GITHUB_ARTIFACTS.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactSubject {
     pub name: String,
     pub digest: String,
@@ -96,7 +102,7 @@ pub struct ArtifactSubject {
 }
 
 /// Result of a completed step.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepResult {
     pub outcome: String,
     pub conclusion: String,
@@ -160,6 +166,7 @@ impl JobContext {
             env: HashMap::new(),
             extra_path: Vec::new(),
             steps: IndexMap::new(),
+            live_steps: None,
             masks: masks.clone(),
             live_masks: Arc::new(RwLock::new(masks)),
             outputs: HashMap::new(),
@@ -181,6 +188,10 @@ impl JobContext {
             node20_warning_emitted: false,
             artifact_subjects: IndexMap::new(),
         }
+    }
+
+    pub(crate) fn attach_live_steps(&mut self, live_steps: SharedSteps) {
+        self.live_steps = Some(live_steps);
     }
 
     /// Record an action that was upgraded from node20 to node24 by migration policy.
@@ -269,9 +280,16 @@ impl JobContext {
         } else {
             &[]
         };
+        let live_masks = self
+            .live_masks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         preloop_gha_protocol::masking::mask_secrets(
             input,
-            self.masks.iter().map(String::as_str),
+            self.masks
+                .iter()
+                .chain(live_masks.iter())
+                .map(String::as_str),
             exclude,
         )
     }
@@ -414,28 +432,35 @@ impl JobContext {
 
         // steps context
         let mut steps_map = serde_json::Map::new();
-        for (id, result) in &self.steps {
-            let mut step_val = serde_json::Map::new();
-            // GitHub exposes these context fields as lowercase strings even
-            // though the runner's internal result model uses title case.
-            step_val.insert(
-                "outcome".to_string(),
-                serde_json::json!(result.outcome.to_ascii_lowercase()),
-            );
-            step_val.insert(
-                "conclusion".to_string(),
-                serde_json::json!(result.conclusion.to_ascii_lowercase()),
-            );
-            let mut outputs_map = serde_json::Map::new();
-            for (k, v) in &result.outputs {
-                outputs_map.insert(k.clone(), serde_json::json!(v));
+        let mut add_steps = |steps: &IndexMap<String, StepResult>| {
+            for (id, result) in steps {
+                let mut step_val = serde_json::Map::new();
+                step_val.insert(
+                    "outcome".to_string(),
+                    serde_json::json!(result.outcome.to_ascii_lowercase()),
+                );
+                step_val.insert(
+                    "conclusion".to_string(),
+                    serde_json::json!(result.conclusion.to_ascii_lowercase()),
+                );
+                let mut outputs_map = serde_json::Map::new();
+                for (k, v) in &result.outputs {
+                    outputs_map.insert(k.clone(), serde_json::json!(v));
+                }
+                step_val.insert(
+                    "outputs".to_string(),
+                    serde_json::Value::Object(outputs_map),
+                );
+                steps_map.insert(id.clone(), serde_json::Value::Object(step_val));
             }
-            step_val.insert(
-                "outputs".to_string(),
-                serde_json::Value::Object(outputs_map),
-            );
-            steps_map.insert(id.clone(), serde_json::Value::Object(step_val));
+        };
+        if let Some(live_steps) = &self.live_steps {
+            let live_steps = live_steps
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            add_steps(&live_steps);
         }
+        add_steps(&self.steps);
         ctx.insert("steps", serde_json::Value::Object(steps_map));
 
         // job context — P1.12: add container and services (empty objects when not containerized)
