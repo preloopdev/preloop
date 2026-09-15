@@ -404,7 +404,6 @@ fn schema_drops_fields(left: &Value, right: &Value) -> bool {
             }
         }),
         (Value::Object(_), _) => true,
-        (Value::Array(_), Value::Array(r)) if r.is_empty() => false,
         (Value::Array(l), Value::Array(r)) => l
             .iter()
             .any(|lv| !r.iter().any(|rv| !schema_drops_fields(lv, rv))),
@@ -1406,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_drops_accepts_union_variants_and_empty_arrays() {
+    fn schema_drops_accepts_union_variants_but_rejects_empty_candidate_arrays() {
         let expression = to_schema_value(&serde_json::json!({
             "type": 3,
             "expr": "format('x')"
@@ -1419,7 +1418,7 @@ mod tests {
 
         let reference = to_schema_value(&serde_json::json!({"items": [{"name": "x"}]}));
         let candidate = to_schema_value(&serde_json::json!({"items": []}));
-        assert!(!schema_drops_fields(&reference, &candidate));
+        assert!(schema_drops_fields(&reference, &candidate));
         let official_null = to_schema_value(&serde_json::json!({"matrix": null}));
         let preloop_empty_token = to_schema_value(&serde_json::json!({
             "matrix": {"d": [], "t": "number"}

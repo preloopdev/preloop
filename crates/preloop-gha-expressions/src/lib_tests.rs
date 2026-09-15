@@ -179,6 +179,7 @@ fn evaluates_json_join_and_comparisons() {
     assert!(validate_expression("case(true, 'a')").is_err());
     assert!(validate_expression("case(true, 'a', false, 'b')").is_err());
     assert!(validate_expression("case(github.ref == 'refs/heads/dev', format('{0}-{1}', github.workflow, github.run_id), 'default')").is_ok());
+
     assert_eq!(
         eval_expression("fromJson('[\"a\",\"b\"]')", &context).unwrap(),
         json!(["a", "b"])
@@ -215,6 +216,32 @@ fn evaluates_json_join_and_comparisons() {
         eval_expression("hashFiles('Cargo.toml')", &context).unwrap(),
         Value::String(String::new())
     );
+}
+#[test]
+fn function_arity_is_enforced_during_validation_and_evaluation() {
+    for expression in [
+        "always(true)",
+        "cancelled('job')",
+        "contains('only-one')",
+        "fromJSON()",
+        "join('a', '-', 'extra')",
+        "hashFiles()",
+    ] {
+        assert!(
+            matches!(
+                validate_expression(expression),
+                Err(ExpressionError::InvalidFunctionArity { .. })
+            ),
+            "validation accepted {expression}"
+        );
+        assert!(
+            matches!(
+                eval_expression(expression, &Context::default()),
+                Err(ExpressionError::InvalidFunctionArity { .. })
+            ),
+            "evaluation accepted {expression}"
+        );
+    }
 }
 
 #[test]

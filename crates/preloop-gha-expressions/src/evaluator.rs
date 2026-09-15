@@ -6,8 +6,43 @@ use super::{
     ast::{BinaryOp, Expr},
     conditions::is_truthy,
     context::Context,
-    ExpressionError,
+    ContextFunctionCall, ExpressionError, ExpressionReferences,
 };
+
+fn function_arity(name: &str) -> Option<(usize, usize)> {
+    match name {
+        "always" | "cancelled" => Some((0, 0)),
+        // Job-level status functions accept dependency names. Step-level
+        // validation narrows these to zero arguments from the schema context.
+        "success" | "failure" => Some((0, 255)),
+        "contains" | "startswith" | "endswith" => Some((2, 2)),
+        "format" => Some((1, 255)),
+        "fromjson" | "tojson" => Some((1, 1)),
+        "join" => Some((1, 2)),
+        "hashfiles" => Some((1, 255)),
+        "case" => Some((3, 255)),
+        _ => None,
+    }
+}
+
+fn validate_function_arity(name: &str, actual: usize) -> Result<(), ExpressionError> {
+    let lower = name.to_ascii_lowercase();
+    let Some((min, max)) = function_arity(&lower) else {
+        return Err(ExpressionError::UnknownFunction(name.to_owned()));
+    };
+    if lower == "case" && actual.is_multiple_of(2) {
+        return Err(ExpressionError::EvenCaseParameters);
+    }
+    if !(min..=max).contains(&actual) {
+        return Err(ExpressionError::InvalidFunctionArity {
+            name: name.to_owned(),
+            min,
+            max,
+            actual,
+        });
+    }
+    Ok(())
+}
 
 pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError> {
     match expr {
@@ -24,56 +59,49 @@ pub(super) fn validate_function_calls(expr: &Expr) -> Result<(), ExpressionError
             validate_function_calls(right)
         }
         Expr::Call { name, args } => {
-            if !matches!(
-                name.to_ascii_lowercase().as_str(),
-                "always"
-                    | "success"
-                    | "failure"
-                    | "cancelled"
-                    | "contains"
-                    | "startswith"
-                    | "endswith"
-                    | "format"
-                    | "fromjson"
-                    | "join"
-                    | "hashfiles"
-                    | "tojson"
-                    | "case"
-            ) {
-                return Err(ExpressionError::UnknownFunction(name.clone()));
-            }
-            if name.eq_ignore_ascii_case("case") && (args.len() < 3 || args.len().is_multiple_of(2))
-            {
-                return Err(ExpressionError::EvenCaseParameters);
-            }
+            validate_function_arity(name, args.len())?;
             args.iter().try_for_each(validate_function_calls)
         }
     }
 }
 
-/// Collect all top-level context names referenced in an expression AST.
-pub(super) fn collect_contexts_from_expr(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+/// Collect top-level data contexts and context-sensitive function calls.
+pub(super) fn collect_expression_references_from_expr(
+    expr: &Expr,
+    references: &mut ExpressionReferences,
+) {
     match expr {
         Expr::Path(path) => {
             if let Some(first) = path.first() {
-                out.insert(first.to_ascii_lowercase());
+                references.contexts.insert(first.to_ascii_lowercase());
             }
         }
         Expr::Literal(_) => {}
         Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
-            collect_contexts_from_expr(inner, out);
+            collect_expression_references_from_expr(inner, references);
         }
         Expr::Index { base, key } => {
-            collect_contexts_from_expr(base, out);
-            collect_contexts_from_expr(key, out);
+            collect_expression_references_from_expr(base, references);
+            collect_expression_references_from_expr(key, references);
         }
         Expr::Binary { left, right, .. } => {
-            collect_contexts_from_expr(left, out);
-            collect_contexts_from_expr(right, out);
+            collect_expression_references_from_expr(left, references);
+            collect_expression_references_from_expr(right, references);
         }
-        Expr::Call { args, .. } => {
+        Expr::Call { name, args } => {
+            let lower = name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "always" | "success" | "failure" | "cancelled" | "hashfiles"
+            ) {
+                references.contexts.insert(lower.clone());
+                references.functions.push(ContextFunctionCall {
+                    name: lower,
+                    argument_count: args.len(),
+                });
+            }
             for arg in args {
-                collect_contexts_from_expr(arg, out);
+                collect_expression_references_from_expr(arg, references);
             }
         }
     }
@@ -352,11 +380,9 @@ fn eval_call(
     budget: &mut EvalBudget,
 ) -> Result<Value, ExpressionError> {
     let lower = name.to_ascii_lowercase();
+    validate_function_arity(name, args.len())?;
     // case() uses lazy evaluation — handle before eager collect
     if lower == "case" {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(ExpressionError::EvenCaseParameters);
-        }
         // Evaluate predicate-result pairs lazily
         for i in (0..args.len() - 1).step_by(2) {
             let predicate = eval(&args[i], context, budget)?;

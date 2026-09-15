@@ -167,6 +167,32 @@ pub fn validate_expressions_in_string(
     Ok(())
 }
 
+fn context_spec_name(spec: &str) -> &str {
+    spec.split_once('(').map_or(spec, |(name, _)| name)
+}
+
+fn context_spec_arity(spec: &str) -> Result<Option<(usize, usize)>, String> {
+    let Some((_, bounds)) = spec.split_once('(') else {
+        return Ok(None);
+    };
+    let bounds = bounds
+        .strip_suffix(')')
+        .ok_or_else(|| format!("invalid context function contract `{spec}`"))?;
+    let (min, max) = bounds
+        .split_once(',')
+        .ok_or_else(|| format!("invalid context function contract `{spec}`"))?;
+    let min = min
+        .parse::<usize>()
+        .map_err(|_| format!("invalid context function contract `{spec}`"))?;
+    let max = if max.eq_ignore_ascii_case("MAX") {
+        usize::MAX
+    } else {
+        max.parse::<usize>()
+            .map_err(|_| format!("invalid context function contract `{spec}`"))?
+    };
+    Ok(Some((min, max)))
+}
+
 fn validate_contexts(
     expr: &str,
     allowed_contexts: Option<&[&str]>,
@@ -175,10 +201,13 @@ fn validate_contexts(
     let Some(allowed) = allowed_contexts else {
         return Ok(());
     };
-    let contexts = preloop_gha_expressions::collect_contexts(expr)
+    let references = preloop_gha_expressions::collect_expression_references(expr)
         .map_err(|e| format!("invalid expression in `{input}`: {e}"))?;
-    for ctx in &contexts {
-        if !allowed.iter().any(|a| a.eq_ignore_ascii_case(ctx)) {
+    for ctx in &references.contexts {
+        if !allowed
+            .iter()
+            .any(|spec| context_spec_name(spec).eq_ignore_ascii_case(ctx))
+        {
             return Err(format!(
                 "context \"{ctx}\" is not allowed here. available contexts are {}.",
                 allowed
@@ -187,6 +216,23 @@ fn validate_contexts(
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+    }
+    for function in references.functions {
+        let Some(spec) = allowed
+            .iter()
+            .find(|spec| context_spec_name(spec).eq_ignore_ascii_case(&function.name))
+        else {
+            continue;
+        };
+        if let Some((min, max)) = context_spec_arity(spec)? {
+            if !(min..=max).contains(&function.argument_count) {
+                return Err(format!(
+                    "function \"{}\" with {} argument(s) is not allowed here; \
+                     allowed contract is \"{spec}\".",
+                    function.name, function.argument_count
+                ));
+            }
         }
     }
     Ok(())
@@ -243,22 +289,26 @@ const CTX_JOB_IF: &[&str] = &[
     "inputs",
     "vars",
     "needs",
-    "always",
-    "failure",
-    "cancelled",
-    "success",
+    "always(0,0)",
+    "failure(0,MAX)",
+    "cancelled(0,0)",
+    "success(0,MAX)",
 ];
 const CTX_JOB_RUNS_ON: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
-const CTX_STRATEGY: &[&str] = &["github", "inputs", "vars", "needs", "matrix", "strategy"];
+const CTX_STRATEGY: &[&str] = &["github", "inputs", "vars", "needs"];
 const CTX_JOB_ENV: &[&str] = &[
-    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "env",
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets",
 ];
 const CTX_JOB_CONCURRENCY: &[&str] = &["github", "inputs", "vars", "needs", "strategy", "matrix"];
+const CTX_JOB_DEFAULTS_RUN: &[&str] = &[
+    "github", "inputs", "vars", "strategy", "matrix", "needs", "env",
+];
 const CTX_NO_EXPRESSIONS: &[&str] = &[];
 const CTX_JOB_CONTAINER: &[&str] = &["github", "inputs", "needs", "strategy", "matrix", "vars"];
-const CTX_CONTAINER_CREDENTIALS: &[&str] = &["secrets", "env", "github", "vars"];
+const CTX_CONTAINER_CREDENTIALS: &[&str] = &["github", "inputs", "vars", "secrets", "env"];
 const CTX_RUNNER: &[&str] = &[
-    "github", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner", "env", "vars",
+    "github", "inputs", "vars", "needs", "strategy", "matrix", "secrets", "steps", "job", "runner",
+    "env",
 ];
 const CTX_STEP_IF: &[&str] = &[
     "github",
@@ -267,19 +317,31 @@ const CTX_STEP_IF: &[&str] = &[
     "needs",
     "strategy",
     "matrix",
-    "secrets",
     "steps",
     "job",
     "runner",
     "env",
-    "always",
-    "failure",
-    "cancelled",
-    "success",
-    "hashfiles",
+    "always(0,0)",
+    "failure(0,0)",
+    "cancelled(0,0)",
+    "success(0,0)",
+    "hashFiles(1,255)",
 ];
+// `steps` is intentionally omitted. Step plans currently resolve numeric
+// timeouts before any step has run, so advertising a runtime-only value would
+// validate and then resolve it to null.
 const CTX_STEP_TIMEOUT: &[&str] = &[
-    "github", "inputs", "vars", "needs", "strategy", "matrix", "env",
+    "github",
+    "inputs",
+    "vars",
+    "needs",
+    "strategy",
+    "matrix",
+    "secrets",
+    "job",
+    "runner",
+    "env",
+    "hashFiles(1,255)",
 ];
 const CTX_STEP_ENV: &[&str] = &[
     "github",
@@ -293,8 +355,9 @@ const CTX_STEP_ENV: &[&str] = &[
     "job",
     "runner",
     "env",
-    "hashfiles",
+    "hashFiles(1,255)",
 ];
+const CTX_STEP_CONTINUE_ON_ERROR: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_WITH: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_RUN: &[&str] = CTX_STEP_ENV;
 const CTX_STEP_NAME: &[&str] = CTX_STEP_ENV;
@@ -322,6 +385,7 @@ fn validate_container_expressions(value: &Value) -> Result<(), String> {
 fn validate_run_defaults(
     defaults: &crate::models::JobDefaults,
     label: &str,
+    allowed_contexts: &[&str],
 ) -> Result<(), ParserError> {
     let Some(run) = &defaults.run else {
         return Ok(());
@@ -331,7 +395,7 @@ fn validate_run_defaults(
         ("working-directory", run.working_directory.as_ref()),
     ] {
         if let Some(value) = value {
-            validate_expressions_in_string(value, false, Some(CTX_NO_EXPRESSIONS)).map_err(
+            validate_expressions_in_string(value, false, Some(allowed_contexts)).map_err(
                 |error| ParserError::InvalidExpression(format!("{label}.run.{field}: {error}")),
             )?;
         }
@@ -348,7 +412,7 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
     validate_env_expressions(&workflow.env, Some(CTX_WORKFLOW_ENV))
         .map_err(ParserError::InvalidExpression)?;
     if let Some(defaults) = &workflow.defaults {
-        validate_run_defaults(defaults, "workflow defaults")?;
+        validate_run_defaults(defaults, "workflow defaults", CTX_NO_EXPRESSIONS)?;
     }
 
     if let Some(concurrency) = &workflow.concurrency {
@@ -451,7 +515,11 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
             }
         }
         if let Some(defaults) = &job.defaults {
-            validate_run_defaults(defaults, &format!("job `{job_id}` defaults"))?;
+            validate_run_defaults(
+                defaults,
+                &format!("job `{job_id}` defaults"),
+                CTX_JOB_DEFAULTS_RUN,
+            )?;
         }
         for (output_name, output) in &job.outputs {
             validate_value_expressions(output, Some(CTX_RUNNER)).map_err(|e| {
@@ -482,13 +550,12 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
             if let Some(crate::models::DeferredBool::Expression(expression)) =
                 &step.continue_on_error
             {
-                validate_expressions_in_string(expression, false, Some(CTX_STEP_IF)).map_err(
-                    |e| {
+                validate_expressions_in_string(expression, false, Some(CTX_STEP_CONTINUE_ON_ERROR))
+                    .map_err(|e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` {step_ref} continue-on-error: {e}"
                         ))
-                    },
-                )?;
+                    })?;
             }
             if let Some(crate::models::DeferredNumber::Expression(expression)) =
                 &step.timeout_minutes
@@ -519,6 +586,15 @@ pub fn validate_workflow_expressions(workflow: &Workflow) -> Result<(), ParserEr
                     |e| {
                         ParserError::InvalidExpression(format!(
                             "job `{job_id}` {step_ref} working-directory: {e}"
+                        ))
+                    },
+                )?;
+            }
+            if let Some(shell) = &step.shell {
+                validate_expressions_in_string(shell, false, Some(CTX_NO_EXPRESSIONS)).map_err(
+                    |e| {
+                        ParserError::InvalidExpression(format!(
+                            "job `{job_id}` {step_ref} shell: {e}"
                         ))
                     },
                 )?;

@@ -15,7 +15,9 @@ mod lexer;
 pub use conditions::{contains_status_check_function, effective_condition, is_truthy};
 pub use context::Context;
 
-use evaluator::{collect_contexts_from_expr, eval, validate_function_calls, EvalBudget};
+use evaluator::{
+    collect_expression_references_from_expr, eval, validate_function_calls, EvalBudget,
+};
 use expr_parser::Parser;
 use lexer::Lexer;
 
@@ -83,6 +85,18 @@ pub enum ExpressionError {
     /// Unknown function.
     #[error("unknown function `{0}`")]
     UnknownFunction(String),
+    /// A known function was called with an unsupported number of arguments.
+    #[error("function `{name}` expects {min}..={max} arguments, got {actual}")]
+    InvalidFunctionArity {
+        /// Function spelling from the expression.
+        name: String,
+        /// Minimum accepted arguments.
+        min: usize,
+        /// Maximum accepted arguments.
+        max: usize,
+        /// Arguments present in the call.
+        actual: usize,
+    },
     /// `case()` must have predicate/result pairs followed by a default.
     #[error("case() requires an odd number of arguments (at least 3)")]
     EvenCaseParameters,
@@ -114,13 +128,39 @@ pub fn validate_expression(input: &str) -> Result<(), ExpressionError> {
     validate_function_calls(&expr)
 }
 
-/// Collect top-level context names (e.g. "github", "matrix") from an expression string.
-pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>, ExpressionError> {
+/// One context-sensitive function call found in an expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFunctionCall {
+    /// Lowercase function name.
+    pub name: String,
+    /// Number of supplied arguments.
+    pub argument_count: usize,
+}
+
+/// Contexts and context-sensitive function calls referenced by an expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpressionReferences {
+    /// Lowercase top-level context and context-sensitive function names.
+    pub contexts: std::collections::HashSet<String>,
+    /// Context-sensitive calls with their actual argument counts.
+    pub functions: Vec<ContextFunctionCall>,
+}
+
+/// Collect top-level data contexts and context-sensitive function calls.
+pub fn collect_expression_references(input: &str) -> Result<ExpressionReferences, ExpressionError> {
     let trimmed = trim_expression_markers(input);
     let expr = parse_cached(trimmed)?;
-    let mut contexts = std::collections::HashSet::new();
-    collect_contexts_from_expr(&expr, &mut contexts);
-    Ok(contexts)
+    let mut references = ExpressionReferences {
+        contexts: std::collections::HashSet::new(),
+        functions: Vec::new(),
+    };
+    collect_expression_references_from_expr(&expr, &mut references);
+    Ok(references)
+}
+
+/// Collect top-level data contexts and context-sensitive function names.
+pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>, ExpressionError> {
+    collect_expression_references(input).map(|references| references.contexts)
 }
 
 /// Parse and evaluate a GitHub Actions expression.

@@ -1418,7 +1418,7 @@ jobs:
     if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     steps:
-      - if: ${{ secrets['system.preloop.debug_worker_token'] != '' }}
+      - if: ${{ github.ref == 'refs/heads/main' }}
         run: exit 23
 "#,
         )
@@ -1439,7 +1439,7 @@ jobs:
         );
         assert_eq!(
             message.steps[0].condition.as_deref(),
-            Some("secrets['system.preloop.debug_worker_token'] != ''")
+            Some("github.ref == 'refs/heads/main'")
         );
     }
 
