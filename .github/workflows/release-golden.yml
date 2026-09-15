@@ -224,20 +224,51 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
+          # Acquire the base through the host Docker daemon, not from inside
+          # the bake VM: the nested VM's resolver cannot reach ghcr.io on
+          # hosted runners (release-golden #68/#69/#70: every attempt failed
+          # in `smolvm start` with `crane manifest failed ... lookup ghcr.io
+          # on 100.96.0.1:53: i/o timeout`), while the host pulls the same
+          # digest fine. A local tar also keeps the 17 GiB base off the VM's
+          # network path entirely.
+          IMAGE_TAR="$(pwd)/base-image.tar"
+          if [ ! -s "$IMAGE_TAR" ]; then
+            echo "Pulling base image via host Docker daemon..."
+            docker pull "$BASE_IMAGE"
+            echo "Saving base image to $IMAGE_TAR..."
+            docker save "$BASE_IMAGE" -o "$IMAGE_TAR"
+          fi
+          test -s "$IMAGE_TAR"
+
           export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
-          # The runner-large image is too large for a Docker save on the
-          # hosted runner's filesystem. SmolVM's registry export path streams
-          # the digest-pinned image without materializing a second 17 GiB tar.
+          # The runner-large base archive is ~17 GiB uncompressed, over
+          # smolvm's 8 GiB default local-archive cap. Without this the bake
+          # fails every attempt at `smolvm create` before extracting a byte.
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
           # SmolVM machine names allow only ASCII alphanumerics and hyphens.
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-x86-64"
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
+          need_mib=6144
           attempts=3
+          headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
           for attempt in $(seq 1 "$attempts"); do
-            smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
+            for _ in $(seq 1 45); do
+              waiting="$(headroom)"
+              if [ "$waiting" -ge "$need_mib" ]; then break; fi
+              echo "waiting for host headroom: ${waiting} MiB < ${need_mib} MiB"
+              sleep 60
+            done
+            available="$(headroom)"
+            if [ "$available" -lt "$need_mib" ]; then
+              echo "host never freed ${need_mib} MiB (last ${available} MiB)" >&2
+              exit 1
+            fi
+            echo "attempt ${attempt}/${attempts} with ${available} MiB available"
+            smolvm machine delete --name "$builder" \
+              --force --cascade >/dev/null 2>&1 || true
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
                 --output "dist/$GOLDEN_NAME"; then
@@ -247,8 +278,8 @@ jobs:
               echo "build-golden failed after ${attempts} attempts" >&2
               exit 1
             fi
-            rm -f "dist/$GOLDEN_NAME"
             echo "build-golden failed; backing off before retry"
+            rm -f "dist/$GOLDEN_NAME"
             sleep $((attempt * 120))
           done
           test -s "dist/$GOLDEN_NAME"
@@ -437,6 +468,26 @@ jobs:
         run: |
           brew install e2fsprogs
           echo "$(brew --prefix e2fsprogs)/sbin" >> "$GITHUB_PATH"
+      - name: Prepare 120G disk templates
+        run: |
+          set -euo pipefail
+          # The bake requests 120G storage + overlay disks. The Linux twin
+          # builds those templates explicitly (truncate + mkfs.ext4); without
+          # them `smolvm create` must grow whatever the release archive ships,
+          # and release-golden #68/#69/#70 died at VmCreate with
+          # `krun_start_enter -22 (EINVAL)` — smolvm's own hint for "a
+          # disk/overlay that could not be opened". Feed it identical inputs.
+          df -h "$HOME"
+          rm -f "$HOME/.smolvm/storage-template.ext4" \
+            "$HOME/.smolvm/overlay-template.ext4"
+          truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 \
+            "$HOME/.smolvm/storage-template.ext4"
+          truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay \
+            "$HOME/.smolvm/overlay-template.ext4"
+          ls -lh "$HOME/.smolvm/"*.ext4
+          df -h "$HOME"
 
       - name: Capture pinned base provenance
         run: |
@@ -469,14 +520,23 @@ jobs:
           export SMOLVM_MAX_IMAGE_BYTES=34359738368
           export PRELOOP_GOLDEN_NAME_PREFIX="preloop-release-golden-${GITHUB_RUN_ID}-aarch64"
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
-          attempts=3
           for attempt in $(seq 1 "$attempts"); do
             smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
+            # A deleted VM's disks can stay open until its processes fully
+            # exit; recreating immediately re-pins the same paths and fails
+            # the create the same way. Let go, then confirm it is gone.
+            sleep 15
+            smolvm machine list 2>/dev/null || true
             if ./target/release/preloop build-golden \
                 --runner-bundle "target/$RUNNER_TARGET/release" \
                 --output "dist/$GOLDEN_NAME"; then
               break
             fi
+            echo "--- bake diagnostics (attempt $attempt) ---"
+            df -h "$HOME" || true
+            ls -lh "$HOME/.smolvm/"*.ext4 2>/dev/null || true
+            smolvm machine list 2>/dev/null || true
+            echo "--- end diagnostics ---"
             if [ "$attempt" -eq "$attempts" ]; then
               echo "build-golden failed after ${attempts} attempts" >&2
               exit 1
