@@ -1,0 +1,16 @@
+{"substrate":"aenv","workflow":"__cold_start_to_pool_ready","rep":0,"seconds":1319.923023536,"exit":0,"conclusion":"success","run_id":""}
+{"substrate":"aenv","workflow":"bench-hello.yml","rep":1,"seconds":12.423459466,"exit":0,"conclusion":"success","run_id":"b23d80e5-67dd-41f9-bd2b-8bcc65c90e79"}
+{"substrate":"aenv","workflow":"bench-io.yml","rep":1,"seconds":5.413612245,"exit":0,"conclusion":"success","run_id":"c6d1717e-b463-4d84-ad02-71c7d7ae5a0a"}
+{"substrate":"aenv","workflow":"bench-checkout-rust.yml","rep":1,"seconds":5.316481246,"exit":0,"conclusion":"success","run_id":"bce652a0-5a10-45e1-8237-9be665c2b28e"}
+{"substrate":"aenv","workflow":"bench-node.yml","rep":1,"seconds":3.816625077,"exit":0,"conclusion":"success","run_id":"6afce89a-bfc7-4d81-947d-1268a5d4e3eb"}
+{"substrate":"aenv","workflow":"bench-matrix8.yml","rep":1,"seconds":1.909679489,"exit":0,"conclusion":"success","run_id":"84a1b161-f99e-4348-9253-413610f21d70"}
+{"substrate":"aenv","workflow":"bench-hello.yml","rep":2,"seconds":.208919896,"exit":0,"conclusion":"success","run_id":"6ecc8400-e7d7-419b-a159-8fc557218b03"}
+{"substrate":"aenv","workflow":"bench-io.yml","rep":2,"seconds":2.512343829,"exit":0,"conclusion":"success","run_id":"e9a688be-d0c4-4285-9e7d-57096d4c22e7"}
+{"substrate":"aenv","workflow":"bench-checkout-rust.yml","rep":2,"seconds":.912183578,"exit":0,"conclusion":"success","run_id":"0e578fba-64c7-4a46-9bff-79028a14c974"}
+{"substrate":"aenv","workflow":"bench-node.yml","rep":2,"seconds":6.519541822,"exit":0,"conclusion":"success","run_id":"8ce0b88d-9e88-4627-b8a1-d802dbe14425"}
+{"substrate":"aenv","workflow":"bench-matrix8.yml","rep":2,"seconds":2.009818021,"exit":0,"conclusion":"success","run_id":"96689056-7413-4082-922d-603ce5715805"}
+{"substrate":"aenv","workflow":"bench-hello.yml","rep":3,"seconds":.208310268,"exit":0,"conclusion":"success","run_id":"ac3a10d4-1d41-4196-ab3e-089256eeb8f1"}
+{"substrate":"aenv","workflow":"bench-io.yml","rep":3,"seconds":2.812008951,"exit":0,"conclusion":"success","run_id":"f60ed891-78c4-458a-b5c3-065552ca0a94"}
+{"substrate":"aenv","workflow":"bench-checkout-rust.yml","rep":3,"seconds":.908718143,"exit":0,"conclusion":"success","run_id":"bf7f9c5f-c21f-4123-9496-24dd32fa08ca"}
+{"substrate":"aenv","workflow":"bench-node.yml","rep":3,"seconds":4.416567128,"exit":0,"conclusion":"success","run_id":"79e678e6-3231-4b33-84c5-cd823d6a4d38"}
+{"substrate":"aenv","workflow":"bench-matrix8.yml","rep":3,"seconds":3.210634931,"exit":0,"conclusion":"success","run_id":"6fadb85b-57a7-42f1-83cf-fd2415a89e7b"}

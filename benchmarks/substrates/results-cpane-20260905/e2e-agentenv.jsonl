@@ -1,0 +1,6 @@
+{"substrate":"aenv","workflow":"__cold_start_to_pool_ready","rep":0,"seconds":768.231881306,"exit":0,"conclusion":"success","run_id":""}
+{"substrate":"aenv","workflow":"bench-hello.yml","rep":1,"seconds":9.128083117,"exit":0,"conclusion":"success","run_id":"570c677a-4f2f-4a64-ac9c-090f1ce2f324"}
+{"substrate":"aenv","workflow":"bench-io.yml","rep":1,"seconds":123.634232582,"exit":0,"conclusion":"success","run_id":"ef3134fc-23e6-488c-b5cd-c30c16641b62"}
+{"substrate":"aenv","workflow":"bench-checkout-rust.yml","rep":1,"seconds":3.215516545,"exit":1,"conclusion":"failure","run_id":"4612ee1e-2904-4c1d-bb83-6b0ba8dca322"}
+{"substrate":"aenv","workflow":"bench-node.yml","rep":1,"seconds":4.316846208,"exit":0,"conclusion":"success","run_id":"21cbfde4-4c7d-4117-9388-03fc13989966"}
+{"substrate":"aenv","workflow":"bench-matrix8.yml","rep":1,"seconds":601.704840628,"exit":0,"conclusion":"success","run_id":"dc402560-c8d9-4b82-ba66-e9e6f7889faa"}

@@ -14,6 +14,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+pub mod agentenv;
 pub mod telemetry;
 
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -287,9 +288,58 @@ pub enum VmError {
     },
 }
 
+/// What a backend can express, so the orchestrator can pick a strategy
+/// instead of assuming SmolVM's.
+///
+/// Every field defaults to what SmolVM does, so an existing provider needs no
+/// change and a new backend only declares what it *cannot* do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Host directories can be mounted into a guest and stay live.
+    ///
+    /// `false` means [`MachineSpec::volumes`] is satisfied by copying at
+    /// start time: correct for read-mostly mounts like the runner bundle,
+    /// wrong for anything the host mutates while the guest runs.
+    pub live_host_volumes: bool,
+    /// Host Unix sockets can be forwarded into a guest.
+    ///
+    /// `false` forces the guest control plane onto TCP.
+    pub socket_mounts: bool,
+    /// [`VmProvider::pack`] produces a host file usable as a base image.
+    ///
+    /// `false` means packs live inside the backend (AgentENV snapshots), so
+    /// the pool must not try to build, download, or relocate artifact files.
+    pub file_packs: bool,
+    /// A clone inherits filesystem writes the golden made *after* it booted.
+    ///
+    /// SmolVM's forkable snapshot does not: the pool reinstalls the baseline
+    /// into each fork. AgentENV snapshots the golden's live filesystem.
+    pub fork_inherits_guest_writes: bool,
+    /// A suspended guest retains its live runner, processes, and filesystem
+    /// state when resumed. Backends without this must not auto-suspend a live
+    /// debug session.
+    pub preserves_runtime_state_on_suspend: bool,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            live_host_volumes: true,
+            socket_mounts: true,
+            file_packs: true,
+            fork_inherits_guest_writes: false,
+            preserves_runtime_state_on_suspend: false,
+        }
+    }
+}
+
 /// Provider contract consumed by the Preloop orchestrator.
 #[async_trait]
 pub trait VmProvider: Send + Sync {
+    /// What this backend can express. Defaults to SmolVM's behaviour.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
     /// Create a persistent machine.
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError>;
     /// Start an existing machine.
@@ -349,6 +399,76 @@ pub trait VmProvider: Send + Sync {
     async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError>;
     /// Pack a configured machine into a reusable immutable artifact.
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError>;
+}
+
+/// Delegate through a box so a backend can be chosen at runtime.
+///
+/// The pool is generic over its provider for zero-cost static dispatch, but
+/// the CLI picks between SmolVM and AgentENV from the environment. One
+/// `Box<dyn VmProvider>` keeps that choice out of the pool's type parameter
+/// without an enum that has to be extended for every future backend. The
+/// virtual call is irrelevant next to booting a VM.
+#[async_trait]
+impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
+    fn capabilities(&self) -> ProviderCapabilities {
+        (**self).capabilities()
+    }
+    async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
+        (**self).create(spec).await
+    }
+    async fn start(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).start(name).await
+    }
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).start_forkable(name).await
+    }
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        (**self).fork(golden, clone).await
+    }
+    async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).stop(name).await
+    }
+    async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).delete(name).await
+    }
+    async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
+        (**self).status(name).await
+    }
+    async fn list(&self) -> Result<Vec<MachineName>, VmError> {
+        (**self).list().await
+    }
+    async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
+        (**self).exec(name, argv).await
+    }
+    async fn exec_with_secret_env(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        secrets: &[(String, SecretSource)],
+    ) -> Result<ExecOutput, VmError> {
+        (**self).exec_with_secret_env(name, argv, secrets).await
+    }
+    async fn rearm_fork_base(
+        &self,
+        golden: &MachineName,
+        partial: Option<&MachineName>,
+    ) -> Result<bool, VmError> {
+        (**self).rearm_fork_base(golden, partial).await
+    }
+    async fn exec_stream(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        output: mpsc::Sender<OutputChunk>,
+    ) -> Result<i32, VmError> {
+        (**self).exec_stream(name, argv, output).await
+    }
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError> {
+        (**self).copy(source, destination).await
+    }
+    async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
+        (**self).pack(name, output).await
+    }
 }
 
 /// CLI-backed SmolVM provider.
@@ -1149,27 +1269,12 @@ impl VmProvider for SmolVmProvider {
             program: self.binary.display().to_string(),
             source,
         })?;
-        let stdout_task = forward(
-            child.stdout.take().expect("piped stdout"),
-            output.clone(),
-            true,
-        );
-        let stderr_task = forward(child.stderr.take().expect("piped stderr"), output, false);
-        let (stdout_result, stderr_result, status) =
-            tokio::join!(stdout_task, stderr_task, child.wait());
-        stdout_result.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        stderr_result.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        let status = status.map_err(|source| VmError::Launch {
-            program: self.binary.display().to_string(),
-            source,
-        })?;
-        Ok(status.code().unwrap_or(-1))
+        stream_output(&mut child, output)
+            .await
+            .map_err(|source| VmError::Launch {
+                program: self.binary.display().to_string(),
+                source,
+            })
     }
 
     async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError> {
@@ -2114,6 +2219,29 @@ async fn forward(
             return Ok(());
         }
     }
+}
+
+/// Forward a child's piped stdout and stderr to `output` and return its exit
+/// code.
+///
+/// Shared by every provider's streaming exec: both readers are drained
+/// concurrently with the wait, so a child that fills one pipe while the other
+/// stays idle cannot deadlock, and a dropped receiver ends forwarding without
+/// killing the child.
+async fn stream_output(
+    child: &mut tokio::process::Child,
+    output: mpsc::Sender<OutputChunk>,
+) -> std::io::Result<i32> {
+    let stdout = forward(
+        child.stdout.take().expect("piped stdout"),
+        output.clone(),
+        true,
+    );
+    let stderr = forward(child.stderr.take().expect("piped stderr"), output, false);
+    let (stdout, stderr, status) = tokio::join!(stdout, stderr, child.wait());
+    stdout?;
+    stderr?;
+    Ok(status?.code().unwrap_or(-1))
 }
 
 #[cfg(test)]

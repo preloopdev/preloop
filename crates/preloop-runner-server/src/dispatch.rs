@@ -510,6 +510,7 @@ fn submission_from_effective(
         selected_jobs: vec![],
         base_ref: None,
         preserve_on_failure: false,
+        debug_on_failure: false,
         push: None,
         push_tree: None,
     }

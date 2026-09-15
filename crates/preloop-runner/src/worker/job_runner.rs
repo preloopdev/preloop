@@ -622,16 +622,11 @@ pub async fn run_job(
     let job_result = if let Err(e) = debugger_result {
         Err(e)
     } else {
-        // Live pause-on-failure. Reuses the existing per-run opt-in rather
-        // than adding a second flag meaning nearly the same thing: both say
-        // "do not throw this failure away". When a session opens, the worker
-        // blocks in the step loop and the post-mortem marker path below never
-        // fires,  the live session supersedes it.
-        // Every way this can come up empty is reported. Silently falling back
-        // to "no debugging" is the one outcome a user cannot diagnose: they
-        // asked for a pause, the job died, and nothing said why.
+        // `preloopDebugOnFailure` is separate from preservation: a detached
+        // run may request a post-mortem shell without making the worker wait
+        // for a controller that cannot answer.
         let debug_client = if job_message
-            .get("preloopPreserveOnFailure")
+            .get("preloopDebugOnFailure")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {

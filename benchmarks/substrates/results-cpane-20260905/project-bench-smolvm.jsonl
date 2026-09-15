@@ -1,0 +1,5 @@
+{"substrate":"smolvm","project":"eslint","rep":1,"seconds":311.3584854602814,"exit":0,"conclusion":"success"}
+{"substrate":"smolvm","project":"typescript","rep":1,"seconds":266.9992005825043,"exit":1,"conclusion":"failure"}
+{"substrate":"smolvm","project":"pydantic-core","rep":1,"seconds":382.9342837333679,"exit":1,"conclusion":"failure"}
+{"substrate":"smolvm","project":"cargo-mutants","rep":1,"seconds":339.3297162055969,"exit":1,"conclusion":"failure"}
+{"substrate":"smolvm","project":"gobgp","rep":1,"seconds":233.40032815933228,"exit":1,"conclusion":"failure"}
