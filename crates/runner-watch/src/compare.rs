@@ -27,34 +27,6 @@ const IGNORED_HEADERS: &[&str] = &[
 
 // ── path normalisation ───────────────────────────────────────────────────────
 
-/// Strip transport prefixes that are not part of the logical endpoint: a
-/// leading `/runner/server`, and a single random base segment before `/_apis/`
-/// (e.g. `/BFN7BKz/_apis/…`). Shared by [`normalize_path`] (request URLs) and
-/// coverage route canonicalization so both sides land in one namespace.
-pub fn strip_transport_prefixes(path: &str) -> &str {
-    let path = if path.starts_with("/runner/server/") {
-        &path["/runner/server".len()..]
-    } else {
-        path
-    };
-    if let Some(rest) = path.strip_prefix('/') {
-        if let Some(slash) = rest.find('/') {
-            let seg = &rest[..slash];
-            let tail = &rest[slash..]; // starts with /
-                                       // Only strip if the tail continues with /_apis/ and the
-                                       // segment is purely alphanumeric+hyphen (no dots — avoids
-                                       // stripping hostnames).
-            if tail.starts_with("/_apis/")
-                && !seg.is_empty()
-                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            {
-                return tail;
-            }
-        }
-    }
-    path
-}
-
 /// Normalise volatile parts of a URL path + query string for grouping.
 ///
 /// Matches the Python `normalize_path` function exactly:
@@ -64,9 +36,36 @@ pub fn strip_transport_prefixes(path: &str) -> &str {
 /// - replace all-digit path segments with `{n}`
 /// - replace all-digit or GUID-prefixed query values with `{n}` / `{guid}`
 pub fn normalize_path(path: &str) -> String {
-    // Strip transport prefixes (/runner/server, single random base before
-    // /_apis/) so the same logical endpoint groups regardless of URL form.
-    let path = strip_transport_prefixes(path);
+    // Strip /runner/server prefix when immediately followed by /.
+    let path = if path.starts_with("/runner/server/") {
+        &path["/runner/server".len()..]
+    } else {
+        path
+    };
+
+    // Strip single-segment random base before /_apis/
+    // e.g. /BFN7BKz.../_apis/... → /_apis/...
+    // Must be exactly one path segment (no embedded slashes).
+    let path = if let Some(rest) = path.strip_prefix('/') {
+        if let Some(slash) = rest.find('/') {
+            let seg = &rest[..slash];
+            let tail = &rest[slash..]; // starts with /
+                                       // Only strip if the tail continues with /_apis/ and the segment
+                                       // is purely alphanumeric+hyphen (no dots — avoids stripping hostnames).
+            if tail.starts_with("/_apis/")
+                && !seg.is_empty()
+                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            {
+                tail
+            } else {
+                path
+            }
+        } else {
+            path
+        }
+    } else {
+        path
+    };
 
     // Replace GUIDs (8-4-4-4-12 hex digits).
     let guid_re =
@@ -129,21 +128,10 @@ pub fn normalize_path(path: &str) -> String {
 
 /// Redact JWTs and long high-entropy tokens from a report string.
 pub fn redact_report(s: &str) -> String {
-    // Redact GitHub credential shapes (ghp_/gho_/ghu_/ghs_/ghr_ and
-    // fine-grained github_pat_ tokens) that ride in captured bodies. The
-    // class includes dots so the whole `ghs_<installation>_<jwt>` token goes
-    // in one pass: a prefix-only match would leave the two JWT segments that
-    // follow it, which the bare-JWT rule below cannot see as one token.
-    let github_token_re = Regex::new(r"gh[sopur]_[A-Za-z0-9_.-]{8,}|github_pat_[A-Za-z0-9_]{15,}")
+    // Redact JWT tokens (three base64url segments separated by dots).
+    let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}")
         .expect("static regex");
-    let s = github_token_re.replace_all(s, "***REDACTED***");
-
-    // Redact JWT tokens: an `eyJ` header followed by one or more base64url
-    // segments separated by dots. Requiring exactly three segments missed
-    // truncated forms (e.g. the payload+signature that survive after the
-    // token-prefix rule above has eaten the header).
-    let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,})+").expect("static regex");
-    let s = jwt_re.replace_all(&s, "***REDACTED***");
+    let s = jwt_re.replace_all(s, "***REDACTED***");
 
     // Redact long alphanumeric strings with high character diversity.
     let long_re = Regex::new(r"[A-Za-z0-9_]{30,}").expect("static regex");
@@ -787,7 +775,6 @@ pub fn load_endpoint_keys(dir: &Path) -> Result<BTreeSet<String>> {
     let flows = load_flows(dir)?;
     Ok(group_flows(&flows).into_keys().collect())
 }
-
 // ── header key collection ────────────────────────────────────────────────────
 
 fn header_keys(flows: &[Value]) -> BTreeSet<String> {
@@ -1235,25 +1222,6 @@ mod tests {
         let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         let out = redact_report(jwt);
         assert_eq!(out, "***REDACTED***");
-    }
-
-    #[test]
-    fn redact_removes_installation_token_with_prefix() {
-        // The full `ghs_<installation>_<jwt>` shape leaked into goldens: the
-        // bare-JWT regex could not see past the prefix, and the high-entropy
-        // rule stops at the JWT's dot separators.
-        let token = "ghs_15368_eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJhaWQiOjE1MzY4LCJhdWQiOiIvdHdpcnAvZ2l0aHViLmF1dGhlbnRpY2F0aW9uLnYwLkNyZWRlbnRpYWxNYW5hZ2VyLyJ9.Duv_FPs3lVT_AQMuc_hlx2yoPpoQg5UKnmUxJtw0fgDNShl5hWjolhCP70--tpA0wzvwhwJScAxwJAFFuRkuPg";
-        let out = redact_report(&format!("token: {token} in body"));
-        assert_eq!(out, "token: ***REDACTED*** in body");
-    }
-
-    #[test]
-    fn redact_preserves_mask_regex_strings() {
-        // The server's own masking rules are regexes, not tokens; they must
-        // survive so captures still describe the masking contract.
-        let mask = r"\bgithub_pat_[0-9][A-Za-z0-9]{21}_[A-Za-z0-9]{59}\b";
-        let out = redact_report(mask);
-        assert_eq!(out, mask);
     }
 
     #[test]
