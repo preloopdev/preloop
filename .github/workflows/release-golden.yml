@@ -224,24 +224,13 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           rm -f "dist/$GOLDEN_NAME"
-          # Acquire the base through the host Docker daemon, not from inside
-          # the bake VM: the nested VM's resolver cannot reach ghcr.io on
-          # hosted runners (release-golden #68/#69/#70: every attempt failed
-          # in `smolvm start` with `crane manifest failed ... lookup ghcr.io
-          # on 100.96.0.1:53: i/o timeout`), while the host pulls the same
-          # digest fine. A local tar also keeps the 17 GiB base off the VM's
-          # network path entirely.
-          IMAGE_TAR="$(pwd)/base-image.tar"
-          if [ ! -s "$IMAGE_TAR" ]; then
-            echo "Pulling base image via host Docker daemon..."
-            docker pull "$BASE_IMAGE"
-            echo "Saving base image to $IMAGE_TAR..."
-            docker save "$BASE_IMAGE" -o "$IMAGE_TAR"
-          fi
-          test -s "$IMAGE_TAR"
-
+          # Stream the base from the registry inside the bake VM. Do NOT go
+          # back to a host `docker save` tar: the 17 GiB export does not fit
+          # the hosted runner's disk (release-golden #66-rerun/#71: `docker
+          # save` dies with `no space left on device` after a successful
+          # pull). Streaming keeps every copy off the host filesystem.
           export PRELOOP_REQUIRE_BASE_DIGEST=1
-          export PRELOOP_RUNNER_BASE_IMAGE="$IMAGE_TAR"
+          export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           export PRELOOP_RUNNER_STORAGE_GB=120
           export PRELOOP_RUNNER_OVERLAY_GB=120
           # The runner-large base archive is ~17 GiB uncompressed, over
@@ -255,6 +244,19 @@ jobs:
           attempts=3
           headroom() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
           for attempt in $(seq 1 "$attempts"); do
+            if [ "$attempt" -eq 1 ]; then
+              echo "attempt 1/${attempts}: default guest resolvers"
+            else
+              # The default path answers through the NAT DNS proxy
+              # (100.96.0.1), which cannot resolve ghcr.io on hosted runners
+              # (release-golden #68/#69/#70: `crane manifest ... lookup
+              # ghcr.io ... i/o timeout`, 9/9 attempts). Answer the guest
+              # directly instead (`smolvm --dns`, via PRELOOP_RUNNER_DNS).
+              # Attempt 1 runs first so a healthy default path never pays
+              # for this deviation.
+              export PRELOOP_RUNNER_DNS=1.1.1.1
+              echo "attempt ${attempt}/${attempts}: direct guest DNS (PRELOOP_RUNNER_DNS=$PRELOOP_RUNNER_DNS)"
+            fi
             for _ in $(seq 1 45); do
               waiting="$(headroom)"
               if [ "$waiting" -ge "$need_mib" ]; then break; fi
@@ -522,6 +524,14 @@ jobs:
           builder="${PRELOOP_GOLDEN_NAME_PREFIX}-builder"
           attempts=3
           for attempt in $(seq 1 "$attempts"); do
+            if [ "$attempt" -eq 1 ]; then
+              echo "attempt 1/${attempts}: default guest resolvers"
+            else
+              # Same NAT-DNS-proxy wall as the x86_64 twin (ghcr.io
+              # unresolvable from the bake VM); answer the guest directly.
+              export PRELOOP_RUNNER_DNS=1.1.1.1
+              echo "attempt ${attempt}/${attempts}: direct guest DNS (PRELOOP_RUNNER_DNS=$PRELOOP_RUNNER_DNS)"
+            fi
             smolvm machine delete --name "$builder" --force --cascade >/dev/null 2>&1 || true
             # A deleted VM's disks can stay open until its processes fully
             # exit; recreating immediately re-pins the same paths and fails
