@@ -17,6 +17,7 @@ use super::http::HttpClient;
 const DISTTASK_API_VERSION: &str = "5.1-preview.1";
 
 /// Client for the AzDO distributedtask endpoints.
+#[derive(Clone)]
 pub struct AzdoClient {
     http: HttpClient,
     base_url: String,
