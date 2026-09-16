@@ -302,10 +302,13 @@ jobs:
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
+          MAX_AGE_DAYS="$(grep '^apt_indices_max_age_days' versions.toml | cut -d'"' -f2)"
+          test -n "$MAX_AGE_DAYS"
           python3 scripts/write-golden-provenance.py \
             --golden "dist/$GOLDEN_NAME" \
             --base-evidence "dist/$GOLDEN_NAME.base-provenance.json" \
             --base-sbom "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
+            --apt-indices-max-age-days "$MAX_AGE_DAYS" \
             --output "dist/$GOLDEN_NAME.provenance.json"
 
       - name: Install cosign
@@ -574,10 +577,13 @@ jobs:
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
         run: |
+          MAX_AGE_DAYS="$(grep '^apt_indices_max_age_days' versions.toml | cut -d'"' -f2)"
+          test -n "$MAX_AGE_DAYS"
           python3 scripts/write-golden-provenance.py \
             --golden "dist/$GOLDEN_NAME" \
             --base-evidence "dist/$GOLDEN_NAME.base-provenance.json" \
             --base-sbom "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
+            --apt-indices-max-age-days "$MAX_AGE_DAYS" \
             --output "dist/$GOLDEN_NAME.provenance.json"
 
       - name: Install cosign

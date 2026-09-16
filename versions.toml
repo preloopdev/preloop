@@ -18,7 +18,15 @@ smolvm_min_version = "1.8.1"
 # .github/workflows/smolvm-release-verify.yml gates the merge with the real-VM
 # E2E on the smolvm-host. Deliberately separate from smolvm_min_version:
 # goldens track the last *verified* release, the runtime floor rarely moves.
-smolvm_golden_version = "1.14.3"
+smolvm_golden_version = "1.14.5"
+
+ # Freshness policy for apt package indices baked into golden images.
+ # Provisioning stamps each bake with its date (see prepare_artifact) and
+ # warns when a pack serving curated jobs is older than this. The weekly
+ # apt-indices-refresh workflow rebuilds the goldens past this age.
+ # Quoted: build.rs only picks up quoted values (and Renovate's regex
+ # manager expects flat `key = "value"` lines).
+ apt_indices_max_age_days = "7"
 
 # Image inputs for the runner golden. The OCI bases are immutable filesystem
 # inputs. `github_runner_image_version` is the actions/runner-images snapshot

@@ -111,6 +111,19 @@ jobs:
           smolvm machine fork --help >/dev/null 2>&1 \
             || { echo "candidate lacks machine fork command" >&2; exit 1; }
 
+      - name: Grant runner KVM access
+        if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Recent hosted images no longer put the runner user in the kvm
+          # group, so every boot dies with `Cannot access /dev/kvm
+          # (permission denied)` before the candidate under test even runs.
+          # This only opens the device on the ephemeral host; the gate below
+          # still boots a real VM with the candidate smolvm.
+          ls -l /dev/kvm || { echo "no /dev/kvm on this host" >&2; exit 1; }
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+
       - name: Boot a VM with the candidate (regression smoke)
         if: github.event_name == 'workflow_dispatch' || steps.changed.outputs.changed == 'true'
         run: |

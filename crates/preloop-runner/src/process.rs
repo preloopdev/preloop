@@ -828,15 +828,20 @@ mod tests {
     #[tokio::test]
     async fn cancellation_interrupts_background_child_after_shell_exit() {
         // The shell exits within a millisecond, so cancellation always lands
-        // after the leader has been reaped, and the backgrounded child ignores
-        // both graceful signals — SIGKILL against the group is the only thing
-        // that can reap it. Assert the child actually died rather than
-        // trusting the error string: a survivor is reparented to init and
-        // silently outlives the job.
+        // after the leader has been reaped. The trap is installed in the
+        // *parent*, before the background job is forked: ignored dispositions
+        // are inherited atomically at fork, so there is no window where the
+        // shell-exit SIGHUP can land with a default disposition. (Installing
+        // the trap inside the subshell lost that race on loaded hosts: the
+        // child occasionally died before the 150 ms cancellation fired and
+        // `invoke` correctly returned success.) SIGKILL against the group
+        // must be the only thing that can reap the child. Assert the child
+        // actually died rather than trusting the error string: a survivor is
+        // reparented to init and silently outlives the job.
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_path = dir.path().join("background.pid");
         let script = format!(
-            "(trap '' TERM INT; while :; do sleep 1; done) & echo $! > {}; echo ready",
+            "trap '' HUP TERM INT; (while :; do sleep 1; done) & echo $! > {}; echo ready",
             pid_path.display()
         );
 

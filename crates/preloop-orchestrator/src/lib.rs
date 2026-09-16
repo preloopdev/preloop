@@ -8,6 +8,7 @@ pub mod node_externals;
 
 use crate::environment::{
     curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
+    APT_INDICES_MARKER_PATH,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -37,6 +38,21 @@ use tracing::{debug, error, info, warn};
 
 const GUEST_CONTROL_DIR: &str = "/run/preloop-control";
 const GUEST_CONTROL_SOCKET: &str = "/run/preloop-control/engine.sock";
+/// Rust toolchain homes inside the guest.
+///
+/// rustup obeys `RUSTUP_HOME`/`CARGO_HOME` verbatim — no fallback to `$HOME`,
+/// no search for a writable candidate — so these fixed system addresses are a
+/// contract, not a hint. Every party MUST agree: the bake installs here
+/// (`ToolchainLayer::Rust`), `runner_account_script` chowns them to the runner
+/// uid, `guest_env_prefix` exports them, `guest_runner_path` puts
+/// `$CARGO_HOME/bin` on PATH, and `verify_toolchain_homes` refuses to register
+/// a runner whose golden disagrees. A `$HOME`-derived location instead would
+/// split root's copy from the runner's: `/root` is 0700, so the runner gets
+/// EACCES statting it, and a second writable home silently shadows the baked
+/// toolchain with a fresh `stable` download.
+const GUEST_RUSTUP_HOME: &str = "/usr/local/rustup";
+const GUEST_CARGO_HOME: &str = "/usr/local/cargo";
+
 const GUEST_FAILURE_MARKER: &str = "/home/runner/.preloop-job-failed";
 /// Written by the worker while a job is paused in a debug session and removed
 /// when the session closes. The pool probes it to release the slot's
@@ -1573,8 +1589,12 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// Start the container engine, if one is installed.
 ///
 /// Runs per machine rather than in the golden: a daemon captured mid-flight by
-/// a fork would wake up with stale state and a socket it does not own. Machines
-/// are pre-provisioned, so this sits off the critical path of any job.
+/// a fork would wake up with stale state and a socket it does not own. It runs
+/// as a background task from provisioning (overlapping runner registration),
+/// never gating readiness: the 5-15 s cold boot sits off the starting path,
+/// and the worker waits for the daemon before container setup, so neither
+/// declared (`container:`/`services:`) nor ad-hoc (`docker run` steps)
+/// container use can observe a half-started engine.
 ///
 /// Never fatal. A pool without a working container engine still runs every job
 /// that does not use `container:` or `services:`.
@@ -1822,9 +1842,10 @@ async fn write_bake_manifest<P: VmProvider>(
 /// (nodejs/ci: `EACCES: permission denied, stat '/root/.cargo/bin/git'`).
 /// Absent directories cost nothing.
 pub fn guest_runner_path(_config: &RunnerPoolConfig) -> String {
-    "/usr/local/cargo/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
-     /usr/sbin:/usr/bin:/sbin:/bin"
-        .to_owned()
+    format!(
+        "{GUEST_CARGO_HOME}/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:\
+          /usr/sbin:/usr/bin:/sbin:/bin"
+    )
 }
 
 /// `env` prefix for guest runner invocations, empty when nothing needs setting.
@@ -1872,8 +1893,8 @@ fn guest_env_prefix(config: &RunnerPoolConfig, name: &MachineName) -> Vec<String
     // are exported here so every user resolves the identical toolchain.
     // Order is irrelevant (env entries are independent); they sit last so
     // the historical PATH/MACHINE_NAME-first prefix is undisturbed.
-    env.push("RUSTUP_HOME=/usr/local/rustup".to_owned());
-    env.push("CARGO_HOME=/usr/local/cargo".to_owned());
+    env.push(format!("RUSTUP_HOME={GUEST_RUSTUP_HOME}"));
+    env.push(format!("CARGO_HOME={GUEST_CARGO_HOME}"));
     if !env.is_empty() {
         env.insert(0, "/usr/bin/env".to_owned());
     }
@@ -3055,6 +3076,30 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                         .last()
                         .unwrap_or("unknown error")
                 )));
+            }
+        }
+        // Stamp apt-index freshness into the image. Provisioning reads this
+        // back to log the pack's age and warn past the versions.toml policy;
+        // the weekly apt-indices-refresh workflow rebuilds stale packs. The
+        // policy travels in the marker so a running engine never needs the
+        // policy compiled in — only the bake-time CLI does. Never fail the
+        // bake for telemetry: a missing marker just means "stale", which is
+        // today's behavior (full refresh) everywhere.
+        if stock_base {
+            let stamp = format!(
+                "mkdir -p /etc/preloop && printf '%s\\n%s\\n' \"$(date -u +%F)\" \"{}\" > /etc/preloop/apt-indices-baked-at",
+                crate::APT_INDICES_MAX_AGE_DAYS
+            );
+            if let Err(error) = self
+                .provider
+                .exec(&name, &["sh".to_owned(), "-c".to_owned(), stamp])
+                .await
+            {
+                warn!(
+                    machine = name.as_str(),
+                    %error,
+                    "apt-index freshness stamp failed; pack will read as stale"
+                );
             }
         }
         // Bake the externals *pointer*, not the externals: the packed rootfs
@@ -4784,6 +4829,51 @@ async fn provision_runner<P: VmProvider + 'static>(
                     );
                 }
             }
+            // Log the pack's apt-index age from the freshness marker baked
+            // with it. A missing marker just means "stale" (packs predating
+            // the stamp, or env-golden forks that boot bare) — the refresh
+            // above already ran, so behavior is unchanged; only the warning
+            // is new, and the weekly apt-indices-refresh rebuilds stale packs.
+            match provider
+                .exec(
+                    name,
+                    &["cat".to_owned(), APT_INDICES_MARKER_PATH.to_owned()],
+                )
+                .await
+            {
+                Ok(output) if output.exit_code == 0 => {
+                    let today_days = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs() / 86_400)
+                        .unwrap_or(0);
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    match crate::environment::apt_marker_age_days(&text, today_days) {
+                        Some((age_days, max_age_days)) if age_days > max_age_days => {
+                            warn!(
+                                machine = name.as_str(),
+                                age_days,
+                                max_age_days,
+                                "pack apt indices are stale; refresh ran but consider rebuilding the golden"
+                            );
+                        }
+                        Some((age_days, _)) => {
+                            info!(machine = name.as_str(), age_days, "pack apt indices fresh");
+                        }
+                        None => {
+                            debug!(
+                                machine = name.as_str(),
+                                "pack has no parseable apt-index marker"
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    debug!(
+                        machine = name.as_str(),
+                        "pack has no apt-index marker; treating as stale"
+                    );
+                }
+            }
         } else if environment.curated {
             install_base_dependencies(provider.as_ref(), name).await?;
             for layer in &environment.toolchains {
@@ -4968,6 +5058,28 @@ async fn provision_runner<P: VmProvider + 'static>(
             }
         }
     }
+    // Start the container engine in the background while `configure`
+    // registers the runner: the 5-15 s dockerd cold boot overlaps
+    // registration instead of gating readiness. The worker waits for the
+    // daemon before container setup (and it is up long before step 1 for
+    // ad-hoc `docker` steps), so nothing observes a half-started engine.
+    // Fire-and-forget: a failure only warns here; container setup reports
+    // the missing daemon against the job it actually blocks.
+    {
+        let provider = std::sync::Arc::clone(provider);
+        let name = name.clone();
+        let start_command = docker_start_command();
+        tokio::spawn(async move {
+            if let Err(error) = provider.exec(&name, &start_command).await {
+                warn!(
+                    machine = name.as_str(),
+                    %error,
+                    "background container engine start failed; container setup will report it"
+                );
+            }
+        });
+    }
+
     let configure_result = provider
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
         .await;
@@ -4988,17 +5100,6 @@ async fn provision_runner<P: VmProvider + 'static>(
         let _ = std::fs::remove_file(path);
     }
     configure_result?;
-
-    // Bring the container engine up before the runner accepts work, so a job
-    // declaring `container:` or `services:` does not race the daemon. Failure
-    // is not fatal — only container jobs depend on it.
-    if let Err(error) = provider.exec(name, &docker_start_command()).await {
-        warn!(
-            machine = name.as_str(),
-            %error,
-            "container engine did not start; `container:` and `services:` jobs will fail"
-        );
-    }
 
     info!(machine = name.as_str(), "ephemeral runner ready");
     let mut run = guest_env_prefix(config, name);

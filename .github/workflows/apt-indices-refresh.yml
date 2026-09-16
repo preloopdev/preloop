@@ -1,0 +1,60 @@
+name: apt-indices-refresh
+
+# Weekly freshness loop for golden apt indices. Pack production stamps each
+# bake (marker in the image, `apt_indices` in provenance.json); this job
+# compares the published pack's stamp against the versions.toml policy and
+# dispatches a rebuild when stale. Nothing runs on the Preloop pool — the
+# bake itself executes in release-golden on hosted runners.
+on:
+  schedule:
+    # Monday 04:00 UTC: at most one rebake per week when indices rot past policy.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  check:
+    name: Rebuild goldens past index policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          sparse-checkout: versions.toml
+
+      - name: Rebuild when the published pack is stale
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          MAX_AGE_DAYS="$(grep '^apt_indices_max_age_days' versions.toml | cut -d'"' -f2)"
+          test -n "$MAX_AGE_DAYS"
+          TAG="$(gh release view --json tagName --jq .tagName)"
+          echo "policy: ${MAX_AGE_DAYS}d; latest release: $TAG"
+          # A pack predating the stamp feature has no provenance field and
+          # reads as infinitely stale: the first run self-heals by rebuilding.
+          if gh release download "$TAG" \
+            --pattern 'preloop-ubuntu-24.04-x86_64.provenance.json' \
+            --dir /tmp/apt-prov --clobber >/dev/null 2>&1; then
+            STAMP="$(python3 -c 'import json; print(json.load(open("/tmp/apt-prov/preloop-ubuntu-24.04-x86_64.provenance.json")).get("apt_indices", {}).get("baked_at", ""))')"
+          else
+            echo "no provenance asset; treating pack as stale"
+            STAMP=""
+          fi
+          if [ -z "$STAMP" ]; then
+            echo "stale (no stamp); dispatching golden rebuild"
+            gh workflow run release-golden --ref main
+            exit 0
+          fi
+          AGE_DAYS="$(( ($(date -u +%s) - $(date -u -d "$STAMP" +%s)) / 86400 ))"
+          echo "indices baked $STAMP (${AGE_DAYS}d old)"
+          if [ "$AGE_DAYS" -gt "$MAX_AGE_DAYS" ]; then
+            echo "stale; dispatching golden rebuild"
+            gh workflow run release-golden --ref main
+          else
+            echo "fresh; nothing to do"
+          fi

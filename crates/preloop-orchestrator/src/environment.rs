@@ -291,6 +291,69 @@ pub const OFFICIAL_RUNNER_IMAGE_ARM64_PIN: &str = crate::OFFICIAL_RUNNER_IMAGE_B
 /// The default base image for GitHub-runner-labelled jobs.
 pub const DEFAULT_BASE_IMAGE: &str = UBUNTU_24_04_PIN;
 
+/// Guest path of the apt-index freshness marker baked into golden images.
+/// Written by `prepare_artifact` after the baseline install; forks inherit
+/// it through the packed rootfs (unlike post-create exec writes, which
+/// snapshots do not carry).
+pub const APT_INDICES_MARKER_PATH: &str = "/etc/preloop/apt-indices-baked-at";
+/// Fallback freshness policy when a marker lacks its policy line.
+pub const APT_INDICES_DEFAULT_MAX_AGE_DAYS: u64 = 7;
+
+/// Parse an apt-index marker into `(age_days, max_age_days)`.
+///
+/// The marker is `YYYY-MM-DD` on line one with an optional policy age on
+/// line two. `today_days` is days since the Unix epoch. Returns `None` when
+/// the marker is absent or malformed — the caller then behaves exactly as
+/// before markers existed (full refresh, no warning).
+pub fn apt_marker_age_days(marker: &str, today_days: u64) -> Option<(u64, u64)> {
+    let mut lines = marker.lines().map(str::trim);
+    let baked = days_from_civil_date(lines.next()?)?;
+    let max_age = lines
+        .next()
+        .map_or(APT_INDICES_DEFAULT_MAX_AGE_DAYS, |line| {
+            line.parse::<u64>()
+                .ok()
+                .filter(|days| *days > 0)
+                .unwrap_or(APT_INDICES_DEFAULT_MAX_AGE_DAYS)
+        });
+    Some((today_days.saturating_sub(baked), max_age))
+}
+
+/// Days since the Unix epoch for a civil date, or `None` if invalid.
+/// (Howard Hinnant's days_from_civil; std has no civil-date type and this
+/// crate has no chrono dependency for three lines of math.)
+fn days_from_civil_date(text: &str) -> Option<u64> {
+    let mut parts = text.split('-');
+    let (year, month, day) = (
+        parts.next()?.parse::<i64>().ok()?,
+        parts.next()?.parse::<u64>().ok()?,
+        parts.next()?.parse::<u64>().ok()?,
+    );
+    if parts.next().is_some() || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    let max_day = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = (year - era * 400) as u64;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era as u64)
+        .checked_mul(146097)?
+        .checked_add(doe)?
+        .checked_sub(719468)
+}
+
 /// The plain repository:tag of an image reference, ignoring any `@digest`.
 pub fn base_name(image_ref: &str) -> &str {
     image_ref.split('@').next().unwrap_or(image_ref)
@@ -532,6 +595,49 @@ mod tests {
         assert!(script.contains("node-$VERSION-linux-$NODE_ARCH.tar.gz"));
         assert!(!script.contains("nodesource"));
         assert!(!script.contains("apt-get"));
+    }
+
+    #[test]
+    fn apt_marker_reports_age_against_baked_policy() {
+        // 2026-09-16 is day 20712; keep the arithmetic anchored to fixed
+        // values rather than the wall clock so the test never rots.
+        const TODAY: u64 = 20712;
+        assert_eq!(
+            apt_marker_age_days("2026-09-09\n7\n", TODAY),
+            Some((7, 7)),
+            "exactly at policy reads fresh-or-stale by strict greater-than"
+        );
+        assert_eq!(apt_marker_age_days("2026-09-08\n7\n", TODAY), Some((8, 7)));
+        assert_eq!(
+            apt_marker_age_days("2026-09-16\n", TODAY),
+            Some((0, APT_INDICES_DEFAULT_MAX_AGE_DAYS)),
+            "missing policy line falls back to the default"
+        );
+        assert_eq!(
+            apt_marker_age_days("2026-09-16\n0\n", TODAY),
+            Some((0, APT_INDICES_DEFAULT_MAX_AGE_DAYS)),
+            "zero policy is garbage, not instant-stale"
+        );
+    }
+
+    #[test]
+    fn apt_marker_rejects_impossible_dates() {
+        const TODAY: u64 = 20712;
+        for bad in [
+            "",
+            "yesterday\n7\n",
+            "2026-13-01\n7\n",
+            "2026-02-30\n7\n",
+            "2023-02-29\n7\n",
+        ] {
+            assert_eq!(apt_marker_age_days(bad, TODAY), None, "{bad:?}");
+        }
+        // Leap day parses; future bakes saturate at age zero.
+        assert_eq!(
+            apt_marker_age_days("2024-02-29\n7\n", TODAY),
+            Some((TODAY - 19782, 7))
+        );
+        assert_eq!(apt_marker_age_days("2026-09-20\n7\n", TODAY), Some((0, 7)));
     }
 
     #[test]

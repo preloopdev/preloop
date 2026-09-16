@@ -285,13 +285,22 @@ pub async fn run_steps(
         // with a red job, no step output, and the reason in a `warn!` that
         // never leaves the guest.
         let mut init_logs = Vec::new();
-        let init_result = initialize_containers(
-            container_spec,
-            service_specs,
-            workspace,
-            job,
-            &mut init_logs,
-        )
+        // The daemon boots in the background from provisioning and is
+        // usually up long before this point; only a job paired immediately
+        // after provisioning can arrive first. Wait here rather than at
+        // provision time so plain jobs never pay the cold boot.
+        let init_result = super::container_ops::wait_for_daemon_ready(&mut init_logs).await;
+        let init_result = async {
+            init_result?;
+            initialize_containers(
+                container_spec,
+                service_specs,
+                workspace,
+                job,
+                &mut init_logs,
+            )
+            .await
+        }
         .await;
         if let Err(error) = &init_result {
             init_logs.push(format!("##[error]{error:#}"));

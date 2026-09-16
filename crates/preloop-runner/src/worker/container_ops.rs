@@ -874,6 +874,45 @@ async fn docker_registry_login(
 
 // ── Internal helpers ─────────────────────────────────────────────────
 
+/// Wait for the container daemon that provisioning boots in the background.
+///
+/// The orchestrator no longer gates runner readiness on the 5-15 s dockerd
+/// cold boot, so a container job paired immediately after provisioning can
+/// reach setup before the daemon answers. Poll `docker info` (the same
+/// readiness definition the start script uses) until it succeeds or the
+/// timeout elapses; only container setup calls this, so plain jobs and
+/// ad-hoc `docker` steps never wait here.
+pub(crate) async fn wait_for_daemon_ready(log: &mut Vec<String>) -> Result<()> {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    log.push(
+        "Waiting for the container daemon (booted in background at provision time)".to_string(),
+    );
+    let start = std::time::Instant::now();
+    loop {
+        let ready = process::invoke(
+            "docker",
+            &["info"],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .map(|output| output.exit_code == 0)
+        .unwrap_or(false);
+        if ready {
+            log.push("Container daemon is ready".to_string());
+            return Ok(());
+        }
+        if start.elapsed() >= TIMEOUT {
+            anyhow::bail!("container daemon did not become ready within 90s");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Run a docker command, logging the command line, and return stdout lines.
 async fn docker_cmd(args: &[&str], log: &mut Vec<String>) -> Result<Vec<String>> {
     let cmd_line = format!("/usr/bin/docker {}", args.join(" "));
