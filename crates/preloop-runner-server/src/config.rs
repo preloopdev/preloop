@@ -307,11 +307,32 @@ pub enum CheckoutCacheMode {
     Repository,
 }
 
+/// Lenient mode deserialization for the config file: an unknown value warns
+/// and falls back to `off` (no retention) instead of refusing to boot. Off
+/// is the safe state — unlike secret handling, there is nothing dangerous
+/// about retaining less — so a typo must cost caching, never startup.
+fn de_checkout_cache_mode<'de, D>(deserializer: D) -> Result<CheckoutCacheMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match parse_checkout_cache_mode(&raw) {
+        Ok(mode) => Ok(mode),
+        Err(_) => {
+            tracing::warn!(
+                "unknown checkout cache mode `{raw}` in config file; falling back to `off`"
+            );
+            Ok(CheckoutCacheMode::Off)
+        }
+    }
+}
+
 /// Effective checkout-cache configuration. Durations are seconds so the file,
 /// environment, native API, and eventual UI share one unambiguous wire shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CheckoutCacheConfig {
+    #[serde(default, deserialize_with = "de_checkout_cache_mode")]
     pub mode: CheckoutCacheMode,
     pub run_retention_seconds: u64,
     pub repository_retention_seconds: u64,
@@ -370,8 +391,9 @@ pub const CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV: &str =
     "PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS";
 pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES";
 
-/// Parse a checkout-cache mode. Unknown values are an error: a typo must never
-/// silently turn source retention on (or off).
+/// Parse a checkout-cache mode. Unknown values are an error from the parser;
+/// every caller warns and falls back to `off`, so a typo never silently
+/// turns source retention on and never blocks startup either.
 pub fn parse_checkout_cache_mode(raw: &str) -> anyhow::Result<CheckoutCacheMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" => Ok(CheckoutCacheMode::Off),
@@ -384,15 +406,23 @@ pub fn parse_checkout_cache_mode(raw: &str) -> anyhow::Result<CheckoutCacheMode>
 }
 
 /// Resolve checkout-cache configuration with environment variables taking
-/// precedence. Invalid opt-in values fail startup instead of silently changing
-/// source-retention policy.
+/// precedence. An unknown mode warns and falls back to `off`: off retains
+/// nothing, so a typo costs caching, never startup.
 pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCacheConfig> {
     let mut effective = config.checkout_cache.clone();
     if let Some(raw) = std::env::var(CHECKOUT_CACHE_MODE_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        effective.mode = parse_checkout_cache_mode(&raw)?;
+        effective.mode = match parse_checkout_cache_mode(&raw) {
+            Ok(mode) => mode,
+            Err(_) => {
+                tracing::warn!(
+                    "{CHECKOUT_CACHE_MODE_ENV} has unknown mode `{raw}`; falling back to `off`"
+                );
+                CheckoutCacheMode::Off
+            }
+        };
     }
     for (name, target) in [
         (
@@ -431,7 +461,7 @@ mod checkout_cache_tests {
     }
 
     #[test]
-    fn checkout_cache_modes_parse_and_typos_fail_closed() {
+    fn checkout_cache_modes_parse_and_typos_fall_back_to_off() {
         let config: ConfigFile = toml::from_str(
             r#"
 [checkout_cache]
@@ -454,7 +484,26 @@ run_retention_seconds = 60
         );
         assert!(parse_checkout_cache_mode("run scoped").is_err());
         assert!(parse_checkout_cache_mode("on").is_err());
-        assert!(toml::from_str::<ConfigFile>("[checkout_cache]\nmode = \"everything\"").is_err());
+        // A typo in the file warns and keeps retention off instead of
+        // refusing to boot.
+        let typo: ConfigFile = toml::from_str("[checkout_cache]\nmode = \"everything\"").unwrap();
+        assert_eq!(typo.checkout_cache.mode, CheckoutCacheMode::Off);
+    }
+
+    /// An unknown mode from the environment warns and keeps retention off
+    /// instead of refusing to boot. No other test touches this variable, so
+    /// setting it here cannot race.
+    #[test]
+    fn checkout_cache_unknown_env_mode_falls_back_to_off() {
+        let prior = std::env::var(CHECKOUT_CACHE_MODE_ENV).ok();
+        std::env::set_var(CHECKOUT_CACHE_MODE_ENV, "everything");
+        let effective =
+            checkout_cache_config(&ConfigFile::default()).expect("fallback is not an error");
+        assert_eq!(effective.mode, CheckoutCacheMode::Off);
+        match prior {
+            Some(value) => std::env::set_var(CHECKOUT_CACHE_MODE_ENV, value),
+            None => std::env::remove_var(CHECKOUT_CACHE_MODE_ENV),
+        }
     }
 }
 

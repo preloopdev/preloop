@@ -150,8 +150,9 @@ shared, read-only, and only through the engine's authenticated Git endpoint.
 
 The same keys live under `[checkout_cache]` in the config file
 (`mode`, `run_retention_seconds`, `repository_retention_seconds`, `max_bytes`);
-the environment wins, and an unknown mode fails startup rather than silently
-changing retention. `GET /api/v1/config/checkout-cache` (native bearer) returns
+the environment wins, and an unknown mode warns and falls back to `off`
+rather than refusing to boot — off retains nothing, so a typo costs caching,
+never startup. `GET /api/v1/config/checkout-cache` (native bearer) returns
 the effective policy.
 
 Objects are namespaced by forge origin, the credential that fetched them (App
