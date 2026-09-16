@@ -2300,10 +2300,35 @@ pub(crate) fn redirect_primary_checkout(
                     || declared_default(name).is_none_or(|default| value != default)
             })
         };
+        // The snapshot holds exactly one commit and no tags. History the
+        // snapshot cannot serve must stay on the forge: an explicit depth
+        // other than the action default of 1, or requested tags. Values the
+        // server cannot evaluate (unresolved expressions) are unprovable
+        // and stay on the forge too. Other inputs are not history and are
+        // judged by the target rules above, never here.
+        let history_compatible = step.inputs.iter().all(|(key, value)| {
+            let depth = key.eq_ignore_ascii_case("fetch-depth");
+            let tags = key.eq_ignore_ascii_case("fetch-tags");
+            if !depth && !tags {
+                return true;
+            }
+            let value = value.as_str().trim();
+            if value.is_empty() {
+                return true;
+            }
+            if value.contains("${{") {
+                return false;
+            }
+            if depth {
+                return value == "1";
+            }
+            value.eq_ignore_ascii_case("false") || value == "0"
+        });
         if !is_checkout
             || ["repository", "ref", "github-server-url"]
                 .iter()
                 .any(|reserved| explicitly_set(reserved))
+            || !history_compatible
         {
             continue;
         }
@@ -3024,14 +3049,52 @@ mod deepen_and_redirect_tests {
         );
         // Absent and empty inputs keep the default-branch redirect.
         assert_eq!(
-            redirect_count(serde_json::json!({"fetch-depth": "0"})),
+            redirect_count(serde_json::json!({"fetch-depth": "1"})),
             1,
             "an absent ref/repository is default-branch semantics"
         );
         assert_eq!(
-            redirect_count(serde_json::json!({"ref": "", "fetch-depth": "0"})),
+            redirect_count(serde_json::json!({"ref": "", "fetch-depth": "1"})),
             1,
             "an empty ref is default-branch semantics"
+        );
+    }
+
+    /// The snapshot holds one commit and no tags, so history it cannot
+    /// serve must stay on the forge: full or deeper fetches and tag
+    /// requests are left for the forge, while the action default (depth 1,
+    /// no tags) redirects.
+    #[test]
+    fn redirect_leaves_history_requests_on_the_forge() {
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-depth": "0"})),
+            0,
+            "unlimited history cannot come from a single-commit snapshot"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-depth": "5"})),
+            0,
+            "deeper history cannot come from a single-commit snapshot"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-tags": "true"})),
+            0,
+            "tags are absent from the snapshot and must come from the forge"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-depth": "1"})),
+            1,
+            "the action default depth matches the snapshot"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-tags": "false"})),
+            1,
+            "explicitly declining tags matches the snapshot"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"fetch-depth": "${{ inputs.depth }}"})),
+            0,
+            "an unevaluatable depth is unprovable and stays on the forge"
         );
     }
 }

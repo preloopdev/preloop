@@ -20003,7 +20003,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             "id": "00000000-0000-0000-0000-000000000010",
             "name": "checkout",
             "reference": {"name": "Actions/Checkout", "version": "v4", "type": "repository"},
-            "inputs": {"path": "source", "fetch-depth": "0"},
+            "inputs": {"path": "source", "fetch-depth": "1"},
             "continueOnError": false,
             "timeoutInMinutes": null
         },
@@ -20034,7 +20034,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         "id": "00000000-0000-0000-0000-000000000013",
         "name": "token-only checkout",
         "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
-        "inputs": {"token": "submodule-token", "fetch-depth": "0"},
+            "inputs": {"token": "submodule-token", "fetch-depth": "1"},
         "continueOnError": false,
         "timeoutInMinutes": null
     }]));
@@ -20044,7 +20044,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
         // An expression that resolved to nothing means "default branch" —
         // the local snapshot IS the default, so the redirect must apply.
-        "inputs": {"ref": "", "fetch-depth": "0"},
+        "inputs": {"ref": "", "fetch-depth": "1"},
         "continueOnError": false,
         "timeoutInMinutes": null
     }]));
@@ -20104,7 +20104,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     // GitHub App installation token or PAT the snapshot endpoint cannot verify.
     assert_eq!(primary.get("token"), Some(&"local-runtime-jwt".to_owned()));
     assert_eq!(primary.get("path"), Some(&"source".to_owned()));
-    assert_eq!(primary.get("fetch-depth"), Some(&"0".to_owned()));
+    assert_eq!(primary.get("fetch-depth"), Some(&"1".to_owned()));
     assert_eq!(message.steps[1].inputs, original_explicit);
     assert_eq!(message.steps[2].inputs, original_non_checkout);
     assert!(
