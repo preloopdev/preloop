@@ -133,6 +133,41 @@ or commit the fallback file.
 | `PRELOOP_GITHUB_SERVER_URL` / `_API_URL` / `_GRAPHQL_URL` | Point at GitHub Enterprise Server |
 | `PRELOOP_GITHUB_REPOSITORY` | Repository the scheduler scans for `schedule:` workflows at startup |
 
+### Checkout cache
+
+Off by default: every job fetches its own checkout straight from the forge, and
+the engine retains no repository objects. The opt-in modes trade that retention
+for one upstream fetch instead of one per job. Each job still gets a private,
+writable checkout in its own disposable VM; only the immutable Git objects are
+shared, read-only, and only through the engine's authenticated Git endpoint.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_CHECKOUT_CACHE_MODE` | `off` | `off`, `run-scoped` (fetch the run's commit once, keep it for the retry window), or `repository` (keep objects across runs) |
+| `PRELOOP_CHECKOUT_CACHE_RUN_RETENTION_SECONDS` | `3600` | How long a finished run's objects survive for reruns and late retries |
+| `PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS` | `604800` | Idle age at which a repository cache is dropped |
+| `PRELOOP_CHECKOUT_CACHE_MAX_BYTES` | `100 GiB` | Ceiling across both caches; oldest entries are evicted first |
+
+The same keys live under `[checkout_cache]` in the config file
+(`mode`, `run_retention_seconds`, `repository_retention_seconds`, `max_bytes`);
+the environment wins, and an unknown mode fails startup rather than silently
+changing retention. `GET /api/v1/config/checkout-cache` (native bearer) returns
+the effective policy.
+
+Objects are namespaced by forge origin, the credential that fetched them (App
+installation, or a PAT fingerprint), and the repository's numeric id — never by
+`owner/repo` or commit sha, so a rename cannot cross namespaces and two
+installations never share one cache. A future tenant id is an additional outer
+boundary: adding it starts a cold cache instead of sharing pre-tenant objects.
+Jobs read a cache only by presenting their own `ACTIONS_RUNTIME_TOKEN`, which
+the engine resolves to a live job in that exact run; cache writes are
+control-plane only. Anything the engine cannot prove — no numeric repository
+id, a non-immutable ref, an explicit `repository:`/`ref:` on the checkout step,
+a private repository with no usable credential, or any cache failure — falls
+back to a direct forge checkout. Caching is an accelerator, never a
+prerequisite. Objects are stored as ordinary files: put the state directory on
+an encrypted volume if source retention needs encryption at rest.
+
 ### Runner pool
 
 | Variable | Default | Meaning |

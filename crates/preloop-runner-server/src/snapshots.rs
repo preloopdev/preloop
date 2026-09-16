@@ -1,9 +1,9 @@
-//! Immutable local-workspace snapshots exposed as Git repositories.
+//! Immutable checkout snapshots exposed as Git repositories.
 //!
-//! A local submission is captured as a synthetic root commit. The server then
-//! exposes the resulting bare repository over Git smart HTTP so an unmodified
-//! `actions/checkout` step can fetch the exact local tree through supported
-//! checkout inputs. No runner-specific job-message extension is required.
+//! Local submissions capture a synthetic commit. Opt-in remote checkout
+//! caching fetches a webhook run's immutable commit once, then exposes the
+//! resulting bare repository over Git smart HTTP so each job still receives a
+//! private writable checkout through the unmodified `actions/checkout`.
 
 use super::*;
 use axum::body::{to_bytes, Body};
@@ -19,8 +19,29 @@ use tokio_util::io::ReaderStream;
 const SNAPSHOT_REF: &str = "refs/heads/snapshot";
 const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
-/// The checkout coordinates for one immutable workspace snapshot.
+/// Storage lifetime for one snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SnapshotSource {
+    #[default]
+    LocalWorkspace,
+    RemoteRunScoped,
+    RemoteRepository,
+}
+
+/// Security namespace for remote Git objects. `tenant_id` is deliberately
+/// present before first-class tenancy: adding it later creates a cold namespace
+/// rather than sharing pre-tenant objects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckoutCacheNamespace {
+    pub(crate) tenant_id: Option<String>,
+    pub(crate) provider_origin: String,
+    pub(crate) credential_domain: String,
+    pub(crate) repository_id: String,
+}
+
+/// The checkout coordinates for one immutable workspace snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WorkspaceSnapshot {
     pub(crate) commit_sha: String,
     /// Tree of the snapshot commit — the exact tree the run tests. A
@@ -50,6 +71,14 @@ pub(crate) struct WorkspaceSnapshot {
     /// created after the timing instrumentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) snapshot_timing: Option<crate::models::SnapshotTiming>,
+    /// Physical bare repository relative to the state directory. Older local
+    /// snapshots derive this from `repository`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) storage_repository: Option<String>,
+    #[serde(default)]
+    pub(crate) source: SnapshotSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_namespace: Option<CheckoutCacheNamespace>,
 }
 
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
@@ -165,7 +194,196 @@ pub(crate) async fn create_workspace_snapshot(
         default_branch,
         before_sha,
         snapshot_timing: timing,
+        storage_repository: None,
+        source: SnapshotSource::LocalWorkspace,
+        cache_namespace: None,
     })
+}
+
+/// Fetch a webhook run's immutable commit into the configured checkout cache.
+///
+/// The control plane alone writes this repository. Jobs only reach it through
+/// [`snapshot_git_http`], authenticated by their Actions runtime token.
+pub(crate) async fn create_remote_checkout_snapshot(
+    shared: &SharedState,
+    submission: &preloop_gha_protocol::WorkflowSubmission,
+    run_id: RunId,
+    commit_sha: &str,
+) -> Result<Option<WorkspaceSnapshot>, ApiError> {
+    use crate::config::CheckoutCacheMode;
+    use sha2::Digest;
+
+    let mode = shared.state.checkout_cache.mode;
+    if mode == CheckoutCacheMode::Off || submission.local_workspace.is_some() {
+        return Ok(None);
+    }
+    if !(40..=64).contains(&commit_sha.len())
+        || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(None);
+    }
+    let Some(repository_id) = submission
+        .payload
+        .pointer("/repository/id")
+        .and_then(|value| value.as_u64())
+        .filter(|id| *id > 0)
+        .map(|id| id.to_string())
+    else {
+        return Ok(None);
+    };
+    let repository_private = submission
+        .payload
+        .pointer("/repository/private")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    let mut upstream_token = None;
+    let credential_domain = if let Some(app) =
+        crate::github_app::select_app_for_repo(shared, &submission.repository).await
+    {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        let token =
+            crate::github_app::get_or_mint_token(&app, &submission.repository, &permissions)
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("failed to mint checkout-cache token: {error:#}"))
+                })?;
+        let Some(entry) = app.mint_ledger.lookup(&token) else {
+            return Ok(None);
+        };
+        upstream_token = Some(token);
+        format!("app-{}-installation-{}", app.app_id, entry.installation_id)
+    } else if let Some(token) = shared.state.static_github_pat() {
+        let fingerprint = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
+        upstream_token = Some(token);
+        format!("pat-{fingerprint}")
+    } else if !repository_private {
+        "public".to_owned()
+    } else {
+        return Ok(None);
+    };
+
+    let namespace = CheckoutCacheNamespace {
+        tenant_id: None,
+        provider_origin: shared.state.github_urls.server_url.clone(),
+        credential_domain,
+        repository_id,
+    };
+    let namespace_json = serde_json::to_vec(&namespace).map_err(|error| {
+        ApiError::internal(format!("failed to encode cache namespace: {error}"))
+    })?;
+    let namespace_key = format!("{:x}", sha2::Sha256::digest(namespace_json));
+    let (repository, lock) = match mode {
+        CheckoutCacheMode::Off => return Ok(None),
+        CheckoutCacheMode::RunScoped => {
+            let root = shared.state.state_dir.join("checkout-cache/runs");
+            (
+                root.join(format!("{run_id}.git")),
+                root.join(format!("{run_id}.lock")),
+            )
+        }
+        CheckoutCacheMode::Repository => {
+            let root = shared.state.state_dir.join("checkout-cache/repositories");
+            (
+                root.join(format!("{namespace_key}.git")),
+                root.join(format!("{namespace_key}.lock")),
+            )
+        }
+    };
+    let parent = repository
+        .parent()
+        .ok_or_else(|| ApiError::internal("checkout cache repository has no parent"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to create checkout cache: {error}")))?;
+    let _guard = acquire_cache_lock(&lock).await?;
+
+    if !repository.is_dir() {
+        let mut init = Command::new("git");
+        init.arg("init").arg("--bare").arg(&repository);
+        run_git(&mut init, "initialize remote checkout cache").await?;
+    }
+
+    let upstream = format!(
+        "{}/{}.git",
+        shared.state.github_urls.server_url.trim_end_matches('/'),
+        submission.repository
+    );
+    let mut fetch = Command::new("git");
+    fetch
+        .arg("--git-dir")
+        .arg(&repository)
+        .arg("fetch")
+        .arg("--no-tags")
+        .arg("--depth=1")
+        .arg(&upstream)
+        .arg(commit_sha)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(token) = upstream_token.as_deref() {
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+        fetch
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                format!("Authorization: basic {credentials}"),
+            );
+    }
+    run_git(&mut fetch, "fetch remote checkout snapshot").await?;
+
+    let snapshot_ref = format!("refs/preloop/runs/{run_id}");
+    let mut update_ref = Command::new("git");
+    update_ref
+        .arg("--git-dir")
+        .arg(&repository)
+        .arg("update-ref")
+        .arg(&snapshot_ref)
+        .arg(commit_sha);
+    run_git(&mut update_ref, "publish remote checkout snapshot").await?;
+    let mut configure = Command::new("git");
+    configure
+        .arg("--git-dir")
+        .arg(&repository)
+        .arg("config")
+        .arg("uploadpack.allowAnySHA1InWant")
+        .arg("true");
+    run_git(&mut configure, "configure remote checkout cache").await?;
+
+    let mut tree = Command::new("git");
+    tree.arg("--git-dir")
+        .arg(&repository)
+        .arg("rev-parse")
+        .arg(format!("{commit_sha}^{{tree}}"));
+    let tree_sha = output_text(
+        &run_git(&mut tree, "resolve remote checkout tree").await?,
+        "resolve remote checkout tree",
+    )?;
+    let storage_repository = repository
+        .strip_prefix(&shared.state.state_dir)
+        .map_err(|_| ApiError::internal("checkout cache escaped state directory"))?
+        .to_string_lossy()
+        .to_string();
+    Ok(Some(WorkspaceSnapshot {
+        commit_sha: commit_sha.to_owned(),
+        tree_sha,
+        head_sha: Some(commit_sha.to_owned()),
+        repository: format!("snapshots/{run_id}"),
+        default_branch: submission
+            .payload
+            .pointer("/repository/default_branch")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        before_sha: None,
+        snapshot_timing: None,
+        storage_repository: Some(storage_repository),
+        source: match mode {
+            CheckoutCacheMode::RunScoped => SnapshotSource::RemoteRunScoped,
+            CheckoutCacheMode::Repository => SnapshotSource::RemoteRepository,
+            CheckoutCacheMode::Off => unreachable!(),
+        },
+        cache_namespace: Some(namespace),
+    }))
 }
 
 /// Object-count and stored-size statistics for a snapshot repository.
@@ -1752,6 +1970,188 @@ pub(crate) async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId
     }
 }
 
+/// Marker file recording when a run-scoped cache became releasable.
+const RELEASED_MARKER: &str = "preloop-released-at";
+
+/// Release a finished run's remote checkout cache.
+///
+/// Run-scoped caches are marked rather than deleted: a retry window needs the
+/// objects, and [`prune_checkout_cache`] collects them once the configured
+/// retention elapses. Repository caches only drop the run's ref; the shared
+/// objects are the whole point of that mode.
+pub(crate) async fn release_remote_checkout_snapshot(
+    state_dir: &FsPath,
+    snapshot: &WorkspaceSnapshot,
+    run_id: RunId,
+) {
+    let Some(relative) = snapshot.storage_repository.as_deref() else {
+        return;
+    };
+    let repository = state_dir.join(relative);
+    match snapshot.source {
+        SnapshotSource::LocalWorkspace => {}
+        SnapshotSource::RemoteRunScoped => {
+            let marker = repository.join(RELEASED_MARKER);
+            if let Err(error) = tokio::fs::write(&marker, crate::store::now_us().to_string()).await
+            {
+                warn!(
+                    %run_id,
+                    path = %marker.display(),
+                    %error,
+                    "Failed to mark run-scoped checkout cache releasable"
+                );
+            }
+        }
+        SnapshotSource::RemoteRepository => {
+            let mut delete = Command::new("git");
+            delete
+                .arg("--git-dir")
+                .arg(&repository)
+                .arg("update-ref")
+                .arg("-d")
+                .arg(format!("refs/preloop/runs/{run_id}"));
+            if let Err(error) = run_git(&mut delete, "release repository checkout ref").await {
+                debug!(%run_id, error = ?error, "Failed to drop repository checkout ref");
+            }
+        }
+    }
+}
+
+/// Collect expired checkout caches and enforce the configured size ceiling.
+///
+/// Run-scoped entries go once their release marker ages past the run
+/// retention; an entry that never terminalized is still bounded by the same
+/// window measured from its own mtime, so a lost completion cannot leak a
+/// repository forever. Repository entries expire on idle age, then the
+/// largest-first sweep brings total bytes under `max_bytes`.
+pub(crate) async fn prune_checkout_cache(
+    state_dir: &FsPath,
+    config: &crate::config::CheckoutCacheConfig,
+) {
+    let root = state_dir.join("checkout-cache");
+    let run_retention = std::time::Duration::from_secs(config.run_retention_seconds);
+    let repository_retention = std::time::Duration::from_secs(config.repository_retention_seconds);
+    // A run whose completion never landed has no marker; bound it by the same
+    // retention applied to the repository itself, with a floor so a tiny
+    // configured retention cannot delete a cache a live run is still using.
+    let orphan_retention = run_retention.max(std::time::Duration::from_secs(6 * 60 * 60));
+
+    for (directory, expiry, marker_required) in [
+        (root.join("runs"), run_retention, true),
+        (root.join("repositories"), repository_retention, false),
+    ] {
+        let mut entries = match tokio::fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn!(path = %directory.display(), %error, "Failed to scan checkout cache");
+                continue;
+            }
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("git") {
+                continue;
+            }
+            let age = if marker_required {
+                match tokio::fs::read(path.join(RELEASED_MARKER)).await {
+                    Ok(_) => entry_age(&path.join(RELEASED_MARKER)).await,
+                    Err(_) => entry_age(&path).await.filter(|age| *age > orphan_retention),
+                }
+            } else {
+                entry_age(&path).await
+            };
+            if age.is_some_and(|age| age > expiry) {
+                remove_cache_entry(&path).await;
+            }
+        }
+    }
+
+    if config.max_bytes == 0 {
+        return;
+    }
+    let mut sized: Vec<(PathBuf, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    for directory in [root.join("runs"), root.join("repositories")] {
+        let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("git") {
+                continue;
+            }
+            let bytes = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || directory_bytes(&path))
+                    .await
+                    .unwrap_or(0)
+            };
+            total = total.saturating_add(bytes);
+            sized.push((path, bytes));
+        }
+    }
+    if total <= config.max_bytes {
+        return;
+    }
+    // Oldest first: a cache nobody has touched recently is the cheapest one to
+    // lose, and every eviction only costs the next run an upstream fetch.
+    let mut ordered: Vec<(PathBuf, u64, std::time::Duration)> = Vec::new();
+    for (path, bytes) in sized {
+        let age = entry_age(&path).await.unwrap_or_default();
+        ordered.push((path, bytes, age));
+    }
+    ordered.sort_by_key(|(_, _, age)| std::cmp::Reverse(*age));
+    for (path, bytes, _) in ordered {
+        if total <= config.max_bytes {
+            break;
+        }
+        remove_cache_entry(&path).await;
+        total = total.saturating_sub(bytes);
+    }
+}
+
+async fn entry_age(path: &FsPath) -> Option<std::time::Duration> {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+}
+
+async fn remove_cache_entry(path: &FsPath) {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => debug!(path = %path.display(), "Evicted checkout cache entry"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %path.display(),
+            %error,
+            "Failed to evict checkout cache entry"
+        ),
+    }
+}
+
+fn directory_bytes(path: &FsPath) -> u64 {
+    let mut total: u64 = 0;
+    let mut pending = vec![path.to_owned()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
+}
+
 impl Drop for CacheLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.0);
@@ -1981,7 +2381,7 @@ pub(crate) async fn snapshot_git_http(
     let token = authorization_header
         .as_deref()
         .and_then(snapshot_authorization_token);
-    let authorization = match token {
+    let storage_repository = match token {
         Some(token) => authorize_snapshot_token(&shared.state, &token, run_id).await,
         None => Err(ApiError::unauthorized(
             "snapshot Git authentication required",
@@ -1991,14 +2391,13 @@ pub(crate) async fn snapshot_git_http(
     // username ("could not read Username ... terminal prompts disabled").
     // The Bearer challenge tells git the failure is an authentication
     // rejection, so it reports it instead of prompting.
-    if let Err(error) = authorization {
-        return if error.status() == StatusCode::UNAUTHORIZED {
-            Ok(snapshot_unauthorized_response(error.message()))
-        } else {
-            Err(error)
-        };
-    }
-
+    let storage_repository = match storage_repository {
+        Ok(repository) => repository,
+        Err(error) if error.status() == StatusCode::UNAUTHORIZED => {
+            return Ok(snapshot_unauthorized_response(error.message()));
+        }
+        Err(error) => return Err(error),
+    };
     let method = request.method().clone();
     let query = request.uri().query().unwrap_or_default().to_owned();
     let lfs_object_oid = lfs_object_oid_from_path(&path);
@@ -2013,12 +2412,11 @@ pub(crate) async fn snapshot_git_http(
         return Err(ApiError::not_found("snapshot Git endpoint not found"));
     }
 
-    let project_root = shared.state.state_dir.join("snapshots");
-    let repository = project_root.join(run_id.to_string());
+    let project_root = &shared.state.state_dir;
+    let repository = project_root.join(&storage_repository);
     if !repository.is_dir() {
-        return Err(ApiError::not_found("workspace snapshot not found"));
+        return Err(ApiError::not_found("checkout snapshot not found"));
     }
-
     if let Some(oid) = lfs_object_oid {
         return serve_lfs_object(&repository, oid).await;
     }
@@ -2086,11 +2484,10 @@ pub(crate) async fn snapshot_git_http(
     let mut command = Command::new("git");
     command
         .arg("http-backend")
-        .env("GIT_PROJECT_ROOT", &project_root)
+        .env("GIT_PROJECT_ROOT", project_root)
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("REQUEST_METHOD", method.as_str())
-        .env("PATH_INFO", format!("/{run_id}/{path}"))
-        .env("QUERY_STRING", query)
+        .env("PATH_INFO", format!("/{storage_repository}/{path}"))
         .env("REMOTE_USER", "preloop-runner")
         .env("CONTENT_LENGTH", request_body.len().to_string())
         .stdin(Stdio::piped())
@@ -2217,7 +2614,7 @@ async fn authorize_snapshot_token(
     state: &AppState,
     token: &str,
     run_id: RunId,
-) -> Result<(), ApiError> {
+) -> Result<String, ApiError> {
     let identity = match crate::auth::results_identity(state, token) {
         Ok(crate::auth::ResultsIdentity::Job(identity)) => identity,
         Ok(crate::auth::ResultsIdentity::System) => {
@@ -2241,23 +2638,33 @@ async fn authorize_snapshot_token(
     };
 
     let inner = state.inner.lock().await;
-    let belongs_to_run = inner
+    let Some(request) = inner
         .agent_job_requests
         .get(&identity.job_id)
         .and_then(|request_id| inner.job_requests.get(request_id))
-        .is_some_and(|request| {
-            request.run_id == run_id
-                && request.plan_id == identity.plan_id
-                && request.agent_job_id == identity.job_id
-        });
-    if !belongs_to_run {
+    else {
+        return Err(ApiError::forbidden(
+            "snapshot Git token is not bound to a live job",
+        ));
+    };
+    if request.run_id != run_id
+        || request.plan_id != identity.plan_id
+        || request.agent_job_id != identity.job_id
+    {
         return Err(ApiError::forbidden(
             "snapshot Git token does not belong to this run",
         ));
     }
-    Ok(())
+    let snapshot = inner
+        .runs
+        .get(&run_id)
+        .and_then(|run| run.workspace_snapshot.as_ref())
+        .ok_or_else(|| ApiError::not_found("checkout snapshot not found"))?;
+    Ok(snapshot
+        .storage_repository
+        .clone()
+        .unwrap_or_else(|| snapshot.repository.clone()))
 }
-
 fn snapshot_authorization_token(value: &str) -> Option<String> {
     let (scheme, credentials) = value.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") {
@@ -2550,6 +2957,7 @@ mod deepen_and_redirect_tests {
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
             snapshot_timing: None,
+            ..Default::default()
         }
     }
 
@@ -2707,5 +3115,265 @@ mod lfs_batch_tests {
 
         let response = lfs_batch_response(&repository, run_id, None, body.as_bytes()).unwrap();
         assert_eq!(response["objects"][0]["error"]["code"], 403);
+    }
+}
+
+#[cfg(test)]
+mod remote_checkout_cache_tests {
+    use super::*;
+
+    fn git(directory: &FsPath, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .env("GIT_AUTHOR_NAME", "preloop")
+            .env("GIT_AUTHOR_EMAIL", "preloop@example.com")
+            .env("GIT_COMMITTER_NAME", "preloop")
+            .env("GIT_COMMITTER_EMAIL", "preloop@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            status.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    /// A bare `owner/repo.git` under `root`, carrying one commit, addressable
+    /// as `{root}/owner/repo.git` — the shape the cache builds from
+    /// `github.server_url`.
+    fn upstream_repository(root: &FsPath) -> String {
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "cached\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "cached commit"]);
+        let bare = root.join("owner/repo.git");
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        git(
+            root,
+            &[
+                "clone",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        String::from_utf8(head.stdout).unwrap().trim().to_owned()
+    }
+
+    fn submission(commit: &str) -> preloop_gha_protocol::WorkflowSubmission {
+        preloop_gha_protocol::WorkflowSubmission {
+            repository: "owner/repo".to_owned(),
+            event: "push".to_owned(),
+            sha: commit.to_owned(),
+            payload: serde_json::json!({
+                "repository": {
+                    "id": 4242,
+                    "private": false,
+                    "default_branch": "main"
+                }
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn fixture(
+        mode: crate::config::CheckoutCacheMode,
+    ) -> (tempfile::TempDir, Arc<SharedState>, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let upstream_root = temp.path().join("upstream");
+        std::fs::create_dir_all(&upstream_root).unwrap();
+        let commit = upstream_repository(&upstream_root);
+        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        state.checkout_cache = crate::config::CheckoutCacheConfig {
+            mode,
+            ..Default::default()
+        };
+        state.github_urls.server_url = upstream_root.to_string_lossy().to_string();
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        (temp, shared, commit)
+    }
+
+    /// Off is the default and must stay a pure no-op: nothing is fetched and no
+    /// repository source is written to the state directory.
+    #[tokio::test]
+    async fn disabled_mode_caches_nothing() {
+        let (_temp, shared, commit) = fixture(crate::config::CheckoutCacheMode::Off).await;
+        let run_id: RunId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let snapshot =
+            create_remote_checkout_snapshot(&shared, &submission(&commit), run_id, &commit)
+                .await
+                .expect("disabled mode is not an error");
+        assert!(snapshot.is_none());
+        assert!(!shared.state.state_dir.join("checkout-cache").exists());
+    }
+
+    /// One upstream fetch per run attempt yields a servable snapshot of exactly
+    /// the requested commit, and every later job in the same run reuses it.
+    #[tokio::test]
+    async fn run_scoped_mode_caches_the_requested_commit() {
+        let (_temp, shared, commit) = fixture(crate::config::CheckoutCacheMode::RunScoped).await;
+        let run_id: RunId = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+        let submission = submission(&commit);
+
+        let snapshot = create_remote_checkout_snapshot(&shared, &submission, run_id, &commit)
+            .await
+            .expect("cache population succeeds")
+            .expect("run-scoped mode caches the commit");
+        assert_eq!(snapshot.commit_sha, commit);
+        assert_eq!(snapshot.source, SnapshotSource::RemoteRunScoped);
+        assert_eq!(snapshot.default_branch.as_deref(), Some("main"));
+        let namespace = snapshot
+            .cache_namespace
+            .clone()
+            .expect("namespace recorded");
+        assert_eq!(namespace.repository_id, "4242");
+        assert!(namespace.tenant_id.is_none());
+
+        let repository = shared
+            .state
+            .state_dir
+            .join(snapshot.storage_repository.as_deref().unwrap());
+        assert!(repository.is_dir(), "cache repository exists");
+        let present = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                repository.to_str().unwrap(),
+                "cat-file",
+                "-e",
+                &commit,
+            ])
+            .status()
+            .unwrap();
+        assert!(present.success(), "the requested commit is in the cache");
+
+        // A second job in the same run resolves the same repository instead of
+        // fetching again.
+        let reused = create_remote_checkout_snapshot(&shared, &submission, run_id, &commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused.storage_repository, snapshot.storage_repository);
+    }
+
+    /// Release is not deletion: the retry window keeps the objects, and the
+    /// sweep collects them only once the configured retention has elapsed.
+    #[tokio::test]
+    async fn released_run_cache_survives_retention_then_is_pruned() {
+        let (_temp, shared, commit) = fixture(crate::config::CheckoutCacheMode::RunScoped).await;
+        let run_id: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
+        let snapshot =
+            create_remote_checkout_snapshot(&shared, &submission(&commit), run_id, &commit)
+                .await
+                .unwrap()
+                .unwrap();
+        let repository = shared
+            .state
+            .state_dir
+            .join(snapshot.storage_repository.as_deref().unwrap());
+
+        release_remote_checkout_snapshot(&shared.state.state_dir, &snapshot, run_id).await;
+        assert!(repository.is_dir(), "release must not delete the objects");
+
+        let keep = crate::config::CheckoutCacheConfig {
+            run_retention_seconds: 3_600,
+            ..shared.state.checkout_cache.clone()
+        };
+        prune_checkout_cache(&shared.state.state_dir, &keep).await;
+        assert!(
+            repository.is_dir(),
+            "a cache inside its retention window must be kept"
+        );
+
+        let expire = crate::config::CheckoutCacheConfig {
+            run_retention_seconds: 0,
+            ..shared.state.checkout_cache.clone()
+        };
+        prune_checkout_cache(&shared.state.state_dir, &expire).await;
+        assert!(
+            !repository.exists(),
+            "an expired released cache must be collected"
+        );
+    }
+
+    /// Repository mode keeps the shared objects across runs and only drops the
+    /// finished run's ref.
+    #[tokio::test]
+    async fn repository_mode_keeps_objects_after_release() {
+        let (_temp, shared, commit) = fixture(crate::config::CheckoutCacheMode::Repository).await;
+        let run_id: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
+        let snapshot =
+            create_remote_checkout_snapshot(&shared, &submission(&commit), run_id, &commit)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot.source, SnapshotSource::RemoteRepository);
+        let repository = shared
+            .state
+            .state_dir
+            .join(snapshot.storage_repository.as_deref().unwrap());
+
+        release_remote_checkout_snapshot(&shared.state.state_dir, &snapshot, run_id).await;
+        assert!(repository.is_dir(), "repository caches persist across runs");
+        let refs = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                repository.to_str().unwrap(),
+                "for-each-ref",
+                "--format=%(refname)",
+            ])
+            .output()
+            .unwrap();
+        let refs = String::from_utf8(refs.stdout).unwrap();
+        assert!(
+            !refs.contains(&run_id.to_string()),
+            "the finished run's ref is dropped: {refs}"
+        );
+        let present = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                repository.to_str().unwrap(),
+                "cat-file",
+                "-e",
+                &commit,
+            ])
+            .status()
+            .unwrap();
+        assert!(present.success(), "shared objects outlive the run");
+    }
+
+    /// A repository whose numeric identity the event never carried is not
+    /// cacheable: without it the security namespace cannot be derived, so the
+    /// job falls back to a direct forge checkout.
+    #[tokio::test]
+    async fn missing_repository_identity_is_not_cached() {
+        let (_temp, shared, commit) = fixture(crate::config::CheckoutCacheMode::RunScoped).await;
+        let run_id: RunId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        let mut submission = submission(&commit);
+        submission.payload = serde_json::json!({ "repository": { "private": false } });
+        assert!(
+            create_remote_checkout_snapshot(&shared, &submission, run_id, &commit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // A ref that is not an immutable object id is equally ineligible.
+        let identified = super::remote_checkout_cache_tests::submission(&commit);
+        assert!(
+            create_remote_checkout_snapshot(&shared, &identified, run_id, "main")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

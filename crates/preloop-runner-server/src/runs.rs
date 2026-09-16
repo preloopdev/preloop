@@ -99,6 +99,13 @@ pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoR
     }
     Json(snap).into_response()
 }
+/// Effective checkout-cache policy for operator UIs. The native bearer on the
+/// containing router protects this deployment configuration.
+pub(crate) async fn checkout_cache_config(
+    State(shared): State<Arc<SharedState>>,
+) -> impl IntoResponse {
+    Json(shared.state.checkout_cache.clone())
+}
 
 pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     let body = shared.state.observability.render_metrics();
@@ -863,8 +870,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         None
     };
 
-    // Capture the workspace once per run, before any job is queued. Every
-    // redirected checkout then fetches the same immutable local tree.
+    // Capture one immutable source per run before any job is queued. Local
+    // submissions snapshot the caller's working tree; opt-in remote modes
+    // fetch the webhook commit once for every job in this run.
     let local_workspace = submission
         .local_workspace
         .as_deref()
@@ -886,7 +894,13 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         }
     } else {
-        None
+        match create_remote_checkout_snapshot(shared, &submission, run_id, &sha).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(%run_id, error = ?error, "Failed to populate remote checkout cache — falling back to normal checkout");
+                None
+            }
+        }
     };
 
     // A push-requested submission from a dirty tree carries no explicit
@@ -2192,18 +2206,24 @@ pub(crate) fn build_job_artifacts(
                 job = %job.id,
                 %redirected,
                 commit = %snapshot.commit_sha,
-                "Redirected primary checkout to local workspace snapshot"
+                source = ?snapshot.source,
+                "Redirected primary checkout to immutable snapshot"
             );
             agent_msg.preloop_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
-        // Cover the workflows the checkout redirect cannot reach: anything
-        // that hardcodes the forge URL. Without this a job running unpushed
-        // work fails the moment it fetches its own sha from github.com.
+        // Local-workspace runs test code the forge has never seen, so anything
+        // hardcoding github.com has to be rewritten or the job fails fetching
+        // its own sha. A cached remote checkout is the opposite case: the
+        // commit exists upstream, the cache holds only that commit, and
+        // rewriting the origin would break every legitimate fetch of anything
+        // else.
         let repository = normalized_github
             .get("repository")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
-        if let Some(repository) = repository {
+        if let (Some(repository), crate::snapshots::SnapshotSource::LocalWorkspace) =
+            (repository, snapshot.source)
+        {
             use base64::Engine as _;
             let credentials = base64::engine::general_purpose::STANDARD
                 .encode(format!("x-access-token:{runtime_token}"));
