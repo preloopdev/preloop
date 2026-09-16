@@ -320,15 +320,19 @@ pub(crate) async fn create_remote_checkout_snapshot(
         .arg(commit_sha)
         .env("GIT_TERMINAL_PROMPT", "0");
     if let Some(token) = upstream_token.as_deref() {
-        let credentials =
-            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
-        fetch
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-            .env(
-                "GIT_CONFIG_VALUE_0",
-                format!("Authorization: basic {credentials}"),
+        // Scope the credential to the upstream origin: a command-wide header
+        // would also ride along on redirects to unvouched hosts.
+        if let Some((key, value)) = scoped_fetch_auth_header(&upstream, token) {
+            fetch
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", key)
+                .env("GIT_CONFIG_VALUE_0", value);
+        } else if upstream.contains("://") {
+            warn!(
+                %run_id,
+                "checkout-cache upstream URL has no usable origin; fetching without credentials"
             );
+        }
     }
     run_git(&mut fetch, "fetch remote checkout snapshot").await?;
 
@@ -1876,6 +1880,32 @@ fn sanitize_remote_url(remote_url: &str) -> String {
     format!("{scheme}://{authority}{suffix}")
 }
 
+/// Origin-scoped auth header for the checkout-cache fetch: the credential
+/// rides only to the upstream's own origin. A command-wide `http.extraHeader`
+/// would also be sent on redirects to hosts the operator never vouched for.
+/// Returns `None` for URLs without a usable HTTP(S) authority (local paths
+/// in tests need no auth at all).
+fn scoped_fetch_auth_header(upstream_url: &str, token: &str) -> Option<(String, String)> {
+    let (scheme, rest) = upstream_url.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // Strip userinfo before extracting the host; the port separator must not
+    // truncate a host, and credentials in the URL must not leak into the key.
+    let authority = rest.rsplit('@').next().unwrap_or(rest);
+    let host = authority.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{token}").as_bytes());
+    Some((
+        format!("http.{scheme}://{host}/.extraHeader"),
+        format!("Authorization: basic {encoded}"),
+    ))
+}
+
 /// Extra-header config that authenticates a deepen fetch against the engine's
 /// GitHub credential, or `None` when the remote is not GitHub.
 ///
@@ -1941,7 +1971,21 @@ async fn persist_snapshot_index(staging_index: &FsPath, destination: &FsPath) {
     }
 }
 
-struct CacheLock(PathBuf);
+/// Directory-based mutex for one cache repository. The holder refreshes a
+/// heartbeat file inside the directory while it works: without it a slow
+/// upstream fetch (past the 60s stale takeover) would have its lock stolen
+/// mid-write and share the repository with a second writer. Takeover still
+/// applies to holders that died without cleanup — their heartbeat goes stale
+/// exactly like their lock did before.
+struct CacheLock {
+    dir: PathBuf,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Liveness marker refreshed by the lock holder. Cousin of
+/// [`RELEASED_MARKER`]: presence plus freshness means "owned", absence or
+/// age means "abandoned".
+const LOCK_HEARTBEAT: &str = "preloop-lock-heartbeat";
 
 /// Drop a finished run's snapshot repository.
 ///
@@ -2106,8 +2150,38 @@ pub(crate) async fn prune_checkout_cache(
         if total <= config.max_bytes {
             break;
         }
+        // A ceiling must never break a live checkout: unreleased run caches
+        // and shared repositories that still publish a run ref may be serving
+        // a job right now, and redirected checkouts have no forge fallback.
+        if cache_entry_is_live(&path, &root).await {
+            continue;
+        }
         remove_cache_entry(&path).await;
         total = total.saturating_sub(bytes);
+    }
+}
+
+/// Whether a cache entry may still serve a live run. Run-scoped entries are
+/// live until the release marker lands; shared repositories are live while
+/// any run ref is published. Anything else is retry-window weight the size
+/// sweep may reclaim.
+async fn cache_entry_is_live(path: &FsPath, root: &FsPath) -> bool {
+    if path.starts_with(root.join("runs")) {
+        return tokio::fs::try_exists(path.join(RELEASED_MARKER))
+            .await
+            .map(|exists| !exists)
+            .unwrap_or(true);
+    }
+    let mut refs = Command::new("git");
+    refs.arg("--git-dir")
+        .arg(path)
+        .arg("for-each-ref")
+        .arg("--format=%(refname)")
+        .arg("refs/preloop/runs");
+    match run_git(&mut refs, "list cached run refs").await {
+        Ok(output) => !output.stdout.is_empty(),
+        // An unreadable repository serves nothing; let the sweep reclaim it.
+        Err(_) => false,
     }
 }
 
@@ -2152,24 +2226,58 @@ fn directory_bytes(path: &FsPath) -> u64 {
     total
 }
 
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+impl CacheLock {
+    fn held(path: PathBuf) -> Self {
+        let heartbeat_file = path.join(LOCK_HEARTBEAT);
+        let _ = std::fs::write(&heartbeat_file, "held");
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                if std::fs::write(&heartbeat_file, "held").is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            dir: path,
+            heartbeat: Some(heartbeat),
+        }
     }
 }
 
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        let _ = std::fs::remove_file(self.dir.join(LOCK_HEARTBEAT));
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Freshness of a lock directory: the holder's heartbeat when present, the
+/// directory itself for locks that predate heartbeats or died mid-create.
+fn lock_age(path: &FsPath) -> Option<std::time::Duration> {
+    let marker = path.join(LOCK_HEARTBEAT);
+    let target = if marker.is_file() { &marker } else { path };
+    std::fs::metadata(target)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+}
 async fn acquire_cache_lock(path: &FsPath) -> Result<CacheLock, ApiError> {
     let started = std::time::Instant::now();
     loop {
         match std::fs::create_dir(path) {
-            Ok(()) => return Ok(CacheLock(path.to_owned())),
+            Ok(()) => return Ok(CacheLock::held(path.to_owned())),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > std::time::Duration::from_secs(60));
+                // Freshness comes from the holder's heartbeat, so a slow
+                // fetch is never mistaken for an abandoned lock. Only a
+                // holder that died without cleanup goes stale.
+                let stale =
+                    lock_age(path).is_some_and(|age| age > std::time::Duration::from_secs(60));
                 if stale {
+                    let _ = std::fs::remove_file(path.join(LOCK_HEARTBEAT));
                     let _ = std::fs::remove_dir(path);
                     continue;
                 }
@@ -2513,6 +2621,7 @@ pub(crate) async fn snapshot_git_http(
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("REQUEST_METHOD", method.as_str())
         .env("PATH_INFO", format!("/{storage_repository}/{path}"))
+        .env("QUERY_STRING", query)
         .env("REMOTE_USER", "preloop-runner")
         .env("CONTENT_LENGTH", request_body.len().to_string())
         .stdin(Stdio::piped())
@@ -2830,6 +2939,37 @@ mod auth_scoping_tests {
                 github_auth_header_for_remote(url, "gho_secret"),
                 None,
                 "PAT must not be attached to {url}"
+            );
+        }
+    }
+    #[test]
+    fn fetch_credential_is_scoped_to_the_upstream_origin() {
+        let (key, value) =
+            scoped_fetch_auth_header("https://ghe.example.com/owner/repo.git", "tok").unwrap();
+        assert_eq!(key, "http.https://ghe.example.com/.extraHeader");
+        assert!(value.starts_with("Authorization: basic "));
+        // Ports are part of the origin and survive.
+        let (key, _) =
+            scoped_fetch_auth_header("https://ghe.example.com:8443/owner/repo.git", "tok").unwrap();
+        assert_eq!(key, "http.https://ghe.example.com:8443/.extraHeader");
+        // Userinfo in the URL must not leak into the config key.
+        let (key, _) =
+            scoped_fetch_auth_header("https://user:pass@ghe.example.com/owner/repo.git", "tok")
+                .unwrap();
+        assert_eq!(key, "http.https://ghe.example.com/.extraHeader");
+    }
+
+    #[test]
+    fn fetch_credential_is_withheld_without_usable_origin() {
+        for url in [
+            "git@ghe.example.com:owner/repo.git",
+            "/srv/git/owner/repo.git",
+            "https:///owner/repo.git",
+        ] {
+            assert_eq!(
+                scoped_fetch_auth_header(url, "tok"),
+                None,
+                "no credential without an HTTP(S) origin: {url}"
             );
         }
     }
@@ -3437,6 +3577,105 @@ mod remote_checkout_cache_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+    fn sized_cache_entry(root: &FsPath, relative: &str) -> PathBuf {
+        let dir = root.join(relative);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("objects.bin"), vec![0u8; 100]).unwrap();
+        dir
+    }
+
+    fn sweep_config() -> crate::config::CheckoutCacheConfig {
+        crate::config::CheckoutCacheConfig {
+            mode: crate::config::CheckoutCacheMode::RunScoped,
+            run_retention_seconds: 3_600,
+            repository_retention_seconds: 7 * 24 * 60 * 60,
+            max_bytes: 1,
+        }
+    }
+
+    /// The size ceiling must not break a live checkout: a run cache without
+    /// a release marker may still be serving a job, so the sweep spares it
+    /// even when the ceiling is exceeded.
+    #[tokio::test]
+    async fn size_sweep_spares_unreleased_run_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let entry = sized_cache_entry(&state_dir, "checkout-cache/runs/live.git");
+        prune_checkout_cache(&state_dir, &sweep_config()).await;
+        assert!(entry.is_dir(), "a live run cache must survive the ceiling");
+    }
+
+    /// A released cache inside its retention window is still reclaimable by
+    /// the ceiling: its run is terminal, so nothing can be fetching from it.
+    #[tokio::test]
+    async fn size_sweep_evicts_released_run_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let entry = sized_cache_entry(&state_dir, "checkout-cache/runs/done.git");
+        std::fs::write(entry.join(RELEASED_MARKER), "1").unwrap();
+        prune_checkout_cache(&state_dir, &sweep_config()).await;
+        assert!(
+            !entry.exists(),
+            "a released cache must yield to the ceiling"
+        );
+    }
+
+    /// A shared repository that still publishes a run ref is live no matter
+    /// its idle age; once the last ref is released the ceiling may take it.
+    #[tokio::test]
+    async fn size_sweep_spares_repo_with_live_run_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let entry = state_dir.join("checkout-cache/repositories/shared.git");
+        std::fs::create_dir_all(&entry).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&entry)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let probe = entry.join("probe.bin");
+        std::fs::write(&probe, b"live").unwrap();
+        let run_ref = "refs/preloop/runs/99999999-9999-4999-8999-999999999999";
+        let hash = std::process::Command::new("git")
+            .args(["--git-dir", entry.to_str().unwrap(), "hash-object", "-w"])
+            .arg(&probe)
+            .output()
+            .unwrap();
+        assert!(hash.status.success());
+        let object = String::from_utf8(hash.stdout).unwrap().trim().to_owned();
+        let status = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                entry.to_str().unwrap(),
+                "update-ref",
+                run_ref,
+                object.as_str(),
+            ])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+
+        prune_checkout_cache(&state_dir, &sweep_config()).await;
+        assert!(entry.is_dir(), "a repo with a live run ref must survive");
+
+        let status = std::process::Command::new("git")
+            .args([
+                "--git-dir",
+                entry.to_str().unwrap(),
+                "update-ref",
+                "-d",
+                run_ref,
+            ])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        prune_checkout_cache(&state_dir, &sweep_config()).await;
+        assert!(
+            !entry.exists(),
+            "an unreferenced repo must yield to the ceiling"
         );
     }
 }

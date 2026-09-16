@@ -20983,6 +20983,17 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
         .await
         .unwrap();
     assert_eq!(advertisement.status(), StatusCode::OK);
+    // A real git client only proceeds on the upload-pack advertisement. A
+    // missing query passthrough would answer the dumb text/plain listing
+    // instead, which still names the commit but no client can fetch from.
+    assert_eq!(
+        advertisement
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-git-upload-pack-advertisement"),
+        "the engine must answer smart-HTTP discovery, not the dumb listing"
+    );
     let advertised = to_bytes(advertisement.into_body(), usize::MAX)
         .await
         .unwrap();

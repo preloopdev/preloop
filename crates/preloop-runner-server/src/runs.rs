@@ -929,7 +929,15 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // (`dorny/paths-filter`, `tj-actions/changed-files`) and `actions/checkout`
     // read `payload.repository.default_branch` and `payload.before` to pick
     // their diff base; without them they abort and gate the whole DAG closed.
-    if let Some(snapshot) = &workspace_snapshot {
+    // The synthetic shape below is a local-submission concern: it fabricates
+    // repository/before/head_commit data the forge never sent. A remote
+    // snapshot carries the forge's real event payload, which must reach
+    // workflows untouched — rewriting it would fake pushes, erase real
+    // commit messages, and break changed-file and skip-ci gates.
+    let local_snapshot = workspace_snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace);
+    if let Some(snapshot) = local_snapshot {
         // Payload-less submissions (native local runs) carry `payload: null`;
         // the synthetic push/PR shape below needs an object to mutate, and
         // without it `before`/`after`/`ref`/`head_commit` were silently

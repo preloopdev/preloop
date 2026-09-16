@@ -573,6 +573,29 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
     }
 }
 
+/// Hourly checkout-cache sweep. Retention is otherwise enforced only on run
+/// completion and at startup, so a quiet server would hold expired caches
+/// indefinitely. Best-effort housekeeping, never on a request path.
+async fn run_checkout_cache_pruner(shared: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(3_600));
+    // Skip the first tick: serve() already sweeps once at startup.
+    interval.tick().await;
+    while !shared.shutdown.is_cancelled() {
+        tokio::select! {
+            _ = interval.tick() => {
+                if shared.state.checkout_cache.mode != crate::config::CheckoutCacheMode::Off {
+                    let state_dir = shared.state.state_dir.clone();
+                    let checkout_cache = shared.state.checkout_cache.clone();
+                    crate::snapshots::prune_checkout_cache(&state_dir, &checkout_cache).await;
+                }
+            }
+            _ = shared.shutdown.cancelled() => {
+                break;
+            }
+        }
+    }
+}
+
 /// Everything the operational snapshot reads from `inner`, collected under a
 /// single lock acquisition. The 5s sampler and the startup seed after a store
 /// restore both build their snapshots from this, so the two cannot drift.
@@ -1413,6 +1436,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     }
     // Ensure uptime base is now (AppState::new set it, but re-arm after store load).
     state.started_at = std::time::Instant::now();
+    // Retention is otherwise enforced only when a run completes; a quiet
+    // server with no finishing runs would keep expired caches indefinitely.
+    // Sweep once at startup so expiry does not depend on future completions.
+    if state.checkout_cache.mode != crate::config::CheckoutCacheMode::Off {
+        let state_dir = state.state_dir.clone();
+        let checkout_cache = state.checkout_cache.clone();
+        tokio::spawn(async move {
+            crate::snapshots::prune_checkout_cache(&state_dir, &checkout_cache).await;
+        });
+    }
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -1646,6 +1679,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let checker_shared = shared.clone();
     tokio::spawn(async move {
         run_background_reaper(checker_shared).await;
+    });
+    let cache_pruner_shared = shared.clone();
+    tokio::spawn(async move {
+        run_checkout_cache_pruner(cache_pruner_shared).await;
     });
 
     let webhook_worker_heartbeat = state.observability.heartbeat().clone();
