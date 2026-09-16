@@ -281,6 +281,19 @@ struct LfsFetch<'a> {
     upstream_private: bool,
 }
 
+/// Host (with port) of an HTTP(S) URL, lowercased and without userinfo.
+/// Decides whether a forge-supplied download address may receive the forge
+/// credential: the batch host may, anything else never may. `None` means
+/// unparseable — never equal to anything, not even another `None`.
+fn url_download_host(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.rsplit('@').next().unwrap_or(rest);
+    let host = authority.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
 /// Pull one LFS blob from the forge into the run's cache on first request.
 ///
 /// Returns `true` when the object is now servable from `repository_dir`
@@ -313,10 +326,15 @@ async fn fetch_lfs_object_into_cache(
         "transfers": ["basic"],
         "objects": [{ "oid": oid, "size": expected_size }],
     });
-    let mut batch = client.post(&batch_url).header(
-        reqwest::header::CONTENT_TYPE,
-        "application/json; charset=utf-8",
-    );
+    // The batch media type, both directions: strict forges reject plain
+    // `application/json` with 406/415 even though lenient ones accept it.
+    let mut batch = client
+        .post(&batch_url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/vnd.git-lfs+json",
+        )
+        .header(reqwest::header::ACCEPT, "application/vnd.git-lfs+json");
     if let Some(token) = credential.upstream_token.as_deref() {
         batch = batch.basic_auth("x-access-token", Some(token));
     }
@@ -349,9 +367,20 @@ async fn fetch_lfs_object_into_cache(
         .and_then(|action| action.pointer("/header/Authorization"))
         .and_then(|value| value.as_str())
     {
+        // The forge authorized this exact URL; forward its header as-is.
         download_request = download_request.header(reqwest::header::AUTHORIZATION, authorization);
     } else if let Some(token) = credential.upstream_token.as_deref() {
-        download_request = download_request.basic_auth("x-access-token", Some(token));
+        // Otherwise the engine credential rides only back to the forge that
+        // issued the batch answer — never to presigned storage URLs or any
+        // other host the batch response names.
+        let http_scheme = href.starts_with("http://") || href.starts_with("https://");
+        let same_host = match (url_download_host(href), url_download_host(&batch_url)) {
+            (Some(target), Some(forge)) => target == forge,
+            _ => false,
+        };
+        if same_host && http_scheme {
+            download_request = download_request.basic_auth("x-access-token", Some(token));
+        }
     }
     let mut response = download_request
         .send()
@@ -380,6 +409,10 @@ async fn fetch_lfs_object_into_cache(
         if written > MAX_LFS_OBJECT_BYTES {
             drop(file);
             let _ = tokio::fs::remove_file(&tmp).await;
+            warn!(
+                %oid,
+                "LFS object exceeds the per-object cache cap; leaving uncached"
+            );
             return Ok(false);
         }
         hasher.update(&chunk);
@@ -1608,6 +1641,28 @@ async fn populate_missing_lfs_objects(
     }
     if missing.is_empty() {
         return;
+    }
+    // The ceiling is enforced by the sweep after the fact; check the
+    // projection first so one batch cannot blow past it before any sweep
+    // runs. Sizes are client-claimed, so this is a guard, not accounting —
+    // the per-object cap bounds what actually lands on disk.
+    let max_bytes = fetch.shared.state.checkout_cache.max_bytes;
+    if max_bytes > 0 {
+        let dir = repository.to_owned();
+        let current = tokio::task::spawn_blocking(move || directory_bytes(&dir))
+            .await
+            .unwrap_or(0);
+        let wanted: u64 = missing
+            .iter()
+            .map(|(_, size)| *size)
+            .fold(0, u64::saturating_add);
+        if current.saturating_add(wanted) > max_bytes {
+            warn!(
+                wanted,
+                max_bytes, "LFS populate would exceed the cache ceiling; leaving uncached"
+            );
+            return;
+        }
     }
     let credential = match resolve_cache_upstream_credential(
         fetch.shared,
@@ -4063,6 +4118,7 @@ mod remote_checkout_cache_tests {
             !entry.exists(),
             "an unreferenced repo must yield to the ceiling"
         );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockForge {
@@ -4072,8 +4128,9 @@ mod remote_checkout_cache_tests {
 
     /// A minimal forge LFS endpoint: answers batch with a download address
     /// for the requested oid and serves `blob` there. Anonymous, like a
-    /// public repository.
-    async fn mock_forge(blob: Vec<u8>) -> MockForge {
+    /// public repository. `href_base` overrides where downloads point, so a
+    /// test can aim them at a different host.
+    async fn mock_forge(blob: Vec<u8>, href_base: Option<String>) -> MockForge {
         use axum::extract::{Extension, Path as AxumPath};
         use axum::routing::{get, post};
 
@@ -4086,6 +4143,7 @@ mod remote_checkout_cache_tests {
                 post(
                     |Extension(base): Extension<String>,
                      Extension(hits): Extension<Arc<AtomicUsize>>,
+                     Extension(href_base): Extension<Option<String>>,
                      body: String| async move {
                         hits.fetch_add(1, Ordering::SeqCst);
                         let request: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4096,7 +4154,7 @@ mod remote_checkout_cache_tests {
                                 "oid": oid,
                                 "size": size,
                                 "actions": {
-                                    "download": { "href": format!("{base}/blobs/{oid}") }
+                                    "download": { "href": format!("{}/blobs/{oid}", href_base.as_deref().unwrap_or(&base)) }
                                 }
                             }]
                         }))
@@ -4108,6 +4166,7 @@ mod remote_checkout_cache_tests {
                 get(|AxumPath(_oid): AxumPath<String>| async move { blob }),
             )
             .layer(Extension(base.clone()))
+            .layer(Extension(href_base))
             .layer(Extension(batch_hits.clone()));
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -4120,10 +4179,15 @@ mod remote_checkout_cache_tests {
         format!("{:x}", sha2::Sha256::digest(contents))
     }
 
-    async fn lfs_state(temp: &tempfile::TempDir, forge_base: &str) -> Arc<SharedState> {
+    async fn lfs_state(
+        temp: &tempfile::TempDir,
+        forge_base: &str,
+        max_bytes: u64,
+    ) -> Arc<SharedState> {
         let mut state = AppState::new(temp.path().join("state")).await.unwrap();
         state.checkout_cache = crate::config::CheckoutCacheConfig {
             mode: crate::config::CheckoutCacheMode::RunScoped,
+            max_bytes,
             ..Default::default()
         };
         state.github_urls.server_url = forge_base.to_owned();
@@ -4149,9 +4213,9 @@ mod remote_checkout_cache_tests {
     async fn lfs_miss_populates_cache_then_serves_locally() {
         let contents = b"golden-bytes".to_vec();
         let oid = lfs_blob_oid(&contents);
-        let forge = mock_forge(contents.clone()).await;
+        let forge = mock_forge(contents.clone(), None).await;
         let temp = tempfile::tempdir().unwrap();
-        let shared = lfs_state(&temp, &forge.base).await;
+        let shared = lfs_state(&temp, &forge.base, u64::MAX).await;
         let run_id: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
         let repository = shared
             .state
@@ -4210,9 +4274,9 @@ mod remote_checkout_cache_tests {
     #[tokio::test]
     async fn lfs_corrupt_upstream_is_rejected() {
         let oid = lfs_blob_oid(b"expected-bytes");
-        let forge = mock_forge(b"tampered-bytes".to_vec()).await;
+        let forge = mock_forge(b"tampered-bytes".to_vec(), None).await;
         let temp = tempfile::tempdir().unwrap();
-        let shared = lfs_state(&temp, &forge.base).await;
+        let shared = lfs_state(&temp, &forge.base, u64::MAX).await;
         let run_id: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
         let repository = shared
             .state
@@ -4245,9 +4309,9 @@ mod remote_checkout_cache_tests {
     async fn lfs_private_without_credential_is_not_fetched() {
         let contents = b"private-bytes".to_vec();
         let oid = lfs_blob_oid(&contents);
-        let forge = mock_forge(contents).await;
+        let forge = mock_forge(contents, None).await;
         let temp = tempfile::tempdir().unwrap();
-        let shared = lfs_state(&temp, &forge.base).await;
+        let shared = lfs_state(&temp, &forge.base, u64::MAX).await;
         let run_id: RunId = "88888888-8888-4888-8888-888888888888".parse().unwrap();
         let repository = shared
             .state
@@ -4266,6 +4330,117 @@ mod remote_checkout_cache_tests {
                 repository_dir: repository.as_path(),
                 upstream_repository: "owner/repo",
                 upstream_private: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["objects"][0]["error"]["code"], 404);
+        assert_eq!(forge.batch_hits.load(Ordering::SeqCst), 0);
+    }
+    /// A blob server on another host, answering openly like presigned
+    /// storage. Records whether the caller presented any Authorization.
+    async fn open_blob_server(blob: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+        use axum::extract::Extension;
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+
+        let authed = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route(
+                "/blobs/:oid",
+                get(
+                    |headers: HeaderMap,
+                     Extension(authed): Extension<Arc<AtomicUsize>>,
+                     Extension(blob): Extension<Vec<u8>>| async move {
+                        if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                            authed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        blob
+                    },
+                ),
+            )
+            .layer(Extension(authed.clone()))
+            .layer(Extension(blob));
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (base, authed)
+    }
+
+    /// A forge-named download on another host must not receive the forge
+    /// credential: presigned-style URLs carry their own authorization, and
+    /// anything else must fail closed rather than leak the token.
+    #[tokio::test]
+    async fn lfs_cross_host_download_sends_no_credential() {
+        let contents = b"external-bytes".to_vec();
+        let oid = lfs_blob_oid(&contents);
+        let (blob_base, authed) = open_blob_server(contents.clone()).await;
+        let forge = mock_forge(vec![], Some(blob_base)).await;
+        let temp = tempfile::tempdir().unwrap();
+        let shared = lfs_state(&temp, &forge.base, u64::MAX).await;
+        let run_id: RunId = "99999999-9999-4999-8999-999999999999".parse().unwrap();
+        let repository = shared
+            .state
+            .state_dir
+            .join(format!("checkout-cache/runs/{run_id}.git"));
+        std::fs::create_dir_all(&repository).unwrap();
+
+        let body = lfs_batch_body(&oid, contents.len() as u64);
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            Some("Bearer job-token"),
+            &body,
+            Some(LfsFetch {
+                shared: shared.as_ref(),
+                repository_dir: repository.as_path(),
+                upstream_repository: "owner/repo",
+                upstream_private: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response["objects"][0]["actions"]["download"]["href"].is_string());
+        assert_eq!(
+            std::fs::read(lfs_object_path(&repository, &oid)).unwrap(),
+            contents
+        );
+        assert_eq!(
+            authed.load(Ordering::SeqCst),
+            0,
+            "no Authorization header may leave the engine for another host"
+        );
+    }
+
+    /// A batch whose claimed sizes already exceed the ceiling is not
+    /// fetched at all: the forge is never contacted.
+    #[tokio::test]
+    async fn lfs_populate_respects_the_cache_ceiling() {
+        let contents = b"ceiling-bytes".to_vec();
+        let oid = lfs_blob_oid(&contents);
+        let forge = mock_forge(contents, None).await;
+        let temp = tempfile::tempdir().unwrap();
+        let shared = lfs_state(&temp, &forge.base, 1).await;
+        let run_id: RunId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".parse().unwrap();
+        let repository = shared
+            .state
+            .state_dir
+            .join(format!("checkout-cache/runs/{run_id}.git"));
+        std::fs::create_dir_all(&repository).unwrap();
+
+        let body = lfs_batch_body(&oid, 1_000_000);
+        let response = lfs_batch_response(
+            &repository,
+            run_id,
+            Some("Bearer job-token"),
+            &body,
+            Some(LfsFetch {
+                shared: shared.as_ref(),
+                repository_dir: repository.as_path(),
+                upstream_repository: "owner/repo",
+                upstream_private: false,
             }),
         )
         .await

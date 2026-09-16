@@ -170,7 +170,8 @@ lazily: the first job in a run to request a file pulls it through the engine
 (job token on the inside, the engine's own forge credential on the outside),
 where it is hash-verified and stored next to the run's Git objects for the
 remaining jobs to reuse. Private repositories without a usable credential are
-never fetched. Caching is an accelerator, never a
+never fetched. Blobs over 1 GiB per object, and batches already over
+`max_bytes`, stay uncached. Caching is an accelerator, never a
 prerequisite. Objects are stored as ordinary files: put the state directory on
 an encrypted volume if source retention needs encryption at rest.
 
