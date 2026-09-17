@@ -19153,10 +19153,16 @@ fn commit_workflow_fixture(worktree: &FsPath, paths: &[&str]) -> String {
 }
 
 fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
+    // Fixture commits must not depend on the machine's global git identity:
+    // clean CI runners have none, so `commit` fails with Author unknown.
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
         .args(args)
+        .env("GIT_AUTHOR_NAME", "preloop")
+        .env("GIT_AUTHOR_EMAIL", "preloop@example.com")
+        .env("GIT_COMMITTER_NAME", "preloop")
+        .env("GIT_COMMITTER_EMAIL", "preloop@example.com")
         .output()
         .unwrap();
     assert!(
