@@ -456,6 +456,8 @@ pub struct AppState {
     pub webhook_secret: Option<String>,
     /// Optional local workspace path to load workflows from.
     pub local_workspace: Option<PathBuf>,
+    /// Effective checkout-object retention policy. Off by default.
+    pub(crate) checkout_cache: crate::config::CheckoutCacheConfig,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
     /// Native API administrator credential for this server instance.
@@ -933,6 +935,7 @@ impl AppState {
         // durable base set.
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
+        let checkout_cache = crate::config::checkout_cache_config(&config)?;
         let github_apps = crate::github_app::load_from(&config)?;
         let github_app = github_apps
             .as_ref()
@@ -1081,6 +1084,7 @@ impl AppState {
             artifacts,
             webhook_secret,
             local_workspace,
+            checkout_cache,
             state_dir,
             system_token,
             registration_policy: RegistrationPolicy::from_env(),
