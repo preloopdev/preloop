@@ -165,7 +165,13 @@ the engine resolves to a live job in that exact run; cache writes are
 control-plane only. Anything the engine cannot prove — no numeric repository
 id, a non-immutable ref, an explicit `repository:`/`ref:` on the checkout step,
 a private repository with no usable credential, or any cache failure — falls
-back to a direct forge checkout. Caching is an accelerator, never a
+back to a direct forge checkout. LFS blobs follow the same per-run lifecycle
+lazily: the first job in a run to request a file pulls it through the engine
+(job token on the inside, the engine's own forge credential on the outside),
+where it is hash-verified and stored next to the run's Git objects for the
+remaining jobs to reuse. Private repositories without a usable credential are
+never fetched. Blobs over 1 GiB per object, and batches already over
+`max_bytes`, stay uncached. Caching is an accelerator, never a
 prerequisite. Objects are stored as ordinary files: put the state directory on
 an encrypted volume if source retention needs encryption at rest.
 
