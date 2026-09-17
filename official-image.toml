@@ -1,0 +1,20 @@
+# Official runner-image inputs for golden bakes.
+#
+# Separated from versions.toml on purpose: bumps here mean "rebuild the
+# official goldens", while versions.toml churns for unrelated reasons
+# (toolchain pins, runner/smolvm bumps). `.github/workflows/official-golden.yml`
+# triggers on pushes to this file; its weekly drift check compares the
+# floating dump tags below against these pins and opens the bump PR.
+#
+# Source: the official GitHub-hosted runner image snapshot, republished as OCI
+# by the preloopdev/runner-image-blobs dump pipeline and vetted (scanned,
+# signed, and SLSA-attested) before the floating tag advances. Release goldens
+# are baked from this instead of the plain Ubuntu base. The dump pipeline
+# publishes per-architecture floating tags (ubuntu24-* for amd64,
+# ubuntu24-arm64-* for arm64); each pin below is digest-pinned at its own
+# platform index.
+#
+# Flat `key = "value"` lines like versions.toml, so the same readers apply
+# (orchestrator build.rs codegen, workflow awk, Renovate regex managers).
+official_runner_image_base_amd64 = "ghcr.io/preloopdev/runner-images:ubuntu24-runner-large-latest@sha256:4f7e4be438e4eb9c0f23bebdec12cf1d25520876ad2052412ba18580919b7795"
+official_runner_image_base_arm64 = "ghcr.io/preloopdev/runner-images:ubuntu24-arm64-runner-large-latest@sha256:3884ef2266edee7ae2da8f70f54faba5340238e68ede5274d0e90fdec80faf9e"

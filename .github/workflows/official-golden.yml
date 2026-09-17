@@ -1,132 +1,100 @@
-name: release-golden
+name: official-golden
 
+# Official golden images, decoupled from releases.
+#
+# Release jobs consume published goldens; they never bake. This workflow owns
+# the bake side, triggered three ways:
+# - `push` touching official-image.toml (a pin bump means rebuild);
+# - weekly `schedule`, which only runs the drift check below;
+# - manual `workflow_dispatch` with an arch selector.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: Release tag to receive the generated assets (defaults to latest)
+      arch:
+        description: Architecture to build
         required: false
-        type: string
-      reuse_previous_goldens:
-        description: Copy existing goldens instead of rebuilding them
-        required: false
-        default: false
-        type: boolean
-      previous_release_tag:
-        description: Release tag whose goldens should be reused
-        required: false
-        default: v0.29.5
-        type: string
+        default: both
+        type: choice
+        options:
+          - both
+          - x86_64
+          - aarch64
+  push:
+    paths:
+      - official-image.toml
+  schedule:
+    # Monday 04:00 UTC: poll the dump pipeline's floating tags; a mismatch
+    # opens a pin-bump PR, which retriggers this workflow via the push rule.
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
 
 jobs:
-  reuse-previous-goldens:
-    name: Reuse Previous Golden Artifacts
-    if: github.event_name == 'workflow_dispatch' && inputs.reuse_previous_goldens
+  check-upstream-drift:
+    name: Open bump PR on upstream rebuild
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+      pull-requests: write
     steps:
-      - name: Copy goldens to target release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_TAG: ${{ inputs.release_tag }}
-          PREVIOUS_TAG: ${{ inputs.previous_release_tag }}
-        run: |
-          set -euo pipefail
-          if [ -z "$TARGET_TAG" ]; then
-            TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
-          fi
-          mkdir -p dist
-          gh release download "$PREVIOUS_TAG" \
-            --pattern 'preloop-ubuntu-24.04-*' \
-            --dir dist \
-            --repo "$GITHUB_REPOSITORY"
-          # Preserve signatures, attestations, and provenance sidecars
-          gh release upload "$TARGET_TAG" \
-            dist/preloop-ubuntu-24.04-* \
-            --clobber \
-            --repo "$GITHUB_REPOSITORY"
-
-  build-and-publish-linux-binaries:
-    name: Build Linux ${{ matrix.arch }} release
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            target: x86_64-unknown-linux-musl
-          - arch: aarch64
-            target: aarch64-unknown-linux-musl
-    permissions:
-      contents: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
 
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: "1.97"
-          targets: ${{ matrix.target }}
-
-      - name: Set up Zig cross toolchain
-        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
-        with:
-          version: 0.14.1
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
-        with:
-          tool: cargo-zigbuild@0.23.0
-
-      - name: Build release binaries
-        env:
-          TARGET: ${{ matrix.target }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          cargo zigbuild --release \
-            --target "$TARGET" \
-            -p preloop-cli \
-            -p preloop-runner-server \
-            -p preloop-runner
-          mkdir -p "dist/preloop-$ARCH"
-          cp "target/$TARGET/release/preloop" \
-            "target/$TARGET/release/preloop-server" \
-            "target/$TARGET/release/preloop-runner" \
-            "dist/preloop-$ARCH/"
-          tar -C dist -czf \
-            "dist/preloop-$ARCH-linux-musl.tar.gz" \
-            "preloop-$ARCH"
-          sha256sum "dist/preloop-$ARCH-linux-musl.tar.gz" \
-            > "dist/preloop-$ARCH-linux-musl.tar.gz.sha256"
-
-      - name: Upload Linux binaries to release
-        if: github.event_name == 'release'
+      - name: Compare floating dump tags against pins
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
-          ARCH: ${{ matrix.arch }}
         run: |
-          gh release upload "$TAG_NAME" \
-            "dist/preloop-$ARCH-linux-musl.tar.gz" \
-            "dist/preloop-$ARCH-linux-musl.tar.gz.sha256" \
-            --clobber
+          set -euo pipefail
+          CRANE_TAG="$(gh release view --repo google/go-containerregistry --json tagName --jq .tagName)"
+          gh release download --repo google/go-containerregistry "$CRANE_TAG"             --pattern '*Linux_x86_64.tar.gz' --dir /tmp/crane-dl --clobber
+          sudo tar -xzf /tmp/crane-dl/go-containerregistry_Linux_x86_64.tar.gz -C /usr/local/bin crane
+          drift_arch() {
+            local key="$1"
+            local pinned
+            pinned="$(awk -F'"' -v k="^${key} = " '$0 ~ k { print $2; exit }' official-image.toml)"
+            test -n "$pinned"
+            local floating="${pinned%%@*}"
+            local live
+            live="$(crane digest "$floating")"
+            local want="${pinned##*@}"
+            if [ "$live" != "$want" ]; then
+              echo "$key drifted: $want -> $live"
+              sed -i "s|^${key} = \"${floating}@sha256:[0-9a-f]*\"$|${key} = \"${floating}@${live}\"|" official-image.toml
+              grep -q "^${key} = \"${floating}@${live}\"$" official-image.toml
+              return 0
+            fi
+            echo "$key up to date ($want)"
+            return 1
+          }
+          CHANGED=0
+          if drift_arch official_runner_image_base_amd64; then CHANGED=1; fi
+          if drift_arch official_runner_image_base_arm64; then CHANGED=1; fi
+          if [ "$CHANGED" -eq 0 ]; then
+            echo "pins match floating tags; nothing to do"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="chore/official-image-drift-$(date -u +%F)"
+          git checkout -b "$BRANCH"
+          git add official-image.toml
+          git commit -m "chore(golden): update official image pins to upstream rebuild"
+          git push -u origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH"             --title "chore(golden): update official image pins to upstream rebuild"             --body "Weekly drift check found the dump pipeline's floating tags ahead of the pins. Merging rebuilds the official goldens via push trigger."
 
-  build-and-publish-golden:
-    name: Build & Publish Golden MicroVM Artifact
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
+  build-official-x86_64:
+    name: Build official x86_64 golden
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
       packages: read
@@ -372,26 +340,6 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Upload Golden Artifact to Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
-          REQUESTED_TAG: ${{ inputs.release_tag }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          TARGET_TAG="${EVENT_TAG:-$REQUESTED_TAG}"
-          if [ -z "$TARGET_TAG" ]; then
-            TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
-          fi
-          gh release upload "$TARGET_TAG" \
-            "dist/$GOLDEN_NAME" \
-            "dist/$GOLDEN_NAME.sha256" \
-            "dist/$GOLDEN_NAME.bundle" \
-            "dist/$GOLDEN_NAME.base-provenance.json" \
-            "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
-            "dist/$GOLDEN_NAME.provenance.json" --clobber
-
       - name: Split golden for artifact retention
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
@@ -401,9 +349,9 @@ jobs:
           split -b 4G -d "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.part."
           sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
 
-  build-and-publish-golden-macos:
-    name: Build & Publish aarch64 Golden (macOS)
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
+  build-official-aarch64:
+    name: Build official aarch64 golden
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'aarch64'))
     # Hosted Apple Silicon builds this golden: macos-14 produced the last
     # working aarch64 golden (v0.29.6, 2026-08-09). 7f18e8a0 then repointed
     # it at a self-hosted Mac that was never registered, so every run since
@@ -421,7 +369,7 @@ jobs:
       # image build; job VMs still default to policy-enforced virtio-net.
       PRELOOP_SMOLVM_NET_BACKEND: tsi
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
       packages: read
@@ -645,20 +593,3 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Upload Golden Artifact to Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOLDEN_NAME: preloop-ubuntu-24.04-aarch64
-          REQUESTED_TAG: ${{ inputs.release_tag }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          TARGET_TAG="${EVENT_TAG:-$REQUESTED_TAG}"
-          if [ -z "$TARGET_TAG" ]; then
-            TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
-          fi
-          gh release upload "$TARGET_TAG" \
-            "dist/$GOLDEN_NAME" "dist/$GOLDEN_NAME.sha256" \
-            "dist/$GOLDEN_NAME.bundle" \
-            "dist/$GOLDEN_NAME.base-provenance.json" \
-            "dist/$GOLDEN_NAME.base-sbom.spdx.json" \
-            "dist/$GOLDEN_NAME.provenance.json" --clobber

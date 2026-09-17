@@ -313,6 +313,10 @@ pub struct VmFleetSnapshot {
     pub configured: VmConfigured,
     pub host_usage: VmHostUsage,
     pub top_consumers: Vec<VmTopConsumer>,
+    /// Measured host processes by RSS, descending. Empty when unmeasured —
+    /// never a fabricated zero.
+    #[serde(default)]
+    pub host_top_processes: Vec<HostTopProcess>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -341,6 +345,23 @@ pub struct VmHostUsage {
     pub memory_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sparse_disk_allocated_bytes: Option<u64>,
+    /// Total host RAM. Measured, not configured — compare with
+    /// `mem_available_bytes` for real headroom.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_total_bytes: Option<u64>,
+    /// Host RAM available for new work (reclaimable included).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_free_bytes: Option<u64>,
+    /// Engine's own RSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_rss_bytes: Option<u64>,
+    /// Summed guest-VM RSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_rss_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -351,6 +372,17 @@ pub struct VmTopConsumer {
     pub cpu_cores: f64,
     pub memory_bytes: u64,
     pub sparse_disk_allocated_bytes: u64,
+}
+
+/// One host process by measured RSS. Unlike [`VmTopConsumer`] (registered
+/// VMs), this covers everything alive on the engine host — the engine
+/// itself, guests, and sidecars — so an unfamiliar consumer is visible
+/// instead of hiding in an unattributed total.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HostTopProcess {
+    pub pid: u32,
+    pub name: String,
+    pub rss_bytes: u64,
 }
 
 use std::collections::HashMap;
