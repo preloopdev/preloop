@@ -345,13 +345,27 @@ pub(crate) async fn create_remote_checkout_snapshot(
         .arg(&snapshot_ref)
         .arg(commit_sha);
     run_git(&mut update_ref, "publish remote checkout snapshot").await?;
+    // Serving rules differ by scope. A run-scoped repository holds exactly
+    // one run's commit, so arbitrary wants cannot escape it and its refs
+    // stay advertised. A shared repository retains many runs' commits: hide
+    // every run ref and serve only ref tips, so a job fetches its own run
+    // commit and can neither enumerate nor request any other run's objects.
+    if mode == CheckoutCacheMode::Repository {
+        let mut hide = Command::new("git");
+        hide.arg("--git-dir")
+            .arg(&repository)
+            .arg("config")
+            .arg("uploadpack.hideRefs")
+            .arg("refs/preloop/runs");
+        run_git(&mut hide, "hide cached run refs").await?;
+    }
     let mut configure = Command::new("git");
-    configure
-        .arg("--git-dir")
-        .arg(&repository)
-        .arg("config")
-        .arg("uploadpack.allowAnySHA1InWant")
-        .arg("true");
+    configure.arg("--git-dir").arg(&repository).arg("config");
+    if mode == CheckoutCacheMode::Repository {
+        configure.arg("uploadpack.allowTipSHA1InWant").arg("true");
+    } else {
+        configure.arg("uploadpack.allowAnySHA1InWant").arg("true");
+    }
     run_git(&mut configure, "configure remote checkout cache").await?;
 
     let mut tree = Command::new("git");
@@ -3577,6 +3591,64 @@ mod remote_checkout_cache_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+    fn upload_pack_want_request(sha: &str) -> Vec<u8> {
+        let body = format!("want {sha} multi_ack\n");
+        let mut request = format!("{:04x}{body}", body.len() + 4).into_bytes();
+        request.extend_from_slice(b"00000009done\n");
+        request
+    }
+
+    fn upload_pack_verdict(repository: &FsPath, sha: &str) -> String {
+        let mut child = std::process::Command::new("git")
+            .args(["--git-dir", repository.to_str().unwrap(), "upload-pack"])
+            .arg(repository)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&upload_pack_want_request(sha))
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let mut combined = output.stdout;
+        combined.extend_from_slice(&output.stderr);
+        String::from_utf8_lossy(&combined).into_owned()
+    }
+
+    /// Repository mode shares one repo across runs, so serving must not
+    /// expose more than the requesting run's tip: refs stay hidden and only
+    /// tip wants are honored. Objects left behind by a released run are
+    /// present on disk but unreachable — a want for one must be refused.
+    #[tokio::test]
+    async fn repository_mode_serves_only_run_tips() {
+        let (_temp, shared, commit) = fixture(crate::config::CheckoutCacheMode::Repository).await;
+        let run_id: RunId = "99999999-9999-4999-8999-999999999999".parse().unwrap();
+        let snapshot =
+            create_remote_checkout_snapshot(&shared, &submission(&commit), run_id, &commit)
+                .await
+                .unwrap()
+                .expect("repository mode caches the commit");
+        let repository = shared
+            .state
+            .state_dir
+            .join(snapshot.storage_repository.as_deref().unwrap());
+        // While the run is live its tip is fetchable.
+        assert!(
+            upload_pack_verdict(&repository, &commit).contains("ACK"),
+            "the live run tip must stay fetchable"
+        );
+        // Release drops the run's ref but the objects remain on disk.
+        release_remote_checkout_snapshot(&shared.state.state_dir, &snapshot, run_id).await;
+        assert!(
+            !upload_pack_verdict(&repository, &commit).contains("ACK"),
+            "a released run's retained objects must not be fetchable"
         );
     }
     fn sized_cache_entry(root: &FsPath, relative: &str) -> PathBuf {
