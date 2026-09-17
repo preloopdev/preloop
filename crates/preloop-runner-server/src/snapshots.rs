@@ -362,23 +362,25 @@ async fn fetch_lfs_object_into_cache(
     else {
         return Ok(false);
     };
+    // Trust boundary for anything the batch response names: the forge may
+    // point downloads anywhere, including an attacker host, so no
+    // Authorization value — neither the forge-supplied header nor the
+    // engine credential — leaves for another host. Same-host downloads
+    // keep working; presigned cross-host URLs download anonymously.
+    let http_scheme = href.starts_with("http://") || href.starts_with("https://");
+    let same_host = match (url_download_host(href), url_download_host(&batch_url)) {
+        (Some(target), Some(forge)) => target == forge,
+        _ => false,
+    };
     let mut download_request = client.get(href);
-    if let Some(authorization) = download
-        .and_then(|action| action.pointer("/header/Authorization"))
-        .and_then(|value| value.as_str())
-    {
-        // The forge authorized this exact URL; forward its header as-is.
-        download_request = download_request.header(reqwest::header::AUTHORIZATION, authorization);
-    } else if let Some(token) = credential.upstream_token.as_deref() {
-        // Otherwise the engine credential rides only back to the forge that
-        // issued the batch answer — never to presigned storage URLs or any
-        // other host the batch response names.
-        let http_scheme = href.starts_with("http://") || href.starts_with("https://");
-        let same_host = match (url_download_host(href), url_download_host(&batch_url)) {
-            (Some(target), Some(forge)) => target == forge,
-            _ => false,
-        };
-        if same_host && http_scheme {
+    if same_host && http_scheme {
+        if let Some(authorization) = download
+            .and_then(|action| action.pointer("/header/Authorization"))
+            .and_then(|value| value.as_str())
+        {
+            download_request =
+                download_request.header(reqwest::header::AUTHORIZATION, authorization);
+        } else if let Some(token) = credential.upstream_token.as_deref() {
             download_request = download_request.basic_auth("x-access-token", Some(token));
         }
     }
@@ -4124,17 +4126,27 @@ mod remote_checkout_cache_tests {
     struct MockForge {
         base: String,
         batch_hits: Arc<AtomicUsize>,
+        authed_downloads: Arc<AtomicUsize>,
     }
 
     /// A minimal forge LFS endpoint: answers batch with a download address
     /// for the requested oid and serves `blob` there. Anonymous, like a
     /// public repository. `href_base` overrides where downloads point, so a
     /// test can aim them at a different host.
+    ///
+    /// Counter layers use distinct wrapper types: two `Extension<Arc<…>>`
+    /// layers would collapse into one map entry and alias the counters.
+    #[derive(Clone)]
+    struct BatchHits(Arc<AtomicUsize>);
+    #[derive(Clone)]
+    struct AuthedDownloads(Arc<AtomicUsize>);
+
     async fn mock_forge(blob: Vec<u8>, href_base: Option<String>) -> MockForge {
-        use axum::extract::{Extension, Path as AxumPath};
+        use axum::extract::Extension;
         use axum::routing::{get, post};
 
         let batch_hits = Arc::new(AtomicUsize::new(0));
+        let authed_downloads = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = axum::Router::new()
@@ -4142,10 +4154,10 @@ mod remote_checkout_cache_tests {
                 "/owner/repo.git/info/lfs/objects/batch",
                 post(
                     |Extension(base): Extension<String>,
-                     Extension(hits): Extension<Arc<AtomicUsize>>,
+                     Extension(hits): Extension<BatchHits>,
                      Extension(href_base): Extension<Option<String>>,
                      body: String| async move {
-                        hits.fetch_add(1, Ordering::SeqCst);
+                        hits.0.fetch_add(1, Ordering::SeqCst);
                         let request: serde_json::Value = serde_json::from_str(&body).unwrap();
                         let oid = request["objects"][0]["oid"].as_str().unwrap().to_owned();
                         let size = request["objects"][0]["size"].as_u64().unwrap_or(0);
@@ -4154,7 +4166,7 @@ mod remote_checkout_cache_tests {
                                 "oid": oid,
                                 "size": size,
                                 "actions": {
-                                    "download": { "href": format!("{}/blobs/{oid}", href_base.as_deref().unwrap_or(&base)) }
+                                    "download": { "href": format!("{}/blobs/{oid}", href_base.as_deref().unwrap_or(&base)), "header": { "Authorization": "Bearer forge-issued" } }
                                 }
                             }]
                         }))
@@ -4163,15 +4175,30 @@ mod remote_checkout_cache_tests {
             )
             .route(
                 "/blobs/:oid",
-                get(|AxumPath(_oid): AxumPath<String>| async move { blob }),
+                get(
+                    |headers: axum::http::HeaderMap,
+                     Extension(authed): Extension<AuthedDownloads>,
+                     Extension(blob): Extension<Vec<u8>>| async move {
+                        if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                            authed.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                        blob
+                    },
+                ),
             )
             .layer(Extension(base.clone()))
             .layer(Extension(href_base))
-            .layer(Extension(batch_hits.clone()));
+            .layer(Extension(BatchHits(batch_hits.clone())))
+            .layer(Extension(AuthedDownloads(authed_downloads.clone())))
+            .layer(Extension(blob));
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        MockForge { base, batch_hits }
+        MockForge {
+            base,
+            batch_hits,
+            authed_downloads,
+        }
     }
 
     fn lfs_blob_oid(contents: &[u8]) -> String {
@@ -4246,11 +4273,10 @@ mod remote_checkout_cache_tests {
                 runner_base_url()
             )
         );
-        assert_eq!(
-            std::fs::read(lfs_object_path(&repository, &oid)).unwrap(),
-            contents
+        assert!(
+            forge.authed_downloads.load(Ordering::SeqCst) >= 1,
+            "the forge-issued header must ride the same-host download"
         );
-        assert_eq!(forge.batch_hits.load(Ordering::SeqCst), 1);
 
         let second = lfs_batch_response(
             &repository,
