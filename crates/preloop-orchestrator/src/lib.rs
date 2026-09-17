@@ -1042,22 +1042,16 @@ fn parse_sha256_checksum(text: &str) -> Option<String> {
         None
     }
 }
-/// Packages the golden image carries.
+/// Packages common to Ubuntu 22.04 and 24.04 environment goldens.
 ///
-/// Tracks the apt package list of GitHub's `ubuntu-latest` runner image, which
-/// is what workflows are written against. Any gap here produces the exact bug
-/// class this project exists to eliminate: "works on GitHub, fails locally".
-///
-/// Deliberately *only* the apt baseline — not `ubuntu-latest`'s preinstalled
-/// toolchains (Android SDK, five JDKs, .NET, browsers, cloud CLIs). Those come
-/// to ~90 GB and are the job of `actions/setup-*` and `container:`, which keeps
-/// workflows portable. This list is ~350 MB.
+/// Tracks the apt baseline of GitHub's hosted Ubuntu images. ABI-transition
+/// packages are selected separately: Jammy uses the original names while
+/// Noble renamed them with the `t64` suffix.
 const BASE_PACKAGES: &str = "\
      git curl wget ca-certificates gnupg2 sudo openssh-client \
-     libnspr4 libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 \
-     libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 \
-     libglib2.0-0t64 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-     libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 libasound2t64 \
+     libnspr4 libnss3 libcairo2 libdbus-1-3 libdrm2 libgbm1 \
+     libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+     libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
      ruby ruby-rubygems perl cpanminus lsb-release fonts-noto-color-emoji \
      haveged mediainfo p7zip-rar pollinate sshpass telnet tk xvfb zsync ftp \
      sphinxsearch systemd-coredump libnss3-tools software-properties-common \
@@ -1070,6 +1064,12 @@ const BASE_PACKAGES: &str = "\
      rsync dnsutils iputils-ping net-tools iproute2 netcat-openbsd \
      sqlite3 rpm aria2 mercurial libcurl4-openssl-dev zlib1g-dev gettext \
      libexpat1-dev";
+
+const BASE_PACKAGES_22_04: &str =
+    "libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0 libcups2 libglib2.0-0 libasound2";
+const BASE_PACKAGES_24_04: &str = "\
+    libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
+    libcups2t64 libglib2.0-0t64 libasound2t64";
 
 /// Node.js baked into the base image, pinned (via `versions.toml`) to the
 /// GitHub-hosted ubuntu-24.04 system Node. Ubuntu's apt `nodejs` (18.19) is
@@ -1441,15 +1441,21 @@ pub fn base_install_script() -> String {
             if [ -f \"$p\" ]; then chown 0:0 \"$p\" 2>/dev/null; chmod u+s \"$p\" 2>/dev/null; fi; \
           done) && \
          apt-get update -qq && \
+         . /etc/os-release && \
+         case \"$VERSION_ID\" in \
+           22.04) base_packages='{BASE_PACKAGES} {BASE_PACKAGES_22_04}' ;; \
+           *) base_packages='{BASE_PACKAGES} {BASE_PACKAGES_24_04}' ;; \
+         esac && \
          (echo \"### install hosted apt baseline\" >&2 && \
-          if DEBIAN_FRONTEND=noninteractive \
+          if [ \"$VERSION_ID\" = 24.04 ] && \
+             DEBIAN_FRONTEND=noninteractive \
              apt-get -s install -qq --no-install-recommends {base_packages_pinned} >/dev/null 2>&1; then \
             DEBIAN_FRONTEND=noninteractive \
             apt-get install -y -qq --no-install-recommends {base_packages_pinned}; \
           else \
             echo \"WARNING: exact hosted apt pins are unavailable; falling back to archive versions\" >&2; \
             DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y -qq --no-install-recommends {BASE_PACKAGES}; \
+            apt-get install -y -qq --no-install-recommends $base_packages; \
           fi) \
          && printf '{LOOPBACK_HOSTS}' > /etc/hosts && \
          printf '127.0.0.1 %s\\n' \"$(hostname)\" >> /etc/hosts && \

@@ -217,8 +217,11 @@ fn install_script_survives_archive_pin_drift() {
     assert!(
         script.contains("apt-get -s install -qq --no-install-recommends git=")
             && script.contains("exact hosted apt pins are unavailable")
-            && script.contains("apt-get install -y -qq --no-install-recommends git curl wget"),
-        "the baseline must probe exact pins before falling back to archive packages"
+            && script.contains("22.04) base_packages='")
+            && script.contains("libatk1.0-0 libatk-bridge2.0-0")
+            && script.contains("libatk1.0-0t64 libatk-bridge2.0-0t64")
+            && script.contains("apt-get install -y -qq --no-install-recommends $base_packages",),
+        "the baseline must choose Jammy/Noble ABI package names before falling back"
     );
     assert!(
         script.contains("for package in clang-16 clang-format-16 clang-tidy-16")

@@ -29,7 +29,13 @@ concurrency:
 
 jobs:
   pullfrog:
-    if: github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' && github.actor != 'pullfrog[bot]'
+    if: >
+       (github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'pull_request' ||
+        (github.event_name == 'issue_comment' &&
+         contains(github.event.comment.body, '/pullfrog review'))) &&
+       github.actor != 'renovate[bot]' && github.actor != 'dependabot[bot]' &&
+       github.actor != 'pullfrog[bot]'
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 60
     steps:

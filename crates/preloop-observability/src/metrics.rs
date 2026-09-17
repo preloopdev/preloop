@@ -458,6 +458,94 @@ impl PoolMetrics {
     }
 }
 
+/// Host memory instruments, recorded by the 5s state sampler from
+/// [`vm_telemetry::sample_host`]. Absolute bytes (alerts derive ratios) plus
+/// the RAM-consumed ratio as the single OOM-proximity signal: swap counts as
+/// pressure in the ratio's inputs upstream, never as headroom here.
+#[derive(Clone)]
+pub struct HostMetrics {
+    mem_total: Gauge<u64>,
+    mem_available: Gauge<u64>,
+    swap_total: Gauge<u64>,
+    swap_free: Gauge<u64>,
+    engine_rss: Gauge<u64>,
+    vm_rss: Gauge<u64>,
+    ram_used_ratio: opentelemetry::metrics::Gauge<f64>,
+}
+
+impl std::fmt::Debug for HostMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostMetrics").finish_non_exhaustive()
+    }
+}
+
+impl HostMetrics {
+    fn new(meter: &Meter) -> Self {
+        Self {
+            mem_total: meter
+                .u64_gauge("preloop.host.mem.total_bytes")
+                .with_description("Total host RAM")
+                .with_unit("By")
+                .build(),
+            mem_available: meter
+                .u64_gauge("preloop.host.mem.available_bytes")
+                .with_description("Host RAM available for new work")
+                .with_unit("By")
+                .build(),
+            swap_total: meter
+                .u64_gauge("preloop.host.swap.total_bytes")
+                .with_description("Total host swap")
+                .with_unit("By")
+                .build(),
+            swap_free: meter
+                .u64_gauge("preloop.host.swap.free_bytes")
+                .with_description("Free host swap")
+                .with_unit("By")
+                .build(),
+            engine_rss: meter
+                .u64_gauge("preloop.host.engine_rss_bytes")
+                .with_description("Engine process RSS")
+                .with_unit("By")
+                .build(),
+            vm_rss: meter
+                .u64_gauge("preloop.host.vm_rss_bytes")
+                .with_description("Summed guest VM RSS")
+                .with_unit("By")
+                .build(),
+            ram_used_ratio: meter
+                .f64_gauge("preloop.host.ram_used_ratio")
+                .with_description("Fraction of host RAM consumed (OOM proximity)")
+                .with_unit("1")
+                .build(),
+        }
+    }
+
+    /// Record one host sample. Missing measurements record nothing (never zero).
+    pub fn record(&self, sample: &crate::vm_telemetry::HostSample) {
+        if let Some(value) = sample.mem_total_bytes {
+            self.mem_total.record(value, &[]);
+        }
+        if let Some(value) = sample.mem_available_bytes {
+            self.mem_available.record(value, &[]);
+        }
+        if let Some(value) = sample.swap_total_bytes {
+            self.swap_total.record(value, &[]);
+        }
+        if let Some(value) = sample.swap_free_bytes {
+            self.swap_free.record(value, &[]);
+        }
+        if let Some(value) = sample.engine_rss_bytes {
+            self.engine_rss.record(value, &[]);
+        }
+        if let Some(value) = sample.vm_rss_bytes {
+            self.vm_rss.record(value, &[]);
+        }
+        if let Some(value) = sample.ram_used_fraction() {
+            self.ram_used_ratio.record(value, &[]);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -471,6 +559,7 @@ pub struct MetricsRegistry {
     pub store: StoreMetrics,
     pub lifecycle: LifecycleMetrics,
     pub pool: PoolMetrics,
+    pub host: HostMetrics,
 }
 
 impl std::fmt::Debug for MetricsRegistry {
@@ -495,6 +584,7 @@ impl MetricsRegistry {
             store: StoreMetrics::new(&meter),
             lifecycle: LifecycleMetrics::new(&meter),
             pool: PoolMetrics::new(&meter),
+            host: HostMetrics::new(&meter),
         }
     }
 }

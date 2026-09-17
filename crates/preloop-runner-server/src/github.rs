@@ -2108,6 +2108,21 @@ async fn process_delivery_payload_with_lease(
             return WebhookOutcome::Unreportable(format!("malformed JSON payload: {e}"));
         }
     };
+    let workflow_dispatch_target = if delivery.event == "workflow_dispatch" {
+        let Some(target) = payload_val.get("workflow").and_then(Value::as_str) else {
+            return WebhookOutcome::Unreportable(
+                "workflow_dispatch payload missing workflow".to_owned(),
+            );
+        };
+        Some(
+            target
+                .strip_prefix(".github/workflows/")
+                .unwrap_or(target)
+                .to_owned(),
+        )
+    } else {
+        None
+    };
 
     if lease_lost.is_cancelled() {
         return WebhookOutcome::Success;
@@ -2337,6 +2352,13 @@ async fn process_delivery_payload_with_lease(
             if lease_lost.is_cancelled() {
                 return WebhookOutcome::Success;
             }
+            if workflow_dispatch_target
+                .as_deref()
+                .is_some_and(|target| target != filename)
+            {
+                continue;
+            }
+
             if is_github_owned_workflow(&filename, &github_owned_workflows) {
                 info!(
                     workflow = %filename,
@@ -3246,6 +3268,50 @@ mod tests {
         assert!(
             inner.runs.is_empty(),
             "a failed delivery must not create a run"
+        );
+    }
+    /// GitHub's workflow_dispatch webhook names the one selected workflow.
+    /// Treating it as a repository-wide broadcast multiplies every manual
+    /// dispatch across all workflows that declare the trigger.
+    #[tokio::test]
+    async fn workflow_dispatch_webhook_submits_only_the_named_workflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        for name in ["first.yml", "selected.yml"] {
+            std::fs::write(
+                ws_dir.join(".github/workflows").join(name),
+                "on: workflow_dispatch\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo selected\n",
+            )
+            .unwrap();
+        }
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "ref": "main",
+            "workflow": ".github/workflows/selected.yml",
+            "inputs": {},
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "sender": {"login": "octocat"},
+        }))
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-targeted-dispatch",
+                    Some("workflow_dispatch"),
+                    &payload,
+                )
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1);
+        assert_eq!(
+            inner.runs.values().next().unwrap().workflow_path_str,
+            ".github/workflows/selected.yml"
         );
     }
 

@@ -621,6 +621,22 @@ Every item below broke a real workflow step and was fixed in preloop:
   GitHub's image keeps `/tmp` on disk; the golden could mask
   `tmp.mount` for parity.
 
+### 1c.5 Checkout-cache known limitations
+
+- **Snapshot serving is not contents-permission aware.** Any live job in the
+  run may fetch the cached commit, including a job declaring
+  `permissions: { contents: none }` whose forge checkout would be denied.
+  Enforcing this needs per-job effective permissions plumbed into snapshot
+  authorization; until then the cache trusts run membership alone.
+- **Cached checkouts keep the engine as their git origin.** Post-checkout
+  `git push` or branch fetches target the read-only engine endpoint instead
+  of the forge. Fixing this needs runner cooperation, so workflows that push
+  from a cached checkout should use an explicit full checkout from the forge.
+- **LFS objects past the per-object cap are not cached.** Blobs over 1 GiB
+  stay per-object not-found and the job must fetch them from the forge;
+  batches whose claimed sizes already exceed `max_bytes` are skipped the
+  same way.
+
 ---
 
 ## 2. Upstream surface we must emulate

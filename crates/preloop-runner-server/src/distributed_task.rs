@@ -1117,6 +1117,25 @@ pub(crate) async fn complete_job_inner(
                 discard_workspace_snapshot(&state_dir, completion.run_id).await;
             });
         }
+        // A remote checkout cache is released rather than deleted with the
+        // run: the configured retention window is what a rerun or a late
+        // retry fetches from, and the sweep below is the only collector.
+        let released = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(&completion.run_id)
+                .and_then(|run| run.workspace_snapshot.clone())
+        };
+        if let Some(snapshot) = released {
+            release_remote_checkout_snapshot(&shared.state.state_dir, &snapshot, completion.run_id)
+                .await;
+        }
+        if shared.state.checkout_cache.mode != crate::config::CheckoutCacheMode::Off {
+            let state_dir = shared.state.state_dir.clone();
+            let checkout_cache = shared.state.checkout_cache.clone();
+            tokio::spawn(async move { prune_checkout_cache(&state_dir, &checkout_cache).await });
+        }
         // Off the completion path on purpose: this is housekeeping, and the
         // runner is waiting on this response before its slot can turn over.
         let state_dir = shared.state.state_dir.clone();
