@@ -40,7 +40,7 @@ jobs:
           CHANGED=false
           if ! git diff --quiet "$BASE_SHA" -- versions.toml \
               && git diff "$BASE_SHA" -- versions.toml \
-                 | grep -q '^[+-]smolvm_golden_version'; then
+                 | grep -q '^[+-][[:space:]]*smolvm_golden_version'; then
             CHANGED=true
           fi
           echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
@@ -54,7 +54,7 @@ jobs:
           if [ -n "$INPUT_VERSION" ]; then
             VERSION="$INPUT_VERSION"
           else
-            VERSION="$(grep '^smolvm_golden_version' versions.toml | cut -d'"' -f2)"
+            VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
           fi
           [ -n "$VERSION" ] || { echo "no smolvm version resolved" >&2; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

@@ -6,8 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Releases before v0.27.0 predate the changelog.
-
 ## [Unreleased]
+
+## [0.33.2] - 2026-09-17
+
+### Fixed
+
+- Release gate fix: `0.33.1` changelog headings were indented, failing the entry check. Headings restored to column zero.
+
+## [0.33.1] - 2026-09-17
+
+ ### Added
+
+ - Host memory observability: the engine now samples host RAM/swap, engine
+   RSS, guest VM RSS, and top processes, exposing them in status, OTLP
+   metrics, and `host_memory_pressure` / `host_memory_critical` conditions.
+ - Pullfrog reviews run only on explicit request (`/pullfrog review`
+   comments, manual dispatch, or newly opened/updated PRs).
+
+ ### Fixed
+
+ - Release notes again include the auto-generated merged-PR list.
+
+
+## [0.33.0] - 2026-09-17
 
 ### Added
 

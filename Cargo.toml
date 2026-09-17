@@ -27,7 +27,7 @@ edition = "2021"
 # deployed binary's provenance unreadable (a host reporting CLI 0.32.7 was
 # running post-0.32.7 code, while `service.version` showed the server's
 # unrelated 0.2.0). Both now inherit this single number.
-version = "0.32.9"
+version = "0.33.2"
 license = "MIT"
 repository = "https://github.com/preloopdev/preloop"
 rust-version = "1.97"

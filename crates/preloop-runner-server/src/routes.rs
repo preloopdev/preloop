@@ -322,6 +322,10 @@ pub(crate) fn build_app(
 
     let observability_routes = Router::new()
         .route("/api/v1/status", get(status))
+        .route(
+            "/api/v1/config/checkout-cache",
+            get(crate::runs::checkout_cache_config),
+        )
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
