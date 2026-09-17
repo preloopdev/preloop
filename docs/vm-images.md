@@ -354,22 +354,22 @@ On Linux hosts the installed `preloop-runner` is already a Linux binary, so no
 bundle is needed. Missing on macOS, the engine logs a startup warning and
 submitted jobs queue until a runner exists.
 
-## Version tracking (`versions.toml`)
+ ## Version tracking (`versions.toml`, `official-image.toml`)
 
-Every pinned version lives in one place — `versions.toml` — and is consumed
-by the build:
+ Every pinned version lives in one of two flat files — `versions.toml` for
+ toolchain and runtime pins, `official-image.toml` for the official runner
+ bases (bumping those means rebuilding goldens, so they trigger
+ separately) — and is consumed by the build:
 
-
-| Key                                                     | What it pins                                                                     | Bump when                                                               |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+ | Key                                                     | What it pins                                                                     | Bump when                                                               |
 | `runner_version`                                        | Official `actions/runner` protocol target (currently `2.336.0`)                  | Upstream runner changes protocol surface                                |
 | `smolvm_min_version`                                    | SmolVM runtime floor `preloop update --ensure-runtime` accepts and upgrades from | A future SmolVM drops a capability preloop needs (rare, human-driven)   |
 | `smolvm_golden_version`                                 | SmolVM release the golden workflow builds with                                    | Upstream ships a newer stable (Renovate opens a bump PR, `smolvm-release-verify` gates it) |
 | `github_runner_image_version`                           | Official `actions/runner-images` Ubuntu 24.04 snapshot used as the parity source | Refreshing the hosted-image parity bake list                            |
 | `ubuntu_24_04_base`                                     | Base image by digest (`ubuntu:24.04@sha256:…`)                                   | You want a newer OS snapshot — always bump the digest, never a bare tag |
 | `ubuntu_22_04_base`                                     | Second pinned base                                                               | Same                                                                    |
-| `official_runner_image_base_amd64`                      | Official GitHub-hosted runner image OCI reference for the x86_64 golden         | Bump the digest after re-running `runner-image-blobs` attestation and verifying the new digest |
-| `official_runner_image_base_arm64`                      | Official GitHub-hosted runner image OCI reference for the aarch64 golden         | Same as above                                                           |
+| `official_runner_image_base_amd64` (`official-image.toml`) | Official GitHub-hosted runner image OCI reference for the x86_64 golden | Bump the digest after re-running `runner-image-blobs` attestation and verifying the new digest |
+| `official_runner_image_base_arm64` (`official-image.toml`) | Official GitHub-hosted runner image OCI reference for the aarch64 golden | Same as above |
 | `node_version`                                          | Node baked as the runner's externals                                             | A workflow needs a newer default Node                                   |
 | `node20_externals_version` / `node24_externals_version` | Additional Node externals                                                        | Same                                                                    |
 | `rustup_version`                                        | Rustup used to install baked Rust toolchains                                     | Toolchain bootstrap changes                                             |

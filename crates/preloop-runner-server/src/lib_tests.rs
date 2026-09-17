@@ -19153,10 +19153,16 @@ fn commit_workflow_fixture(worktree: &FsPath, paths: &[&str]) -> String {
 }
 
 fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
+    // Fixture commits must not depend on the machine's global git identity:
+    // clean CI runners have none, so `commit` fails with Author unknown.
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
         .args(args)
+        .env("GIT_AUTHOR_NAME", "preloop")
+        .env("GIT_AUTHOR_EMAIL", "preloop@example.com")
+        .env("GIT_COMMITTER_NAME", "preloop")
+        .env("GIT_COMMITTER_EMAIL", "preloop@example.com")
         .output()
         .unwrap();
     assert!(
@@ -20003,7 +20009,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             "id": "00000000-0000-0000-0000-000000000010",
             "name": "checkout",
             "reference": {"name": "Actions/Checkout", "version": "v4", "type": "repository"},
-            "inputs": {"path": "source", "fetch-depth": "0"},
+            "inputs": {"path": "source", "fetch-depth": "1"},
             "continueOnError": false,
             "timeoutInMinutes": null
         },
@@ -20034,7 +20040,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         "id": "00000000-0000-0000-0000-000000000013",
         "name": "token-only checkout",
         "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
-        "inputs": {"token": "submodule-token", "fetch-depth": "0"},
+            "inputs": {"token": "submodule-token", "fetch-depth": "1"},
         "continueOnError": false,
         "timeoutInMinutes": null
     }]));
@@ -20044,7 +20050,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
         // An expression that resolved to nothing means "default branch" —
         // the local snapshot IS the default, so the redirect must apply.
-        "inputs": {"ref": "", "fetch-depth": "0"},
+        "inputs": {"ref": "", "fetch-depth": "1"},
         "continueOnError": false,
         "timeoutInMinutes": null
     }]));
@@ -20075,6 +20081,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             default_branch: Some("main".to_owned()),
             before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
             snapshot_timing: None,
+            ..Default::default()
         },
         "http://127.0.0.1:9090",
         "local-runtime-jwt",
@@ -20103,7 +20110,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
     // GitHub App installation token or PAT the snapshot endpoint cannot verify.
     assert_eq!(primary.get("token"), Some(&"local-runtime-jwt".to_owned()));
     assert_eq!(primary.get("path"), Some(&"source".to_owned()));
-    assert_eq!(primary.get("fetch-depth"), Some(&"0".to_owned()));
+    assert_eq!(primary.get("fetch-depth"), Some(&"1".to_owned()));
     assert_eq!(message.steps[1].inputs, original_explicit);
     assert_eq!(message.steps[2].inputs, original_non_checkout);
     assert!(
@@ -20122,6 +20129,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
                 snapshot_timing: None,
+                ..Default::default()
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
@@ -20144,6 +20152,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
                 snapshot_timing: None,
+                ..Default::default()
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
@@ -20166,6 +20175,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
                 default_branch: Some("main".to_owned()),
                 before_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
                 snapshot_timing: None,
+                ..Default::default()
             },
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
@@ -20819,6 +20829,213 @@ jobs:
         ),
         b"tracked unstaged change\n"
     );
+}
+
+/// With `checkout_cache.mode = "run-scoped"`, a webhook-shaped run fetches its
+/// commit once and every job in that run checks it out from the engine with its
+/// own Actions runtime token. A token bound to a different run must not reach
+/// those objects.
+#[tokio::test]
+async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let upstream_root = temp.path().join("upstream");
+    let work = upstream_root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    git_fixture_command(&work, &["init", "-b", "main"]);
+    fs::write(work.join("tracked.txt"), "cached upstream\n").unwrap();
+    git_fixture_command(&work, &["add", "."]);
+    git_fixture_command(&work, &["commit", "-m", "upstream commit"]);
+    let bare = upstream_root.join("owner/repo.git");
+    fs::create_dir_all(bare.parent().unwrap()).unwrap();
+    git_fixture_command(
+        &upstream_root,
+        &[
+            "clone",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let commit = String::from_utf8(git_fixture_output(&work, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.checkout_cache = crate::config::CheckoutCacheConfig {
+        mode: crate::config::CheckoutCacheMode::RunScoped,
+        ..Default::default()
+    };
+    state.github_urls.server_url = upstream_root.to_string_lossy().to_string();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "payload": {
+                "after": commit,
+                "ref": "refs/heads/main",
+                "repository": {
+                    "id": 4242,
+                    "private": false,
+                    "default_branch": "main"
+                }
+            }
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "cache-runner"},
+            "ownerName": "checkout cache test",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"].as_str().unwrap();
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "cache-runner", &["self-hosted"], None).await;
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+
+    // The default checkout is redirected at the engine, and the commit it asks
+    // for is the run's own immutable sha — not a rewritten synthetic one.
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job carries a checkout step");
+    fn cached_checkout_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
+        step["inputs"]
+            .get(name)
+            .and_then(Value::as_str)
+            .or_else(|| {
+                step["inputs"]["map"]
+                    .as_array()?
+                    .iter()
+                    .find(|entry| {
+                        entry
+                            .get("Key")
+                            .or_else(|| entry.get("key"))
+                            .and_then(|key| key.get("lit"))
+                            .and_then(Value::as_str)
+                            == Some(name)
+                    })
+                    .and_then(|entry| entry.get("Value").or_else(|| entry.get("value")))
+                    .and_then(|value| value.get("lit"))
+                    .and_then(Value::as_str)
+            })
+    }
+    let inputs =
+        |name: &str| -> Option<String> { cached_checkout_input(checkout, name).map(str::to_owned) };
+    assert_eq!(inputs("ref").as_deref(), Some(commit.as_str()));
+    assert_eq!(inputs("repository"), Some(format!("snapshots/{run_id}")));
+    assert_eq!(inputs("github-server-url"), Some(public_base_url()));
+    // The forge origin is left alone: the commit exists upstream, and the cache
+    // holds only that commit.
+    assert_eq!(acquired["snapshotOriginRewrite"], Value::Null);
+
+    let runtime_token = acquired["variables"]["system.github.token"]["value"]
+        .as_str()
+        .expect("the job exposes its runtime token");
+    let advertisement = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{run_id}/info/refs?service=git-upload-pack"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(advertisement.status(), StatusCode::OK);
+    // A real git client only proceeds on the upload-pack advertisement. A
+    // missing query passthrough would answer the dumb text/plain listing
+    // instead, which still names the commit but no client can fetch from.
+    assert_eq!(
+        advertisement
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-git-upload-pack-advertisement"),
+        "the engine must answer smart-HTTP discovery, not the dumb listing"
+    );
+    let advertised = to_bytes(advertisement.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        advertised
+            .windows(commit.len())
+            .any(|window| window == commit.as_bytes()),
+        "the cached commit must be fetchable by the job"
+    );
+
+    let foreign_run = "99999999-9999-4999-8999-999999999999";
+    let foreign = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{foreign_run}/info/refs?service=git-upload-pack"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {runtime_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+
+    // The objects live in the checkout cache, not in a per-run copy of the
+    // repository.
+    assert!(state_dir
+        .join(format!("checkout-cache/runs/{run_id}.git"))
+        .is_dir());
+    assert!(!state_dir
+        .join("snapshots")
+        .join(run_id.to_string())
+        .exists());
 }
 
 /// Uploaded job logs must stay bounded, and pruning must not cost a run its

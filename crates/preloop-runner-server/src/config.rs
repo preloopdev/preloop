@@ -304,11 +304,69 @@ impl std::fmt::Debug for GitHubConfig {
     }
 }
 
+/// Checkout object retention policy. Disabled is the compatibility default:
+/// workflows fetch directly from their forge exactly as they do today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckoutCacheMode {
+    #[default]
+    Off,
+    RunScoped,
+    Repository,
+}
+
+/// Lenient mode deserialization for the config file: an unknown value warns
+/// and falls back to `off` (no retention) instead of refusing to boot. Off
+/// is the safe state — unlike secret handling, there is nothing dangerous
+/// about retaining less — so a typo must cost caching, never startup.
+fn de_checkout_cache_mode<'de, D>(deserializer: D) -> Result<CheckoutCacheMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match parse_checkout_cache_mode(&raw) {
+        Ok(mode) => Ok(mode),
+        Err(_) => {
+            tracing::warn!(
+                "unknown checkout cache mode `{raw}` in config file; falling back to `off`"
+            );
+            Ok(CheckoutCacheMode::Off)
+        }
+    }
+}
+
+/// Effective checkout-cache configuration. Durations are seconds so the file,
+/// environment, native API, and eventual UI share one unambiguous wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckoutCacheConfig {
+    #[serde(default, deserialize_with = "de_checkout_cache_mode")]
+    pub mode: CheckoutCacheMode,
+    pub run_retention_seconds: u64,
+    pub repository_retention_seconds: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for CheckoutCacheConfig {
+    fn default() -> Self {
+        Self {
+            mode: CheckoutCacheMode::Off,
+            run_retention_seconds: 3_600,
+            repository_retention_seconds: 7 * 24 * 60 * 60,
+            max_bytes: 100 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// The engine configuration file.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
     pub github: GitHubConfig,
+    /// Optional checkout-object reuse. `off` is the default and preserves
+    /// direct per-job forge checkout.
+    #[serde(default)]
+    pub checkout_cache: CheckoutCacheConfig,
     /// Stored job secrets injected into every trusted job, mirroring
     /// GitHub's org-level secrets.
     #[serde(default)]
@@ -335,6 +393,127 @@ pub struct ConfigFile {
 
 /// Env override for the secrets-store mode; see [`ConfigFile::secrets_store`].
 pub const SECRETS_STORE_ENV: &str = "PRELOOP_SECRETS_STORE";
+pub const CHECKOUT_CACHE_MODE_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MODE";
+pub const CHECKOUT_CACHE_RUN_RETENTION_ENV: &str = "PRELOOP_CHECKOUT_CACHE_RUN_RETENTION_SECONDS";
+pub const CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV: &str =
+    "PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS";
+pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES";
+
+/// Parse a checkout-cache mode. Unknown values are an error from the parser;
+/// every caller warns and falls back to `off`, so a typo never silently
+/// turns source retention on and never blocks startup either.
+pub fn parse_checkout_cache_mode(raw: &str) -> anyhow::Result<CheckoutCacheMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(CheckoutCacheMode::Off),
+        "run-scoped" => Ok(CheckoutCacheMode::RunScoped),
+        "repository" => Ok(CheckoutCacheMode::Repository),
+        other => anyhow::bail!(
+            "invalid checkout cache mode `{other}` (expected off, run-scoped, or repository)"
+        ),
+    }
+}
+
+/// Resolve checkout-cache configuration with environment variables taking
+/// precedence. An unknown mode warns and falls back to `off`: off retains
+/// nothing, so a typo costs caching, never startup.
+pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCacheConfig> {
+    let mut effective = config.checkout_cache.clone();
+    if let Some(raw) = std::env::var(CHECKOUT_CACHE_MODE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        effective.mode = match parse_checkout_cache_mode(&raw) {
+            Ok(mode) => mode,
+            Err(_) => {
+                tracing::warn!(
+                    "{CHECKOUT_CACHE_MODE_ENV} has unknown mode `{raw}`; falling back to `off`"
+                );
+                CheckoutCacheMode::Off
+            }
+        };
+    }
+    for (name, target) in [
+        (
+            CHECKOUT_CACHE_RUN_RETENTION_ENV,
+            &mut effective.run_retention_seconds,
+        ),
+        (
+            CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV,
+            &mut effective.repository_retention_seconds,
+        ),
+        (CHECKOUT_CACHE_MAX_BYTES_ENV, &mut effective.max_bytes),
+    ] {
+        if let Some(raw) = std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            *target = raw
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid unsigned integer in {name}"))?;
+        }
+    }
+    Ok(effective)
+}
+
+#[cfg(test)]
+mod checkout_cache_tests {
+    use super::*;
+
+    /// Retaining repository source is opt-in: an absent section keeps every
+    /// job checking out directly from its forge.
+    #[test]
+    fn checkout_cache_defaults_to_off() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.checkout_cache.mode, CheckoutCacheMode::Off);
+    }
+
+    #[test]
+    fn checkout_cache_modes_parse_and_typos_fall_back_to_off() {
+        let config: ConfigFile = toml::from_str(
+            r#"
+[checkout_cache]
+mode = "run-scoped"
+run_retention_seconds = 60
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.checkout_cache.mode, CheckoutCacheMode::RunScoped);
+        assert_eq!(config.checkout_cache.run_retention_seconds, 60);
+        // Unset keys keep their defaults rather than collapsing to zero.
+        assert_eq!(
+            config.checkout_cache.repository_retention_seconds,
+            CheckoutCacheConfig::default().repository_retention_seconds
+        );
+
+        assert_eq!(
+            parse_checkout_cache_mode("repository").unwrap(),
+            CheckoutCacheMode::Repository
+        );
+        assert!(parse_checkout_cache_mode("run scoped").is_err());
+        assert!(parse_checkout_cache_mode("on").is_err());
+        // A typo in the file warns and keeps retention off instead of
+        // refusing to boot.
+        let typo: ConfigFile = toml::from_str("[checkout_cache]\nmode = \"everything\"").unwrap();
+        assert_eq!(typo.checkout_cache.mode, CheckoutCacheMode::Off);
+    }
+
+    /// An unknown mode from the environment warns and keeps retention off
+    /// instead of refusing to boot. No other test touches this variable, so
+    /// setting it here cannot race.
+    #[test]
+    fn checkout_cache_unknown_env_mode_falls_back_to_off() {
+        let prior = std::env::var(CHECKOUT_CACHE_MODE_ENV).ok();
+        std::env::set_var(CHECKOUT_CACHE_MODE_ENV, "everything");
+        let effective =
+            checkout_cache_config(&ConfigFile::default()).expect("fallback is not an error");
+        assert_eq!(effective.mode, CheckoutCacheMode::Off);
+        match prior {
+            Some(value) => std::env::set_var(CHECKOUT_CACHE_MODE_ENV, value),
+            None => std::env::remove_var(CHECKOUT_CACHE_MODE_ENV),
+        }
+    }
+}
 
 /// Systemd sets this when the unit mounts any `LoadCredential=`.
 pub const CREDENTIALS_ENV: &str = "CREDENTIALS_DIRECTORY";
@@ -921,6 +1100,7 @@ mod tests {
                 )]),
             )]),
             secrets_store: None,
+            checkout_cache: CheckoutCacheConfig::default(),
         }
     }
 

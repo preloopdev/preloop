@@ -24,6 +24,7 @@ on:
 
 jobs:
   rust-lint:
+    name: rust-lint
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 20
     env:
@@ -159,6 +160,7 @@ jobs:
           RUSTFLAGS: "-A warnings"
 
   property-tests-fast:
+    name: property-tests-fast
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 30
     if: github.event_name != 'schedule'
@@ -265,6 +267,7 @@ jobs:
           if-no-files-found: ignore
 
   property-tests-intensive:
+    name: Property tests intensive
     runs-on: [self-hosted, preloop-cpane]
     timeout-minutes: 120
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'intensive')
