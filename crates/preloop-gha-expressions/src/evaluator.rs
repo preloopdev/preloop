@@ -675,11 +675,11 @@ fn push_evaluation_capped(
 /// all matching file paths (sorted), SHA-256 hashes each file, then
 /// SHA-256 hashes the concatenated hex digests. Returns `""` on no match.
 ///
-/// R1-7: every match is confined to the workspace. Absolute patterns are
-/// treated as workspace-relative (never used as-is, which would make
+/// R1-7: every match is confined to the workspace. Absolute patterns and
+/// `..` traversal are rejected outright (never used as-is, which would make
 /// `hashFiles('/etc/passwd')` a file-content oracle), each candidate is
 /// canonicalized and required to stay under the canonical workspace root
-/// (so `../` traversal and escaping symlinks are skipped), and the number of
+/// (so escaping symlinks are skipped), and the number of
 /// files / total bytes hashed are capped. Files are streamed through the
 /// hasher instead of being `fs::read` into memory whole.
 ///
@@ -724,9 +724,11 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         patterns.push(s);
     }
 
-    // R1-7: dedup during collection (overlapping patterns must not trip the
+    // R1-7: dedup by matched path (overlapping patterns must not trip the
     // file cap with duplicates) and bound the retained set so adversarial
-    // globs like `**/*` cannot grow it without limit.
+    // globs like `**/*` cannot grow it without limit. Canonicalization is
+    // only the confinement check — hashing/sorting keep the matched path so
+    // symlink aliases matching the same target hash per match like official.
     let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
 
@@ -769,7 +771,10 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
                     }
                     // Canonicalize (resolves symlinks and `..`) and require
                     // the result to stay under the workspace root; anything
-                    // escaping the workspace is skipped.
+                    // escaping the workspace is skipped. The canonical path
+                    // is only the confinement check: the matched `entry` is
+                    // what gets hashed, so symlink aliases to the same target
+                    // stay distinct matches like official path-based hashing.
                     let canonical = match std::fs::canonicalize(&entry) {
                         Ok(p) => p,
                         Err(_) => continue,
@@ -782,7 +787,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
                     if !canonical.is_file() {
                         continue;
                     }
-                    if seen_paths.insert(canonical) && seen_paths.len() > MAX_FILES {
+                    if seen_paths.insert(entry) && seen_paths.len() > MAX_FILES {
                         return Err(ExpressionError::HashFilesTooManyFiles(MAX_FILES));
                     }
                 }

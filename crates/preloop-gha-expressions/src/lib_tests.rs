@@ -861,6 +861,50 @@ mod official_semantics {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// R1-7/Codex: symlink aliases to the same target hash per matched path
+    /// like official — canonical dedup must not collapse them into one entry.
+    #[cfg(unix)]
+    #[test]
+    fn hash_files_symlink_alias_hashes_per_match() {
+        use sha2::{Digest, Sha256};
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17e-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink(workspace.join("real.txt"), workspace.join("inner-link"))
+            .unwrap();
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        let single = eval_expression("hashFiles('real.txt')", &context).unwrap();
+        let aliased = eval_expression(
+            "hashFiles('--follow-symbolic-links', 'real.txt', 'inner-link')",
+            &context,
+        )
+        .unwrap();
+        let Value::String(single_hex) = single else {
+            panic!("expected string hash");
+        };
+        let Value::String(aliased_hex) = aliased else {
+            panic!("expected string hash");
+        };
+        assert_eq!(single_hex.len(), 64);
+        assert_eq!(aliased_hex.len(), 64);
+        assert_ne!(
+            single_hex, aliased_hex,
+            "alias + target must hash as two matches, not dedup to one"
+        );
+        // Both matches hold identical bytes, so order is irrelevant: the
+        // outer hash must equal SHA256(digest || digest).
+        let inner = Sha256::digest(b"real");
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&inner);
+        combined.extend_from_slice(&inner);
+        let expected = format!("{:x}", Sha256::digest(&combined));
+        assert_eq!(aliased_hex, expected);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// R1-7: matching more than the file cap is a clear error, not silent
     /// truncation or unbounded hashing.
