@@ -875,7 +875,8 @@ async fn verify_release_signature(
         })?;
     let archive_bytes = std::fs::read(archive_path)
         .with_context(|| format!("read downloaded asset {}", archive_path.display()))?;
-    verify_detached_signature(&archive_bytes, &signature).map_err(|_| {        anyhow::anyhow!(
+    verify_detached_signature(&archive_bytes, &signature).map_err(|_| {
+        anyhow::anyhow!(
             "invalid release signature for {}: refusing to install",
             archive.name
         )
