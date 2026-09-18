@@ -170,3 +170,56 @@ async fn bridge_half_close_preserves_response() {
     std::env::remove_var(BRIDGE_MAX_CONNECTIONS_ENV);
     std::env::remove_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV);
 }
+
+/// Sustained one-way traffic must not trip the idle deadline: the timer is
+/// shared and reset by bytes flowing in *either* direction, so a silent
+/// reverse channel never kills an active forward one.
+#[tokio::test]
+async fn bridge_one_way_traffic_survives_idle_timeout() {
+    let _env = ENV_LOCK.lock().await;
+    // Upstream drains request bytes and never answers.
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = upstream.accept().await {
+            tokio::spawn(async move {
+                let mut sink = [0u8; 1024];
+                while s.read(&mut sink).await.unwrap_or(0) > 0 {}
+            });
+        }
+    });
+
+    std::env::set_var(CONTROL_ORIGIN_ENV, "http://127.0.0.1:0");
+    std::env::remove_var(CONTROL_SOCKET_ENV);
+    std::env::set_var(CONTROL_UPSTREAM_ENV, upstream_addr.to_string());
+    std::env::set_var(BRIDGE_MAX_CONNECTIONS_ENV, "8");
+    std::env::set_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV, "1");
+
+    let bridge = control_bridge::spawn_from_env()
+        .await
+        .expect("bridge should spawn");
+    let addr = bridge.address();
+
+    // One byte every 500ms for 3s: always under the 1s deadline, while the
+    // reverse direction stays completely silent throughout.
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    for _ in 0..6 {
+        client.write_all(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Still open: a short read must time out, not return EOF.
+    let mut buf = [0u8; 1];
+    let still_open = tokio::time::timeout(Duration::from_millis(300), client.read(&mut buf)).await;
+    assert!(
+        still_open.is_err(),
+        "one-way active connection reaped as idle: {still_open:?}"
+    );
+
+    drop(client);
+    drop(bridge);
+
+    std::env::remove_var(CONTROL_ORIGIN_ENV);
+    std::env::remove_var(CONTROL_UPSTREAM_ENV);
+    std::env::remove_var(BRIDGE_MAX_CONNECTIONS_ENV);
+    std::env::remove_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV);
+}
