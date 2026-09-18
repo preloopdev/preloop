@@ -235,13 +235,17 @@ async fn live_log_stream(
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
-        let lines_arc = inner.live_log_lines.entry(key.to_owned()).or_default().clone();
+        let lines_arc = inner
+            .live_log_lines
+            .entry(key.to_owned())
+            .or_default()
+            .clone();
         let lines = lines_arc.lock().await;
         let snapshot = lines.clone();
-        let subscription = if live_log_is_closed(&inner, run_id, job_id, &key) {
+        let subscription = if live_log_is_closed(&inner, run_id, job_id, key) {
             None
         } else {
-            Some(live_log_sender(&mut inner, &key).subscribe())
+            Some(live_log_sender(&mut inner, key).subscribe())
         };
         // Keep the guard alive through subscription creation; this explicit
         // binding makes the lock ordering above visible to future edits.
