@@ -145,6 +145,18 @@ impl JobContext {
                             masks.insert(
                                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val),
                             );
+                            // H1: register each non-empty trimmed CR/LF-delimited
+                            // line too. Log masking runs per assembled line, so
+                            // a multiline initial secret (PEM key, JSON blob)
+                            // would otherwise never match the whole value and
+                            // would leak line by line. Mirrors add_mask.
+                            for line in val
+                                .split(['\r', '\n'])
+                                .map(str::trim)
+                                .filter(|l| !l.is_empty())
+                            {
+                                masks.insert(line.to_string());
+                            }
                         }
                     }
                 }

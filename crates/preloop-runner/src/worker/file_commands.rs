@@ -14,6 +14,45 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::debug;
 
+/// R1-12: file-command inputs (GITHUB_ENV/OUTPUT/STATE/PATH) are bounded
+/// like step summaries already are (1 MiB). A step can otherwise grow these
+/// files without limit and have the runner read them whole into memory.
+const FILE_COMMAND_MAX_BYTES: u64 = 1_048_576;
+
+/// R1-12: read a file-command input through a single handle with a byte
+/// budget. A metadata size check followed by a separate read is two
+/// filesystem observations: a file growing between them passes the gate and
+/// then allocates to EOF. Open once, require a regular file (no
+/// directories, devices, FIFOs, or sockets), and read at most MAX+1 bytes
+/// so an over-budget file errors instead of allocating.
+/// (Residual: opening a FIFO blocks until a writer arrives — same as
+/// pre-PR; only the size race is closed here.)
+fn read_file_command(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    if !file
+        .metadata()
+        .with_context(|| format!("reading {}", path.display()))?
+        .is_file()
+    {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut limited = file.take(FILE_COMMAND_MAX_BYTES + 1);
+    let mut text = String::new();
+    limited
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if text.len() as u64 > FILE_COMMAND_MAX_BYTES {
+        bail!(
+            "{} exceeds the {} KiB file-command size limit (got {} KiB)",
+            path.display(),
+            FILE_COMMAND_MAX_BYTES / 1024,
+            text.len() as u64 / 1024
+        );
+    }
+    Ok(text)
+}
+
 /// Paths to the file command temp files for a step.
 pub struct FileCommandPaths {
     pub env_file: PathBuf,
@@ -156,8 +195,8 @@ pub fn parse_kv_file(path: &Path) -> Result<HashMap<String, String>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // R1-12: single-handle bounded read (no check-then-read race).
+    let text = read_file_command(path)?;
 
     let mut result = HashMap::new();
     let mut index = 0;
@@ -261,8 +300,8 @@ pub fn parse_path_file(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // R1-12: single-handle bounded read (no check-then-read race).
+    let content = read_file_command(path)?;
 
     Ok(content
         .lines()
@@ -418,31 +457,32 @@ fn process_artifacts_file(
 /// Apply GITHUB_ENV and GITHUB_PATH from file commands to the job context.
 /// Used between composite steps so env changes propagate to subsequent steps.
 /// Does NOT apply outputs or state — those are handled by the composite handler.
-pub fn apply_file_commands_to_job(paths: &FileCommandPaths, job: &mut super::contexts::JobContext) {
+/// Returns Err on oversized/unreadable inputs: callers must fail the step,
+/// matching the top-level path. Swallowing the error reports success with
+/// silently missing env, which is worse than failing.
+pub fn apply_file_commands_to_job(
+    paths: &FileCommandPaths,
+    job: &mut super::contexts::JobContext,
+) -> Result<()> {
     // GitHub Actions runner v2.335.1 SetEnvFileCommand.ProcessCommand applies
     // the NODE_OPTIONS block list case-insensitively, including embedded steps.
-    if let Ok(env_vars) = parse_kv_file(&paths.env_file) {
-        for (k, v) in env_vars {
-            if k.eq_ignore_ascii_case("NODE_OPTIONS") {
-                tracing::warn!(
-                    "Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command."
-                );
-                continue;
-            }
-            debug!("GITHUB_ENV (composite): {k}={v}");
-            job.env.insert(k, v);
+    for (k, v) in parse_kv_file(&paths.env_file)? {
+        if k.eq_ignore_ascii_case("NODE_OPTIONS") {
+            tracing::warn!(
+                "Can't store NODE_OPTIONS output parameter using '$GITHUB_ENV' command."
+            );
+            continue;
         }
+        debug!("GITHUB_ENV (composite): {k}={v}");
+        job.env.insert(k, v);
     }
     // Preserve AddPathFileCommand's file order for composite steps too.
-    if let Ok(extra_paths) = parse_path_file(&paths.path_file) {
-        for p in extra_paths.into_iter().rev() {
-            debug!("GITHUB_PATH (composite): {p}");
-            job.extra_path.insert(0, p);
-        }
+    for p in parse_path_file(&paths.path_file)?.into_iter().rev() {
+        debug!("GITHUB_PATH (composite): {p}");
+        job.extra_path.insert(0, p);
     }
+    Ok(())
 }
-
-/// Clean up file command temp files.
 pub fn cleanup_file_commands(paths: &FileCommandPaths) {
     for path in [
         &paths.env_file,
@@ -558,9 +598,6 @@ fn make_file_subject(
         base.join(declared_path)
     };
 
-    if file_path.is_dir() {
-        bail!("'{declared_path}' is a directory, not a regular file");
-    }
     if !file_path.exists() {
         if !Path::new(declared_path).is_absolute() {
             let root = workspace.unwrap_or(".");
@@ -571,9 +608,26 @@ fn make_file_subject(
         bail!("file '{declared_path}' does not exist");
     }
 
-    let content = std::fs::read(&file_path)
+    // R1-12: stream the file through the hasher instead of reading it whole
+    // into memory. The declared path is attacker-chosen (absolute paths are
+    // allowed) and may be gigabytes; a 2 GiB sparse file previously added
+    // ~2 GiB to RSS.
+    let mut file = std::fs::File::open(&file_path)
         .with_context(|| format!("reading artifact file {}", file_path.display()))?;
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&content));
+    // The declared path is attacker-chosen: refuse directories, devices,
+    // FIFOs, and sockets before streaming. Symlinks to regular files still
+    // resolve through the open handle.
+    if !file
+        .metadata()
+        .with_context(|| format!("reading artifact file {}", file_path.display()))?
+        .is_file()
+    {
+        bail!("'{declared_path}' is not a regular file");
+    }
+    let mut hasher = sha2::Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("hashing artifact file {}", file_path.display()))?;
+    let digest = format!("sha256:{:x}", hasher.finalize());
     let name = file_path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -654,6 +708,79 @@ mod tests {
         std::fs::write(&path, "/usr/local/bin\n/opt/bin\n").unwrap();
         let result = parse_path_file(&path).unwrap();
         assert_eq!(result, vec!["/usr/local/bin", "/opt/bin"]);
+    }
+
+    /// R1-12: artifact file subjects are hashed by streaming, not by reading
+    /// the whole file into memory. Uses a 512 MiB sparse file (instant to
+    /// create); the digest must match a streaming reference hash.
+    #[test]
+    fn artifact_file_subject_streams_large_file() {
+        use sha2::Digest as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(512 * 1024 * 1024).unwrap();
+        drop(f);
+        let subject = make_file_subject(path.to_str().unwrap(), None).unwrap();
+        // Reference: stream 512 MiB of zeros through SHA-256.
+        let mut hasher = sha2::Sha256::new();
+        let zeros = [0u8; 65536];
+        for _ in 0..(512 * 1024 * 1024 / 65536) {
+            hasher.update(zeros);
+        }
+        let expected = format!("sha256:{:x}", hasher.finalize());
+        assert_eq!(subject.digest, expected);
+        assert_eq!(subject.kind, "file");
+    }
+    /// R1-12: an over-budget file-command input errors with the size message
+    /// instead of being read whole.
+    #[test]
+    fn oversized_file_command_rejected() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env");
+        std::fs::write(&path, format!("K={}\n", "x".repeat(2 * 1024 * 1024))).unwrap();
+        let err = parse_kv_file(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("file-command size limit"),
+            "wrong error: {err}"
+        );
+    }
+
+    /// Non-regular files (directories, devices) are refused before hashing.
+    #[test]
+    fn artifact_subject_rejects_non_regular_file() {
+        let dir = TempDir::new().unwrap();
+        let err = make_file_subject(dir.path().to_str().unwrap(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "wrong error: {err}");
+    }
+
+    /// The size gate and the read are one observation: a file growing
+    /// between them must still come back bounded — Err or a small parse,
+    /// never a giant allocation.
+    #[test]
+    fn growing_file_command_stays_bounded() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("growing");
+        std::fs::write(&path, "K=v\n").unwrap();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..200 {
+                let _ =
+                    std::fs::write(&writer_path, format!("K={}\n", "x".repeat(2 * 1024 * 1024)));
+            }
+        });
+        for _ in 0..100 {
+            match parse_kv_file(&path) {
+                Err(_) => {}
+                Ok(m) => {
+                    let total: usize = m.iter().map(|(k, v)| k.len() + v.len()).sum();
+                    assert!(total <= 2 * 1024 * 1024, "unbounded parse: {total}");
+                }
+            }
+        }
+        let _ = writer.join();
     }
 
     #[test]
@@ -1196,7 +1323,7 @@ mod tests {
             prop_assert!(!normal.env.keys().any(|key| key.eq_ignore_ascii_case("NODE_OPTIONS")));
 
             let mut composite = new_job(&[]);
-            apply_file_commands_to_job(&paths, &mut composite);
+            apply_file_commands_to_job(&paths, &mut composite).unwrap();
             prop_assert_eq!(composite.env.get("SAFE").map(String::as_str), Some(safe_value.as_str()));
             prop_assert!(!composite.env.keys().any(|key| key.eq_ignore_ascii_case("NODE_OPTIONS")));
         }

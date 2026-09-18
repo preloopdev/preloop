@@ -26,11 +26,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 /// Consecutive upstream connect failures before the bridge logs a warning.
@@ -52,6 +54,26 @@ pub const CONTROL_ORIGIN_ENV: &str = "PRELOOP_CONTROL_ORIGIN";
 /// Set when the mounted Unix socket is unavailable and the bridge should
 /// forward connections over TCP instead (e.g. to a LAN-reachable host IP).
 pub const CONTROL_UPSTREAM_ENV: &str = "PRELOOP_CONTROL_UPSTREAM";
+/// Environment variable overriding the maximum concurrent spliced
+/// connections. Defaults to [`DEFAULT_MAX_CONNECTIONS`].
+pub const BRIDGE_MAX_CONNECTIONS_ENV: &str = "PRELOOP_BRIDGE_MAX_CONNECTIONS";
+/// Environment variable overriding the idle timeout for a spliced
+/// connection, in seconds. Defaults to 300
+/// ([`DEFAULT_IDLE_TIMEOUT_SECS`]).
+pub const BRIDGE_IDLE_TIMEOUT_SECS_ENV: &str = "PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS";
+
+/// Default cap on concurrent spliced connections.
+///
+/// R1-13: every accepted connection spawns a task and opens an upstream
+/// socket. Without a cap, a guest process can accumulate tasks and sockets
+/// without bound by opening connections and leaving them idle.
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
+/// Default idle timeout, in seconds, for a spliced connection.
+///
+/// R1-13: a connection that moves zero bytes in either direction for this
+/// long is closed. Polling HTTP clients and keep-alive pools reconnect
+/// transparently, so this only reaps truly idle splices.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
 /// Which upstream transport the bridge forwards accepted connections to.
 #[derive(Debug, Clone)]
@@ -87,6 +109,10 @@ impl Drop for ControlBridge {
 /// Returns `None` when the runner is not behind a mounted control socket (the
 /// normal GitHub-hosted case) or when the advertised origin is not a loopback
 /// address the guest can bind.
+///
+/// R1-13: concurrent connections are capped at `PRELOOP_BRIDGE_MAX_CONNECTIONS`
+/// (default 256); excess connections are closed immediately. Connections idle
+/// longer than `PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS` (default 300) are closed.
 pub async fn spawn_from_env() -> Option<ControlBridge> {
     let origin = std::env::var(CONTROL_ORIGIN_ENV).ok()?;
     let socket = std::env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
@@ -114,7 +140,20 @@ pub async fn spawn_from_env() -> Option<ControlBridge> {
         (None, None) => return None,
     };
     let address = loopback_address(&origin)?;
-    match spawn(address, upstream).await {
+    // Absurd values fall back to the default: 0 would refuse everything and
+    // anything above Semaphore::MAX_PERMITS would panic in the constructor.
+    let max_connections = std::env::var(BRIDGE_MAX_CONNECTIONS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    let idle_timeout = std::env::var(BRIDGE_IDLE_TIMEOUT_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+    match spawn(address, upstream, max_connections, idle_timeout).await {
         Ok(bridge) => {
             info!(%address, "control-plane loopback bridge listening");
             Some(bridge)
@@ -188,11 +227,20 @@ fn upstream_tcp_address(addr: &str) -> Option<SocketAddr> {
     addr.parse().ok()
 }
 
-async fn spawn(address: SocketAddr, upstream: Upstream) -> std::io::Result<ControlBridge> {
+async fn spawn(
+    address: SocketAddr,
+    upstream: Upstream,
+    max_connections: usize,
+    idle_timeout: Duration,
+) -> std::io::Result<ControlBridge> {
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     let consecutive_failures = Arc::new(AtomicU32::new(0));
     let warned_at_threshold = Arc::new(AtomicBool::new(false));
+    // R1-13: bound the number of concurrent spliced connections. The permit
+    // is held for the whole connection lifetime, so at most `max_connections`
+    // tasks and upstream sockets can exist at once.
+    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
     let task = tokio::spawn(async move {
         loop {
             let (client, peer) = match listener.accept().await {
@@ -202,11 +250,23 @@ async fn spawn(address: SocketAddr, upstream: Upstream) -> std::io::Result<Contr
                     continue;
                 }
             };
+            let permit = match connection_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // Over the cap: close immediately rather than queueing a
+                    // task the bridge can never service. HTTP clients retry.
+                    debug!(%peer, "control bridge connection cap reached; closing");
+                    drop(client);
+                    continue;
+                }
+            };
             let upstream = upstream.clone();
             let failures = Arc::clone(&consecutive_failures);
             let warned = Arc::clone(&warned_at_threshold);
             tokio::spawn(async move {
-                match splice(client, &upstream).await {
+                // Hold the permit until the splice ends.
+                let _permit = permit;
+                match splice(client, &upstream, idle_timeout).await {
                     Ok(()) => {
                         failures.store(0, Ordering::Relaxed);
                     }
@@ -230,32 +290,109 @@ async fn spawn(address: SocketAddr, upstream: Upstream) -> std::io::Result<Contr
     Ok(ControlBridge { address, task })
 }
 
-async fn splice(client: TcpStream, upstream: &Upstream) -> std::io::Result<()> {
+async fn splice(
+    client: TcpStream,
+    upstream: &Upstream,
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
     // Nagle would add up to 40ms to the small request/response pairs the
     // control plane exchanges.
     client.set_nodelay(true)?;
+    // The idle deadline covers establishment too: a wedged connect must not
+    // retain a semaphore permit past it.
     match upstream {
         #[cfg(unix)]
         Upstream::Socket(socket) => {
-            let stream = UnixStream::connect(socket).await?;
-            pump(client, stream).await
+            let stream = tokio::time::timeout(idle_timeout, UnixStream::connect(socket))
+                .await
+                .map_err(|_| idle_expired())??;
+            pump(client, stream, idle_timeout).await
         }
         Upstream::Tcp(addr) => {
-            let stream = TcpStream::connect(addr).await?;
+            let stream = tokio::time::timeout(idle_timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| idle_expired())??;
             stream.set_nodelay(true)?;
-            pump(client, stream).await
+            pump(client, stream, idle_timeout).await
         }
     }
 }
 
-async fn pump<A, B>(mut a: A, mut b: B) -> std::io::Result<()>
+/// Idle-deadline expiry shared by bridge connects, reads, and writes, so no
+/// stalled phase can retain a semaphore permit past the deadline.
+fn idle_expired() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "control bridge connection idle",
+    )
+}
+
+/// Bidirectional splice with an idle timeout and independent half-close.
+///
+/// R1-13: `copy_bidirectional` never times out, so a guest could hold
+/// connections open forever at near-zero cost. This closes a splice that
+/// moves no bytes in *either* direction for `idle_timeout`. Active traffic
+/// — bytes flowing either way — resets the deadline; only truly idle
+/// connections are reaped.
+///
+/// Each direction ends independently: EOF on one side shuts down only the
+/// other side's writer, and relaying continues until both sides reach EOF.
+/// Returning on the first EOF would drop a response already on its way back
+/// after a client half-close. Stalled writes share the deadline so a wedged
+/// peer cannot pin the opposite direction.
+async fn pump<A, B>(mut a: A, mut b: B, idle_timeout: Duration) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional(&mut a, &mut b)
-        .await
-        .map(drop)
+    async fn read_with_timeout<R: AsyncRead + Unpin>(
+        r: &mut R,
+        buf: &mut [u8],
+        idle_timeout: Duration,
+    ) -> std::io::Result<usize> {
+        tokio::time::timeout(idle_timeout, r.read(buf))
+            .await
+            .map_err(|_| idle_expired())?
+    }
+
+    async fn write_with_timeout<W: AsyncWrite + Unpin>(
+        w: &mut W,
+        buf: &[u8],
+        idle_timeout: Duration,
+    ) -> std::io::Result<()> {
+        tokio::time::timeout(idle_timeout, w.write_all(buf))
+            .await
+            .map_err(|_| idle_expired())?
+    }
+
+    let mut a_buf = [0u8; 8192];
+    let mut b_buf = [0u8; 8192];
+    let (mut a_eof, mut b_eof) = (false, false);
+    loop {
+        if a_eof && b_eof {
+            return Ok(());
+        }
+        tokio::select! {
+            read = read_with_timeout(&mut a, &mut a_buf, idle_timeout), if !a_eof => {
+                let n = read?;
+                if n == 0 {
+                    a_eof = true;
+                    b.shutdown().await?;
+                } else {
+                    write_with_timeout(&mut b, &a_buf[..n], idle_timeout).await?;
+                }
+            }
+            read = read_with_timeout(&mut b, &mut b_buf, idle_timeout), if !b_eof => {
+                let n = read?;
+                if n == 0 {
+                    b_eof = true;
+                    a.shutdown().await?;
+                } else {
+                    write_with_timeout(&mut a, &b_buf[..n], idle_timeout).await?;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +480,8 @@ mod tests {
         let bridge = spawn(
             "127.0.0.1:0".parse().unwrap(),
             Upstream::Socket(socket_path),
+            DEFAULT_MAX_CONNECTIONS,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
         )
         .await
         .unwrap();
@@ -365,9 +504,14 @@ mod tests {
         let upstream_addr = probe.local_addr().unwrap();
         drop(probe);
 
-        let bridge = spawn("127.0.0.1:0".parse().unwrap(), Upstream::Tcp(upstream_addr))
-            .await
-            .unwrap();
+        let bridge = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            Upstream::Tcp(upstream_addr),
+            DEFAULT_MAX_CONNECTIONS,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        )
+        .await
+        .unwrap();
         let addr = bridge.address();
 
         // Exhaust the old failure budget: each connection is accepted, then
@@ -414,9 +558,14 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
 
-        let bridge = spawn("127.0.0.1:0".parse().unwrap(), Upstream::Tcp(upstream_addr))
-            .await
-            .unwrap();
+        let bridge = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            Upstream::Tcp(upstream_addr),
+            DEFAULT_MAX_CONNECTIONS,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        )
+        .await
+        .unwrap();
         let mut client = TcpStream::connect(bridge.address()).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut response = Vec::new();
