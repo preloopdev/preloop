@@ -134,25 +134,18 @@ async fn authorize_live_log_read(
         .state
         .job_uuid_from_token(bearer)
         .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
-    // A UUID target that is not the caller's job is rejected without resolving
-    // it, so a mismatch never reveals whether the target exists.
-    if let Ok(target) = job_id.parse::<uuid::Uuid>() {
-        if target != caller {
-            return Err(ApiError::forbidden("live-log read job mismatch"));
-        }
-    } else {
-        // Otherwise the path carries a logical job key: resolve it to the
-        // concrete agent job and compare against the caller.
-        let key = {
-            let inner = shared.state.inner.lock().await;
-            live_log_key_for_job(&inner, run_id, job_id)
-        }
-        // Missing and foreign logical targets share one response: a distinct
-        // 404 would let a job credential enumerate which job names exist.
-        .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
-        if key != caller.to_string() {
-            return Err(ApiError::forbidden("live-log read job mismatch"));
-        }
+    // Resolve the selector to the concrete live-log key first: the path may
+    // carry a logical job name, an agent-job UUID, or a logical name that
+    // happens to be UUID-shaped — only resolution tells them apart. Missing
+    // and foreign targets share one response so a mismatch never reveals
+    // whether the target exists.
+    let key = {
+        let inner = shared.state.inner.lock().await;
+        live_log_key_for_job(&inner, run_id, job_id)
+    }
+    .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
+    if key != caller.to_string() {
+        return Err(ApiError::forbidden("live-log read job mismatch"));
     }
     Ok(())
 }
