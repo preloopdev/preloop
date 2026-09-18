@@ -49,6 +49,11 @@ const READ_BUF_SIZE: usize = 65536; // 64 KB
 /// (docker invocations, e.g. `docker logs` at service teardown). Without a
 /// cap, a chatty subprocess grows the line vecs without bound.
 const MAX_KEPT_LINES: usize = 100_000;
+/// R1-12: maximum retained bytes across both line vecs per invocation. The
+/// line-count cap alone still admits 100k × 64 KiB newline-free chunks, and
+/// stdout is mirrored into `lines`, doubling it again. Both vecs share one
+/// budget; retention stops (silently, like the line cap) once exhausted.
+const MAX_KEPT_BYTES: u64 = 64 * 1024 * 1024;
 
 // ProcessInvoker.cs v2.335.1 waits five seconds for redirected streams after
 // the parent exits, then kills the remaining process tree.
@@ -150,6 +155,8 @@ pub async fn invoke<'a>(
     let stderr_handle = stderr.map(|s| spawn_chunk_reader(s, chunk_tx, false));
     let mut lines = Vec::new();
     let mut stdout_lines = Vec::new();
+    // Shared retain budget for both vecs; see MAX_KEPT_BYTES.
+    let mut kept_bytes = 0u64;
 
     // Wait for process, racing against cancellation while draining chunks.
     let mut status_opt: Option<std::process::ExitStatus> = None;
@@ -184,6 +191,7 @@ pub async fn invoke<'a>(
                         &mut on_chunk,
                         keep_lines,
                         is_stdout,
+                        &mut kept_bytes,
                     ),
                     None => continue,
                 },
@@ -212,6 +220,7 @@ pub async fn invoke<'a>(
                         &mut on_chunk,
                         keep_lines,
                         is_stdout,
+                        &mut kept_bytes,
                     ),
                     None => continue,
                 },
@@ -237,6 +246,7 @@ pub async fn invoke<'a>(
             &mut on_chunk,
             keep_lines,
             false,
+            &mut kept_bytes,
         )
         .await;
         return Err(anyhow::anyhow!("process cancelled"));
@@ -256,6 +266,7 @@ pub async fn invoke<'a>(
         &mut on_chunk,
         keep_lines,
         !forced_stream_close,
+        &mut kept_bytes,
     )
     .await;
 
@@ -315,11 +326,21 @@ where
 
 // ── push_chunk / drain_chunks ───────────────────────────────────────────
 
-/// Deliver a raw byte chunk to the consumer.
-///
-/// When `on_chunk` is present, it receives the raw bytes directly (zero
-/// String allocation). When `keep_lines` is true, the chunk is split on
-/// newlines and accumulated into `lines` for test assertions.
+/// Retain one chunk segment against the line-count cap and the shared byte
+/// budget. Either bound stops retention; an overshooting final segment is
+/// kept whole, bounding overshoot to one read chunk.
+fn retain_segment(segment: &[u8], target: &mut Vec<String>, kept_bytes: &mut u64) {
+    if segment.is_empty() || target.len() >= MAX_KEPT_LINES || *kept_bytes >= MAX_KEPT_BYTES {
+        return;
+    }
+    let s = match std::str::from_utf8(segment) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::from_utf8_lossy(segment).into_owned(),
+    };
+    *kept_bytes += s.len() as u64;
+    target.push(s);
+}
+
 fn push_chunk(
     bytes: Bytes,
     lines: &mut Vec<String>,
@@ -327,41 +348,23 @@ fn push_chunk(
     on_chunk: &mut Option<ChunkCallback<'_>>,
     keep_lines: bool,
     is_stdout: bool,
+    kept_bytes: &mut u64,
 ) {
     if let Some(cb) = on_chunk.as_mut() {
         cb(&bytes);
     }
     if keep_lines {
-        let target: &mut Vec<String> = if is_stdout { stdout_lines } else { lines };
-        for segment in bytes.split(|&b| b == b'\n') {
-            if !segment.is_empty() {
-                // R1-12: stop retaining lines past the cap instead of growing
-                // the vec without bound.
-                if target.len() >= MAX_KEPT_LINES {
-                    continue;
-                }
-                match std::str::from_utf8(segment) {
-                    Ok(s) => target.push(s.to_string()),
-                    Err(_) => {
-                        target.push(String::from_utf8_lossy(segment).into_owned());
-                    }
-                }
+        if is_stdout {
+            // Stdout is retained twice (its own vec plus the combined one);
+            // both draws come from the same byte budget.
+            for segment in bytes.split(|&b| b == b'\n') {
+                retain_segment(segment, stdout_lines, kept_bytes);
             }
         }
-        if is_stdout {
-            for segment in bytes.split(|&b| b == b'\n') {
-                if !segment.is_empty() {
-                    if lines.len() >= MAX_KEPT_LINES {
-                        continue;
-                    }
-                    match std::str::from_utf8(segment) {
-                        Ok(s) => lines.push(s.to_string()),
-                        Err(_) => {
-                            lines.push(String::from_utf8_lossy(segment).into_owned());
-                        }
-                    }
-                }
-            }
+        // Combined vec always receives the segments (stdout additionally
+        // keeps its own copy above).
+        for segment in bytes.split(|&b| b == b'\n') {
+            retain_segment(segment, lines, kept_bytes);
         }
     }
 }
@@ -377,6 +380,7 @@ async fn drain_chunks(
     on_chunk: &mut Option<ChunkCallback<'_>>,
     keep_lines: bool,
     wait_for_eof: bool,
+    kept_bytes: &mut u64,
 ) {
     if wait_for_eof {
         // Runner.Worker does not complete a normally exited process until its
@@ -384,7 +388,15 @@ async fn drain_chunks(
         // that inherited either pipe therefore keeps the step active and
         // remains cancellable through the process group.
         while let Some((is_stdout, bytes)) = chunk_rx.recv().await {
-            push_chunk(bytes, lines, stdout_lines, on_chunk, keep_lines, is_stdout);
+            push_chunk(
+                bytes,
+                lines,
+                stdout_lines,
+                on_chunk,
+                keep_lines,
+                is_stdout,
+                kept_bytes,
+            );
         }
         if let Some(handle) = stdout_handle.take() {
             let _ = handle.await;
@@ -406,7 +418,15 @@ async fn drain_chunks(
         handle.abort();
     }
     while let Ok((is_stdout, bytes)) = chunk_rx.try_recv() {
-        push_chunk(bytes, lines, stdout_lines, on_chunk, keep_lines, is_stdout);
+        push_chunk(
+            bytes,
+            lines,
+            stdout_lines,
+            on_chunk,
+            keep_lines,
+            is_stdout,
+            kept_bytes,
+        );
     }
 }
 
@@ -1048,6 +1068,33 @@ mod tests {
         assert_eq!(result.lines.len(), 200);
         assert_eq!(result.lines.first().map(String::as_str), Some("line-0"));
         assert_eq!(result.lines.last().map(String::as_str), Some("line-199"));
+    }
+    #[test]
+    fn retained_output_bounded_by_bytes_not_just_lines() {
+        // Newline-free flood: 2000 × 64 KiB chunks with no `\n` would
+        // previously retain ~256 MiB (×2 mirrored) under the line-count cap.
+        let mut lines = Vec::new();
+        let mut stdout_lines = Vec::new();
+        let mut kept_bytes = 0u64;
+        let flood = Bytes::from(vec![b'A'; 64 * 1024]);
+        for _ in 0..2000 {
+            push_chunk(
+                flood.clone(),
+                &mut lines,
+                &mut stdout_lines,
+                &mut None,
+                true,
+                true,
+                &mut kept_bytes,
+            );
+        }
+        let total: u64 = lines.iter().map(|l| l.len() as u64).sum::<u64>()
+            + stdout_lines.iter().map(|l| l.len() as u64).sum::<u64>();
+        assert!(
+            total <= MAX_KEPT_BYTES + 128 * 1024,
+            "retained {total} bytes past the budget"
+        );
+        assert!(!lines.is_empty(), "budget must retain early output");
     }
 
     #[tokio::test]
