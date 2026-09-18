@@ -113,7 +113,7 @@ pub enum ExpressionError {
     #[error("hashFiles() matched more than the maximum of {0} files")]
     HashFilesTooManyFiles(usize),
     /// `hashFiles()` visited more entries than the per-call traversal budget.
-    #[error("hashFiles() visited more than the maximum of {0} files while expanding patterns")]
+    #[error("hashFiles() visited more than the maximum of {0} entries while expanding patterns")]
     HashFilesTraversalLimit(usize),
     /// `hashFiles()` input bytes exceeded the per-call budget.
     #[error("hashFiles() input exceeds the maximum of {0} bytes")]
