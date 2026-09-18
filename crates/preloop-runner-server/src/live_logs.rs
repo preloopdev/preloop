@@ -147,7 +147,9 @@ async fn authorize_live_log_read(
             let inner = shared.state.inner.lock().await;
             live_log_key_for_job(&inner, run_id, job_id)
         }
-        .ok_or_else(|| ApiError::not_found("job not found"))?;
+        // Missing and foreign logical targets share one response: a distinct
+        // 404 would let a job credential enumerate which job names exist.
+        .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
         if key != caller.to_string() {
             return Err(ApiError::forbidden("live-log read job mismatch"));
         }
