@@ -858,6 +858,35 @@ pub(crate) async fn job_repository_from_headers(
     Ok(Some(repository))
 }
 
+/// R1-5: resolve the git ref of the job behind a job runtime bearer, from
+/// the job → run → submission chain. Mirrors `job_repository_from_headers`.
+/// Returns `None` for the system token (the engine itself has no job).
+pub(crate) async fn job_git_ref_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let Some(token) = bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized("job runtime token required"));
+    };
+    if token == state.system_token.as_str() {
+        return Ok(None);
+    }
+    let job_id = state
+        .job_uuid_from_token(token)
+        .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
+    let inner = state.inner.lock().await;
+    let git_ref = inner
+        .agent_job_requests
+        .get(&job_id)
+        .and_then(|request_id| inner.job_requests.get(request_id))
+        .and_then(|record| inner.runs.get(&record.run_id))
+        .map(|run| run.submission.git_ref.clone())
+        .ok_or_else(|| {
+            ApiError::forbidden("job runtime token is not bound to a live workflow run")
+        })?;
+    Ok(Some(git_ref))
+}
+
 pub(crate) fn job_runtime_claims_from_headers(
     state: &AppState,
     headers: &HeaderMap,

@@ -65,6 +65,18 @@ fn default_artifact_file_name() -> String {
     "artifact.bin".to_owned()
 }
 
+/// R1-5: include the job's git ref in the legacy cache namespace so one
+/// branch cannot poison another branch's entries (first write wins on an
+/// exact key+version). The system token keeps the historical
+/// repository-only namespace.
+pub(crate) fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<String>) -> String {
+    match (repository, git_ref) {
+        (Some(repository), Some(git_ref)) => format!("{repository}\0{git_ref}"),
+        (Some(repository), None) => repository,
+        (None, _) => String::new(),
+    }
+}
+
 pub(crate) async fn cache_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CachePutRequest>,
@@ -120,20 +132,43 @@ pub(crate) async fn cache_reserve(
 ) -> Result<Json<CacheReserveResponse>, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
+    let git_ref = auth::job_git_ref_from_headers(&shared.state, &headers).await?;
     let job_backend_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
         .map(|claims| claims.job_id.to_string())
         .unwrap_or_default();
     let mut inner = shared.state.inner.lock().await;
+    // R1-6: bound in-flight legacy reservations per job, mirroring the v2
+    // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
+    // unbounded reservation state in server RAM.
+    if !job_backend_id.is_empty() {
+        let in_flight = inner
+            .pending_caches
+            .values()
+            .filter(|pending| pending.job_backend_id == job_backend_id)
+            .count();
+        if in_flight >= MAX_PENDING_PER_JOB {
+            return Err(ApiError::bad_request(format!(
+                "job has {in_flight} pending cache uploads (cap {MAX_PENDING_PER_JOB})"
+            )));
+        }
+    }
     inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
     inner.pending_caches.insert(
         cache_id,
         PendingCache {
             key: request.key,
-            namespace: repository.unwrap_or_default(),
+            // R1-5: the reservation is bound to the job's git ref, not just
+            // the repository, so a branch run cannot squat another branch's
+            // key namespace.
+            namespace: ref_scoped_namespace(repository, git_ref),
             version: request.version,
             bytes: Vec::new(),
             job_backend_id,
+            // R1-6: stamp the reservation so the TTL sweeper can free it if
+            // the job never commits (previously abandoned reservations held
+            // their bytes forever).
+            created_unix: crate::memory_caps::now_unix(),
         },
     );
     let meta = crate::store::build_meta_snapshot(&inner);
@@ -162,6 +197,16 @@ pub(crate) async fn cache_upload(
         return Err(ApiError::forbidden(
             "cache reservation belongs to another job",
         ));
+    }
+    // R1-6: cap each in-flight upload's running total. Without this check a
+    // job could grow server RAM without bound by PATCHing chunks forever
+    // (~500 requests/GiB at the 2 MiB default body limit). The check runs
+    // before the vector grows so the refusal itself allocates nothing.
+    if pending.bytes.len() as u64 + bytes.len() as u64 > MAX_CACHE_UPLOAD_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "cache upload exceeds the {} MiB per-upload cap",
+            MAX_CACHE_UPLOAD_BYTES / (1024 * 1024)
+        )));
     }
     pending.bytes.extend_from_slice(&bytes);
     // No write-through here on purpose: the in-flight payload is not durable
@@ -238,17 +283,36 @@ pub(crate) async fn cache_lookup(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let key = query.key.unwrap_or_default();
     let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
+    let git_ref = auth::job_git_ref_from_headers(&shared.state, &headers).await?;
     let restore_keys = parse_restore_keys(query.keys.as_deref());
-    let response = shared
-        .state
-        .cache
-        .get_scoped(
-            repository.as_deref().unwrap_or_default(),
-            &key,
-            &query.version,
-            &restore_keys,
-        )
-        .await?;
+    // R1-5: a job reads its own ref's namespace, falling back to the default
+    // branch (GitHub semantics). Caches on unrelated branches stay invisible.
+    // The system token keeps the historical repository-only namespace.
+    let namespaces: Vec<String> = match (repository, git_ref) {
+        (Some(repository), Some(git_ref)) => {
+            let mut namespaces = vec![format!("{repository}\0{git_ref}")];
+            if git_ref != crate::results_twirp::DEFAULT_BRANCH_REF {
+                namespaces.push(format!(
+                    "{repository}\0{}",
+                    crate::results_twirp::DEFAULT_BRANCH_REF
+                ));
+            }
+            namespaces
+        }
+        (Some(repository), None) => vec![repository],
+        (None, _) => vec![String::new()],
+    };
+    let mut response = None;
+    for namespace in &namespaces {
+        response = shared
+            .state
+            .cache
+            .get_scoped(namespace, &key, &query.version, &restore_keys)
+            .await?;
+        if response.is_some() {
+            break;
+        }
+    }
     if let Some((entry, _bytes)) = response {
         Ok(Json(json!({
             "cacheKey": entry.key,
