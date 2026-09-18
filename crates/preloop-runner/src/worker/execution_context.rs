@@ -42,7 +42,7 @@ const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
 /// R1-12: maximum bytes of a single completed output line passed through
 /// masking/logging. Longer lines are truncated with a marker instead of
 /// being copied whole several times over.
-const MAX_LOG_LINE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
 /// Bytes of the step-log head read for diagnostic scans (group markers,
 /// display-name fixups). The `##[group]Run …` line is emitted at step start,
 /// so scans never need more than the head.
@@ -942,6 +942,24 @@ mod tests {
         assert!(logged.contains("***"), "masked secret missing");
         assert!(
             logged.contains("line truncated"),
+            "truncation marker missing"
+        );
+    }
+    /// Completed newline-terminated lines are capped at 1 MiB: a 3 MiB line
+    /// must come out truncated with a marker, not copied whole.
+    #[test]
+    fn completed_line_capped_at_1mib() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.write_chunk(format!("{}.\n", "C".repeat(3 * 1024 * 1024)).as_bytes());
+        let logged = ctx.log_lines.join("\n");
+        assert!(
+            logged.len() < 2 * 1024 * 1024,
+            "3 MiB line passed through whole ({} bytes)",
+            logged.len()
+        );
+        assert!(
+            logged.contains("line truncated at 1048576 bytes"),
             "truncation marker missing"
         );
     }
