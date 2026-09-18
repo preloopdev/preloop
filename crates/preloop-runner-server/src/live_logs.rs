@@ -111,24 +111,35 @@ pub(crate) async fn live_logs_sse(
     Path((run_id, job_id)): Path<(RunId, String)>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    authorize_live_log_read(&shared, &headers, run_id, &job_id).await?;
-    live_log_stream(&shared, run_id, &job_id).await
+    let (key, job_id) = authorize_live_log_read(&shared, &headers, run_id, &job_id).await?;
+    live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
 /// M5: the protocol live-log read route must not let one job's runtime
 /// credential read another job's output. The caller's credential must identify
 /// the exact job being read; the system credential bypasses (first-party
 /// CLI/UI read through the separate native route).
+/// Returns the authorized concrete live-log key plus the resolved job
+/// selector so the stream binds to the same attempt that was checked —
+/// resolving the logical name twice would let a retry between the lookups
+/// hand an old attempt's credential the new attempt's stream.
 async fn authorize_live_log_read(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     run_id: RunId,
     job_id: &str,
-) -> Result<(), ApiError> {
+) -> Result<(String, String), ApiError> {
     let bearer = crate::auth::bearer_from_headers(headers)
         .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
     if bearer == shared.state.system_token {
-        return Ok(());
+        // The system credential bypasses ownership but still needs the
+        // resolved key so the stream follows the same explicit-key contract.
+        let key = {
+            let inner = shared.state.inner.lock().await;
+            live_log_key_for_job(&inner, run_id, job_id)
+        }
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+        return Ok((key, job_id.to_owned()));
     }
     let caller = shared
         .state
@@ -147,7 +158,7 @@ async fn authorize_live_log_read(
     if key != caller.to_string() {
         return Err(ApiError::forbidden("live-log read job mismatch"));
     }
-    Ok(())
+    Ok((key, job_id.to_owned()))
 }
 
 /// Job selector for the native live-log route.
@@ -205,25 +216,26 @@ pub(crate) async fn live_run_logs_sse(
             }
         }
     };
-    live_log_stream(&shared, run_id, &job_id).await
+    let key = {
+        let inner = shared.state.inner.lock().await;
+        live_log_key_for_job(&inner, run_id, &job_id)
+    }
+    .ok_or_else(|| ApiError::not_found("job not found"))?;
+    live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
-/// Replay the retained per-job buffer, then follow the live broadcast.
-///
-/// Snapshotting and subscribing happen while the global lock and the
-/// per-job lock are both held. Ingestion takes the same locks in that order,
-/// so a wrapper is observed either in the snapshot or in the receiver, never
-/// both.
+/// `key` is the concrete live-log key the caller was authorized for; the
+/// stream must not re-resolve the selector or a retry could redirect it to
+/// a different attempt than the one that passed the check.
 async fn live_log_stream(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &str,
+    key: &str,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
-        let key = live_log_key_for_job(&inner, run_id, job_id)
-            .ok_or_else(|| ApiError::not_found("job not found"))?;
-        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
+        let lines_arc = inner.live_log_lines.entry(key.to_owned()).or_default().clone();
         let lines = lines_arc.lock().await;
         let snapshot = lines.clone();
         let subscription = if live_log_is_closed(&inner, run_id, job_id, &key) {
