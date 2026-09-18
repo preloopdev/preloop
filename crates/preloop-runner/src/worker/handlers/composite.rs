@@ -840,6 +840,7 @@ mod tests {
             "default success() gate must skip later inner steps after a failure"
         );
     }
+
     /// An overgrown file command inside a composite step must fail the
     /// composite — never report success with silently missing env. The
     /// swallowing version returned Ok here.
