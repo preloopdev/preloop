@@ -166,26 +166,31 @@ impl<'a> StepContext<'a> {
         let mut buf = self.line_buffer.lock();
         buf.extend_from_slice(chunk);
 
-        // R1-12: bound the partial-line buffer. Newline-free output (a step
-        // dumping megabytes without `\n`) would otherwise be retained 1:1 in
-        // memory for the whole step. Keep the tail so a later newline still
-        // terminates the line; the dropped head is reported below.
-        if buf.len() > MAX_LINE_BUFFER_BYTES {
-            let drop = buf.len() - MAX_LINE_BUFFER_BYTES;
-            buf.drain(..drop);
-            self.line_buffer_truncated = true;
-        }
-
-        // Process all complete lines (ending with \n)
+        // Extract complete lines FIRST, before bounding the buffer: capping
+        // raw bytes can slice mid-line and discard complete records that
+        // arrived intact. Only the unterminated tail below is ever bounded.
+        // Each line is masked BEFORE truncation so a secret straddling the
+        // cut still matches; truncating first would match against the
+        // survivor and log an unredacted fragment.
         let mut complete_lines = Vec::new();
         while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
             // Extract the line (without the newline)
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-            // R1-12: cap absurd single lines before the masking pass copies
-            // them several times over.
-            let line = truncate_log_line(&line);
-            complete_lines.push(line.into_owned());
+            let masked = self.job.mask_secrets(&line);
+            // R1-12: cap absurd single lines after the masking pass, so the
+            // copies masking makes stay bounded too.
+            complete_lines.push(truncate_log_line(&masked).into_owned());
+        }
+
+        // R1-12: bound only the unterminated tail. Newline-free output (a
+        // step dumping megabytes without `\n`) would otherwise be retained
+        // 1:1 in memory for the whole step. Keep the tail so a later newline
+        // still terminates the line; the dropped head is reported below.
+        if buf.len() > MAX_LINE_BUFFER_BYTES {
+            let drop = buf.len() - MAX_LINE_BUFFER_BYTES;
+            buf.drain(..drop);
+            self.line_buffer_truncated = true;
         }
 
         if !complete_lines.is_empty() {
@@ -241,9 +246,11 @@ impl<'a> StepContext<'a> {
         let line = String::from_utf8_lossy(&buf).into_owned();
         let truncated = self.line_buffer_truncated;
         self.line_buffer_truncated = false;
-        // R1-12: cap the flushed partial line like completed lines above.
-        let line = truncate_log_line(&line).into_owned();
+        // Mask before truncating, as in write_chunk: the flush path handles
+        // the step's final unterminated output, which is just as capable of
+        // carrying a secret across the cut.
         let masked = self.job.mask_secrets(&line);
+        let line = truncate_log_line(&masked).into_owned();
         let is_continuation = self
             .stdout_partial_is_continuation
             .swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -889,6 +896,53 @@ mod tests {
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
         ctx.log("token is secret-value here");
         assert!(ctx.log_lines[0].ends_with("token is *** here"));
+    }
+    /// P1: a secret straddling the line-truncation cut must still be masked.
+    /// Masking runs on the complete line before truncation; truncating first
+    /// would match against the survivor and log an unredacted fragment.
+    #[test]
+    fn truncation_masks_before_cutting() {
+        let mut job = make_job();
+        job.add_mask("straddling-secret-token");
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        // Secret starts 5 bytes before the cut: truncate-first would keep a
+        // "strad" fragment that no longer matches the whole secret and leaks.
+        let line = format!(
+            "{}straddling-secret-token{}",
+            "A".repeat(super::MAX_LOG_LINE_BYTES - 5),
+            "B".repeat(1024)
+        );
+        ctx.write_chunk(format!("{line}\n").as_bytes());
+        let logged = ctx.log_lines.join("\n");
+        assert!(
+            !logged.contains("strad"),
+            "secret fragment leaked past truncation"
+        );
+        assert!(logged.contains("***"), "masked secret missing");
+        assert!(
+            logged.contains("line truncated"),
+            "truncation marker missing"
+        );
+    }
+
+    /// Complete records arriving alongside a huge unterminated suffix must be
+    /// emitted whole: the buffer cap binds only the tail, never intact lines.
+    #[test]
+    fn complete_lines_survive_partial_buffer_pressure() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let chunk = format!("first secret-value\n{}", "Z".repeat(2 * 1024 * 1024));
+        ctx.write_chunk(chunk.as_bytes());
+        assert!(
+            ctx.log_lines.iter().any(|l| l.ends_with("first ***")),
+            "complete line harmed by buffer cap"
+        );
+        assert!(
+            ctx.log_lines
+                .iter()
+                .any(|l| l.contains("partial-line buffer")),
+            "truncation warning missing"
+        );
     }
 
     #[test]
