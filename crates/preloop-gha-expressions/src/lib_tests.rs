@@ -872,6 +872,7 @@ mod official_semantics {
     /// R1-7: symlinks escaping the workspace are skipped even with
     /// --follow-symbolic-links; in-workspace symlinks are only followed
     /// when the flag is passed.
+    #[cfg(unix)]
     #[test]
     fn hash_files_escaping_symlink_skipped() {
         let base =
@@ -962,7 +963,7 @@ mod official_semantics {
     #[test]
     fn hash_files_too_many_files_errors() {
         let base =
-            std::env::temp_dir().join(format!("preloop-hashfiles-r17d-{}", std::process::id()));
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17g-{}", std::process::id()));
         let workspace = base.join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
         for i in 0..10_001 {

@@ -140,10 +140,12 @@ pub async fn spawn_from_env() -> Option<ControlBridge> {
         (None, None) => return None,
     };
     let address = loopback_address(&origin)?;
+    // Absurd values fall back to the default: 0 would refuse everything and
+    // anything above Semaphore::MAX_PERMITS would panic in the constructor.
     let max_connections = std::env::var(BRIDGE_MAX_CONNECTIONS_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
+        .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
         .unwrap_or(DEFAULT_MAX_CONNECTIONS);
     let idle_timeout = std::env::var(BRIDGE_IDLE_TIMEOUT_SECS_ENV)
         .ok()
