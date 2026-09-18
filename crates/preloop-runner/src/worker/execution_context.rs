@@ -43,9 +43,10 @@ const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
 /// masking/logging. Longer lines are truncated with a marker instead of
 /// being copied whole several times over.
 const MAX_LOG_LINE_BYTES: usize = 10 * 1024 * 1024;
-/// R1-12: maximum bytes `log_content` rematerializes from the step log
-/// file. The whole file was previously read into a String at step end.
-const LOG_CONTENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Bytes of the step-log head read for diagnostic scans (group markers,
+/// display-name fixups). The `##[group]Run …` line is emitted at step start,
+/// so scans never need more than the head.
+pub(crate) const LOG_HEAD_SCAN_BYTES: u64 = 1024 * 1024;
 
 /// R1-12: truncate an overlong completed log line, keeping the head so the
 /// start of the output stays visible.
@@ -565,21 +566,41 @@ impl<'a> StepContext<'a> {
         }
         env
     }
-
-    /// Get all collected log content as a single string.
+    /// Full step log for record/upload paths: retry attempt slicing, the
+    /// recorded job-log payload, and the server queue. Unbounded by design —
+    /// capping this shared accessor silently drops recorded history past the
+    /// cap. Callers that only peek near the head must use `log_head`.
+    /// (Residual: disk-scale logs rematerialize here as pre-PR; the
+    /// write-path caps bound per-line copies, not total file size.)
     pub fn log_content(&self) -> String {
-        let mut lock = self.log_file.lock();
+        Self::read_log_file(&self.log_file, None)
+    }
+
+    /// Bounded prefix of the step log for diagnostic scans. Never use for
+    /// recorded history.
+    pub fn log_head(&self, max_bytes: u64) -> String {
+        Self::read_log_file(&self.log_file, Some(max_bytes))
+    }
+
+    fn read_log_file(
+        log_file: &Arc<Mutex<BufWriter<std::fs::File>>>,
+        max_bytes: Option<u64>,
+    ) -> String {
+        let mut lock = log_file.lock();
         let _ = lock.flush();
         let file = lock.get_ref();
         if let Ok(mut cloned) = file.try_clone() {
             use std::io::{Read, Seek, SeekFrom};
             let mut content = String::new();
             let _ = cloned.seek(SeekFrom::Start(0));
-            // R1-12: never rematerialize the whole log file in memory; the
-            // callers only scan for `##[group]…` markers near the head.
-            let _ = cloned
-                .take(LOG_CONTENT_MAX_BYTES)
-                .read_to_string(&mut content);
+            match max_bytes {
+                Some(n) => {
+                    let _ = cloned.take(n).read_to_string(&mut content);
+                }
+                None => {
+                    let _ = cloned.read_to_string(&mut content);
+                }
+            }
             content
         } else {
             String::new()
@@ -957,6 +978,39 @@ mod tests {
             .map(|l| l.split_once(' ').map(|x| x.1).unwrap_or(""))
             .collect();
         assert_eq!(lines, vec!["line1", "line2"]);
+    }
+    /// Record path keeps the whole log: content past the old 8 MiB
+    /// rematerialization cap must still be recorded, not silently dropped.
+    #[test]
+    fn log_content_keeps_history_past_old_cap() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        for i in 0..9 {
+            ctx.log(&format!("pad-{i} {}", "x".repeat(1024 * 1024)));
+        }
+        let content = ctx.log_content();
+        assert!(
+            content.len() > 8 * 1024 * 1024,
+            "recorded log truncated, got {} bytes",
+            content.len()
+        );
+        assert!(content.contains("pad-8"), "tail of recorded log missing");
+    }
+
+    /// Diagnostic path stays bounded: log_head returns at most the budget
+    /// and matches the content prefix.
+    #[test]
+    fn log_head_is_bounded_prefix() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log("line1");
+        ctx.log(&format!("filler {}", "y".repeat(4096)));
+        let head = ctx.log_head(64);
+        assert!(head.len() <= 64, "head exceeded budget: {}", head.len());
+        assert!(
+            ctx.log_content().starts_with(&head),
+            "head is not a content prefix"
+        );
     }
 
     #[test]
