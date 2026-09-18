@@ -498,12 +498,23 @@ fn run_composite_action_inner<'a>(
 
             // Apply GITHUB_ENV and GITHUB_PATH from this composite step
             // so subsequent steps see the env changes (e.g. dtolnay/rust-toolchain
-            // sets CARGO_HOME via GITHUB_ENV and adds to PATH via GITHUB_PATH)
-            crate::worker::file_commands::apply_file_commands_to_job(&file_commands, ctx.job);
-
-            let step_outputs =
-                crate::worker::file_commands::parse_kv_file(&file_commands.output_file)
-                    .unwrap_or_default();
+            // sets CARGO_HOME via GITHUB_ENV and adds to PATH via GITHUB_PATH).
+            // File-command failures are step failures, matching the top-level
+            // path: an overgrown GITHUB_ENV must fail loudly, never report
+            // success with silently missing env/outputs.
+            let file_commands_outcome: Result<std::collections::HashMap<String, String>> =
+                (|| {
+                    crate::worker::file_commands::apply_file_commands_to_job(
+                        &file_commands,
+                        ctx.job,
+                    )?;
+                    crate::worker::file_commands::parse_kv_file(&file_commands.output_file)
+                })();
+            let (outcome, step_outputs) = match (outcome, file_commands_outcome) {
+                (Ok(s), Ok(outputs)) => (Ok(s), outputs),
+                (Err(e), _) => (Err(e), std::collections::HashMap::new()),
+                (Ok(_), Err(e)) => (Err(e), std::collections::HashMap::new()),
+            };
             crate::worker::file_commands::cleanup_file_commands(&file_commands);
             for (key, value) in saved_file_env {
                 if let Some(value) = value {
@@ -827,6 +838,41 @@ mod tests {
         assert!(
             !ctx.log_content().contains("should-not-run"),
             "default success() gate must skip later inner steps after a failure"
+        );
+    }
+    /// An overgrown file command inside a composite step must fail the
+    /// composite — never report success with silently missing env. The
+    /// swallowing version returned Ok here.
+    #[tokio::test]
+    async fn composite_fails_on_oversized_nested_file_command() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let manifest = composite_manifest(vec![serde_json::json!({
+            "id": "flood",
+            "run": "head -c 2000000 /dev/zero | tr '\\0' 'X' >> \"$GITHUB_ENV\"",
+            "shell": "bash"
+        })]);
+        let mut job = JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "composite".into(), "Composite".into());
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
+        let result = run_composite_action(
+            &manifest,
+            workspace.path(),
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "oversized nested GITHUB_ENV must fail the composite, not succeed silently"
         );
     }
 
