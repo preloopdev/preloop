@@ -163,9 +163,13 @@ jobs:
           rm -rf "$DATA_DIR/agent-rootfs"
           cp -R "$SRC/agent-rootfs" "$DATA_DIR/agent-rootfs"
           rm -f "$HOME/.smolvm/storage-template.ext4" "$HOME/.smolvm/overlay-template.ext4"
-          truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
+          # Guest disk must hold extracted layers + merged layer + pack
+          # staging. 120G died at `pack binary: tar error: No space left
+          # on device` (35267336773, 35279487232); sparse on host, so
+          # 200G is safe.
+          truncate -s 200G "$HOME/.smolvm/storage-template.ext4"
           mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
-          truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
+          truncate -s 200G "$HOME/.smolvm/overlay-template.ext4"
           mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay "$HOME/.smolvm/overlay-template.ext4"
           ln -sf /usr/sbin/resize2fs "$DATA_DIR/agent-rootfs/bin/resize2fs" || true
           ln -sf /sbin/e2fsck "$DATA_DIR/agent-rootfs/bin/e2fsck" || true
@@ -467,10 +471,9 @@ jobs:
           df -h "$HOME"
           rm -f "$HOME/.smolvm/storage-template.ext4" \
             "$HOME/.smolvm/overlay-template.ext4"
-          truncate -s 120G "$HOME/.smolvm/storage-template.ext4"
-          mkfs.ext4 -F -q -O ^has_journal -b 4096 \
-            "$HOME/.smolvm/storage-template.ext4"
-          truncate -s 120G "$HOME/.smolvm/overlay-template.ext4"
+          truncate -s 200G "$HOME/.smolvm/storage-template.ext4"
+          mkfs.ext4 -F -q -O ^has_journal -b 4096 "$HOME/.smolvm/storage-template.ext4"
+          truncate -s 200G "$HOME/.smolvm/overlay-template.ext4"
           mkfs.ext4 -F -q -O ^has_journal -b 4096 -L smolvm-overlay \
             "$HOME/.smolvm/overlay-template.ext4"
           ls -lh "$HOME/.smolvm/"*.ext4
