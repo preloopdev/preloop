@@ -676,12 +676,14 @@ fn push_evaluation_capped(
 /// SHA-256 hashes the concatenated hex digests. Returns `""` on no match.
 ///
 /// R1-7: every match is confined to the workspace. Absolute patterns and
-/// `..` traversal are rejected outright (never used as-is, which would make
-/// `hashFiles('/etc/passwd')` a file-content oracle), each candidate is
-/// canonicalized and required to stay under the canonical workspace root
-/// (so escaping symlinks are skipped), and the number of
-/// files / total bytes hashed are capped. Files are streamed through the
-/// hasher instead of being `fs::read` into memory whole.
+/// parent traversal are rejected outright via platform-native components
+/// (so Unix `/`/`..` and Windows `..\`, `C:\`, `\` all fail loudly rather
+/// than becoming a file-content oracle like `hashFiles('/etc/passwd')`),
+/// each candidate is canonicalized and required to stay under the canonical
+/// workspace root (so escaping symlinks are skipped), and the number of
+/// visited entries, hashed files, and total input bytes are capped. Files
+/// are streamed through the hasher instead of being `fs::read` into memory
+/// whole.
 ///
 /// F055: Supports `--follow-symbolic-links` as an optional first argument.
 /// When set, symbolic links are followed during file enumeration.
@@ -693,6 +695,11 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
     /// Maximum files hashed per `hashFiles()` call. Bounds enumeration cost
     /// of adversarial patterns like `**/*`.
     const MAX_FILES: usize = 10_000;
+    /// Maximum entries visited while expanding patterns per `hashFiles()`
+    /// call. The file cap only bounds retained matches; a tree with
+    /// hundreds of thousands of entries would otherwise burn traversal
+    /// cost without ever tripping it.
+    const MAX_VISITED: usize = 100_000;
     /// Maximum total bytes hashed per `hashFiles()` call (100 MiB).
     const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -740,18 +747,36 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         Err(_) => return Ok(String::new()),
     };
 
+    // Total glob entries pulled across all patterns; bounds traversal work
+    // even when few entries are retained.
+    let mut visited = 0usize;
+
     for pattern in &patterns {
         // R1-7: reject absolute patterns and `..` traversal outright.
         // Silently remapping `/etc/passwd` to a workspace-relative path, or
         // skipping escaping `../` matches, would hide attacker intent and
         // turn hashFiles() into a quiet file-content oracle. Fail loudly.
-        if pattern.starts_with('/') || pattern.split('/').any(|segment| segment == "..") {
+        // Platform-native components so Windows `..\`, `C:\`, `\` forms are
+        // rejected on Windows (on Unix they are literal filenames).
+        let disallowed = std::path::Path::new(pattern).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if disallowed {
             return Err(ExpressionError::HashFilesDisallowedPattern(pattern.clone()));
         }
         let abs_pattern = format!("{workspace}/{pattern}");
         match glob::glob(&abs_pattern) {
             Ok(entries) => {
                 for entry in entries.flatten() {
+                    visited += 1;
+                    if visited > MAX_VISITED {
+                        return Err(ExpressionError::HashFilesTraversalLimit(MAX_VISITED));
+                    }
                     // Use symlink_metadata so symlinks are not followed
                     // implicitly here; following is decided below.
                     let metadata = match entry.symlink_metadata() {

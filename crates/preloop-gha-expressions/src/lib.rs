@@ -112,11 +112,14 @@ pub enum ExpressionError {
     /// `hashFiles()` matched more files than the per-call limit.
     #[error("hashFiles() matched more than the maximum of {0} files")]
     HashFilesTooManyFiles(usize),
+    /// `hashFiles()` visited more entries than the per-call traversal budget.
+    #[error("hashFiles() visited more than the maximum of {0} files while expanding patterns")]
+    HashFilesTraversalLimit(usize),
     /// `hashFiles()` input bytes exceeded the per-call budget.
     #[error("hashFiles() input exceeds the maximum of {0} bytes")]
     HashFilesTooLarge(u64),
-    /// `hashFiles()` pattern is absolute or contains `..` traversal.
-    #[error("hashFiles() pattern `{0}` is not allowed: patterns must be workspace-relative and must not contain `..`")]
+    /// `hashFiles()` pattern is absolute or contains parent traversal.
+    #[error("hashFiles() pattern `{0}` is not allowed: patterns must be workspace-relative without absolute or parent components")]
     HashFilesDisallowedPattern(String),
     /// `format()` output exceeded the maximum length.
     #[error("format() output exceeds the maximum of {0} bytes")]

@@ -795,6 +795,57 @@ mod official_semantics {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// R1-7: Windows-native traversal and absolute forms are rejected on
+    /// Windows, where backslash is a separator and prefixes/roots escape.
+    /// (On Unix these are literal filenames and correctly pass the guard.)
+    #[cfg(windows)]
+    #[test]
+    fn hash_files_windows_traversal_rejected() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17w-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        for expr in [
+            "hashFiles('..\\outside.txt')",
+            "hashFiles('C:\\outside.txt')",
+            "hashFiles('\\outside.txt')",
+        ] {
+            let result = eval_expression(expr, &context);
+            assert!(
+                matches!(result, Err(ExpressionError::HashFilesDisallowedPattern(_))),
+                "Windows escape must be rejected, got {result:?}: {expr}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R1-7: the traversal budget bounds visited entries, not just retained
+    /// matches. 100k+ skipped directories would otherwise burn glob work
+    /// without ever tripping the 10k retained-file cap.
+    #[test]
+    fn hash_files_traversal_budget_bounds_skipped_entries() {
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17f-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for i in 0..100_050 {
+            std::fs::create_dir(workspace.join(format!("d{i}"))).unwrap();
+        }
+        let context = Context::default().with_workspace(workspace.to_string_lossy().into_owned());
+
+        let result = eval_expression("hashFiles('*')", &context);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(
+                result,
+                Err(ExpressionError::HashFilesTraversalLimit(100_000))
+            ),
+            "expected HashFilesTraversalLimit error, got {result:?}"
+        );
+    }
 
     /// R1-7: hashing more than 100 MiB of input fails with HashFilesTooLarge
     /// instead of loading it all into memory.
