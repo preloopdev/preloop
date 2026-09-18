@@ -109,8 +109,56 @@ impl IntoIterator for LiveLogBuffer {
 pub(crate) async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    live_log_stream(&shared, run_id, &job_id).await
+    let (key, job_id) = authorize_live_log_read(&shared, &headers, run_id, &job_id).await?;
+    live_log_stream(&shared, run_id, &job_id, &key).await
+}
+
+/// M5: the protocol live-log read route must not let one job's runtime
+/// credential read another job's output. The caller's credential must identify
+/// the exact job being read; the system credential bypasses (first-party
+/// CLI/UI read through the separate native route).
+/// Returns the authorized concrete live-log key plus the resolved job
+/// selector so the stream binds to the same attempt that was checked —
+/// resolving the logical name twice would let a retry between the lookups
+/// hand an old attempt's credential the new attempt's stream.
+async fn authorize_live_log_read(
+    shared: &Arc<SharedState>,
+    headers: &HeaderMap,
+    run_id: RunId,
+    job_id: &str,
+) -> Result<(String, String), ApiError> {
+    let bearer = crate::auth::bearer_from_headers(headers)
+        .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
+    if bearer == shared.state.system_token {
+        // The system credential bypasses ownership but still needs the
+        // resolved key so the stream follows the same explicit-key contract.
+        let key = {
+            let inner = shared.state.inner.lock().await;
+            live_log_key_for_job(&inner, run_id, job_id)
+        }
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+        return Ok((key, job_id.to_owned()));
+    }
+    let caller = shared
+        .state
+        .job_uuid_from_token(bearer)
+        .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
+    // Resolve the selector to the concrete live-log key first: the path may
+    // carry a logical job name, an agent-job UUID, or a logical name that
+    // happens to be UUID-shaped — only resolution tells them apart. Missing
+    // and foreign targets share one response so a mismatch never reveals
+    // whether the target exists.
+    let key = {
+        let inner = shared.state.inner.lock().await;
+        live_log_key_for_job(&inner, run_id, job_id)
+    }
+    .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
+    if key != caller.to_string() {
+        return Err(ApiError::forbidden("live-log read job mismatch"));
+    }
+    Ok((key, job_id.to_owned()))
 }
 
 /// Job selector for the native live-log route.
@@ -168,31 +216,36 @@ pub(crate) async fn live_run_logs_sse(
             }
         }
     };
-    live_log_stream(&shared, run_id, &job_id).await
+    let key = {
+        let inner = shared.state.inner.lock().await;
+        live_log_key_for_job(&inner, run_id, &job_id)
+    }
+    .ok_or_else(|| ApiError::not_found("job not found"))?;
+    live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
-/// Replay the retained per-job buffer, then follow the live broadcast.
-///
-/// Snapshotting and subscribing happen while the global lock and the
-/// per-job lock are both held. Ingestion takes the same locks in that order,
-/// so a wrapper is observed either in the snapshot or in the receiver, never
-/// both.
+/// `key` is the concrete live-log key the caller was authorized for; the
+/// stream must not re-resolve the selector or a retry could redirect it to
+/// a different attempt than the one that passed the check.
 async fn live_log_stream(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &str,
+    key: &str,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
-        let key = live_log_key_for_job(&inner, run_id, job_id)
-            .ok_or_else(|| ApiError::not_found("job not found"))?;
-        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
+        let lines_arc = inner
+            .live_log_lines
+            .entry(key.to_owned())
+            .or_default()
+            .clone();
         let lines = lines_arc.lock().await;
         let snapshot = lines.clone();
-        let subscription = if live_log_is_closed(&inner, run_id, job_id, &key) {
+        let subscription = if live_log_is_closed(&inner, run_id, job_id, key) {
             None
         } else {
-            Some(live_log_sender(&mut inner, &key).subscribe())
+            Some(live_log_sender(&mut inner, key).subscribe())
         };
         // Keep the guard alive through subscription creation; this explicit
         // binding makes the lock ordering above visible to future edits.
@@ -307,9 +360,41 @@ pub(crate) fn close_live_log(inner: &mut InnerState, key: &str) {
 pub(crate) async fn ws_live_logs(
     State(shared): State<Arc<SharedState>>,
     Path(job_id): Path<String>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared))
+) -> Result<impl IntoResponse, ApiError> {
+    // R1-8: bind the ingest target to the caller's identity. The generic
+    // protocol bearer admits any job's runtime credential, which would let one
+    // job stream into another job's buffer — forging its live log, or wiping
+    // its retained tail (reopening a feed clears the closed mark and history).
+    // The runner connects with its own job's runtime credential against the
+    // agent job id in its `FeedStreamUrl`; the system credential bypasses.
+    let bearer = crate::auth::bearer_from_headers(&headers)
+        .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
+    if bearer != shared.state.system_token {
+        // Verify the credential first: a malformed or expired token is a 401
+        // no matter what the target is.
+        shared
+            .state
+            .verify_local_jwt_claims(bearer)
+            .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
+        let agent_job_id = job_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
+        let request = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .agent_job_requests
+                .get(&agent_job_id)
+                .copied()
+                .and_then(|request_id| inner.job_requests.get(&request_id).cloned())
+        };
+        // Unresolved and foreign targets share one generic 403: distinct
+        // messages would reveal whether the job UUID resolves.
+        crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())
+            .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
+    }
+    Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
 }
 
 pub(crate) async fn handle_live_log_socket(
