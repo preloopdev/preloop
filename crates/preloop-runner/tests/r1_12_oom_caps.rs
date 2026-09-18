@@ -39,14 +39,15 @@ fn write_chunk_caps_newline_free_output() {
     );
 }
 
-/// R1-12 (log rematerialization): `log_content` must not read the whole log
-/// file into memory.
+/// Record vs diagnostic reads: `log_content` returns the whole file for
+/// record/upload consumers (truncating it silently drops history); the
+/// bounded `log_head` serves diagnostic scans near the head.
 #[test]
-fn log_content_does_not_rematerialize_whole_file() {
+fn log_content_returns_whole_file_while_head_stays_bounded() {
     let mut job = make_job();
     let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
-    // ~100k lines x ~90B -> well over the 8 MiB rematerialization cap once
-    // timestamp prefixes are added.
+    // ~100k lines x ~90B -> well over the old 8 MiB rematerialization cap
+    // once timestamp prefixes are added.
     let mut chunk = Vec::with_capacity(10 * 1024 * 1024);
     for _ in 0..100_000 {
         chunk.extend_from_slice(&[b'a'; 90]);
@@ -55,9 +56,15 @@ fn log_content_does_not_rematerialize_whole_file() {
     ctx.write_chunk(&chunk);
     let content = ctx.log_content();
     assert!(
-        content.len() <= 8 * 1024 * 1024,
-        "log_content must be capped at 8 MiB, got {} bytes",
+        content.len() > 8 * 1024 * 1024,
+        "record path must keep full history, got {} bytes",
         content.len()
+    );
+    let head = ctx.log_head(1024);
+    assert!(head.len() <= 1024, "diagnostic head exceeded budget");
+    assert!(
+        content.starts_with(&head),
+        "diagnostic head must be a content prefix"
     );
 }
 
