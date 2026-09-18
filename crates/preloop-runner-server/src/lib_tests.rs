@@ -10908,10 +10908,14 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     let inner = state.inner.lock().await;
     let fork_message = queued_message_for(&inner, &fork_run_id);
     let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    // Compare token identity (`sub`), not token strings: JWT timestamps are
+    // second-granularity, so a comparison token minted across a clock tick
+    // differs textually from the identical token minted at submission.
+    let expected_sub = jwt_sub(runtime_token.as_str());
     for name in ["system.github.token", "github_token"] {
         assert_eq!(
-            variable_value(&fork_message, name),
-            Some(runtime_token.as_str()),
+            variable_value(&fork_message, name).and_then(jwt_sub),
+            expected_sub.clone(),
             "fork job must carry the local runtime token, not the PAT ({name})"
         );
     }
@@ -15515,6 +15519,19 @@ fn variable_value<'a>(message: &'a AgentJobRequestMessage, name: &str) -> Option
         .variables
         .get(name)
         .and_then(|value| value.value.as_deref())
+}
+/// `sub` claim of a runtime JWT, for comparisons that must ignore
+/// second-granularity timestamps (`iat`/`exp`). Returns `None` for
+/// non-JWT values (e.g. a leaked PAT) so mismatches fail the assertion
+/// instead of panicking in the helper.
+fn jwt_sub(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("sub")?.as_str().map(str::to_owned)
 }
 
 /// `preloop setup github --via pat` stores the credential as `github.pat` and

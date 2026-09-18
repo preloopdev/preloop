@@ -35,6 +35,35 @@ fn format_stdout_line(timestamp: &str, line: &str, prefix: bool) -> String {
     }
 }
 
+/// R1-12: maximum bytes retained for a newline-free partial output line.
+/// A step printing 64 MiB without a `\n` (progress bars, binary dumps)
+/// would otherwise be retained 1:1 in memory for the whole step.
+const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
+/// R1-12: maximum bytes of a single completed output line passed through
+/// masking/logging. Longer lines are truncated with a marker instead of
+/// being copied whole several times over.
+const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
+/// Bytes of the step-log head read for diagnostic scans (group markers,
+/// display-name fixups). The `##[group]Run …` line is emitted at step start,
+/// so scans never need more than the head.
+pub(crate) const LOG_HEAD_SCAN_BYTES: u64 = 1024 * 1024;
+
+/// R1-12: truncate an overlong completed log line, keeping the head so the
+/// start of the output stays visible.
+fn truncate_log_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= MAX_LOG_LINE_BYTES {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut end = MAX_LOG_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = String::with_capacity(end + 64);
+    truncated.push_str(&line[..end]);
+    truncated.push_str(&format!("…[line truncated at {MAX_LOG_LINE_BYTES} bytes]"));
+    std::borrow::Cow::Owned(truncated)
+}
+
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
     pub step_id: String,
@@ -62,6 +91,9 @@ pub struct StepContext<'a> {
     pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
     /// Line buffer for accumulating partial lines from process output chunks.
     line_buffer: Arc<Mutex<Vec<u8>>>,
+    /// R1-12: set when the partial-line buffer overflowed its cap and the
+    /// head was dropped; surfaced as a truncation warning on the next flush.
+    line_buffer_truncated: bool,
     /// Whether to also accumulate log lines in memory (for tests).
     pub keep_in_memory: bool,
     /// Whether continuation lines in a multiline stdout chunk omit the
@@ -117,6 +149,7 @@ impl<'a> StepContext<'a> {
             telemetry_errors: Vec::new(),
             log_file,
             line_buffer: Arc::new(Mutex::new(Vec::new())),
+            line_buffer_truncated: false,
             keep_in_memory,
             disable_stdout_multiline_log_prefixing: disable_stdout_multiline_log_prefixing(),
             stdout_partial_is_continuation: std::sync::atomic::AtomicBool::new(false),
@@ -134,13 +167,31 @@ impl<'a> StepContext<'a> {
         let mut buf = self.line_buffer.lock();
         buf.extend_from_slice(chunk);
 
-        // Process all complete lines (ending with \n)
+        // Extract complete lines FIRST, before bounding the buffer: capping
+        // raw bytes can slice mid-line and discard complete records that
+        // arrived intact. Only the unterminated tail below is ever bounded.
+        // Each line is masked BEFORE truncation so a secret straddling the
+        // cut still matches; truncating first would match against the
+        // survivor and log an unredacted fragment.
         let mut complete_lines = Vec::new();
         while let Some(newline_pos) = buf.iter().position(|&b| b == b'\n') {
             // Extract the line (without the newline)
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-            complete_lines.push(line.into_owned());
+            let masked = self.job.mask_secrets(&line);
+            // R1-12: cap absurd single lines after the masking pass, so the
+            // copies masking makes stay bounded too.
+            complete_lines.push(truncate_log_line(&masked).into_owned());
+        }
+
+        // R1-12: bound only the unterminated tail. Newline-free output (a
+        // step dumping megabytes without `\n`) would otherwise be retained
+        // 1:1 in memory for the whole step. Keep the tail so a later newline
+        // still terminates the line; the dropped head is reported below.
+        if buf.len() > MAX_LINE_BUFFER_BYTES {
+            let drop = buf.len() - MAX_LINE_BUFFER_BYTES;
+            buf.drain(..drop);
+            self.line_buffer_truncated = true;
         }
 
         if !complete_lines.is_empty() {
@@ -153,6 +204,14 @@ impl<'a> StepContext<'a> {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         drop(buf);
+
+        // R1-12: surface a swallowed head instead of silently dropping output.
+        if self.line_buffer_truncated {
+            self.line_buffer_truncated = false;
+            self.log(
+                "##[warning]Step output exceeded the 1 MiB partial-line buffer; output was truncated",
+            );
+        }
 
         for (index, line) in complete_lines.into_iter().enumerate() {
             let masked = self.job.mask_secrets(&line);
@@ -173,15 +232,36 @@ impl<'a> StepContext<'a> {
     pub fn flush_line_buffer(&mut self) {
         let mut buf = self.line_buffer.lock();
         if buf.is_empty() {
+            // R1-12: the buffer may have overflowed and been capped while no
+            // newline ever arrived; still surface the truncation warning.
+            let truncated = self.line_buffer_truncated;
+            self.line_buffer_truncated = false;
+            drop(buf);
+            if truncated {
+                self.log(
+                    "##[warning]Step output exceeded the 1 MiB partial-line buffer; output was truncated",
+                );
+            }
             return;
         }
         let line = String::from_utf8_lossy(&buf).into_owned();
+        let truncated = self.line_buffer_truncated;
+        self.line_buffer_truncated = false;
+        // Mask before truncating, as in write_chunk: the flush path handles
+        // the step's final unterminated output, which is just as capable of
+        // carrying a secret across the cut.
         let masked = self.job.mask_secrets(&line);
+        let line = truncate_log_line(&masked).into_owned();
         let is_continuation = self
             .stdout_partial_is_continuation
             .swap(false, std::sync::atomic::Ordering::Relaxed);
         buf.clear();
         drop(buf);
+        if truncated {
+            self.log(
+                "##[warning]Step output exceeded the 1 MiB partial-line buffer; output was truncated",
+            );
+        }
         self.stdout_prefix_override =
             Some(!self.disable_stdout_multiline_log_prefixing || !is_continuation);
         self.log(&line);
@@ -486,17 +566,41 @@ impl<'a> StepContext<'a> {
         }
         env
     }
-
-    /// Get all collected log content as a single string.
+    /// Full step log for record/upload paths: retry attempt slicing, the
+    /// recorded job-log payload, and the server queue. Unbounded by design —
+    /// capping this shared accessor silently drops recorded history past the
+    /// cap. Callers that only peek near the head must use `log_head`.
+    /// (Residual: disk-scale logs rematerialize here as pre-PR; the
+    /// write-path caps bound per-line copies, not total file size.)
     pub fn log_content(&self) -> String {
-        let mut lock = self.log_file.lock();
+        Self::read_log_file(&self.log_file, None)
+    }
+
+    /// Bounded prefix of the step log for diagnostic scans. Never use for
+    /// recorded history.
+    pub fn log_head(&self, max_bytes: u64) -> String {
+        Self::read_log_file(&self.log_file, Some(max_bytes))
+    }
+
+    fn read_log_file(
+        log_file: &Arc<Mutex<BufWriter<std::fs::File>>>,
+        max_bytes: Option<u64>,
+    ) -> String {
+        let mut lock = log_file.lock();
         let _ = lock.flush();
         let file = lock.get_ref();
         if let Ok(mut cloned) = file.try_clone() {
             use std::io::{Read, Seek, SeekFrom};
             let mut content = String::new();
             let _ = cloned.seek(SeekFrom::Start(0));
-            let _ = cloned.read_to_string(&mut content);
+            match max_bytes {
+                Some(n) => {
+                    let _ = cloned.take(n).read_to_string(&mut content);
+                }
+                None => {
+                    let _ = cloned.read_to_string(&mut content);
+                }
+            }
             content
         } else {
             String::new()
@@ -814,6 +918,71 @@ mod tests {
         ctx.log("token is secret-value here");
         assert!(ctx.log_lines[0].ends_with("token is *** here"));
     }
+    /// P1: a secret straddling the line-truncation cut must still be masked.
+    /// Masking runs on the complete line before truncation; truncating first
+    /// would match against the survivor and log an unredacted fragment.
+    #[test]
+    fn truncation_masks_before_cutting() {
+        let mut job = make_job();
+        job.add_mask("straddling-secret-token");
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        // Secret starts 5 bytes before the cut: truncate-first would keep a
+        // "strad" fragment that no longer matches the whole secret and leaks.
+        let line = format!(
+            "{}straddling-secret-token{}",
+            "A".repeat(super::MAX_LOG_LINE_BYTES - 5),
+            "B".repeat(1024)
+        );
+        ctx.write_chunk(format!("{line}\n").as_bytes());
+        let logged = ctx.log_lines.join("\n");
+        assert!(
+            !logged.contains("strad"),
+            "secret fragment leaked past truncation"
+        );
+        assert!(logged.contains("***"), "masked secret missing");
+        assert!(
+            logged.contains("line truncated"),
+            "truncation marker missing"
+        );
+    }
+    /// Completed newline-terminated lines are capped at 1 MiB: a 3 MiB line
+    /// must come out truncated with a marker, not copied whole.
+    #[test]
+    fn completed_line_capped_at_1mib() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.write_chunk(format!("{}.\n", "C".repeat(3 * 1024 * 1024)).as_bytes());
+        let logged = ctx.log_lines.join("\n");
+        assert!(
+            logged.len() < 2 * 1024 * 1024,
+            "3 MiB line passed through whole ({} bytes)",
+            logged.len()
+        );
+        assert!(
+            logged.contains("line truncated at 1048576 bytes"),
+            "truncation marker missing"
+        );
+    }
+
+    /// Complete records arriving alongside a huge unterminated suffix must be
+    /// emitted whole: the buffer cap binds only the tail, never intact lines.
+    #[test]
+    fn complete_lines_survive_partial_buffer_pressure() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        let chunk = format!("first secret-value\n{}", "Z".repeat(2 * 1024 * 1024));
+        ctx.write_chunk(chunk.as_bytes());
+        assert!(
+            ctx.log_lines.iter().any(|l| l.ends_with("first ***")),
+            "complete line harmed by buffer cap"
+        );
+        assert!(
+            ctx.log_lines
+                .iter()
+                .any(|l| l.contains("partial-line buffer")),
+            "truncation warning missing"
+        );
+    }
 
     #[test]
     fn log_content_joins_lines() {
@@ -827,6 +996,39 @@ mod tests {
             .map(|l| l.split_once(' ').map(|x| x.1).unwrap_or(""))
             .collect();
         assert_eq!(lines, vec!["line1", "line2"]);
+    }
+    /// Record path keeps the whole log: content past the old 8 MiB
+    /// rematerialization cap must still be recorded, not silently dropped.
+    #[test]
+    fn log_content_keeps_history_past_old_cap() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        for i in 0..9 {
+            ctx.log(&format!("pad-{i} {}", "x".repeat(1024 * 1024)));
+        }
+        let content = ctx.log_content();
+        assert!(
+            content.len() > 8 * 1024 * 1024,
+            "recorded log truncated, got {} bytes",
+            content.len()
+        );
+        assert!(content.contains("pad-8"), "tail of recorded log missing");
+    }
+
+    /// Diagnostic path stays bounded: log_head returns at most the budget
+    /// and matches the content prefix.
+    #[test]
+    fn log_head_is_bounded_prefix() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log("line1");
+        ctx.log(&format!("filler {}", "y".repeat(4096)));
+        let head = ctx.log_head(64);
+        assert!(head.len() <= 64, "head exceeded budget: {}", head.len());
+        assert!(
+            ctx.log_content().starts_with(&head),
+            "head is not a content prefix"
+        );
     }
 
     #[test]

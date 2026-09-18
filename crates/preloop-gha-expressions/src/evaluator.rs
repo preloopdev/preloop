@@ -669,17 +669,57 @@ fn push_evaluation_capped(
     Ok(())
 }
 
+/// Confirm an opened handle still resolves under the workspace root.
+///
+/// Canonicalization gates the entry *before* open; a swapped alias, target,
+/// or parent directory in between would redirect a path-based open outside
+/// the root. Resolving `/proc/self/fd` reports the kernel's path for the
+/// handle itself, so verify-then-read shares one handle with no window.
+/// A `(deleted)` suffix (replaced entry) fails the prefix check, which is
+/// the safe direction. Non-Linux targets keep the pre-open gate only.
+#[cfg(target_os = "linux")]
+pub(crate) fn handle_under_root(file: &std::fs::File, workspace_root: &std::path::Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    std::fs::read_link(fd_path)
+        .map(|p| p.starts_with(workspace_root))
+        .unwrap_or(false)
+}
+
 /// Implementation of `hashFiles(pattern, ...)` (F027).
 ///
 /// Globs each argument pattern relative to `context.workspace_dir`, collects
 /// all matching file paths (sorted), SHA-256 hashes each file, then
 /// SHA-256 hashes the concatenated hex digests. Returns `""` on no match.
 ///
+/// R1-7: every match is confined to the workspace. Absolute patterns and
+/// parent traversal are rejected outright via platform-native components
+/// (so Unix `/`/`..` and Windows `..\`, `C:\`, `\` all fail loudly rather
+/// than becoming a file-content oracle like `hashFiles('/etc/passwd')`),
+/// each candidate is canonicalized and required to stay under the canonical
+/// workspace root (so escaping symlinks are skipped), opened handles are
+/// re-verified against the root on Linux (no check-to-open window), and the
+/// visited entries, hashed files, and total input bytes are capped. Files
+/// are streamed through the hasher instead of being `fs::read` into memory
+/// whole.
+///
 /// F055: Supports `--follow-symbolic-links` as an optional first argument.
 /// When set, symbolic links are followed during file enumeration.
 /// Matches official `HashFilesFunction.cs:44-51`.
 fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionError> {
     use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+
+    /// Maximum files hashed per `hashFiles()` call. Bounds enumeration cost
+    /// of adversarial patterns like `**/*`.
+    const MAX_FILES: usize = 10_000;
+    /// Maximum entries visited while expanding patterns per `hashFiles()`
+    /// call. The file cap only bounds retained matches; a tree with
+    /// hundreds of thousands of entries would otherwise burn traversal
+    /// cost without ever tripping it.
+    const MAX_VISITED: usize = 100_000;
+    /// Maximum total bytes hashed per `hashFiles()` call (100 MiB).
+    const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
     let workspace = match &context.workspace_dir {
         Some(dir) => dir.as_str(),
@@ -709,35 +749,89 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         patterns.push(s);
     }
 
-    let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+    // R1-7: dedup by matched path (overlapping patterns must not trip the
+    // file cap with duplicates) and bound the retained set so adversarial
+    // globs like `**/*` cannot grow it without limit. Canonicalization is
+    // only the confinement check — hashing/sorting keep the matched path so
+    // symlink aliases matching the same target hash per match like official.
+    let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+
+    // R1-7: canonical workspace root for the confinement check below. If the
+    // workspace itself cannot be canonicalized there is nothing safe to
+    // match, so return "" like the no-workspace case.
+    let workspace_root = match std::fs::canonicalize(workspace) {
+        Ok(root) => root,
+        Err(_) => return Ok(String::new()),
+    };
+
+    // Total glob entries pulled across all patterns; bounds traversal work
+    // even when few entries are retained.
+    let mut visited = 0usize;
+
     for pattern in &patterns {
-        // Make pattern relative to workspace
-        let abs_pattern = if std::path::Path::new(pattern).is_absolute() {
-            pattern.clone()
-        } else {
-            format!("{workspace}/{pattern}")
-        };
+        // R1-7: reject absolute patterns and `..` traversal outright.
+        // Silently remapping `/etc/passwd` to a workspace-relative path, or
+        // skipping escaping `../` matches, would hide attacker intent and
+        // turn hashFiles() into a quiet file-content oracle. Fail loudly.
+        // Platform-native components so Windows `..\`, `C:\`, `\` forms are
+        // rejected on Windows (on Unix they are literal filenames).
+        let disallowed = std::path::Path::new(pattern).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if disallowed {
+            return Err(ExpressionError::HashFilesDisallowedPattern(pattern.clone()));
+        }
+        let abs_pattern = format!("{workspace}/{pattern}");
         match glob::glob(&abs_pattern) {
             Ok(entries) => {
                 for entry in entries.flatten() {
-                    // F055: When follow_symlinks is true, also include symlinks
-                    // that point to regular files. `is_file()` already follows
-                    // symlinks via `fs::metadata`, so both paths include targets
-                    // of symlinks. The distinction matters for broken symlinks:
-                    // `is_file()` returns false for dangling symlinks but
-                    // `symlink_metadata().is_symlink()` would be true. We match
-                    // the official behavior which uses the globber's follow mode
-                    // (broken symlinks are silently skipped either way).
-                    if entry.is_file() {
-                        all_paths.push(entry);
-                    } else if follow_symlinks
-                        && entry
-                            .symlink_metadata()
-                            .map(|m| m.is_symlink())
-                            .unwrap_or(false)
-                    {
-                        // Broken symlink with follow mode — skip (matches official)
+                    visited += 1;
+                    if visited > MAX_VISITED {
+                        return Err(ExpressionError::HashFilesTraversalLimit(MAX_VISITED));
+                    }
+                    // Use symlink_metadata so symlinks are not followed
+                    // implicitly here; following is decided below.
+                    let metadata = match entry.symlink_metadata() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if metadata.file_type().is_symlink() {
+                        // F055: without --follow-symbolic-links, symlinks are
+                        // never followed.
+                        if !follow_symlinks {
+                            continue;
+                        }
+                        // With follow mode the target is resolved below and
+                        // must be a regular file under the workspace.
+                    } else if !metadata.is_file() {
                         continue;
+                    }
+                    // Canonicalize (resolves symlinks and `..`) and require
+                    // the result to stay under the workspace root; anything
+                    // escaping the workspace is skipped. The canonical path
+                    // is only the confinement check: the matched `entry` is
+                    // what gets hashed, so symlink aliases to the same target
+                    // stay distinct matches like official path-based hashing.
+                    let canonical = match std::fs::canonicalize(&entry) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if !canonical.starts_with(&workspace_root) {
+                        continue;
+                    }
+                    // A symlink to a directory must not contribute an empty
+                    // hash in follow mode.
+                    if !canonical.is_file() {
+                        continue;
+                    }
+                    if seen_paths.insert(entry) && seen_paths.len() > MAX_FILES {
+                        return Err(ExpressionError::HashFilesTooManyFiles(MAX_FILES));
                     }
                 }
             }
@@ -745,24 +839,49 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         }
     }
 
-    if all_paths.is_empty() {
+    if seen_paths.is_empty() {
         return Ok(String::new());
     }
 
+    let mut all_paths: Vec<std::path::PathBuf> = seen_paths.into_iter().collect();
     all_paths.sort();
 
     // Hash each file's bytes; concatenate raw 32-byte binary digests (NOT hex strings).
     // Official hashFiles.ts:29-35 feeds binary digest bytes directly into the outer SHA-256.
     // Concatenating hex-string representations produces a completely different key.
+    //
+    // R1-7: stream each file through the hasher instead of fs::read()-ing it
+    // whole, enforcing the total byte budget so one huge match cannot OOM
+    // the evaluator.
     let mut combined: Vec<u8> = Vec::new();
+    let mut total_bytes: u64 = 0;
     for path in &all_paths {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let digest = Sha256::digest(&bytes);
-                combined.extend_from_slice(&digest);
-            }
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(_) => continue,
+        };
+        // The entry was canonicalized and confinement-checked before open;
+        // re-verify the OPEN handle so an alias, target, or parent swapped
+        // in between cannot redirect hashing outside the workspace. The
+        // verify-then-use pair shares one handle, leaving no window.
+        #[cfg(target_os = "linux")]
+        if !handle_under_root(&file, &workspace_root) {
+            continue;
         }
+        let budget = MAX_TOTAL_BYTES.saturating_sub(total_bytes);
+        // Read one byte past the remaining budget so an over-budget file is
+        // reported instead of silently truncated.
+        let mut limited = file.take(budget.saturating_add(1));
+        let mut hasher = Sha256::new();
+        let hashed = match std::io::copy(&mut limited, &mut hasher) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if hashed > budget {
+            return Err(ExpressionError::HashFilesTooLarge(MAX_TOTAL_BYTES));
+        }
+        total_bytes += hashed;
+        combined.extend_from_slice(&hasher.finalize());
     }
 
     if combined.is_empty() {
