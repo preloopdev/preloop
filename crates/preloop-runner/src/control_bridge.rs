@@ -296,63 +296,98 @@ async fn splice(
     // Nagle would add up to 40ms to the small request/response pairs the
     // control plane exchanges.
     client.set_nodelay(true)?;
+    // The idle deadline covers establishment too: a wedged connect must not
+    // retain a semaphore permit past it.
     match upstream {
         #[cfg(unix)]
         Upstream::Socket(socket) => {
-            let stream = UnixStream::connect(socket).await?;
+            let stream = tokio::time::timeout(idle_timeout, UnixStream::connect(socket))
+                .await
+                .map_err(|_| idle_expired())??;
             pump(client, stream, idle_timeout).await
         }
         Upstream::Tcp(addr) => {
-            let stream = TcpStream::connect(addr).await?;
+            let stream = tokio::time::timeout(idle_timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| idle_expired())??;
             stream.set_nodelay(true)?;
             pump(client, stream, idle_timeout).await
         }
     }
 }
 
-/// Bidirectional splice with an idle timeout.
+/// Idle-deadline expiry shared by bridge connects, reads, and writes, so no
+/// stalled phase can retain a semaphore permit past the deadline.
+fn idle_expired() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "control bridge connection idle",
+    )
+}
+
+/// Bidirectional splice with an idle timeout and independent half-close.
 ///
 /// R1-13: `copy_bidirectional` never times out, so a guest could hold
 /// connections open forever at near-zero cost. This closes a splice that
 /// moves no bytes in *either* direction for `idle_timeout`. Active traffic
 /// — bytes flowing either way — resets the deadline; only truly idle
 /// connections are reaped.
+///
+/// Each direction ends independently: EOF on one side shuts down only the
+/// other side's writer, and relaying continues until both sides reach EOF.
+/// Returning on the first EOF would drop a response already on its way back
+/// after a client half-close. Stalled writes share the deadline so a wedged
+/// peer cannot pin the opposite direction.
 async fn pump<A, B>(mut a: A, mut b: B, idle_timeout: Duration) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    async fn read_with_timeout<R: AsyncRead + Unpin>(
+        r: &mut R,
+        buf: &mut [u8],
+        idle_timeout: Duration,
+    ) -> std::io::Result<usize> {
+        tokio::time::timeout(idle_timeout, r.read(buf))
+            .await
+            .map_err(|_| idle_expired())?
+    }
+
+    async fn write_with_timeout<W: AsyncWrite + Unpin>(
+        w: &mut W,
+        buf: &[u8],
+        idle_timeout: Duration,
+    ) -> std::io::Result<()> {
+        tokio::time::timeout(idle_timeout, w.write_all(buf))
+            .await
+            .map_err(|_| idle_expired())?
+    }
+
     let mut a_buf = [0u8; 8192];
     let mut b_buf = [0u8; 8192];
+    let (mut a_eof, mut b_eof) = (false, false);
     loop {
+        if a_eof && b_eof {
+            return Ok(());
+        }
         tokio::select! {
-            read = tokio::time::timeout(idle_timeout, a.read(&mut a_buf)) => {
-                let n = read
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "control bridge connection idle",
-                        )
-                    })??;
+            read = read_with_timeout(&mut a, &mut a_buf, idle_timeout), if !a_eof => {
+                let n = read?;
                 if n == 0 {
+                    a_eof = true;
                     b.shutdown().await?;
-                    return Ok(());
+                } else {
+                    write_with_timeout(&mut b, &a_buf[..n], idle_timeout).await?;
                 }
-                b.write_all(&a_buf[..n]).await?;
             }
-            read = tokio::time::timeout(idle_timeout, b.read(&mut b_buf)) => {
-                let n = read
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "control bridge connection idle",
-                        )
-                    })??;
+            read = read_with_timeout(&mut b, &mut b_buf, idle_timeout), if !b_eof => {
+                let n = read?;
                 if n == 0 {
+                    b_eof = true;
                     a.shutdown().await?;
-                    return Ok(());
+                } else {
+                    write_with_timeout(&mut a, &b_buf[..n], idle_timeout).await?;
                 }
-                a.write_all(&b_buf[..n]).await?;
             }
         }
     }

@@ -20,6 +20,12 @@ use tokio::net::{TcpListener, TcpStream};
 // and the scenarios below fail at runtime.
 const BRIDGE_MAX_CONNECTIONS_ENV: &str = "PRELOOP_BRIDGE_MAX_CONNECTIONS";
 const BRIDGE_IDLE_TIMEOUT_SECS_ENV: &str = "PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS";
+/// Env overrides are process-global and integration tests in one binary share
+/// a process: serialize scenarios that mutate them.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Fake upstream: accepts connections, drains anything forwarded, never
 /// writes back — so splices only end when the bridge or the client ends them.
@@ -42,6 +48,7 @@ async fn park_upstream(listener: TcpListener) {
 
 #[tokio::test]
 async fn bridge_enforces_connection_cap_and_idle_timeout() {
+    let _env = lock_env();
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
     tokio::spawn(park_upstream(upstream));
@@ -105,6 +112,57 @@ async fn bridge_enforces_connection_cap_and_idle_timeout() {
     );
     drop(active);
     drop(bridge);
+
+    std::env::remove_var(CONTROL_ORIGIN_ENV);
+    std::env::remove_var(CONTROL_UPSTREAM_ENV);
+    std::env::remove_var(BRIDGE_MAX_CONNECTIONS_ENV);
+    std::env::remove_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV);
+}
+
+/// Half-close: a client that finishes its request and shuts down its write
+/// half must still receive the upstream response. Returning on the first EOF
+/// drops a reply already on its way back.
+#[tokio::test]
+async fn bridge_half_close_preserves_response() {
+    let _env = lock_env();
+    // Upstream reads the request to EOF, then answers.
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = upstream.accept().await {
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                if s.read_to_end(&mut req).await.is_ok() {
+                    let _ = s.write_all(b"reply-to:").await;
+                    let _ = s.write_all(&req).await;
+                }
+            });
+        }
+    });
+
+    std::env::set_var(CONTROL_ORIGIN_ENV, "http://127.0.0.1:0");
+    std::env::remove_var(CONTROL_SOCKET_ENV);
+    std::env::set_var(CONTROL_UPSTREAM_ENV, upstream_addr.to_string());
+    std::env::set_var(BRIDGE_MAX_CONNECTIONS_ENV, "8");
+    std::env::set_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV, "10");
+
+    let bridge = control_bridge::spawn_from_env()
+        .await
+        .expect("bridge should spawn");
+    let addr = bridge.address();
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut reply = Vec::new();
+    let got = tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut reply)).await;
+    assert!(got.is_ok(), "response never arrived after half-close");
+    got.unwrap().unwrap();
+    assert_eq!(
+        reply.as_slice(),
+        b"reply-to:ping",
+        "upstream response lost after half-close: {reply:?}"
+    );
 
     std::env::remove_var(CONTROL_ORIGIN_ENV);
     std::env::remove_var(CONTROL_UPSTREAM_ENV);
