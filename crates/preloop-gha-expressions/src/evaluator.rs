@@ -669,6 +669,23 @@ fn push_evaluation_capped(
     Ok(())
 }
 
+/// Confirm an opened handle still resolves under the workspace root.
+///
+/// Canonicalization gates the entry *before* open; a swapped alias, target,
+/// or parent directory in between would redirect a path-based open outside
+/// the root. Resolving `/proc/self/fd` reports the kernel's path for the
+/// handle itself, so verify-then-read shares one handle with no window.
+/// A `(deleted)` suffix (replaced entry) fails the prefix check, which is
+/// the safe direction. Non-Linux targets keep the pre-open gate only.
+#[cfg(target_os = "linux")]
+pub(crate) fn handle_under_root(file: &std::fs::File, workspace_root: &std::path::Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    std::fs::read_link(fd_path)
+        .map(|p| p.starts_with(workspace_root))
+        .unwrap_or(false)
+}
+
 /// Implementation of `hashFiles(pattern, ...)` (F027).
 ///
 /// Globs each argument pattern relative to `context.workspace_dir`, collects
@@ -680,7 +697,8 @@ fn push_evaluation_capped(
 /// (so Unix `/`/`..` and Windows `..\`, `C:\`, `\` all fail loudly rather
 /// than becoming a file-content oracle like `hashFiles('/etc/passwd')`),
 /// each candidate is canonicalized and required to stay under the canonical
-/// workspace root (so escaping symlinks are skipped), and the number of
+/// workspace root (so escaping symlinks are skipped), opened handles are
+/// re-verified against the root on Linux (no check-to-open window), and the
 /// visited entries, hashed files, and total input bytes are capped. Files
 /// are streamed through the hasher instead of being `fs::read` into memory
 /// whole.
@@ -842,6 +860,14 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
             Ok(f) => f,
             Err(_) => continue,
         };
+        // The entry was canonicalized and confinement-checked before open;
+        // re-verify the OPEN handle so an alias, target, or parent swapped
+        // in between cannot redirect hashing outside the workspace. The
+        // verify-then-use pair shares one handle, leaving no window.
+        #[cfg(target_os = "linux")]
+        if !handle_under_root(&file, &workspace_root) {
+            continue;
+        }
         let budget = MAX_TOTAL_BYTES.saturating_sub(total_bytes);
         // Read one byte past the remaining budget so an over-budget file is
         // reported instead of silently truncated.

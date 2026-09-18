@@ -846,6 +846,42 @@ mod official_semantics {
             "expected HashFilesTraversalLimit error, got {result:?}"
         );
     }
+    /// Opened handles are re-verified against the workspace root: an entry
+    /// swapped for an escaping symlink between the pre-open gate and open
+    /// must fail verification on the fresh handle (Linux `/proc/self/fd`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hash_files_opened_handle_reverified() {
+        use crate::evaluator::handle_under_root;
+
+        let base =
+            std::env::temp_dir().join(format!("preloop-hashfiles-r17h-{}", std::process::id()));
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("real.txt"), b"inside").unwrap();
+        std::fs::write(base.join("outside.txt"), b"outside").unwrap();
+        let root = std::fs::canonicalize(&workspace).unwrap();
+
+        // In-workspace handle verifies.
+        let inside = std::fs::File::open(workspace.join("real.txt")).unwrap();
+        assert!(handle_under_root(&inside, &root));
+        // Outside handle does not.
+        let outside = std::fs::File::open(base.join("outside.txt")).unwrap();
+        assert!(!handle_under_root(&outside, &root));
+
+        // Race simulation: swap the entry for an escaping symlink after the
+        // gate would have passed. A fresh open follows it outside and must
+        // fail verification, so no bytes are ever hashed from it.
+        std::fs::remove_file(workspace.join("real.txt")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside.txt"), workspace.join("real.txt")).unwrap();
+        let swapped = std::fs::File::open(workspace.join("real.txt")).unwrap();
+        assert!(
+            !handle_under_root(&swapped, &root),
+            "swapped entry verified: outside bytes would be hashed"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// R1-7: hashing more than 100 MiB of input fails with HashFilesTooLarge
     /// instead of loading it all into memory.
