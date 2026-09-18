@@ -368,6 +368,12 @@ pub(crate) async fn ws_live_logs(
     let bearer = crate::auth::bearer_from_headers(&headers)
         .ok_or_else(|| ApiError::unauthorized("runner or job protocol token required"))?;
     if bearer != shared.state.system_token {
+        // Verify the credential first: a malformed or expired token is a 401
+        // no matter what the target is.
+        shared
+            .state
+            .verify_local_jwt_claims(bearer)
+            .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
         let agent_job_id = job_id
             .parse::<uuid::Uuid>()
             .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
@@ -379,7 +385,10 @@ pub(crate) async fn ws_live_logs(
                 .copied()
                 .and_then(|request_id| inner.job_requests.get(&request_id).cloned())
         };
-        crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())?;
+        // Unresolved and foreign targets share one generic 403: distinct
+        // messages would reveal whether the job UUID resolves.
+        crate::auth::authorize_reporting_request(&shared.state, &headers, request.as_ref())
+            .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
     }
     Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
 }
