@@ -17,7 +17,7 @@ on:
         type: choice
         options:
           - x86_64
-  push:
+  pull_request:
     paths:
       - official-image.toml
   schedule:
@@ -86,7 +86,7 @@ jobs:
 
   build-official-x86_64:
     name: Build official x86_64 golden
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64'))
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.arch == 'both' || inputs.arch == 'x86_64'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
