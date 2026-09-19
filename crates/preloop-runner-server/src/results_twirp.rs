@@ -27,6 +27,8 @@ pub(crate) async fn twirp_workflow_steps_update(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
         .as_str()
@@ -152,6 +154,8 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     // The signed URL is the upload credential for `/replay/results/*` — a
     // bearerless route reachable from inside every runner VM. Only mint for
     // the plan/job the caller's token actually names, or workflow code could
@@ -177,15 +181,36 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
 }
 
 pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
+    State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::auth::require_results_job(
         &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
     )?;
     let token = uuid::Uuid::new_v4();
+    // Bind the bearerless upload token to the owning job so the blob gate
+    // can reject writes from any other job (R1-2). The runner PUTs to this
+    // URL without a bearer (Azure SDK compat), so registration — not a
+    // bearer — is the credential here.
+    {
+        let job_id = match &identity {
+            crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
+            crate::auth::ResultsIdentity::System => String::new(),
+        };
+        let mut inner = shared.state.inner.lock().await;
+        inner.diag_upload_tokens.insert(
+            token.to_string(),
+            DiagUploadToken {
+                job_id,
+                created_unix: now_unix(),
+            },
+        );
+    }
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
@@ -197,6 +222,8 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
@@ -230,6 +257,8 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
@@ -291,6 +320,8 @@ pub(crate) async fn twirp_create_step_summary_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
@@ -337,6 +368,8 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let (Some(plan_id), Some(raw_job_id)) = (
         request.workflow_run_backend_id.as_deref(),
         request.workflow_job_run_backend_id.as_deref(),
@@ -385,6 +418,8 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let Some(raw_job_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
@@ -677,9 +712,12 @@ fn cache_request_fields(
 
 pub(crate) async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let (key, version, _restore, scopes, repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
@@ -811,9 +849,12 @@ pub(crate) async fn twirp_cache_v2_create(
 
 pub(crate) async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let (key, version, _restore, scopes, repository) =

@@ -2769,6 +2769,7 @@ dependencies = [
  "keyring",
  "opentelemetry",
  "parking_lot",
+ "percent-encoding",
  "postgres_rustls",
  "preloop-artifacts",
  "preloop-cache",
