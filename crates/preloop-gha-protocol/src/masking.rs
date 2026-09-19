@@ -29,22 +29,30 @@ where
         .collect();
     sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
 
-    // Scan the original input once. Generated markers are never fed back
-    // through the matcher, so a mask such as "*" cannot expand an existing
-    // "***" marker on a later retroactive pass.
+    // Scan the original input once. A marker run that overlaps a short
+    // marker-valued secret is canonicalized to one replacement marker, rather
+    // than being mistaken for unmasked input or expanded on every pass.
     let mut result = String::with_capacity(input.len());
     let mut offset = 0;
     while offset < input.len() {
         let remaining = &input[offset..];
         let matching_secret = sorted.iter().find(|secret| remaining.starts_with(**secret));
-        if remaining.starts_with(MASK_MARKER)
-            && matching_secret.is_none_or(|secret| secret.len() <= MASK_MARKER.len())
-        {
+        if let Some(secret) = matching_secret {
+            if remaining.starts_with(MASK_MARKER) && secret.len() <= MASK_MARKER.len() {
+                // `***`, `**`, and `*` are all represented by the canonical
+                // marker. Consume the complete marker span so re-masking stays
+                // idempotent while the secret is still treated as matched.
+                result.push_str(MASK_MARKER);
+                offset += MASK_MARKER.len();
+            } else {
+                result.push_str(MASK_MARKER);
+                offset += secret.len();
+            }
+        } else if remaining.starts_with(MASK_MARKER) {
+            // Existing redaction output is opaque when no registered secret
+            // starts there.
             result.push_str(MASK_MARKER);
             offset += MASK_MARKER.len();
-        } else if let Some(secret) = matching_secret {
-            result.push_str(MASK_MARKER);
-            offset += secret.len();
         } else {
             let character = remaining
                 .chars()
@@ -134,6 +142,15 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    #[test]
+    fn marker_valued_secrets_are_redacted_without_expansion() {
+        for secret in ["*", "**", "***"] {
+            let input = format!("before {secret} after");
+            let masked = mask_secrets(&input, [secret].iter().copied(), &[]);
+            assert_eq!(masked, "before *** after");
+            assert_eq!(mask_secrets(&masked, [secret].iter().copied(), &[]), masked);
+        }
+    }
     #[test]
     fn wildcard_masks_do_not_expand_existing_markers() {
         let input = "before *** after";

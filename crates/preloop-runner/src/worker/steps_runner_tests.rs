@@ -54,6 +54,11 @@ fn pause_is_offered_for_continue_on_error_failures_too() {
     assert!(!should_pause_on_failure("Failure", false, true, false));
     assert!(!should_pause_on_failure("Failure", false, false, true));
 }
+#[test]
+fn interactive_continue_preserves_durable_masking_failure() {
+    assert_eq!(interactive_continue_conclusion(false), "Success");
+    assert_eq!(interactive_continue_conclusion(true), "Failure");
+}
 
 #[test]
 fn status_check_function_detection_ignores_string_literals() {

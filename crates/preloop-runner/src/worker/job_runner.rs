@@ -446,7 +446,11 @@ pub async fn run_job(
             .as_ref()
             .map(|rpt| rpt.token())
             .unwrap_or_default();
-        Some(super::live_logs::LiveLogQueue::connect(feed_url, token))
+        Some(super::live_logs::LiveLogQueue::connect(
+            feed_url,
+            token,
+            job_ctx.live_masks.clone(),
+        ))
     } else {
         None
     };
