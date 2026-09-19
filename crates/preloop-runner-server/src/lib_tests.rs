@@ -2409,6 +2409,325 @@ async fn live_log_websocket_rejects_unauthenticated() {
     server.abort();
 }
 
+/// R1-8: the live-log ingest WebSocket must bind the target to the caller's
+/// identity. The generic protocol bearer admits any job's runtime credential;
+/// without an ownership check one job could stream into another job's buffer.
+#[tokio::test]
+async fn live_log_websocket_accepts_own_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // The runner connects with its own job's credential against the agent job
+    // id from its `FeedStreamUrl`.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_a}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let payload = json!({
+        "stepId": "step-1",
+        "startLine": 1,
+        "count": 1,
+        "value": ["hello"]
+    });
+    futures::SinkExt::send(
+        &mut ws,
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_a) {
+                    let wrappers = job_lines.lock().await;
+                    if wrappers.lines.len() == 1 {
+                        assert_eq!(wrappers.lines[0].value, vec!["hello"]);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    server.abort();
+}
+
+/// R1-8: a job's runtime credential must not open another job's ingest feed.
+#[tokio::test]
+async fn live_log_websocket_rejects_other_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let agent_b = jobs[1].2.clone();
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/live-logs/{agent_b}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        result.is_err(),
+        "cross-job live-log ingest must be rejected"
+    );
+
+    server.abort();
+}
+
+/// R1-8: a rejected cross-job ingest attempt must not disturb the victim's
+/// retained history. Reopening a closed feed clears it, so the ownership
+/// check has to happen before the socket is accepted, not on first frame.
+#[tokio::test]
+async fn live_log_websocket_cross_job_attempt_preserves_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let agent_b = jobs[1].2.clone();
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+    let system_credential = state.system_token.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Seed job B's retained tail through its own feed, then close the feed.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_b}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {system_credential}").parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let payload = json!({
+        "stepId": "step-1",
+        "startLine": 1,
+        "count": 1,
+        "value": ["victim-line"]
+    });
+    futures::SinkExt::send(
+        &mut ws,
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_b) {
+                    if job_lines.lock().await.lines.len() == 1 {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(ws);
+    {
+        let mut inner = state.inner.lock().await;
+        crate::live_logs::close_live_log(&mut inner, &agent_b);
+    }
+
+    // Job A's credential against job B's feed: rejected at upgrade.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_b}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        result.is_err(),
+        "cross-job live-log ingest must be rejected"
+    );
+
+    // The victim's retained tail is untouched and still marked closed.
+    {
+        let inner = state.inner.lock().await;
+        let job_lines = inner
+            .live_log_lines
+            .get(&agent_b)
+            .expect("victim history must survive");
+        let wrappers = job_lines.lock().await;
+        assert_eq!(wrappers.lines.len(), 1);
+        assert_eq!(wrappers.lines[0].value, vec!["victim-line"]);
+        assert!(inner.live_log_closed.contains(&agent_b));
+    }
+
+    server.abort();
+}
+
+async fn open_protocol_live(app: &axum::Router, uri: String, bearer: &str) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// M5: the protocol live-log read route must not let one job's runtime
+/// credential read another job's output. A job may read its own feed.
+#[tokio::test]
+async fn live_log_sse_accepts_own_job_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    // Own logical job name.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_a}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Own concrete agent-job UUID.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{agent_a}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// M5: a job's runtime credential must not read another job's live log,
+/// whether addressed by logical name or by concrete agent-job UUID.
+#[tokio::test]
+async fn live_log_sse_rejects_other_job_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let (logical_b, agent_b) = (jobs[1].0.clone(), jobs[1].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_b}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "cross-job read by logical name must be rejected"
+    );
+
+    // A UUID target is rejected without resolving it, so the mismatch never
+    // reveals whether the target exists.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{agent_b}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "cross-job read by concrete job id must be rejected"
+    );
+}
+
+/// M5: the system credential keeps full read access; first-party readers are
+/// unaffected by the per-job ownership check.
+#[tokio::test]
+async fn live_log_sse_system_credential_still_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let logical_b = jobs[1].0.clone();
+    let system_credential = state.system_token.clone();
+
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_b}/logs/live"),
+        &system_credential,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn live_log_websocket_survives_malformed_payload() {
     let temp = tempfile::tempdir().unwrap();
@@ -6998,6 +7317,8 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
     let plan_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
     let runtime_token = state.mint_runtime_token(&plan_id, &job_id);
+    // R1-10: URL-minting writes require a live job record.
+    r1_10_register_live_job(&state, job_id, &plan_id).await;
 
     let response = app
         .clone()
@@ -7029,13 +7350,11 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
         .split_once("/twirp-blob/diag/")
         .expect("diagnostic URL must use the bearerless diag blob endpoint");
     let (blob_token_clean, _) = blob_token.split_once('?').unwrap_or((blob_token, ""));
-    let blob_uuid =
-        uuid::Uuid::parse_str(blob_token_clean).expect("diagnostic token must be a UUID");
-    assert_eq!(blob_uuid.as_bytes()[6] >> 4, 4, "token must be UUIDv4");
+    // The blob token is a server-signed JWT: three base64url segments.
     assert_eq!(
-        blob_uuid.as_bytes()[8] & 0xc0,
-        0x80,
-        "token must use RFC 4122 variant"
+        blob_token_clean.split('.').count(),
+        3,
+        "diagnostic token must be a signed JWT"
     );
 
     let bytes = b"diagnostic log bytes";
@@ -7067,12 +7386,49 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
     assert_eq!(downloaded_bytes.as_ref(), bytes);
 }
 
+/// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
+/// `kind`, `job` ("" for system), `jti` = staging dir name. Returns
+/// `(jwt, jti)` — the pending-reservation maps key on `jti`.
+fn mint_blob_jwt(state: &AppState, kind: &str, job: &str) -> (String, String) {
+    let jti = uuid::Uuid::new_v4().to_string();
+    let jwt = state
+        .local_jwt_with_lifetime(
+            json!({
+                "sub": "preloop-blob",
+                "kind": kind,
+                "job": job,
+                "jti": jti,
+            }),
+            crate::memory_caps::PENDING_UPLOAD_TTL,
+        )
+        .unwrap();
+    (jwt, jti)
+}
+
 #[tokio::test]
 async fn blob_single_shot_streams_to_disk_and_roundtrips() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
+
+    // R1-2: the blob gate requires a server-signed blob JWT whose `job`
+    // claim matches the bearer's job on writes.
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    {
+        let mut inner = state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            jti,
+            crate::models::ArtifactV2Pending {
+                registry_key: format!("run/{job_id}/single-shot"),
+                job_backend_id: job_id.to_string(),
+                created_unix: 0,
+            },
+        );
+    }
+    // R1-10: blob PUTs with a job bearer require a live job record.
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
 
     // A 3 MiB single-shot upload is streamed to a temp file, never buffered
     // whole in memory, and must round-trip byte-for-byte.
@@ -7082,7 +7438,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
-                .uri("/twirp-blob/artifact/single-shot-tok")
+                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::from(payload.clone()))
                 .unwrap(),
@@ -7095,7 +7451,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/twirp-blob/artifact/single-shot-tok")
+                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -7113,9 +7469,27 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
-    let token = state.mint_runtime_token("plan-blob", &uuid::Uuid::new_v4());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
+    // R1-10: blob PUTs with a job bearer require a live job record.
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
-    let put_uri = "/twirp-blob/artifact/concurrent-tok";
+
+    // R1-2: the blob gate requires a server-signed blob JWT whose `job`
+    // claim matches the bearer's job on writes.
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    {
+        let mut inner = state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            jti,
+            crate::models::ArtifactV2Pending {
+                registry_key: format!("run/{job_id}/concurrent"),
+                job_backend_id: job_id.to_string(),
+                created_unix: 0,
+            },
+        );
+    }
+    let put_uri = format!("/twirp-blob/artifact/{blob_jwt}");
 
     // Stage two 1 MiB blocks (ids are base64-safe, so they survive
     // blockid_to_filename unchanged and match the commit XML verbatim).
@@ -7138,12 +7512,12 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
 
     let commit_xml =
         "<BlockList><Latest>YmxvY2sx</Latest><Latest>YmxvY2sy</Latest></BlockList>".to_string();
-    let commit = |app: Router, bearer: String, xml: String| {
+    let commit = |app: Router, bearer: String, xml: String, uri: String| {
         tokio::spawn(async move {
             app.oneshot(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri("/twirp-blob/artifact/concurrent-tok?comp=blocklist")
+                    .uri(format!("{uri}?comp=blocklist"))
                     .header(header::AUTHORIZATION, bearer)
                     .body(Body::from(xml))
                     .unwrap(),
@@ -7158,8 +7532,18 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     // and assembly goes through a temp file + atomic rename, so a losing/late
     // commit can never truncate or delete the blob the winner committed.
     let (s1, s2) = tokio::join!(
-        commit(app.clone(), bearer.clone(), commit_xml.clone()),
-        commit(app.clone(), bearer.clone(), commit_xml.clone()),
+        commit(
+            app.clone(),
+            bearer.clone(),
+            commit_xml.clone(),
+            put_uri.clone()
+        ),
+        commit(
+            app.clone(),
+            bearer.clone(),
+            commit_xml.clone(),
+            put_uri.clone()
+        ),
     );
     let (s1, s2) = (s1.unwrap(), s2.unwrap());
     assert!(
@@ -10589,10 +10973,14 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     let inner = state.inner.lock().await;
     let fork_message = queued_message_for(&inner, &fork_run_id);
     let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    // Compare token identity (`sub`), not token strings: JWT timestamps are
+    // second-granularity, so a comparison token minted across a clock tick
+    // differs textually from the identical token minted at submission.
+    let expected_sub = jwt_sub(runtime_token.as_str());
     for name in ["system.github.token", "github_token"] {
         assert_eq!(
-            variable_value(&fork_message, name),
-            Some(runtime_token.as_str()),
+            variable_value(&fork_message, name).and_then(jwt_sub),
+            expected_sub.clone(),
             "fork job must carry the local runtime token, not the PAT ({name})"
         );
     }
@@ -14477,7 +14865,8 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let claims = json!({
         "sub": client_id,
         "iss": client_id,
-        "aud": "https://preloop.local/oauth",
+        // R1-9: aud must identify this server (the called token endpoint).
+        "aud": "http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token",
         "jti": uuid::Uuid::new_v4().to_string(),
         "nbf": now,
         "exp": now + 300,
@@ -14581,6 +14970,109 @@ async fn runner_oauth2_token_client_assertion_verification() {
         .unwrap();
 
     assert_eq!(bad_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── R1-9: client_assertion expiry / audience validation ───
+
+fn r1_9_test_uri() -> axum::http::Uri {
+    "/runner/server/_apis/v1/oauth2/token".parse().unwrap()
+}
+
+fn r1_9_claims(now: i64, aud: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "sub": "test-client",
+        "iss": "test-client",
+        "aud": aud,
+        "nbf": now,
+        "exp": now + 300,
+    })
+}
+
+#[test]
+fn r1_9_accepts_valid_assertion_claims() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    // Exact endpoint URL.
+    let claims = r1_9_claims(
+        now,
+        serde_json::json!("http://127.0.0.1:9090/runner/server/_apis/v1/oauth2/token"),
+    );
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    // Base URL alone is also accepted.
+    let claims = r1_9_claims(now, serde_json::json!("http://127.0.0.1:9090"));
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+    // Array form.
+    let claims = r1_9_claims(
+        now,
+        serde_json::json!(["https://other.example", "http://127.0.0.1:9090"]),
+    );
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_ok());
+}
+
+#[test]
+fn r1_9_rejects_expired_assertion() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now - 600,
+        "exp": now - 1,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+}
+
+#[test]
+fn r1_9_rejects_wrong_audience() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    // Assertion addressed to a different server must not validate here.
+    let claims = r1_9_claims(now, serde_json::json!("https://preloop.local/oauth"));
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    // Missing aud is also rejected.
+    let claims = serde_json::json!({"sub": "test-client", "nbf": now, "exp": now + 300});
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+}
+
+#[test]
+fn r1_9_rejects_missing_exp_and_excessive_lifetime() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let uri = r1_9_test_uri();
+    // Missing exp.
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    // Lifetime over the 600s cap.
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now,
+        "exp": now + 3600,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
+    // Future-dated nbf beyond skew.
+    let claims = serde_json::json!({
+        "sub": "test-client",
+        "aud": "http://127.0.0.1:9090",
+        "nbf": now + 3600,
+        "exp": now + 3900,
+    });
+    assert!(crate::oauth::validate_client_assertion_claims(&claims, &uri).is_err());
 }
 
 #[test]
@@ -15196,6 +15688,19 @@ fn variable_value<'a>(message: &'a AgentJobRequestMessage, name: &str) -> Option
         .variables
         .get(name)
         .and_then(|value| value.value.as_deref())
+}
+/// `sub` claim of a runtime JWT, for comparisons that must ignore
+/// second-granularity timestamps (`iat`/`exp`). Returns `None` for
+/// non-JWT values (e.g. a leaked PAT) so mismatches fail the assertion
+/// instead of panicking in the helper.
+fn jwt_sub(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("sub")?.as_str().map(str::to_owned)
 }
 
 /// `preloop setup github --via pat` stores the credential as `github.pat` and
@@ -22405,6 +22910,8 @@ async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
     // The runtime token is exported to steps as ACTIONS_RUNTIME_TOKEN, so it
     // is exactly the credential untrusted workflow code holds.
     let runtime_token = state.mint_runtime_token(&plan, &my_job);
+    // R1-10: URL-minting writes require a live job record.
+    r1_10_register_live_job(&state, my_job, &plan).await;
     let mint_url = "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL";
 
     // Minting a signed URL for *another* job's backend ids is refused.
@@ -26032,4 +26539,544 @@ async fn flow_recording_redacts_credentials() {
     assert!(!flow.contains("system-secret"));
     assert!(!flow.contains("provision-secret"));
     assert!(flow.matches("[REDACTED]").count() >= 2);
+}
+
+// ─── R1-2: /twirp-blob/:kind/:token authentication & path validation ───
+
+#[tokio::test]
+async fn r1_2_blob_rejects_unregistered_token() {
+    // The finding's repro: an unauthenticated PUT to an arbitrary token must
+    // not create a blob. The gate returns 404 (not 401) so unregistered
+    // tokens are indistinguishable from missing blobs.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let put = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/attacker-chosen-token")
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r1_2_blob_rejects_wrong_job_write() {
+    // A job's bearer must not write another job's blob token.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let owner_job = uuid::Uuid::new_v4();
+    let other_job = uuid::Uuid::new_v4();
+    let other_token = state.mint_runtime_token("plan-blob", &other_job);
+    // Both jobs are live so the ownership mismatch is the only rejection.
+    r1_10_register_live_job(&state, owner_job, "plan-blob").await;
+    r1_10_register_live_job(&state, other_job, "plan-blob").await;
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &owner_job.to_string());
+    {
+        let mut inner = state.inner.lock().await;
+        inner.artifact_v2_pending.insert(
+            jti,
+            crate::models::ArtifactV2Pending {
+                registry_key: format!("run/{owner_job}/owned"),
+                job_backend_id: owner_job.to_string(),
+                created_unix: 0,
+            },
+        );
+    }
+
+    let put = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {other_token}"),
+                )
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r1_2_bearerless_put_requires_live_owner() {
+    // The bearerless Azure-SDK flow: a minted upload URL works while the
+    // owning job is live and stops the moment the job settles — the stale
+    // replay window R1-10 closes everywhere else.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let job_id = uuid::Uuid::new_v4();
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let uri = format!("/twirp-blob/artifact/{blob_jwt}");
+
+    // Live owner: bearerless PUT succeeds.
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(&uri)
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    // Settled owner: the same URL is rejected before touching the disk.
+    r1_10_complete_job(&state, job_id).await;
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(&uri)
+                .body(Body::from(vec![b'y'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r1_2_bearerless_put_rejects_unsigned_token() {
+    // A bearerless PUT to a token that is not a server-signed blob JWT is
+    // indistinguishable from a missing blob.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let put = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/cache/not-a-jwt-token")
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn r1_2_blob_rejects_path_traversal() {
+    // Raw and percent-encoded separators / traversal must be rejected with
+    // 400 before touching the filesystem.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    for uri in [
+        "/twirp-blob/artifact/..%2F..%2Fsecret",
+        "/twirp-blob/artifact/%2e%2e%2fsecret",
+        "/twirp-blob/evil-kind/some-token",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(uri)
+                    .body(Body::from(vec![b'x'; 8]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "uri: {uri}");
+    }
+    // An empty token doesn't match the route's :token segment at all, so the
+    // router 404s before the gate runs — also safe.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/artifact/")
+                .body(Body::from(vec![b'x'; 8]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn r1_2_parse_blob_path_allowlist() {
+    use crate::blob_store::{is_valid_blob_token, parse_blob_path};
+
+    // Valid paths parse.
+    assert_eq!(
+        parse_blob_path("/twirp-blob/artifact/abc123"),
+        Some(("artifact".to_owned(), "abc123".to_owned()))
+    );
+    assert_eq!(
+        parse_blob_path("/twirp-blob/cache/deadbeef-1234"),
+        Some(("cache".to_owned(), "deadbeef-1234".to_owned()))
+    );
+    // Artifact .zip suffix is accepted and stripped.
+    assert_eq!(
+        parse_blob_path("/twirp-blob/artifact/abc123.zip"),
+        Some(("artifact".to_owned(), "abc123".to_owned()))
+    );
+
+    // Unknown kinds, traversal, and malformed tokens are rejected.
+    assert_eq!(parse_blob_path("/twirp-blob/evil/abc123"), None);
+    assert_eq!(parse_blob_path("/twirp-blob/artifact/..%2Fsecret"), None);
+    assert_eq!(
+        parse_blob_path("/twirp-blob/artifact/%2e%2e%2fsecret"),
+        None
+    );
+    assert_eq!(parse_blob_path("/twirp-blob/artifact/"), None);
+    assert_eq!(parse_blob_path("/twirp-blob/artifact"), None);
+
+    // Token charset: alphanumerics, dash, underscore, dot only.
+    assert!(is_valid_blob_token("abcXYZ-123_.9"));
+    assert!(!is_valid_blob_token(""));
+    assert!(!is_valid_blob_token("has space"));
+    assert!(!is_valid_blob_token("has/slash"));
+    assert!(!is_valid_blob_token("../traversal"));
+}
+
+// ─── R1-10: job token lifecycle (jti uniqueness + liveness enforcement) ───
+
+#[test]
+fn r1_10_local_jwts_have_unique_jti() {
+    // Two tokens minted in the same second must not be byte-identical: the
+    // random jti ensures each minted token is unique.
+    let temp = tempfile::tempdir().unwrap();
+    // AppState::new is async; use a runtime for this sync test.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let state = rt
+        .block_on(AppState::new(temp.path().to_path_buf()))
+        .unwrap();
+    let job_id = uuid::Uuid::new_v4();
+    let t1 = state.mint_runtime_token("plan-jti", &job_id);
+    let t2 = state.mint_runtime_token("plan-jti", &job_id);
+    assert_ne!(
+        t1, t2,
+        "tokens minted in the same second must differ via jti"
+    );
+}
+
+// Helper: register a minimal live job record so R1-10 liveness checks pass.
+async fn r1_10_register_live_job(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
+    use preloop_gha_protocol::{JobId, RunId};
+    let mut inner = state.inner.lock().await;
+    let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
+    let record = crate::models::TaskAgentJobRequestRecord {
+        request_id,
+        run_id: RunId(uuid::Uuid::new_v4()),
+        job_id: JobId("test-job".to_owned()),
+        agent_job_id: job_uuid,
+        plan_id: plan_id.to_owned(),
+        plan_type: "test".to_owned(),
+        timeline_id: uuid::Uuid::new_v4(),
+        result: None,
+        locked_until: String::new(),
+        owner_runner_id: None,
+        started_at: None,
+        last_renewed_at: None,
+        timeout_triggered: false,
+        claimed_at: None,
+        debug_token_issued: false,
+    };
+    inner.agent_job_requests.insert(job_uuid, request_id);
+    inner.job_requests.insert(request_id, record);
+}
+
+// Helper: mark a registered job's request record terminally complete, so the
+// R1-10 liveness check treats its token as stale.
+async fn r1_10_complete_job(state: &AppState, job_uuid: uuid::Uuid) {
+    let mut inner = state.inner.lock().await;
+    let request_id = inner.agent_job_requests.get(&job_uuid).copied().unwrap();
+    if let Some(record) = inner.job_requests.get_mut(&request_id) {
+        record.result = Some(preloop_gha_protocol::ExecutionStatus::Success);
+    }
+}
+
+// Helper: register a live job plus the minimal run record the legacy cache
+// path needs (`job_repository_from_headers` resolves job → request → run →
+// submission.repository).
+async fn r1_10_register_live_job_with_run(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
+    r1_10_register_live_job(state, job_uuid, plan_id).await;
+    let run_id = {
+        let inner = state.inner.lock().await;
+        let request_id = inner.agent_job_requests.get(&job_uuid).copied().unwrap();
+        inner.job_requests.get(&request_id).unwrap().run_id
+    };
+    let submission = std::sync::Arc::new(preloop_gha_protocol::WorkflowSubmission {
+        repository: "test-org/test-repo".to_owned(),
+        ..Default::default()
+    });
+    let mut inner = state.inner.lock().await;
+    inner.runs.insert(
+        run_id,
+        crate::models::RunRecord {
+            run_id,
+            webhook_delivery_id: None,
+            run_name: None,
+            submission,
+            jobs: Default::default(),
+            status: preloop_gha_protocol::ExecutionStatus::InProgress,
+            job_outputs: Default::default(),
+            job_base_ids: Default::default(),
+            job_needs: Default::default(),
+            caller_plans: Default::default(),
+            job_names: Default::default(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: Default::default(),
+            job_continue_on_error: Default::default(),
+            job_check_run_ids: Default::default(),
+            reusable_calls: Default::default(),
+            jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            run_number: 1,
+            run_attempt: 1,
+            workflow_path_str: String::new(),
+            event: "push".to_owned(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing: None,
+        },
+    );
+}
+
+#[tokio::test]
+async fn r1_10_legacy_cache_rejects_stale_job_token() {
+    // Repro: a job token minted at job start keeps working on the legacy
+    // cache write path after the job completes. Reserve + upload while live,
+    // complete the job, then every further write with the stale token must
+    // be rejected.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-cache", &job_id);
+    r1_10_register_live_job_with_run(&state, job_id, "plan-cache").await;
+    let bearer = format!("Bearer {token}");
+
+    // Live: reserve succeeds.
+    let reserve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_apis/artifactcache/cache")
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"key": "k", "version": "v1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reserve.status(), StatusCode::OK);
+    let body = to_bytes(reserve.into_body(), usize::MAX).await.unwrap();
+    let cache_id: i64 = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["cacheId"]
+        .as_i64()
+        .unwrap();
+
+    // Live: upload succeeds.
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .body(Body::from("bytes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::ACCEPTED);
+
+    // The job completes; the token is now stale but still cryptographically
+    // valid (signature + expiry pass).
+    r1_10_complete_job(&state, job_id).await;
+
+    // Stale: new reservations are rejected.
+    let stale_reserve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_apis/artifactcache/cache")
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"key": "k2", "version": "v1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_reserve.status(), StatusCode::FORBIDDEN);
+
+    // Stale: uploading to the still-open reservation is rejected.
+    let stale_upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .body(Body::from("more-bytes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_upload.status(), StatusCode::FORBIDDEN);
+
+    // Stale: committing the reservation is rejected.
+    let stale_commit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"size": 5}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_commit.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r1_10_legacy_cache_allows_live_job_writes() {
+    // The liveness gate must not break the normal flow: a live job can
+    // reserve, upload, and commit through the legacy cache path.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-cache", &job_id);
+    r1_10_register_live_job_with_run(&state, job_id, "plan-cache").await;
+    let bearer = format!("Bearer {token}");
+
+    let reserve = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_apis/artifactcache/cache")
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"key": "k", "version": "v1"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reserve.status(), StatusCode::OK);
+    let body = to_bytes(reserve.into_body(), usize::MAX).await.unwrap();
+    let cache_id: i64 = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["cacheId"]
+        .as_i64()
+        .unwrap();
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .body(Body::from("bytes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::ACCEPTED);
+
+    let commit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"size": 5}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn r1_10_legacy_artifact_create_rejects_stale_job_token() {
+    // Repro: the legacy artifact-create route accepts any valid local JWT
+    // and never checked job liveness, so a stale job token could keep
+    // creating artifacts after its job completed.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-artifact", &job_id);
+    r1_10_register_live_job_with_run(&state, job_id, "plan-artifact").await;
+    let bearer = format!("Bearer {token}");
+    let run_id = uuid::Uuid::new_v4();
+
+    // Live: artifact creation succeeds.
+    let live = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/pipelines/workflows/{run_id}/artifacts"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name": "a", "file_name": "a.bin"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+
+    // The job completes; the token is now stale.
+    r1_10_complete_job(&state, job_id).await;
+
+    // Stale: artifact creation is rejected.
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/pipelines/workflows/{run_id}/artifacts"))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name": "b", "file_name": "b.bin"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::FORBIDDEN);
 }

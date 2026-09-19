@@ -805,7 +805,7 @@ pub async fn run_steps(
             // executed and contexts may have been populated.
             if resolved_display_name.contains("${{") {
                 if let Some(group_line) = step_ctx
-                    .log_content()
+                    .log_head(super::execution_context::LOG_HEAD_SCAN_BYTES)
                     .lines()
                     .find_map(|line| line.split_once("##[group]Run ").map(|(_, name)| name))
                 {

@@ -35,6 +35,97 @@ fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
 
 // ─── Azure Block Blob compat blob store ───────────────────────────────────────
 //
+
+/// Blob kinds the `/twirp-blob/:kind/:token` route serves. Anything else is
+/// rejected before touching the filesystem (R1-2).
+pub(crate) const BLOB_KINDS: &[&str] = &["cache", "artifact", "diag"];
+
+/// Validate an already-decoded blob token: non-empty, restricted charset, no
+/// `..` segments. The charset excludes `/` and `\`, so no validated token can
+/// escape `<state_dir>/blobs/{kind}/` via path joining.
+pub(crate) fn is_valid_blob_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !token.contains("..")
+        && !token.starts_with('.')
+        && !token.ends_with('.')
+}
+
+/// Verify a `/twirp-blob` path token as a server-signed blob JWT.
+///
+/// Blob tokens are `local_jwt`s minted at signed-URL creation: `sub` is
+/// `preloop-blob`, `kind` pins the blob kind, `job` records the owning job
+/// ("" for system-minted URLs), and `jti` is the on-disk staging directory
+/// name. Verification is stateless — signature + `exp` — so a minted URL
+/// survives an engine restart, unlike the pending-registration maps (which
+/// remain for reservation bookkeeping, not credential validity).
+///
+/// Returns the decoded claims, or `None` when the token is not a valid blob
+/// JWT for `kind`.
+pub(crate) fn verify_blob_token(
+    state: &AppState,
+    kind: &str,
+    token: &str,
+) -> Option<serde_json::Value> {
+    let claims = state.verify_local_jwt_claims(token)?;
+    if claims.get("sub").and_then(|v| v.as_str()) != Some("preloop-blob") {
+        return None;
+    }
+    if claims.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+        return None;
+    }
+    Some(claims)
+}
+
+/// The `jti` of a verified blob JWT — the staging directory name under
+/// `<state_dir>/blobs/{kind}/`. Kept separate from the JWT itself because a
+/// signed token is far longer than the 255-byte filename limit.
+pub(crate) fn blob_token_jti(claims: &serde_json::Value) -> Option<String> {
+    let jti = claims.get("jti").and_then(|v| v.as_str())?;
+    is_valid_blob_token(jti).then(|| jti.to_owned())
+}
+
+/// The `job` claim of a verified blob JWT: `Some("")` for system-minted
+/// tokens, `Some(job_uuid)` for job-owned ones, `None` when absent.
+pub(crate) fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
+    claims.get("job").and_then(|v| v.as_str())
+}
+
+/// Parse and validate a raw `/twirp-blob/{kind}/{token}` request path.
+///
+/// Decode-then-validate: the token is percent-decoded *first*, so encoded
+/// separators (`%2f`, `%2e%2e`, double-encoded `%252e`) are caught by the same
+/// checks as literal ones. Returns the canonical `(kind, token)` with any
+/// `.zip` artifact-download suffix removed, or `None` when the path is
+/// malformed or the kind is not allowlisted.
+pub(crate) fn parse_blob_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/twirp-blob/")?;
+    let (kind, raw_token) = rest.split_once('/')?;
+    if raw_token.contains('/') {
+        return None;
+    }
+    if !BLOB_KINDS.contains(&kind) {
+        return None;
+    }
+    let mut token = raw_token.to_string();
+    // Artifact download URLs append `.zip` for toolkit content-type
+    // detection; strip it before validation and map lookup (mirrors blob_get).
+    if kind == "artifact" {
+        if let Some(stripped) = token.strip_suffix(".zip") {
+            token = stripped.to_string();
+        }
+    }
+    let decoded = percent_encoding::percent_decode_str(&token)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    if !is_valid_blob_token(&decoded) {
+        return None;
+    }
+    Some((kind.to_string(), decoded))
+}
 // Both actions/cache@v4 and actions/upload-artifact@v4 upload via the Azure SDK
 // (BlockBlobClient).  The protocol is:
 //   • Single-shot: PUT /twirp-blob/{kind}/{token}                  → 201
@@ -48,9 +139,20 @@ pub(crate) struct BlobPutQuery {
     blockid: Option<String>,
 }
 
-/// Convert a base64 block ID to a filesystem-safe name.
-pub(crate) fn blockid_to_filename(blockid: &str) -> String {
-    blockid.replace('+', "-").replace('/', "_").replace('=', "")
+/// Convert a base64 block ID to a filesystem-safe name, or `None` when the
+/// decoded ID would escape `blocks_dir` — `Query` percent-decodes, so
+/// `%5C` arrives as `\` and `..%5C..%5Ctarget` is a Windows traversal. Only
+/// the base64url charset survives; anything else is rejected outright.
+pub(crate) fn blockid_to_filename(blockid: &str) -> Option<String> {
+    let name = blockid.replace('+', "-").replace('/', "_").replace('=', "");
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+    Some(name)
 }
 
 /// Parse an Azure Block Blob blocklist XML body and return block IDs in order.
@@ -76,11 +178,43 @@ pub(crate) fn parse_blocklist_xml(body: &str) -> Vec<String> {
 
 pub(crate) async fn blob_put(
     State(shared): State<Arc<SharedState>>,
-    Path((kind, token)): Path<(String, String)>,
+    Path((kind, mut token)): Path<(String, String)>,
     Query(query): Query<BlobPutQuery>,
     headers: HeaderMap,
     body: Body,
 ) -> StatusCode {
+    // Mirror blob_get: artifact URLs may carry a `.zip` suffix for toolkit
+    // content-type detection. The gate strips it before validation; strip it
+    // here too so the handler agrees with the gate (the staging dir is named
+    // by the JWT's `jti`, so the suffix never reaches the filesystem).
+    if kind == "artifact" && token.ends_with(".zip") {
+        token.truncate(token.len() - 4);
+    }
+    // Defense in depth: the middleware gate validates first, but the blob
+    // root is built by joining these segments — never join unsanitized ones.
+    // The token is a server-signed blob JWT; `jti` (not the JWT itself, which
+    // exceeds the filename limit) names the staging directory.
+    let Some(claims) = verify_blob_token(&shared.state, &kind, &token) else {
+        warn!(kind, "rejected blob PUT with invalid kind/token");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(stage_name) = blob_token_jti(&claims) else {
+        warn!(kind, "rejected blob PUT with malformed jti");
+        return StatusCode::BAD_REQUEST;
+    };
+    // R1-10: if a bearer is present and verifies as a job identity, require
+    // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
+    // attributed; their liveness is enforced at URL-mint time.
+    if let Some(bearer) = crate::auth::bearer_from_headers(&headers) {
+        if let Ok(identity) = crate::auth::results_identity(&shared.state, bearer) {
+            if crate::auth::require_live_results_job(&shared.state, &identity)
+                .await
+                .is_err()
+            {
+                return StatusCode::FORBIDDEN;
+            }
+        }
+    }
     // Early Content-Length check before buffering — avoids allocating 512 MiB
     // for a block that will be rejected at 8 MiB.
     if let Some(cl) = headers
@@ -103,7 +237,7 @@ pub(crate) async fn blob_put(
         .state_dir
         .join("blobs")
         .join(&kind)
-        .join(&token);
+        .join(&stage_name);
 
     match query.comp.as_deref() {
         Some("block") => {
@@ -119,7 +253,10 @@ pub(crate) async fn blob_put(
                 }
             };
             let block_id = query.blockid.unwrap_or_default();
-            let safe_id = blockid_to_filename(&block_id);
+            let Some(safe_id) = blockid_to_filename(&block_id) else {
+                warn!(kind, "rejected blob block with unsafe blockid");
+                return StatusCode::BAD_REQUEST;
+            };
             let blocks_dir = blob_root.join("blocks");
             if let Err(e) = tokio::fs::create_dir_all(&blocks_dir).await {
                 warn!(kind, "failed to create blocks dir: {e}");
@@ -169,7 +306,10 @@ pub(crate) async fn blob_put(
             // assembling (or materializes the destination).
             let mut total: u64 = 0;
             for bid in &block_ids {
-                let safe_id = blockid_to_filename(bid);
+                let Some(safe_id) = blockid_to_filename(bid) else {
+                    warn!(kind, "rejected blocklist with unsafe blockid");
+                    return StatusCode::BAD_REQUEST;
+                };
                 match tokio::fs::metadata(blocks_dir.join(&safe_id)).await {
                     Ok(md) => {
                         total = total.saturating_add(md.len());
@@ -314,7 +454,10 @@ async fn assemble_streaming(
         .map_err(AssemblyError::Io)?;
     let mut total: u64 = 0;
     for bid in block_ids {
-        let safe_id = blockid_to_filename(bid);
+        // Block IDs were validated at stage/commit time; an unsafe one here
+        // is a bug, not attacker input — treat as an I/O failure.
+        let safe_id = blockid_to_filename(bid)
+            .ok_or_else(|| AssemblyError::Io(std::io::Error::other("unsafe blockid")))?;
         let mut src = tokio::fs::File::open(blocks_dir.join(&safe_id))
             .await
             .map_err(AssemblyError::Io)?;
@@ -328,7 +471,6 @@ async fn assemble_streaming(
     }
     Ok(total)
 }
-
 pub(crate) async fn blob_get(
     State(shared): State<Arc<SharedState>>,
     Path((kind, mut token)): Path<(String, String)>,
@@ -337,13 +479,21 @@ pub(crate) async fn blob_get(
     if kind == "artifact" && token.ends_with(".zip") {
         token.truncate(token.len() - 4);
     }
+    // Defense in depth: the middleware gate validates first — never serve
+    // outside the allowlisted kinds or join an unsanitized token.
+    let Some(claims) = verify_blob_token(&shared.state, &kind, &token) else {
+        warn!(kind, "rejected blob GET with invalid kind/token");
+        return StatusCode::BAD_REQUEST.into_response();
+    };
 
     if kind == "cache" {
-        // Token is a download token → look up (key, version) in state.
-        let kv = {
-            let inner = shared.state.inner.lock().await;
-            inner.cache_v2_dl_tokens.get(&token).cloned()
-        };
+        // Download tokens carry (key, version) in their claims — resolution
+        // is stateless and survives restarts, unlike the dl-token map.
+        let kv = claims
+            .get("key")
+            .and_then(|v| v.as_str())
+            .zip(claims.get("version").and_then(|v| v.as_str()))
+            .map(|(key, version)| (key.to_owned(), version.to_owned()));
         if let Some((key, version)) = kv {
             let empty: Vec<String> = Vec::new();
             return match shared.state.cache.get(&key, &version, &empty).await {
@@ -362,14 +512,19 @@ pub(crate) async fn blob_get(
         }
     }
 
-    // Artifact (or cache fallback): serve from blob staging dir.
+    // Artifact (or cache fallback): serve from blob staging dir, named by jti.
+    let Some(stage_name) = blob_token_jti(&claims) else {
+        warn!(kind, "rejected blob GET with malformed jti");
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     let data_path = shared
         .state
         .state_dir
         .join("blobs")
         .join(&kind)
-        .join(&token)
+        .join(&stage_name)
         .join("data");
+
     match tokio::fs::read(&data_path).await {
         Ok(bytes) => {
             if kind == "artifact" {
@@ -378,7 +533,7 @@ pub(crate) async fn blob_get(
                     inner
                         .artifact_v2_registry
                         .values()
-                        .find(|e| e.blob_token == token)
+                        .find(|e| e.blob_token == stage_name)
                         .map(|e| e.name.clone())
                 };
                 let filename = name.unwrap_or_else(|| "artifact".to_owned());
