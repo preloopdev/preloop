@@ -442,6 +442,10 @@ impl JobContext {
             "temp": std::env::temp_dir().to_string_lossy().to_string(),
             "tool_cache": tool_cache,
             "workspace": runner_workspace,
+            // Official runner exposes `runner.environment` as
+            // "github-hosted" or "self-hosted"; preloop jobs always run on
+            // self-hosted infrastructure.
+            "environment": "self-hosted",
         });
         ctx.insert("runner", runner_ctx);
 

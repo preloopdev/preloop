@@ -97,12 +97,18 @@ jobs:
       attestations: write
       packages: read
     steps:
+      # The bake needs nested KVM to boot the image it packs. Self-hosted
+      # runners (preloop smolvm guests) have no /dev/kvm, so every step is
+      # gated on github-hosted: under preloop the job skips green instead of
+      # burning ~20 min of compile before dying at the KVM check.
       - name: Check out repository
+        if: runner.environment == 'github-hosted'
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
 
       - name: Resolve golden identity and base
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
           echo "RUNNER_TARGET=x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
@@ -113,14 +119,17 @@ jobs:
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
+        if: runner.environment == 'github-hosted'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Build Preloop binaries
+        if: runner.environment == 'github-hosted'
         run: |
           cargo build --release -p preloop-cli -p preloop-runner-server
           cargo build --release -p preloop-runner --target "$RUNNER_TARGET"
 
       - name: Capture pinned base provenance
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -135,6 +144,7 @@ jobs:
               "https://github.com/preloopdev/runner-image-blobs/tree"
 
       - name: Install configured smolvm
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
           SMOLVM_VERSION="$(grep -E '^[[:space:]]*smolvm_golden_version[[:space:]]*=' versions.toml | cut -d'"' -f2 || true)"
@@ -178,6 +188,7 @@ jobs:
           ln -sf "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Grant hosted runner KVM access
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
           test -e /dev/kvm
@@ -187,6 +198,7 @@ jobs:
 
 
       - name: Reclaim runner disk for layer staging
+        if: runner.environment == 'github-hosted'
         run: |
           set -euo pipefail
           # `pack create` stages the extracted layers, the merged layer, the
@@ -212,6 +224,7 @@ jobs:
           AGENT_TOOLSDIRECTORY: ${{ env.AGENT_TOOLSDIRECTORY }}
 
       - name: Pack Golden MicroVM Artifact
+        if: runner.environment == 'github-hosted'
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
           GODEBUG: http2client=0
@@ -292,6 +305,7 @@ jobs:
           sha256sum "dist/$GOLDEN_NAME" > "dist/$GOLDEN_NAME.sha256"
 
       - name: Write golden provenance manifest
+        if: runner.environment == 'github-hosted'
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
@@ -305,9 +319,11 @@ jobs:
             --output "dist/$GOLDEN_NAME.provenance.json"
 
       - name: Install cosign
+        if: runner.environment == 'github-hosted'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign golden (cosign keyless)
+        if: runner.environment == 'github-hosted'
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
@@ -321,6 +337,7 @@ jobs:
             "dist/$GOLDEN_NAME"
 
       - name: Attest golden (GitHub provenance)
+        if: runner.environment == 'github-hosted'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
@@ -330,6 +347,7 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
       - name: Retain Golden Artifact
+        if: runner.environment == 'github-hosted'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: golden-${{ env.GOLDEN_ARCH }}
@@ -346,6 +364,7 @@ jobs:
           if-no-files-found: error
 
       - name: Split golden for artifact retention
+        if: runner.environment == 'github-hosted'
         env:
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
         run: |
