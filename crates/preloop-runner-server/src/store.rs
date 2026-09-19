@@ -1617,11 +1617,29 @@ impl SqliteStore {
 
     pub(crate) fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
-        let mut run_stmt =
-            connection.prepare("SELECT record_blob FROM runs ORDER BY created_at_us")?;
-        let runs = run_stmt
+        // Restore every run still in flight plus the newest completed runs up
+        // to `MAX_COMPLETED_RUNS_RETAINED`. Loading the full history
+        // materializes a ~1 MiB RunRecord per row into heap forever (3203 runs
+        // ≈ 4.4 GiB observed); the durable table keeps everything, memory only
+        // needs live state plus recent history for the run APIs.
+        let mut run_stmt = connection.prepare(
+            "SELECT record_blob FROM runs WHERE completed_at_us IS NULL
+             ORDER BY created_at_us",
+        )?;
+        let mut runs = run_stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut completed_stmt = connection.prepare(
+            "SELECT record_blob FROM runs WHERE completed_at_us IS NOT NULL
+             ORDER BY created_at_us DESC LIMIT ?1",
+        )?;
+        let completed = completed_stmt
+            .query_map(
+                [crate::memory_caps::MAX_COMPLETED_RUNS_RETAINED as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        runs.extend(completed);
         for blob in runs {
             let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;

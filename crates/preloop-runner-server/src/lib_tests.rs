@@ -2409,6 +2409,325 @@ async fn live_log_websocket_rejects_unauthenticated() {
     server.abort();
 }
 
+/// R1-8: the live-log ingest WebSocket must bind the target to the caller's
+/// identity. The generic protocol bearer admits any job's runtime credential;
+/// without an ownership check one job could stream into another job's buffer.
+#[tokio::test]
+async fn live_log_websocket_accepts_own_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // The runner connects with its own job's credential against the agent job
+    // id from its `FeedStreamUrl`.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_a}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let payload = json!({
+        "stepId": "step-1",
+        "startLine": 1,
+        "count": 1,
+        "value": ["hello"]
+    });
+    futures::SinkExt::send(
+        &mut ws,
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_a) {
+                    let wrappers = job_lines.lock().await;
+                    if wrappers.lines.len() == 1 {
+                        assert_eq!(wrappers.lines[0].value, vec!["hello"]);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    server.abort();
+}
+
+/// R1-8: a job's runtime credential must not open another job's ingest feed.
+#[tokio::test]
+async fn live_log_websocket_rejects_other_job_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let agent_b = jobs[1].2.clone();
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws/live-logs/{agent_b}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        result.is_err(),
+        "cross-job live-log ingest must be rejected"
+    );
+
+    server.abort();
+}
+
+/// R1-8: a rejected cross-job ingest attempt must not disturb the victim's
+/// retained history. Reopening a closed feed clears it, so the ownership
+/// check has to happen before the socket is accepted, not on first frame.
+#[tokio::test]
+async fn live_log_websocket_cross_job_attempt_preserves_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (_run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let agent_b = jobs[1].2.clone();
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+    let system_credential = state.system_token.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Seed job B's retained tail through its own feed, then close the feed.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_b}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {system_credential}").parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let payload = json!({
+        "stepId": "step-1",
+        "startLine": 1,
+        "count": 1,
+        "value": ["victim-line"]
+    });
+    futures::SinkExt::send(
+        &mut ws,
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            {
+                let inner = state.inner.lock().await;
+                if let Some(job_lines) = inner.live_log_lines.get(&agent_b) {
+                    if job_lines.lock().await.lines.len() == 1 {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(ws);
+    {
+        let mut inner = state.inner.lock().await;
+        crate::live_logs::close_live_log(&mut inner, &agent_b);
+    }
+
+    // Job A's credential against job B's feed: rejected at upgrade.
+    let url = format!("ws://{addr}/ws/live-logs/{agent_b}");
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url)
+            .unwrap();
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {credential_a}").parse().unwrap(),
+    );
+    let result = tokio_tungstenite::connect_async(request).await;
+    assert!(
+        result.is_err(),
+        "cross-job live-log ingest must be rejected"
+    );
+
+    // The victim's retained tail is untouched and still marked closed.
+    {
+        let inner = state.inner.lock().await;
+        let job_lines = inner
+            .live_log_lines
+            .get(&agent_b)
+            .expect("victim history must survive");
+        let wrappers = job_lines.lock().await;
+        assert_eq!(wrappers.lines.len(), 1);
+        assert_eq!(wrappers.lines[0].value, vec!["victim-line"]);
+        assert!(inner.live_log_closed.contains(&agent_b));
+    }
+
+    server.abort();
+}
+
+async fn open_protocol_live(app: &axum::Router, uri: String, bearer: &str) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// M5: the protocol live-log read route must not let one job's runtime
+/// credential read another job's output. A job may read its own feed.
+#[tokio::test]
+async fn live_log_sse_accepts_own_job_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (logical_a, plan_a, agent_a) = (jobs[0].0.clone(), jobs[0].1.clone(), jobs[0].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    // Own logical job name.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_a}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Own concrete agent-job UUID.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{agent_a}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// M5: a job's runtime credential must not read another job's live log,
+/// whether addressed by logical name or by concrete agent-job UUID.
+#[tokio::test]
+async fn live_log_sse_rejects_other_job_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let (plan_a, agent_a) = (jobs[0].1.clone(), jobs[0].2.clone());
+    let (logical_b, agent_b) = (jobs[1].0.clone(), jobs[1].2.clone());
+    let credential_a = state
+        .local_jwt(json!({
+            "sub": format!("preloop-job-{agent_a}"),
+            "scp": format!("Actions.Results:{plan_a}:{agent_a}"),
+        }))
+        .unwrap();
+
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_b}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "cross-job read by logical name must be rejected"
+    );
+
+    // A UUID target is rejected without resolving it, so the mismatch never
+    // reveals whether the target exists.
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{agent_b}/logs/live"),
+        &credential_a,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "cross-job read by concrete job id must be rejected"
+    );
+}
+
+/// M5: the system credential keeps full read access; first-party readers are
+/// unaffected by the per-job ownership check.
+#[tokio::test]
+async fn live_log_sse_system_credential_still_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, jobs) = two_job_run_for_log_filters(&app, &state).await;
+    let logical_b = jobs[1].0.clone();
+    let system_credential = state.system_token.clone();
+
+    let response = open_protocol_live(
+        &app,
+        format!("/api/v1/runs/{run_id}/jobs/{logical_b}/logs/live"),
+        &system_credential,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn live_log_websocket_survives_malformed_payload() {
     let temp = tempfile::tempdir().unwrap();
@@ -10653,19 +10972,16 @@ async fn fork_job_never_receives_the_configured_pat_override() {
 
     let inner = state.inner.lock().await;
     let fork_message = queued_message_for(&inner, &fork_run_id);
-    // Minted tokens carry a random `jti`, so byte-equality against a fresh
-    // mint is meaningless — verify the queued token's claims instead: it must
-    // be a server-signed runtime token scoped to this job, not the PAT.
+    let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    // Compare token identity (`sub`), not token strings: JWT timestamps are
+    // second-granularity, so a comparison token minted across a clock tick
+    // differs textually from the identical token minted at submission.
+    let expected_sub = jwt_sub(runtime_token.as_str());
     for name in ["system.github.token", "github_token"] {
-        let token = variable_value(&fork_message, name)
-            .unwrap_or_else(|| panic!("fork job must carry a runtime token ({name})"));
-        let claims = state
-            .verify_local_jwt_claims(token)
-            .unwrap_or_else(|| panic!("{name} must be a server-signed JWT"));
         assert_eq!(
-            claims.get("sub").and_then(|v| v.as_str()),
-            Some(format!("preloop-job-{}", fork_message.job_id).as_str()),
-            "{name} must be the job-scoped runtime token, not the PAT"
+            variable_value(&fork_message, name).and_then(jwt_sub),
+            expected_sub.clone(),
+            "fork job must carry the local runtime token, not the PAT ({name})"
         );
     }
     assert!(
@@ -15372,6 +15688,19 @@ fn variable_value<'a>(message: &'a AgentJobRequestMessage, name: &str) -> Option
         .variables
         .get(name)
         .and_then(|value| value.value.as_deref())
+}
+/// `sub` claim of a runtime JWT, for comparisons that must ignore
+/// second-granularity timestamps (`iat`/`exp`). Returns `None` for
+/// non-JWT values (e.g. a leaked PAT) so mismatches fail the assertion
+/// instead of panicking in the helper.
+fn jwt_sub(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("sub")?.as_str().map(str::to_owned)
 }
 
 /// `preloop setup github --via pat` stores the credential as `github.pat` and

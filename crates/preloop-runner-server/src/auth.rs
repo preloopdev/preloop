@@ -34,12 +34,18 @@ pub(crate) fn authorize_reporting_request(
         return Ok(());
     }
 
+    // Authenticate before authorizing: a token that fails verification is a
+    // 401 regardless of whether the target resolves; only a verified token
+    // that names a different job earns the 403.
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
     let Some(request) = request else {
         return Err(ApiError::forbidden(
             "job runtime token cannot resolve the reporting target",
         ));
     };
-    let authorized = state.verify_local_jwt_claims(token).is_some_and(|claims| {
+    let authorized = {
         let subject_job = claims
             .get("sub")
             .and_then(|value| value.as_str())
@@ -55,7 +61,7 @@ pub(crate) fn authorize_reporting_request(
                     "Actions.Results:{}:{}",
                     request.plan_id, request.agent_job_id
                 )
-    });
+    };
     if authorized {
         Ok(())
     } else {

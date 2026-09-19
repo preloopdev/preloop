@@ -1,0 +1,6 @@
+{
+  "last_turn_at": "2026-09-10T20:15:41.093Z",
+  "turn_count": 3,
+  "last_progress_at": "2026-09-10T20:15:41.093Z",
+  "last_agent_output": "## Question\n\nTrace one workflow from CLI submission through queueing, runner polling, execution, and"
+}
