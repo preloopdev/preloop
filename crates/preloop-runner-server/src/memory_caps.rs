@@ -108,6 +108,16 @@ pub(crate) const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 /// durable `runs` table keeps the full history regardless.
 pub(crate) const MAX_COMPLETED_RUNS_RETAINED: usize = 256;
 
+/// F8b — terminal runs whose heavy runtime state (live-log buffers, step
+/// records, timeline projections) stays in memory. `RunRecord`s are retained
+/// for `MAX_COMPLETED_RUNS_RETAINED`, but a finished run's live-log tail is
+/// capped at 64 MiB *per job* and its step/timeline projections are only
+/// dropped on request purge — neither is needed once the run is old enough
+/// that nothing follows it live. Without this bound, ~40 runs/hour of CI
+/// accumulated ~4 GiB/hour of retained buffers on cpane and the kernel OOM
+/// killer kept restarting the engine mid-run (starving every queued job).
+pub(crate) const MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE: usize = 16;
+
 /// F7 — how long a pending upload (or download token) survives without being
 /// finalized/consumed before the reaper sweeps it. Jobs that never finish
 /// their upload leave an entry behind; without a TTL those would accumulate.
@@ -399,17 +409,8 @@ pub(crate) fn trim_cache_dl_tokens(inner: &mut InnerState) {
 /// map cannot grow past the cap between restarts. Evicted runs stay in the
 /// durable `runs` table — this only drops the in-memory copy.
 pub(crate) fn trim_completed_runs(inner: &mut InnerState) {
-    let completed = inner
-        .runs
-        .values()
-        .filter(|run| run.completed_at.is_some())
-        .count();
-    let excess = completed.saturating_sub(MAX_COMPLETED_RUNS_RETAINED);
-    if excess == 0 {
-        return;
-    }
-    // Sort by completion time ascending (oldest first); `created_at` breaks
-    // ties, `run_id` keeps the order deterministic.
+    // Collect terminal runs oldest-first (completion time, then created_at,
+    // then run_id for determinism).
     let mut keyed: Vec<(
         Option<chrono::DateTime<chrono::Utc>>,
         chrono::DateTime<chrono::Utc>,
@@ -421,8 +422,74 @@ pub(crate) fn trim_completed_runs(inner: &mut InnerState) {
         .map(|run| (run.completed_at, run.created_at, run.run_id))
         .collect();
     keyed.sort();
+    let completed = keyed.len();
+
+    // F8b — drop heavy runtime state for terminal runs outside the newest
+    // `MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`. The run record itself stays
+    // (subject to the 256 cap below); only the per-job live-log buffers,
+    // step records, and timeline projections go. These are the dominant
+    // heap consumers for finished runs and are unreachable once nothing
+    // follows the run live.
+    let keep_runtime = completed.saturating_sub(MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE);
+    for (_, _, run_id) in keyed.iter().take(keep_runtime) {
+        drop_run_runtime_state(inner, *run_id);
+    }
+
+    // F8 — evict the oldest completed run records past the cap.
+    let excess = completed.saturating_sub(MAX_COMPLETED_RUNS_RETAINED);
     for (_, _, run_id) in keyed.into_iter().take(excess) {
+        drop_run_runtime_state(inner, run_id);
         inner.runs.remove(&run_id);
+    }
+}
+
+/// Drop the heavy per-job runtime state of a run: retained live-log buffers
+/// (up to 64 MiB each), step records, and timeline projections. The durable
+/// store keeps the authoritative copies; this only frees the in-memory
+/// projections that exist to serve live followers and run-scoped reads.
+fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId) {
+    // Logical job ids from the run record; agent job ids and plan ids from
+    // the job requests that dispatched them.
+    let logical_ids: Vec<String> = inner
+        .runs
+        .get(&run_id)
+        .map(|run| run.jobs.keys().map(|job| job.0.clone()).collect())
+        .unwrap_or_default();
+    let mut agent_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut plan_ids: Vec<String> = Vec::new();
+    for record in inner.job_requests.values() {
+        if record.run_id == run_id {
+            agent_ids.push(record.agent_job_id);
+            plan_ids.push(record.plan_id.clone());
+        }
+    }
+
+    for key in logical_ids
+        .iter()
+        .cloned()
+        .chain(agent_ids.iter().map(uuid::Uuid::to_string))
+    {
+        inner.live_log_lines.remove(&key);
+        inner.live_log_tx.remove(&key);
+        inner.live_log_closed.remove(&key);
+    }
+    for agent_id in &agent_ids {
+        inner.job_steps.remove(agent_id);
+        inner.job_steps_revision.remove(agent_id);
+    }
+    inner.timeline_events.remove(&run_id);
+    inner.timeline_events_order.retain(|id| *id != run_id);
+    for plan_id in &plan_ids {
+        let prefix = format!("{plan_id}/");
+        inner
+            .timeline_records
+            .retain(|key, _| !key.starts_with(&prefix));
+        inner
+            .timeline_change_ids
+            .retain(|key, _| !key.starts_with(&prefix));
+        inner
+            .timeline_records_order
+            .retain(|key| !key.starts_with(&prefix));
     }
 }
 
