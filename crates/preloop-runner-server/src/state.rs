@@ -14,7 +14,7 @@ impl AppState {
         self.local_jwt_with_lifetime(claims, LOCAL_JWT_LIFETIME)
     }
 
-    fn local_jwt_with_lifetime(
+    pub(crate) fn local_jwt_with_lifetime(
         &self,
         mut claims: serde_json::Value,
         lifetime: Duration,

@@ -192,19 +192,56 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
     )?;
-    let token = uuid::Uuid::new_v4();
-    // Bind the bearerless upload token to the owning job so the blob gate
-    // can reject writes from any other job (R1-2). The runner PUTs to this
-    // URL without a bearer (Azure SDK compat), so registration — not a
-    // bearer — is the credential here.
+    let job_id = match &identity {
+        crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
+        crate::auth::ResultsIdentity::System => String::new(),
+    };
+    // The bearerless upload token is a server-signed blob JWT: `job` binds it
+    // to the owning job so the blob gate can reject writes from any other job
+    // (R1-2) and from this job once it settles (R1-10). `jti` names the
+    // on-disk staging directory. The runner PUTs to this URL without a
+    // bearer (Azure SDK compat), so the signature — not a bearer — is the
+    // credential here.
+    let jti = uuid::Uuid::new_v4().to_string();
+    let token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "diag",
+            "job": job_id,
+            "jti": jti,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     {
-        let job_id = match &identity {
-            crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
-            crate::auth::ResultsIdentity::System => String::new(),
-        };
         let mut inner = shared.state.inner.lock().await;
+        // In-lock re-check: the job may have settled between the gate and
+        // this lock — a settled job must not mint a fresh upload credential.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
+        // Per-job cap, same bound as the other pending maps: a live job can
+        // otherwise mint unlimited diag URLs for the full TTL. Evict the
+        // oldest token for this job rather than rejecting — the runner may
+        // legitimately re-mint on retry.
+        let mut owned: Vec<(String, i64)> = inner
+            .diag_upload_tokens
+            .iter()
+            .filter(|(_, t)| t.job_id == job_id)
+            .map(|(k, t)| (k.clone(), t.created_unix))
+            .collect();
+        owned.sort_by_key(|(_, created)| *created);
+        while owned.len() >= crate::memory_caps::MAX_PENDING_PER_JOB {
+            if let Some((oldest, _)) = owned.first() {
+                inner.diag_upload_tokens.remove(oldest);
+            }
+            owned.remove(0);
+        }
         inner.diag_upload_tokens.insert(
-            token.to_string(),
+            jti,
             DiagUploadToken {
                 job_id,
                 created_unix: now_unix(),
@@ -744,19 +781,33 @@ pub(crate) async fn twirp_cache_v2_create(
             }),
         ));
     }
-    let token = uuid::Uuid::new_v4().to_string();
+    // The upload token is a server-signed blob JWT; `jti` names the staging
+    // directory and the pending-reservation map key.
+    let jti = uuid::Uuid::new_v4().to_string();
     let stage_dir = shared
         .state
         .state_dir
         .join("blobs")
         .join("cache")
-        .join(&token);
+        .join(&jti);
     tokio::fs::create_dir_all(&stage_dir)
         .await
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
+    let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
-        let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
+        // In-lock re-check: the job may have settled between the gate above
+        // and this lock acquisition — a settled job must not mint a fresh
+        // upload credential in that window.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                drop(inner);
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
         if inner
             .cache_v2_pending
             .values()
@@ -797,11 +848,11 @@ pub(crate) async fn twirp_cache_v2_create(
                 }
             }
             inner.cache_v2_pending.insert(
-                token.clone(),
+                jti.clone(),
                 CacheV2Pending {
                     key: storage_key.clone(),
                     version: version.clone(),
-                    job_backend_id: job_backend_id.unwrap_or_default(),
+                    job_backend_id: job_backend_id.clone().unwrap_or_default(),
                     created_unix: now_unix(),
                 },
             );
@@ -827,6 +878,15 @@ pub(crate) async fn twirp_cache_v2_create(
             }),
         ));
     }
+    let token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "cache",
+            "job": job_backend_id.unwrap_or_default(),
+            "jti": jti,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
     // The cache key is workflow-controlled content; never log it or the
     // version verbatim. A SHA-256 digest identifies the entry well enough to
@@ -861,13 +921,25 @@ pub(crate) async fn twirp_cache_v2_finalize(
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;
     let scope = scopes.first().map(String::as_str);
     let storage_key = scoped_cache_key(key.as_str(), scope, repository.as_deref());
-    // Find the pending upload token matching key+version.
+    // Find the pending upload token matching key+version, owned by the
+    // caller's job — a live job must not finalize another job's reservation
+    // (IDOR). The system identity bypasses the owner check.
+    let caller_job_id = match &identity {
+        crate::auth::ResultsIdentity::Job(job) => Some(job.job_id.to_string()),
+        crate::auth::ResultsIdentity::System => None,
+    };
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
             .cache_v2_pending
             .iter()
-            .find(|(_, p)| p.key == storage_key && p.version == version)
+            .find(|(_, p)| {
+                p.key == storage_key
+                    && p.version == version
+                    && caller_job_id
+                        .as_deref()
+                        .is_none_or(|job_id| p.job_backend_id == job_id)
+            })
             .map(|(k, _)| k.clone())
     };
     let Some(token) = token else {
@@ -1023,19 +1095,31 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         ));
     };
 
-    let dl_token = uuid::Uuid::new_v4().to_string();
+    // The download token is a server-signed blob JWT carrying (key, version)
+    // in its claims, so blob_get resolves the entry statelessly — a minted
+    // URL survives restarts, unlike the dl-token map (kept for accounting).
+    let dl_jti = uuid::Uuid::new_v4().to_string();
+    let dl_token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "cache",
+            "job": "",
+            "jti": dl_jti,
+            "key": entry.key,
+            "version": entry.version,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .cache_v2_dl_tokens
-            .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
+            .insert(dl_jti.clone(), (entry.key.clone(), entry.version.clone()));
         // F7: bound the minted-token map; the oldest tokens are evicted
         // first. A token that a runner has not yet fetched still works, so a
         // real workflow's few concurrent downloads are never affected.
-        inner.cache_v2_dl_tokens_order.push_back(dl_token.clone());
-        inner
-            .cache_v2_dl_tokens_created
-            .insert(dl_token.clone(), now_unix());
+        inner.cache_v2_dl_tokens_order.push_back(dl_jti.clone());
+        inner.cache_v2_dl_tokens_created.insert(dl_jti, now_unix());
         trim_cache_dl_tokens(&mut inner);
     }
     let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());
