@@ -53,6 +53,46 @@ pub(crate) fn is_valid_blob_token(token: &str) -> bool {
         && !token.ends_with('.')
 }
 
+/// Verify a `/twirp-blob` path token as a server-signed blob JWT.
+///
+/// Blob tokens are `local_jwt`s minted at signed-URL creation: `sub` is
+/// `preloop-blob`, `kind` pins the blob kind, `job` records the owning job
+/// ("" for system-minted URLs), and `jti` is the on-disk staging directory
+/// name. Verification is stateless — signature + `exp` — so a minted URL
+/// survives an engine restart, unlike the pending-registration maps (which
+/// remain for reservation bookkeeping, not credential validity).
+///
+/// Returns the decoded claims, or `None` when the token is not a valid blob
+/// JWT for `kind`.
+pub(crate) fn verify_blob_token(
+    state: &AppState,
+    kind: &str,
+    token: &str,
+) -> Option<serde_json::Value> {
+    let claims = state.verify_local_jwt_claims(token)?;
+    if claims.get("sub").and_then(|v| v.as_str()) != Some("preloop-blob") {
+        return None;
+    }
+    if claims.get("kind").and_then(|v| v.as_str()) != Some(kind) {
+        return None;
+    }
+    Some(claims)
+}
+
+/// The `jti` of a verified blob JWT — the staging directory name under
+/// `<state_dir>/blobs/{kind}/`. Kept separate from the JWT itself because a
+/// signed token is far longer than the 255-byte filename limit.
+pub(crate) fn blob_token_jti(claims: &serde_json::Value) -> Option<String> {
+    let jti = claims.get("jti").and_then(|v| v.as_str())?;
+    is_valid_blob_token(jti).then(|| jti.to_owned())
+}
+
+/// The `job` claim of a verified blob JWT: `Some("")` for system-minted
+/// tokens, `Some(job_uuid)` for job-owned ones, `None` when absent.
+pub(crate) fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
+    claims.get("job").and_then(|v| v.as_str())
+}
+
 /// Parse and validate a raw `/twirp-blob/{kind}/{token}` request path.
 ///
 /// Decode-then-validate: the token is percent-decoded *first*, so encoded
@@ -136,10 +176,18 @@ pub(crate) async fn blob_put(
     // root is built by joining these segments — never join unsanitized ones.
     // (The extractor already percent-decoded `token`; the gate validated the
     // raw path with decode-then-validate.)
-    if !BLOB_KINDS.contains(&kind.as_str()) || !is_valid_blob_token(&token) {
-        warn!(kind, token, "rejected blob PUT with invalid kind/token");
+    // Defense in depth: the middleware gate validates first, but the blob
+    // root is built by joining these segments — never join unsanitized ones.
+    // The token is a server-signed blob JWT; `jti` (not the JWT itself, which
+    // exceeds the filename limit) names the staging directory.
+    let Some(claims) = verify_blob_token(&shared.state, &kind, &token) else {
+        warn!(kind, "rejected blob PUT with invalid kind/token");
         return StatusCode::BAD_REQUEST;
-    }
+    };
+    let Some(stage_name) = blob_token_jti(&claims) else {
+        warn!(kind, "rejected blob PUT with malformed jti");
+        return StatusCode::BAD_REQUEST;
+    };
     // R1-10: if a bearer is present and verifies as a job identity, require
     // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
     // attributed; their liveness is enforced at URL-mint time.
@@ -175,7 +223,7 @@ pub(crate) async fn blob_put(
         .state_dir
         .join("blobs")
         .join(&kind)
-        .join(&token);
+        .join(&stage_name);
 
     match query.comp.as_deref() {
         Some("block") => {
@@ -400,7 +448,6 @@ async fn assemble_streaming(
     }
     Ok(total)
 }
-
 pub(crate) async fn blob_get(
     State(shared): State<Arc<SharedState>>,
     Path((kind, mut token)): Path<(String, String)>,
@@ -411,17 +458,19 @@ pub(crate) async fn blob_get(
     }
     // Defense in depth: the middleware gate validates first — never serve
     // outside the allowlisted kinds or join an unsanitized token.
-    if !BLOB_KINDS.contains(&kind.as_str()) || !is_valid_blob_token(&token) {
-        warn!(kind, token, "rejected blob GET with invalid kind/token");
+    let Some(claims) = verify_blob_token(&shared.state, &kind, &token) else {
+        warn!(kind, "rejected blob GET with invalid kind/token");
         return StatusCode::BAD_REQUEST.into_response();
-    }
+    };
 
     if kind == "cache" {
-        // Token is a download token → look up (key, version) in state.
-        let kv = {
-            let inner = shared.state.inner.lock().await;
-            inner.cache_v2_dl_tokens.get(&token).cloned()
-        };
+        // Download tokens carry (key, version) in their claims — resolution
+        // is stateless and survives restarts, unlike the dl-token map.
+        let kv = claims
+            .get("key")
+            .and_then(|v| v.as_str())
+            .zip(claims.get("version").and_then(|v| v.as_str()))
+            .map(|(key, version)| (key.to_owned(), version.to_owned()));
         if let Some((key, version)) = kv {
             let empty: Vec<String> = Vec::new();
             return match shared.state.cache.get(&key, &version, &empty).await {
@@ -440,14 +489,19 @@ pub(crate) async fn blob_get(
         }
     }
 
-    // Artifact (or cache fallback): serve from blob staging dir.
+    // Artifact (or cache fallback): serve from blob staging dir, named by jti.
+    let Some(stage_name) = blob_token_jti(&claims) else {
+        warn!(kind, "rejected blob GET with malformed jti");
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     let data_path = shared
         .state
         .state_dir
         .join("blobs")
         .join(&kind)
-        .join(&token)
+        .join(&stage_name)
         .join("data");
+
     match tokio::fs::read(&data_path).await {
         Ok(bytes) => {
             if kind == "artifact" {
@@ -456,7 +510,7 @@ pub(crate) async fn blob_get(
                     inner
                         .artifact_v2_registry
                         .values()
-                        .find(|e| e.blob_token == token)
+                        .find(|e| e.blob_token == stage_name)
                         .map(|e| e.name.clone())
                 };
                 let filename = name.unwrap_or_else(|| "artifact".to_owned());

@@ -120,13 +120,15 @@ pub(crate) async fn require_results_bearer(
 /// Instead it enforces three properties:
 ///   1. the kind is allowlisted and the token is decode-then-validated, so no
 ///      request can address outside `<state_dir>/blobs/{kind}/`;
-///   2. the token must have been minted by the server (a pending upload, a
-///      cache download token, a diag reservation, or a finalized artifact) —
-///      arbitrary tokens address nothing, which kills the unauthenticated
-///      PUT-to-anything repro;
-///   3. when a bearer IS present it is verified, and on writes the blob token
-///      must be owned by the bearer's job: a job's token may only write its
-///      own job's blobs.
+///   2. the token must be a server-signed blob JWT (`sub: preloop-blob`,
+///      `kind` matching the path) — arbitrary tokens address nothing, which
+///      kills the unauthenticated PUT-to-anything repro, and minted URLs
+///      survive engine restarts since validity is the signature, not a
+///      registration map;
+///   3. writes require the owning job to still be live: the JWT's `job`
+///      claim names the owner recorded at mint time, so a completed job's
+///      upload URL stops working immediately instead of at TTL sweep. A
+///      presented bearer is verified and must match the `job` claim.
 ///
 /// Reads stay bearer-optional — the unguessable, server-minted URL is the
 /// credential, the same SAS-style model as `/replay/results/*` — because the
@@ -142,34 +144,12 @@ async fn authorize_blob_request(
     };
     let is_write = request.method() == axum::http::Method::PUT;
 
-    // Owner recorded at mint time ("" = minted via the system credential).
-    // Reads additionally honor cache download tokens and finalized artifacts,
-    // whose mint-time handlers already scoped the URL that was issued.
-    let (write_owner, readable) = {
-        let inner = state.inner.lock().await;
-        let write_owner: Option<String> = match kind.as_str() {
-            "artifact" => inner
-                .artifact_v2_pending
-                .get(&token)
-                .map(|pending| pending.job_backend_id.clone()),
-            "cache" => inner
-                .cache_v2_pending
-                .get(&token)
-                .map(|pending| pending.job_backend_id.clone()),
-            "diag" => inner
-                .diag_upload_tokens
-                .get(&token)
-                .map(|reserved| reserved.job_id.clone()),
-            _ => None,
-        };
-        let readable = write_owner.is_some()
-            || inner.cache_v2_dl_tokens.contains_key(&token)
-            || inner
-                .artifact_v2_registry
-                .values()
-                .any(|entry| entry.blob_token == token);
-        (write_owner, readable)
+    // The signed token is the credential: `job` is the owner recorded at
+    // mint time ("" = minted via the system credential).
+    let Some(claims) = crate::blob_store::verify_blob_token(state, &kind, &token) else {
+        return Err(ApiError::not_found("blob not found"));
     };
+    let owner = crate::blob_store::blob_token_job(&claims).unwrap_or_default();
 
     match bearer_from_headers(request.headers()) {
         Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
@@ -179,31 +159,26 @@ async fn authorize_blob_request(
                 _ => return Err(ApiError::unauthorized("results-service job token required")),
             };
             if is_write {
-                match write_owner {
-                    Some(owner) if !owner.is_empty() && owner == job_id => {
-                        Ok(next.run(request).await)
-                    }
-                    _ => Err(ApiError::forbidden("blob token is not owned by this job")),
+                if !owner.is_empty() && owner == job_id {
+                    Ok(next.run(request).await)
+                } else {
+                    Err(ApiError::forbidden("blob token is not owned by this job"))
                 }
-            } else if readable {
-                Ok(next.run(request).await)
             } else {
-                Err(ApiError::not_found("blob not found"))
+                Ok(next.run(request).await)
             }
         }
-        // Bearerless Azure-SDK-style flow: the unguessable, server-minted
-        // token is the credential.
+        // Bearerless Azure-SDK-style flow: the unguessable, server-minted URL
+        // is the credential. Writes additionally require the owning job to be
+        // live — a completed job's minted URL must not keep accepting data.
         None => {
-            let known = if is_write {
-                write_owner.is_some()
-            } else {
-                readable
-            };
-            if known {
-                Ok(next.run(request).await)
-            } else {
-                Err(ApiError::not_found("blob not found"))
+            if is_write && !owner.is_empty() {
+                let job_uuid = owner
+                    .parse::<uuid::Uuid>()
+                    .map_err(|_| ApiError::forbidden("blob token owner is not a job"))?;
+                require_live_job(state, job_uuid).await?;
             }
+            Ok(next.run(request).await)
         }
     }
 }
@@ -236,20 +211,17 @@ pub(crate) async fn require_live_job(
     job_uuid: uuid::Uuid,
 ) -> Result<(), ApiError> {
     let inner = state.inner.lock().await;
+    // Liveness follows the request record, not the projected run status:
+    // cancellation projects `run.jobs` to Cancelled immediately while the
+    // request stays unsettled until the runner finishes reporting — the
+    // window where its final step updates, logs, and uploads must still
+    // land. Only a settled (or purged) request is stale.
     let live = inner
         .agent_job_requests
         .get(&job_uuid)
         .copied()
         .and_then(|request_id| inner.job_requests.get(&request_id))
-        .is_some_and(|record| {
-            let settled = matches!(record.result, Some(status) if status.is_terminal());
-            let projected = inner
-                .runs
-                .get(&record.run_id)
-                .and_then(|run| run.jobs.get(&record.job_id))
-                .is_some_and(|status| status.is_terminal());
-            !settled && !projected
-        });
+        .is_some_and(|record| !matches!(record.result, Some(status) if status.is_terminal()));
     if live {
         Ok(())
     } else {

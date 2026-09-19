@@ -7031,13 +7031,11 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
         .split_once("/twirp-blob/diag/")
         .expect("diagnostic URL must use the bearerless diag blob endpoint");
     let (blob_token_clean, _) = blob_token.split_once('?').unwrap_or((blob_token, ""));
-    let blob_uuid =
-        uuid::Uuid::parse_str(blob_token_clean).expect("diagnostic token must be a UUID");
-    assert_eq!(blob_uuid.as_bytes()[6] >> 4, 4, "token must be UUIDv4");
+    // The blob token is a server-signed JWT: three base64url segments.
     assert_eq!(
-        blob_uuid.as_bytes()[8] & 0xc0,
-        0x80,
-        "token must use RFC 4122 variant"
+        blob_token_clean.split('.').count(),
+        3,
+        "diagnostic token must be a signed JWT"
     );
 
     let bytes = b"diagnostic log bytes";
@@ -7069,6 +7067,25 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
     assert_eq!(downloaded_bytes.as_ref(), bytes);
 }
 
+/// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
+/// `kind`, `job` ("" for system), `jti` = staging dir name. Returns
+/// `(jwt, jti)` — the pending-reservation maps key on `jti`.
+fn mint_blob_jwt(state: &AppState, kind: &str, job: &str) -> (String, String) {
+    let jti = uuid::Uuid::new_v4().to_string();
+    let jwt = state
+        .local_jwt_with_lifetime(
+            json!({
+                "sub": "preloop-blob",
+                "kind": kind,
+                "job": job,
+                "jti": jti,
+            }),
+            crate::memory_caps::PENDING_UPLOAD_TTL,
+        )
+        .unwrap();
+    (jwt, jti)
+}
+
 #[tokio::test]
 async fn blob_single_shot_streams_to_disk_and_roundtrips() {
     let temp = tempfile::tempdir().unwrap();
@@ -7077,12 +7094,13 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
 
-    // R1-2: the blob gate requires the token to be server-minted. Register
-    // the pending artifact upload the way CreateArtifactV2 would.
+    // R1-2: the blob gate requires a server-signed blob JWT whose `job`
+    // claim matches the bearer's job on writes.
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
-            "single-shot-tok".to_owned(),
+            jti,
             crate::models::ArtifactV2Pending {
                 registry_key: format!("run/{job_id}/single-shot"),
                 job_backend_id: job_id.to_string(),
@@ -7101,7 +7119,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
-                .uri("/twirp-blob/artifact/single-shot-tok")
+                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::from(payload.clone()))
                 .unwrap(),
@@ -7114,7 +7132,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/twirp-blob/artifact/single-shot-tok")
+                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -7138,12 +7156,13 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     r1_10_register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
 
-    // R1-2: the blob gate requires the token to be server-minted. Register
-    // the pending artifact upload the way CreateArtifactV2 would.
+    // R1-2: the blob gate requires a server-signed blob JWT whose `job`
+    // claim matches the bearer's job on writes.
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
-            "concurrent-tok".to_owned(),
+            jti,
             crate::models::ArtifactV2Pending {
                 registry_key: format!("run/{job_id}/concurrent"),
                 job_backend_id: job_id.to_string(),
@@ -7151,7 +7170,7 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
             },
         );
     }
-    let put_uri = "/twirp-blob/artifact/concurrent-tok";
+    let put_uri = format!("/twirp-blob/artifact/{blob_jwt}");
 
     // Stage two 1 MiB blocks (ids are base64-safe, so they survive
     // blockid_to_filename unchanged and match the commit XML verbatim).
@@ -7174,12 +7193,12 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
 
     let commit_xml =
         "<BlockList><Latest>YmxvY2sx</Latest><Latest>YmxvY2sy</Latest></BlockList>".to_string();
-    let commit = |app: Router, bearer: String, xml: String| {
+    let commit = |app: Router, bearer: String, xml: String, uri: String| {
         tokio::spawn(async move {
             app.oneshot(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri("/twirp-blob/artifact/concurrent-tok?comp=blocklist")
+                    .uri(format!("{uri}?comp=blocklist"))
                     .header(header::AUTHORIZATION, bearer)
                     .body(Body::from(xml))
                     .unwrap(),
@@ -7194,8 +7213,18 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     // and assembly goes through a temp file + atomic rename, so a losing/late
     // commit can never truncate or delete the blob the winner committed.
     let (s1, s2) = tokio::join!(
-        commit(app.clone(), bearer.clone(), commit_xml.clone()),
-        commit(app.clone(), bearer.clone(), commit_xml.clone()),
+        commit(
+            app.clone(),
+            bearer.clone(),
+            commit_xml.clone(),
+            put_uri.clone()
+        ),
+        commit(
+            app.clone(),
+            bearer.clone(),
+            commit_xml.clone(),
+            put_uri.clone()
+        ),
     );
     let (s1, s2) = (s1.unwrap(), s2.unwrap());
     assert!(
@@ -26211,10 +26240,14 @@ async fn r1_2_blob_rejects_wrong_job_write() {
     let owner_job = uuid::Uuid::new_v4();
     let other_job = uuid::Uuid::new_v4();
     let other_token = state.mint_runtime_token("plan-blob", &other_job);
+    // Both jobs are live so the ownership mismatch is the only rejection.
+    r1_10_register_live_job(&state, owner_job, "plan-blob").await;
+    r1_10_register_live_job(&state, other_job, "plan-blob").await;
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &owner_job.to_string());
     {
         let mut inner = state.inner.lock().await;
         inner.artifact_v2_pending.insert(
-            "owned-tok".to_owned(),
+            jti,
             crate::models::ArtifactV2Pending {
                 registry_key: format!("run/{owner_job}/owned"),
                 job_backend_id: owner_job.to_string(),
@@ -26227,7 +26260,7 @@ async fn r1_2_blob_rejects_wrong_job_write() {
         .oneshot(
             Request::builder()
                 .method(Method::PUT)
-                .uri("/twirp-blob/artifact/owned-tok")
+                .uri(format!("/twirp-blob/artifact/{blob_jwt}"))
                 .header(
                     axum::http::header::AUTHORIZATION,
                     format!("Bearer {other_token}"),
@@ -26238,6 +26271,70 @@ async fn r1_2_blob_rejects_wrong_job_write() {
         .await
         .unwrap();
     assert_eq!(put.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r1_2_bearerless_put_requires_live_owner() {
+    // The bearerless Azure-SDK flow: a minted upload URL works while the
+    // owning job is live and stops the moment the job settles — the stale
+    // replay window R1-10 closes everywhere else.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let job_id = uuid::Uuid::new_v4();
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
+    let uri = format!("/twirp-blob/artifact/{blob_jwt}");
+
+    // Live owner: bearerless PUT succeeds.
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(&uri)
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::CREATED);
+
+    // Settled owner: the same URL is rejected before touching the disk.
+    r1_10_complete_job(&state, job_id).await;
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(&uri)
+                .body(Body::from(vec![b'y'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn r1_2_bearerless_put_rejects_unsigned_token() {
+    // A bearerless PUT to a token that is not a server-signed blob JWT is
+    // indistinguishable from a missing blob.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let put = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/twirp-blob/cache/not-a-jwt-token")
+                .body(Body::from(vec![b'x'; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
