@@ -64,6 +64,10 @@ fn truncate_log_line(line: &str) -> std::borrow::Cow<'_, str> {
     truncated.push_str(&format!("…[line truncated at {MAX_LOG_LINE_BYTES} bytes]"));
     std::borrow::Cow::Owned(truncated)
 }
+/// Count physical newline-delimited records emitted by `writeln!`.
+fn written_log_line_count(line: &str) -> u64 {
+    line.bytes().filter(|byte| *byte == b'\n').count() as u64 + 1
+}
 
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
@@ -303,7 +307,7 @@ impl<'a> StepContext<'a> {
                 writeln!(lock, "{}", fmt).is_ok()
             };
             if wrote {
-                self.log_line_count += 1;
+                self.log_line_count += written_log_line_count(&fmt);
             }
             if self.keep_in_memory {
                 self.log_lines.push(fmt);
@@ -421,7 +425,7 @@ impl<'a> StepContext<'a> {
             writeln!(lock, "{}", fmt).is_ok()
         };
         if wrote {
-            self.log_line_count += 1;
+            self.log_line_count += written_log_line_count(&fmt);
         }
         if self.keep_in_memory {
             self.log_lines.push(fmt);
@@ -1109,6 +1113,35 @@ mod tests {
             ctx.log_content().starts_with(&head),
             "head is not a content prefix"
         );
+    }
+    #[test]
+    fn multiline_durable_writes_count_each_physical_line() {
+        let mut job = make_job();
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log_raw("first\nsecond");
+        assert_eq!(ctx.log_line_count(), 2);
+        let start = ctx.log_line_count();
+        ctx.log("third");
+        assert_eq!(ctx.log_content_since(start).lines().count(), 1);
+    }
+
+    #[test]
+    fn marker_valued_masks_are_stable_retroactively() {
+        for secret in ["*", "**", "***"] {
+            let mut job = make_job();
+            let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+            ctx.log(&format!("before {secret}"));
+            let new_masks = ctx.job.add_mask(secret);
+            ctx.retroactive_mask(&new_masks).unwrap();
+            let once = ctx.log_content();
+            ctx.retroactive_mask(&new_masks).unwrap();
+            let twice = ctx.log_content();
+            assert_eq!(once, twice, "mask {secret:?} expanded on re-mask");
+            assert!(
+                once.contains("before ***"),
+                "mask {secret:?} was not redacted"
+            );
+        }
     }
 
     #[test]
