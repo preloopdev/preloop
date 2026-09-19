@@ -23007,6 +23007,8 @@ async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
         format!("urn:uuid:{canonical}"),
     ];
     let token = state.mint_runtime_token(&plan, &job);
+    // R1-10: results writes require a live job record.
+    r1_10_register_live_job(&state, job, &plan).await;
 
     for form in &forms {
         let requests = [
