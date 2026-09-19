@@ -1192,7 +1192,13 @@ impl AppState {
         // (runner polling, heartbeats, other state mutations).
         if let Some(run_id) = run_id {
             let projection = {
-                let inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().await;
+                // A terminal RunStatus means this run just completed — bound
+                // retained completed-run records before projecting so the
+                // heap cannot grow one RunRecord (~1 MiB) per run forever.
+                if event.terminal_run_status().is_some() {
+                    crate::memory_caps::trim_completed_runs(&mut inner);
+                }
                 crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
             };
             if let Some(projection) = projection {

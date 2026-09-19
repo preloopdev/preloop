@@ -477,10 +477,25 @@ impl Store for PgStore {
 
     async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
         let client = self.connection.lock().await;
+        // Same bound as the SQLite backend: every in-flight run plus the
+        // newest completed runs up to `MAX_COMPLETED_RUNS_RETAINED`. The full
+        // history stays in the table; memory only needs live state plus
+        // recent history for the run APIs.
         let rows = client
-            .query("SELECT record_blob FROM runs ORDER BY created_at_us", &[])
+            .query(
+                "SELECT record_blob FROM runs WHERE completed_at_us IS NULL
+                 ORDER BY created_at_us",
+                &[],
+            )
             .await?;
-        for row in rows {
+        let completed_rows = client
+            .query(
+                "SELECT record_blob FROM runs WHERE completed_at_us IS NOT NULL
+                 ORDER BY created_at_us DESC LIMIT $1",
+                &[&(crate::memory_caps::MAX_COMPLETED_RUNS_RETAINED as i64)],
+            )
+            .await?;
+        for row in rows.into_iter().chain(completed_rows) {
             let blob: Vec<u8> = row.get(0);
             let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;

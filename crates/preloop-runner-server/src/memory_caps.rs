@@ -99,6 +99,15 @@ pub(crate) const MAX_ARTIFACTS_PER_RUN: usize = 500;
 /// are evicted past this so a flood of fabricated run ids stays bounded.
 pub(crate) const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 
+/// F8 — retained *completed* run records. `inner.runs` is the source of truth
+/// for run APIs, but a `RunRecord` is heavy (full `WorkflowSubmission`,
+/// `github` context JSON, job details — ~1 MiB each) and completed runs are
+/// never queried by the scheduler. Without a bound, every completed run
+/// accumulates in heap forever and `load_into` restores all of them at boot
+/// (observed: 3203 runs ≈ 4.4 GiB RSS). Live runs are never evicted; the
+/// durable `runs` table keeps the full history regardless.
+pub(crate) const MAX_COMPLETED_RUNS_RETAINED: usize = 256;
+
 /// F7 — how long a pending upload (or download token) survives without being
 /// finalized/consumed before the reaper sweeps it. Jobs that never finish
 /// their upload leave an entry behind; without a TTL those would accumulate.
@@ -380,6 +389,40 @@ pub(crate) fn trim_cache_dl_tokens(inner: &mut InnerState) {
         let Some(oldest) = oldest else { break };
         inner.cache_v2_dl_tokens.remove(&oldest);
         inner.cache_v2_dl_tokens_created.remove(&oldest);
+    }
+}
+
+/// F8 — bound retained completed runs to `MAX_COMPLETED_RUNS_RETAINED`,
+/// evicting the oldest `completed_at` first. Runs still in flight
+/// (`completed_at.is_none()`) are never evicted. Called at boot after
+/// `load_into` and from `emit` when a terminal `RunStatus` arrives, so the
+/// map cannot grow past the cap between restarts. Evicted runs stay in the
+/// durable `runs` table — this only drops the in-memory copy.
+pub(crate) fn trim_completed_runs(inner: &mut InnerState) {
+    let completed = inner
+        .runs
+        .values()
+        .filter(|run| run.completed_at.is_some())
+        .count();
+    let excess = completed.saturating_sub(MAX_COMPLETED_RUNS_RETAINED);
+    if excess == 0 {
+        return;
+    }
+    // Sort by completion time ascending (oldest first); `created_at` breaks
+    // ties, `run_id` keeps the order deterministic.
+    let mut keyed: Vec<(
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+        RunId,
+    )> = inner
+        .runs
+        .values()
+        .filter(|run| run.completed_at.is_some())
+        .map(|run| (run.completed_at, run.created_at, run.run_id))
+        .collect();
+    keyed.sort();
+    for (_, _, run_id) in keyed.into_iter().take(excess) {
+        inner.runs.remove(&run_id);
     }
 }
 
