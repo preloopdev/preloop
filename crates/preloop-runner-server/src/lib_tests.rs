@@ -10653,12 +10653,19 @@ async fn fork_job_never_receives_the_configured_pat_override() {
 
     let inner = state.inner.lock().await;
     let fork_message = queued_message_for(&inner, &fork_run_id);
-    let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    // Minted tokens carry a random `jti`, so byte-equality against a fresh
+    // mint is meaningless — verify the queued token's claims instead: it must
+    // be a server-signed runtime token scoped to this job, not the PAT.
     for name in ["system.github.token", "github_token"] {
+        let token = variable_value(&fork_message, name)
+            .unwrap_or_else(|| panic!("fork job must carry a runtime token ({name})"));
+        let claims = state
+            .verify_local_jwt_claims(token)
+            .unwrap_or_else(|| panic!("{name} must be a server-signed JWT"));
         assert_eq!(
-            variable_value(&fork_message, name),
-            Some(runtime_token.as_str()),
-            "fork job must carry the local runtime token, not the PAT ({name})"
+            claims.get("sub").and_then(|v| v.as_str()),
+            Some(format!("preloop-job-{}", fork_message.job_id).as_str()),
+            "{name} must be the job-scoped runtime token, not the PAT"
         );
     }
     assert!(

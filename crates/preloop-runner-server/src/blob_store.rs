@@ -139,9 +139,20 @@ pub(crate) struct BlobPutQuery {
     blockid: Option<String>,
 }
 
-/// Convert a base64 block ID to a filesystem-safe name.
-pub(crate) fn blockid_to_filename(blockid: &str) -> String {
-    blockid.replace('+', "-").replace('/', "_").replace('=', "")
+/// Convert a base64 block ID to a filesystem-safe name, or `None` when the
+/// decoded ID would escape `blocks_dir` — `Query` percent-decodes, so
+/// `%5C` arrives as `\` and `..%5C..%5Ctarget` is a Windows traversal. Only
+/// the base64url charset survives; anything else is rejected outright.
+pub(crate) fn blockid_to_filename(blockid: &str) -> Option<String> {
+    let name = blockid.replace('+', "-").replace('/', "_").replace('=', "");
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+    Some(name)
 }
 
 /// Parse an Azure Block Blob blocklist XML body and return block IDs in order.
@@ -167,15 +178,18 @@ pub(crate) fn parse_blocklist_xml(body: &str) -> Vec<String> {
 
 pub(crate) async fn blob_put(
     State(shared): State<Arc<SharedState>>,
-    Path((kind, token)): Path<(String, String)>,
+    Path((kind, mut token)): Path<(String, String)>,
     Query(query): Query<BlobPutQuery>,
     headers: HeaderMap,
     body: Body,
 ) -> StatusCode {
-    // Defense in depth: the middleware gate validates first, but the blob
-    // root is built by joining these segments — never join unsanitized ones.
-    // (The extractor already percent-decoded `token`; the gate validated the
-    // raw path with decode-then-validate.)
+    // Mirror blob_get: artifact URLs may carry a `.zip` suffix for toolkit
+    // content-type detection. The gate strips it before validation; strip it
+    // here too so the handler agrees with the gate (the staging dir is named
+    // by the JWT's `jti`, so the suffix never reaches the filesystem).
+    if kind == "artifact" && token.ends_with(".zip") {
+        token.truncate(token.len() - 4);
+    }
     // Defense in depth: the middleware gate validates first, but the blob
     // root is built by joining these segments — never join unsanitized ones.
     // The token is a server-signed blob JWT; `jti` (not the JWT itself, which
@@ -239,7 +253,10 @@ pub(crate) async fn blob_put(
                 }
             };
             let block_id = query.blockid.unwrap_or_default();
-            let safe_id = blockid_to_filename(&block_id);
+            let Some(safe_id) = blockid_to_filename(&block_id) else {
+                warn!(kind, "rejected blob block with unsafe blockid");
+                return StatusCode::BAD_REQUEST;
+            };
             let blocks_dir = blob_root.join("blocks");
             if let Err(e) = tokio::fs::create_dir_all(&blocks_dir).await {
                 warn!(kind, "failed to create blocks dir: {e}");
@@ -289,7 +306,10 @@ pub(crate) async fn blob_put(
             // assembling (or materializes the destination).
             let mut total: u64 = 0;
             for bid in &block_ids {
-                let safe_id = blockid_to_filename(bid);
+                let Some(safe_id) = blockid_to_filename(bid) else {
+                    warn!(kind, "rejected blocklist with unsafe blockid");
+                    return StatusCode::BAD_REQUEST;
+                };
                 match tokio::fs::metadata(blocks_dir.join(&safe_id)).await {
                     Ok(md) => {
                         total = total.saturating_add(md.len());
@@ -434,7 +454,10 @@ async fn assemble_streaming(
         .map_err(AssemblyError::Io)?;
     let mut total: u64 = 0;
     for bid in block_ids {
-        let safe_id = blockid_to_filename(bid);
+        // Block IDs were validated at stage/commit time; an unsafe one here
+        // is a bug, not attacker input — treat as an I/O failure.
+        let safe_id = blockid_to_filename(bid)
+            .ok_or_else(|| AssemblyError::Io(std::io::Error::other("unsafe blockid")))?;
         let mut src = tokio::fs::File::open(blocks_dir.join(&safe_id))
             .await
             .map_err(AssemblyError::Io)?;

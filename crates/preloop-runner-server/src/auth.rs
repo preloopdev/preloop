@@ -201,6 +201,20 @@ pub(crate) async fn require_live_results_job(
     require_live_job(state, job_uuid).await
 }
 
+/// Liveness predicate on the already-locked inner state — the in-lock
+/// re-check for handlers that mutate `inner`. Checking under a released
+/// lock leaves a check-then-mutate window where the job settles between
+/// the gate and the write; callers that hold `inner` should re-verify with
+/// this before committing the mutation.
+pub(crate) fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
+    inner
+        .agent_job_requests
+        .get(&job_uuid)
+        .copied()
+        .and_then(|request_id| inner.job_requests.get(&request_id))
+        .is_some_and(|record| !matches!(record.result, Some(status) if status.is_terminal()))
+}
+
 /// R1-10: require a job UUID to be live before a write, for handlers that
 /// authenticate from headers rather than a typed [`ResultsIdentity`]
 /// (the legacy `/_apis/artifactcache` cache write path). Same rule as
@@ -216,13 +230,7 @@ pub(crate) async fn require_live_job(
     // request stays unsettled until the runner finishes reporting — the
     // window where its final step updates, logs, and uploads must still
     // land. Only a settled (or purged) request is stale.
-    let live = inner
-        .agent_job_requests
-        .get(&job_uuid)
-        .copied()
-        .and_then(|request_id| inner.job_requests.get(&request_id))
-        .is_some_and(|record| !matches!(record.result, Some(status) if status.is_terminal()));
-    if live {
+    if job_is_live_locked(&inner, job_uuid) {
         Ok(())
     } else {
         Err(ApiError::forbidden(

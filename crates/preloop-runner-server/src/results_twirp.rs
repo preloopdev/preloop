@@ -214,6 +214,32 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
     )?;
     {
         let mut inner = shared.state.inner.lock().await;
+        // In-lock re-check: the job may have settled between the gate and
+        // this lock — a settled job must not mint a fresh upload credential.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
+        // Per-job cap, same bound as the other pending maps: a live job can
+        // otherwise mint unlimited diag URLs for the full TTL. Evict the
+        // oldest token for this job rather than rejecting — the runner may
+        // legitimately re-mint on retry.
+        let mut owned: Vec<(String, i64)> = inner
+            .diag_upload_tokens
+            .iter()
+            .filter(|(_, t)| t.job_id == job_id)
+            .map(|(k, t)| (k.clone(), t.created_unix))
+            .collect();
+        owned.sort_by_key(|(_, created)| *created);
+        while owned.len() >= crate::memory_caps::MAX_PENDING_PER_JOB {
+            if let Some((oldest, _)) = owned.first() {
+                inner.diag_upload_tokens.remove(oldest);
+            }
+            owned.remove(0);
+        }
         inner.diag_upload_tokens.insert(
             jti,
             DiagUploadToken {
@@ -770,6 +796,18 @@ pub(crate) async fn twirp_cache_v2_create(
     let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
+        // In-lock re-check: the job may have settled between the gate above
+        // and this lock acquisition — a settled job must not mint a fresh
+        // upload credential in that window.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                drop(inner);
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
         if inner
             .cache_v2_pending
             .values()
@@ -883,13 +921,25 @@ pub(crate) async fn twirp_cache_v2_finalize(
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;
     let scope = scopes.first().map(String::as_str);
     let storage_key = scoped_cache_key(key.as_str(), scope, repository.as_deref());
-    // Find the pending upload token matching key+version.
+    // Find the pending upload token matching key+version, owned by the
+    // caller's job — a live job must not finalize another job's reservation
+    // (IDOR). The system identity bypasses the owner check.
+    let caller_job_id = match &identity {
+        crate::auth::ResultsIdentity::Job(job) => Some(job.job_id.to_string()),
+        crate::auth::ResultsIdentity::System => None,
+    };
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
             .cache_v2_pending
             .iter()
-            .find(|(_, p)| p.key == storage_key && p.version == version)
+            .find(|(_, p)| {
+                p.key == storage_key
+                    && p.version == version
+                    && caller_job_id
+                        .as_deref()
+                        .is_none_or(|job_id| p.job_backend_id == job_id)
+            })
             .map(|(k, _)| k.clone())
     };
     let Some(token) = token else {
