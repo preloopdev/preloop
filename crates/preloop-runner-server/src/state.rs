@@ -562,6 +562,21 @@ pub(crate) struct SecretStore {
     /// `global` for jobs of that repository whose `environment:` resolves to
     /// that environment.
     pub env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    /// Registered environments, keyed by `owner/repo` then environment name.
+    /// A job's `environment:` must be registered for its repository; a job
+    /// claiming any other name fails closed before secrets are injected or
+    /// an OIDC environment subject is minted (M4).
+    pub environments: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl SecretStore {
+    /// Whether `environment:` `env` names a registered environment of
+    /// `repo` (M4). Jobs claiming an unregistered environment fail closed.
+    pub fn is_environment_registered(&self, repo: &str, env: &str) -> bool {
+        self.environments
+            .get(repo)
+            .is_some_and(|envs| envs.contains(env))
+    }
 }
 
 /// Redacting `Debug`: the store holds plaintext secret values, so a single
@@ -591,6 +606,7 @@ impl std::fmt::Debug for SecretStore {
             .field("global_names", &self.global.keys().collect::<Vec<_>>())
             .field("repo_names", &repo_names)
             .field("env_names", &env_names)
+            .field("environments", &self.environments)
             .finish()
     }
 }
@@ -997,6 +1013,7 @@ impl AppState {
             global: config.secrets,
             repo: config.repo_secrets,
             env: config.env_secrets,
+            environments: config.environments,
         }));
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
