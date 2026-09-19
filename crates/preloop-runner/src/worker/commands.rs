@@ -120,10 +120,14 @@ pub fn handle_command(
 ) {
     match cmd.name.as_str() {
         "add-mask" => {
-            ctx.job.add_mask(&cmd.data);
-            // Retroactive: a secret printed before the mask command would
-            // otherwise stay unmasked in the durable log.
-            ctx.retroactive_mask();
+            let new_masks = ctx.job.add_mask(&cmd.data);
+            // Retroactive: a secret printed before `::add-mask::` would
+            // otherwise stay unmasked in the durable log, memory, or queue.
+            if let Err(error) = ctx.retroactive_mask(&new_masks) {
+                tracing::error!(%error, "failed to retroactively mask durable log");
+                ctx.durable_log_error
+                    .get_or_insert_with(|| error.to_string());
+            }
         }
         "add-path" => {
             ctx.job.extra_path.insert(0, cmd.data.clone());

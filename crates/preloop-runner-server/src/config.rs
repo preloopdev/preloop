@@ -753,43 +753,67 @@ fn resolve_config_sealing_key_with_store(
     let file_key = read_sealing_key_file(&key_path)?;
     if store.available().is_ok() {
         let reference = config_secrets_key_reference(dir)?;
-        match store.get(&reference) {
-            Ok(Some(secret)) => {
+        match store
+            .get(&reference)
+            .with_context(|| format!("reading config-secrets key from {} store", store.name()))?
+        {
+            Some(secret) => {
                 let key = parse_sealing_key(secret.expose().as_bytes()).with_context(|| {
                     format!("parsing config-secrets key from {} store", store.name())
                 })?;
-                // A stale file key shadowed by the store is dead weight — and
-                // keeping it would silently fork the key on the next rotation.
-                if file_key.is_some() {
-                    let _ = std::fs::remove_file(&key_path);
+                if let Some(file_key) = file_key {
+                    anyhow::ensure!(
+                        file_key == key,
+                        "config-secrets key conflict between {} store and {}",
+                        store.name(),
+                        key_path.display()
+                    );
+                    std::fs::remove_file(&key_path)
+                        .with_context(|| format!("retiring {}", key_path.display()))?;
                 }
                 return Ok(key);
             }
-            Ok(None) | Err(_) => {
-                // Missing or unreadable entry: migrate the file key, else
-                // generate a fresh one, then verify the round-trip before
-                // trusting the store (same discipline as the engine token).
+            None => {
+                // A reachable store with no entry is not interchangeable with
+                // an unreadable store. Persist the existing fallback key, or
+                // create one, then require an authenticated read-back before
+                // retiring the file or trusting the store.
                 let key = file_key.unwrap_or_else(generate_sealing_key);
-                if store
+                store
                     .set(&reference, &SecretString::new(hex::encode(key)))
-                    .is_ok()
-                    && store
-                        .get(&reference)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|read_back| {
-                            parse_sealing_key(read_back.expose().as_bytes()).ok() == Some(key)
-                        })
-                {
-                    let _ = std::fs::remove_file(&key_path);
-                    return Ok(key);
+                    .with_context(|| format!("writing config-secrets key to {}", store.name()))?;
+                let read_back = store
+                    .get(&reference)
+                    .with_context(|| {
+                        format!("verifying config-secrets key in {} store", store.name())
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} store accepted the config-secrets key but did not return it",
+                            store.name()
+                        )
+                    })?;
+                let read_back =
+                    parse_sealing_key(read_back.expose().as_bytes()).with_context(|| {
+                        format!(
+                            "parsing config-secrets key read from {} store",
+                            store.name()
+                        )
+                    })?;
+                anyhow::ensure!(
+                    read_back == key,
+                    "{} store returned a different config-secrets key after write",
+                    store.name()
+                );
+                if key_path.exists() {
+                    std::fs::remove_file(&key_path)
+                        .with_context(|| format!("retiring {}", key_path.display()))?;
                 }
-                if let Some(key) = file_key {
-                    return Ok(key);
-                }
+                return Ok(key);
             }
         }
-    } else if let Some(key) = file_key {
+    }
+    if let Some(key) = file_key {
         return Ok(key);
     }
     let key = generate_sealing_key();
@@ -878,17 +902,25 @@ fn seal_secret_value(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String> 
     ))
 }
 
-/// Unseal one `sealed:v1:` config value. Anything without the prefix is
-/// legacy plaintext and returned unchanged.
-fn unseal_secret_value(key: &[u8; 32], stored: &str) -> anyhow::Result<String> {
+/// Try to unseal one `sealed:v1:` config value. A prefix with malformed
+/// base64 is treated as an ordinary plaintext value; a structurally valid
+/// envelope must authenticate or the load fails closed.
+fn try_unseal_secret_value(key: &[u8; 32], stored: &str) -> anyhow::Result<Option<String>> {
     let Some(encoded) = stored.strip_prefix(SEALED_SECRET_PREFIX) else {
-        return Ok(stored.to_owned());
+        return Ok(None);
     };
-    let sealed = BASE64_STANDARD
-        .decode(encoded)
-        .context("sealed config value is not valid base64")?;
+    let Ok(sealed) = BASE64_STANDARD.decode(encoded) else {
+        return Ok(None);
+    };
+    // SNAPSHOT_FORMAT + AES-CBC IV + HMAC tag. Short prefixed plaintext is
+    // not a candidate ciphertext and must remain readable.
+    if sealed.len() < 1 + 16 + 32 {
+        return Ok(None);
+    }
     let plaintext = crate::store::Envelope::new(key).unseal(&sealed)?;
-    String::from_utf8(plaintext).context("sealed config value is not valid UTF-8")
+    Ok(Some(
+        String::from_utf8(plaintext).context("sealed config value is not valid UTF-8")?,
+    ))
 }
 
 /// Apply `f` to every stored secret value across the three scopes (global,
@@ -915,10 +947,6 @@ fn for_each_secret_value(
     Ok(())
 }
 
-/// Seal every stored secret for writing. No-op when there is nothing to
-/// seal, so non-secret config writes never touch the keychain or key file.
-/// The store is a parameter so tests can inject a hermetic backend; the
-/// public write path passes [`OsCredentialStore`].
 fn seal_config_secrets(
     config: &mut ConfigFile,
     dir: &Path,
@@ -935,12 +963,10 @@ fn seal_config_secrets(
     }
     let key = resolve_config_sealing_key_with_store(dir, store)?;
     for_each_secret_value(config, |value| {
-        // Skip values that already carry the prefix: re-sealing ciphertext
-        // would double-wrap it into a value the next read cannot recover.
-        // The load path always unseals first, so a prefixed value here can
-        // only arrive from a caller handing back stored form; skipping keeps
-        // the write idempotent instead of corrupting it.
-        if value.starts_with(SEALED_SECRET_PREFIX) {
+        // Only authenticated envelopes are already sealed. A plaintext secret
+        // is allowed to begin with the marker; malformed marker-prefixed
+        // values must be encrypted rather than silently left on disk.
+        if try_unseal_secret_value(&key, value)?.is_some() {
             return Ok(());
         }
         *value = seal_secret_value(&key, value)?;
@@ -949,9 +975,9 @@ fn seal_config_secrets(
 }
 
 /// Unseal stored secrets after loading. Resolves the key lazily — only when
-/// at least one sealed value is actually present — so legacy plaintext
-/// configs and systemd-credential fragments never touch the keychain or key
-/// file. The store is a parameter so tests can inject a hermetic backend.
+/// at least one structurally valid sealed value is actually present — so
+/// legacy plaintext configs and marker-prefixed plaintext never touch the
+/// keychain or key file.
 fn unseal_config_secrets(
     config: &mut ConfigFile,
     dir: &Path,
@@ -959,7 +985,14 @@ fn unseal_config_secrets(
 ) -> anyhow::Result<()> {
     let mut needs_key = false;
     for_each_secret_value(config, |value| {
-        needs_key |= value.starts_with(SEALED_SECRET_PREFIX);
+        if value.starts_with(SEALED_SECRET_PREFIX) {
+            let encoded = value
+                .strip_prefix(SEALED_SECRET_PREFIX)
+                .expect("checked prefix");
+            if let Ok(sealed) = BASE64_STANDARD.decode(encoded) {
+                needs_key |= sealed.len() >= 1 + 16 + 32;
+            }
+        }
         Ok(())
     })?;
     if !needs_key {
@@ -967,7 +1000,9 @@ fn unseal_config_secrets(
     }
     let key = resolve_config_sealing_key_with_store(dir, store)?;
     for_each_secret_value(config, |value| {
-        *value = unseal_secret_value(&key, value)?;
+        if let Some(plaintext) = try_unseal_secret_value(&key, value)? {
+            *value = plaintext;
+        }
         Ok(())
     })
 }
@@ -1072,6 +1107,7 @@ fn pin_test_config_path() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential_store::WriteOnlyCredentialStore;
 
     // These tests use the path-taking helpers rather than pinning
     // `PRELOOP_CONFIG`: mutating a process-wide env var raced every other test
@@ -1496,6 +1532,69 @@ REPO_OVERLAY = "repo-from-credential"
             "still plaintext: {sealed_text}"
         );
         assert!(sealed_text.contains(SEALED_SECRET_PREFIX));
+    }
+
+    #[test]
+    fn credential_store_read_errors_are_not_treated_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = resolve_config_sealing_key_with_store(dir.path(), &WriteOnlyCredentialStore)
+            .expect_err("unreadable credential store must fail closed");
+        assert!(
+            error.to_string().contains("reading config-secrets key"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !dir.path().join(SECRETS_KEY_FILE).exists(),
+            "read failure generated a fallback key"
+        );
+    }
+
+    #[test]
+    fn conflicting_store_and_file_keys_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryCredentialStore::default();
+        let reference = config_secrets_key_reference(dir.path()).unwrap();
+        let store_key = [0x11; 32];
+        let file_key = [0x22; 32];
+        store
+            .set(&reference, &SecretString::new(hex::encode(store_key)))
+            .unwrap();
+        write_sealing_key_file(&dir.path().join(SECRETS_KEY_FILE), &file_key).unwrap();
+
+        let error = resolve_config_sealing_key_with_store(dir.path(), &store)
+            .expect_err("conflicting key sources must not silently choose one");
+        assert!(error.to_string().contains("key conflict"));
+        assert!(dir.path().join(SECRETS_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn plaintext_marker_prefix_is_not_misclassified_as_ciphertext() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryCredentialStore::default();
+        let mut config = ConfigFile {
+            secrets: BTreeMap::from([(
+                "TOKEN".to_owned(),
+                format!("{SEALED_SECRET_PREFIX}not-a-ciphertext"),
+            )]),
+            ..ConfigFile::default()
+        };
+
+        unseal_config_secrets(&mut config, dir.path(), &UnavailableCredentialStore).unwrap();
+        assert_eq!(
+            config.secrets["TOKEN"],
+            format!("{SEALED_SECRET_PREFIX}not-a-ciphertext")
+        );
+        seal_config_secrets(&mut config, dir.path(), &store).unwrap();
+        assert_ne!(
+            config.secrets["TOKEN"],
+            format!("{SEALED_SECRET_PREFIX}not-a-ciphertext")
+        );
+        let mut restored = config.clone();
+        unseal_config_secrets(&mut restored, dir.path(), &store).unwrap();
+        assert_eq!(
+            restored.secrets["TOKEN"],
+            format!("{SEALED_SECRET_PREFIX}not-a-ciphertext")
+        );
     }
 
     /// The key is stable per config directory and distinct across directories.

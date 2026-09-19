@@ -15852,8 +15852,7 @@ async fn concurrent_secret_mutations_keep_store_and_file_in_agreement() {
         let store_names: Vec<String> = store.global.keys().cloned().collect();
         drop(store);
 
-        let persisted = std::fs::read_to_string(&config_path).unwrap();
-        let persisted: crate::config::ConfigFile = toml::from_str(&persisted).unwrap();
+        let persisted = crate::config::load_config_from(&config_path).unwrap();
         for name in &expected {
             assert!(
                 persisted.secrets.contains_key(name),

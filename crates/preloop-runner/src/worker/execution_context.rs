@@ -3,6 +3,7 @@
 //! Wraps the job context with step-specific state: env stack,
 //! secret masking, issue/annotation collection, debug flag.
 
+use anyhow::Context;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
@@ -49,6 +50,10 @@ pub struct StepContext<'a> {
     pub echo: bool,
     /// Log lines collected during step execution.
     pub log_lines: Vec<String>,
+    /// Number of durable log lines written, independent of byte length.
+    log_line_count: u64,
+    /// First durable log rewrite error; the step must not report success.
+    pub durable_log_error: Option<String>,
     stdout_prefix_override: Option<bool>,
     /// Whether the step was cancelled.
     pub cancelled: bool,
@@ -110,6 +115,8 @@ impl<'a> StepContext<'a> {
             debug,
             echo: false,
             log_lines: Vec::new(),
+            log_line_count: 0,
+            durable_log_error: None,
             stdout_prefix_override: None,
             cancelled: false,
             stop_commands_token: None,
@@ -155,12 +162,12 @@ impl<'a> StepContext<'a> {
         drop(buf);
 
         for (index, line) in complete_lines.into_iter().enumerate() {
-            let masked = self.job.mask_secrets(&line);
             self.stdout_prefix_override =
                 Some(index == 0 || !self.disable_stdout_multiline_log_prefixing);
             self.log(&line);
             self.stdout_prefix_override = None;
             if let Some(live) = &self.live_logs {
+                let masked = self.job.mask_secrets(&line);
                 let line_num = self
                     .live_line_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -176,7 +183,6 @@ impl<'a> StepContext<'a> {
             return;
         }
         let line = String::from_utf8_lossy(&buf).into_owned();
-        let masked = self.job.mask_secrets(&line);
         let is_continuation = self
             .stdout_partial_is_continuation
             .swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -187,6 +193,7 @@ impl<'a> StepContext<'a> {
         self.log(&line);
         self.stdout_prefix_override = None;
         if let Some(ref live) = self.live_logs {
+            let masked = self.job.mask_secrets(&line);
             let line_num = self
                 .live_line_counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -210,9 +217,12 @@ impl<'a> StepContext<'a> {
             } else {
                 format!("{ts} {masked}")
             };
-            {
+            let wrote = {
                 let mut lock = self.log_file.lock();
-                let _ = writeln!(lock, "{}", fmt);
+                writeln!(lock, "{}", fmt).is_ok()
+            };
+            if wrote {
+                self.log_line_count += 1;
             }
             if self.keep_in_memory {
                 self.log_lines.push(fmt);
@@ -325,9 +335,12 @@ impl<'a> StepContext<'a> {
             }
         };
 
-        {
+        let wrote = {
             let mut lock = self.log_file.lock();
-            let _ = writeln!(lock, "{}", fmt);
+            writeln!(lock, "{}", fmt).is_ok()
+        };
+        if wrote {
+            self.log_line_count += 1;
         }
         if self.keep_in_memory {
             self.log_lines.push(fmt);
@@ -503,45 +516,70 @@ impl<'a> StepContext<'a> {
         }
     }
 
-    /// Re-apply the current mask set to log output already written.
+    /// Return log content beginning at a logical line checkpoint. Byte offsets
+    /// are invalid after retroactive masking changes line lengths.
+    pub fn log_content_since(&self, start_line: u64) -> String {
+        let start_line = usize::try_from(start_line).unwrap_or(usize::MAX);
+        self.log_content()
+            .split_inclusive('\n')
+            .skip(start_line)
+            .collect()
+    }
+
+    /// Return the number of durable lines written so far.
+    pub fn log_line_count(&self) -> u64 {
+        self.log_line_count
+    }
+
+    /// Re-apply newly registered masks to output already written.
     ///
-    /// `::add-mask::` registers the value for future lines; without this
-    /// pass, anything printed earlier in the step stays unmasked in the
-    /// durable log (the tempfile) and in the in-memory buffer. Re-masking is
-    /// idempotent: earlier masks already replaced their values with `***`,
-    /// and the mask set only ever grows, so already-masked lines are
-    /// unaffected. Uses the same [`JobContext::mask_secrets`] (raw value
-    /// plus each trimmed CR/LF-delimited line) as the write path.
-    ///
-    /// Lines already streamed over the live-log WebSocket cannot be
-    /// recalled; this covers the durable record.
-    pub fn retroactive_mask(&mut self) {
+    /// The durable replacement is prepared and synced in a separate unnamed
+    /// tempfile before swapping it into the context. Any read/write failure
+    /// leaves the old file untouched and is returned to the step runner.
+    pub fn retroactive_mask(&mut self, secrets: &[String]) -> anyhow::Result<()> {
+        if secrets.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut lock = self.log_file.lock();
+            lock.flush()
+                .context("flushing durable log before masking")?;
+            let mut cloned = lock
+                .get_ref()
+                .try_clone()
+                .context("cloning durable log before masking")?;
+            use std::io::{Read, Seek, SeekFrom};
+            cloned
+                .seek(SeekFrom::Start(0))
+                .context("seeking durable log before masking")?;
+            let mut content = Vec::new();
+            cloned
+                .read_to_end(&mut content)
+                .context("reading durable log before masking")?;
+            drop(cloned);
+
+            let masked = self
+                .job
+                .mask_secrets_with(&String::from_utf8_lossy(&content), secrets);
+            let mut replacement =
+                tempfile::tempfile().context("creating durable log replacement")?;
+            replacement
+                .write_all(masked.as_bytes())
+                .context("writing durable log replacement")?;
+            replacement
+                .sync_all()
+                .context("syncing durable log replacement")?;
+            *lock = BufWriter::new(replacement);
+        }
+
         for line in &mut self.log_lines {
-            *line = self.job.mask_secrets(line);
+            *line = self.job.mask_secrets_with(line, secrets);
         }
-        // Rewrite the durable log file in place. The tempfile is exclusively
-        // owned by this step context, so a read/mask/rewrite under the file
-        // lock is safe. The BufWriter is flushed first, so its internal
-        // buffer is empty and direct writes on the file keep the position
-        // consistent for subsequent log appends.
-        let mut lock = self.log_file.lock();
-        let _ = lock.flush();
-        let file = lock.get_mut();
-        use std::io::{Read, Seek, SeekFrom, Write};
-        if file.seek(SeekFrom::Start(0)).is_err() {
-            return;
+        if let Some(live) = &self.live_logs {
+            live.remask_with(secrets);
         }
-        let mut content = Vec::new();
-        if file.read_to_end(&mut content).is_err() {
-            return;
-        }
-        let masked = self.job.mask_secrets(&String::from_utf8_lossy(&content));
-        if file.seek(SeekFrom::Start(0)).is_err() {
-            return;
-        }
-        let _ = file.set_len(0);
-        let _ = file.write_all(masked.as_bytes());
-        let _ = file.sync_all();
+        Ok(())
     }
 }
 
@@ -868,6 +906,26 @@ mod tests {
             .map(|l| l.split_once(' ').map(|x| x.1).unwrap_or(""))
             .collect();
         assert_eq!(lines, vec!["line1", "line2"]);
+    }
+
+    #[test]
+    fn logical_attempt_checkpoint_survives_retroactive_masking() {
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log("prior hunter2-secret");
+        let attempt_start = ctx.log_line_count();
+        let new_masks = ctx.job.add_mask("hunter2-secret");
+        ctx.retroactive_mask(&new_masks).unwrap();
+        ctx.log("current output");
+
+        let attempt = ctx.log_content_since(attempt_start);
+        assert!(attempt.contains("current output"));
+        assert!(!attempt.contains("prior hunter2-secret"));
     }
 
     #[test]
