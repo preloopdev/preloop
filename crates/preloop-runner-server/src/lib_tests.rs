@@ -16357,8 +16357,7 @@ async fn concurrent_secret_mutations_keep_store_and_file_in_agreement() {
         let store_names: Vec<String> = store.global.keys().cloned().collect();
         drop(store);
 
-        let persisted = std::fs::read_to_string(&config_path).unwrap();
-        let persisted: crate::config::ConfigFile = toml::from_str(&persisted).unwrap();
+        let persisted = crate::config::load_config_from(&config_path).unwrap();
         for name in &expected {
             assert!(
                 persisted.secrets.contains_key(name),
@@ -23008,6 +23007,8 @@ async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
         format!("urn:uuid:{canonical}"),
     ];
     let token = state.mint_runtime_token(&plan, &job);
+    // R1-10: results writes require a live job record.
+    r1_10_register_live_job(&state, job, &plan).await;
 
     for form in &forms {
         let requests = [

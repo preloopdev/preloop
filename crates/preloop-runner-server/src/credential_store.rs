@@ -608,7 +608,7 @@ impl CredentialStore for NonPersistingCredentialStore {
 /// A backend that accepts writes but cannot read them back.
 #[cfg(test)]
 #[derive(Clone, Copy, Default)]
-struct WriteOnlyCredentialStore;
+pub(crate) struct WriteOnlyCredentialStore;
 
 #[cfg(test)]
 impl CredentialStore for WriteOnlyCredentialStore {

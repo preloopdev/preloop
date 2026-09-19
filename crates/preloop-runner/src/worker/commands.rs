@@ -120,7 +120,14 @@ pub fn handle_command(
 ) {
     match cmd.name.as_str() {
         "add-mask" => {
-            ctx.job.add_mask(&cmd.data);
+            let new_masks = ctx.job.add_mask(&cmd.data);
+            // Retroactive: a secret printed before `::add-mask::` would
+            // otherwise stay unmasked in the durable log, memory, or queue.
+            if let Err(error) = ctx.retroactive_mask(&new_masks) {
+                tracing::error!(%error, "failed to retroactively mask durable log");
+                ctx.durable_log_error
+                    .get_or_insert_with(|| error.to_string());
+            }
         }
         "add-path" => {
             ctx.job.extra_path.insert(0, cmd.data.clone());
@@ -543,6 +550,57 @@ mod tests {
             ctx.job.mask_secrets("my-secret-token is here"),
             "*** is here"
         );
+    }
+
+    /// A secret logged before `::add-mask::` must be masked retroactively —
+    /// both in the in-memory buffer and in the durable log file.
+    #[test]
+    fn add_mask_masks_previously_logged_lines() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        ctx.log("deploying with token hunter2-secret");
+        ctx.log("nothing sensitive here");
+        let cmd = parse_command("::add-mask::hunter2-secret").unwrap();
+        handle_command(&cmd, &mut ctx);
+        // In-memory buffer re-scanned.
+        assert_eq!(ctx.log_lines.len(), 2);
+        assert!(
+            ctx.log_lines[0].ends_with("deploying with token ***"),
+            "in-memory line not masked: {}",
+            ctx.log_lines[0]
+        );
+        assert!(ctx.log_lines[1].ends_with("nothing sensitive here"));
+        // Durable log file rewritten.
+        let content = ctx.log_content();
+        assert!(
+            !content.contains("hunter2-secret"),
+            "secret survives in durable log: {content}"
+        );
+        assert!(content.contains("deploying with token ***"));
+        assert!(content.contains("nothing sensitive here"));
+        // Lines logged after the mask are masked as before, and appends
+        // still land after the rewritten content.
+        ctx.log("token hunter2-secret again");
+        assert!(ctx.log_lines[2].ends_with("token *** again"));
+        assert!(ctx.log_content().contains("token *** again"));
+    }
+
+    /// Multi-line mask values apply retroactively per line, matching the
+    /// write path's line-split mask set.
+    #[test]
+    fn add_mask_retroactive_uses_line_split_masks() {
+        let mut job = make_job();
+        let mut ctx = make_ctx(&mut job);
+        ctx.log("first line1-value then line2-value");
+        let cmd = parse_command("::add-mask::line1-value%0Aline2-value").unwrap();
+        handle_command(&cmd, &mut ctx);
+        assert!(
+            ctx.log_lines[0].ends_with("first *** then ***"),
+            "multi-line mask not applied retroactively: {}",
+            ctx.log_lines[0]
+        );
+        assert!(!ctx.log_content().contains("line1-value"));
+        assert!(!ctx.log_content().contains("line2-value"));
     }
 
     #[test]

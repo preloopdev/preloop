@@ -123,10 +123,131 @@ impl PgStore {
             }
         };
         Self::migrate(&mut client).await?;
-        Ok(Self {
+        let store = Self {
             connection: Arc::new(tokio::sync::Mutex::new(client)),
             cipher,
-        })
+        };
+        store.migrate_legacy_message_payloads().await?;
+        Ok(store)
+    }
+
+    /// Upgrade legacy plaintext/unbound message rows once, before normal
+    /// restoration starts. The marker is written only after the transaction
+    /// commits, so an interrupted migration retries safely on the next boot.
+    async fn migrate_legacy_message_payloads(&self) -> anyhow::Result<()> {
+        let mut client = self.connection.lock().await;
+        let completed = client
+            .query_opt(
+                "SELECT completed_at_us FROM message_payload_migrations
+                 WHERE migration = $1",
+                &[&"message-payloads-bound-v1"],
+            )
+            .await?;
+        if completed.is_some() {
+            return Ok(());
+        }
+
+        let tx = client.transaction().await?;
+        let broker_rows = tx
+            .query(
+                "SELECT session_id, message_id, payload_json FROM broker_messages",
+                &[],
+            )
+            .await?;
+        for row in broker_rows {
+            let session_id: String = row.get(0);
+            let message_id: i64 = row.get(1);
+            let payload_json: String = row.get(2);
+            let associated_data = crate::store::broker_message_payload_aad(&session_id, message_id);
+            match crate::store::decode_message_payload::<azdo::TaskAgentMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
+                Ok((_, crate::store::MessagePayloadEncoding::Bound)) => {}
+                Ok((message, _)) => {
+                    let migrated = crate::store::seal_message_payload(
+                        &self.cipher,
+                        &message,
+                        &associated_data,
+                    )?;
+                    tx.execute(
+                        "UPDATE broker_messages SET payload_json = $1
+                         WHERE session_id = $2 AND message_id = $3",
+                        &[&migrated, &session_id, &message_id],
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id,
+                        message_id,
+                        %error,
+                        "dropping undecodable legacy broker message during migration"
+                    );
+                    tx.execute(
+                        "DELETE FROM broker_messages
+                         WHERE session_id = $1 AND message_id = $2",
+                        &[&session_id, &message_id],
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        let job_request_rows = tx
+            .query(
+                "SELECT request_id, payload_json FROM job_request_messages",
+                &[],
+            )
+            .await?;
+        for row in job_request_rows {
+            let request_id: i64 = row.get(0);
+            let payload_json: String = row.get(1);
+            let associated_data = crate::store::job_request_message_payload_aad(request_id);
+            match crate::store::decode_message_payload::<azdo::AgentJobRequestMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
+                Ok((_, crate::store::MessagePayloadEncoding::Bound)) => {}
+                Ok((message, _)) => {
+                    let migrated = crate::store::seal_message_payload(
+                        &self.cipher,
+                        &message,
+                        &associated_data,
+                    )?;
+                    tx.execute(
+                        "UPDATE job_request_messages SET payload_json = $1
+                         WHERE request_id = $2",
+                        &[&migrated, &request_id],
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id,
+                        %error,
+                        "dropping undecodable legacy job request message during migration"
+                    );
+                    tx.execute(
+                        "DELETE FROM job_request_messages WHERE request_id = $1",
+                        &[&request_id],
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO message_payload_migrations(migration, completed_at_us)
+             VALUES ($1, $2)
+             ON CONFLICT(migration) DO NOTHING",
+            &[&"message-payloads-bound-v1", &crate::store::now_us()],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Apply pending migrations. `schema_migrations` doubles as the version
@@ -374,7 +495,9 @@ impl PgStore {
         }
         tx.execute("DELETE FROM broker_messages", &[]).await?;
         for (session_id, message_id, payload) in inflight {
-            let payload_json = serde_json::to_string(payload)?;
+            let associated_data = crate::store::broker_message_payload_aad(session_id, *message_id);
+            let payload_json =
+                crate::store::seal_message_payload(&self.cipher, payload, &associated_data)?;
             tx.execute(
                 "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
                  VALUES ($1, $2, $3, $4)",
@@ -384,7 +507,9 @@ impl PgStore {
         }
         tx.execute("DELETE FROM job_request_messages", &[]).await?;
         for (request_id, payload) in broker_request_messages {
-            let payload_json = serde_json::to_string(payload)?;
+            let associated_data = crate::store::job_request_message_payload_aad(*request_id);
+            let payload_json =
+                crate::store::seal_message_payload(&self.cipher, payload, &associated_data)?;
             tx.execute(
                 "INSERT INTO job_request_messages(request_id, payload_json, written_at_us)
                  VALUES ($1, $2, $3)",
@@ -657,7 +782,12 @@ impl Store for PgStore {
             let session_id: String = row.get(0);
             let message_id: i64 = row.get(1);
             let payload_json: String = row.get(2);
-            match serde_json::from_str::<azdo::TaskAgentMessage>(&payload_json) {
+            let associated_data = crate::store::broker_message_payload_aad(&session_id, message_id);
+            match crate::store::unseal_message_payload::<azdo::TaskAgentMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
                 Ok(message) => {
                     inner
                         .inflight_messages
@@ -667,6 +797,13 @@ impl Store for PgStore {
                 }
                 Err(error) => {
                     tracing::warn!(%session_id, message_id, %error, "dropping undecodable broker message");
+                    client
+                        .execute(
+                            "DELETE FROM broker_messages
+                             WHERE session_id = $1 AND message_id = $2",
+                            &[&session_id, &message_id],
+                        )
+                        .await?;
                 }
             }
         }
@@ -682,12 +819,23 @@ impl Store for PgStore {
         for row in rows {
             let request_id: i64 = row.get(0);
             let payload_json: String = row.get(1);
-            match serde_json::from_str::<azdo::AgentJobRequestMessage>(&payload_json) {
+            let associated_data = crate::store::job_request_message_payload_aad(request_id);
+            match crate::store::unseal_message_payload::<azdo::AgentJobRequestMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
                 Ok(message) => {
                     inner.broker_messages.insert(request_id, message);
                 }
                 Err(error) => {
                     tracing::warn!(request_id, %error, "dropping undecodable job request message");
+                    client
+                        .execute(
+                            "DELETE FROM job_request_messages WHERE request_id = $1",
+                            &[&request_id],
+                        )
+                        .await?;
                 }
             }
         }
@@ -2041,6 +2189,16 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         r#"
         ALTER TABLE webhook_watchdog ADD COLUMN IF NOT EXISTS cursor_delivered_at_guid TEXT;
         ALTER TABLE webhook_watchdog ADD COLUMN IF NOT EXISTS scan_cursor TEXT;
+        "#,
+    ),
+    (
+        12,
+        "message-payload-migration-marker",
+        r#"
+        CREATE TABLE IF NOT EXISTS message_payload_migrations (
+          migration TEXT PRIMARY KEY,
+          completed_at_us BIGINT NOT NULL
+        );
         "#,
     ),
 ];
