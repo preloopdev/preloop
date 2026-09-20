@@ -61,8 +61,9 @@ async fn resolve_ref_to_sha(
     repo: &str,
     git_ref: &str,
 ) -> Option<String> {
-    // Already a full SHA: no lookup needed.
-    if preloop_gha_protocol::git_ref::is_commit_sha(git_ref) {
+    // Already a full SHA: no lookup needed. The all-zero sentinel is not a
+    // real commit, so it must not short-circuit as "resolved".
+    if preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
         return Some(git_ref.to_owned());
     }
     let cache_key = (owner.to_owned(), repo.to_owned(), git_ref.to_owned());
@@ -100,7 +101,7 @@ async fn resolve_ref_to_sha(
             .and_then(|body| {
                 body.get("sha")
                     .and_then(|value| value.as_str())
-                    .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha))
+                    .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha))
                     .map(str::to_owned)
             })
     } else {

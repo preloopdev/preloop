@@ -76,9 +76,45 @@ pub(crate) async fn resolve_remote_workflows(
                     .build()
                     .map_err(|error| ApiError::internal(format!("build GitHub client: {error}")))?,
             );
+            // Resolve the mutable ref to a commit SHA first, then fetch the
+            // workflow content pinned to that exact SHA. Fetching content with
+            // the mutable ref and resolving the SHA afterwards would let a
+            // retargeted branch/tag store content from commit A under the
+            // identity of commit B (TOCTOU); `?ref=<sha>` binds both values
+            // to the same revision.
+            let mut commit_request =
+                client.get(format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}"));
+            if let Some(token) = token {
+                commit_request = commit_request.bearer_auth(token);
+            }
+            let commit_response = commit_request.send().await.map_err(|error| {
+                ApiError::bad_gateway(format!(
+                    "resolve reusable workflow `{reference}` SHA: {error}"
+                ))
+            })?;
+            let commit_status = commit_response.status();
+            if !commit_status.is_success() {
+                return Err(ApiError::bad_gateway(format!(
+                    "GitHub returned {commit_status} while resolving reusable workflow `{reference}` SHA"
+                )));
+            }
+            let commit: GithubCommitResponse = commit_response.json().await.map_err(|error| {
+                ApiError::bad_gateway(format!("read reusable workflow `{reference}` SHA: {error}"))
+            })?;
+            // The recorded SHA is what later stages trust as this reusable
+            // workflow's pinned identity, so a malformed lookup response must
+            // not be stored as if it were a commit — and no content is
+            // fetched until the identity is validated.
+            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(&commit.sha) {
+                return Err(ApiError::bad_gateway(format!(
+                    "reusable workflow `{reference}` resolved to a non-commit SHA: {:?}",
+                    commit.sha
+                )));
+            }
             let mut request = client
                 .get(format!(
-                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
+                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={}",
+                    commit.sha
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github+json");
             if let Some(token) = token {
@@ -100,38 +136,9 @@ pub(crate) async fn resolve_remote_workflows(
             let contents = decode_github_contents(&content_response).map_err(|error| {
                 ApiError::bad_gateway(format!("decode reusable workflow `{reference}`: {error}"))
             })?;
-
-            let mut commit_request =
-                client.get(format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}"));
-            if let Some(token) = token {
-                commit_request = commit_request.bearer_auth(token);
-            }
-            let commit_response = commit_request.send().await.map_err(|error| {
-                ApiError::bad_gateway(format!(
-                    "resolve reusable workflow `{reference}` SHA: {error}"
-                ))
-            })?;
-            let commit_status = commit_response.status();
-            if !commit_status.is_success() {
-                return Err(ApiError::bad_gateway(format!(
-                    "GitHub returned {commit_status} while resolving reusable workflow `{reference}` SHA"
-                )));
-            }
-            let commit: GithubCommitResponse = commit_response.json().await.map_err(|error| {
-                ApiError::bad_gateway(format!("read reusable workflow `{reference}` SHA: {error}"))
-            })?;
             submission
                 .reusable_workflows
                 .insert(reference.to_owned(), contents.clone());
-            // The recorded SHA is what later stages trust as this reusable
-            // workflow's pinned identity, so a malformed lookup response must
-            // not be stored as if it were a commit.
-            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(&commit.sha) {
-                return Err(ApiError::bad_gateway(format!(
-                    "reusable workflow `{reference}` resolved to a non-commit SHA: {:?}",
-                    commit.sha
-                )));
-            }
             submission
                 .reusable_workflow_shas
                 .insert(reference.to_owned(), commit.sha);

@@ -2462,6 +2462,13 @@ pub(crate) fn build_job_artifacts(
     // minting a token for a never-created, never-approved environment.
     // This check runs ahead of `policy.allows_secrets` because the OIDC
     // subject is minted for jobs even when secret injection is disabled.
+    // Note: expression-based names (`${{ needs.* }}`, `${{ vars.* }}`, …)
+    // arrive here as `None` — the parser only resolves `matrix.*` at build
+    // time — so they are not rejected here, but they also receive no
+    // environment secrets and no environment OIDC subject (both are keyed
+    // off this same field). The name later resolved by
+    // `hydrate_needs_context` is not re-validated against the registry;
+    // it only reaches the runner's deployment record.
     if let Some(env_name) = job.oidc_environment.as_deref() {
         if !shared
             .state

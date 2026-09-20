@@ -38,8 +38,9 @@ pub async fn download_action(
     auth_token: Option<&str>,
 ) -> Result<PathBuf> {
     // M2: only pinned commit SHAs may be downloaded; anything else means
-    // server-side resolution failed.
-    if !preloop_gha_protocol::git_ref::is_commit_sha(git_ref) {
+    // server-side resolution failed. The all-zero sentinel is a valid SHA
+    // shape but names no commit, so it is rejected like any unpinned ref.
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
         anyhow::bail!(
             "M2: refusing to download action {owner}/{repo}@{git_ref}: \
              ref was not resolved to a commit SHA"
@@ -665,6 +666,34 @@ mod tests {
         let mode = metadata.permissions().mode();
         // The setuid bit (0o4000) must be stripped, leaving only rwxr-xr-x (0o755)
         assert_eq!(mode & 0o7777, 0o755);
+    }
+
+    #[tokio::test]
+    async fn download_action_refuses_all_zero_sha() {
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        // No server is started: the zero sentinel must be refused before any
+        // network access or cache lookup.
+        let result = download_action(
+            "owner",
+            "repo",
+            "0000000000000000000000000000000000000000",
+            &actions_dir,
+            Some("http://127.0.0.1:1/tarball"),
+            None,
+        )
+        .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("was not resolved to a commit SHA"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !actions_dir.exists(),
+            "refused download must not create the actions directory"
+        );
     }
 
     #[tokio::test]

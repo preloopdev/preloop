@@ -5911,6 +5911,139 @@ async fn action_download_info_discards_malformed_or_abbreviated_sha() {
 }
 
 #[tokio::test]
+async fn action_download_info_rejects_all_zero_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // The all-zero sentinel is a valid SHA shape but names no commit. The
+    // resolver must not short-circuit it as "already resolved"; it goes
+    // through lookup like any other ref. The mock answers 404 for it (as
+    // GitHub would), so resolvedSha stays null instead of echoing the zero SHA.
+    let zero = "0000000000000000000000000000000000000000".to_owned();
+    let zero_for_mock = zero.clone();
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/:owner/:repo/commits/:git_ref",
+        axum::routing::get(
+            move |axum::extract::Path(git_ref): axum::extract::Path<String>| async move {
+                if git_ref == zero_for_mock {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::NOT_FOUND,
+                    );
+                }
+                axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+                    "sha": "abc123def456abc123def456abc123def456abc1"
+                })))
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+
+    let response = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/ActionDownloadInfo/scope/actions/plan",
+        json!({
+            "actions": [
+                {"nameWithOwner": "actions/checkout", "ref": zero, "path": ""}
+            ]
+        }),
+    )
+    .await;
+
+    let actions = response["actions"].as_object().unwrap();
+    let checkout = &actions[&format!("actions/checkout@{zero}")];
+    // Zero SHA was not accepted as a pinned commit; resolution failed closed.
+    assert!(checkout["resolvedSha"].is_null());
+    assert_ne!(
+        checkout["resolvedSha"].as_str().unwrap_or_default(),
+        zero,
+        "all-zero sentinel must never be emitted as a resolved commit SHA"
+    );
+}
+
+#[tokio::test]
+async fn remote_workflow_content_is_fetched_at_resolved_sha() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // The mutable ref `main` resolves to a fixed SHA. The contents request
+    // must carry `?ref=<sha>` — not `?ref=main` — so a branch retargeted
+    // between the two requests cannot mix content from commit A with the
+    // recorded identity of commit B.
+    let sha = "abc123def456abc123def456abc123def456abc1".to_owned();
+    let seen_ref: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new()
+        .route(
+            "/repos/:owner/:repo/commits/:git_ref",
+            axum::routing::get({
+                let sha = sha.clone();
+                move || async move { axum::Json(serde_json::json!({"sha": sha})) }
+            }),
+        )
+        .route(
+            "/repos/:owner/:repo/contents/*path",
+            axum::routing::get({
+                let seen_ref = seen_ref.clone();
+                move |axum::extract::Query(
+                    params,
+                ): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    *seen_ref.lock().unwrap() = params.get("ref").cloned();
+                    // base64("on: push\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"echo hi\"\n")
+                    axum::Json(serde_json::json!({
+                        "content": "b246IHB1c2gKam9iczoKICBjYWxsZWU6CiAgICBydW5zLW9uOiB1YnVudHUtbGF0ZXN0CiAgICBzdGVwczoKICAgICAgLSBydW46ICJlY2hvIGhpIgo=",
+                        "encoding": "base64",
+                    }))
+                }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let root_yaml = "on: push\njobs:\n  caller:\n    uses: someowner/somerepo/.github/workflows/callee.yml@main\n";
+    let workflow = preloop_gha_parser::parse_workflow(root_yaml).unwrap();
+    let reference = "someowner/somerepo/.github/workflows/callee.yml@main";
+    let mut submission = preloop_gha_protocol::WorkflowSubmission {
+        workflow_yaml: root_yaml.to_owned(),
+        event: "push".to_owned(),
+        repository: "owner/repo".to_owned(),
+        ..Default::default()
+    };
+    crate::remote_workflows::resolve_remote_workflows(&mut submission, &workflow, None)
+        .await
+        .unwrap();
+
+    // Content and identity are bound to the same validated revision.
+    assert_eq!(
+        seen_ref.lock().unwrap().as_deref(),
+        Some(sha.as_str()),
+        "contents request must pin ?ref= to the resolved commit SHA"
+    );
+    assert_eq!(
+        submission
+            .reusable_workflow_shas
+            .get(reference)
+            .map(String::as_str),
+        Some(sha.as_str())
+    );
+    assert!(
+        submission.reusable_workflows[reference].contains("runs-on: ubuntu-latest"),
+        "fetched workflow content must be stored under the original reference"
+    );
+}
+
+#[tokio::test]
 async fn resolve_ref_to_sha_omits_pat_over_http() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "secret-pat");
