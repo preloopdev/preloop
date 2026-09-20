@@ -390,7 +390,7 @@ pub(crate) async fn warm_pat_scope_cache(pat: &str) {
 }
 
 /// Outcome of PAT scope introspection.
-enum PatScopeOutcome {
+pub(crate) enum PatScopeOutcome {
     /// Classic scopes positively determined: enforce declared-vs-PAT.
     Known(Vec<String>),
     /// No scopes header (fine-grained PAT), a quirky API root, or an
@@ -405,6 +405,19 @@ enum PatScopeOutcome {
     Invalid(anyhow::Error),
 }
 
+/// Whether the static PAT may be sent to this GitHub API URL: HTTPS always.
+/// Plain HTTP is allowed only to loopback hosts in test builds, where the
+/// suite serves mock API endpoints over `http://127.0.0.1`. Any other
+/// cleartext URL would expose the PAT on the network (CWE-319).
+fn github_api_url_allows_credential(url: &reqwest::Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    cfg!(test)
+        && url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
 /// Introspect the static PAT's classic OAuth scopes via the `X-OAuth-Scopes`
 /// response header on an authenticated API-root request.
 ///
@@ -414,7 +427,7 @@ enum PatScopeOutcome {
 /// for fine-grained PATs, so absence means the token's bounds are unknown
 /// rather than narrow. Results are cached per PAT (SHA-256 of the token) for
 /// [`PAT_SCOPE_CACHE_TTL`].
-async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
+pub(crate) async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
     if let Ok(cache) = PAT_SCOPE_CACHE.lock() {
@@ -425,8 +438,24 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
         }
     }
     let url = format!("{}/", crate::github::github_api_base());
+    // Never send the PAT over cleartext HTTP: refuse the request before any
+    // network access when the API URL is not HTTPS (loopback HTTP stays
+    // allowed in test builds for the suite's mock API servers).
+    let url = match reqwest::Url::parse(&url) {
+        Ok(url) if github_api_url_allows_credential(&url) => url,
+        Ok(url) => {
+            return PatScopeOutcome::Unverifiable {
+                reason: format!("GitHub API URL must use HTTPS: {url}"),
+            };
+        }
+        Err(error) => {
+            return PatScopeOutcome::Unverifiable {
+                reason: format!("invalid GitHub API URL: {error}"),
+            };
+        }
+    };
     let response = match crate::shared_http::CLIENT
-        .get(&url)
+        .get(url)
         .header("Authorization", format!("Bearer {pat}"))
         .header("Accept", "application/vnd.github+json")
         .send()

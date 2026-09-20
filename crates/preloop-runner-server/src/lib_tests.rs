@@ -15480,6 +15480,29 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     );
 }
 
+/// H3 follow-up (CodeRabbit): PAT scope introspection must not send the PAT
+/// over cleartext HTTP. A non-HTTPS, non-loopback API base is refused before
+/// any request is made, so the PAT never leaves the host in the clear; HTTP
+/// loopback stays permitted in test builds for the suite's mock API servers.
+#[tokio::test]
+async fn pat_scope_introspection_rejects_cleartext_non_loopback_api_url() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // TEST-NET-1 is never routable, and the guard must fire before dialing it.
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", "http://192.0.2.1/");
+    // A distinct PAT value: the scope cache is process-global and keyed by
+    // the token hash, so reusing another test's PAT could return a cached
+    // verdict instead of exercising the URL guard.
+    let reason = match crate::runs::pat_oauth_scopes("https-guard-test-pat").await {
+        crate::runs::PatScopeOutcome::Unverifiable { reason } => reason,
+        _ => panic!("a cleartext non-loopback API URL must be refused before sending the PAT"),
+    };
+    assert!(
+        reason.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {reason}"
+    );
+}
+
 /// H3: scope-mismatch matrix for the static-PAT permission check. A classic
 /// PAT carrying write authority must never back a job whose effective
 /// `permissions:` are read-only (or empty); a PAT no broader than declared
