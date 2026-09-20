@@ -2284,12 +2284,10 @@ impl SqliteStore {
                     context_name,
                     name,
                     conclusion,
-                    started_at: started_at_us.map(|us| {
-                        chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()
-                    }),
-                    finished_at: finished_at_us.map(|us| {
-                        chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()
-                    }),
+                    started_at: started_at_us
+                        .map(|us| chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()),
+                    finished_at: finished_at_us
+                        .map(|us| chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()),
                 });
         }
         // Log bytes live in their own table; rebuild the in-memory buffers
