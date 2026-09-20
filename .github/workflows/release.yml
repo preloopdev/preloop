@@ -321,6 +321,32 @@ jobs:
           test -n "$source_tag"
           cp "$golden_dir"/preloop-ubuntu-24.04-{x86_64,aarch64} artifacts/
           echo "Seeded golden assets from $source_tag"
+      # M1: the updater pins the matching public key
+      # (crates/preloop-cli/src/update.rs) and refuses any asset without a
+      # valid detached signature. Sign every published asset with
+      # `openssl dgst -sha256 -sign` (PKCS#1 v1.5 / SHA-256, raw binary
+      # signature in `<asset>.sig`) so `preloop update` can authenticate it.
+      # The private key lives only in the PRELOOP_RELEASE_SIGNING_KEY
+      # secret and never appears in logs or artifacts.
+      - name: Sign release assets
+        env:
+          PRELOOP_RELEASE_SIGNING_KEY: ${{ secrets.PRELOOP_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$PRELOOP_RELEASE_SIGNING_KEY" ]; then
+            echo "PRELOOP_RELEASE_SIGNING_KEY secret is not set; cannot sign release assets" >&2
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/release-signing-key.pem"
+          printf '%s' "$PRELOOP_RELEASE_SIGNING_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          for asset in artifacts/*; do
+            case "$asset" in
+              *.sig) continue ;;
+            esac
+            openssl dgst -sha256 -sign "$key_file" -out "$asset.sig" "$asset"
+          done
+          rm -f "$key_file"
+          ls artifacts/*.sig
       - name: Create GitHub Release
         env:
           # The org disables workflow write tokens, so GITHUB_TOKEN can never

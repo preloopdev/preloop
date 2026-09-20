@@ -630,6 +630,102 @@ mod official_semantics {
     }
 
     #[test]
+    fn string_string_comparison_never_coerces_to_numbers() {
+        // Live-verified against GitHub-hosted runners (2026-09-19):
+        // official compares string-string ordinally, never numerically.
+        assert_bool("'10' > '9'", false);
+        assert_bool("'2' > '10'", true);
+        assert_bool("'10' < '9'", true);
+        assert_bool("'2' < '10'", false);
+        assert_bool("'10' >= '9'", false);
+        assert_bool("'2' <= '10'", false);
+        assert_bool("'10' <= '9'", true);
+    }
+
+    #[test]
+    fn unicode_case_insensitive_comparison() {
+        // Live-verified: official uses OrdinalIgnoreCase (Unicode-aware).
+        assert_bool("'Ä' == 'ä'", true);
+        assert_bool("'ÄBC' == 'äbc'", true);
+        assert_bool("contains('ÄBC', 'ä')", true);
+        assert_bool("startsWith('ÄBC', 'äb')", true);
+        assert_bool("endsWith('ABCÄ', 'cä')", true);
+    }
+
+    #[test]
+    fn ordinal_ignore_case_uses_simple_case_mapping() {
+        // .NET OrdinalIgnoreCase maps each character through the simple
+        // (non-expanding) uppercase table. A lowercasing implementation
+        // would wrongly equate these.
+        // 'İ' (U+0130) lowercases to 'i' + U+0307, but OrdinalIgnoreCase
+        // keeps it a single character: it must NOT equal the two-char string.
+        assert_bool("'İ' == 'i\u{0307}'", false);
+        assert_bool("'İ' != 'i\u{0307}'", true);
+        // Greek sigmas: final 'ς' (U+03C2), medial 'σ' (U+03C3) and capital
+        // 'Σ' (U+03A3) all map to 'Σ'.
+        assert_bool("'ς' == 'σ'", true);
+        assert_bool("'ς' == 'Σ'", true);
+        assert_bool("'σ' == 'Σ'", true);
+        assert_bool("startsWith('Σίσυφος', 'σίσυ')", true);
+        assert_bool("endsWith('Ὀδυσσεύς', 'Σ')", true);
+        assert_bool("contains('Ὀδυσσεύς', 'σ')", true);
+        // 'ß' (U+00DF) has no single-character uppercase: it must NOT equal "SS".
+        assert_bool("'ß' == 'SS'", false);
+        assert_bool("contains('STRASSE', 'ß')", false);
+        assert_bool("contains('straße', 'SS')", false);
+    }
+
+    #[test]
+    fn ordinal_ignore_case_orders_by_code_point() {
+        // Mixed BMP / non-BMP ordering follows UTF-16 code unit order.
+        assert_bool("'a' < 'Ā'", true); // U+0061 < U+0100
+        assert_bool("'Ā' > 'a'", true);
+        assert_bool("'Ā' < '𐀀'", true); // U+0100 < U+10000
+        assert_bool("'z' < 'ä'", true); // U+007A < U+00E4 after case mapping
+    }
+
+    #[test]
+    fn fromjson_accepts_newtonsoft_extensions() {
+        // The official runner parses fromJSON through Newtonsoft's
+        // JsonTextReader, which accepts comments, single-quoted strings,
+        // and trailing commas. In expression syntax a literal single quote
+        // is written ''.
+        let value =
+            eval_expression("fromJSON('{''key'': ''value''}')", &Context::default()).unwrap();
+        assert_eq!(value, json!({"key": "value"}));
+        let value = eval_expression("fromJSON('{\"a\": 1,}')", &Context::default()).unwrap();
+        assert_eq!(value, json!({"a": 1}));
+        let value =
+            eval_expression("fromJSON('{\"a\": 1, /* comment */}')", &Context::default()).unwrap();
+        assert_eq!(value, json!({"a": 1}));
+        let value = eval_expression("fromJSON('[1, 2, ]')", &Context::default()).unwrap();
+        assert_eq!(value, json!([1, 2]));
+        // A comma is trailing only after a value; leading and misplaced
+        // commas remain invalid.
+        for expression in [
+            "fromJSON('{,}')",
+            "fromJSON('[,]')",
+            "fromJSON('{\"a\":,}')",
+            "fromJSON('[1,,]')",
+        ] {
+            assert!(
+                eval_expression(expression, &Context::default()).is_err(),
+                "expression should reject misplaced comma: {expression}"
+            );
+        }
+        // Anything beyond the supported extensions is still an error.
+        assert!(eval_expression("fromJSON('{key: 1}')", &Context::default()).is_err());
+        assert!(eval_expression("fromJSON('not json')", &Context::default()).is_err());
+    }
+
+    #[test]
+    fn fromjson_errors_on_invalid_json() {
+        // Live-verified: official fails the job on invalid JSON.
+        let result = eval_expression("fromJSON('not json')", &Context::default());
+        assert!(result.is_err(), "fromJSON('not json') should error");
+    }
+
+    #[test]
     fn mixed_kind_coercion_uses_official_numeric_rules() {
         let cases = [
             ("0 == ''", true),

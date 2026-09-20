@@ -1423,7 +1423,7 @@ async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiErr
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|sha| sha.len() == 40);
+        .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha));
     Ok(WorkspaceRevision {
         common_dir,
         source_head,

@@ -471,7 +471,7 @@ pub(crate) fn validate_push_target(
             "--push supports branch refs only (got `{git_ref}`)"
         )));
     }
-    if !(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) && sha != ZERO_SHA) {
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
         return Err(ApiError::bad_request(
             "--push requires a committed HEAD (submit from a git checkout)",
         ));
@@ -484,8 +484,6 @@ pub(crate) fn validate_push_target(
     }
     Ok(())
 }
-
-const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 
 /// Installation token covering everything the sync touches, or the ambient
 /// PAT when no App is configured.

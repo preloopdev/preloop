@@ -221,12 +221,7 @@ pub(crate) async fn oidc_token(
                 reference
                     .rsplit_once('@')
                     .map(|(_, git_ref)| git_ref)
-                    .filter(|git_ref| {
-                        git_ref.len() == 40
-                            && git_ref
-                                .chars()
-                                .all(|character| character.is_ascii_hexdigit())
-                    })
+                    .filter(|git_ref| preloop_gha_protocol::git_ref::is_commit_sha(git_ref))
                     .map(str::to_owned)
             })
             .or_else(|| job_workflow_ref.as_ref().map(|_| sha.clone()))
