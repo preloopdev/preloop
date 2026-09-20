@@ -159,11 +159,12 @@ jobs:
         env:
           RUSTFLAGS: "-A warnings"
           # The preloop-runner-server lib test is a single ~27k-line crate and
-          # the largest rustc unit in the workspace; with full debug info its
-          # compile OOMs (SIGKILL) inside the 4 GiB runner guest. Line-tables-
-          # only debug info keeps backtrace line numbers while cutting rustc's
-          # peak memory enough to fit the guest.
-          CARGO_PROFILE_TEST_DEBUG: "1"
+          # the largest rustc unit in the workspace; with debug info its
+          # compile peaks near 2 GiB and was OOM-killed (SIGKILL) inside the
+          # 4 GiB runner guest on rust-test shard 1 while the other shards
+          # passed. debug=0 drops the peak to ~0.4 GiB so it fits the guest;
+          # the cost is losing line numbers in test backtraces.
+          CARGO_PROFILE_TEST_DEBUG: "0"
 
   property-tests-fast:
     name: property-tests-fast
