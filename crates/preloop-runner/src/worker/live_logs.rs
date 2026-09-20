@@ -50,6 +50,12 @@ impl std::fmt::Debug for LiveLogQueue {
 pub struct LiveLogQueue {
     lines: Mutex<VecDeque<ConsoleLineInfo>>,
     masks: Arc<RwLock<HashSet<String>>>,
+    /// Gate synchronizing mask registration with transmission. The
+    /// `::add-mask::` path holds it for writing across registration while
+    /// each WebSocket batch holds it for reading across the final mask
+    /// snapshot and the send, so a batch can never go out with a mask
+    /// snapshot taken before a registration that completed first.
+    mask_gate: Arc<tokio::sync::RwLock<()>>,
     ws: tokio::sync::Mutex<Option<WebSocketSender>>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -73,6 +79,7 @@ impl LiveLogQueue {
         let queue = Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
             masks,
+            mask_gate: Arc::new(tokio::sync::RwLock::new(())),
             ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
         });
@@ -101,9 +108,25 @@ impl LiveLogQueue {
         Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
             masks: Arc::new(RwLock::new(HashSet::new())),
+            mask_gate: Arc::new(tokio::sync::RwLock::new(())),
             ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
         })
+    }
+
+    /// Acquire the mask gate for writing, for use from sync code.
+    ///
+    /// `handle_command` runs on step-output threads that may sit inside the
+    /// tokio runtime, where `blocking_write()` would panic, so this acquires
+    /// cooperatively. The read critical section is one batch send, making
+    /// the spin uncontended in practice.
+    pub fn acquire_mask_gate_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        loop {
+            match Arc::clone(&self.mask_gate).try_write_owned() {
+                Ok(guard) => return guard,
+                Err(_) => std::thread::sleep(std::time::Duration::from_micros(100)),
+            }
+        }
     }
 
     /// Enqueue one console line. Lines above the official 1024-entry threshold
@@ -223,7 +246,7 @@ impl LiveLogQueue {
                 return;
             };
             let wrapper = wrapper_from_lines(&batches[index]);
-            let sent = sender.send(&wrapper, &self.masks).await;
+            let sent = sender.send(&wrapper, self).await;
             if !sent {
                 let disable = sender.should_disable();
                 if disable {
@@ -287,28 +310,41 @@ impl WebSocketSender {
     async fn send(
         &mut self,
         wrapper: &TimelineRecordFeedLinesWrapper,
-        masks: &Arc<RwLock<HashSet<String>>>,
+        queue: &LiveLogQueue,
     ) -> bool {
         self.total_batches += 1;
 
         for attempt in 0..RETRIES {
-            let masked = match mask_wrapper(wrapper, masks) {
-                Some(wrapper) => wrapper,
-                None => {
-                    warn!("live log mask set is unavailable; refusing to transmit batch");
-                    self.failed_batches += 1;
-                    return false;
-                }
+            // Hold the mask gate for reading across the final mask snapshot
+            // and the send: a concurrent `::add-mask::` registration either
+            // completes fully before this snapshot (and is included in it) or
+            // waits until the send finishes, so a batch can never go out with
+            // a snapshot taken before a completed registration. The guard is
+            // scoped to one attempt so backoff/reconnect between attempts do
+            // not block mask registration.
+            let sent = {
+                // `tokio::sync::RwLock` guards are `Send`, unlike the std /
+                // parking_lot ones, so this can be held across the await.
+                let _gate = queue.mask_gate.read().await;
+                let masked = match mask_wrapper(wrapper, &queue.masks) {
+                    Some(wrapper) => wrapper,
+                    None => {
+                        warn!("live log mask set is unavailable; refusing to transmit batch");
+                        self.failed_batches += 1;
+                        return false;
+                    }
+                };
+                let payload = match serde_json::to_string(&masked) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(%error, "serializing live log wrapper failed");
+                        self.failed_batches += 1;
+                        return false;
+                    }
+                };
+                self.ws.send(Message::Text(payload)).await.is_ok()
             };
-            let payload = match serde_json::to_string(&masked) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    warn!(%error, "serializing live log wrapper failed");
-                    self.failed_batches += 1;
-                    return false;
-                }
-            };
-            if self.ws.send(Message::Text(payload)).await.is_ok() {
+            if sent {
                 return true;
             }
 

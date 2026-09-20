@@ -22,6 +22,34 @@ pub fn mask_secrets<'a, I>(input: &str, secrets: I, exclude: &[&str]) -> String
 where
     I: IntoIterator<Item = &'a str>,
 {
+    mask_secrets_inner(input, secrets, exclude, false)
+}
+
+/// Mask secret values like [`mask_secrets`], but preserve the newline
+/// structure of the input: a secret spanning N lines is replaced with one
+/// [`MASK_MARKER`] per line instead of a single marker.
+///
+/// Retroactive masking rewrites the durable log after line checkpoints were
+/// already captured (`StepContext::log_line_count` /
+/// `log_content_since`). Collapsing a multi-line secret into one marker would
+/// silently invalidate those checkpoints, so the retroactive path must keep
+/// every physical record intact.
+pub fn mask_secrets_preserving_lines<'a, I>(input: &str, secrets: I, exclude: &[&str]) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    mask_secrets_inner(input, secrets, exclude, true)
+}
+
+fn mask_secrets_inner<'a, I>(
+    input: &str,
+    secrets: I,
+    exclude: &[&str],
+    preserve_lines: bool,
+) -> String
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let mut sorted: Vec<&str> = secrets
         .into_iter()
         .filter(|s| !s.is_empty())
@@ -44,6 +72,18 @@ where
                 // idempotent while the secret is still treated as matched.
                 result.push_str(MASK_MARKER);
                 offset += MASK_MARKER.len();
+            } else if preserve_lines {
+                // Keep the physical record count stable: re-emit every
+                // newline inside the matched secret so line checkpoints
+                // captured before this retroactive pass stay valid.
+                result.push_str(MASK_MARKER);
+                for ch in secret.chars() {
+                    if ch == '\n' || ch == '\r' {
+                        result.push(ch);
+                        result.push_str(MASK_MARKER);
+                    }
+                }
+                offset += secret.len();
             } else {
                 result.push_str(MASK_MARKER);
                 offset += secret.len();
@@ -164,6 +204,35 @@ mod tests {
     fn no_secrets_returns_input_unchanged() {
         let input = "nothing to mask here";
         assert_eq!(mask_secrets(input, std::iter::empty(), &[]), input);
+    }
+
+    #[test]
+    fn preserving_lines_keeps_newline_count() {
+        let input = "before token-a\ntoken-b after";
+        let masked =
+            mask_secrets_preserving_lines(input, ["token-a\ntoken-b"].iter().copied(), &[]);
+        assert_eq!(masked, "before ***\n*** after");
+        assert_eq!(
+            masked.bytes().filter(|b| *b == b'\n').count(),
+            input.bytes().filter(|b| *b == b'\n').count()
+        );
+    }
+
+    #[test]
+    fn preserving_lines_matches_collapsing_for_single_line_secrets() {
+        let input = "my secret value";
+        assert_eq!(
+            mask_secrets_preserving_lines(input, ["secret"].iter().copied(), &[]),
+            mask_secrets(input, ["secret"].iter().copied(), &[]),
+        );
+    }
+
+    #[test]
+    fn preserving_lines_is_idempotent() {
+        let input = "leak token-a\ntoken-b here";
+        let once = mask_secrets_preserving_lines(input, ["token-a\ntoken-b"].iter().copied(), &[]);
+        let twice = mask_secrets_preserving_lines(&once, ["token-a\ntoken-b"].iter().copied(), &[]);
+        assert_eq!(once, twice);
     }
 
     #[test]

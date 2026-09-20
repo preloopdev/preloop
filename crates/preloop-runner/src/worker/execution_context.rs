@@ -642,6 +642,11 @@ impl<'a> StepContext<'a> {
 
     /// Re-apply newly registered masks to output already written.
     ///
+    /// Masking preserves the physical line count: a multi-line secret is
+    /// redacted to one `***` per line rather than a single marker, so line
+    /// checkpoints captured before this rewrite (`log_line_count` /
+    /// `log_content_since`) stay valid.
+    ///
     /// The durable replacement is prepared and synced in a separate unnamed
     /// tempfile before swapping it into the context. Any read/write failure
     /// leaves the old file untouched and is returned to the step runner.
@@ -670,7 +675,7 @@ impl<'a> StepContext<'a> {
 
             let masked = self
                 .job
-                .mask_secrets_with(&String::from_utf8_lossy(&content), secrets);
+                .mask_secrets_preserving_lines_with(&String::from_utf8_lossy(&content), secrets);
             let mut replacement =
                 tempfile::tempfile().context("creating durable log replacement")?;
             replacement
@@ -683,7 +688,7 @@ impl<'a> StepContext<'a> {
         }
 
         for line in &mut self.log_lines {
-            *line = self.job.mask_secrets_with(line, secrets);
+            *line = self.job.mask_secrets_preserving_lines_with(line, secrets);
         }
         if let Some(live) = &self.live_logs {
             live.remask_with(secrets);
@@ -1162,6 +1167,40 @@ mod tests {
         let attempt = ctx.log_content_since(attempt_start);
         assert!(attempt.contains("current output"));
         assert!(!attempt.contains("prior hunter2-secret"));
+    }
+
+    #[test]
+    fn multiline_secret_retroactive_masking_preserves_line_checkpoints() {
+        // Codex review on #298: a cross-line secret value printed before
+        // `::add-mask::` registers it occupies two physical records.
+        // Retroactive masking must redact it without collapsing those
+        // records, or a debug-retry checkpoint captured at the attempt
+        // boundary skips into the new attempt's output.
+        let mut job = JobContext::new(
+            "j1".into(),
+            "Test".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.log_raw("leaked token-a\ntoken-b here");
+        let count_before = ctx.log_line_count();
+        assert_eq!(count_before, 2);
+
+        let attempt_start = ctx.log_line_count();
+        let new_masks = ctx.job.add_mask("token-a\ntoken-b");
+        ctx.retroactive_mask(&new_masks).unwrap();
+        // No records were collapsed by the rewrite.
+        assert_eq!(ctx.log_line_count(), count_before);
+
+        ctx.log("current output");
+        let attempt = ctx.log_content_since(attempt_start);
+        assert!(
+            attempt.contains("current output"),
+            "attempt slice lost the new attempt's first line: {attempt:?}"
+        );
+        assert!(!attempt.contains("token-a"), "multiline secret leaked");
+        assert!(!attempt.contains("token-b"), "multiline secret leaked");
     }
 
     #[test]

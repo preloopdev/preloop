@@ -120,6 +120,14 @@ pub fn handle_command(
 ) {
     match cmd.name.as_str() {
         "add-mask" => {
+            // Hold the live-log mask gate for writing across registration:
+            // the drain task holds it for reading across its final mask
+            // snapshot and WebSocket send, so a batch can never go out with
+            // a snapshot taken before this registration completes.
+            let _mask_gate = ctx
+                .live_logs
+                .as_ref()
+                .map(|live| live.acquire_mask_gate_write());
             let new_masks = ctx.job.add_mask(&cmd.data);
             // Retroactive: a secret printed before `::add-mask::` would
             // otherwise stay unmasked in the durable log, memory, or queue.
