@@ -21,6 +21,10 @@ pub mod masking;
 /// Live debug-session DTOs for the native `/api/v1/debug/...` surface.
 pub mod debug_session;
 
+/// Commit-identity helpers: what counts as a pinned commit SHA, shared by the
+/// control plane, the runner, and the CLI.
+pub mod git_ref;
+
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.preloop.v1";
 

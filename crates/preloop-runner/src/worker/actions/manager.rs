@@ -1,11 +1,15 @@
 //! Action download and extraction manager.
 //!
 //! F022: Uses `ActionsResolveClient` to batch-resolve `uses:` refs to SHA-pinned
-//! codeload.github.com URLs before downloading. Falls back to api.github.com
-//! tarball if the launch endpoint is unavailable (e.g. local aksh).
+//! codeload.github.com URLs before downloading.
 //!
 //! Golden 10 flow 19-20: batch POST to runnerresolve → GET codeload tarball →
 //! extract to `_work/_actions/{owner}/{repo}/{sha}/`.
+//!
+//! M2: there is no api.github.com fallback. If the server did not resolve
+//! the ref to a commit SHA with a SHA-pinned download URL, the download is
+//! refused before any network access — fetching the mutable ref would
+//! reintroduce the TOCTOU that SHA pinning removes.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -13,9 +17,18 @@ use tracing::info;
 
 /// Download and extract a remote action to the _actions directory.
 ///
-/// `resolved_sha` — if Some, is used for the directory name and download URL.
-/// `download_url` — if Some, overrides the URL (from runnerresolve response).
-/// `auth_token` — if Some, added as Bearer auth to the download.
+/// `git_ref` must be the server-resolved commit SHA (40 hex chars), not a
+/// mutable branch/tag: callers pass `resolved_sha` from the runnerresolve
+/// response, falling back to the raw `uses:` ref only when resolution
+/// failed. `download_url` must be the server-supplied SHA-pinned tarball
+/// URL. Both are required (M2): if the server could not pin the ref to a
+/// commit, the runner refuses to fetch the mutable ref from
+/// api.github.com — downloading `tarball/{branch|tag}` reintroduces the
+/// TOCTOU that SHA pinning exists to remove (the ref can move between
+/// resolution and download).
+///
+/// These checks run before the cache lookup so a stale mutable-ref cache
+/// entry cannot bypass them, and before any network access.
 pub async fn download_action(
     owner: &str,
     repo: &str,
@@ -24,6 +37,22 @@ pub async fn download_action(
     download_url: Option<&str>,
     auth_token: Option<&str>,
 ) -> Result<PathBuf> {
+    // M2: only pinned commit SHAs may be downloaded; anything else means
+    // server-side resolution failed. The all-zero sentinel is a valid SHA
+    // shape but names no commit, so it is rejected like any unpinned ref.
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
+        anyhow::bail!(
+            "M2: refusing to download action {owner}/{repo}@{git_ref}: \
+             ref was not resolved to a commit SHA"
+        );
+    }
+    let url = download_url.filter(|url| !url.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "M2: refusing to download action {owner}/{repo}@{git_ref}: \
+             server supplied no SHA-pinned download URL"
+        )
+    })?;
+
     // Use the resolved SHA as directory name when available for correctness.
     let dir_ref = git_ref; // caller should pass resolved_sha here when available
     let dest = actions_dir.join(owner).join(repo).join(dir_ref);
@@ -36,13 +65,9 @@ pub async fn download_action(
         return Ok(dest);
     }
 
-    // Build download URL: prefer resolved codeload URL, fall back to api.github.com
-    let url = download_url.map(String::from).unwrap_or_else(|| {
-        tracing::warn!(
-            "No resolved URL for {owner}/{repo}@{git_ref}, using api.github.com fallback"
-        );
-        format!("https://api.github.com/repos/{owner}/{repo}/tarball/{git_ref}")
-    });
+    // M2: no api.github.com fallback. `url` is the server-supplied
+    // SHA-pinned tarball URL, validated above; a missing URL fails closed.
+    let url = url.to_string();
 
     info!("Downloading action {owner}/{repo}@{git_ref} from {url}");
 
@@ -644,6 +669,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_action_refuses_all_zero_sha() {
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        // No server is started: the zero sentinel must be refused before any
+        // network access or cache lookup.
+        let result = download_action(
+            "owner",
+            "repo",
+            "0000000000000000000000000000000000000000",
+            &actions_dir,
+            Some("http://127.0.0.1:1/tarball"),
+            None,
+        )
+        .await;
+
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("was not resolved to a commit SHA"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !actions_dir.exists(),
+            "refused download must not create the actions directory"
+        );
+    }
+
+    #[tokio::test]
     async fn download_action_atomic_cleanup_on_error() {
         use axum::{routing::get, Router};
         let evil_tar = create_test_tarball(&[("root/../../escape.txt", b"evil")]);
@@ -659,10 +712,21 @@ mod tests {
         let actions_dir = temp.path().join("actions");
 
         let url = format!("http://{addr}/tarball");
-        let result = download_action("owner", "repo", "v1", &actions_dir, Some(&url), None).await;
+        let result = download_action(
+            "owner",
+            "repo",
+            "0123456789abcdef0123456789abcdef01234567",
+            &actions_dir,
+            Some(&url),
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
-        let dest = actions_dir.join("owner").join("repo").join("v1");
+        let dest = actions_dir
+            .join("owner")
+            .join("repo")
+            .join("0123456789abcdef0123456789abcdef01234567");
         assert!(
             !dest.exists(),
             "failed download must not leave dest directory behind"
@@ -685,9 +749,16 @@ mod tests {
         let actions_dir = temp.path().join("actions");
 
         let url = format!("http://{addr}/tarball");
-        let res = download_action("owner", "repo", "v1", &actions_dir, Some(&url), None)
-            .await
-            .unwrap();
+        let res = download_action(
+            "owner",
+            "repo",
+            "0123456789abcdef0123456789abcdef01234567",
+            &actions_dir,
+            Some(&url),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(res.exists());
         assert_eq!(
@@ -699,7 +770,7 @@ mod tests {
         let cached_res = download_action(
             "owner",
             "repo",
-            "v1",
+            "0123456789abcdef0123456789abcdef01234567",
             &actions_dir,
             Some("http://127.0.0.1:1/unreachable"),
             None,
@@ -707,6 +778,80 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(cached_res, res);
+    }
+
+    /// M2: an unresolved action (no SHA-pinned download URL from the
+    /// server) must be rejected before any network access — the runner
+    /// must not fall back to `api.github.com/repos/{o}/{r}/tarball/{ref}`.
+    #[tokio::test]
+    async fn download_action_rejects_missing_resolved_url() {
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let result = download_action("owner", "repo", sha, &actions_dir, None, None).await;
+        let error = result.expect_err("missing resolved URL must fail closed");
+        assert!(
+            error.to_string().contains("no SHA-pinned download URL"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !actions_dir.join("owner").join("repo").join(sha).exists(),
+            "rejected download must not create the destination"
+        );
+    }
+
+    /// M2: a mutable ref (branch/tag/short SHA) that the server failed to
+    /// resolve must be rejected before any network access, even when a URL
+    /// is supplied. The unreachable URL proves no network attempt happens:
+    /// a fetch would fail with a connection error, not the M2 error.
+    #[tokio::test]
+    async fn download_action_rejects_mutable_ref() {
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        for git_ref in ["v4", "main", "a5ac7e5", "not-a-sha"] {
+            let result = download_action(
+                "owner",
+                "repo",
+                git_ref,
+                &actions_dir,
+                Some("http://127.0.0.1:1/unreachable"),
+                None,
+            )
+            .await;
+            let error = result.expect_err("mutable ref must fail closed");
+            assert!(
+                error.to_string().contains("not resolved to a commit SHA"),
+                "ref {git_ref:?}: unexpected error: {error:#}"
+            );
+        }
+    }
+
+    /// M2: the SHA/URL checks run before the cache lookup — a stale
+    /// mutable-ref cache entry (left by a pre-fix run) must not bypass
+    /// fail-closed.
+    #[tokio::test]
+    async fn download_action_rejects_mutable_ref_despite_cache() {
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let stale = actions_dir.join("owner").join("repo").join("v4");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("action.yml"), b"stale").unwrap();
+
+        let result = download_action(
+            "owner",
+            "repo",
+            "v4",
+            &actions_dir,
+            Some("http://127.0.0.1:1/unreachable"),
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale mutable-ref cache entry must not bypass M2"
+        );
     }
 
     #[cfg(unix)]

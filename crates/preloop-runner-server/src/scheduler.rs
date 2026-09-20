@@ -639,7 +639,7 @@ async fn latest_default_branch_sha(workspace: &PathBuf, branch: &str) -> Option<
     String::from_utf8(output.stdout)
         .ok()
         .map(|value| value.trim().to_owned())
-        .filter(|sha| sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit()))
+        .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha))
 }
 
 async fn latest_commit_sha(workspace: &PathBuf) -> Option<String> {
@@ -656,7 +656,7 @@ async fn latest_commit_sha(workspace: &PathBuf) -> Option<String> {
     String::from_utf8(output.stdout)
         .ok()
         .map(|value| value.trim().to_owned())
-        .filter(|sha| sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit()))
+        .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha))
 }
 
 fn next_schedule_time(schedule: &Schedule, timezone: Option<&str>) -> Option<DateTime<Utc>> {

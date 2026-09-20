@@ -3,6 +3,8 @@
 use anyhow::{bail, Context};
 use flate2::read::GzDecoder;
 use reqwest::Client;
+use rsa::pkcs1::DecodeRsaPublicKey;
+use rsa::{Pkcs1v15Sign, RsaPublicKey};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -18,6 +20,55 @@ const DEFAULT_REPOSITORY: &str = "preloopdev/preloop";
 const USER_AGENT: &str = concat!("preloop/", env!("CARGO_PKG_VERSION"));
 const SMOLVM_REPOSITORY: &str = "smol-machines/smolvm";
 include!(concat!(env!("OUT_DIR"), "/pins.rs"));
+
+/// M1: pinned release-signing public key (RSA-3072, PKCS#1 v1.5 / SHA-256).
+///
+/// The release workflow signs every published asset with the matching
+/// private key (`openssl dgst -sha256 -sign` over the asset bytes, raw
+/// binary signature in `<asset>.sig`). The updater refuses any asset whose
+/// detached signature is missing or invalid — a SHA-256 checksum alone
+/// cannot authenticate the release because it is published on the same
+/// channel as the asset it describes.
+const RELEASE_SIGNING_PUBLIC_KEY_DER_B64: &str = "MIIBigKCAYEA3Fz8tdm/XggeYlZbs9DRXPDzlgrcLpHKEKUJvkxnj1J6GOgz4qho1PEZ0nzEOxxESl2FZDQLD/UdcQpw+pae0Jhumm3mOSG9mJaGF1ZGVjSU8oHOU0Y887wu7FIqBMLa1/O9SmVe4xCzhvaHJKczrdXzCJcOji98nhx0omwUdIRClaZ4P/iK+/oG0d7+K+efexhfRdncXD5+iu/D60RjDG96KLs4wOfY9ciudBnpYYOe57a9YQEsZ8gKWm5bB4Bcz1k0sCfoeHDO0KAMySn1TbFmPM9aEPQ7M+rd7jhPb06QVvq6ROIlMhi1AJ0v2eYqkIYwJjPrAt2rVEqJaKdxqzUOyxRdj6gaGkYocatrPbmRwu4t/+KanPOMtY/EyJ9XzHLQ3yFWsnxNmqRwSFrf3RWGnzrLsVVktXxgwcp/IBad440sQOqV9vx/wYzy4MkSuMBfLFdm2qV9zSYMwlRVqIKZ1shi2aABlQpyRz4xFtLXjMLoTryAcLZkxvfvUmNbAgMBAAE=";
+
+/// M1: the updater replaces the running binary — it must never fetch
+/// release metadata or assets over plaintext HTTP, where a network
+/// attacker could substitute the binary. Caller-controlled endpoints
+/// (`PRELOOP_RELEASES_API`, asset URLs) are rejected at entry, and the
+/// client's redirect policy refuses HTTPS-to-HTTP downgrades.
+fn require_https_url(url: &str) -> anyhow::Result<()> {
+    let parsed: reqwest::Url = url.parse().context("parse release URL")?;
+    if parsed.scheme() != "https" {
+        bail!("refusing non-HTTPS release URL: {url}");
+    }
+    Ok(())
+}
+
+/// Redirect policy for the updater client: follow redirects, but never
+/// allow a downgrade from HTTPS to HTTP (a compromised or malicious
+/// mirror answering the API over TLS could otherwise bounce the asset
+/// download to plaintext).
+fn updater_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let downgraded = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| is_https_downgrade(previous, attempt.url()));
+        if downgraded {
+            attempt.error("refusing redirect that downgrades HTTPS to HTTP")
+        } else if attempt.previous().len() >= 10 {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Pure downgrade check, separated for testing: a redirect from an HTTPS
+/// URL to a non-HTTPS URL is a downgrade.
+fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    previous.scheme() == "https" && next.scheme() != "https"
+}
 
 /// Minimum SmolVM release `preloop update` accepts as already compatible,
 /// compiled from `smolvm_min_version` in the workspace `versions.toml` (see
@@ -73,11 +124,13 @@ struct ReleaseAsset {
 struct SelectedAsset<'a> {
     archive: &'a ReleaseAsset,
     checksum: Option<&'a ReleaseAsset>,
+    signature: Option<&'a ReleaseAsset>,
 }
 
 pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     let client = Client::builder()
         .user_agent(USER_AGENT)
+        .redirect(updater_redirect_policy())
         .build()
         .context("build release API client")?;
     if args.ensure_runtime {
@@ -97,6 +150,8 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
     let api_url = args
         .api_url
         .unwrap_or_else(|| format!("https://api.github.com/repos/{repository}/releases"));
+    // M1: `PRELOOP_RELEASES_API` is caller-controlled — never poll it over HTTP.
+    require_https_url(&api_url)?;
     let release = fetch_release(&client, &api_url, args.version.as_deref()).await?;
     if release.draft || release.prerelease {
         bail!("release {} is not a stable release", release.tag_name);
@@ -679,6 +734,8 @@ async fn fetch_release(
 }
 
 async fn download(client: &Client, url: &str, destination: &Path) -> anyhow::Result<()> {
+    // M1: asset URLs come from release metadata — never fetch over HTTP.
+    require_https_url(url)?;
     let mut response = client
         .get(url)
         .send()
@@ -768,7 +825,88 @@ struct StagedRelease {
     binary_path: PathBuf,
 }
 
-/// Download a release asset, verify its checksum, and extract the binary.
+/// M1: verify the release asset's detached RSA signature against the
+/// pinned release-signing public key.
+///
+/// The signature is computed by the release workflow with
+/// `openssl dgst -sha256 -sign <key> <asset>` (PKCS#1 v1.5 over the
+/// SHA-256 digest; raw binary signature bytes in `<asset>.sig`). A
+/// missing or invalid signature fails closed: the updater must never
+/// install a binary it cannot authenticate, because the checksum alone
+/// is published on the same channel as the asset.
+async fn verify_release_signature(
+    client: &Client,
+    archive: &ReleaseAsset,
+    signature_asset: Option<&ReleaseAsset>,
+    archive_path: &Path,
+) -> anyhow::Result<()> {
+    let signature_asset = signature_asset.ok_or_else(|| {
+        anyhow::anyhow!(
+            "release asset {} has no detached signature ({}.sig); \
+             refusing to install an unauthenticated release",
+            archive.name,
+            archive.name,
+        )
+    })?;
+    let signature = client
+        .get(&signature_asset.browser_download_url)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "download release signature {}",
+                signature_asset.browser_download_url
+            )
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "download release signature {}",
+                signature_asset.browser_download_url
+            )
+        })?
+        .bytes()
+        .await
+        .with_context(|| {
+            format!(
+                "read release signature {}",
+                signature_asset.browser_download_url
+            )
+        })?;
+    let archive_bytes = std::fs::read(archive_path)
+        .with_context(|| format!("read downloaded asset {}", archive_path.display()))?;
+    verify_detached_signature(&archive_bytes, &signature).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid release signature for {}: refusing to install",
+            archive.name
+        )
+    })?;
+    Ok(())
+}
+
+/// Pure signature check, separated for testing: PKCS#1 v1.5 / SHA-256 over
+/// the asset bytes against the pinned release-signing public key.
+fn verify_detached_signature(archive_bytes: &[u8], signature: &[u8]) -> anyhow::Result<()> {
+    let public_key = release_signing_public_key()?;
+    public_key
+        .verify(
+            Pkcs1v15Sign::new::<Sha256>(),
+            &Sha256::digest(archive_bytes),
+            signature,
+        )
+        .map_err(|_| anyhow::anyhow!("invalid release signature"))
+}
+
+fn release_signing_public_key() -> anyhow::Result<RsaPublicKey> {
+    use base64::Engine;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(RELEASE_SIGNING_PUBLIC_KEY_DER_B64)
+        .context("decode pinned release signing key")?;
+    RsaPublicKey::from_pkcs1_der(&der).context("parse pinned release signing key")
+}
+
+/// Download a release asset, verify its detached signature and checksum,
+/// and extract the binary.
 async fn stage_release(
     client: &Client,
     selected: &SelectedAsset<'_>,
@@ -782,6 +920,10 @@ async fn stage_release(
         &archive_path,
     )
     .await?;
+    // M1: authenticate before trusting — signature first (proves the asset
+    // came from the release pipeline), then the checksum (proves the
+    // download is intact).
+    verify_release_signature(client, selected.archive, selected.signature, &archive_path).await?;
     verify_checksum(client, selected.archive, selected.checksum, &archive_path).await?;
     let staged_binary = temp_dir.path().join(binary_name());
     extract_binary(&archive_path, &staged_binary)?;
@@ -967,7 +1109,17 @@ fn select_asset<'a>(
             || asset.name == "sha256sums.txt"
             || asset.name == "sha256.sum"
     });
-    Some(SelectedAsset { archive, checksum })
+    // M1: the detached signature the release workflow publishes next to
+    // each asset (`<archive>.sig`, raw RSA signature bytes). Absence is a
+    // hard failure in `stage_release`, never a silent skip.
+    let signature = assets
+        .iter()
+        .find(|asset| asset.name == format!("{}.sig", archive.name));
+    Some(SelectedAsset {
+        archive,
+        checksum,
+        signature,
+    })
 }
 
 fn parse_checksum(contents: &str, archive_name: &str) -> Option<String> {
@@ -1142,6 +1294,128 @@ async fn restart_systemd_service() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    /// M1: caller-controlled release endpoints must never be fetched over
+    /// plaintext HTTP — a network attacker could substitute the binary.
+    #[test]
+    fn release_urls_must_be_https() {
+        assert!(
+            require_https_url("https://api.github.com/repos/preloopdev/preloop/releases").is_ok()
+        );
+        assert!(
+            require_https_url("https://github.example.com/api/v3/repos/acme/preloop/releases")
+                .is_ok()
+        );
+        assert!(
+            require_https_url("http://api.github.com/repos/preloopdev/preloop/releases").is_err()
+        );
+        assert!(require_https_url("http://127.0.0.1:9090/releases").is_err());
+        assert!(require_https_url("ftp://example.com/releases").is_err());
+        assert!(require_https_url("not a url").is_err());
+    }
+
+    /// M1: the redirect policy must refuse HTTPS-to-HTTP downgrades (a
+    /// compromised mirror could otherwise bounce the asset download to
+    /// plaintext), while allowing HTTPS-to-HTTPS and HTTP-to-HTTP hops.
+    #[test]
+    fn redirect_downgrade_is_rejected() {
+        let url = |s: &str| s.parse::<reqwest::Url>().unwrap();
+        assert!(is_https_downgrade(
+            &url("https://example.com/asset"),
+            &url("http://example.com/asset"),
+        ));
+        assert!(!is_https_downgrade(
+            &url("https://example.com/asset"),
+            &url("https://mirror.example.com/asset"),
+        ));
+        assert!(!is_https_downgrade(
+            &url("http://example.com/asset"),
+            &url("http://example.com/asset"),
+        ));
+    }
+
+    /// M1: the pinned public key must verify a signature produced by the
+    /// release-signing private key (`openssl dgst -sha256 -sign`), proving
+    /// the updater trusts the same key the release pipeline signs with.
+    /// Test asset bytes and signature generated 2026-09-14; the signature
+    /// is public (it ships next to the asset) so embedding it is safe.
+    #[test]
+    fn pinned_key_verifies_release_pipeline_signature() {
+        let asset = b"preloop-m1-release-signature-test-asset-v1";
+        let signature = base64::engine::general_purpose::STANDARD.decode(
+            "iLUt5DpGI/QwD5xlhIUwOguf0Uq8zbnRj3CjpICQxWENE/ckUNZKLaJ4Mz3Fo4pGkInqImHkaLEBBjsn3wZVC2/WlLKKhkv7zuBE6JHE79RovSVB7EYph5GMUNkI+WDm5HiGoNhWSGegRHo89BKkhBnDJ1TLK9DhIkrcZNAqbrLofpHZxyrfKAW7I8Onfl76GGxjCHEovY3yG4KDOFoAK3WpFNkQRPhauAclMSrBTvLIWz4sdDfYV8Quf2rrEDapUZJrlGr/7WdkogoNWxVt+m2KcE6xi8l7LiK9sjRQzEH9Pgt08vGNsn46MtM0R1P52dZdi+L0EuRxa8Qkfrr3eO8/FrcuIgDcukOynNvSOI4ywWWxPyw1+0lILtjou0yX0jRVoXRLAKkmWcJYRFn+RcmOLO94N7jm+mByjARa6f32DVbjN6W1SEPC5r8EDyvye8IT0XH1etQMnzh3QS48e6tnERjIFGyK/ZlzNiW6QqRVUEYYJ7NQ37lGXqTynyGL",
+        ).unwrap();
+        assert!(verify_detached_signature(asset, &signature).is_ok());
+    }
+
+    /// M1: tampered asset bytes or a tampered signature must fail closed.
+    #[test]
+    fn tampered_asset_or_signature_fails_closed() {
+        let asset = b"preloop-m1-release-signature-test-asset-v1";
+        let mut signature = base64::engine::general_purpose::STANDARD.decode(
+            "iLUt5DpGI/QwD5xlhIUwOguf0Uq8zbnRj3CjpICQxWENE/ckUNZKLaJ4Mz3Fo4pGkInqImHkaLEBBjsn3wZVC2/WlLKKhkv7zuBE6JHE79RovSVB7EYph5GMUNkI+WDm5HiGoNhWSGegRHo89BKkhBnDJ1TLK9DhIkrcZNAqbrLofpHZxyrfKAW7I8Onfl76GGxjCHEovY3yG4KDOFoAK3WpFNkQRPhauAclMSrBTvLIWz4sdDfYV8Quf2rrEDapUZJrlGr/7WdkogoNWxVt+m2KcE6xi8l7LiK9sjRQzEH9Pgt08vGNsn46MtM0R1P52dZdi+L0EuRxa8Qkfrr3eO8/FrcuIgDcukOynNvSOI4ywWWxPyw1+0lILtjou0yX0jRVoXRLAKkmWcJYRFn+RcmOLO94N7jm+mByjARa6f32DVbjN6W1SEPC5r8EDyvye8IT0XH1etQMnzh3QS48e6tnERjIFGyK/ZlzNiW6QqRVUEYYJ7NQ37lGXqTynyGL",
+        ).unwrap();
+        // Tampered asset bytes: signature no longer matches.
+        let mut tampered_asset = asset.to_vec();
+        tampered_asset[0] ^= 0x01;
+        assert!(verify_detached_signature(&tampered_asset, &signature).is_err());
+        // Tampered signature bytes: verification fails.
+        signature[0] ^= 0x01;
+        assert!(verify_detached_signature(asset, &signature).is_err());
+        // Truncated signature: verification fails.
+        assert!(verify_detached_signature(asset, &signature[..signature.len() - 1]).is_err());
+    }
+
+    /// M1: a release asset with no published `.sig` sidecar must be
+    /// refused, not installed on checksum alone.
+    #[tokio::test]
+    async fn missing_signature_sidecar_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("preloop.tar.gz");
+        std::fs::write(&archive_path, b"fake-asset").unwrap();
+        let archive = ReleaseAsset {
+            name: "preloop.tar.gz".into(),
+            browser_download_url: "https://example.com/preloop.tar.gz".into(),
+            digest: None,
+        };
+        let client = Client::builder().build().unwrap();
+        let error = verify_release_signature(&client, &archive, None, &archive_path)
+            .await
+            .expect_err("missing signature must fail closed");
+        assert!(
+            error.to_string().contains("no detached signature"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// M1: `select_asset` must pick up the detached signature sidecar so
+    /// `stage_release` can authenticate the asset.
+    #[test]
+    fn selects_target_archive_checksum_and_signature() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "preloop-cli-aarch64-apple-darwin.tar.gz".into(),
+                browser_download_url: String::new(),
+                digest: None,
+            },
+            ReleaseAsset {
+                name: "preloop-cli-aarch64-apple-darwin.tar.gz.sha256".into(),
+                browser_download_url: String::new(),
+                digest: None,
+            },
+            ReleaseAsset {
+                name: "preloop-cli-aarch64-apple-darwin.tar.gz.sig".into(),
+                browser_download_url: String::new(),
+                digest: None,
+            },
+        ];
+        let selected = select_asset(&assets, &Version::new(0, 22, 0), "aarch64-apple-darwin")
+            .expect("matching target");
+        assert_eq!(selected.archive.name, assets[0].name);
+        assert_eq!(selected.checksum.expect("sidecar").name, assets[1].name);
+        assert_eq!(selected.signature.expect("signature").name, assets[2].name);
+    }
 
     #[test]
     fn parses_sha256sum_format() {

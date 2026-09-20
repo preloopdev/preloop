@@ -1098,9 +1098,7 @@ pub(crate) async fn resolve_ref_sha(
             return Ok(String::from_utf8(output.stdout)
                 .ok()
                 .map(|sha| sha.trim().to_owned())
-                .filter(|sha| {
-                    sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit())
-                }));
+                .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha)));
         }
         return Ok(None);
     }
@@ -1346,6 +1344,20 @@ async fn enqueue_webhook_delivery_with_budget(
 /// Verifies the signature, atomically enqueues the delivery to the durable
 /// store, and acknowledges with HTTP 202 Accepted. Background workers drain
 /// the queue asynchronously.
+/// The `repository.full_name` a webhook payload claims, if any (M3).
+///
+/// Read before any event processing so the signer's installation coverage
+/// can be bound to the claimed repository. A payload without a repository
+/// (e.g. `ping`) has nothing to bind.
+fn claimed_repository(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("repository")?
+        .get("full_name")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 pub(crate) async fn handle_github_webhook(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
@@ -1358,20 +1370,69 @@ pub(crate) async fn handle_github_webhook(
         .ok_or(StatusCode::UNAUTHORIZED)?;
     // Every registered App's secret is a candidate (D6): a payload signed by
     // any App preloop fronts is accepted, one signed by none is rejected.
-    let secrets: Vec<String> = match &shared.state.github_apps {
-        Some(apps) => apps.webhook_secrets(shared.state.webhook_secret.as_deref()),
-        None => shared.state.webhook_secret.clone().into_iter().collect(),
+    // M3: identify WHICH credential verified the payload — the signer
+    // binds the claimed repository below.
+    let signers: Vec<(String, crate::github_app::WebhookSigner)> = match &shared.state.github_apps {
+        Some(apps) => apps.webhook_signers(shared.state.webhook_secret.as_deref()),
+        None => shared
+            .state
+            .webhook_secret
+            .clone()
+            .filter(|secret| !secret.is_empty())
+            .map(|secret| (secret, crate::github_app::WebhookSigner::Legacy))
+            .into_iter()
+            .collect(),
     };
-    if secrets.is_empty() {
+    if signers.is_empty() {
         warn!("No webhook secret is configured on the server, rejecting request");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    if !secrets
+    let signer = signers
         .iter()
-        .any(|secret| verify_signature(secret, &body, sig_header))
-    {
+        .find(|(secret, _)| verify_signature(secret, &body, sig_header))
+        .map(|(_, signer)| signer.clone());
+    let Some(signer) = signer else {
         return Err(StatusCode::UNAUTHORIZED);
+    };
+
+    // M3: bind the claimed repository to the signer's installation
+    // coverage BEFORE any event processing (adapters and check_run
+    // rerequests alike). The signature only proves *some* registered
+    // credential sent the payload — without binding, a payload signed by
+    // App B's secret could claim App A's repository and trigger runs
+    // there under App A's credentials. Coverage is verified at exact
+    // repository granularity: an owner-granularity check would pass a
+    // selected-repository installation for a sibling repo under the same
+    // owner that the installation does not cover.
+    if let crate::github_app::WebhookSigner::App(app_id) = &signer {
+        if let Some(claimed) = claimed_repository(&body) {
+            // Resolve the App's credentials here rather than in the signer:
+            // the signer carries only the id, so a delivery never clones App
+            // key material.
+            let covers = match shared
+                .state
+                .github_apps
+                .as_ref()
+                .and_then(|apps| apps.app_by_id(app_id))
+            {
+                Some(app) => crate::github_app::app_covers_repository(app, &claimed).await,
+                // The payload's secret matched a registered App's secret, so
+                // its id must resolve. Fail closed rather than skip binding.
+                None => false,
+            };
+            if !covers {
+                warn!(
+                    app_id = %app_id,
+                    repository = %claimed,
+                    "webhook signer is not installed on the claimed repository; rejecting"
+                );
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
     }
+    // `WebhookSigner::Legacy`: the single shared secret is the only trust
+    // anchor — with no registry there is no cross-App confusion to bind
+    // against.
 
     let event_name = headers
         .get("x-github-event")

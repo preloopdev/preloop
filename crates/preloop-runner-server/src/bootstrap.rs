@@ -1440,6 +1440,18 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
     }
+    // H3: warm the static-PAT OAuth scope cache once at startup. Job expansion
+    // is synchronous and cannot introspect the PAT itself, so without this the
+    // first expansions after a restart would find a cold cache and withhold the
+    // credential. The PAT is read from config/env during state construction and
+    // is fixed for the process lifetime, so one lookup here covers every later
+    // expansion. A failure is logged, not fatal: the run path withholds the PAT
+    // rather than embedding one whose bounds could not be established.
+    if state.github_app.is_none() {
+        if let Some(pat) = state.static_github_pat() {
+            crate::runs::warm_pat_scope_cache(&pat).await;
+        }
+    }
     // Resolve the effective store URL exactly once, mirroring `open_store`
     // precedence: the explicit URL wins, then the environment, then SQLite at
     // the state dir. Both the instrumentation label and the status-snapshot
