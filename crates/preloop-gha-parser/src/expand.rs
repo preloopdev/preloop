@@ -1391,15 +1391,20 @@ fn expand_matrix(
     let mut matrix = match matrix {
         MatrixValue::Static(matrix) => matrix.clone(),
         MatrixValue::Expression(expression) => {
+            // `needs.*` is unavailable during parse-time expansion. Defer the
+            // whole matrix before evaluating fromJSON so the new strict JSON
+            // error behavior does not turn an unresolved output into a
+            // parse-time failure. Runtime expansion evaluates it with the
+            // completed needs context and still propagates invalid JSON.
+            if expression.contains("needs.") || expression.contains("needs[") {
+                return Ok(MatrixExpansion::Deferred(expression.clone()));
+            }
             let value = eval_expression(
                 expression,
                 &expression_context(&IndexMap::new(), inputs, event_name),
             )
             .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
             if value.is_null() {
-                if expression.contains("needs.") || expression.contains("needs[") {
-                    return Ok(MatrixExpansion::Deferred(expression.clone()));
-                }
                 return Ok(MatrixExpansion::Combinations(Vec::new()));
             }
             let spec = matrix_expand::value_to_matrix_spec(job_id, &value)?;

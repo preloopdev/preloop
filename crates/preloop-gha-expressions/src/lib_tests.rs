@@ -659,8 +659,8 @@ mod official_semantics {
         // would wrongly equate these.
         // 'İ' (U+0130) lowercases to 'i' + U+0307, but OrdinalIgnoreCase
         // keeps it a single character: it must NOT equal the two-char string.
-        assert_bool("'İ' == 'í'", false);
-        assert_bool("'İ' != 'í'", true);
+        assert_bool("'İ' == 'i\u{0307}'", false);
+        assert_bool("'İ' != 'i\u{0307}'", true);
         // Greek sigmas: final 'ς' (U+03C2), medial 'σ' (U+03C3) and capital
         // 'Σ' (U+03A3) all map to 'Σ'.
         assert_bool("'ς' == 'σ'", true);
@@ -687,16 +687,33 @@ mod official_semantics {
     #[test]
     fn fromjson_accepts_newtonsoft_extensions() {
         // The official runner parses fromJSON through Newtonsoft's
-        // JsonTextReader, which accepts single-quoted strings and trailing
-        // commas. In expression syntax a literal single quote is written ''.
+        // JsonTextReader, which accepts comments, single-quoted strings,
+        // and trailing commas. In expression syntax a literal single quote
+        // is written ''.
         let value =
             eval_expression("fromJSON('{''key'': ''value''}')", &Context::default()).unwrap();
         assert_eq!(value, json!({"key": "value"}));
         let value = eval_expression("fromJSON('{\"a\": 1,}')", &Context::default()).unwrap();
         assert_eq!(value, json!({"a": 1}));
+        let value =
+            eval_expression("fromJSON('{\"a\": 1, /* comment */}')", &Context::default()).unwrap();
+        assert_eq!(value, json!({"a": 1}));
         let value = eval_expression("fromJSON('[1, 2, ]')", &Context::default()).unwrap();
         assert_eq!(value, json!([1, 2]));
-        // Anything beyond those two extensions is still an error.
+        // A comma is trailing only after a value; leading and misplaced
+        // commas remain invalid.
+        for expression in [
+            "fromJSON('{,}')",
+            "fromJSON('[,]')",
+            "fromJSON('{\"a\":,}')",
+            "fromJSON('[1,,]')",
+        ] {
+            assert!(
+                eval_expression(expression, &Context::default()).is_err(),
+                "expression should reject misplaced comma: {expression}"
+            );
+        }
+        // Anything beyond the supported extensions is still an error.
         assert!(eval_expression("fromJSON('{key: 1}')", &Context::default()).is_err());
         assert!(eval_expression("fromJSON('not json')", &Context::default()).is_err());
     }

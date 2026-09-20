@@ -590,80 +590,189 @@ fn from_json_lenient(input: &str) -> Result<Value, String> {
     }
 }
 
-/// Rewrite the two Newtonsoft `JsonTextReader` extensions into strict JSON:
-/// single-quoted strings become double-quoted, and trailing commas before
-/// `}`/`]` are dropped. Returns `None` when the input needed no rewriting,
-/// so the caller does not pay for a second doomed parse.
+/// Rewrite the Newtonsoft `JsonTextReader` extensions into strict JSON:
+/// single-quoted strings become double-quoted, comments are removed, and
+/// trailing commas before `}`/`]` are dropped only after a value. Returns
+/// `None` when the input needed no rewriting, or when it contains an
+/// unterminated block comment.
 fn normalize_newtonsoft_json(input: &str) -> Option<String> {
+    let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+    let mut containers: Vec<char> = Vec::new();
+    let mut previous_was_value = false;
     let mut changed = false;
-    while let Some(c) = chars.next() {
-        match c {
+    let mut index = 0;
+
+    // Find the next non-whitespace, non-comment character without consuming
+    // the original input. This lets comma handling distinguish `[1,]` from
+    // `[,]` and still recognize comments between a value and its closer.
+    let next_non_comment_character = |mut index: usize| -> Option<char> {
+        loop {
+            while chars
+                .get(index)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                index += 1;
+            }
+            match chars.get(index).copied() {
+                Some('/') if chars.get(index + 1) == Some(&'/') => {
+                    index += 2;
+                    while chars.get(index).is_some_and(|character| *character != '\n') {
+                        index += 1;
+                    }
+                }
+                Some('/') if chars.get(index + 1) == Some(&'*') => {
+                    index += 2;
+                    let mut closed = false;
+                    while index + 1 < chars.len() {
+                        if chars[index] == '*' && chars[index + 1] == '/' {
+                            index += 2;
+                            closed = true;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    if !closed {
+                        return None;
+                    }
+                }
+                Some(character) => return Some(character),
+                None => return None,
+            }
+        }
+    };
+
+    while index < chars.len() {
+        match chars[index] {
             '"' => {
-                // Copy double-quoted strings verbatim (escapes included) so a
-                // single quote inside them is not mistaken for a delimiter.
-                out.push(c);
+                // Copy double-quoted strings verbatim (escapes included) so
+                // quotes and comment markers inside them stay data.
+                out.push('"');
+                index += 1;
                 let mut escaped = false;
-                for sc in chars.by_ref() {
-                    out.push(sc);
+                while index < chars.len() {
+                    let character = chars[index];
+                    out.push(character);
+                    index += 1;
                     if escaped {
                         escaped = false;
-                    } else if sc == '\\' {
+                    } else if character == '\\' {
                         escaped = true;
-                    } else if sc == '"' {
+                    } else if character == '"' {
                         break;
                     }
                 }
+                previous_was_value = true;
             }
             '\'' => {
-                // Single-quoted string → double-quoted string.
+                // Single-quoted string -> double-quoted string.
                 changed = true;
                 out.push('"');
+                index += 1;
                 let mut escaped = false;
-                for sc in chars.by_ref() {
+                while index < chars.len() {
+                    let character = chars[index];
+                    index += 1;
                     if escaped {
                         escaped = false;
-                        match sc {
+                        match character {
                             '\'' => out.push('\''),
                             '"' => out.push_str("\\\""),
                             _ => {
                                 out.push('\\');
-                                out.push(sc);
+                                out.push(character);
                             }
                         }
-                    } else if sc == '\\' {
+                    } else if character == '\\' {
                         escaped = true;
-                    } else if sc == '\'' {
+                    } else if character == '\'' {
                         out.push('"');
                         break;
-                    } else if sc == '"' {
+                    } else if character == '"' {
                         out.push_str("\\\"");
                     } else {
-                        out.push(sc);
+                        out.push(character);
                     }
+                }
+                previous_was_value = true;
+            }
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                // Newtonsoft accepts both line and block comments. Replace
+                // comments with whitespace so adjacent tokens do not merge;
+                // preserve the line ending for line-comment formatting.
+                changed = true;
+                out.push(' ');
+                index += 2;
+                while chars.get(index).is_some_and(|character| *character != '\n') {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                changed = true;
+                out.push(' ');
+                index += 2;
+                let mut closed = false;
+                while index + 1 < chars.len() {
+                    if chars[index] == '*' && chars[index + 1] == '/' {
+                        index += 2;
+                        closed = true;
+                        break;
+                    }
+                    index += 1;
+                }
+                if !closed {
+                    return None;
                 }
             }
             ',' => {
-                // Drop the comma when only whitespace separates it from a
-                // closing bracket — a trailing comma.
-                let mut ahead = chars.clone();
-                let mut trailing = false;
-                while let Some(&nc) = ahead.peek() {
-                    if nc.is_whitespace() {
-                        ahead.next();
-                    } else {
-                        trailing = nc == '}' || nc == ']';
-                        break;
-                    }
-                }
-                if trailing {
+                let trailing = matches!(
+                    (
+                        containers.last().copied(),
+                        next_non_comment_character(index + 1),
+                    ),
+                    (Some('{'), Some('}')) | (Some('['), Some(']'))
+                );
+                if previous_was_value && trailing {
                     changed = true;
                 } else {
-                    out.push(c);
+                    out.push(',');
+                    previous_was_value = false;
                 }
+                index += 1;
             }
-            _ => out.push(c),
+            '{' | '[' => {
+                let opener = chars[index];
+                containers.push(opener);
+                out.push(opener);
+                previous_was_value = false;
+                index += 1;
+            }
+            '}' | ']' => {
+                let closer = chars[index];
+                let opener = if closer == '}' { '{' } else { '[' };
+                if containers.last().copied() == Some(opener) {
+                    containers.pop();
+                }
+                out.push(closer);
+                previous_was_value = true;
+                index += 1;
+            }
+            ':' => {
+                out.push(':');
+                previous_was_value = false;
+                index += 1;
+            }
+            character if character.is_whitespace() => {
+                out.push(character);
+                index += 1;
+            }
+            character => {
+                // Numbers, literals, and invalid bare tokens are validated by
+                // the strict serde_json retry after normalization.
+                out.push(character);
+                previous_was_value = true;
+                index += 1;
+            }
         }
     }
     changed.then_some(out)
