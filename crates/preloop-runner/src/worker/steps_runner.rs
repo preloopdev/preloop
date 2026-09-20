@@ -232,6 +232,15 @@ pub async fn run_steps(
                         setup_lines.push(format!("{ts} {perm}: {level_str}"));
                     }
                 }
+                // H3: a static-PAT-backed GITHUB_TOKEN does not honor the
+                // workflow's `permissions:` block, so the declared set above is
+                // not what the token carries. State the token's real authority
+                // in the same group rather than leaving it to be inferred.
+                if let Some(pat_scopes) = job.get_variable("system.github.token.pat_scopes") {
+                    setup_lines.push(format!(
+                        "{ts} PAT mode: `permissions:` is NOT enforced; GITHUB_TOKEN authority: {pat_scopes}"
+                    ));
+                }
                 setup_lines.push(format!("{ts} ##[endgroup]"));
             }
         }

@@ -2312,11 +2312,11 @@ where
     // by the broker at dispatch.
     //
     // H3: the expansion pipeline is synchronous, so it cannot introspect the
-    // PAT's OAuth scopes itself; it enforces from the process-wide scope
-    // cache warmed by submission-time introspection. On a cold cache the
-    // scopes are unverifiable — warn loudly and mark the token unverified
-    // (the wire variable says so honestly) rather than blocking the executor
-    // on network I/O.
+    // PAT's OAuth scopes itself; it enforces from the process-wide scope cache,
+    // which the server warms at startup and every submission refreshes. On a
+    // cold cache the bounds are unverifiable, so the PAT is withheld rather
+    // than embedded: the executor must not block on network I/O, and a
+    // credential nobody can bound must not reach a job.
     let pat_override = if shared.state.github_app.is_none() {
         match shared.state.static_github_pat() {
             Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
@@ -2336,10 +2336,11 @@ where
                 None => {
                     tracing::warn!(
                         run_id = %ctx.run_id,
-                        "expanding jobs with a PAT whose OAuth scopes have not been introspected: \
-                         workflow `permissions:` blocks are NOT enforced in PAT mode"
+                        "Withholding the static PAT for this expansion: its OAuth scopes have not been \
+                         introspected, so workflow `permissions:` blocks cannot be enforced. Jobs keep \
+                         the job-scoped runtime token and any step that needs GitHub fails."
                     );
-                    Some(crate::runs::PatToken::unverified(pat))
+                    Some(crate::runs::PatToken::withheld())
                 }
             },
             None => None,

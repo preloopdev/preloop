@@ -10525,15 +10525,38 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
 }
 
 /// Point PAT scope introspection (H3) at a dead local address so tests that
-/// submit runs with a configured PAT stay hermetic: the probe fails fast
-/// with connection-refused (`Unverifiable` → loud warning, run proceeds)
-/// instead of reaching api.github.com, where a fake PAT would 401 and fail
-/// the run.
+/// submit runs with a configured PAT stay hermetic: the probe fails fast with
+/// connection-refused instead of reaching api.github.com, where a fake PAT
+/// would 401 and fail the run. The scopes are then `Unverifiable`, so the PAT
+/// is withheld from jobs while the run itself still proceeds.
 fn dead_pat_scope_api() -> crate::state::TestEnvVar {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead API port");
     let port = listener.local_addr().expect("dead API local addr").port();
     drop(listener);
     crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"))
+}
+
+/// Point PAT scope introspection (H3) at a local stub that reports `scopes` as
+/// the PAT's classic OAuth scopes, so the credential can be verified and is
+/// therefore embedded.
+async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVar {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind API stub port");
+    let addr = listener.local_addr().expect("API stub local addr");
+    let stub = axum::Router::new().route(
+        "/",
+        axum::routing::get(move || async move {
+            (
+                [("X-OAuth-Scopes", scopes)],
+                axum::Json(serde_json::json!({})),
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, stub).await.unwrap();
+    });
+    crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://{addr}"))
 }
 
 /// A PAT-only deployment embeds the static PAT into job messages at build
@@ -10547,10 +10570,11 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     // asserted token flips under parallelism.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    // H3: PAT scope introspection must stay hermetic — without this the probe
+    // H3: PAT scope introspection must stay hermetic — without a stub the probe
     // would reach api.github.com, where the fake PAT 401s and the run is
-    // refused.
-    let _dead_api = dead_pat_scope_api();
+    // refused. A stub reporting read-only scopes lets the PAT be verified, and
+    // therefore embedded, without a real credential.
+    let _live_api = live_pat_scope_api("read:org, read:user").await;
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
@@ -15224,8 +15248,10 @@ async fn pat_only_config_supplies_job_github_token() {
     // it, and a leaked value would win env-then-config and break the assert.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    // H3: keep PAT scope introspection hermetic (see `dead_pat_scope_api`).
-    let _dead_api = dead_pat_scope_api();
+    // H3: keep PAT scope introspection hermetic while still letting the PAT be
+    // verified: the stub reports read-only scopes, so the configured PAT is
+    // embedded rather than withheld.
+    let _live_api = live_pat_scope_api("read:org, read:user").await;
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     std::fs::write(&config_path, "[github]\npat = \"github_pat_testvalue\"\n").unwrap();
@@ -15256,6 +15282,69 @@ async fn pat_only_config_supplies_job_github_token() {
         .expect("job message carries a GitHub token variable");
     assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
     assert_eq!(token.is_secret, Some(true));
+}
+
+/// H3: a PAT whose OAuth scopes cannot be introspected must not be embedded.
+/// The job keeps the job-scoped runtime token, so a step that needs GitHub
+/// fails at the point of use instead of running with authority nobody could
+/// bound, and the wire variable discloses the withholding.
+#[tokio::test]
+async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _dead_api = dead_pat_scope_api();
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    // A distinct PAT value, because the scope cache is process-global and keyed
+    // by the token hash: reusing another test's PAT could read a verified answer
+    // cached there and never exercise the withheld path.
+    std::fs::write(
+        &config_path,
+        "[github]\npat = \"github_pat_unverifiable_scopes\"\n",
+    )
+    .unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+
+    let yaml =
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    let accepted = crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("unverifiable scopes withhold the PAT, they do not refuse the run");
+    let run_id = accepted.run_id.to_string();
+
+    let inner = state.inner.lock().await;
+    let message = queued_message_for(&inner, &run_id);
+    let runtime_token = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    assert_eq!(
+        variable_value(&message, "system.github.token"),
+        Some(runtime_token.as_str()),
+        "an unverifiable PAT is withheld in favour of the job-scoped runtime token"
+    );
+    assert_ne!(
+        variable_value(&message, "system.github.token"),
+        Some("github_pat_unverifiable_scopes"),
+        "the PAT must never reach a job whose bounds could not be verified"
+    );
+    let authority = variable_value(&message, "system.github.token.pat_scopes")
+        .expect("the withheld state is published for the runner to print");
+    assert!(
+        authority.contains("withheld"),
+        "the wire variable must disclose the withheld PAT, got: {authority}"
+    );
 }
 
 /// H3: scope-mismatch matrix for the static-PAT permission check. A classic
@@ -15457,15 +15546,22 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
         Some("h3-narrow-pat"),
         "the narrow PAT still reaches the job"
     );
+    // `system.github.token.permissions` keeps its documented map shape: a
+    // consumer parsing it as `{"<Permission>": "<level>"}` must not meet a
+    // non-permission key whose value is prose.
     let wire = variable_value(&message, "system.github.token.permissions")
-        .expect("PAT mode restates the permissions wire variable");
+        .expect("PAT mode keeps the permissions wire variable");
     assert!(
-        wire.contains("static PAT OAuth scopes"),
-        "wire variable admits the declared set is not honored, got: {wire}"
+        serde_json::from_str::<serde_json::Value>(wire).is_ok_and(|value| value.is_object()),
+        "the permissions wire variable must stay a JSON object, got: {wire}"
     );
+    // The token's real authority is published separately, so the runner can
+    // state that the declared set above is not enforced in PAT mode.
+    let pat_scopes = variable_value(&message, "system.github.token.pat_scopes")
+        .expect("PAT mode publishes the token's real authority");
     assert!(
-        !wire.contains("contents"),
-        "wire variable must not echo the declared set, got: {wire}"
+        pat_scopes.contains("static PAT OAuth scopes") && pat_scopes.contains("read:org"),
+        "pat_scopes must carry the introspected OAuth scopes, got: {pat_scopes}"
     );
 }
 

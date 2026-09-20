@@ -294,33 +294,37 @@ fn existing_webhook_run(
 /// silently ignored while `system.github.token.permissions` still advertises
 /// the declared set. `submit_run_inner` introspects the PAT's classic OAuth
 /// scopes (`X-OAuth-Scopes`) and refuses the run when the PAT is broader than
-/// a job declared; an invalid PAT is refused outright. The wire variable is
-/// restated honestly in `build_job_artifacts`.
-/// A static PAT embedded as a job's `GITHUB_TOKEN`, with the classic OAuth
-/// scopes introspected at submission. Empty `scopes` means the PAT returned
-/// no scopes header (fine-grained PATs don't) or introspection was
-/// impossible, so its bounds are unverifiable here.
+/// a job declared; an invalid PAT is refused outright. `build_job_artifacts`
+/// publishes the token's real authority in `system.github.token.pat_scopes`,
+/// which the runner prints alongside the declared permission set.
+///
+/// What a job's `GITHUB_TOKEN` becomes in PAT mode (H3).
+///
+/// A static PAT cannot be narrowed per job, so it is embedded only when its
+/// classic OAuth scopes were introspected and do not exceed the job's declared
+/// `permissions:`. When its bounds cannot be established the credential is
+/// withheld: the job keeps the job-scoped runtime token, so a step that needs
+/// GitHub fails at the point of use instead of running with authority nobody
+/// could bound.
 #[derive(Clone, Debug)]
-pub(crate) struct PatToken {
-    token: String,
-    scopes: Vec<String>,
+pub(crate) enum PatToken {
+    /// Classic OAuth scopes introspected and no broader than declared.
+    Embed { token: String, scopes: Vec<String> },
+    /// Bounds unverifiable (no scopes header, cold scope cache, unreachable
+    /// API). The PAT is not embedded.
+    Withheld,
 }
 
 impl PatToken {
     /// A PAT whose classic OAuth scopes were introspected: the wire variable
     /// advertises the actual scopes.
     pub(crate) fn with_scopes(token: String, scopes: Vec<String>) -> Self {
-        Self { token, scopes }
+        Self::Embed { token, scopes }
     }
 
-    /// A PAT whose scopes could not be introspected (fine-grained PAT, cold
-    /// scope cache, unreachable API): the wire variable says so honestly
-    /// instead of claiming the declared permission set.
-    pub(crate) fn unverified(token: String) -> Self {
-        Self {
-            token,
-            scopes: Vec::new(),
-        }
+    /// A PAT whose bounds could not be verified, so it is withheld.
+    pub(crate) fn withheld() -> Self {
+        Self::Withheld
     }
 }
 
@@ -334,8 +338,9 @@ static PAT_SCOPE_CACHE: LazyLock<PatScopeCache> = LazyLock::new(|| Mutex::new(Ha
 
 /// Synchronous read of the PAT scope cache, for the synchronous scheduler
 /// expansion pipeline (`build_jobs` cannot do network I/O). Returns the
-/// cached scopes when a previous submission-time introspection populated
-/// them; `None` on a cold or expired entry.
+/// cached scopes once the process has introduced them already: startup warms
+/// the cache and every submission refreshes it. `None` on a cold or expired
+/// entry.
 pub(crate) fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
@@ -347,15 +352,54 @@ pub(crate) fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
         .map(|(_, scopes)| scopes)
 }
 
+/// Warm the process-wide PAT scope cache once at startup (H3).
+///
+/// The job expansion pipeline is synchronous and reads [`cached_pat_scopes`],
+/// so without a warm entry the first expansions after a restart would find a
+/// cold cache and have to withhold the PAT. The PAT is fixed for the process
+/// lifetime (read from config/env during state construction), so one lookup
+/// here covers every later expansion.
+///
+/// Failures are logged, never fatal: a server that cannot reach the GitHub API
+/// still serves, and the run path withholds the credential instead of
+/// embedding one whose bounds nobody established.
+pub(crate) async fn warm_pat_scope_cache(pat: &str) {
+    match pat_oauth_scopes(pat).await {
+        PatScopeOutcome::Known(scopes) => {
+            tracing::info!(
+                scope_count = scopes.len(),
+                "Warmed the static PAT OAuth scope cache"
+            );
+        }
+        PatScopeOutcome::Unverifiable { reason } => {
+            tracing::warn!(
+                reason = %reason,
+                "Could not introspect PRELOOP_GITHUB_TOKEN OAuth scopes at startup; jobs keep the \
+                 job-scoped runtime token until an introspection succeeds, so any step that needs \
+                 GitHub fails."
+            );
+        }
+        PatScopeOutcome::Invalid(error) => {
+            tracing::error!(
+                error = %error,
+                "PRELOOP_GITHUB_TOKEN was rejected by the GitHub API at startup; jobs keep the \
+                 job-scoped runtime token and any step that needs GitHub fails."
+            );
+        }
+    }
+}
+
 /// Outcome of PAT scope introspection.
 enum PatScopeOutcome {
     /// Classic scopes positively determined: enforce declared-vs-PAT.
     Known(Vec<String>),
     /// No scopes header (fine-grained PAT), a quirky API root, or an
-    /// unreachable API: bounds unverifiable. The caller warns loudly and
-    /// proceeds — the control plane cannot always reach the API (proxies,
-    /// air gaps) and refusing every run then is a self-DoS; the warning and
-    /// the honest wire variable are the backstop.
+    /// unreachable API: bounds unverifiable. The caller withholds the PAT
+    /// rather than embedding a credential whose authority nobody can bound:
+    /// the job still runs, on the job-scoped runtime token, and a step that
+    /// needs GitHub fails at the point of use. Refusing the whole run instead
+    /// would be a self-DoS when the control plane cannot reach the API
+    /// (proxies, air gaps).
     Unverifiable { reason: String },
     /// The PAT itself was rejected by the API: fail closed.
     Invalid(anyhow::Error),
@@ -365,9 +409,11 @@ enum PatScopeOutcome {
 /// response header on an authenticated API-root request.
 ///
 /// Returns [`PatScopeOutcome::Known`] with the scope list when GitHub answers
-/// successfully; an empty list means the PAT emitted no scopes header
-/// (fine-grained PATs don't), so its bounds are unverifiable. Results are
-/// cached per PAT (SHA-256 of the token) for [`PAT_SCOPE_CACHE_TTL`].
+/// successfully with an `X-OAuth-Scopes` header. An *absent* header is
+/// [`PatScopeOutcome::Unverifiable`], not an empty scope list: GitHub omits it
+/// for fine-grained PATs, so absence means the token's bounds are unknown
+/// rather than narrow. Results are cached per PAT (SHA-256 of the token) for
+/// [`PAT_SCOPE_CACHE_TTL`].
 async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
@@ -404,18 +450,23 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
             reason: format!("unexpected status {status} from the GitHub API root"),
         };
     }
-    let scopes: Vec<String> = response
-        .headers()
-        .get("x-oauth-scopes")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .map(|scope| scope.trim().to_owned())
-                .filter(|scope| !scope.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(header) = response.headers().get("x-oauth-scopes") else {
+        return PatScopeOutcome::Unverifiable {
+            reason: "GitHub returned no X-OAuth-Scopes header (fine-grained PAT, or a proxied API \
+                     root that drops it)"
+                .to_owned(),
+        };
+    };
+    let Ok(header) = header.to_str() else {
+        return PatScopeOutcome::Unverifiable {
+            reason: "X-OAuth-Scopes header was not valid UTF-8".to_owned(),
+        };
+    };
+    let scopes: Vec<String> = header
+        .split(',')
+        .map(|scope| scope.trim().to_owned())
+        .filter(|scope| !scope.is_empty())
+        .collect();
     if let Ok(mut cache) = PAT_SCOPE_CACHE.lock() {
         cache.insert(cache_key, (Instant::now(), scopes.clone()));
     }
@@ -499,17 +550,21 @@ pub(crate) fn enforce_pat_permissions(
     )))
 }
 
-/// Honest `system.github.token.permissions` wire value for a PAT-backed
+/// Honest `system.github.token.pat_scopes` wire value for a PAT-backed
 /// `GITHUB_TOKEN`: the workflow's declared set is not honored in PAT mode, so
-/// advertise the PAT's actual OAuth scopes (or their unverifiability) instead
-/// of a permission set the token does not carry.
-fn pat_permissions_wire_json(scopes: &[String]) -> String {
-    let value = if scopes.is_empty() {
-        "unverified: fine-grained PAT or scopes unavailable; NOT the declared set".to_owned()
+/// the token's actual classic OAuth scopes (or their unverifiability) are
+/// stated here. `system.github.token.permissions` keeps its documented
+/// `{"<Permission>": "<level>"}` map shape, so consumers that parse it are not
+/// surprised by a key that is not a permission and a value that is prose.
+fn pat_scopes_wire_value(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        // The header was present but listed nothing: the token carries no
+        // classic scopes, which is narrower than any declaration. Distinct from
+        // an absent header, which is unverifiable and never reaches this path.
+        "no classic OAuth scopes reported; NOT the declared `permissions:` set".to_owned()
     } else {
         format!("static PAT OAuth scopes: {}", scopes.join(", "))
-    };
-    serde_json::json!({ "PAT": value }).to_string()
+    }
 }
 
 pub(crate) async fn submit_run_inner(
@@ -948,12 +1003,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| {
-            if submission.git_ref.len() == 40
-                && submission
-                    .git_ref
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit())
-            {
+            if preloop_gha_protocol::git_ref::is_commit_sha(&submission.git_ref) {
                 submission.git_ref.clone()
             } else {
                 "0000000000000000000000000000000000000000".to_owned()
@@ -1300,22 +1350,39 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             // than a job's declared `permissions:` would silently hand every
             // non-fork job authority the workflow never claimed. Introspect
             // the PAT's classic OAuth scopes and refuse the run on mismatch;
-            // an invalid PAT is refused outright.
-            let scopes = match pat_oauth_scopes(&pat).await {
+            // an invalid PAT is refused outright, and a PAT whose bounds
+            // cannot be verified is withheld rather than embedded.
+            match pat_oauth_scopes(&pat).await {
                 PatScopeOutcome::Known(scopes) => {
                     enforce_pat_permissions(&jobs, &submission, &scopes)?;
-                    scopes
+                    tracing::warn!(
+                        %run_id,
+                        pat_scopes = %scopes.join(", "),
+                        "Using PRELOOP_GITHUB_TOKEN PAT for run jobs: workflow `permissions:` blocks are \
+                         NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
+                         GitHub App to mint least-privilege installation tokens."
+                    );
+                    github_tokens.extend(jobs.iter().map(|job| {
+                        (
+                            job.id.clone(),
+                            PatToken::with_scopes(pat.clone(), scopes.clone()),
+                        )
+                    }));
                 }
                 PatScopeOutcome::Unverifiable { reason } => {
                     tracing::warn!(
                         %run_id,
                         reason = %reason,
-                        "Using PRELOOP_GITHUB_TOKEN PAT for run jobs with unverifiable OAuth scopes: \
-                         workflow `permissions:` blocks are NOT enforced in PAT mode. Ensure the PAT \
-                         is scoped no broader than your workflows' declared permissions, or configure \
-                         a GitHub App to mint least-privilege installation tokens."
+                        "Withholding PRELOOP_GITHUB_TOKEN for run jobs: its OAuth scopes could not be \
+                         introspected, so workflow `permissions:` blocks cannot be enforced and the \
+                         PAT is not embedded. Jobs keep the job-scoped runtime token, so any step that \
+                         needs GitHub fails. Configure a GitHub App to mint least-privilege installation \
+                         tokens, or make the GitHub API reachable so the scopes can be verified."
                     );
-                    Vec::new()
+                    github_tokens.extend(
+                        jobs.iter()
+                            .map(|job| (job.id.clone(), PatToken::withheld())),
+                    );
                 }
                 PatScopeOutcome::Invalid(error) => {
                     return Err(ApiError::forbidden(format!(
@@ -1324,22 +1391,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                          job GITHUB_TOKENs"
                     )));
                 }
-            };
-            if !scopes.is_empty() {
-                tracing::warn!(
-                    %run_id,
-                    pat_scopes = %scopes.join(", "),
-                    "Using PRELOOP_GITHUB_TOKEN PAT for run jobs: workflow `permissions:` blocks are \
-                     NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
-                     GitHub App to mint least-privilege installation tokens."
-                );
             }
-            github_tokens.extend(jobs.iter().map(|job| {
-                (
-                    job.id.clone(),
-                    PatToken::with_scopes(pat.clone(), scopes.clone()),
-                )
-            }));
         }
     }
 
@@ -2417,7 +2469,7 @@ pub(crate) fn build_job_artifacts(
             .read()
             .is_environment_registered(&submission.repository, env_name)
         {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::forbidden(format!(
                 "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
                 submission.repository
             )));
@@ -2565,15 +2617,28 @@ pub(crate) fn build_job_artifacts(
         runtime_token.clone()
     } else if let Some(pat) = github_token_override {
         // PAT mode: the token carries the PAT's OAuth scopes, not the
-        // workflow's declared `permissions:` the builder wrote into the wire
-        // variable above. Restate it honestly — the runner prints this as its
-        // `GITHUB_TOKEN Permissions` group and it must not claim authority
-        // the token lacks, nor hide authority it has.
+        // workflow's declared `permissions:`. `system.github.token.permissions`
+        // keeps its documented map shape (the declared set, as the message
+        // builder wrote it) so consumers that parse it are not surprised; the
+        // token's real authority goes in its own variable, which the runner
+        // prints inside the same `GITHUB_TOKEN Permissions` group.
+        let (token, authority) = match pat {
+            PatToken::Embed { token, scopes } => (token, pat_scopes_wire_value(&scopes)),
+            // H3: unverifiable authority means no PAT is embedded. The job
+            // keeps the runtime token, which authenticates only against this
+            // control plane, so a step that needs GitHub fails at the point of
+            // use rather than running with authority nobody could bound.
+            PatToken::Withheld => (
+                runtime_token.clone(),
+                "withheld: PAT authority unverifiable; NOT the declared `permissions:` set"
+                    .to_owned(),
+            ),
+        };
         agent_msg.variables.insert(
-            "system.github.token.permissions".to_owned(),
-            preloop_gha_protocol::azdo::VariableValue::new(pat_permissions_wire_json(&pat.scopes)),
+            "system.github.token.pat_scopes".to_owned(),
+            preloop_gha_protocol::azdo::VariableValue::new(authority),
         );
-        pat.token
+        token
     } else {
         runtime_token.clone()
     };
@@ -4013,7 +4078,7 @@ mod tests {
         .await;
         assert_eq!(
             status,
-            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
             "a job claiming an unregistered environment must fail closed, got: {body}"
         );
         assert!(
