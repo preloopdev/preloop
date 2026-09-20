@@ -158,6 +158,12 @@ jobs:
       - run: cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4
         env:
           RUSTFLAGS: "-A warnings"
+          # The preloop-runner-server lib test is a single ~27k-line crate and
+          # the largest rustc unit in the workspace; with full debug info its
+          # compile OOMs (SIGKILL) inside the 4 GiB runner guest. Line-tables-
+          # only debug info keeps backtrace line numbers while cutting rustc's
+          # peak memory enough to fit the guest.
+          CARGO_PROFILE_TEST_DEBUG: "1"
 
   property-tests-fast:
     name: property-tests-fast
