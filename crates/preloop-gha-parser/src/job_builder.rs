@@ -685,7 +685,10 @@ pub fn build_agent_job_message_with_normalized_context(
         steps,
         retry_count: None,
         pre_job_timeout: None,
-        job_timeout: None,
+        // `jobTimeout` is seconds on the wire (see azdo::job). The workflow's
+        // `timeout-minutes` is minutes, so it is scaled here; `None` leaves the
+        // runner/server default (360 min) in effect.
+        job_timeout: plan.timeout_minutes.map(|minutes| (minutes * 60) as i64),
         job_container: plan
             .container
             .as_ref()
@@ -1078,6 +1081,59 @@ jobs:
             .endpoints
             .iter()
             .any(|e| e.name == "SystemVssConnection"));
+    }
+
+    /// `timeout-minutes` on the job must reach the runner as `jobTimeout` in
+    /// seconds — the field the server's reaper and the runner's timer both
+    /// read. An absent `timeout-minutes` leaves the field `None` so the
+    /// default applies.
+    #[test]
+    fn job_timeout_minutes_maps_to_job_timeout_seconds() {
+        let workflow = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - run: echo ok
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&workflow).unwrap()[0];
+        assert_eq!(plan.timeout_minutes, Some(60));
+        let msg = build_agent_job_message(
+            plan,
+            &serde_json::json!({}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(msg.job_timeout, Some(3600));
+
+        let no_timeout = parse_workflow(
+            r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"#,
+        )
+        .unwrap();
+        let plan = &crate::expand_jobs(&no_timeout).unwrap()[0];
+        let msg = build_agent_job_message(
+            plan,
+            &serde_json::json!({}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(msg.job_timeout, None);
     }
 
     #[test]

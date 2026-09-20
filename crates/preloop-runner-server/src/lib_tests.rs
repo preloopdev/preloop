@@ -13578,9 +13578,18 @@ async fn runner_lease_expiration_disconnect_reaper() {
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // 3. Exercise the just-before-boundary case without sleeping.
+    // 3. Exercise the just-before-boundary case without sleeping. The session
+    // must be dead here: a *live* session with a stale lease is the hung-
+    // worker case (reaped at HUNG_WORKER_LEASE_SECONDS), not the disconnect
+    // boundary this test isolates. Age the session past liveness so only the
+    // lease clock decides.
     {
         let mut inner = state.inner.lock().await;
+        let stale_seen =
+            std::time::Instant::now() - inner.runner_liveness_timeout - Duration::from_secs(1);
+        inner
+            .session_last_seen
+            .insert("default".to_owned(), stale_seen);
         let request = inner.job_requests.get_mut(&request_id).unwrap();
         request.last_renewed_at =
             Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS - 1));
@@ -13622,6 +13631,138 @@ async fn runner_lease_expiration_disconnect_reaper() {
         let run = inner.runs.get(&run_id).unwrap();
         assert_eq!(run.status, ExecutionStatus::Failure);
     }
+}
+/// A worker that stops renewing while its session keeps polling is hung, not
+/// disconnected: the live session proves the guest is reachable, so the stale
+/// lease can only mean the renew task died. The reaper must fail the job on
+/// the worker's own cadence (HUNG_WORKER_LEASE_SECONDS) rather than holding
+/// the runner slot for the full JOB_LEASE_SECONDS disconnect timeout.
+#[tokio::test]
+async fn hung_worker_reaped_while_session_still_polls() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 10\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Poll to claim the job; this marks the session live and sets the lease.
+    let _msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.job_requests.keys().next().unwrap()
+    };
+
+    // Worker stops renewing (lease stale past the hung threshold) but the
+    // session stays fresh — the listener is alive, the worker is not.
+    {
+        let mut inner = state.inner.lock().await;
+        inner
+            .session_last_seen
+            .insert("default".to_owned(), std::time::Instant::now());
+        let request = inner.job_requests.get_mut(&request_id).unwrap();
+        request.last_renewed_at =
+            Some(SystemTime::now() - Duration::from_secs(HUNG_WORKER_LEASE_SECONDS + 1));
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    let request = inner.job_requests.get(&request_id).unwrap();
+    assert_eq!(
+        request.result,
+        Some(ExecutionStatus::Failure),
+        "a hung worker must be reaped on its own cadence, not the full lease"
+    );
+    assert!(inner.session_active_requests.is_empty());
+    assert_eq!(
+        inner.runs.get(&run_id).unwrap().status,
+        ExecutionStatus::Failure
+    );
+}
+
+/// The mirror image: a stale lease with a *dead* session is a disconnect, not
+/// a hung worker. It must wait out the full JOB_LEASE_SECONDS boundary — the
+/// guest may be partitioned and could still come back.
+#[tokio::test]
+async fn dead_session_stale_lease_waits_for_full_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 10\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let _run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let _msg = request_json(
+        &app,
+        Method::GET,
+        "/runner/server/_apis/v1/Message/1?sessionId=default",
+        Value::Null,
+    )
+    .await;
+    let request_id = {
+        let inner = state.inner.lock().await;
+        *inner.job_requests.keys().next().unwrap()
+    };
+
+    // Lease stale past the hung threshold but the session is dead — this is a
+    // disconnect, so the job must NOT be reaped at the hung-worker cadence.
+    {
+        let mut inner = state.inner.lock().await;
+        let stale_seen =
+            std::time::Instant::now() - inner.runner_liveness_timeout - Duration::from_secs(1);
+        inner
+            .session_last_seen
+            .insert("default".to_owned(), stale_seen);
+        let request = inner.job_requests.get_mut(&request_id).unwrap();
+        request.last_renewed_at =
+            Some(SystemTime::now() - Duration::from_secs(HUNG_WORKER_LEASE_SECONDS + 1));
+    }
+
+    reap_once(&shared).await;
+
+    let inner = state.inner.lock().await;
+    let request = inner.job_requests.get(&request_id).unwrap();
+    assert_eq!(
+        request.result, None,
+        "a dead session is a disconnect; it must wait out the full lease"
+    );
 }
 
 #[tokio::test]

@@ -606,6 +606,13 @@ pub(crate) fn agent_request_result(status: ExecutionStatus) -> &'static str {
 /// mirroring the official dispatcher.
 pub(crate) const JOB_LEASE_SECONDS: u64 = 2700;
 
+/// How stale a job lease may grow while its session still polls before the
+/// worker is declared hung. The runner renews every ~60s; three missed
+/// renewals is a wedged renew task, not a slow one. Far below
+/// [`JOB_LEASE_SECONDS`] because the live session already proves the guest is
+/// reachable — the lease is only stale because the worker died.
+pub(crate) const HUNG_WORKER_LEASE_SECONDS: u64 = 180;
+
 pub(crate) fn agent_request_locked_until() -> String {
     server_iso_at(SystemTime::now() + Duration::from_secs(JOB_LEASE_SECONDS))
 }

@@ -3353,6 +3353,7 @@ mod tests {
             concurrency_cancel_in_progress: None,
             concurrency_queue: None,
             reusable_call: None,
+            timeout_minutes: None,
         };
 
         // A job defined in the caller contributes no second entry.

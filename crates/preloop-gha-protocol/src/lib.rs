@@ -517,6 +517,12 @@ pub struct JobPlan {
     /// matching GitHub, which never materializes a false-gated caller's subtree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reusable_call: Option<ReusableCallPlan>,
+    /// Resolved job `timeout-minutes`, in minutes.
+    ///
+    /// Carried to the runner as `jobTimeout` (seconds) on the job request
+    /// message; `None` means the runner/server default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<u64>,
 }
 
 /// Everything needed to expand a reusable-workflow caller node into its

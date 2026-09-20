@@ -583,6 +583,15 @@ fn job_plan_from_job(
     } else {
         resolve_deferred_number(job.strategy.max_parallel.as_ref(), &matrix, inputs)?
     };
+    // Job `timeout-minutes` resolves like `max-parallel`: literals apply even
+    // under a needs-deferred matrix, expressions wait for the runtime fan-out.
+    let timeout_minutes = if matrix_deferred {
+        job.timeout_minutes
+            .as_ref()
+            .and_then(DeferredNumber::literal)
+    } else {
+        resolve_deferred_number(job.timeout_minutes.as_ref(), &matrix, inputs)?
+    };
     let steps = job
         .steps
         .iter()
@@ -658,6 +667,7 @@ fn job_plan_from_job(
         concurrency_cancel_in_progress,
         concurrency_queue,
         reusable_call: None,
+        timeout_minutes,
     })
 }
 
@@ -981,6 +991,7 @@ fn expand_jobs_with_reusables_internal(
                         }),
                         depth: depth + 1,
                     }),
+                    timeout_minutes: None,
                 });
             }
             continue;
