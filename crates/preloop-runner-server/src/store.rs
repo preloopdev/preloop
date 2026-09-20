@@ -2243,6 +2243,19 @@ impl SqliteStore {
                 tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
                 continue;
             };
+            // `job_steps.run_id REFERENCES runs` — restoring a step for a
+            // run that `inner.runs` did not restore (evicted past the
+            // completed cap) makes the next `store_inner` snapshot violate
+            // the FK. Map the attempt back to its run through
+            // `agent_job_requests` and skip if the run is not in memory.
+            let run_id = inner
+                .agent_job_requests
+                .get(&agent_job_id)
+                .and_then(|request_id| inner.job_requests.get(request_id))
+                .map(|record| record.run_id);
+            if run_id.is_none() || !inner.runs.contains_key(&run_id.unwrap()) {
+                continue;
+            }
             let name = match self.cipher.unseal(&name_blob) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(error) => {
@@ -2266,13 +2279,17 @@ impl SqliteStore {
                         "workflow" => crate::models::StepKind::Workflow,
                         _ => crate::models::StepKind::Synthetic,
                     },
-                    workflow_index: workflow_index.map(|index| index as usize),
-                    runner_number: runner_number.map(|number| number as u32),
+                    workflow_index: workflow_index.map(|value| value as usize),
+                    runner_number: runner_number.map(|value| value as u32),
                     context_name,
                     name,
                     conclusion,
-                    started_at: started_at_us.and_then(chrono::DateTime::from_timestamp_micros),
-                    finished_at: finished_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                    started_at: started_at_us.map(|us| {
+                        chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()
+                    }),
+                    finished_at: finished_at_us.map(|us| {
+                        chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()
+                    }),
                 });
         }
         // Log bytes live in their own table; rebuild the in-memory buffers
