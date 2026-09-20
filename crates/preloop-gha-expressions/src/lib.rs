@@ -131,6 +131,9 @@ pub enum ExpressionError {
     /// Expression nesting exceeded the parser's depth ceiling.
     #[error("expression nesting exceeds the maximum depth of {0}")]
     TooDeep(usize),
+    /// `fromJSON()` received invalid JSON.
+    #[error("fromJSON() received invalid JSON: {0}")]
+    InvalidJson(String),
 }
 
 /// Parse an expression without evaluating it.
