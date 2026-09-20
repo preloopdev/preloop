@@ -1934,6 +1934,13 @@ impl SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for row in jobs {
+            // `jobs.run_id REFERENCES runs` — restoring a job for a run that
+            // `inner.runs` did not restore (evicted past the completed cap)
+            // makes the next `store_inner` snapshot violate the FK. Skip it;
+            // the durable row stays and live-run jobs are always present.
+            if !inner.runs.contains_key(&row.run_id) {
+                continue;
+            }
             let job: QueuedJob = serde_json::from_slice(&self.cipher.unseal(&row.payload)?)?;
             match row.queue_kind.as_str() {
                 "ready" => inner.queue.push_back(job),
@@ -2135,6 +2142,16 @@ impl SqliteStore {
         })? {
             let (request_id, blob) = row?;
             let record = restore_request_snapshot(&self.cipher, &blob)?;
+            // `inner.runs` restores only in-flight runs plus the newest
+            // `MAX_COMPLETED_RUNS_RETAINED` completed ones; `job_requests`
+            // has `FOREIGN KEY (run_id) REFERENCES runs`, so restoring a
+            // request for an evicted run makes the next `store_inner`
+            // snapshot violate the constraint and every persist fails.
+            // Skip requests whose run is not in memory — the durable row
+            // stays, and a live run's requests are always present.
+            if !inner.runs.contains_key(&record.run_id) {
+                continue;
+            }
             inner
                 .inflight_requests
                 .insert(request_id, (record.run_id, record.job_id.clone()));
