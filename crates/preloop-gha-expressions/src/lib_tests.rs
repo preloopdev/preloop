@@ -630,6 +630,34 @@ mod official_semantics {
     }
 
     #[test]
+    fn tojson_pretty_prints_with_two_space_indent() {
+        // Live-verified against GitHub-hosted runners 2026-09-19.
+        let actual = eval_expression("toJSON(fromJSON('{\"b\":2,\"a\":1}'))", &Context::default())
+            .expect("toJSON should evaluate");
+        let expected = "{\n  \"b\": 2,\n  \"a\": 1\n}";
+        assert_eq!(actual, Value::String(expected.to_string()));
+    }
+
+    #[test]
+    fn join_ignores_non_primitive_separator() {
+        // Live-verified: official falls back to "," when separator is not primitive.
+        let actual = eval_expression(
+            "join(fromJSON('[\"a\",\"b\"]'), fromJSON('[\"x\"]'))",
+            &Context::default(),
+        )
+        .expect("join should evaluate");
+        assert_eq!(actual, Value::String("a,b".to_string()));
+    }
+
+    #[test]
+    fn join_object_returns_empty_string() {
+        // Live-verified: official returns "" for non-array, non-primitive input.
+        let actual = eval_expression("join(fromJSON('{\"a\":1}'))", &Context::default())
+            .expect("join should evaluate");
+        assert_eq!(actual, Value::String(String::new()));
+    }
+
+    #[test]
     fn mixed_kind_coercion_uses_official_numeric_rules() {
         let cases = [
             ("0 == ''", true),

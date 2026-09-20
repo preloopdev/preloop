@@ -428,9 +428,15 @@ fn eval_call(
             .unwrap_or(Value::Null)),
         "join" => join_args(&values, budget).map(Value::String),
         "hashfiles" => hash_files(&values, context).map(Value::String),
-        "tojson" => Ok(Value::String(
-            serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
-        )),
+        "tojson" => {
+            // Official runner (ToJson.cs) pretty-prints with 2-space indent.
+            // Previously emitted compact JSON, breaking text comparisons.
+            // Live-verified against GitHub-hosted runners 2026-09-19.
+            let value = values.first().unwrap_or(&Value::Null);
+            serde_json::to_string_pretty(value).map(Value::String).map_err(|_| {
+                ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES)
+            })
+        }
         _ => Err(ExpressionError::UnknownFunction(name.to_owned())),
     }
 }
@@ -632,27 +638,46 @@ fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, Expressi
 }
 
 fn join_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
-    let separator = string_value_capped(values.get(1).unwrap_or(&Value::Null), budget.remaining())?;
+    // Official runner (Join.cs): separator defaults to "," and is only
+    // honored if the provided value IsPrimitive (arrays/objects fall back
+    // to ","). Non-array, non-primitive input (e.g. objects) yields "".
+    // Live-verified against GitHub-hosted runners 2026-09-19:
+    // join(['a','b'], ['x']) == 'a,b', join({'a':1}) == ''.
+    let separator = match values.get(1) {
+        Some(value) if is_primitive(value) => {
+            string_value_capped(value, budget.remaining())?.into_owned()
+        }
+        _ => ",".to_string(),
+    };
     let mut output = String::new();
     match values.first() {
-        Some(Value::Array(values)) => {
-            for (index, value) in values.iter().enumerate() {
+        Some(Value::Array(items)) => {
+            for (index, value) in items.iter().enumerate() {
                 if index > 0 {
-                    push_evaluation_capped(&mut output, separator.as_ref(), budget)?;
+                    push_evaluation_capped(&mut output, &separator, budget)?;
                 }
                 let rendered =
                     string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
                 push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
             }
         }
-        Some(value) => {
-            let rendered =
-                string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+        Some(value) if is_primitive(value) => {
+            let rendered = string_value_capped(value, budget.remaining())?;
             push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
         }
-        None => {}
+        // Objects and other non-primitives → empty string per official.
+        _ => {}
     }
     Ok(output)
+}
+
+/// Matches official EvaluationResult.IsPrimitive: null, booleans, numbers,
+/// and strings — not arrays or objects.
+fn is_primitive(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    )
 }
 
 fn push_evaluation_capped(
