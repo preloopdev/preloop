@@ -883,6 +883,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             &shared.state.state_dir,
             workspace,
             run_id,
+            Some(shared),
             shared.state.static_github_pat().as_deref(),
         )
         .await
