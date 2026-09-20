@@ -1098,9 +1098,7 @@ pub(crate) async fn resolve_ref_sha(
             return Ok(String::from_utf8(output.stdout)
                 .ok()
                 .map(|sha| sha.trim().to_owned())
-                .filter(|sha| {
-                    sha.len() == 40 && sha.chars().all(|character| character.is_ascii_hexdigit())
-                }));
+                .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha)));
         }
         return Ok(None);
     }
@@ -1406,11 +1404,25 @@ pub(crate) async fn handle_github_webhook(
     // repository granularity: an owner-granularity check would pass a
     // selected-repository installation for a sibling repo under the same
     // owner that the installation does not cover.
-    if let crate::github_app::WebhookSigner::App(app) = &signer {
+    if let crate::github_app::WebhookSigner::App(app_id) = &signer {
         if let Some(claimed) = claimed_repository(&body) {
-            if !crate::github_app::app_covers_repository(app, &claimed).await {
+            // Resolve the App's credentials here rather than in the signer:
+            // the signer carries only the id, so a delivery never clones App
+            // key material.
+            let covers = match shared
+                .state
+                .github_apps
+                .as_ref()
+                .and_then(|apps| apps.app_by_id(app_id))
+            {
+                Some(app) => crate::github_app::app_covers_repository(app, &claimed).await,
+                // The payload's secret matched a registered App's secret, so
+                // its id must resolve. Fail closed rather than skip binding.
+                None => false,
+            };
+            if !covers {
                 warn!(
-                    app_id = %app.app_id,
+                    app_id = %app_id,
                     repository = %claimed,
                     "webhook signer is not installed on the claimed repository; rejecting"
                 );

@@ -117,7 +117,8 @@ impl ActionsResolveClient {
             }
             Err(e) => {
                 tracing::warn!(
-                    "runnerresolve batch failed (will use api.github.com fallback): {e:#}"
+                    "runnerresolve batch failed; action downloads will fail closed \
+                     (M2: there is no api.github.com fallback): {e:#}"
                 );
                 return Ok(HashMap::new());
             }

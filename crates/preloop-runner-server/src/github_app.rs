@@ -285,6 +285,15 @@ impl GitHubApps {
         &self.apps[self.default_index]
     }
 
+    /// The registered App with this id, if any.
+    ///
+    /// `WebhookSigner` carries only an App id so a webhook delivery never
+    /// clones App key material; the binding step resolves the credentials
+    /// here.
+    pub(crate) fn app_by_id(&self, app_id: &str) -> Option<&GitHubAppCredentials> {
+        self.apps.iter().find(|app| app.app_id == app_id)
+    }
+
     /// Every registered webhook secret paired with the signer it belongs
     /// to (M3). Each App's secret maps to that App; the legacy
     /// `AppState::webhook_secret` (if set) maps to [`WebhookSigner::Legacy`].
@@ -301,7 +310,7 @@ impl GitHubApps {
         for app in &self.apps {
             if let Some(secret) = &app.webhook_secret {
                 if !secret.is_empty() && !signers.iter().any(|(have, _)| have == secret) {
-                    signers.push((secret.clone(), WebhookSigner::App(Box::new(app.clone()))));
+                    signers.push((secret.clone(), WebhookSigner::App(app.app_id.clone())));
                 }
             }
         }
@@ -314,14 +323,22 @@ impl GitHubApps {
 /// the payload; the signer binds the claimed repository to the sender's
 /// installation coverage before any event is processed.
 ///
-/// `Debug` is deliberately not derived: the `App` variant carries the App's
-/// private key, which must never appear in logs.
-#[derive(Clone)]
+/// `Debug` is safe to derive now that the `App` variant carries only an id:
+/// the credentials (App private key, PAT fallback, webhook secret) stay in the
+/// registry and never enter a webhook request's memory more than the registry
+/// itself already holds them.
+#[derive(Clone, Debug)]
 pub(crate) enum WebhookSigner {
-    /// A registered GitHub App's webhook secret, boxed to keep the enum
-    /// small. The claimed repository must lie within this App's
+    /// App id of the registered GitHub App whose webhook secret verified the
+    /// payload. The claimed repository must lie within this App's
     /// installation coverage.
-    App(Box<GitHubAppCredentials>),
+    ///
+    /// The id, not the credentials: `GitHubAppCredentials` owns the App
+    /// private key, a PAT fallback, and the webhook secret, so carrying them
+    /// here would deep-copy key material on every delivery. The binding step
+    /// resolves them with [`GitHubApps::app_by_id`]. Because no secret is
+    /// held, `Debug` is safe to derive.
+    App(String),
     /// The legacy single `webhook_secret`: no App identity, no binding —
     /// with no registry there is no cross-App confusion, and a legacy
     /// secret alongside a registry is the operator's own credential.

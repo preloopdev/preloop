@@ -15,13 +15,6 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-/// Whether `git_ref` is a pinned commit SHA (40 hex chars), as opposed to
-/// a mutable branch/tag/short-SHA ref. M2: only pinned SHAs may be
-/// downloaded — anything else means server-side resolution failed.
-fn is_pinned_sha(git_ref: &str) -> bool {
-    git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 /// Download and extract a remote action to the _actions directory.
 ///
 /// `git_ref` must be the server-resolved commit SHA (40 hex chars), not a
@@ -44,7 +37,9 @@ pub async fn download_action(
     download_url: Option<&str>,
     auth_token: Option<&str>,
 ) -> Result<PathBuf> {
-    if !is_pinned_sha(git_ref) {
+    // M2: only pinned commit SHAs may be downloaded; anything else means
+    // server-side resolution failed.
+    if !preloop_gha_protocol::git_ref::is_commit_sha(git_ref) {
         anyhow::bail!(
             "M2: refusing to download action {owner}/{repo}@{git_ref}: \
              ref was not resolved to a commit SHA"

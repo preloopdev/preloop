@@ -61,12 +61,8 @@ async fn resolve_ref_to_sha(
     repo: &str,
     git_ref: &str,
 ) -> Option<String> {
-    // Already a full SHA — no lookup needed.
-    if git_ref.len() == 40
-        && git_ref
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
+    // Already a full SHA: no lookup needed.
+    if preloop_gha_protocol::git_ref::is_commit_sha(git_ref) {
         return Some(git_ref.to_owned());
     }
     let cache_key = (owner.to_owned(), repo.to_owned(), git_ref.to_owned());
@@ -104,7 +100,7 @@ async fn resolve_ref_to_sha(
             .and_then(|body| {
                 body.get("sha")
                     .and_then(|value| value.as_str())
-                    .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+                    .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha))
                     .map(str::to_owned)
             })
     } else {
@@ -538,17 +534,20 @@ pub(crate) async fn runnerresolve_action(
 ) -> Option<(String, serde_json::Value)> {
     let (key, name, git_ref, resolved_sha_opt, tar_url) =
         resolve_action_download(state, action, version_override).await?;
-    let resolved_sha = resolved_sha_opt.unwrap_or_else(|| git_ref.clone());
-    Some((
-        key,
-        json!({
-            "name": name,
-            "version": git_ref,
-            "resolved_sha": resolved_sha,
-            "tar_url": tar_url,
-            "authentication": null,
-        }),
-    ))
+    // M2: never echo the mutable ref back as `resolved_sha`. A caller that trusts the
+    // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
+    // explicit on the wire, and the runner refuses the download instead of fetching
+    // the mutable ref.
+    let mut entry = json!({
+        "name": name,
+        "version": git_ref,
+        "tar_url": tar_url,
+        "authentication": null,
+    });
+    if let Some(resolved_sha) = resolved_sha_opt {
+        entry["resolved_sha"] = json!(resolved_sha);
+    }
+    Some((key, entry))
 }
 
 /// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.

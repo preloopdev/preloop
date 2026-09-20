@@ -123,6 +123,15 @@ pub(crate) async fn resolve_remote_workflows(
             submission
                 .reusable_workflows
                 .insert(reference.to_owned(), contents.clone());
+            // The recorded SHA is what later stages trust as this reusable
+            // workflow's pinned identity, so a malformed lookup response must
+            // not be stored as if it were a commit.
+            if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(&commit.sha) {
+                return Err(ApiError::bad_gateway(format!(
+                    "reusable workflow `{reference}` resolved to a non-commit SHA: {:?}",
+                    commit.sha
+                )));
+            }
             submission
                 .reusable_workflow_shas
                 .insert(reference.to_owned(), commit.sha);
