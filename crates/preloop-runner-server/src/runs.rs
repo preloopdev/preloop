@@ -390,6 +390,7 @@ pub(crate) async fn warm_pat_scope_cache(pat: &str) {
 }
 
 /// Outcome of PAT scope introspection.
+#[derive(Debug)]
 pub(crate) enum PatScopeOutcome {
     /// Classic scopes positively determined: enforce declared-vs-PAT.
     Known(Vec<String>),
@@ -416,6 +417,16 @@ fn github_api_url_allows_credential(url: &reqwest::Url) -> bool {
     cfg!(test)
         && url.scheme() == "http"
         && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+/// Scheme and host only: a configured API URL may embed userinfo or secret
+/// query parameters, which must never be copied into log-facing reasons.
+fn redacted_api_url(url: &reqwest::Url) -> String {
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+        (Some(host), None) => format!("{}://{host}", url.scheme()),
+        (None, _) => format!("{}://?", url.scheme()),
+    }
 }
 
 /// Introspect the static PAT's classic OAuth scopes via the `X-OAuth-Scopes`
@@ -445,7 +456,7 @@ pub(crate) async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
         Ok(url) if github_api_url_allows_credential(&url) => url,
         Ok(url) => {
             return PatScopeOutcome::Unverifiable {
-                reason: format!("GitHub API URL must use HTTPS: {url}"),
+                reason: format!("GitHub API URL must use HTTPS: {}", redacted_api_url(&url)),
             };
         }
         Err(error) => {
@@ -454,7 +465,38 @@ pub(crate) async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
             };
         }
     };
-    let response = match crate::shared_http::CLIENT
+    // The shared client's default redirect policy would follow an `http://`
+    // redirect target with the Authorization header still attached on a
+    // same-host downgrade, re-opening the cleartext PAT leak (CWE-319) the
+    // scheme check above closes. This introspection request therefore only
+    // follows redirects that stay credential-safe; a downgrade attempt
+    // surfaces as a 3xx below and the PAT is withheld.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("preloop-runner-server")
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // Custom policies bypass reqwest's built-in redirect limit, so
+            // cap the chain explicitly; a longer chain is a loop or an
+            // attack, not a healthy API root.
+            if attempt.previous().len() >= 10 {
+                attempt.stop()
+            } else if github_api_url_allows_credential(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build();
+    let client = match client {
+        Ok(client) => client,
+        Err(error) => {
+            return PatScopeOutcome::Unverifiable {
+                reason: format!("GitHub API client build failed: {error:#}"),
+            };
+        }
+    };
+    let response = match client
         .get(url)
         .header("Authorization", format!("Bearer {pat}"))
         .header("Accept", "application/vnd.github+json")
