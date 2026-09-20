@@ -70,7 +70,11 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     env:
-      CARGO_BUILD_JOBS: "6"
+      # 4 GiB runner guests OOM (SIGKILL) when too many rustc/linker jobs run
+      # at once — the preloop-runner-server lib test is the largest unit and
+      # was killed on shard 1 while the other three passed. 6 jobs was tuned
+      # for a bigger box; 4 keeps parallel peak memory inside the guest.
+      CARGO_BUILD_JOBS: "4"
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
     steps:
