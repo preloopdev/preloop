@@ -2052,16 +2052,6 @@ impl SqliteStore {
                 .sessions
                 .insert(session.session_id.0.to_string(), session);
         }
-        // Restore `session_active_requests` so a restarted broker session
-        // knows which request it had claimed but not acked.
-        let mut sar_stmt = connection
-            .prepare("SELECT session_id, active_request_id FROM session_active_requests")?;
-        for row in sar_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })? {
-            let (session_id, request_id) = row?;
-            inner.session_active_requests.insert(session_id, request_id);
-        }
         // Restore per-session broker message queues (dequeued but not yet
         // delivered to the runner) from the `broker_messages` table that
         // `store_inner` writes. `inner.broker_messages` (keyed by request_id)
@@ -2165,6 +2155,23 @@ impl SqliteStore {
                 .timeline_requests
                 .insert(record.timeline_id, request_id);
             inner.job_requests.insert(request_id, record);
+        }
+        // Restore `session_active_requests` so a restarted broker session
+        // knows which request it had claimed but not acked.
+        let mut sar_stmt = connection
+            .prepare("SELECT session_id, active_request_id FROM session_active_requests")?;
+        for row in sar_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (session_id, request_id) = row?;
+            // `session_active_requests.active_request_id` references
+            // `job_requests(request_id)` — restoring a row for a request
+            // that `job_requests` did not restore (evicted run) makes the
+            // next `store_inner` snapshot violate the FK. Skip it.
+            if !inner.job_requests.contains_key(&request_id) {
+                continue;
+            }
+            inner.session_active_requests.insert(session_id, request_id);
         }
 
         if let Some(blob) = connection
