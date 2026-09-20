@@ -152,13 +152,24 @@ pub(crate) async fn twirp_artifact_v2_create(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate the JWT signature and claims before taking the global state lock.
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // R1-10: reject writes from completed/unknown jobs.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
     };
     validate_artifact_name(&request.name)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let token = uuid::Uuid::new_v4().to_string();
+    // The upload token is a server-signed blob JWT; `jti` names the staging
+    // directory and the pending-reservation map key.
+    let jti = uuid::Uuid::new_v4().to_string();
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     // F7: the job is taken from the signed runtime token scope, not the
     // request body, so a runner cannot evade its per-job pending cap by
@@ -170,12 +181,23 @@ pub(crate) async fn twirp_artifact_v2_create(
         .state_dir
         .join("blobs")
         .join("artifact")
-        .join(&token);
+        .join(&jti);
     tokio::fs::create_dir_all(&stage_dir)
         .await
         .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
     {
         let mut inner = shared.state.inner.lock().await;
+        // In-lock re-check: the job may have settled between the gate and
+        // this lock — a settled job must not mint a fresh upload credential.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                drop(inner);
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
         if inner.artifact_v2_registry.contains_key(&registry_key) {
             let _ = tokio::fs::remove_dir_all(&stage_dir).await;
             return Err(ApiError::conflict(format!(
@@ -211,10 +233,10 @@ pub(crate) async fn twirp_artifact_v2_create(
             }
         }
         inner.artifact_v2_pending.insert(
-            token.clone(),
+            jti.clone(),
             ArtifactV2Pending {
                 registry_key,
-                job_backend_id: job_backend_id.unwrap_or_default(),
+                job_backend_id: job_backend_id.clone().unwrap_or_default(),
                 created_unix: now_unix(),
             },
         );
@@ -223,6 +245,15 @@ pub(crate) async fn twirp_artifact_v2_create(
             tracing::warn!(?error, "failed to persist artifact v2 reservation");
         }
     }
+    let token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "artifact",
+            "job": job_backend_id.unwrap_or_default(),
+            "jti": jti,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     let upload_url = format!("{}/twirp-blob/artifact/{token}", runner_base_url());
     info!(
         name = request.name,
@@ -239,6 +270,15 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     Json(request): Json<ArtifactV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // R1-10: reject writes from completed/unknown jobs.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
@@ -394,7 +434,7 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
-    let blob_token = {
+    let blob_jti = {
         let inner = shared.state.inner.lock().await;
         inner
             .artifact_v2_registry
@@ -403,8 +443,19 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
     }
     .ok_or_else(|| ApiError::not_found("artifact not found"))?;
 
+    // Mint a fresh download JWT bound to the stored staging dir — the upload
+    // token's TTL is upload-scoped, so downloads get their own credential.
+    let dl_token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "artifact",
+            "job": "",
+            "jti": blob_jti,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     // URL must end in .zip so the toolkit's streamExtract detects it as a zip.
-    let signed_url = format!("{}/twirp-blob/artifact/{blob_token}.zip", runner_base_url());
+    let signed_url = format!("{}/twirp-blob/artifact/{dl_token}.zip", runner_base_url());
     Ok(Json(json!({ "signed_url": signed_url })))
 }
 
@@ -414,6 +465,15 @@ pub(crate) async fn twirp_artifact_v2_delete(
     Json(request): Json<ArtifactV2DeleteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
+    // R1-10: reject writes from completed/unknown jobs.
+    let identity = match job {
+        None => crate::auth::ResultsIdentity::System,
+        Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+            plan_id: String::new(),
+            job_id,
+        }),
+    };
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
         let inner = shared.state.inner.lock().await;
         artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?

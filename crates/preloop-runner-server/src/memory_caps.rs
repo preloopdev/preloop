@@ -99,6 +99,25 @@ pub(crate) const MAX_ARTIFACTS_PER_RUN: usize = 500;
 /// are evicted past this so a flood of fabricated run ids stays bounded.
 pub(crate) const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 
+/// F8 — retained *completed* run records. `inner.runs` is the source of truth
+/// for run APIs, but a `RunRecord` is heavy (full `WorkflowSubmission`,
+/// `github` context JSON, job details — ~1 MiB each) and completed runs are
+/// never queried by the scheduler. Without a bound, every completed run
+/// accumulates in heap forever and `load_into` restores all of them at boot
+/// (observed: 3203 runs ≈ 4.4 GiB RSS). Live runs are never evicted; the
+/// durable `runs` table keeps the full history regardless.
+pub(crate) const MAX_COMPLETED_RUNS_RETAINED: usize = 256;
+
+/// F8b — terminal runs whose heavy runtime state (live-log buffers, step
+/// records, timeline projections) stays in memory. `RunRecord`s are retained
+/// for `MAX_COMPLETED_RUNS_RETAINED`, but a finished run's live-log tail is
+/// capped at 64 MiB *per job* and its step/timeline projections are only
+/// dropped on request purge — neither is needed once the run is old enough
+/// that nothing follows it live. Without this bound, ~40 runs/hour of CI
+/// accumulated ~4 GiB/hour of retained buffers on cpane and the kernel OOM
+/// killer kept restarting the engine mid-run (starving every queued job).
+pub(crate) const MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE: usize = 16;
+
 /// F7 — how long a pending upload (or download token) survives without being
 /// finalized/consumed before the reaper sweeps it. Jobs that never finish
 /// their upload leave an entry behind; without a TTL those would accumulate.
@@ -383,6 +402,153 @@ pub(crate) fn trim_cache_dl_tokens(inner: &mut InnerState) {
     }
 }
 
+/// F8 — bound retained completed runs to `MAX_COMPLETED_RUNS_RETAINED`,
+/// evicting the oldest `completed_at` first. Runs still in flight
+/// (`completed_at.is_none()`) are never evicted. Called at boot after
+/// `load_into` and from `emit` when a terminal `RunStatus` arrives, so the
+/// map cannot grow past the cap between restarts. Evicted runs stay in the
+/// durable `runs` table — this only drops the in-memory copy.
+pub(crate) fn trim_completed_runs(inner: &mut InnerState) {
+    // Collect terminal runs oldest-first (completion time, then created_at,
+    // then run_id for determinism).
+    let mut keyed: Vec<(
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+        RunId,
+    )> = inner
+        .runs
+        .values()
+        .filter(|run| run.completed_at.is_some())
+        .map(|run| (run.completed_at, run.created_at, run.run_id))
+        .collect();
+    keyed.sort();
+    let completed = keyed.len();
+
+    // F8b — drop heavy runtime state for terminal runs outside the newest
+    // `MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`. The run record itself stays
+    // (subject to the 256 cap below); only the per-job live-log buffers,
+    // step records, and timeline projections go. These are the dominant
+    // heap consumers for finished runs and are unreachable once nothing
+    // follows the run live.
+    let keep_runtime = completed.saturating_sub(MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE);
+    for (_, _, run_id) in keyed.iter().take(keep_runtime) {
+        drop_run_runtime_state(inner, *run_id);
+    }
+
+    // F8 — evict the oldest completed run records past the cap. Every
+    // FK-bearing reference to the run must go with it: `store_inner` mirrors
+    // memory wholesale, so a leftover `job_requests`/`session_active_requests`/
+    // queued-job row for an evicted run violates `REFERENCES runs` and makes
+    // EVERY subsequent full persist fail (observed: runner registration 500s
+    // → provisioning retry loop → CI stall).
+    let excess = completed.saturating_sub(MAX_COMPLETED_RUNS_RETAINED);
+    for (_, _, run_id) in keyed.into_iter().take(excess) {
+        drop_run_runtime_state(inner, run_id);
+        purge_evicted_run(inner, run_id);
+        inner.runs.remove(&run_id);
+    }
+}
+
+/// Remove every in-memory reference to an evicted run that `store_inner`
+/// would persist into an FK-constrained table. Mirrors the
+/// `retire_node_requests` Purge path in `runtime_scheduling`, run-wide.
+/// The durable rows stay; a restart skips them via the restore guards.
+fn purge_evicted_run(inner: &mut InnerState, run_id: RunId) {
+    let request_ids: Vec<i64> = inner
+        .job_requests
+        .iter()
+        .filter(|(_, record)| record.run_id == run_id)
+        .map(|(id, _)| *id)
+        .collect();
+    for request_id in request_ids {
+        inner
+            .session_active_requests
+            .retain(|_, &mut rid| rid != request_id);
+        inner.inflight_requests.remove(&request_id);
+        inner.github_token_requests.remove(&request_id);
+        inner.broker_messages.remove(&request_id);
+        let Some(record) = inner.job_requests.remove(&request_id) else {
+            continue;
+        };
+        // Sibling requests may own the current index entry; only drop one
+        // that still points at this request (same guard as the Purge path).
+        if inner.plan_requests.get(&record.plan_id) == Some(&request_id) {
+            inner.plan_requests.remove(&record.plan_id);
+        }
+        if inner.agent_job_requests.get(&record.agent_job_id) == Some(&request_id) {
+            inner.agent_job_requests.remove(&record.agent_job_id);
+        }
+        if inner.timeline_requests.get(&record.timeline_id) == Some(&request_id) {
+            inner.timeline_requests.remove(&record.timeline_id);
+        }
+        inner.job_steps.remove(&record.agent_job_id);
+        inner.job_steps_revision.remove(&record.agent_job_id);
+    }
+    // Queued-job rows carry `jobs.run_id REFERENCES runs`. A terminal run
+    // should hold none, but a cancelled run can leave strays — purge them
+    // rather than let one row poison every persist.
+    inner.queue.retain(|job| job.run_id != run_id);
+    inner.pending_jobs.retain(|job| job.run_id != run_id);
+    inner.concurrency_blocked.retain(|job| job.run_id != run_id);
+    inner.held_runs.remove(&run_id);
+    inner.queued_at.retain(|(rid, _), _| *rid != run_id);
+    inner.job_assignments.retain(|(rid, _), _| *rid != run_id);
+    inner.pool_pending.retain(|(rid, _), _| *rid != run_id);
+    inner.cancellation_queue.retain(|c| c.run_id != run_id);
+    inner.id_token_grants.retain(|(rid, _), _| *rid != run_id);
+    inner.oidc_job_contexts.retain(|(rid, _), _| *rid != run_id);
+}
+
+/// Drop the heavy per-job runtime state of a run: retained live-log buffers
+/// (up to 64 MiB each), step records, and timeline projections. The durable
+/// store keeps the authoritative copies; this only frees the in-memory
+/// projections that exist to serve live followers and run-scoped reads.
+fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId) {
+    // Logical job ids from the run record; agent job ids and plan ids from
+    // the job requests that dispatched them.
+    let logical_ids: Vec<String> = inner
+        .runs
+        .get(&run_id)
+        .map(|run| run.jobs.keys().map(|job| job.0.clone()).collect())
+        .unwrap_or_default();
+    let mut agent_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut plan_ids: Vec<String> = Vec::new();
+    for record in inner.job_requests.values() {
+        if record.run_id == run_id {
+            agent_ids.push(record.agent_job_id);
+            plan_ids.push(record.plan_id.clone());
+        }
+    }
+
+    for key in logical_ids
+        .iter()
+        .cloned()
+        .chain(agent_ids.iter().map(uuid::Uuid::to_string))
+    {
+        inner.live_log_lines.remove(&key);
+        inner.live_log_tx.remove(&key);
+        inner.live_log_closed.remove(&key);
+    }
+    for agent_id in &agent_ids {
+        inner.job_steps.remove(agent_id);
+        inner.job_steps_revision.remove(agent_id);
+    }
+    inner.timeline_events.remove(&run_id);
+    inner.timeline_events_order.retain(|id| *id != run_id);
+    for plan_id in &plan_ids {
+        let prefix = format!("{plan_id}/");
+        inner
+            .timeline_records
+            .retain(|key, _| !key.starts_with(&prefix));
+        inner
+            .timeline_change_ids
+            .retain(|key, _| !key.starts_with(&prefix));
+        inner
+            .timeline_records_order
+            .retain(|key| !key.starts_with(&prefix));
+    }
+}
+
 /// F7 — bound the finalized artifact v2 registry: `MAX_ARTIFACTS_PER_RUN` per
 /// run and `MAX_ARTIFACT_REGISTRY_ENTRIES` globally, evicting oldest entries
 /// by finalization order (not lexicographic key order).
@@ -481,6 +647,15 @@ pub(crate) fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) 
         inner
             .cache_v2_dl_tokens_order
             .retain(|queued| queued != &token);
+    }
+    let stale_diag: Vec<String> = inner
+        .diag_upload_tokens
+        .iter()
+        .filter(|(_, pending)| pending.created_unix > 0 && pending.created_unix < cutoff)
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in stale_diag {
+        inner.diag_upload_tokens.remove(&token);
     }
     // Compact order deque if it grew with stale entries while under cap.
     if inner.cache_v2_dl_tokens_order.len() > inner.cache_v2_dl_tokens.len() + 1024 {
@@ -816,5 +991,184 @@ mod tests {
             None,
             "the administrator credential is intentionally not one job"
         );
+    }
+
+    /// `trim_completed_runs` evicts a run record past the retention cap; every
+    /// reference that `store_inner` persists into an FK-constrained table must
+    /// go with it, or the next full snapshot fails on `REFERENCES runs` and
+    /// every persist fails from then on (runner registration 500s, CI stall).
+    #[test]
+    fn evicted_run_purges_fk_bearing_state() {
+        let mut inner = InnerState::default();
+        let base = chrono::Utc::now();
+        let mut run_ids = Vec::new();
+        for index in 0..=MAX_COMPLETED_RUNS_RETAINED {
+            let run_id = RunId::new();
+            run_ids.push(run_id);
+            inner.runs.insert(
+                run_id,
+                RunRecord {
+                    run_id,
+                    webhook_delivery_id: None,
+                    run_name: None,
+                    submission: Arc::new(WorkflowSubmission {
+                        repository: "test/repo".to_owned(),
+                        ..Default::default()
+                    }),
+                    jobs: BTreeMap::new(),
+                    status: ExecutionStatus::Success,
+                    job_outputs: BTreeMap::new(),
+                    job_base_ids: BTreeMap::new(),
+                    job_needs: BTreeMap::new(),
+                    caller_plans: BTreeMap::new(),
+                    job_names: BTreeMap::new(),
+                    github: serde_json::Value::Null,
+                    head_sha: String::new(),
+                    workflow_ref: String::new(),
+                    workspace_snapshot: None,
+                    job_fail_fast: BTreeMap::new(),
+                    job_continue_on_error: BTreeMap::new(),
+                    job_check_run_ids: BTreeMap::new(),
+                    reusable_calls: BTreeMap::new(),
+                    jobs_list: Vec::new(),
+                    created_at: base,
+                    started_at: Some(base),
+                    // Oldest completed_at first: index 0 is the eviction victim.
+                    completed_at: Some(base + chrono::Duration::seconds(index as i64)),
+                    run_number: index as u64,
+                    run_attempt: 1,
+                    workflow_path_str: ".github/workflows/ci.yml".to_owned(),
+                    event: "push".to_owned(),
+                    conclusion: Some("success".to_owned()),
+                    push_state: None,
+                    snapshot_timing: None,
+                },
+            );
+        }
+        let evicted = run_ids[0];
+        let retained = run_ids[1];
+
+        // FK-bearing state for the victim run: a settled job request plus the
+        // claim/index maps that reference it.
+        let request_id = 42i64;
+        let agent_job_id = uuid::Uuid::new_v4();
+        let plan_id = "plan-evicted".to_owned();
+        let timeline_id = uuid::Uuid::new_v4();
+        inner.job_requests.insert(
+            request_id,
+            TaskAgentJobRequestRecord {
+                request_id,
+                run_id: evicted,
+                job_id: JobId("build".to_owned()),
+                agent_job_id,
+                plan_id: plan_id.clone(),
+                plan_type: "build".to_owned(),
+                timeline_id,
+                result: Some(ExecutionStatus::Success),
+                locked_until: String::new(),
+                claimed_at: None,
+                owner_runner_id: None,
+                started_at: None,
+                last_renewed_at: None,
+                timeout_triggered: false,
+                debug_token_issued: false,
+            },
+        );
+        inner
+            .inflight_requests
+            .insert(request_id, (evicted, JobId("build".to_owned())));
+        inner.plan_requests.insert(plan_id, request_id);
+        inner.agent_job_requests.insert(agent_job_id, request_id);
+        inner.timeline_requests.insert(timeline_id, request_id);
+        inner
+            .session_active_requests
+            .insert("session-1".to_owned(), request_id);
+        inner.broker_messages.insert(
+            request_id,
+            serde_json::from_value(serde_json::json!({
+                "jobId": agent_job_id.to_string(),
+                "requestId": request_id,
+                "plan": {"planId": "plan-evicted", "planType": "build", "version": 1,
+                         "artifactUri": "", "artifactLocation": ""},
+                "timeline": {"id": timeline_id.to_string(), "changeId": 0, "location": null},
+                "jobName": "build",
+                "lockedUntil": "",
+                "resources": {"endpoints": []},
+                "steps": [],
+                "snapshot": null
+            }))
+            .unwrap(),
+        );
+        inner.github_token_requests.insert(
+            request_id,
+            GitHubTokenRequest {
+                repository: "test/repo".to_owned(),
+                permissions: BTreeMap::new(),
+                declared: false,
+                untrusted: false,
+            },
+        );
+        inner.cancellation_queue.push_back(QueuedCancellation {
+            run_id: evicted,
+            job_id: JobId("build".to_owned()),
+            agent_job_id,
+        });
+        inner
+            .id_token_grants
+            .insert((evicted, JobId("build".to_owned())), true);
+        inner.oidc_job_contexts.insert(
+            (evicted, JobId("build".to_owned())),
+            OidcJobContext {
+                environment: None,
+                job_workflow_ref: None,
+                job_workflow_sha: None,
+            },
+        );
+        inner.queued_at.insert(
+            (evicted, JobId("build".to_owned())),
+            std::time::SystemTime::now(),
+        );
+        inner.job_assignments.insert(
+            (evicted, JobId("build".to_owned())),
+            AssignmentRecord {
+                runner_id: None,
+                at: std::time::SystemTime::now(),
+                first_at: std::time::SystemTime::now(),
+            },
+        );
+        trim_completed_runs(&mut inner);
+
+        assert!(
+            !inner.runs.contains_key(&evicted),
+            "the oldest completed run must be evicted"
+        );
+        assert!(inner.runs.contains_key(&retained));
+        assert!(
+            !inner.job_requests.contains_key(&request_id),
+            "job_requests rows for an evicted run violate REFERENCES runs"
+        );
+        assert!(!inner.inflight_requests.contains_key(&request_id));
+        assert!(!inner.plan_requests.values().any(|id| *id == request_id));
+        assert!(!inner
+            .agent_job_requests
+            .values()
+            .any(|id| *id == request_id));
+        assert!(!inner.timeline_requests.values().any(|id| *id == request_id));
+        assert!(
+            !inner
+                .session_active_requests
+                .values()
+                .any(|id| *id == request_id),
+            "session_active_requests rows for a dropped request violate REFERENCES job_requests"
+        );
+        assert!(!inner.broker_messages.contains_key(&request_id));
+        assert!(!inner.github_token_requests.contains_key(&request_id));
+        assert!(!inner.job_steps.contains_key(&agent_job_id));
+        assert!(inner.cancellation_queue.is_empty());
+        assert!(inner.id_token_grants.is_empty());
+        assert!(inner.oidc_job_contexts.is_empty());
+        assert!(inner.queued_at.is_empty());
+        assert!(inner.job_assignments.is_empty());
+        assert!(inner.pool_pending.is_empty());
     }
 }

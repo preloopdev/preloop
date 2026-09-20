@@ -114,6 +114,19 @@ impl LiveLogQueue {
         });
     }
 
+    /// Re-mask lines that are still queued after a newly registered secret.
+    /// Lines already dequeued cannot be recalled from the WebSocket.
+    pub fn remask_with(&self, secrets: &[String]) {
+        let mut lines = self.lines.lock().expect("live log queue poisoned");
+        for entry in &mut *lines {
+            entry.line = preloop_gha_protocol::masking::mask_secrets(
+                &entry.line,
+                secrets.iter().map(String::as_str),
+                &[],
+            );
+        }
+    }
+
     /// Spawn the background drain loop.
     pub fn spawn_drain(self: &Arc<Self>) -> JoinHandle<()> {
         let this = Arc::clone(self);
@@ -428,6 +441,16 @@ mod tests {
         assert_eq!(lines.len(), QUEUE_DROP_THRESHOLD + 1);
         assert_eq!(lines[0].line.chars().count(), LINE_TRUNCATE_CHARS);
         assert_eq!(lines.last().unwrap().line, "line-1023");
+    }
+
+    #[test]
+    fn queued_lines_are_remasked_before_delivery() {
+        let queue = LiveLogQueue::disconnected();
+        queue.enqueue("step", "token hunter2-secret", 1);
+        queue.remask_with(&["hunter2-secret".to_owned()]);
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "token ***");
     }
 
     #[test]

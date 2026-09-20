@@ -120,11 +120,31 @@ pub(crate) async fn cache_reserve(
 ) -> Result<Json<CacheReserveResponse>, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
-    let job_backend_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
-        .map(|claims| claims.job_id.to_string())
-        .unwrap_or_default();
+    let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
+    // R1-10: a stale job token must not reserve new uploads after its job
+    // completes. The system bearer manages the lifecycle itself and bypasses;
+    // every other caller must present a resolvable job identity — a request
+    // without claims cannot be attributed to a live job.
+    if !auth::system_bearer_authorized(&shared.state, &headers) {
+        let Some(claims) = claims.as_ref() else {
+            return Err(ApiError::unauthorized(
+                "job token required for cache writes",
+            ));
+        };
+        auth::require_live_job(&shared.state, claims.job_id).await?;
+    }
+    let job_uuid = claims.map(|claims| claims.job_id);
+    let job_backend_id = job_uuid.map(|uuid| uuid.to_string()).unwrap_or_default();
     let mut inner = shared.state.inner.lock().await;
-    inner.next_cache_id += 1;
+    // In-lock re-check: the job may have settled between the gate above and
+    // this lock — a settled job must not mint a fresh reservation.
+    if let Some(job_uuid) = job_uuid {
+        if !auth::job_is_live_locked(&inner, job_uuid) {
+            return Err(ApiError::forbidden(
+                "job is not live; writes are rejected for completed or unknown jobs",
+            ));
+        }
+    }
     let cache_id = inner.next_cache_id;
     inner.pending_caches.insert(
         cache_id,
@@ -150,9 +170,19 @@ pub(crate) async fn cache_upload(
     bytes: Bytes,
 ) -> Result<StatusCode, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
-    let caller_job_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
-        .map(|claims| claims.job_id.to_string());
+    let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
+    let caller_job_id = claims.as_ref().map(|claims| claims.job_id.to_string());
     let system = auth::system_bearer_authorized(&shared.state, &headers);
+    // R1-10: a stale job token must not keep uploading after its job
+    // completes. The system bearer manages the lifecycle itself and bypasses.
+    if !system {
+        let Some(claims) = claims else {
+            return Err(ApiError::unauthorized(
+                "job token required for cache writes",
+            ));
+        };
+        auth::require_live_job(&shared.state, claims.job_id).await?;
+    }
     let mut inner = shared.state.inner.lock().await;
     let pending = inner
         .pending_caches
@@ -178,9 +208,18 @@ pub(crate) async fn cache_commit(
     Json(request): Json<CacheCommitRequest>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
-    let caller_job_id = auth::job_runtime_claims_from_headers(&shared.state, &headers)
-        .map(|claims| claims.job_id.to_string());
+    let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
+    let caller_job_id = claims.as_ref().map(|claims| claims.job_id.to_string());
     let system = auth::system_bearer_authorized(&shared.state, &headers);
+    // R1-10: a stale job token must not commit uploads after its job
+    if !system {
+        let Some(claims) = claims else {
+            return Err(ApiError::unauthorized(
+                "job token required for cache writes",
+            ));
+        };
+        auth::require_live_job(&shared.state, claims.job_id).await?;
+    }
     let pending = {
         let mut inner = shared.state.inner.lock().await;
         let pending = inner
@@ -277,9 +316,21 @@ pub(crate) async fn artifact_put(
 
 pub(crate) async fn artifact_create(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Path(run_id): Path<RunId>,
     Json(request): Json<ArtifactCreateRequest>,
 ) -> Result<Json<ArtifactRecord>, ApiError> {
+    // R1-10: a stale job token must not create artifacts after its job
+    // completes. The system bearer manages the lifecycle itself and bypasses;
+    // the official runner uploads during the run, while its job is live.
+    if !auth::system_bearer_authorized(&shared.state, &headers) {
+        let Some(claims) = auth::job_runtime_claims_from_headers(&shared.state, &headers) else {
+            return Err(ApiError::unauthorized(
+                "job token required for artifact writes",
+            ));
+        };
+        auth::require_live_job(&shared.state, claims.job_id).await?;
+    }
     put_artifact(shared, run_id, request.name, request.file_name, Vec::new()).await
 }
 

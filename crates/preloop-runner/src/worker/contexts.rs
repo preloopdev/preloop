@@ -145,6 +145,18 @@ impl JobContext {
                             masks.insert(
                                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val),
                             );
+                            // H1: register each non-empty trimmed CR/LF-delimited
+                            // line too. Log masking runs per assembled line, so
+                            // a multiline initial secret (PEM key, JSON blob)
+                            // would otherwise never match the whole value and
+                            // would leak line by line. Mirrors add_mask.
+                            for line in val
+                                .split(['\r', '\n'])
+                                .map(str::trim)
+                                .filter(|l| !l.is_empty())
+                            {
+                                masks.insert(line.to_string());
+                            }
                         }
                     }
                 }
@@ -237,15 +249,17 @@ impl JobContext {
             .unwrap_or(false)
     }
 
-    /// Add a mask value (secrets, add-mask command).
-    pub fn add_mask(&mut self, value: &str) {
+    /// Add a mask value (secrets, add-mask command), returning the raw value
+    /// and every trimmed CR/LF-delimited value that was registered.
+    pub fn add_mask(&mut self, value: &str) -> Vec<String> {
         // actions/runner v2.335.1 AddMaskCommandExtension.ProcessCommand registers
         // Pinned upstream contract (actions/runner v2.335.1, AddMaskCommandExtension):
         // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionCommandManager.cs#L419-L448
         // the raw command data and each non-empty, trimmed CR/LF-delimited line.
         if value.trim().is_empty() {
-            return;
+            return Vec::new();
         }
+        let mut added = vec![value.to_string()];
         self.masks.insert(value.to_string());
         if let Ok(mut live) = self.live_masks.write() {
             live.insert(value.to_string());
@@ -255,11 +269,30 @@ impl JobContext {
             .map(str::trim)
             .filter(|line| !line.is_empty())
         {
-            self.masks.insert(line.to_string());
+            let line = line.to_string();
+            self.masks.insert(line.clone());
             if let Ok(mut live) = self.live_masks.write() {
-                live.insert(line.to_string());
+                live.insert(line.clone());
             }
+            added.push(line);
         }
+        added
+    }
+
+    /// Mask using only newly-added values. Existing durable output already
+    /// contains the replacements for the older mask set, so this keeps a
+    /// retroactive add-mask pass proportional to the new command.
+    pub fn mask_secrets_with(&self, input: &str, secrets: &[String]) -> String {
+        let exclude: &[&str] = if self.dap_debugger.is_some() {
+            preloop_dap::DAP_PROTOCOL_KEYWORDS
+        } else {
+            &[]
+        };
+        preloop_gha_protocol::masking::mask_secrets(
+            input,
+            secrets.iter().map(String::as_str),
+            exclude,
+        )
     }
 
     /// Mask secret values in a string (longest secrets first to prevent partial matches).
@@ -409,6 +442,10 @@ impl JobContext {
             "temp": std::env::temp_dir().to_string_lossy().to_string(),
             "tool_cache": tool_cache,
             "workspace": runner_workspace,
+            // Official runner exposes `runner.environment` as
+            // "github-hosted" or "self-hosted"; preloop jobs always run on
+            // self-hosted infrastructure.
+            "environment": "self-hosted",
         });
         ctx.insert("runner", runner_ctx);
 
