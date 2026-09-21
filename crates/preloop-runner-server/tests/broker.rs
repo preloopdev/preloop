@@ -2200,11 +2200,26 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
 
     let inner = state.inner.lock().await;
     let message = queued_message_for(&inner, &run_id);
-    let runtime_token = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    // Minted tokens carry a random `jti`, so compare claims rather than bytes:
+    // the wire variable must be a valid local JWT scoped to this job.
+    let wire_token = variable_value(&message, "system.github.token")
+        .expect("the job message carries a GitHub token variable");
+    let claims = state
+        .verify_local_jwt_claims(wire_token)
+        .expect("an unverifiable PAT is withheld in favour of a job-scoped runtime token");
     assert_eq!(
-        variable_value(&message, "system.github.token"),
-        Some(runtime_token.as_str()),
-        "an unverifiable PAT is withheld in favour of the job-scoped runtime token"
+        claims.get("sub").and_then(|value| value.as_str()),
+        Some(format!("preloop-job-{}", message.job_id).as_str())
+    );
+    assert_eq!(
+        claims.get("scp").and_then(|value| value.as_str()),
+        Some(
+            format!(
+                "Actions.Results:{}:{}",
+                message.plan.plan_id, message.job_id
+            )
+            .as_str()
+        )
     );
     assert_ne!(
         variable_value(&message, "system.github.token"),
