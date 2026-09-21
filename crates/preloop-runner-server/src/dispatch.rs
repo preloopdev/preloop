@@ -35,7 +35,7 @@ use crate::{errors::ApiErrorKind, ApiError, RunAccepted, WorkflowSubmission};
 ///
 /// Body: `{ "ref": string?, "inputs": {k: v}? }` — `ref` defaults to the
 /// default branch. Success is `204 No Content`.
-pub(crate) async fn workflow_dispatch(
+pub async fn workflow_dispatch(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, workflow_id)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
@@ -127,7 +127,7 @@ pub(crate) async fn workflow_dispatch(
 /// object? }`. A broadcast: every workflow whose `on.repository_dispatch.types`
 /// matches `event_type` runs (an absent `types` matches every event_type).
 /// Success is `204 No Content` even when no workflow matches.
-pub(crate) async fn repository_dispatch(
+pub async fn repository_dispatch(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
@@ -234,7 +234,7 @@ pub(crate) async fn repository_dispatch(
 /// `id` is a deterministic hash of the workflow path — preloop does not track
 /// github.com's numeric workflow ids (see the plan's open question 2), so the
 /// dispatch `workflow_id` accepts filenames, not numbers.
-pub(crate) async fn list_workflows(
+pub async fn list_workflows(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
@@ -272,7 +272,7 @@ pub(crate) async fn list_workflows(
 /// Convenience list of recent runs for the repository. `id` is a
 /// deterministic hash of the preloop run UUID; the native `run_id` field is
 /// included for preloop-native consumers.
-pub(crate) async fn list_actions_runs(
+pub async fn list_actions_runs(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(identity): Extension<DispatchIdentity>,

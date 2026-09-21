@@ -6,9 +6,9 @@ use std::time::Instant;
 /// A heartbeat or sampler snapshot older than this is stale: three sampler
 /// intervals of 5s. Single source so `/readyz` and `/api/v1/status` cannot
 /// disagree when the interval changes.
-pub(crate) const STALENESS_THRESHOLD: Duration = Duration::from_secs(15);
+pub const STALENESS_THRESHOLD: Duration = Duration::from_secs(15);
 
-pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+pub async fn healthz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     let shutdown = shared.shutdown.is_cancelled();
     let body = json!({
         "ok": !shutdown,
@@ -22,7 +22,7 @@ pub(crate) async fn healthz(State(shared): State<Arc<SharedState>>) -> impl Into
     }
 }
 
-pub(crate) async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+pub async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     if shared.shutdown.is_cancelled() {
         let body = json!({ "ready": false, "reason": "shutting_down" });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
@@ -64,7 +64,7 @@ pub(crate) async fn readyz(State(shared): State<Arc<SharedState>>) -> impl IntoR
     (StatusCode::OK, Json(body)).into_response()
 }
 
-pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+pub async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     // Fail-open, no InnerState lock — clone cached snapshot and update age.
     let mut snap = shared.state.status_snapshot.read().clone();
     let now = chrono::Utc::now();
@@ -103,13 +103,11 @@ pub(crate) async fn status(State(shared): State<Arc<SharedState>>) -> impl IntoR
 }
 /// Effective checkout-cache policy for operator UIs. The native bearer on the
 /// containing router protects this deployment configuration.
-pub(crate) async fn checkout_cache_config(
-    State(shared): State<Arc<SharedState>>,
-) -> impl IntoResponse {
+pub async fn checkout_cache_config(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     Json(shared.state.checkout_cache.clone())
 }
 
-pub(crate) async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
+pub async fn metrics(State(shared): State<Arc<SharedState>>) -> impl IntoResponse {
     let body = shared.state.observability.render_metrics();
     (
         [(
@@ -307,7 +305,7 @@ fn existing_webhook_run(
 /// GitHub fails at the point of use instead of running with authority nobody
 /// could bound.
 #[derive(Clone, Debug)]
-pub(crate) enum PatToken {
+pub enum PatToken {
     /// Classic OAuth scopes introspected and no broader than declared.
     Embed { token: String, scopes: Vec<String> },
     /// Bounds unverifiable (no scopes header, cold scope cache, unreachable
@@ -318,12 +316,12 @@ pub(crate) enum PatToken {
 impl PatToken {
     /// A PAT whose classic OAuth scopes were introspected: the wire variable
     /// advertises the actual scopes.
-    pub(crate) fn with_scopes(token: String, scopes: Vec<String>) -> Self {
+    pub fn with_scopes(token: String, scopes: Vec<String>) -> Self {
         Self::Embed { token, scopes }
     }
 
     /// A PAT whose bounds could not be verified, so it is withheld.
-    pub(crate) fn withheld() -> Self {
+    pub fn withheld() -> Self {
         Self::Withheld
     }
 }
@@ -341,7 +339,7 @@ static PAT_SCOPE_CACHE: LazyLock<PatScopeCache> = LazyLock::new(|| Mutex::new(Ha
 /// cached scopes once the process has introduced them already: startup warms
 /// the cache and every submission refreshes it. `None` on a cold or expired
 /// entry.
-pub(crate) fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
+pub fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
     PAT_SCOPE_CACHE
@@ -363,7 +361,7 @@ pub(crate) fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
 /// Failures are logged, never fatal: a server that cannot reach the GitHub API
 /// still serves, and the run path withholds the credential instead of
 /// embedding one whose bounds nobody established.
-pub(crate) async fn warm_pat_scope_cache(pat: &str) {
+pub async fn warm_pat_scope_cache(pat: &str) {
     match pat_oauth_scopes(pat).await {
         PatScopeOutcome::Known(scopes) => {
             tracing::info!(
@@ -478,11 +476,8 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
 /// declared `write`/`admin` grant, or any PAT authority at all against an
 /// empty (`permissions: {}`) declaration.
 ///
-/// `pub(crate)` for the scope-matrix unit tests in `lib_tests.rs`.
-pub(crate) fn pat_exceeds_declared(
-    pat_scopes: &[String],
-    declared: &BTreeMap<String, String>,
-) -> bool {
+/// `pub` for the scope-matrix unit tests in `lib_tests.rs`.
+pub fn pat_exceeds_declared(pat_scopes: &[String], declared: &BTreeMap<String, String>) -> bool {
     // Mirror of `github_app::effective_permissions`: `id-token` and `models`
     // are runner-authenticated and granted by the platform, not the token.
     let declared_write = declared.iter().any(|(scope, level)| {
@@ -516,7 +511,7 @@ fn classic_scope_is_read_only(scope: &str) -> bool {
 /// no broader than declared, a GitHub App (installation tokens are minted
 /// with exactly the declared set), or no run at all. Fork-restricted jobs
 /// never receive the PAT, so they are exempt.
-pub(crate) fn enforce_pat_permissions(
+pub fn enforce_pat_permissions(
     jobs: &[preloop_gha_protocol::JobPlan],
     submission: &preloop_gha_protocol::WorkflowSubmission,
     pat_scopes: &[String],
@@ -567,7 +562,7 @@ fn pat_scopes_wire_value(scopes: &[String]) -> String {
     }
 }
 
-pub(crate) async fn submit_run_inner(
+pub async fn submit_run_inner(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
@@ -578,7 +573,7 @@ pub(crate) async fn submit_run_inner(
 ///
 /// A replay that arrives while the first delivery is still constructing a
 /// large matrix waits for that construction instead of duplicating the work.
-pub(crate) async fn submit_run_inner_with_webhook_delivery(
+pub async fn submit_run_inner_with_webhook_delivery(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
     webhook_delivery_id: Option<&str>,
@@ -2213,7 +2208,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         })
     }
 }
-pub(crate) async fn submit_run(
+pub async fn submit_run(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Json(mut submission): Json<WorkflowSubmission>,
@@ -2321,7 +2316,7 @@ pub(crate) async fn submit_run(
     Ok(Json(accepted))
 }
 
-pub(crate) async fn get_scheduler_history(
+pub async fn get_scheduler_history(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<Vec<crate::scheduler::ScheduleFire>>, ApiError> {
     if let Some(scheduler) = &shared.state.scheduler {
@@ -2332,7 +2327,7 @@ pub(crate) async fn get_scheduler_history(
     }
 }
 
-pub(crate) fn value_to_input_string(value: &serde_json::Value) -> String {
+pub fn value_to_input_string(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
         serde_json::Value::Bool(value) => value.to_string(),
@@ -2341,7 +2336,7 @@ pub(crate) fn value_to_input_string(value: &serde_json::Value) -> String {
     }
 }
 
-pub(crate) fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>) {
+pub fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>) {
     if let Some(branch) = git_ref.strip_prefix("refs/heads/") {
         (Some(branch.to_owned()), None)
     } else if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
@@ -2351,7 +2346,7 @@ pub(crate) fn git_ref_context(git_ref: &str) -> (Option<String>, Option<String>)
     }
 }
 
-pub(crate) fn changed_paths_from_payload(payload: &serde_json::Value) -> Vec<String> {
+pub fn changed_paths_from_payload(payload: &serde_json::Value) -> Vec<String> {
     let mut paths = Vec::new();
 
     if let Some(values) = payload.get("paths").and_then(|value| value.as_array()) {
@@ -2373,7 +2368,7 @@ pub(crate) fn changed_paths_from_payload(payload: &serde_json::Value) -> Vec<Str
     paths
 }
 
-pub(crate) fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>) {
+pub fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>) {
     out.extend(
         values
             .iter()
@@ -2384,13 +2379,13 @@ pub(crate) fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<S
 
 /// Per-job runner artifacts: agent message plus the correlation records the
 /// broker and results/timeline services use to track the delivered request.
-pub(crate) struct BuiltJobArtifacts {
-    pub(crate) agent_msg: azdo::AgentJobRequestMessage,
-    pub(crate) request_id: i64,
-    pub(crate) job_request: TaskAgentJobRequestRecord,
-    pub(crate) id_token_granted: bool,
-    pub(crate) oidc_ctx: OidcJobContext,
-    pub(crate) github_token_request: Option<GitHubTokenRequest>,
+pub struct BuiltJobArtifacts {
+    pub agent_msg: azdo::AgentJobRequestMessage,
+    pub request_id: i64,
+    pub job_request: TaskAgentJobRequestRecord,
+    pub id_token_granted: bool,
+    pub oidc_ctx: OidcJobContext,
+    pub github_token_request: Option<GitHubTokenRequest>,
 }
 
 /// The `fileTable` entry naming the reusable workflow a job was inlined from.
@@ -2428,7 +2423,7 @@ fn strip_repo_prefix<'a>(file: &'a str, repository: &str) -> &'a str {
 /// runtime expansion of reusable-workflow callee subtrees (which cannot be
 /// built at submission: they exist only after the caller's `if:` gate passes).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_job_artifacts(
+pub fn build_job_artifacts(
     shared: &SharedState,
     submission: &WorkflowSubmission,
     run_id: RunId,
@@ -2807,7 +2802,7 @@ pub(crate) fn build_job_artifacts(
 /// Attempts are ordered by `request_id`, which is a monotonic allocation, so
 /// the highest one is the newest dispatch. `None` when the job was never
 /// dispatched (skipped or cancelled before a request was built).
-pub(crate) fn latest_attempt_steps(
+pub fn latest_attempt_steps(
     inner: &crate::state::InnerState,
     run_id: RunId,
     job_id: &JobId,
@@ -2830,7 +2825,7 @@ pub(crate) fn latest_attempt_steps(
 /// attempt-scoped manifest rather than in the stored run, so a caller that
 /// clones `inner.runs` directly returns empty step arrays — which is exactly
 /// what the list endpoint did.
-pub(crate) fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunRecord {
+pub fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunRecord {
     let run_id = run.run_id;
 
     // GitHub's run record shows a gate-passed reusable caller only as its
@@ -2887,7 +2882,7 @@ pub(crate) fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) 
     run
 }
 
-pub(crate) async fn get_run(
+pub async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
@@ -2905,7 +2900,7 @@ pub(crate) async fn get_run(
 /// This deliberately projects only execution metadata. The native run response
 /// remains bearer-protected because it contains the submitted event payload and
 /// secret names.
-pub(crate) async fn get_public_run(
+pub async fn get_public_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<axum::response::Html<String>, ApiError> {
@@ -2958,7 +2953,7 @@ fn escape_html(value: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ListRunsQuery {
+pub struct ListRunsQuery {
     #[serde(default)]
     workflow: Option<String>,
     #[serde(default)]
@@ -2975,7 +2970,7 @@ fn deserialize_limit<'de, D: serde::Deserializer<'de>>(
     Option::<usize>::deserialize(deserializer)
 }
 
-pub(crate) async fn list_runs(
+pub async fn list_runs(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<RunRecord>>, ApiError> {
@@ -3036,7 +3031,7 @@ pub(crate) async fn list_runs(
 /// Both are absent for the historical whole-run behavior, so an unfiltered
 /// request still returns every job's log merged in request order.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct RunLogsQuery {
+pub struct RunLogsQuery {
     /// Workflow job key (`job_id`) or the agent job UUID. Matched exactly as
     /// the live-log feed matches it, so the same value works for both.
     #[serde(default)]
@@ -3277,7 +3272,7 @@ async fn append_step(
     }
 }
 
-pub(crate) async fn get_run_logs(
+pub async fn get_run_logs(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
     Query(query): Query<RunLogsQuery>,
@@ -3417,7 +3412,7 @@ pub(crate) async fn get_run_logs(
         .expect("static run log response"))
 }
 
-pub(crate) async fn cancel_run(
+pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
@@ -3472,7 +3467,7 @@ pub(crate) async fn cancel_run(
         .await;
     Ok(Json(record))
 }
-pub(crate) async fn rerun_run_inner(
+pub async fn rerun_run_inner(
     shared: &Arc<SharedState>,
     run_id: RunId,
     reused_check_run: Option<(JobId, u64)>,
@@ -3510,7 +3505,7 @@ pub(crate) async fn rerun_run_inner(
     Ok(accepted)
 }
 
-pub(crate) async fn rerun_run(
+pub async fn rerun_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunAccepted>, ApiError> {
@@ -3529,7 +3524,7 @@ const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Holding the response open is what keeps `preloop run` off a poll timer —
 /// snapshot-and-close forced clients to re-request on an interval, which added
 /// that interval to every run's wall clock.
-pub(crate) async fn run_events(
+pub async fn run_events(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Response, ApiError> {

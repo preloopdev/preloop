@@ -134,7 +134,7 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
     })
 }
 
-pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
+pub async fn reap_once(shared: &Arc<SharedState>) {
     let (expired_cache_tokens, expired_artifact_tokens) = {
         let mut inner = shared.state.inner.lock().await;
         // Migrate legacy pending entries that restored with `created_unix == 0`

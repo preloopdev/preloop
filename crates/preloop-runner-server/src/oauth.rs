@@ -4,7 +4,7 @@ use super::*;
 /// The official `actions/runner` config.sh calls this to get a registration token.
 /// Matches the ChristopherHX/runner.server format: `GitHubAuthResult` with
 /// `token`, `token_schema`, and `tenant_url`.
-pub(crate) async fn github_registration_token(
+pub async fn github_registration_token(
     State(shared): State<Arc<SharedState>>,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -65,35 +65,35 @@ pub(crate) async fn github_registration_token(
 }
 
 #[derive(Serialize)]
-pub(crate) struct TokenResponse {
-    pub(crate) access_token: String,
-    pub(crate) token_type: String,
-    pub(crate) expires_in: u64,
+pub struct TokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: u64,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct FormOAuth2Request {
+pub struct FormOAuth2Request {
     // serde: accepted from the runner's form payload but not inspected.
     #[allow(dead_code)]
-    pub(crate) client_assertion_type: Option<String>,
-    pub(crate) client_assertion: Option<String>,
+    pub client_assertion_type: Option<String>,
+    pub client_assertion: Option<String>,
     // serde: accepted from the runner's form payload but not inspected.
     #[allow(dead_code)]
-    pub(crate) grant_type: Option<String>,
+    pub grant_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct JsonOAuth2Request {
+pub struct JsonOAuth2Request {
     // serde: accepted from the runner's JSON payload but not inspected.
     #[allow(dead_code)]
-    pub(crate) grant_type: String,
-    pub(crate) client_id: String,
+    pub grant_type: String,
+    pub client_id: String,
     // serde: accepted from the runner's JSON payload but not inspected.
     #[allow(dead_code)]
-    pub(crate) client_secret: String,
+    pub client_secret: String,
 }
 
-pub(crate) fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
+pub fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
     let bytes = BASE64_STANDARD
         .decode(segment.as_bytes())
         .or_else(|_| URL_SAFE_NO_PAD.decode(segment.as_bytes()))
@@ -103,7 +103,7 @@ pub(crate) fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
 
 /// Token TTL in seconds. Override with PRELOOP_TOKEN_TTL_SECS for testing
 /// short-lived tokens (e.g. =1 triggers RLIS-02 proactive refresh immediately).
-pub(crate) fn token_ttl_secs() -> u64 {
+pub fn token_ttl_secs() -> u64 {
     std::env::var("PRELOOP_TOKEN_TTL_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -123,7 +123,7 @@ const ASSERTION_CLOCK_SKEW_SECS: i64 = 60;
 /// the server base URL, string or array form); requires `iat` or `nbf` and
 /// rejects not-yet-valid assertions; caps the assertion lifetime so a
 /// captured assertion cannot replay indefinitely.
-pub(crate) fn validate_client_assertion_claims(
+pub fn validate_client_assertion_claims(
     claims: &serde_json::Value,
     uri: &axum::http::Uri,
 ) -> Result<(), ApiError> {
@@ -183,7 +183,7 @@ pub(crate) fn validate_client_assertion_claims(
     Ok(())
 }
 
-pub(crate) async fn oauth2_token(
+pub async fn oauth2_token(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,

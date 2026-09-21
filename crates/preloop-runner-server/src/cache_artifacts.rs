@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CachePutRequest {
+pub struct CachePutRequest {
     key: String,
     version: String,
     #[serde(default)]
@@ -9,14 +9,14 @@ pub(crate) struct CachePutRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CacheQuery {
+pub struct CacheQuery {
     key: Option<String>,
     keys: Option<String>,
     version: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct CacheLookupResponse {
+pub struct CacheLookupResponse {
     hit: bool,
     key: Option<String>,
     version: Option<String>,
@@ -26,26 +26,26 @@ pub(crate) struct CacheLookupResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CacheReserveRequest {
+pub struct CacheReserveRequest {
     key: String,
     version: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CacheReserveResponse {
+pub struct CacheReserveResponse {
     cache_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CacheCommitRequest {
+pub struct CacheCommitRequest {
     #[serde(default)]
     size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactPutRequest {
+pub struct ArtifactPutRequest {
     run_id: RunId,
     name: String,
     file_name: String,
@@ -55,7 +55,7 @@ pub(crate) struct ArtifactPutRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArtifactCreateRequest {
+pub struct ArtifactCreateRequest {
     name: String,
     #[serde(default = "default_artifact_file_name")]
     file_name: String,
@@ -69,7 +69,7 @@ fn default_artifact_file_name() -> String {
 /// branch cannot poison another branch's entries (first write wins on an
 /// exact key+version). The system token keeps the historical
 /// repository-only namespace.
-pub(crate) fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<String>) -> String {
+pub fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<String>) -> String {
     match (repository, git_ref) {
         (Some(repository), Some(git_ref)) => format!("{repository}\0{git_ref}"),
         (Some(repository), None) => repository,
@@ -81,7 +81,7 @@ pub(crate) fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<S
 /// `max_bytes`. Split from `cache_upload` so tests can exercise the
 /// boundary with a small limit instead of allocating the production
 /// 512 MiB cap.
-pub(crate) fn ensure_cache_chunk_fits(
+pub fn ensure_cache_chunk_fits(
     current_bytes: u64,
     chunk_bytes: u64,
     max_bytes: u64,
@@ -100,7 +100,7 @@ pub(crate) fn ensure_cache_chunk_fits(
 /// `MAX_PENDING_PER_JOB` × 512 MiB; this bounds the job's total. Split out
 /// so tests can exercise the boundary with a small limit instead of
 /// allocating the production 1 GiB budget.
-pub(crate) fn ensure_pending_cache_bytes_fit(
+pub fn ensure_pending_cache_bytes_fit(
     inner: &InnerState,
     job_backend_id: &str,
     chunk_bytes: u64,
@@ -121,7 +121,7 @@ pub(crate) fn ensure_pending_cache_bytes_fit(
     Ok(())
 }
 
-pub(crate) async fn cache_put(
+pub async fn cache_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CachePutRequest>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
@@ -140,7 +140,7 @@ pub(crate) async fn cache_put(
     }))
 }
 
-pub(crate) async fn cache_get(
+pub async fn cache_get(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
@@ -169,7 +169,7 @@ pub(crate) async fn cache_get(
     }))
 }
 
-pub(crate) async fn cache_reserve(
+pub async fn cache_reserve(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<CacheReserveRequest>,
@@ -243,7 +243,7 @@ pub(crate) async fn cache_reserve(
     Ok(Json(CacheReserveResponse { cache_id }))
 }
 
-pub(crate) async fn cache_upload(
+pub async fn cache_upload(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
@@ -314,7 +314,7 @@ pub(crate) async fn cache_upload(
     Ok(StatusCode::ACCEPTED)
 }
 
-pub(crate) async fn cache_commit(
+pub async fn cache_commit(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
@@ -383,7 +383,7 @@ pub(crate) async fn cache_commit(
     }))
 }
 
-pub(crate) async fn cache_lookup(
+pub async fn cache_lookup(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CacheQuery>,
@@ -437,7 +437,7 @@ pub(crate) async fn cache_lookup(
     }
 }
 
-pub(crate) async fn artifact_put(
+pub async fn artifact_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactPutRequest>,
 ) -> Result<Json<ArtifactRecord>, ApiError> {
@@ -452,7 +452,7 @@ pub(crate) async fn artifact_put(
     .await
 }
 
-pub(crate) async fn artifact_create(
+pub async fn artifact_create(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(run_id): Path<RunId>,
@@ -472,7 +472,7 @@ pub(crate) async fn artifact_create(
     put_artifact(shared, run_id, request.name, request.file_name, Vec::new()).await
 }
 
-pub(crate) async fn put_artifact(
+pub async fn put_artifact(
     shared: Arc<SharedState>,
     run_id: RunId,
     name: String,
@@ -501,21 +501,21 @@ pub(crate) async fn put_artifact(
     Ok(Json(record))
 }
 
-pub(crate) async fn artifact_get(
+pub async fn artifact_get(
     State(shared): State<Arc<SharedState>>,
     Path(artifact_id): Path<String>,
 ) -> Result<Response, ApiError> {
     read_artifact(shared, artifact_id).await
 }
 
-pub(crate) async fn artifact_get_compat(
+pub async fn artifact_get_compat(
     State(shared): State<Arc<SharedState>>,
     Path((_run_id, artifact_id)): Path<(RunId, String)>,
 ) -> Result<Response, ApiError> {
     read_artifact(shared, artifact_id).await
 }
 
-pub(crate) async fn read_artifact(
+pub async fn read_artifact(
     shared: Arc<SharedState>,
     artifact_id: String,
 ) -> Result<Response, ApiError> {
@@ -534,7 +534,7 @@ pub(crate) async fn read_artifact(
         .expect("static response builder"))
 }
 
-pub(crate) async fn artifact_list(
+pub async fn artifact_list(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Json<serde_json::Value> {
@@ -550,7 +550,7 @@ pub(crate) async fn artifact_list(
     }))
 }
 
-pub(crate) fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
+pub fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
     keys.unwrap_or_default()
         .split(',')
         .filter(|key| !key.is_empty())
@@ -558,7 +558,7 @@ pub(crate) fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
+pub fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
     BASE64_STANDARD
         .decode(value)
         .map_err(|error| ApiError::bad_request(format!("invalid base64 content: {error}")))

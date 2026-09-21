@@ -23,7 +23,7 @@ fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
     out
 }
 
-pub(crate) async fn register_runner(
+pub async fn register_runner(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerRegistrationRequest>,
 ) -> Result<Json<RegisteredRunner>, ApiError> {
@@ -97,7 +97,7 @@ async fn persist_full_state(shared: &Arc<SharedState>) -> Result<(), ApiError> {
 /// Wrapper for the native registration route: native-bearer gated, so the
 /// registration is engine-authorized and the fresh runner may be paired
 /// with a pending pool-assigned job immediately.
-pub(crate) async fn register_runner_native(
+pub async fn register_runner_native(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerRegistrationRequest>,
 ) -> Result<Json<RegisteredRunner>, ApiError> {
@@ -115,7 +115,7 @@ pub(crate) async fn register_runner_native(
 
 /// Optional run-scoped query for [`list_runners_native`].
 #[derive(Debug, Deserialize)]
-pub(crate) struct RunnerListQuery {
+pub struct RunnerListQuery {
     #[serde(default)]
     run_id: Option<RunId>,
 }
@@ -130,7 +130,7 @@ pub(crate) struct RunnerListQuery {
 /// up, however long `still waiting` prints — even when other runners are
 /// registered whose labels match nothing in the queue. Without `run_id` the
 /// response is the plain list.
-pub(crate) async fn list_runners_native(
+pub async fn list_runners_native(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<RunnerListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -175,7 +175,7 @@ pub(crate) async fn list_runners_native(
     Ok(Json(response))
 }
 
-pub(crate) async fn create_session(
+pub async fn create_session(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<RunnerSessionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -231,7 +231,7 @@ pub(crate) async fn create_session(
 
 use preloop_gha_protocol::crypto::RsaOaepHash;
 
-pub(crate) async fn create_session_disttask(
+pub async fn create_session_disttask(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -341,7 +341,7 @@ pub(crate) async fn create_session_disttask(
     ))
 }
 
-pub(crate) async fn delete_session(
+pub async fn delete_session(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -389,7 +389,7 @@ pub(crate) async fn delete_session(
 /// Jobs it was assigned but never claimed go back to pool-pending so the
 /// pool provisions a replacement machine for them.
 /// Returns null response body in JSON to match official.
-pub(crate) async fn delete_agent(
+pub async fn delete_agent(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -407,7 +407,7 @@ pub(crate) async fn delete_agent(
     Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)))
 }
 
-pub(crate) async fn purge_runner_identity_guarded(
+pub async fn purge_runner_identity_guarded(
     shared: &Arc<SharedState>,
     caller: crate::auth::AdminCaller,
     agent_id: i64,
@@ -467,7 +467,7 @@ pub(crate) async fn purge_runner_identity_guarded(
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
-pub(crate) async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
+pub async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
     let _ =
         purge_runner_identity_guarded(shared, crate::auth::AdminCaller::System, runner_id).await;
 }
@@ -660,14 +660,14 @@ async fn purge_runner_identity_with_phantom_check(
     true
 }
 
-pub(crate) async fn purge_phantom_runner(shared: &Arc<SharedState>, runner_id: i64) -> bool {
+pub async fn purge_phantom_runner(shared: &Arc<SharedState>, runner_id: i64) -> bool {
     purge_runner_identity_with_phantom_check(shared, runner_id, true).await
 }
 
 /// A server restart destroys every process-owned ephemeral VM. Their durable
 /// runner registrations and sessions cannot reconnect, so purge them as one
 /// transaction before serving or they masquerade as idle capacity forever.
-pub(crate) async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
+pub async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
     let runner_ids: Vec<i64> = {
         let inner = shared.state.inner.lock().await;
         inner
@@ -721,13 +721,13 @@ pub(crate) async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) 
 /// Broker-side session teardown: the runner deletes the session-less path on the broker host.
 /// Return 204 unconditionally; the concrete session was already cleaned up individually.
 /// Returns null response body in JSON to match official.
-pub(crate) async fn delete_sessions_for_pool(
+pub async fn delete_sessions_for_pool(
     Path(_pool_id): Path<i64>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::NO_CONTENT, Json(serde_json::Value::Null))
 }
 
-pub(crate) fn rsa_public_key_xml_from_value(value: &serde_json::Value) -> Option<String> {
+pub fn rsa_public_key_xml_from_value(value: &serde_json::Value) -> Option<String> {
     if let Some(text) = value.as_str() {
         return Some(text.to_owned());
     }
@@ -738,7 +738,7 @@ pub(crate) fn rsa_public_key_xml_from_value(value: &serde_json::Value) -> Option
     ))
 }
 
-pub(crate) fn task_agent_public_key(request: &serde_json::Value) -> Option<String> {
+pub fn task_agent_public_key(request: &serde_json::Value) -> Option<String> {
     request
         .get("authorization")
         .and_then(|authorization| authorization.get("publicKey"))
@@ -753,7 +753,7 @@ pub(crate) fn task_agent_public_key(request: &serde_json::Value) -> Option<Strin
 /// GET /_apis/v1/Agent/:pool_id — look up runner by agentName query param.
 /// Returns 200 with the agent if found, or 200 with an empty array if not found.
 /// The runner treats a non-empty result as "agent exists" and empty as "needs registration".
-pub(crate) async fn agent_lookup(
+pub async fn agent_lookup(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -809,7 +809,7 @@ pub(crate) async fn agent_lookup(
 /// GET /_apis/v1/Agent/:pool_id/:agent_id — look up runner by agentId in path.
 /// The runner constructs URLs from the service definition template `{poolId}/{agentId}`.
 /// For lookups it uses agentId=0; for registration it POSTs.
-pub(crate) async fn agent_lookup_by_id(
+pub async fn agent_lookup_by_id(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, _agent_id)): Path<(i64, i64)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -817,7 +817,7 @@ pub(crate) async fn agent_lookup_by_id(
     agent_lookup(State(shared), Path(_pool_id), Query(params)).await
 }
 
-pub(crate) async fn runner_pools() -> Json<serde_json::Value> {
+pub async fn runner_pools() -> Json<serde_json::Value> {
     let instance_id = crate::connection::INSTANCE_ID;
     Json(json!({
         "count": 2,
@@ -848,7 +848,7 @@ pub(crate) async fn runner_pools() -> Json<serde_json::Value> {
 }
 
 /// Compat handler: register runner via AzDO Agent path.
-pub(crate) async fn register_runner_compat(
+pub async fn register_runner_compat(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, _agent_id)): Path<(i64, String)>,
     headers: axum::http::HeaderMap,
@@ -1005,7 +1005,7 @@ pub(crate) async fn register_runner_compat(
 /// Compat handler for the official runner's PUT replacement flow. The old
 /// identity is purged before a fresh registration is created, so the PUT does
 /// not leave two live runners and the old listen token is revoked.
-pub(crate) async fn replace_runner_compat(
+pub async fn replace_runner_compat(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, agent_id)): Path<(i64, String)>,
     headers: axum::http::HeaderMap,
@@ -1035,7 +1035,7 @@ pub(crate) async fn replace_runner_compat(
 }
 
 /// Compat handler: register runner via `/_apis/v1/Agent/:pool_id` (no agent_id in path).
-pub(crate) async fn register_runner_compat_pool_only(
+pub async fn register_runner_compat_pool_only(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
     headers: axum::http::HeaderMap,
@@ -1051,7 +1051,7 @@ pub(crate) async fn register_runner_compat_pool_only(
 }
 
 /// Compat handler: create session via AzDO AgentSession path.
-pub(crate) async fn create_session_compat(
+pub async fn create_session_compat(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, _session_id)): Path<(i64, String)>,
     headers: axum::http::HeaderMap,
@@ -1094,7 +1094,7 @@ pub(crate) async fn create_session_compat(
 }
 
 /// Compat handler: next message via AzDO Message path.
-pub(crate) async fn next_message_compat(
+pub async fn next_message_compat(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -1105,7 +1105,7 @@ pub(crate) async fn next_message_compat(
 /// POST /api/v1/runners/purge — orchestrator-facing runner deregistration:
 /// purges the identity AND requeues any claimed-but-unfinished job, so a
 /// machine torn down mid-job stops stalling the job until the lease reaper.
-pub(crate) async fn purge_runners_by_name(
+pub async fn purge_runners_by_name(
     State(shared): State<Arc<SharedState>>,
     Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {

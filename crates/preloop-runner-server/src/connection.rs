@@ -5,9 +5,9 @@ use super::*;
 const DEPLOYMENT_ID: &str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
 
 /// Stable instance ID — same reasoning as deployment ID.
-pub(crate) const INSTANCE_ID: &str = "bc944321-3dbc-431b-8cf2-8afa3e25e359";
+pub const INSTANCE_ID: &str = "bc944321-3dbc-431b-8cf2-8afa3e25e359";
 
-pub(crate) async fn connection_data(
+pub async fn connection_data(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     if params.get("connectOptions").map(String::as_str) == Some("0")

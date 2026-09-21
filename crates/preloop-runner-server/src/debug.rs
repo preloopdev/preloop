@@ -1,12 +1,12 @@
 use super::*;
 
 #[derive(serde::Deserialize)]
-pub(crate) struct RegisterDapPortRequest {
+pub struct RegisterDapPortRequest {
     port: u16,
     job_id: JobId,
 }
 
-pub(crate) async fn register_dap_port(
+pub async fn register_dap_port(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
     Json(payload): Json<RegisterDapPortRequest>,
@@ -42,7 +42,7 @@ pub(crate) async fn register_dap_port(
     Ok(StatusCode::OK)
 }
 
-pub(crate) async fn ws_dap_debug(
+pub async fn ws_dap_debug(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
     ws: WebSocketUpgrade,
@@ -50,11 +50,7 @@ pub(crate) async fn ws_dap_debug(
     ws.on_upgrade(move |socket| handle_dap_debug_socket(socket, run_id, shared))
 }
 
-pub(crate) async fn handle_dap_debug_socket(
-    socket: WebSocket,
-    run_id: RunId,
-    shared: Arc<SharedState>,
-) {
+pub async fn handle_dap_debug_socket(socket: WebSocket, run_id: RunId, shared: Arc<SharedState>) {
     let registration = {
         let inner = shared.state.inner.lock().await;
         inner.dap_ports.get(&run_id).cloned()
@@ -73,10 +69,7 @@ pub(crate) async fn handle_dap_debug_socket(
     }
 }
 
-pub(crate) async fn pump_axum_ws_to_dap(
-    ws: WebSocket,
-    target_port: u16,
-) -> Result<(), anyhow::Error> {
+pub async fn pump_axum_ws_to_dap(ws: WebSocket, target_port: u16) -> Result<(), anyhow::Error> {
     use futures::{SinkExt, StreamExt};
 
     let url = format!("ws://127.0.0.1:{target_port}");

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) async fn require_protocol_bearer(
+pub async fn require_protocol_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -23,7 +23,7 @@ pub(crate) async fn require_protocol_bearer(
 /// because it fronts both runner and results-service routes. Reporting is
 /// narrower: workflow code can read its own runtime token, and a listen or
 /// manage token must not be able to finish another job.
-pub(crate) fn authorize_reporting_request(
+pub fn authorize_reporting_request(
     state: &AppState,
     headers: &HeaderMap,
     request: Option<&TaskAgentJobRequestRecord>,
@@ -71,7 +71,7 @@ pub(crate) fn authorize_reporting_request(
     }
 }
 
-pub(crate) async fn require_results_bearer(
+pub async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,
     next: Next,
@@ -196,7 +196,7 @@ async fn authorize_blob_request(
 /// credential replay window. The system identity (engine) bypasses: it
 /// manages the lifecycle itself. Reads are unaffected; each handler decides
 /// whether it is a write.
-pub(crate) async fn require_live_results_job(
+pub async fn require_live_results_job(
     state: &AppState,
     identity: &ResultsIdentity,
 ) -> Result<(), ApiError> {
@@ -212,7 +212,7 @@ pub(crate) async fn require_live_results_job(
 /// lock leaves a check-then-mutate window where the job settles between
 /// the gate and the write; callers that hold `inner` should re-verify with
 /// this before committing the mutation.
-pub(crate) fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
+pub fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
     inner
         .agent_job_requests
         .get(&job_uuid)
@@ -226,7 +226,7 @@ pub(crate) fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bo
 /// (the legacy `/_apis/artifactcache` cache write path). Same rule as
 /// [`require_live_results_job`]: the system identity bypasses, so callers
 /// must skip this helper for the system bearer themselves.
-pub(crate) async fn require_live_job(
+pub async fn require_live_job(
     state: &AppState,
     job_uuid: uuid::Uuid,
 ) -> Result<(), ApiError> {
@@ -245,7 +245,7 @@ pub(crate) async fn require_live_job(
     }
 }
 
-pub(crate) async fn require_test_api_token(
+pub async fn require_test_api_token(
     State(expected): State<Arc<str>>,
     request: Request,
     next: Next,
@@ -264,7 +264,7 @@ pub(crate) async fn require_test_api_token(
     Ok(next.run(request).await)
 }
 
-pub(crate) fn system_bearer_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+pub fn system_bearer_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     bearer_from_headers(headers).is_some_and(|token| token == state.system_token)
 }
 
@@ -272,7 +272,7 @@ fn request_system_bearer_authorized(shared: &Arc<SharedState>, request: &Request
     bearer_token(request).is_some_and(|token| token == shared.state.system_token)
 }
 
-pub(crate) async fn require_system_bearer(
+pub async fn require_system_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -286,7 +286,7 @@ pub(crate) async fn require_system_bearer(
 
 /// Who a session/agent administration request acts as.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdminCaller {
+pub enum AdminCaller {
     System,
     /// A runner-registration credential used by configure/replace.
     RunnerManager,
@@ -309,7 +309,7 @@ pub(crate) enum AdminCaller {
 /// listen token. So admit the system token *or* a registered runner's listen
 /// token here, reject job runtime tokens, and let the handlers enforce
 /// self-ownership via [`admin_caller`].
-pub(crate) async fn require_runner_admin_bearer(
+pub async fn require_runner_admin_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -357,7 +357,7 @@ pub(crate) async fn require_runner_admin_bearer(
 ///
 /// Fail-closed: anything that is neither the system token nor a verified
 /// runner identity is an error, never silently treated as the administrator.
-pub(crate) fn admin_caller(
+pub fn admin_caller(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     identity: Option<&RunnerIdentity>,
@@ -396,7 +396,7 @@ pub(crate) fn admin_caller(
         })
 }
 
-pub(crate) async fn require_native_bearer(
+pub async fn require_native_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -410,7 +410,7 @@ pub(crate) async fn require_native_bearer(
     }
 }
 
-pub(crate) async fn require_runner_bearer(
+pub async fn require_runner_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -422,7 +422,7 @@ pub(crate) async fn require_runner_bearer(
     }
     Err(ApiError::unauthorized("runner listen token required"))
 }
-pub(crate) fn runner_registration_bearer_authorized(state: &AppState, token: &str) -> bool {
+pub fn runner_registration_bearer_authorized(state: &AppState, token: &str) -> bool {
     token == state.system_token.as_str()
         || state.verify_local_jwt_claims(token).is_some_and(|claims| {
             claims.get("sub").and_then(|value| value.as_str())
@@ -442,7 +442,7 @@ pub(crate) fn runner_registration_bearer_authorized(state: &AppState, token: &st
 /// the legacy AzDO registration aliases. The GitHub-compatible registration
 /// endpoint mints this local RunnerManage token; a pool provision token is the
 /// other supported path for the host-side configure flow.
-pub(crate) async fn require_runner_registration_bearer(
+pub async fn require_runner_registration_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -466,7 +466,7 @@ pub(crate) async fn require_runner_registration_bearer(
 /// Require a credential that identifies a registered runner on the legacy
 /// session/message surface. The system token remains valid for trusted
 /// control-plane tests and operators; runner traffic must prove a listen JWT.
-pub(crate) async fn require_legacy_runner_bearer(
+pub async fn require_legacy_runner_bearer(
     State(shared): State<Arc<SharedState>>,
     request: Request,
     next: Next,
@@ -503,7 +503,7 @@ fn provision_token_is_fresh(issued_at: std::time::SystemTime) -> bool {
 /// under the write lock so concurrent registration attempts cannot both pass.
 /// The issuance time is returned so a validation failure can restore the
 /// credential without extending its lifetime.
-pub(crate) fn consume_pending_provision_token(
+pub fn consume_pending_provision_token(
     state: &AppState,
     token: &str,
 ) -> Option<std::time::SystemTime> {
@@ -515,7 +515,7 @@ pub(crate) fn consume_pending_provision_token(
         .filter(|issued_at| provision_token_is_fresh(*issued_at))
 }
 
-pub(crate) fn restore_pending_provision_token(
+pub fn restore_pending_provision_token(
     state: &AppState,
     token: &str,
     issued_at: std::time::SystemTime,
@@ -533,7 +533,7 @@ pub(crate) fn restore_pending_provision_token(
 /// Both production PS256 tokens and local JSON-OAuth compatibility tokens use
 /// this single mapping path. The request middleware and broker handlers call
 /// the same helper so token identity cannot drift between surfaces.
-pub(crate) async fn registered_runner_id(shared: &Arc<SharedState>, token: &str) -> Option<i64> {
+pub async fn registered_runner_id(shared: &Arc<SharedState>, token: &str) -> Option<i64> {
     let runner_id = if let Some(runner_id) = shared.state.runner_id_from_token(token) {
         Some(runner_id)
     } else {
@@ -563,11 +563,11 @@ pub(crate) async fn registered_runner_id(shared: &Arc<SharedState>, token: &str)
         .then_some(runner_id)
 }
 
-pub(crate) fn bearer_token(request: &Request) -> Option<&str> {
+pub fn bearer_token(request: &Request) -> Option<&str> {
     bearer_from_headers(request.headers())
 }
 
-pub(crate) fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
+pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -591,9 +591,9 @@ async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
 }
 
 /// Signed replay blob upload tickets expire after one hour.
-pub(crate) const REPLAY_TICKET_TTL_SECS: u64 = 3600;
+pub const REPLAY_TICKET_TTL_SECS: u64 = 3600;
 
-pub(crate) fn replay_ticket_expiry() -> u64 {
+pub fn replay_ticket_expiry() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -609,7 +609,7 @@ pub(crate) fn replay_ticket_expiry() -> u64 {
 /// overwrite another job's stored logs and summaries by guessing the URL
 /// shape. Binding the signature to the exact path and expiry makes a URL
 /// minted for one job worthless against any other, or after its lifetime.
-pub(crate) fn sign_replay_upload_ticket(state: &AppState, path: &str, expires_at: u64) -> String {
+pub fn sign_replay_upload_ticket(state: &AppState, path: &str, expires_at: u64) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(&state.local_jwt_key)
         .expect("HMAC accepts keys of any length");
     mac.update(replay_ticket_payload(path, expires_at).as_bytes());
@@ -618,7 +618,7 @@ pub(crate) fn sign_replay_upload_ticket(state: &AppState, path: &str, expires_at
 
 /// Whether the `sig` query parameter of `uri` authorises an upload to exactly
 /// that replay path before the signed Unix expiry (`se`).
-pub(crate) fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Uri) -> bool {
+pub fn verify_replay_upload_ticket(state: &AppState, uri: &axum::http::Uri) -> bool {
     let Some(query) = uri.query() else {
         return false;
     };
@@ -658,7 +658,7 @@ fn replay_ticket_payload(path: &str, expires_at: u64) -> String {
 /// handler that mints anything (e.g. runner-management JWTs) may require a
 /// stronger credential there than on TCP, where GitHub-compatible clients
 /// (official runner, conformance replays) present credentials only they hold.
-pub(crate) struct SocketSurface;
+pub struct SocketSurface;
 
 impl Clone for SocketSurface {
     fn clone(&self) -> Self {
@@ -669,13 +669,13 @@ impl Clone for SocketSurface {
 /// The authenticated identity carried by a Results bearer is used by every
 /// Results handler, including signed-URL minting and metadata mutation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResultsJobIdentity {
-    pub(crate) plan_id: String,
-    pub(crate) job_id: uuid::Uuid,
+pub struct ResultsJobIdentity {
+    pub plan_id: String,
+    pub job_id: uuid::Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ResultsIdentity {
+pub enum ResultsIdentity {
     /// The engine credential is allowed to address every Results target.
     System,
     /// A runtime credential is bound to one plan/job pair.
@@ -683,7 +683,7 @@ pub(crate) enum ResultsIdentity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResultsIdentityError {
+pub enum ResultsIdentityError {
     /// The bearer is signed locally but does not identify a Results job.
     NotJob,
     /// A job-shaped bearer has a valid job subject but malformed Results claims.
@@ -702,7 +702,7 @@ pub(crate) enum ResultsIdentityError {
 /// valid local JWT minted for one protocol surface from being repurposed as a
 /// different job's Results credential. The error distinguishes a malformed
 /// job-shaped token so cache writes can retain their fail-closed behavior.
-pub(crate) fn results_identity(
+pub fn results_identity(
     state: &AppState,
     bearer: &str,
 ) -> Result<ResultsIdentity, ResultsIdentityError> {
@@ -739,7 +739,7 @@ pub(crate) fn results_identity(
     Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
-pub(crate) fn results_identity_binds_job(
+pub fn results_identity_binds_job(
     identity: &ResultsIdentity,
     plan_id: &str,
     job_id: &str,
@@ -756,7 +756,7 @@ pub(crate) fn results_identity_binds_job(
 }
 
 /// Require the typed Results identity to name the exact plan/job target.
-pub(crate) fn require_results_job(
+pub fn require_results_job(
     identity: &ResultsIdentity,
     plan_id: &str,
     job_id: &str,
@@ -776,7 +776,7 @@ pub(crate) fn require_results_job(
 /// spellings collapse to the lower-case hyphenated form used by the runner's
 /// lookup path. The system identity keeps accepting opaque backend ids for
 /// compatibility, while still canonicalizing valid UUIDs.
-pub(crate) fn require_canonical_results_job_id(
+pub fn require_canonical_results_job_id(
     identity: &ResultsIdentity,
     plan_id: &str,
     job_id: &str,
@@ -795,8 +795,8 @@ pub(crate) fn require_canonical_results_job_id(
 /// token, job runtime token, unresolvable mock subject — leaves it `None`,
 /// which handlers must treat as unverified (never as a runner).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RunnerIdentity {
-    pub(crate) runner_id: Option<i64>,
+pub struct RunnerIdentity {
+    pub runner_id: Option<i64>,
 }
 
 /// Non-rejecting resolver: tags every request with the [`RunnerIdentity`] its
@@ -804,7 +804,7 @@ pub(crate) struct RunnerIdentity {
 /// several endpoints and external runners still rely on that, so enforcement
 /// decisions belong to the handlers; this layer only makes the identity
 /// available so handlers cannot be talked into trusting request bodies.
-pub(crate) async fn resolve_runner_identity(
+pub async fn resolve_runner_identity(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,
     next: Next,
@@ -827,7 +827,7 @@ pub(crate) async fn resolve_runner_identity(
 /// - verified identity otherwise → that runner
 /// - unverified request → `None` (legacy permissive claims only; the claim
 ///   filter then bars assigned and pool-pending jobs)
-pub(crate) fn effective_claim_runner(
+pub fn effective_claim_runner(
     identity: Option<&RunnerIdentity>,
     bound: Option<i64>,
 ) -> Option<i64> {
@@ -866,7 +866,7 @@ fn debug_session_member(path: &str, suffix: &str) -> bool {
 /// every runner VM, so anything not part of the runner/broker protocol is
 /// refused there. Native management and GUI API prefixes have no legitimate
 /// use from a guest.
-pub(crate) async fn runner_surface_only(
+pub async fn runner_surface_only(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
@@ -912,7 +912,7 @@ pub(crate) async fn runner_surface_only(
 /// reachable by any live job's token, which makes session ids the only thing
 /// standing between one job and another's debug session.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct WorkerJob(pub(crate) uuid::Uuid);
+pub struct WorkerJob(pub uuid::Uuid);
 
 /// Require a job debug-worker token and record which job it names.
 ///
@@ -922,7 +922,7 @@ pub(crate) struct WorkerJob(pub(crate) uuid::Uuid);
 /// (`sub: preloop-debug-worker-{uuid}`) and delivered only to the trusted runner
 /// process, so it identifies the caller precisely; neither a runtime token nor
 /// a runner listen token is accepted here.
-pub(crate) async fn require_worker_bearer(
+pub async fn require_worker_bearer(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,
     next: Next,
@@ -946,7 +946,7 @@ pub(crate) async fn require_worker_bearer(
 /// *exchange* accepts this identity; the debug-session routes themselves still
 /// demand a [`WorkerJob`].
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct JobRuntimeIdentity(pub(crate) uuid::Uuid);
+pub struct JobRuntimeIdentity(pub uuid::Uuid);
 
 /// Require a job runtime token and record which job it names.
 ///
@@ -957,7 +957,7 @@ pub(crate) struct JobRuntimeIdentity(pub(crate) uuid::Uuid);
 /// exchange is one-shot. A runner listen token, the native system token and a
 /// debug-worker token are all rejected here — each names something other than
 /// one job.
-pub(crate) async fn require_job_runtime_bearer(
+pub async fn require_job_runtime_bearer(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,
     next: Next,
@@ -973,7 +973,7 @@ pub(crate) async fn require_job_runtime_bearer(
 }
 
 /// Resolve the repository authorized by a job runtime bearer.
-pub(crate) async fn job_repository_from_headers(
+pub async fn job_repository_from_headers(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, ApiError> {
@@ -1002,7 +1002,7 @@ pub(crate) async fn job_repository_from_headers(
 /// R1-5: resolve the git ref of the job behind a job runtime bearer, from
 /// the job → run → submission chain. Mirrors `job_repository_from_headers`.
 /// Returns `None` for the system token (the engine itself has no job).
-pub(crate) async fn job_git_ref_from_headers(
+pub async fn job_git_ref_from_headers(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, ApiError> {
@@ -1033,26 +1033,26 @@ pub(crate) async fn job_git_ref_from_headers(
 /// belongs to — never from request bodies — so a compromised job cannot
 /// move its cache namespace across repositories or branches.
 #[derive(Debug, Clone)]
-pub(crate) struct JobCacheContext {
+pub struct JobCacheContext {
     /// Repository the run belongs to (`owner/repo`).
-    pub(crate) repository: String,
+    pub repository: String,
     /// Git ref the run executes on (`refs/heads/feature`,
     /// `refs/pull/42/merge`, `refs/tags/v1`, …).
-    pub(crate) git_ref: String,
+    pub git_ref: String,
     /// The repository's default branch as a full ref, taken from the event
     /// payload's `repository.default_branch`. Falls back to
     /// `refs/heads/main` only when the payload does not carry it (native
     /// submissions, pre-payload fixtures).
-    pub(crate) default_branch_ref: String,
+    pub default_branch_ref: String,
     /// For `pull_request`/`pull_request_target` runs, the PR's base branch
     /// as a full ref (`refs/heads/release`). `None` for non-PR events.
-    pub(crate) base_ref: Option<String>,
+    pub base_ref: Option<String>,
 }
 
 /// Resolve the cache-scoping context of the job behind a job runtime
 /// bearer. Returns `None` for the system token (the engine itself has no
 /// job); a job token that resolves to no live run fails closed.
-pub(crate) async fn job_cache_context_from_headers(
+pub async fn job_cache_context_from_headers(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<JobCacheContext>, ApiError> {
@@ -1098,7 +1098,7 @@ pub(crate) async fn job_cache_context_from_headers(
     }))
 }
 
-pub(crate) fn job_runtime_claims_from_headers(
+pub fn job_runtime_claims_from_headers(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Option<JobRuntimeClaims> {
@@ -1107,7 +1107,7 @@ pub(crate) fn job_runtime_claims_from_headers(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct JobRuntimeClaims {
-    pub(crate) plan_id: String,
-    pub(crate) job_id: uuid::Uuid,
+pub struct JobRuntimeClaims {
+    pub plan_id: String,
+    pub job_id: uuid::Uuid,
 }

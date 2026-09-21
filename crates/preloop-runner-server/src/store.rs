@@ -29,7 +29,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
 const DATABASE_FILE: &str = "preloop.db";
-pub(crate) const SNAPSHOT_FORMAT: u8 = 2;
+pub const SNAPSHOT_FORMAT: u8 = 2;
 const MIGRATION_DOMAIN: &[u8] = b"preloop-store-v2";
 const KEY_INFO_ENCRYPT: &[u8] = b"aks-store-aead/v1";
 const KEY_INFO_MAC: &[u8] = b"aks-store-mac/v1";
@@ -38,7 +38,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Durable-state backend. See the module docs for the contract.
 #[async_trait]
-pub(crate) trait Store: Send + Sync {
+pub trait Store: Send + Sync {
     /// Restore the persisted state into `inner` (startup path).
     async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()>;
     /// Full snapshot: rewrite every table from a captured [`StoreSnapshot`]
@@ -204,7 +204,7 @@ pub(crate) trait Store: Send + Sync {
 
 /// Decorator that records `preloop.store.operation.duration` for every
 /// `Store` method. One wrapper, not per-backend duplication.
-pub(crate) struct InstrumentedStore {
+pub struct InstrumentedStore {
     inner: Arc<dyn Store>,
     observability: preloop_observability::Observability,
     backend: String,
@@ -223,7 +223,7 @@ impl InstrumentedStore {
         }
     }
 
-    pub(crate) fn wrap(
+    pub fn wrap(
         inner: Arc<dyn Store>,
         observability: preloop_observability::Observability,
         backend: &str,
@@ -593,28 +593,28 @@ impl Store for InstrumentedStore {
 /// Captured under the state lock; the database write happens after the lock
 /// is released, so a slow backend never stalls the control plane.
 #[derive(Clone)]
-pub(crate) struct StoreSnapshot {
-    pub(crate) runs: Vec<RunRecord>,
+pub struct StoreSnapshot {
+    pub runs: Vec<RunRecord>,
     /// (queue_kind, job, global queue position within the kind).
-    pub(crate) jobs: Vec<(&'static str, QueuedJob, i64)>,
-    pub(crate) runners: Vec<RegisteredRunner>,
-    pub(crate) rsa_public_keys: Vec<(i64, AgentRsaPublicKey)>,
-    pub(crate) sessions: Vec<RunnerSession>,
-    pub(crate) session_keys: Vec<(String, SessionEncryption)>,
-    pub(crate) requests: Vec<TaskAgentJobRequestRecord>,
+    pub jobs: Vec<(&'static str, QueuedJob, i64)>,
+    pub runners: Vec<RegisteredRunner>,
+    pub rsa_public_keys: Vec<(i64, AgentRsaPublicKey)>,
+    pub sessions: Vec<RunnerSession>,
+    pub session_keys: Vec<(String, SessionEncryption)>,
+    pub requests: Vec<TaskAgentJobRequestRecord>,
     /// (session_id, message_id, undelivered message).
-    pub(crate) inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
+    pub inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
     /// session_id → currently claimed request id.
-    pub(crate) session_active_requests: Vec<(String, i64)>,
+    pub session_active_requests: Vec<(String, i64)>,
     /// request_id → undelivered job message.
-    pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    pub broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
     /// (agent_job_id, that attempt's step records, its revision).
-    pub(crate) job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>, u64)>,
-    pub(crate) meta: MetaSnapshot,
+    pub job_steps: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>, u64)>,
+    pub meta: MetaSnapshot,
 }
 
 impl StoreSnapshot {
-    pub(crate) fn from_inner(inner: &InnerState) -> Self {
+    pub fn from_inner(inner: &InnerState) -> Self {
         StoreSnapshot {
             runs: inner.runs.values().cloned().collect(),
             jobs: queue_rows(inner)
@@ -676,25 +676,21 @@ impl StoreSnapshot {
 /// yet acked survives a restart in the same transaction that rewrites its
 /// run's queue rows.
 #[derive(Clone)]
-pub(crate) struct RunProjection {
-    pub(crate) run: RunRecord,
+pub struct RunProjection {
+    pub run: RunRecord,
     /// (queue_kind, job, global queue position within the kind).
-    pub(crate) jobs: Vec<(&'static str, QueuedJob, i64)>,
-    pub(crate) requests: Vec<TaskAgentJobRequestRecord>,
-    pub(crate) session_active_requests: Vec<(String, i64)>,
-    pub(crate) inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
-    pub(crate) broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
-    pub(crate) event: NdjsonEvent,
+    pub jobs: Vec<(&'static str, QueuedJob, i64)>,
+    pub requests: Vec<TaskAgentJobRequestRecord>,
+    pub session_active_requests: Vec<(String, i64)>,
+    pub inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
+    pub broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
+    pub event: NdjsonEvent,
 }
 
 impl RunProjection {
     /// Returns `None` when the run is no longer present; the caller then skips
     /// persistence but still broadcasts.
-    pub(crate) fn from_inner(
-        inner: &InnerState,
-        run_id: RunId,
-        event: NdjsonEvent,
-    ) -> Option<Self> {
+    pub fn from_inner(inner: &InnerState, run_id: RunId, event: NdjsonEvent) -> Option<Self> {
         let run = inner.runs.get(&run_id)?.clone();
         Some(RunProjection {
             run,
@@ -734,7 +730,7 @@ impl RunProjection {
 
 /// SQLite backend: `<state_dir>/preloop.db`, one connection behind a mutex.
 #[derive(Clone)]
-pub(crate) struct SqliteStore {
+pub struct SqliteStore {
     connection: Arc<StdMutex<Connection>>,
     cipher: Envelope,
     /// Commits since the last forced WAL truncation. A full
@@ -756,7 +752,7 @@ const WAL_CHECKPOINT_INTERVAL: u64 = 128;
 /// Where the server should look for durable state. Parsed from `PRELOOP_STORE_URL`
 /// (or an explicit override); see [`parse_store_url`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StoreUrl {
+pub enum StoreUrl {
     /// `sqlite://<path>`, `sqlite:<path>`, or a bare filesystem path.
     /// An empty path means the default `<state_dir>/preloop.db`.
     Sqlite(std::path::PathBuf),
@@ -766,11 +762,11 @@ pub(crate) enum StoreUrl {
 
 /// Environment variable selecting the store backend when no explicit URL is
 /// given. Values: `sqlite://<path>`, `postgres://…`, or a bare path.
-pub(crate) const STORE_URL_ENV: &str = "PRELOOP_STORE_URL";
+pub const STORE_URL_ENV: &str = "PRELOOP_STORE_URL";
 
 /// Parse a store URL. Bare paths and `sqlite:` forms map to the SQLite
 /// backend; `postgres://` / `postgresql://` map to the Postgres backend.
-pub(crate) fn parse_store_url(value: &str) -> anyhow::Result<StoreUrl> {
+pub fn parse_store_url(value: &str) -> anyhow::Result<StoreUrl> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(StoreUrl::Sqlite(std::path::PathBuf::new()));
@@ -797,7 +793,7 @@ pub(crate) fn parse_store_url(value: &str) -> anyhow::Result<StoreUrl> {
 /// Open the store selected by `url` (falling back to `PRELOOP_STORE_URL`, then
 /// to SQLite at `<state_dir>/preloop.db`). The AEAD envelope key is derived from
 /// the JWT HMAC key with domain separation, independent of the backend.
-pub(crate) async fn open_store(
+pub async fn open_store(
     url: Option<&str>,
     state_dir: &std::path::Path,
     key: &[u8],
@@ -825,7 +821,7 @@ pub(crate) async fn open_store(
 /// metadata snapshot). Backend-independent: SQLite and Postgres both store
 /// the sealed bytes as opaque blobs.
 #[derive(Clone)]
-pub(crate) struct Envelope {
+pub struct Envelope {
     aead: [u8; 32],
     mac: [u8; 32],
 }
@@ -833,7 +829,7 @@ pub(crate) struct Envelope {
 impl Envelope {
     /// Derive the AEAD + MAC sub-keys from the root HMAC key (HKDF-SHA256,
     /// domain-separated per purpose).
-    pub(crate) fn new(root: &[u8]) -> Self {
+    pub fn new(root: &[u8]) -> Self {
         let keys = derive_keys(root);
         Self {
             aead: keys.aead,
@@ -843,12 +839,12 @@ impl Envelope {
 
     /// AES-256-CBC + HMAC-SHA256 over the migration domain, associated data,
     /// IV, and ciphertext. Returns `(ciphertext, iv, tag)`.
-    pub(crate) fn encrypt_sealed(&self, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    pub fn encrypt_sealed(&self, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         self.encrypt_sealed_with_associated_data(plaintext, &[])
     }
 
     /// Encrypt and authenticate a blob with caller-provided associated data.
-    pub(crate) fn encrypt_sealed_with_associated_data(
+    pub fn encrypt_sealed_with_associated_data(
         &self,
         plaintext: &[u8],
         associated_data: &[u8],
@@ -866,7 +862,7 @@ impl Envelope {
     }
 
     /// Verify the MAC and decrypt. Fails on tampering or a wrong key.
-    pub(crate) fn decrypt_sealed(
+    pub fn decrypt_sealed(
         &self,
         ciphertext: &[u8],
         iv: &[u8],
@@ -876,7 +872,7 @@ impl Envelope {
     }
 
     /// Verify and decrypt a blob with caller-provided associated data.
-    pub(crate) fn decrypt_sealed_with_associated_data(
+    pub fn decrypt_sealed_with_associated_data(
         &self,
         ciphertext: &[u8],
         iv: &[u8],
@@ -896,12 +892,12 @@ impl Envelope {
     }
 
     /// Seal a plaintext blob: `version || iv || ciphertext || tag`.
-    pub(crate) fn seal(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn seal(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.seal_with_associated_data(plaintext, &[])
     }
 
     /// Seal a plaintext blob bound to associated data.
-    pub(crate) fn seal_with_associated_data(
+    pub fn seal_with_associated_data(
         &self,
         plaintext: &[u8],
         associated_data: &[u8],
@@ -918,12 +914,12 @@ impl Envelope {
 
     /// Unseal a blob written by [`Envelope::seal`]. Rejects foreign envelope
     /// versions (v1 used a different, unauthenticated scheme).
-    pub(crate) fn unseal(&self, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub fn unseal(&self, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.unseal_with_associated_data(sealed, &[])
     }
 
     /// Unseal a blob and require the supplied associated data.
-    pub(crate) fn unseal_with_associated_data(
+    pub fn unseal_with_associated_data(
         &self,
         sealed: &[u8],
         associated_data: &[u8],
@@ -952,7 +948,7 @@ const MESSAGE_PAYLOAD_AAD_DOMAIN: &str = "preloop-message-payload-aad-v1";
 
 /// The encoding found in a persisted broker/job-request payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessagePayloadEncoding {
+pub enum MessagePayloadEncoding {
     Bound,
     LegacySealed,
     LegacyPlaintext,
@@ -961,7 +957,7 @@ pub(crate) enum MessagePayloadEncoding {
 /// Canonical associated data for a payload row. The table/type and every row
 /// identity are authenticated, so copying a valid ciphertext to another row
 /// cannot make it execute in the wrong broker context.
-pub(crate) fn message_payload_aad(
+pub fn message_payload_aad(
     table: &str,
     payload_type: &str,
     session_id: Option<&str>,
@@ -979,7 +975,7 @@ pub(crate) fn message_payload_aad(
     .expect("message payload AAD tuple is serializable")
 }
 
-pub(crate) fn broker_message_payload_aad(session_id: &str, message_id: i64) -> Vec<u8> {
+pub fn broker_message_payload_aad(session_id: &str, message_id: i64) -> Vec<u8> {
     message_payload_aad(
         "broker_messages",
         "TaskAgentMessage",
@@ -989,7 +985,7 @@ pub(crate) fn broker_message_payload_aad(session_id: &str, message_id: i64) -> V
     )
 }
 
-pub(crate) fn job_request_message_payload_aad(request_id: i64) -> Vec<u8> {
+pub fn job_request_message_payload_aad(request_id: i64) -> Vec<u8> {
     message_payload_aad(
         "job_request_messages",
         "AgentJobRequestMessage",
@@ -1000,7 +996,7 @@ pub(crate) fn job_request_message_payload_aad(request_id: i64) -> Vec<u8> {
 }
 
 /// Seal a broker/job-request message payload for its specific row.
-pub(crate) fn seal_message_payload<T: serde::Serialize>(
+pub fn seal_message_payload<T: serde::Serialize>(
     cipher: &Envelope,
     value: &T,
     associated_data: &[u8],
@@ -1012,7 +1008,7 @@ pub(crate) fn seal_message_payload<T: serde::Serialize>(
 /// Decode a payload for the one-time migration. Current rows are bound to
 /// `associated_data`; rows from the first sealing implementation used an
 /// authenticated but unbound envelope; older rows were plaintext JSON.
-pub(crate) fn decode_message_payload<T: serde::de::DeserializeOwned>(
+pub fn decode_message_payload<T: serde::de::DeserializeOwned>(
     cipher: &Envelope,
     raw: &str,
     associated_data: &[u8],
@@ -1047,7 +1043,7 @@ pub(crate) fn decode_message_payload<T: serde::de::DeserializeOwned>(
 
 /// Read a current payload row. Legacy encodings are deliberately rejected
 /// here; startup migration must finish before normal restoration.
-pub(crate) fn unseal_message_payload<T: serde::de::DeserializeOwned>(
+pub fn unseal_message_payload<T: serde::de::DeserializeOwned>(
     cipher: &Envelope,
     raw: &str,
     associated_data: &[u8],
@@ -1061,9 +1057,9 @@ pub(crate) fn unseal_message_payload<T: serde::de::DeserializeOwned>(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct MetaSnapshot {
+pub struct MetaSnapshot {
     #[serde(default)]
-    pub(crate) revision: u64,
+    pub revision: u64,
     workflow_run_counters: BTreeMap<String, u64>,
     next_runner_id: i64,
     next_cache_id: i64,
@@ -1134,7 +1130,7 @@ pub(crate) struct MetaSnapshot {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct RequestSnapshot {
+pub struct RequestSnapshot {
     request_id: i64,
     run_id: RunId,
     job_id: JobId,
@@ -1155,12 +1151,12 @@ pub(crate) struct RequestSnapshot {
 }
 
 #[derive(Debug)]
-pub(crate) struct RowJob {
-    pub(crate) run_id: RunId,
-    pub(crate) job_id: JobId,
-    pub(crate) queue_kind: String,
-    pub(crate) queue_position: i64,
-    pub(crate) payload: Vec<u8>,
+pub struct RowJob {
+    pub run_id: RunId,
+    pub job_id: JobId,
+    pub queue_kind: String,
+    pub queue_position: i64,
+    pub payload: Vec<u8>,
 }
 
 struct DerivedKeys {
@@ -1199,7 +1195,7 @@ fn derive_keys(root: &[u8]) -> DerivedKeys {
 /// (`caller_plans`, `github`, `head_sha`, `workflow_ref`, `workspace_snapshot`)
 /// that the scheduler needs to materialize a deferred reusable-caller or
 /// matrix subtree after a restart.
-pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
+pub fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
     let mut value = serde_json::to_value(run)?;
     if let Some(object) = value.as_object_mut() {
         object.insert("submission".to_owned(), run.submission.to_request_json()?);
@@ -1230,7 +1226,7 @@ pub(crate) fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Va
 }
 
 /// Unseal + parse a run blob written by [`run_record_value`].
-pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
+pub fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
     let value: serde_json::Value = serde_json::from_slice(&cipher.unseal(blob)?)?;
     let mut run: RunRecord = serde_json::from_value(value.clone())?;
     if let Some(object) = value.as_object() {
@@ -1287,7 +1283,7 @@ pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Resu
     Ok(run)
 }
 /// Project a job-request record into its persisted snapshot shape.
-pub(crate) fn request_snapshot(record: &TaskAgentJobRequestRecord) -> RequestSnapshot {
+pub fn request_snapshot(record: &TaskAgentJobRequestRecord) -> RequestSnapshot {
     RequestSnapshot {
         request_id: record.request_id,
         run_id: record.run_id,
@@ -1307,7 +1303,7 @@ pub(crate) fn request_snapshot(record: &TaskAgentJobRequestRecord) -> RequestSna
     }
 }
 /// Unseal + parse a request blob written by [`request_snapshot`].
-pub(crate) fn restore_request_snapshot(
+pub fn restore_request_snapshot(
     cipher: &Envelope,
     blob: &[u8],
 ) -> anyhow::Result<TaskAgentJobRequestRecord> {
@@ -1333,7 +1329,7 @@ pub(crate) fn restore_request_snapshot(
 
 /// Serialize the runtime metadata snapshot from in-memory state. Shared by
 /// every backend so one code path defines what survives a restart.
-pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
+pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
     MetaSnapshot {
         revision: inner
             .metadata_revision
@@ -1465,7 +1461,7 @@ pub(crate) fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
 }
 
 /// Apply a restored metadata snapshot onto in-memory state.
-pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
+pub fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     inner.workflow_run_counters = meta.workflow_run_counters;
     inner.next_runner_id = meta.next_runner_id;
     inner.next_cache_id = meta.next_cache_id;
@@ -1610,17 +1606,14 @@ pub(crate) fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
 }
 
 /// Seal a session AES key for storage. Returns `(ciphertext, iv, tag)`.
-pub(crate) fn seal_session_key(
-    cipher: &Envelope,
-    enc: &SessionEncryption,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub fn seal_session_key(cipher: &Envelope, enc: &SessionEncryption) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let payload = serde_json::to_vec(&SessionKeyPayload(enc.key.clone()))
         .expect("SessionKeyPayload is always serializable");
     cipher.encrypt_sealed(&payload)
 }
 
 /// Unseal + parse a session AES key blob written by [`seal_session_key`].
-pub(crate) fn restore_session_key(
+pub fn restore_session_key(
     cipher: &Envelope,
     key_blob: &[u8],
     iv: &[u8],
@@ -1665,7 +1658,7 @@ fn checkpoint_wal(connection: &Connection) -> anyhow::Result<()> {
 }
 
 impl SqliteStore {
-    pub(crate) fn open(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
+    pub fn open(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1881,7 +1874,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+    pub fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         // Restore every run still in flight plus the newest completed runs up
         // to `MAX_COMPLETED_RUNS_RETAINED`. Loading the full history
@@ -2338,7 +2331,7 @@ impl SqliteStore {
 
     /// Persist a single log chunk. Replaces the old behaviour of rewriting the
     /// entire `meta_blob` on every append.
-    pub(crate) fn store_log_chunk(
+    pub fn store_log_chunk(
         &self,
         key: &str,
         chunk_index: i64,
@@ -2383,13 +2376,13 @@ impl SqliteStore {
     }
 
     /// Delete a log's parent row; `log_chunks` cascade away with it.
-    pub(crate) fn delete_log(&self, key: &str) -> anyhow::Result<()> {
+    pub fn delete_log(&self, key: &str) -> anyhow::Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         connection.execute("DELETE FROM log_files WHERE log_key = ?1", params![key])?;
         Ok(())
     }
 
-    pub(crate) fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
+    pub fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
         for table in [
@@ -2554,7 +2547,7 @@ impl SqliteStore {
     /// Persist only one run's mutable projection. This is the hot path used
     /// after runner events; rebuilding every run on every status transition
     /// turns a burst of independent submissions into quadratic work.
-    pub(crate) fn store_run_event(&self, projection: &RunProjection) -> anyhow::Result<()> {
+    pub fn store_run_event(&self, projection: &RunProjection) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
         let run_id = projection.run.run_id;
@@ -2601,7 +2594,7 @@ impl SqliteStore {
     }
 
     /// Persist one attempt's step rows in their own transaction.
-    pub(crate) fn store_job_steps(
+    pub fn store_job_steps(
         &self,
         run_id: RunId,
         agent_job_id: uuid::Uuid,
@@ -2616,7 +2609,7 @@ impl SqliteStore {
         self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
-    pub(crate) fn store_workflow_run_counter(
+    pub fn store_workflow_run_counter(
         &self,
         workflow_path: &str,
         next_run_number: u64,
@@ -2647,7 +2640,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
+    pub fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
         self.write_meta_tx(&tx, meta)?;
@@ -2867,7 +2860,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
+    pub fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
         self.insert_event_tx(&tx, event)?;
@@ -2900,7 +2893,7 @@ impl SqliteStore {
         )?;
         Ok(())
     }
-    pub(crate) fn enqueue_webhook_delivery(
+    pub fn enqueue_webhook_delivery(
         &self,
         delivery: &WebhookDeliveryRecord,
     ) -> anyhow::Result<bool> {
@@ -2941,7 +2934,7 @@ impl SqliteStore {
         self.maybe_checkpoint_wal(&connection)?;
         Ok(rows_affected > 0)
     }
-    pub(crate) fn claim_webhook_deliveries(
+    pub fn claim_webhook_deliveries(
         &self,
         limit: usize,
         lease_duration_secs: u64,
@@ -3040,7 +3033,7 @@ impl SqliteStore {
     }
 
     /// Renew a live webhook processing lease without changing its attempt.
-    pub(crate) fn renew_webhook_delivery(
+    pub fn renew_webhook_delivery(
         &self,
         delivery_id: &str,
         lease_token: &str,
@@ -3061,7 +3054,7 @@ impl SqliteStore {
         )?;
         Ok(rows_affected > 0)
     }
-    pub(crate) fn complete_webhook_delivery(
+    pub fn complete_webhook_delivery(
         &self,
         delivery_id: &str,
         lease_token: &str,
@@ -3084,7 +3077,7 @@ impl SqliteStore {
         Ok(rows_affected > 0)
     }
 
-    pub(crate) fn fail_webhook_delivery(
+    pub fn fail_webhook_delivery(
         &self,
         delivery_id: &str,
         lease_token: &str,
@@ -3121,7 +3114,7 @@ impl SqliteStore {
         Ok(rows_affected > 0)
     }
 
-    pub(crate) fn get_webhook_delivery(
+    pub fn get_webhook_delivery(
         &self,
         delivery_id: &str,
     ) -> anyhow::Result<Option<WebhookDeliveryRecord>> {
@@ -3158,7 +3151,7 @@ impl SqliteStore {
         }
     }
 
-    pub(crate) fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64> {
+    pub fn count_dead_letter_webhook_deliveries(&self) -> anyhow::Result<u64> {
         let connection = self
             .connection
             .lock()
@@ -3171,7 +3164,7 @@ impl SqliteStore {
         Ok(count as u64)
     }
 
-    pub(crate) fn recover_webhook_deliveries(&self) -> anyhow::Result<u64> {
+    pub fn recover_webhook_deliveries(&self) -> anyhow::Result<u64> {
         let mut connection = self
             .connection
             .lock()
@@ -3189,11 +3182,7 @@ impl SqliteStore {
         Ok(rows_affected as u64)
     }
     /// Remove terminal rows older than the deduplication retention window.
-    pub(crate) fn prune_webhook_deliveries(
-        &self,
-        before_us: i64,
-        limit: usize,
-    ) -> anyhow::Result<u64> {
+    pub fn prune_webhook_deliveries(&self, before_us: i64, limit: usize) -> anyhow::Result<u64> {
         let mut connection = self
             .connection
             .lock()
@@ -3221,7 +3210,7 @@ impl SqliteStore {
     /// anyone knows whether the failure will be the payload's fault or
     /// GitHub's. Refunding it here is what keeps a dependency outage from
     /// consuming the retry budget of every delivery it touches.
-    pub(crate) fn park_webhook_delivery(
+    pub fn park_webhook_delivery(
         &self,
         delivery_id: &str,
         lease_token: &str,
@@ -3248,7 +3237,7 @@ impl SqliteStore {
         Ok(rows_affected > 0)
     }
 
-    pub(crate) fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool> {
+    pub fn requeue_webhook_delivery(&self, delivery_id: &str) -> anyhow::Result<bool> {
         let mut connection = self
             .connection
             .lock()
@@ -3266,7 +3255,7 @@ impl SqliteStore {
         Ok(rows_affected > 0)
     }
 
-    pub(crate) fn list_webhook_deliveries(
+    pub fn list_webhook_deliveries(
         &self,
         state: Option<WebhookDeliveryStatus>,
         limit: usize,
@@ -3325,7 +3314,7 @@ impl SqliteStore {
             .collect()
     }
 
-    pub(crate) fn webhook_deliveries_present(
+    pub fn webhook_deliveries_present(
         &self,
         delivery_ids: &[String],
     ) -> anyhow::Result<BTreeSet<String>> {
@@ -3353,7 +3342,7 @@ impl SqliteStore {
         Ok(found)
     }
 
-    pub(crate) fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats> {
+    pub fn webhook_queue_stats(&self) -> anyhow::Result<WebhookQueueStats> {
         let connection = self
             .connection
             .lock()
@@ -3385,7 +3374,7 @@ impl SqliteStore {
         Ok(stats)
     }
 
-    pub(crate) fn load_webhook_watchdog_cursor(
+    pub fn load_webhook_watchdog_cursor(
         &self,
         scope: &str,
     ) -> anyhow::Result<Option<WebhookWatchdogCursor>> {
@@ -3414,7 +3403,7 @@ impl SqliteStore {
         Ok(cursor)
     }
 
-    pub(crate) fn store_webhook_watchdog_cursor(
+    pub fn store_webhook_watchdog_cursor(
         &self,
         cursor: &WebhookWatchdogCursor,
     ) -> anyhow::Result<()> {
@@ -3486,7 +3475,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn upsert_webhook_redelivery(
+    pub fn upsert_webhook_redelivery(
         &self,
         record: &WebhookRedeliveryRecord,
     ) -> anyhow::Result<()> {
@@ -3535,7 +3524,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub(crate) fn load_webhook_redelivery(
+    pub fn load_webhook_redelivery(
         &self,
         delivery_guid: &str,
     ) -> anyhow::Result<Option<WebhookRedeliveryRecord>> {
@@ -3555,7 +3544,7 @@ impl SqliteStore {
         row.transpose()
     }
 
-    pub(crate) fn open_webhook_redeliveries(
+    pub fn open_webhook_redeliveries(
         &self,
         limit: usize,
     ) -> anyhow::Result<Vec<WebhookRedeliveryRecord>> {
@@ -3580,7 +3569,7 @@ impl SqliteStore {
         rows.into_iter().collect()
     }
 
-    pub(crate) fn resolve_webhook_redelivery(
+    pub fn resolve_webhook_redelivery(
         &self,
         delivery_guid: &str,
         resolved_at_us: i64,
@@ -3958,7 +3947,7 @@ impl Store for SqliteStore {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct SessionKeyPayload(Vec<u8>);
+pub struct SessionKeyPayload(Vec<u8>);
 
 const MIGRATIONS: &[(u32, &str, &str)] = &[
     (
@@ -4286,7 +4275,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     ),
 ];
 
-pub(crate) fn now_us() -> i64 {
+pub fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4302,11 +4291,11 @@ pub(crate) fn now_us() -> i64 {
 /// epoch. Wrapping there would turn a deliberate long backoff into a deadline
 /// in the past — an immediately claimable row, i.e. the hot retry loop the
 /// ladder exists to prevent.
-pub(crate) fn retry_deadline_us(now_us: i64, delay: std::time::Duration) -> i64 {
+pub fn retry_deadline_us(now_us: i64, delay: std::time::Duration) -> i64 {
     now_us.saturating_add(delay.as_micros().min(i64::MAX as u128) as i64)
 }
 
-pub(crate) fn unix_us(value: chrono::DateTime<chrono::Utc>) -> i64 {
+pub fn unix_us(value: chrono::DateTime<chrono::Utc>) -> i64 {
     value.timestamp_micros()
 }
 
@@ -4337,7 +4326,7 @@ fn system_time_from_us(value: i64) -> SystemTime {
 /// left behind by another run's write still orders correctly relative to
 /// later writes: popping the front shifts everyone down uniformly and
 /// pushing to the back always yields a larger index than anything present.
-pub(crate) fn queue_rows(inner: &InnerState) -> Vec<(&'static str, &QueuedJob, i64)> {
+pub fn queue_rows(inner: &InnerState) -> Vec<(&'static str, &QueuedJob, i64)> {
     let mut rows = Vec::new();
     for (kind, jobs) in [
         ("ready", &inner.queue),
@@ -4362,7 +4351,7 @@ pub(crate) fn queue_rows(inner: &InnerState) -> Vec<(&'static str, &QueuedJob, i
 }
 
 /// [`queue_rows`] restricted to one run, keeping the global positions.
-pub(crate) fn queue_rows_for_run(
+pub fn queue_rows_for_run(
     inner: &InnerState,
     run_id: RunId,
 ) -> Vec<(&'static str, &QueuedJob, i64)> {
@@ -4378,7 +4367,7 @@ pub(crate) fn queue_rows_for_run(
 /// from another code path still produces a valid `(runner_id, label)` insert.
 /// Matches the case-insensitive semantics of
 /// `runtime_scheduling::job_matches_runner`.
-pub(crate) fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
+pub fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(labels.len());
     let mut out: Vec<String> = Vec::with_capacity(labels.len());

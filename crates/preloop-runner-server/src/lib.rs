@@ -11,86 +11,87 @@ use std::sync::Arc;
 pub mod concurrency;
 pub mod config;
 pub mod credential_store;
-mod errors;
+pub mod errors;
 pub mod events;
 pub mod github;
 pub mod github_app;
-mod github_breaker;
-mod github_pr;
-mod github_push;
+pub mod github_breaker;
+pub mod github_pr;
+pub mod github_push;
 pub mod scheduler;
-mod shared_http;
-mod webhook_api;
-mod webhook_health;
-mod webhook_status;
-mod webhook_watchdog;
+pub mod shared_http;
+pub mod webhook_api;
+pub mod webhook_health;
+pub mod webhook_status;
+pub mod webhook_watchdog;
 pub use errors::ApiError;
-mod actions;
+pub mod actions;
 use actions::*;
-mod secrets_api;
+pub mod secrets_api;
 use secrets_api::*;
-mod reusable_workflows;
+pub mod reusable_workflows;
 use reusable_workflows::*;
-mod remote_workflows;
-mod runs;
+pub mod remote_workflows;
+pub mod runs;
 use runs::*;
-mod runtime_scheduling;
+pub mod runtime_scheduling;
 use runtime_scheduling::*;
-mod timeline_logs;
+pub mod timeline_logs;
 use timeline_logs::*;
-mod routes;
+pub mod routes;
 use routes::build_app;
 pub use routes::{app, app_with_test_api};
-mod live_logs;
-mod openapi;
+pub mod live_logs;
+pub mod openapi;
 use live_logs::*;
-mod debug;
+pub mod debug;
 mod http_metrics;
 use debug::*;
-mod debug_sessions;
-mod runner_lifecycle;
+pub mod debug_sessions;
+pub mod runner_lifecycle;
 use runner_lifecycle::*;
-mod broker;
+pub mod broker;
 use broker::*;
-mod distributed_task;
+pub mod distributed_task;
 use distributed_task::*;
-mod auth;
+pub mod auth;
 use auth::*;
-mod dispatch;
-mod dispatch_auth;
-mod oauth;
+pub mod dispatch;
+pub mod dispatch_auth;
+pub mod oauth;
 use oauth::*;
-mod oidc_handlers;
+pub mod oidc_handlers;
 use oidc_handlers::*;
-mod results_twirp;
+pub mod results_twirp;
 use results_twirp::*;
-mod artifact_twirp;
+pub mod artifact_twirp;
 use artifact_twirp::*;
-mod compat_ghes;
+pub mod compat_ghes;
 use compat_ghes::*;
-mod cache_artifacts;
+pub mod cache_artifacts;
 use cache_artifacts::*;
-mod snapshots;
+pub mod snapshots;
 use snapshots::*;
-mod recording;
+pub mod recording;
 use recording::*;
-mod state;
+pub mod state;
 use state::*;
 pub use state::{AppState, SharedState};
-mod models;
+pub mod models;
 use models::*;
-mod store;
+pub mod store;
 use store::*;
-mod bootstrap;
-mod store_pg;
-#[cfg(test)]
+pub mod bootstrap;
+pub mod store_pg;
+#[cfg(any(test, feature = "test-support"))]
+#[allow(unused_imports)]
 use bootstrap::reap_once;
 pub use bootstrap::{generate_self_signed_cert, serve, SelfSignedCert, ServerConfig, TlsMode};
-mod blob_store;
+pub mod blob_store;
 use blob_store::*;
-mod connection;
+pub mod connection;
 use connection::*;
-mod memory_caps;
+pub mod memory_caps;
 use memory_caps::*;
 
 /// Pure job-graph scheduler model and property tests.
@@ -142,27 +143,17 @@ use tokio::sync::{broadcast, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 /// Deterministic administrator token used only by in-process tests.
-const DEFAULT_PRELOOP_SYSTEM_TOKEN: &str = "preloop-system-token";
-#[cfg(test)]
-const TEST_LOCAL_JWT_KEY: &[u8] = b"preloop-test-local-jwt-signing-key";
+pub const DEFAULT_PRELOOP_SYSTEM_TOKEN: &str = "preloop-system-token";
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_LOCAL_JWT_KEY: &[u8] = b"preloop-test-local-jwt-signing-key";
 
 // Re-export from protocol crate — shared wire type with the runner.
 use preloop_gha_protocol::LiveLogFeedLinesWrapper;
 
-#[cfg(test)]
-/// Production-path DAG/workflow properties.
-///
-/// Oracle sources:
-/// - `needs`, skipped dependencies, and job-level conditions:
-///   <https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idneeds>.
-/// - status functions: <https://docs.github.com/en/actions/learn-github-actions/expressions#status-check-functions>.
-/// - runner v2.335.1: `src/Runner.Worker/StepsRunner.cs` and
-///   `src/Runner.Worker/Expressions/{Success,Failure,Cancelled,Always}Function.cs`.
-///
-/// These tests submit YAML through the real parser/router and use only the
-/// explicitly gated internal test API to simulate worker completions. The
-/// oracle compares observable job/run state; it does not copy scheduler code.
-#[path = "lib_tests.rs"]
-mod tests;
+// The former `#[cfg(test)] mod tests` unit (lib_tests.rs, ~27k lines) was split
+// into separate `tests/*.rs` integration crates — a single rustc unit that
+// large was OOM-killed inside the 4 GiB CI runner guest. Those crates link
+// against this lib with the `test-support` feature for the deterministic
+// hooks above.

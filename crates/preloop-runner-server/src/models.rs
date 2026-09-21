@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum PushStatus {
+pub enum PushStatus {
     /// The run requested push-back and it has not been performed yet.
     Pending,
     /// The tested commit is on GitHub and the PR/check runs are in place.
@@ -15,23 +15,23 @@ pub(crate) enum PushStatus {
 
 /// Push-back state for a run that requested `submission.push`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PushState {
-    pub(crate) status: PushStatus,
-    pub(crate) error: Option<String>,
+pub struct PushState {
+    pub status: PushStatus,
+    pub error: Option<String>,
     /// Pull request number, when the branch has an open PR (created or
     /// pre-existing).
-    pub(crate) pr_number: Option<u64>,
+    pub pr_number: Option<u64>,
     /// The commit the sync actually published (`submission.sha` for a clean
     /// submission; the materialized branch head for a dirty one). Webhook
     /// dedup matches the echo of our own push against this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) effective_sha: Option<String>,
+    pub effective_sha: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DapPortRegistration {
-    pub(crate) port: u16,
-    pub(crate) job_id: JobId,
+pub struct DapPortRegistration {
+    pub port: u16,
+    pub job_id: JobId,
 }
 
 /// How a step came to exist, which decides whether `--step N` counts it.
@@ -50,7 +50,7 @@ pub(crate) struct DapPortRegistration {
 /// shape, and never the display name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum StepKind {
+pub enum StepKind {
     /// Declared in the workflow and present in the job request message.
     Workflow,
     /// Reported by the runner with no manifest entry. This is the default so a
@@ -61,46 +61,46 @@ pub(crate) enum StepKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StepRecord {
+pub struct StepRecord {
     /// Stable protocol identity: `TaskStep.id` in the job request message,
     /// echoed as `external_id` in `WorkflowStepsUpdate`, and the name of the
     /// durable `step-<id>.txt` blob. Empty only for a record restored from a
     /// pre-manifest run, which resolution refuses rather than guesses.
     #[serde(default)]
-    pub(crate) id: String,
+    pub id: String,
     #[serde(default)]
-    pub(crate) kind: StepKind,
+    pub kind: StepKind,
     /// 0-based position among the job's declared workflow steps. `Some`
     /// exactly when `kind` is `Workflow`; this is what `--step N` indexes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) workflow_index: Option<usize>,
+    pub workflow_index: Option<usize>,
     /// The runner's own 1-based timeline position, which counts synthetic
     /// steps too — the golden capture reports declared step 1 as `number: 2`
     /// because "Set up job" takes 1. Presentation and protocol fidelity only;
     /// never an input to `--step`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runner_number: Option<u32>,
+    pub runner_number: Option<u32>,
     /// Expression-context key (`compile`, `__run_2`). Unlike `id`, this is
     /// derived from the YAML and so is stable across runs of the same
     /// workflow, which is what lets one step be correlated over time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) context_name: Option<String>,
-    pub(crate) name: String,
-    pub(crate) conclusion: String,
+    pub context_name: Option<String>,
+    pub name: String,
+    pub conclusion: String,
     /// Server-side observation of when the step first appeared (started) and
     /// when it turned terminal (finished). Stamped at projection time, so
     /// durations are authoritative even when the runner omits wire
     /// timestamps (preloop-runner) or when a worker dies mid-step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl StepRecord {
     /// A manifest entry for a declared workflow step, built from the job
     /// request message before the runner has reported anything.
-    pub(crate) fn workflow(
+    pub fn workflow(
         id: String,
         workflow_index: usize,
         name: String,
@@ -125,7 +125,7 @@ impl StepRecord {
     /// index is the order and `TaskStep.id` is the identity. Nothing here
     /// inspects the filesystem or sorts ids: a v4 UUID sorts randomly, and an
     /// upload timestamp records when a blob landed, not when a step ran.
-    pub(crate) fn manifest(steps: &[azdo::TaskStep]) -> Vec<Self> {
+    pub fn manifest(steps: &[azdo::TaskStep]) -> Vec<Self> {
         steps
             .iter()
             .enumerate()
@@ -185,7 +185,7 @@ impl StepRecord {
     /// `Set up job` after the workflow steps despite it running first. A
     /// restore adds a third order again. Every surface that shows a whole
     /// step list goes through this instead.
-    pub(crate) fn sort_execution_order(steps: &mut [Self]) {
+    pub fn sort_execution_order(steps: &mut [Self]) {
         steps.sort_by(|left, right| left.execution_key().cmp(&right.execution_key()));
     }
 
@@ -193,7 +193,7 @@ impl StepRecord {
     ///
     /// Display names repeat legitimately — two steps may both be named `Test`
     /// — so matching on them merged distinct steps and lost one from the run.
-    pub(crate) fn find_by_id(steps: &[Self], id: &str) -> Option<usize> {
+    pub fn find_by_id(steps: &[Self], id: &str) -> Option<usize> {
         if id.is_empty() {
             return None;
         }
@@ -204,7 +204,7 @@ impl StepRecord {
     ///
     /// Synthetic steps are excluded, so `Set up job` and `Post <action>` never
     /// shift what `--step N` selects.
-    pub(crate) fn workflow_steps(steps: &[Self]) -> Vec<&Self> {
+    pub fn workflow_steps(steps: &[Self]) -> Vec<&Self> {
         let mut workflow: Vec<&Self> = steps
             .iter()
             .filter(|step| step.kind == StepKind::Workflow)
@@ -216,17 +216,17 @@ impl StepRecord {
 
 /// Server-side timing for the workspace snapshot created at submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SnapshotTiming {
+pub struct SnapshotTiming {
     /// Wall time spent capturing the tree, including the git operations.
-    pub(crate) duration_ms: u64,
+    pub duration_ms: u64,
     /// Objects (loose + packed) in the snapshot repository.
-    pub(crate) object_count: u64,
+    pub object_count: u64,
     /// Packed size in bytes (loose objects are negligible after repacking).
-    pub(crate) pack_bytes: u64,
+    pub pack_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct JobDetail {
+pub struct JobDetail {
     /// Stable workflow job key (`build`, `build (ubuntu-latest)`).
     ///
     /// Separate from `name` because the run projection overwrites `name` with
@@ -234,15 +234,15 @@ pub(crate) struct JobDetail {
     /// belongs to. Empty only for a detail restored from a run written before
     /// this field existed.
     #[serde(default)]
-    pub(crate) job_id: String,
+    pub job_id: String,
     /// GitHub display name, as shown in a run's job list.
-    pub(crate) name: String,
-    pub(crate) conclusion: String,
-    pub(crate) steps: Vec<StepRecord>,
+    pub name: String,
+    pub conclusion: String,
+    pub steps: Vec<StepRecord>,
     /// Job-level annotations reported by the runner (worker-crash detail,
     /// infrastructure failures). Kept as raw wire values.
     #[serde(default)]
-    pub(crate) annotations: Vec<serde_json::Value>,
+    pub annotations: Vec<serde_json::Value>,
 }
 
 impl JobDetail {
@@ -250,7 +250,7 @@ impl JobDetail {
     ///
     /// Falls back to the display name only for details restored without a
     /// `job_id`; new details always carry one.
-    pub(crate) fn find<'a>(details: &'a mut [Self], job_id: &str) -> Option<&'a mut Self> {
+    pub fn find<'a>(details: &'a mut [Self], job_id: &str) -> Option<&'a mut Self> {
         let index = details
             .iter()
             .position(|detail| detail.job_id == job_id)
@@ -265,99 +265,99 @@ impl JobDetail {
 
 /// Metadata tracked per log file for results-service Twirp retrieval.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct LogMetadata {
+pub struct LogMetadata {
     /// Total bytes appended so far.
-    pub(crate) byte_count: usize,
+    pub byte_count: usize,
     /// Total lines appended so far.
-    pub(crate) line_count: usize,
+    pub line_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RunRecord {
-    pub(crate) run_id: RunId,
+pub struct RunRecord {
+    pub run_id: RunId,
     /// GitHub delivery ID that created this run, when the run came from the
     /// durable webhook queue. Persisted for at-least-once processing
     /// idempotency, but omitted from run API responses.
     #[serde(default, skip_serializing)]
-    pub(crate) webhook_delivery_id: Option<String>,
-    pub(crate) run_name: Option<String>,
-    pub(crate) submission: Arc<WorkflowSubmission>,
-    pub(crate) jobs: BTreeMap<JobId, ExecutionStatus>,
-    pub(crate) status: ExecutionStatus,
-    pub(crate) job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
-    pub(crate) job_base_ids: BTreeMap<JobId, String>,
+    pub webhook_delivery_id: Option<String>,
+    pub run_name: Option<String>,
+    pub submission: Arc<WorkflowSubmission>,
+    pub jobs: BTreeMap<JobId, ExecutionStatus>,
+    pub status: ExecutionStatus,
+    pub job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
+    pub job_base_ids: BTreeMap<JobId, String>,
     #[serde(skip)]
-    pub(crate) job_needs: BTreeMap<JobId, Vec<JobId>>,
+    pub job_needs: BTreeMap<JobId, Vec<JobId>>,
     /// Expanded plans for deferred reusable-caller nodes, consumed by the
     /// scheduler when a caller's `if:` gate passes and its callee subtree is
     /// materialized.
     #[serde(skip)]
-    pub(crate) caller_plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan>,
+    pub caller_plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan>,
     /// GitHub display name per job (evaluated `name:`, ` / ` caller/callee
     /// separator). The run record keys everything by job id; this maps ids to
     /// what GitHub's jobs API would show.
     #[serde(default)]
-    pub(crate) job_names: BTreeMap<JobId, String>,
+    pub job_names: BTreeMap<JobId, String>,
     /// GitHub context JSON captured at submission, reused when runtime
     /// expansion builds runner messages for a callee subtree.
     #[serde(skip)]
-    pub(crate) github: serde_json::Value,
+    pub github: serde_json::Value,
     /// Resolved head SHA / workflow ref captured at submission for runtime
     /// expansion (message context data).
     #[serde(skip)]
-    pub(crate) head_sha: String,
+    pub head_sha: String,
     #[serde(skip)]
-    pub(crate) workflow_ref: String,
+    pub workflow_ref: String,
     /// Immutable workspace snapshot created at submission, when local
     /// checkout redirection is active; runtime-expanded jobs check out the
     /// same tree.
     #[serde(skip)]
-    pub(crate) workspace_snapshot: Option<crate::snapshots::WorkspaceSnapshot>,
-    pub(crate) job_fail_fast: BTreeMap<String, bool>,
+    pub workspace_snapshot: Option<crate::snapshots::WorkspaceSnapshot>,
+    pub job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
-    pub(crate) job_continue_on_error: BTreeMap<String, bool>,
+    pub job_continue_on_error: BTreeMap<String, bool>,
     #[serde(default)]
-    pub(crate) job_check_run_ids: BTreeMap<JobId, u64>,
+    pub job_check_run_ids: BTreeMap<JobId, u64>,
     #[serde(default)]
-    pub(crate) reusable_calls: BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
+    pub reusable_calls: BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
     #[serde(default)]
-    pub(crate) jobs_list: Vec<JobDetail>,
-    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) started_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(crate) run_number: u64,
-    pub(crate) run_attempt: u64,
-    pub(crate) workflow_path_str: String,
-    pub(crate) event: String,
-    pub(crate) conclusion: Option<String>,
+    pub jobs_list: Vec<JobDetail>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub run_number: u64,
+    pub run_attempt: u64,
+    pub workflow_path_str: String,
+    pub event: String,
+    pub conclusion: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) push_state: Option<PushState>,
+    pub push_state: Option<PushState>,
     /// Submission-time workspace snapshot cost; present only for local
     /// submissions that snapshot a workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) snapshot_timing: Option<SnapshotTiming>,
+    pub snapshot_timing: Option<SnapshotTiming>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TaskAgentJobRequestRecord {
-    pub(crate) request_id: i64,
-    pub(crate) run_id: RunId,
-    pub(crate) job_id: JobId,
-    pub(crate) agent_job_id: uuid::Uuid,
-    pub(crate) plan_id: String,
-    pub(crate) plan_type: String,
-    pub(crate) timeline_id: uuid::Uuid,
-    pub(crate) result: Option<ExecutionStatus>,
-    pub(crate) locked_until: String,
+pub struct TaskAgentJobRequestRecord {
+    pub request_id: i64,
+    pub run_id: RunId,
+    pub job_id: JobId,
+    pub agent_job_id: uuid::Uuid,
+    pub plan_id: String,
+    pub plan_type: String,
+    pub timeline_id: uuid::Uuid,
+    pub result: Option<ExecutionStatus>,
+    pub locked_until: String,
     /// When a runner removed this job from the ready queue.
-    pub(crate) claimed_at: Option<std::time::SystemTime>,
+    pub claimed_at: Option<std::time::SystemTime>,
     /// Runner identity that claimed this request. Kept after completion so
     /// late AgentRequest reads and retries remain bound to the original owner.
-    pub(crate) owner_runner_id: Option<i64>,
+    pub owner_runner_id: Option<i64>,
     /// When the runner request was handed to the session.
-    pub(crate) started_at: Option<std::time::SystemTime>,
-    pub(crate) last_renewed_at: Option<std::time::SystemTime>,
-    pub(crate) timeout_triggered: bool,
+    pub started_at: Option<std::time::SystemTime>,
+    pub last_renewed_at: Option<std::time::SystemTime>,
+    pub timeout_triggered: bool,
     /// Whether this job request has already spent its one debug-worker token
     /// exchange.
     ///
@@ -366,7 +366,7 @@ pub(crate) struct TaskAgentJobRequestRecord {
     /// credential during job setup, before the first step runs, so consuming
     /// the exchange closes the window in which workflow code could replay that
     /// token to mint a debug credential of its own.
-    pub(crate) debug_token_issued: bool,
+    pub debug_token_issued: bool,
 }
 
 /// A job → runner pairing recorded when the pool provisions a machine for a
@@ -377,71 +377,71 @@ pub(crate) struct TaskAgentJobRequestRecord {
 /// (or any other code running inside a pool machine) from pulling a job that
 /// belongs to a different machine or tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AssignmentRecord {
-    pub(crate) runner_id: Option<i64>,
-    pub(crate) at: std::time::SystemTime,
+pub struct AssignmentRecord {
+    pub runner_id: Option<i64>,
+    pub at: std::time::SystemTime,
     /// When this job was *first* bound to any machine. Rebinding to a
     /// replacement machine refreshes `at` but never this, so a pool that
     /// keeps provisioning and losing machines cannot hold a job away from
     /// healthy runners indefinitely.
-    pub(crate) first_at: std::time::SystemTime,
+    pub first_at: std::time::SystemTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct QueuedJob {
-    pub(crate) run_id: RunId,
-    pub(crate) job_id: JobId,
-    pub(crate) base_id: String,
+pub struct QueuedJob {
+    pub run_id: RunId,
+    pub job_id: JobId,
+    pub base_id: String,
     /// Unix nanoseconds when this job was created.
     #[serde(default)]
-    pub(crate) created_at_unix_nanos: i64,
+    pub created_at_unix_nanos: i64,
     /// Unix nanoseconds when all `needs:` dependencies became satisfied.
     #[serde(default)]
-    pub(crate) dependencies_ready_at_unix_nanos: Option<i64>,
+    pub dependencies_ready_at_unix_nanos: Option<i64>,
     /// Unix nanoseconds when this job first waited on a concurrency gate.
     #[serde(default)]
-    pub(crate) concurrency_wait_started_at_unix_nanos: Option<i64>,
+    pub concurrency_wait_started_at_unix_nanos: Option<i64>,
     /// Unix nanoseconds when the first applicable concurrency gate admitted
     /// this job.
     #[serde(default)]
-    pub(crate) concurrency_acquired_at_unix_nanos: Option<i64>,
+    pub concurrency_acquired_at_unix_nanos: Option<i64>,
     /// Unix nanoseconds when the job entered the ready queue. This is the
     /// runner-wait clock, not the workflow or dependency creation time.
     /// `0` is used only before the job first becomes ready.
     #[serde(default)]
-    pub(crate) enqueued_at_unix_nanos: i64,
-    pub(crate) needs: Vec<JobId>,
-    pub(crate) if_condition: Option<String>,
-    pub(crate) condition_context: preloop_gha_expressions::Context,
-    pub(crate) max_parallel: Option<u64>,
+    pub enqueued_at_unix_nanos: i64,
+    pub needs: Vec<JobId>,
+    pub if_condition: Option<String>,
+    pub condition_context: preloop_gha_expressions::Context,
+    pub max_parallel: Option<u64>,
     /// Required runner labels from `runs-on`.
-    pub(crate) runs_on: Vec<String>,
+    pub runs_on: Vec<String>,
     /// Explicit runner group from object-valued `runs-on`.
-    pub(crate) runner_group: Option<String>,
-    pub(crate) message: azdo::AgentJobRequestMessage,
+    pub runner_group: Option<String>,
+    pub message: azdo::AgentJobRequestMessage,
     /// Original `environment:` value, retained until `needs` is hydrated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) environment: Option<serde_json::Value>,
+    pub environment: Option<serde_json::Value>,
     /// Raw job-level concurrency (evaluated when the job becomes ready).
-    pub(crate) concurrency: Option<preloop_gha_parser::Concurrency>,
+    pub concurrency: Option<preloop_gha_parser::Concurrency>,
     /// Matrix values for this expansion (for concurrency expression eval).
-    pub(crate) matrix: BTreeMap<String, serde_json::Value>,
+    pub matrix: BTreeMap<String, serde_json::Value>,
     /// Deferred expression for runtime dynamic matrix expansion, if any.
-    pub(crate) deferred_matrix: Option<String>,
+    pub deferred_matrix: Option<String>,
     /// Deferred reusable-workflow invocation, expanded on gate pass. This
     /// node is scheduling-only: it never reaches `inner.queue`.
-    pub(crate) reusable_call: Option<preloop_gha_protocol::ReusableCallPlan>,
+    pub reusable_call: Option<preloop_gha_protocol::ReusableCallPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct GitHubTokenRequest {
-    pub(crate) repository: String,
-    pub(crate) permissions: BTreeMap<String, String>,
+pub struct GitHubTokenRequest {
+    pub repository: String,
+    pub permissions: BTreeMap<String, String>,
     /// Whether the workflow wrote its own `permissions:` block.
     ///
     /// A declared set must be minted verbatim or fail visibly; the implicit
     /// default may be narrowed to what the App installation actually grants.
-    pub(crate) declared: bool,
+    pub declared: bool,
     /// Whether the job's trust tier restricts GitHub authority (fork PR or
     /// fail-closed unknown event). Such jobs carry only the read-only fork
     /// profile, and a mint failure never falls back to the broad
@@ -455,7 +455,7 @@ pub(crate) struct GitHubTokenRequest {
     /// serialize the field explicitly (`false` for trusted jobs), so only
     /// genuinely old state hits the fail-closed default.
     #[serde(default = "default_untrusted")]
-    pub(crate) untrusted: bool,
+    pub untrusted: bool,
 }
 
 /// Fail-closed default for persisted [`GitHubTokenRequest`]s that predate
@@ -467,25 +467,25 @@ fn default_untrusted() -> bool {
 
 /// Runner metadata used by dispatch matching.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RunnerCapabilities {
-    pub(crate) known: bool,
-    pub(crate) labels: Vec<String>,
-    pub(crate) runner_group_id: Option<i64>,
-    pub(crate) runner_group_name: Option<String>,
+pub struct RunnerCapabilities {
+    pub known: bool,
+    pub labels: Vec<String>,
+    pub runner_group_id: Option<i64>,
+    pub runner_group_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct QueuedCancellation {
-    pub(crate) run_id: RunId,
-    pub(crate) job_id: JobId,
+pub struct QueuedCancellation {
+    pub run_id: RunId,
+    pub job_id: JobId,
     /// Agent job GUID from the job message (`jobId`), required for official JobCancelMessage.
-    pub(crate) agent_job_id: uuid::Uuid,
+    pub agent_job_id: uuid::Uuid,
 }
 
 /// Lifecycle status of a durable GitHub webhook delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum WebhookDeliveryStatus {
+pub enum WebhookDeliveryStatus {
     Received,
     Processing,
     Done,
@@ -493,7 +493,7 @@ pub(crate) enum WebhookDeliveryStatus {
 }
 
 impl WebhookDeliveryStatus {
-    pub(crate) fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Received => "received",
             Self::Processing => "processing",
@@ -502,7 +502,7 @@ impl WebhookDeliveryStatus {
         }
     }
 
-    pub(crate) fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "received" => Some(Self::Received),
             "processing" => Some(Self::Processing),
@@ -515,19 +515,19 @@ impl WebhookDeliveryStatus {
 
 /// A durably queued webhook delivery record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WebhookDeliveryRecord {
-    pub(crate) delivery_id: String,
-    pub(crate) event: String,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) received_at_us: i64,
-    pub(crate) state: WebhookDeliveryStatus,
-    pub(crate) attempts: u32,
-    pub(crate) lease_until_us: Option<i64>,
+pub struct WebhookDeliveryRecord {
+    pub delivery_id: String,
+    pub event: String,
+    pub payload: Vec<u8>,
+    pub received_at_us: i64,
+    pub state: WebhookDeliveryStatus,
+    pub attempts: u32,
+    pub lease_until_us: Option<i64>,
     /// Fencing token for the current processing lease. A stale worker cannot
     /// renew or finalize a lease that another worker has reclaimed.
     #[serde(default)]
-    pub(crate) lease_token: Option<String>,
-    pub(crate) last_error: Option<String>,
+    pub lease_token: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// A webhook delivery row without its payload — the operator listing surface.
@@ -536,27 +536,27 @@ pub(crate) struct WebhookDeliveryRecord {
 /// it; keeping it out of this type means a list endpoint cannot accidentally
 /// stream the whole queue's bodies (or their decrypted secrets) to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WebhookDeliverySummary {
-    pub(crate) delivery_id: String,
-    pub(crate) event: String,
-    pub(crate) received_at_us: i64,
-    pub(crate) state: WebhookDeliveryStatus,
-    pub(crate) attempts: u32,
-    pub(crate) lease_until_us: Option<i64>,
-    pub(crate) last_error: Option<String>,
+pub struct WebhookDeliverySummary {
+    pub delivery_id: String,
+    pub event: String,
+    pub received_at_us: i64,
+    pub state: WebhookDeliveryStatus,
+    pub attempts: u32,
+    pub lease_until_us: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 /// Aggregate queue health, read by the status snapshot and the health API.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WebhookQueueStats {
-    pub(crate) received: u64,
-    pub(crate) processing: u64,
-    pub(crate) done: u64,
-    pub(crate) failed: u64,
+pub struct WebhookQueueStats {
+    pub received: u64,
+    pub processing: u64,
+    pub done: u64,
+    pub failed: u64,
     /// Receipt time of the oldest row still awaiting a terminal state. A
     /// growing age here is the only signal that separates "queue is quiet"
     /// from "queue is stuck".
-    pub(crate) oldest_pending_received_at_us: Option<i64>,
+    pub oldest_pending_received_at_us: Option<i64>,
 }
 
 /// Persisted high-water mark for one GitHub App's delivery-history poll.
@@ -566,31 +566,31 @@ pub(crate) struct WebhookQueueStats {
 /// delivery and never learning it existed. It is persisted per App id: a
 /// restart must not rewind (duplicate work) or skip forward (silent gap).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WebhookWatchdogCursor {
+pub struct WebhookWatchdogCursor {
     /// GitHub App id the cursor belongs to.
-    pub(crate) scope: String,
+    pub scope: String,
     /// Newest `(delivered_at, guid)` the watchdog has fully examined. Never
     /// advanced past the grace window, and never advanced on a failed poll.
     #[serde(default)]
-    pub(crate) cursor_delivered_at_us: Option<i64>,
+    pub cursor_delivered_at_us: Option<i64>,
     /// GUID tie-breaker for deliveries sharing the same timestamp.
     #[serde(default)]
-    pub(crate) cursor_delivered_at_guid: Option<String>,
+    pub cursor_delivered_at_guid: Option<String>,
     /// Opaque GitHub pagination cursor to resume when a bounded pass did not
     /// reach the watermark.
     #[serde(default)]
-    pub(crate) scan_cursor: Option<String>,
+    pub scan_cursor: Option<String>,
     /// When a poll was last attempted, successful or not.
-    pub(crate) last_poll_at_us: Option<i64>,
+    pub last_poll_at_us: Option<i64>,
     /// When a poll last completed without error. Staleness here is an alert:
     /// a blind watchdog looks exactly like a quiet one.
-    pub(crate) last_success_at_us: Option<i64>,
+    pub last_success_at_us: Option<i64>,
 }
 
 /// Why the watchdog wants a delivery replayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum WebhookRepairReason {
+pub enum WebhookRepairReason {
     /// GitHub recorded a non-2xx (or no) response: the delivery never landed.
     RemoteFailure,
     /// GitHub recorded success but no local row exists — the phantom ack.
@@ -598,14 +598,14 @@ pub(crate) enum WebhookRepairReason {
 }
 
 impl WebhookRepairReason {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::RemoteFailure => "remote_failure",
             Self::PhantomAck => "phantom_ack",
         }
     }
 
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "remote_failure" => Some(Self::RemoteFailure),
             "phantom_ack" => Some(Self::PhantomAck),
@@ -620,79 +620,79 @@ impl WebhookRepairReason {
 /// on — so a redelivery that finally lands is recognised as the repair of
 /// this row rather than as new work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WebhookRedeliveryRecord {
-    pub(crate) delivery_guid: String,
+pub struct WebhookRedeliveryRecord {
+    pub delivery_guid: String,
     /// Numeric delivery id: `POST /app/hook/deliveries/{id}/attempts` takes
     /// this, not the GUID.
-    pub(crate) github_delivery_id: i64,
+    pub github_delivery_id: i64,
     /// App id that owns the delivery, so a multi-App deployment redelivers
     /// with the right JWT.
-    pub(crate) app_id: String,
-    pub(crate) reason: WebhookRepairReason,
-    pub(crate) attempts: u32,
-    pub(crate) first_seen_at_us: i64,
-    pub(crate) last_attempt_at_us: Option<i64>,
+    pub app_id: String,
+    pub reason: WebhookRepairReason,
+    pub attempts: u32,
+    pub first_seen_at_us: i64,
+    pub last_attempt_at_us: Option<i64>,
     /// Set once the delivery is present locally; a resolved row is history,
     /// not backlog.
-    pub(crate) resolved_at_us: Option<i64>,
-    pub(crate) last_error: Option<String>,
+    pub resolved_at_us: Option<i64>,
+    pub last_error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PendingCache {
-    pub(crate) key: String,
-    pub(crate) version: String,
+pub struct PendingCache {
+    pub key: String,
+    pub version: String,
     #[serde(default)]
-    pub(crate) namespace: String,
+    pub namespace: String,
     #[serde(default)]
-    pub(crate) job_backend_id: String,
-    pub(crate) bytes: Vec<u8>,
+    pub job_backend_id: String,
+    pub bytes: Vec<u8>,
     /// R1-6 — unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.
     #[serde(default)]
-    pub(crate) created_unix: i64,
+    pub created_unix: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ArtifactRecord {
-    pub(crate) id: String,
-    pub(crate) run_id: RunId,
-    pub(crate) name: String,
-    pub(crate) file_name: String,
-    pub(crate) path: String,
-    pub(crate) size: u64,
+pub struct ArtifactRecord {
+    pub id: String,
+    pub run_id: RunId,
+    pub name: String,
+    pub file_name: String,
+    pub path: String,
+    pub size: u64,
 }
 
 /// Pending cache v2 upload (Twirp CacheService).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct CacheV2Pending {
-    pub(crate) key: String,
-    pub(crate) version: String,
+pub struct CacheV2Pending {
+    pub key: String,
+    pub version: String,
     /// Job backend id that reserved the upload, derived from the runtime
     /// token scope. `#[serde(default)]` keeps old persisted metas restoring
     /// (an empty value means the entry predates per-job accounting and is
     /// never billed to any job).
     #[serde(default)]
-    pub(crate) job_backend_id: String,
+    pub job_backend_id: String,
     /// Unix seconds the reservation was made; `0` for restored entries so
     /// the TTL sweeper leaves them alone.
     #[serde(default)]
-    pub(crate) created_unix: i64,
+    pub created_unix: i64,
 }
 
 /// Pending artifact v2 upload (Twirp ArtifactService).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ArtifactV2Pending {
+pub struct ArtifactV2Pending {
     /// Registry key = "{run_backend_id}/{job_backend_id}/{name}".
-    pub(crate) registry_key: String,
+    pub registry_key: String,
     /// Job backend id that reserved the upload, derived from the runtime
     /// token scope. `#[serde(default)]` keeps old persisted metas restoring.
     #[serde(default)]
-    pub(crate) job_backend_id: String,
+    pub job_backend_id: String,
     /// Unix seconds the reservation was made; `0` for restored entries so
     /// the TTL sweeper leaves them alone.
     #[serde(default)]
-    pub(crate) created_unix: i64,
+    pub created_unix: i64,
 }
 
 /// Reserved diagnostic-log upload (Twirp `GetJobDiagLogsSignedBlobURL`).
@@ -703,31 +703,31 @@ pub(crate) struct ArtifactV2Pending {
 /// writes from any other job. In-memory only: diag uploads happen
 /// immediately after minting, and the TTL sweeper bounds the map.
 #[derive(Debug, Clone)]
-pub(crate) struct DiagUploadToken {
+pub struct DiagUploadToken {
     /// Job backend id that reserved the upload (job UUID string), derived
     /// from the runtime token scope; empty when minted by the system token.
-    pub(crate) job_id: String,
+    pub job_id: String,
     /// Unix seconds the reservation was made.
-    pub(crate) created_unix: i64,
+    pub created_unix: i64,
 }
 
 /// Finalized artifact v2 entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ArtifactV2Entry {
-    pub(crate) id: u64,
-    pub(crate) workflow_run_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) name: String,
-    pub(crate) size: u64,
-    pub(crate) created_at: String,
-    pub(crate) digest: Option<String>,
+pub struct ArtifactV2Entry {
+    pub id: u64,
+    pub workflow_run_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub name: String,
+    pub size: u64,
+    pub created_at: String,
+    pub digest: Option<String>,
     /// Upload token used to find the assembled blob on disk.
-    pub(crate) blob_token: String,
+    pub blob_token: String,
 }
 
 /// Unix nanoseconds now, for queue-latency bookkeeping. `i64` keeps the
 /// field serde-friendly (it travels in persisted job snapshots).
-pub(crate) fn now_unix_nanos() -> i64 {
+pub fn now_unix_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)

@@ -22,7 +22,7 @@ const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 /// Storage lifetime for one snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum SnapshotSource {
+pub enum SnapshotSource {
     #[default]
     LocalWorkspace,
     RemoteRunScoped,
@@ -33,62 +33,62 @@ pub(crate) enum SnapshotSource {
 /// present before first-class tenancy: adding it later creates a cold namespace
 /// rather than sharing pre-tenant objects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CheckoutCacheNamespace {
-    pub(crate) tenant_id: Option<String>,
-    pub(crate) provider_origin: String,
-    pub(crate) credential_domain: String,
-    pub(crate) repository_id: String,
+pub struct CheckoutCacheNamespace {
+    pub tenant_id: Option<String>,
+    pub provider_origin: String,
+    pub credential_domain: String,
+    pub repository_id: String,
 }
 
 /// The checkout coordinates for one immutable workspace snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WorkspaceSnapshot {
-    pub(crate) commit_sha: String,
+pub struct WorkspaceSnapshot {
+    pub commit_sha: String,
     /// Tree of the snapshot commit — the exact tree the run tests. A
     /// push-back client materializes a real commit from this tree so the
     /// pushed commit is byte-identical to what CI validated.
-    pub(crate) tree_sha: String,
+    pub tree_sha: String,
     /// The workspace's real HEAD commit (the commit the submission is based
     /// on), when the workspace has one. This is the identity a workflow sees
     /// as `github.sha`: it is what a custom checkout that fetches from the
     /// real remote can actually resolve. The synthetic [`Self::commit_sha`]
     /// exists only in this engine's snapshot store and would be rejected as
     /// `not our ref` by the upstream host.
-    pub(crate) head_sha: Option<String>,
-    pub(crate) repository: String,
+    pub head_sha: Option<String>,
+    pub repository: String,
     /// Current branch of the source workspace (`master`, `main`, …), when
     /// resolvable. Mirrored into the event payload as
     /// `repository.default_branch` so changed-file actions can pick a base.
-    pub(crate) default_branch: Option<String>,
+    pub default_branch: Option<String>,
     /// Base commit the synthetic push measures against, mirrored into push
     /// event payloads as `before`. When the working tree carries uncommitted
     /// edits this is the workspace `HEAD` (so `before..after` is exactly the
     /// local delta); when the tree is clean it is `HEAD^` (so the range still
     /// covers the last commit the user wants tested). `None` on an unborn or
     /// initial-commit clean tree yields the null-SHA "initial push" base.
-    pub(crate) before_sha: Option<String>,
+    pub before_sha: Option<String>,
     /// Server-side cost of capturing this snapshot; present on snapshots
     /// created after the timing instrumentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) snapshot_timing: Option<crate::models::SnapshotTiming>,
+    pub snapshot_timing: Option<crate::models::SnapshotTiming>,
     /// Physical bare repository relative to the state directory. Older local
     /// snapshots derive this from `repository`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) storage_repository: Option<String>,
+    pub storage_repository: Option<String>,
     #[serde(default)]
-    pub(crate) source: SnapshotSource,
+    pub source: SnapshotSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) cache_namespace: Option<CheckoutCacheNamespace>,
+    pub cache_namespace: Option<CheckoutCacheNamespace>,
     /// Forge coordinates this snapshot was fetched from (`owner/repo`), for
     /// remote snapshots only. Lets later requests (LFS batch) find the same
     /// upstream without the original submission. Absent on local and legacy
     /// snapshots, which never fetch on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) upstream_repository: Option<String>,
+    pub upstream_repository: Option<String>,
     /// Whether that upstream is private. Unknown (legacy) reads as private so
     /// on-demand fetching fails closed instead of trying anonymous access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) upstream_private: Option<bool>,
+    pub upstream_private: Option<bool>,
 }
 
 /// Capture `workspace` as an immutable cache-backed bare repository for `run_id`.
@@ -98,7 +98,7 @@ pub(crate) struct WorkspaceSnapshot {
 /// into a state-directory cache; each run stores only its synthetic dirty-tree
 /// objects and references that private cache as an alternate. No snapshot keeps
 /// a path to the user's source repository.
-pub(crate) async fn create_workspace_snapshot(
+pub async fn create_workspace_snapshot(
     state_dir: &FsPath,
     workspace: &FsPath,
     run_id: RunId,
@@ -440,7 +440,7 @@ async fn fetch_lfs_object_into_cache(
 ///
 /// The control plane alone writes this repository. Jobs only reach it through
 /// [`snapshot_git_http`], authenticated by their Actions runtime token.
-pub(crate) async fn create_remote_checkout_snapshot(
+pub async fn create_remote_checkout_snapshot(
     shared: &SharedState,
     submission: &preloop_gha_protocol::WorkflowSubmission,
     run_id: RunId,
@@ -2342,7 +2342,7 @@ const LOCK_HEARTBEAT: &str = "preloop-lock-heartbeat";
 /// enough matrix runs filled the disk and the engine began failing blob writes
 /// with HTTP 500. The persistent object cache is untouched: it is shared and
 /// is what makes the next snapshot cheap.
-pub(crate) async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
+pub async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
     let started = std::time::Instant::now();
     let repository = state_dir.join("snapshots").join(run_id.to_string());
     match tokio::fs::remove_dir_all(&repository).await {
@@ -2370,7 +2370,7 @@ const RELEASED_MARKER: &str = "preloop-released-at";
 /// objects, and [`prune_checkout_cache`] collects them once the configured
 /// retention elapses. Repository caches only drop the run's ref; the shared
 /// objects are the whole point of that mode.
-pub(crate) async fn release_remote_checkout_snapshot(
+pub async fn release_remote_checkout_snapshot(
     state_dir: &FsPath,
     snapshot: &WorkspaceSnapshot,
     run_id: RunId,
@@ -2415,10 +2415,7 @@ pub(crate) async fn release_remote_checkout_snapshot(
 /// window measured from its own mtime, so a lost completion cannot leak a
 /// repository forever. Repository entries expire on idle age, then the
 /// largest-first sweep brings total bytes under `max_bytes`.
-pub(crate) async fn prune_checkout_cache(
-    state_dir: &FsPath,
-    config: &crate::config::CheckoutCacheConfig,
-) {
+pub async fn prune_checkout_cache(state_dir: &FsPath, config: &crate::config::CheckoutCacheConfig) {
     let root = state_dir.join("checkout-cache");
     let run_retention = std::time::Duration::from_secs(config.run_retention_seconds);
     let repository_retention = std::time::Duration::from_secs(config.repository_retention_seconds);
@@ -2708,7 +2705,7 @@ fn state_dir_exclusion(state_dir: &FsPath, workspace: &FsPath) -> Result<Option<
 /// step would fall back to `${{ github.token }}`, which carries a GitHub App
 /// installation token or PAT whenever one is configured — neither of which
 /// [`authorize_snapshot_token`] can verify.
-pub(crate) fn redirect_primary_checkout(
+pub fn redirect_primary_checkout(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     snapshot: &WorkspaceSnapshot,
     github_server_url: &str,
@@ -2882,7 +2879,7 @@ mod route_run_id_tests {
 }
 
 /// Serve a snapshot bare repository through Git's read-only smart HTTP CGI.
-pub(crate) async fn snapshot_git_http(
+pub async fn snapshot_git_http(
     State(shared): State<Arc<SharedState>>,
     Path((run_id_raw, path)): Path<(String, String)>,
     request: Request,

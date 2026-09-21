@@ -25,7 +25,7 @@ use axum::http::HeaderMap;
 
 /// Why a GitHub call counted against the breaker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GithubFailureKind {
+pub enum GithubFailureKind {
     /// Transport error or 5xx: GitHub could not answer.
     Unavailable,
     /// Rate limited or secondary-limited, with GitHub's own resume time when
@@ -38,15 +38,15 @@ pub(crate) enum GithubFailureKind {
 /// queue, and a five-minute ceiling so a long outage is retried steadily
 /// rather than exponentially forgotten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BreakerConfig {
-    pub(crate) enabled: bool,
-    pub(crate) failure_threshold: u32,
-    pub(crate) base_open: Duration,
-    pub(crate) max_open: Duration,
+pub struct BreakerConfig {
+    pub enabled: bool,
+    pub failure_threshold: u32,
+    pub base_open: Duration,
+    pub max_open: Duration,
     /// How long a half-open probe may run before another caller is allowed
     /// through. Without this a probe whose task died would wedge the breaker
     /// half-open forever.
-    pub(crate) probe_timeout: Duration,
+    pub probe_timeout: Duration,
 }
 
 impl Default for BreakerConfig {
@@ -65,7 +65,7 @@ impl BreakerConfig {
     /// `PRELOOP_GITHUB_BREAKER=off` disables tripping entirely (calls are
     /// still observed, so the status snapshot keeps reporting failures);
     /// `PRELOOP_GITHUB_BREAKER_THRESHOLD` overrides the failure count.
-    pub(crate) fn from_env() -> Self {
+    pub fn from_env() -> Self {
         let mut config = Self::default();
         if let Ok(value) = std::env::var("PRELOOP_GITHUB_BREAKER") {
             let value = value.trim().to_ascii_lowercase();
@@ -87,13 +87,13 @@ impl BreakerConfig {
 /// Point-in-time breaker state for the operational snapshot and the health
 /// API. Instant-free so it can be serialized and compared in tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct BreakerSnapshot {
-    pub(crate) open: bool,
-    pub(crate) retry_in_seconds: Option<u64>,
-    pub(crate) consecutive_failures: u32,
-    pub(crate) trips: u64,
-    pub(crate) rate_limited: bool,
-    pub(crate) last_error: Option<String>,
+pub struct BreakerSnapshot {
+    pub open: bool,
+    pub retry_in_seconds: Option<u64>,
+    pub consecutive_failures: u32,
+    pub trips: u64,
+    pub rate_limited: bool,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -110,7 +110,7 @@ struct BreakerInner {
 
 /// Shared breaker guarding every GitHub-dependent call in the webhook path.
 #[derive(Debug)]
-pub(crate) struct GithubBreaker {
+pub struct GithubBreaker {
     config: BreakerConfig,
     inner: parking_lot::Mutex<BreakerInner>,
 }
@@ -122,7 +122,7 @@ impl Default for GithubBreaker {
 }
 
 impl GithubBreaker {
-    pub(crate) fn new(config: BreakerConfig) -> Self {
+    pub fn new(config: BreakerConfig) -> Self {
         Self {
             config,
             inner: parking_lot::Mutex::new(BreakerInner::default()),
@@ -134,7 +134,7 @@ impl GithubBreaker {
     ///
     /// Unlike [`GithubBreaker::acquire`] this reserves nothing, so the queue
     /// worker can use it to decide whether to claim a row at all.
-    pub(crate) fn retry_after(&self) -> Option<Duration> {
+    pub fn retry_after(&self) -> Option<Duration> {
         let now = Instant::now();
         let inner = self.inner.lock();
         if let Some(remaining) = Self::remaining(&inner, now) {
@@ -152,7 +152,7 @@ impl GithubBreaker {
         None
     }
 
-    pub(crate) fn is_open(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         self.retry_after().is_some()
     }
 
@@ -162,7 +162,7 @@ impl GithubBreaker {
     /// is let through as a probe; everyone else keeps waiting until that
     /// probe reports back (or its timeout lapses), so recovery costs GitHub
     /// one request rather than the whole backlog at once.
-    pub(crate) fn acquire(&self) -> Result<(), Duration> {
+    pub fn acquire(&self) -> Result<(), Duration> {
         let now = Instant::now();
         let mut inner = self.inner.lock();
         if let Some(remaining) = Self::remaining(&inner, now) {
@@ -184,7 +184,7 @@ impl GithubBreaker {
     /// Record a GitHub call that answered — any answer at all, including
     /// 404 or 422. Those prove reachability, which is the only thing this
     /// breaker is about; payload-level failures are the delivery's problem.
-    pub(crate) fn record_success(&self) {
+    pub fn record_success(&self) {
         let mut inner = self.inner.lock();
         inner.consecutive_failures = 0;
         inner.open_until = None;
@@ -196,7 +196,7 @@ impl GithubBreaker {
 
     /// Record a dependency failure, opening the breaker once the threshold is
     /// reached. A rate limit opens immediately for as long as GitHub says.
-    pub(crate) fn record_failure(&self, kind: &GithubFailureKind, error: impl Into<String>) {
+    pub fn record_failure(&self, kind: &GithubFailureKind, error: impl Into<String>) {
         let now = Instant::now();
         let mut inner = self.inner.lock();
         inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
@@ -235,7 +235,7 @@ impl GithubBreaker {
     /// Returns the failure classification when the exchange counted as a
     /// dependency failure, so the caller can decide to park rather than fail
     /// the work item.
-    pub(crate) fn observe_status(
+    pub fn observe_status(
         &self,
         status: axum::http::StatusCode,
         headers: &HeaderMap,
@@ -253,13 +253,13 @@ impl GithubBreaker {
     }
 
     /// Observe a transport-level failure (DNS, TLS, connect, timeout).
-    pub(crate) fn observe_transport_error(&self, error: &reqwest::Error) -> GithubFailureKind {
+    pub fn observe_transport_error(&self, error: &reqwest::Error) -> GithubFailureKind {
         let kind = GithubFailureKind::Unavailable;
         self.record_failure(&kind, error.to_string());
         kind
     }
 
-    pub(crate) fn snapshot(&self) -> BreakerSnapshot {
+    pub fn snapshot(&self) -> BreakerSnapshot {
         let now = Instant::now();
         let inner = self.inner.lock();
         let remaining = Self::remaining(&inner, now);
@@ -293,7 +293,7 @@ impl GithubBreaker {
 /// or a `retry-after` header. A plain 403 is a permission problem, which is
 /// the delivery's fault and must dead-letter normally instead of parking the
 /// whole queue behind a breaker.
-pub(crate) fn classify_status(
+pub fn classify_status(
     status: axum::http::StatusCode,
     headers: &HeaderMap,
 ) -> Option<GithubFailureKind> {
@@ -347,7 +347,7 @@ fn header_str<'headers>(headers: &'headers HeaderMap, name: &str) -> Option<&'he
 /// sees the whole dependency, not the one endpoint someone remembered to
 /// instrument. The response is returned untouched: a 404 still means what
 /// it meant to the caller, it just also counts as proof GitHub is up.
-pub(crate) async fn send_observed(
+pub async fn send_observed(
     breaker: &GithubBreaker,
     request: reqwest::RequestBuilder,
 ) -> anyhow::Result<reqwest::Response> {

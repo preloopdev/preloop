@@ -2,16 +2,16 @@ use super::*;
 use prost::Message;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct JobLogsSignedBlobUrlRequest {
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) workflow_run_backend_id: String,
+pub struct JobLogsSignedBlobUrlRequest {
+    pub workflow_job_run_backend_id: String,
+    pub workflow_run_backend_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct StepLogsSignedBlobUrlRequest {
-    pub(crate) step_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) workflow_run_backend_id: String,
+pub struct StepLogsSignedBlobUrlRequest {
+    pub step_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub workflow_run_backend_id: String,
 }
 
 /// Reconcile a runner's step report into that attempt's manifest.
@@ -22,7 +22,7 @@ pub(crate) struct StepLogsSignedBlobUrlRequest {
 /// ("Set up job", `Pre`/`Post` hooks, container lifecycle, "Complete job") and
 /// is appended as a synthetic record, so it owns its logs without shifting the
 /// numbering `--step` reads off the workflow.
-pub(crate) async fn twirp_workflow_steps_update(
+pub async fn twirp_workflow_steps_update(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
@@ -149,7 +149,7 @@ pub(crate) async fn twirp_workflow_steps_update(
     Ok(Json(json!({"ok": true})))
 }
 
-pub(crate) async fn twirp_get_job_logs_signed_blob_url(
+pub async fn twirp_get_job_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
@@ -180,7 +180,7 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     })))
 }
 
-pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
+pub async fn twirp_get_job_diag_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
@@ -254,7 +254,7 @@ pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
     })))
 }
 
-pub(crate) async fn twirp_get_step_logs_signed_blob_url(
+pub async fn twirp_get_step_logs_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
@@ -283,13 +283,13 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct StepSummarySignedBlobUrlRequest {
-    pub(crate) step_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) workflow_run_backend_id: String,
+pub struct StepSummarySignedBlobUrlRequest {
+    pub step_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub workflow_run_backend_id: String,
 }
 
-pub(crate) async fn twirp_get_step_summary_signed_blob_url(
+pub async fn twirp_get_step_summary_signed_blob_url(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
@@ -340,19 +340,19 @@ fn results_metadata_key(
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct StepSummaryMetadataRequest {
+pub struct StepSummaryMetadataRequest {
     // The backend identifiers identify the target job for Results authorization.
-    pub(crate) step_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) workflow_run_backend_id: String,
+    pub step_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub workflow_run_backend_id: String,
     // serde: metadata is accepted for protocol compatibility; this records the summary size.
-    pub(crate) size: Option<u64>,
+    pub size: Option<u64>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
-    pub(crate) uploaded_at: Option<String>,
+    pub uploaded_at: Option<String>,
 }
 
-pub(crate) async fn twirp_create_step_summary_metadata(
+pub async fn twirp_create_step_summary_metadata(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
@@ -387,20 +387,20 @@ pub(crate) async fn twirp_create_step_summary_metadata(
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct StepLogsMetadataRequest {
+pub struct StepLogsMetadataRequest {
     // The backend identifiers identify the target job for Results authorization.
-    pub(crate) step_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: Option<String>,
-    pub(crate) workflow_run_backend_id: Option<String>,
+    pub step_backend_id: String,
+    pub workflow_job_run_backend_id: Option<String>,
+    pub workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
-    pub(crate) upload_url: Option<String>,
+    pub upload_url: Option<String>,
     // serde: metadata is accepted for protocol compatibility; this records the line count.
-    pub(crate) line_count: Option<u64>,
+    pub line_count: Option<u64>,
 }
 
 /// POST CreateStepLogsMetadata — runner calls this after uploading step logs.
-pub(crate) async fn twirp_create_step_logs_metadata(
+pub async fn twirp_create_step_logs_metadata(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
@@ -439,18 +439,18 @@ pub(crate) async fn twirp_create_step_logs_metadata(
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct JobLogsMetadataRequest {
+pub struct JobLogsMetadataRequest {
     // Job-log metadata is job-scoped and intentionally has no step_backend_id.
-    pub(crate) workflow_job_run_backend_id: Option<String>,
-    pub(crate) workflow_run_backend_id: Option<String>,
+    pub workflow_job_run_backend_id: Option<String>,
+    pub workflow_run_backend_id: Option<String>,
     // serde: metadata is accepted for protocol compatibility; field is not inspected.
     #[allow(dead_code)]
-    pub(crate) upload_url: Option<String>,
+    pub upload_url: Option<String>,
     // serde: metadata is accepted for protocol compatibility; this records the line count.
-    pub(crate) line_count: Option<u64>,
+    pub line_count: Option<u64>,
 }
 
-pub(crate) async fn twirp_create_job_logs_metadata(
+pub async fn twirp_create_job_logs_metadata(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
@@ -490,7 +490,7 @@ pub(crate) async fn twirp_create_job_logs_metadata(
 
 // ─── Cache v2 Twirp (github.actions.results.api.v1.CacheService) ─────────────
 
-pub(crate) fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Option<&str>) -> String {
+pub fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Option<&str>) -> String {
     format!(
         "{}:{}\0{key}",
         repository.unwrap_or("default"),
@@ -583,35 +583,35 @@ fn cache_id_digest(key: &str, version: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CacheV2CreateRequest {
-    pub(crate) key: String,
-    pub(crate) version: String,
+pub struct CacheV2CreateRequest {
+    pub key: String,
+    pub version: String,
     #[serde(default)]
-    pub(crate) scope: Option<String>,
+    pub scope: Option<String>,
     #[serde(default)]
-    pub(crate) repository: Option<String>,
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CacheV2FinalizeRequest {
-    pub(crate) key: String,
-    pub(crate) version: String,
+pub struct CacheV2FinalizeRequest {
+    pub key: String,
+    pub version: String,
     #[serde(default)]
-    pub(crate) scope: Option<String>,
+    pub scope: Option<String>,
     #[serde(default)]
-    pub(crate) repository: Option<String>,
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CacheV2GetDlUrlRequest {
-    pub(crate) key: String,
-    pub(crate) version: String,
+pub struct CacheV2GetDlUrlRequest {
+    pub key: String,
+    pub version: String,
     #[serde(default)]
-    pub(crate) restore_keys: Vec<String>,
+    pub restore_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) scope: Option<String>,
+    pub scope: Option<String>,
     #[serde(default)]
-    pub(crate) repository: Option<String>,
+    pub repository: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +819,7 @@ fn cache_request_fields(
     }
 }
 
-pub(crate) async fn twirp_cache_v2_create(
+pub async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     headers: axum::http::HeaderMap,
@@ -986,7 +986,7 @@ pub(crate) async fn twirp_cache_v2_create(
     ))
 }
 
-pub(crate) async fn twirp_cache_v2_finalize(
+pub async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     headers: axum::http::HeaderMap,
@@ -1124,7 +1124,7 @@ pub(crate) async fn twirp_cache_v2_finalize(
     ))
 }
 
-pub(crate) async fn twirp_cache_v2_get_dl_url(
+pub async fn twirp_cache_v2_get_dl_url(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,

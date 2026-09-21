@@ -38,12 +38,12 @@ fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
 
 /// Blob kinds the `/twirp-blob/:kind/:token` route serves. Anything else is
 /// rejected before touching the filesystem (R1-2).
-pub(crate) const BLOB_KINDS: &[&str] = &["cache", "artifact", "diag"];
+pub const BLOB_KINDS: &[&str] = &["cache", "artifact", "diag"];
 
 /// Validate an already-decoded blob token: non-empty, restricted charset, no
 /// `..` segments. The charset excludes `/` and `\`, so no validated token can
 /// escape `<state_dir>/blobs/{kind}/` via path joining.
-pub(crate) fn is_valid_blob_token(token: &str) -> bool {
+pub fn is_valid_blob_token(token: &str) -> bool {
     !token.is_empty()
         && token
             .chars()
@@ -64,11 +64,7 @@ pub(crate) fn is_valid_blob_token(token: &str) -> bool {
 ///
 /// Returns the decoded claims, or `None` when the token is not a valid blob
 /// JWT for `kind`.
-pub(crate) fn verify_blob_token(
-    state: &AppState,
-    kind: &str,
-    token: &str,
-) -> Option<serde_json::Value> {
+pub fn verify_blob_token(state: &AppState, kind: &str, token: &str) -> Option<serde_json::Value> {
     let claims = state.verify_local_jwt_claims(token)?;
     if claims.get("sub").and_then(|v| v.as_str()) != Some("preloop-blob") {
         return None;
@@ -82,14 +78,14 @@ pub(crate) fn verify_blob_token(
 /// The `jti` of a verified blob JWT — the staging directory name under
 /// `<state_dir>/blobs/{kind}/`. Kept separate from the JWT itself because a
 /// signed token is far longer than the 255-byte filename limit.
-pub(crate) fn blob_token_jti(claims: &serde_json::Value) -> Option<String> {
+pub fn blob_token_jti(claims: &serde_json::Value) -> Option<String> {
     let jti = claims.get("jti").and_then(|v| v.as_str())?;
     is_valid_blob_token(jti).then(|| jti.to_owned())
 }
 
 /// The `job` claim of a verified blob JWT: `Some("")` for system-minted
 /// tokens, `Some(job_uuid)` for job-owned ones, `None` when absent.
-pub(crate) fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
+pub fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
     claims.get("job").and_then(|v| v.as_str())
 }
 
@@ -100,7 +96,7 @@ pub(crate) fn blob_token_job(claims: &serde_json::Value) -> Option<&str> {
 /// checks as literal ones. Returns the canonical `(kind, token)` with any
 /// `.zip` artifact-download suffix removed, or `None` when the path is
 /// malformed or the kind is not allowlisted.
-pub(crate) fn parse_blob_path(path: &str) -> Option<(String, String)> {
+pub fn parse_blob_path(path: &str) -> Option<(String, String)> {
     let rest = path.strip_prefix("/twirp-blob/")?;
     let (kind, raw_token) = rest.split_once('/')?;
     if raw_token.contains('/') {
@@ -134,7 +130,7 @@ pub(crate) fn parse_blob_path(path: &str) -> Option<(String, String)> {
 // Downloads (cache + artifact) use a plain GET.
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct BlobPutQuery {
+pub struct BlobPutQuery {
     comp: Option<String>,
     blockid: Option<String>,
 }
@@ -143,7 +139,7 @@ pub(crate) struct BlobPutQuery {
 /// decoded ID would escape `blocks_dir` — `Query` percent-decodes, so
 /// `%5C` arrives as `\` and `..%5C..%5Ctarget` is a Windows traversal. Only
 /// the base64url charset survives; anything else is rejected outright.
-pub(crate) fn blockid_to_filename(blockid: &str) -> Option<String> {
+pub fn blockid_to_filename(blockid: &str) -> Option<String> {
     let name = blockid.replace('+', "-").replace('/', "_").replace('=', "");
     if name.is_empty()
         || !name
@@ -156,7 +152,7 @@ pub(crate) fn blockid_to_filename(blockid: &str) -> Option<String> {
 }
 
 /// Parse an Azure Block Blob blocklist XML body and return block IDs in order.
-pub(crate) fn parse_blocklist_xml(body: &str) -> Vec<String> {
+pub fn parse_blocklist_xml(body: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut pos = 0;
     while let Some(start_off) = body[pos..].find("<Latest>") {
@@ -176,7 +172,7 @@ pub(crate) fn parse_blocklist_xml(body: &str) -> Vec<String> {
     ids
 }
 
-pub(crate) async fn blob_put(
+pub async fn blob_put(
     State(shared): State<Arc<SharedState>>,
     Path((kind, mut token)): Path<(String, String)>,
     Query(query): Query<BlobPutQuery>,
@@ -471,7 +467,7 @@ async fn assemble_streaming(
     }
     Ok(total)
 }
-pub(crate) async fn blob_get(
+pub async fn blob_get(
     State(shared): State<Arc<SharedState>>,
     Path((kind, mut token)): Path<(String, String)>,
 ) -> Response {
@@ -565,7 +561,7 @@ pub(crate) async fn blob_get(
 /// `preloop logs` prefers these blobs and falls back to the in-memory log
 /// blocks when they are gone, so a pruned run still reports its logs for as
 /// long as the engine lives.
-pub(crate) const REPLAY_PLANS_RETAINED: usize = 64;
+pub const REPLAY_PLANS_RETAINED: usize = 64;
 
 /// Bound the replay directory to the most recently written plans.
 ///
@@ -578,7 +574,7 @@ pub(crate) const REPLAY_PLANS_RETAINED: usize = 64;
 /// Retention is by modification time rather than by run, because blobs are
 /// keyed by execution plan and a run's plan ids are not recoverable once its
 /// records are gone.
-pub(crate) async fn prune_replay_results(
+pub async fn prune_replay_results(
     state_dir: &std::path::Path,
     active_plans: &std::collections::BTreeSet<String>,
 ) {
@@ -632,7 +628,7 @@ async fn collect_plan_directories(
 
 /// Accept blob uploads (logs, summaries) at signed-URL paths.
 /// Stores them in a local replay directory for conformance inspection.
-pub(crate) async fn replay_results_put(
+pub async fn replay_results_put(
     State(shared): State<Arc<SharedState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
     body: axum::body::Bytes,
