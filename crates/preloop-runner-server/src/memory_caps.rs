@@ -95,6 +95,15 @@ pub(crate) const MAX_PENDING_PER_JOB: usize = 32;
 /// limit). Matches the 512 MiB body limit on the Twirp blob upload route.
 pub(crate) const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// R1-6 — per-job aggregate cap on in-flight legacy cache upload bytes.
+/// `MAX_CACHE_UPLOAD_BYTES` bounds one reservation; without an aggregate
+/// budget a job could still hold `MAX_PENDING_PER_JOB` × 512 MiB (~16 GiB)
+/// in `pending_caches`. 1 GiB leaves headroom for two full-size uploads
+/// while keeping a hostile job's worst case bounded. Enforced under the
+/// `inner` lock in `cache_upload`, so concurrent chunks cannot race past
+/// it; bytes are released when the reservation commits or is swept.
+pub(crate) const MAX_PENDING_CACHE_BYTES_PER_JOB: u64 = 1024 * 1024 * 1024;
+
 /// F7 — global cap on minted cache download tokens; the oldest are evicted.
 pub(crate) const MAX_CACHE_DL_TOKENS: usize = 1024;
 

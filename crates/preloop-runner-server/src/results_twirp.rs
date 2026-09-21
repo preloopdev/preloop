@@ -517,11 +517,6 @@ async fn resolve_cache_repository(
     }
 }
 
-/// Default branch ref for the GitHub-style cache read fallback: a job may
-/// restore caches written on its own ref or on the default branch, never on
-/// an unrelated branch.
-pub(crate) const DEFAULT_BRANCH_REF: &str = "refs/heads/main";
-
 /// R1-5: bind the cache *write* scope to the token's job. The scope is the
 /// job's own git ref from the run submission — never the client-supplied
 /// scope — so a branch run cannot claim `refs/heads/main` and poison the
@@ -540,8 +535,10 @@ async fn resolve_cache_write_scope(
     }
 }
 
-/// R1-5: scopes a job token may *read*, GitHub-style: its own ref, plus the
-/// default branch as fallback. Caches written on unrelated branches stay
+/// R1-5: scopes a job token may *read*, GitHub-style: its own ref, the PR
+/// base branch when the run is a pull request, and the repository's real
+/// default branch as fallback (resolved from the event payload, not
+/// assumed to be `main`). Caches written on unrelated branches stay
 /// invisible, so a malicious branch cannot harvest (or rely on poisoning)
 /// another branch's entries. The system token keeps the client-supplied
 /// scopes; with none supplied, the unscoped default is tried once.
@@ -550,11 +547,18 @@ async fn resolve_cache_read_scopes(
     headers: &axum::http::HeaderMap,
     client_scopes: &[String],
 ) -> Result<Vec<Option<String>>, ApiError> {
-    match crate::auth::job_git_ref_from_headers(state, headers).await? {
-        Some(git_ref) => {
-            let mut scopes = vec![Some(git_ref.clone())];
-            if git_ref != DEFAULT_BRANCH_REF {
-                scopes.push(Some(DEFAULT_BRANCH_REF.to_owned()));
+    match crate::auth::job_cache_context_from_headers(state, headers).await? {
+        Some(context) => {
+            let mut scopes = vec![Some(context.git_ref.clone())];
+            for candidate in [context.base_ref, Some(context.default_branch_ref)]
+                .into_iter()
+                .flatten()
+            {
+                if candidate != context.git_ref
+                    && !scopes.iter().flatten().any(|scope| *scope == candidate)
+                {
+                    scopes.push(Some(candidate));
+                }
             }
             Ok(scopes)
         }
@@ -1480,6 +1484,29 @@ mod cache_pb_tests {
         repository: &str,
         git_ref: &str,
     ) {
+        bind_job_to_ref_with_payload(
+            state,
+            job_id,
+            request_id,
+            repository,
+            git_ref,
+            serde_json::Value::Null,
+        )
+        .await;
+    }
+
+    /// Bind a job token to a live run whose submission carries `repository`,
+    /// `git_ref`, and an event payload — the payload is where the server
+    /// reads `repository.default_branch` and `pull_request.base.ref` for
+    /// cache read scopes.
+    async fn bind_job_to_ref_with_payload(
+        state: &AppState,
+        job_id: uuid::Uuid,
+        request_id: i64,
+        repository: &str,
+        git_ref: &str,
+        payload: serde_json::Value,
+    ) {
         let run_id = RunId::new();
         let mut inner = state.inner.lock().await;
         inner.agent_job_requests.insert(job_id, request_id);
@@ -1512,6 +1539,7 @@ mod cache_pb_tests {
                 submission: Arc::new(WorkflowSubmission {
                     repository: repository.to_owned(),
                     git_ref: git_ref.to_owned(),
+                    payload,
                     ..Default::default()
                 }),
                 jobs: BTreeMap::new(),
@@ -1634,6 +1662,75 @@ mod cache_pb_tests {
             .await
             .unwrap();
         assert_eq!(scopes, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn cache_read_scopes_use_the_real_default_branch() {
+        // The fallback must come from the repository's actual default
+        // branch (event payload `repository.default_branch`), not a
+        // hard-coded `main` — a repo defaulting to `trunk` would otherwise
+        // miss its own default-branch caches.
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        bind_job_to_ref_with_payload(
+            &state,
+            job_id,
+            1,
+            "owner/repo",
+            "refs/heads/feature",
+            serde_json::json!({"repository": {"default_branch": "trunk"}}),
+        )
+        .await;
+        let headers = bearer_headers(&job_token(&state, &job_id));
+
+        let scopes = resolve_cache_read_scopes(&state, &headers, &[])
+            .await
+            .expect("job-bound token resolves its read scopes");
+        assert_eq!(
+            scopes,
+            vec![
+                Some("refs/heads/feature".to_owned()),
+                Some("refs/heads/trunk".to_owned()),
+            ],
+            "the fallback must be the repository's real default branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_read_scopes_include_the_pr_base_branch() {
+        // A pull_request run's own ref is `refs/pull/<n>/merge`; caches
+        // seeded on the PR's *base* branch must stay readable or PRs
+        // targeting non-default branches lose their cache.
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let job_id = uuid::Uuid::new_v4();
+        bind_job_to_ref_with_payload(
+            &state,
+            job_id,
+            1,
+            "owner/repo",
+            "refs/pull/42/merge",
+            serde_json::json!({
+                "repository": {"default_branch": "main"},
+                "pull_request": {"base": {"ref": "release"}},
+            }),
+        )
+        .await;
+        let headers = bearer_headers(&job_token(&state, &job_id));
+
+        let scopes = resolve_cache_read_scopes(&state, &headers, &[])
+            .await
+            .expect("job-bound token resolves its read scopes");
+        assert_eq!(
+            scopes,
+            vec![
+                Some("refs/pull/42/merge".to_owned()),
+                Some("refs/heads/release".to_owned()),
+                Some("refs/heads/main".to_owned()),
+            ],
+            "read scopes must be own ref + PR base + default branch"
+        );
     }
 
     #[test]

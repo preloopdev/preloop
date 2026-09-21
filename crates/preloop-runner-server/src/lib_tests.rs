@@ -25668,9 +25668,23 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
 
 /// R1-6: the legacy upload endpoint appended every PATCH body with no
 /// running total, so a job could grow server RAM without bound (~500
-/// requests/GiB at the 2 MiB default body limit). Each reservation is now
-/// capped at MAX_CACHE_UPLOAD_BYTES; the refusal happens before the buffer
-/// grows, so the 413 itself allocates nothing.
+/// requests/GiB at the 2 MiB default body limit). The boundary logic lives
+/// in `ensure_cache_chunk_fits`, exercised here with a small limit so the
+/// test does not allocate the production 512 MiB cap.
+#[test]
+fn cache_upload_chunk_check_enforces_the_per_upload_cap() {
+    // A chunk that still fits under the cap is accepted.
+    assert!(ensure_cache_chunk_fits(92, 8, 100).is_ok());
+    // A chunk landing exactly on the cap is accepted.
+    assert!(ensure_cache_chunk_fits(99, 1, 100).is_ok());
+    // A chunk pushing past the cap is refused with 413.
+    let err = ensure_cache_chunk_fits(100, 1, 100).unwrap_err();
+    assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// R1-6: the handler wires `ensure_cache_chunk_fits` to
+/// MAX_CACHE_UPLOAD_BYTES — a reservation already at the cap refuses the
+/// next chunk with 413 and the refused bytes never grow the buffer.
 #[tokio::test]
 async fn cache_upload_rejects_chunks_past_the_per_upload_cap() {
     let temp = tempfile::tempdir().unwrap();
@@ -25690,7 +25704,7 @@ async fn cache_upload_rejects_chunks_past_the_per_upload_cap() {
                 namespace: "owner/repo".into(),
                 version: "v1".into(),
                 job_backend_id: String::new(), // system-owned reservation
-                bytes: vec![0u8; (MAX_CACHE_UPLOAD_BYTES - 8) as usize],
+                bytes: vec![0u8; MAX_CACHE_UPLOAD_BYTES as usize],
                 created_unix: now_unix(),
             },
         );
@@ -25701,18 +25715,6 @@ async fn cache_upload_rejects_chunks_past_the_per_upload_cap() {
         format!("Bearer {}", state.system_token).parse().unwrap(),
     )]);
 
-    // A chunk that still fits under the cap is accepted.
-    let ok = cache_upload(
-        axum::extract::State(shared.clone()),
-        headers.clone(),
-        axum::extract::Path(cache_id),
-        axum::body::Bytes::from(vec![0u8; 8]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(ok, StatusCode::ACCEPTED);
-
-    // A chunk pushing past the cap is refused with 413.
     let err = cache_upload(
         axum::extract::State(shared.clone()),
         headers,
@@ -25727,6 +25729,101 @@ async fn cache_upload_rejects_chunks_past_the_per_upload_cap() {
         inner.pending_caches.get(&cache_id).unwrap().bytes.len() as u64,
         MAX_CACHE_UPLOAD_BYTES,
         "the refused chunk must not grow the buffer"
+    );
+}
+
+/// R1-6: the per-upload cap alone still lets a job hold
+/// MAX_PENDING_PER_JOB × 512 MiB. `ensure_pending_cache_bytes_fit` bounds
+/// the job's aggregate pending bytes; exercised here with a small limit so
+/// the test does not allocate the production 1 GiB budget.
+#[test]
+fn pending_cache_byte_budget_covers_the_job_aggregate() {
+    let mut inner = InnerState::default();
+    for (cache_id, bytes) in [(1i64, 60u64), (2i64, 32u64)] {
+        inner.pending_caches.insert(
+            cache_id,
+            PendingCache {
+                key: format!("k-{cache_id}"),
+                namespace: "owner/repo".into(),
+                version: "v1".into(),
+                job_backend_id: "job-1".into(),
+                bytes: vec![0u8; bytes as usize],
+                created_unix: now_unix(),
+            },
+        );
+    }
+    // Other jobs' reservations do not count against this job's budget.
+    inner.pending_caches.insert(
+        3i64,
+        PendingCache {
+            key: "other".into(),
+            namespace: "owner/repo".into(),
+            version: "v1".into(),
+            job_backend_id: "job-2".into(),
+            bytes: vec![0u8; 512],
+            created_unix: now_unix(),
+        },
+    );
+
+    // 92 held + 8 incoming lands exactly on the budget — accepted.
+    assert!(ensure_pending_cache_bytes_fit(&inner, "job-1", 8, 100).is_ok());
+    // One more byte pushes the aggregate past the budget — refused.
+    let err = ensure_pending_cache_bytes_fit(&inner, "job-1", 9, 100).unwrap_err();
+    assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        err.message().contains("pending-cache byte budget"),
+        "unexpected message: {}",
+        err.message()
+    );
+}
+
+/// R1-6: an active chunked upload must not be reaped mid-flight. Each
+/// accepted PATCH refreshes `created_unix`, so a reservation that keeps
+/// receiving chunks never looks abandoned to the TTL sweeper.
+#[tokio::test]
+async fn cache_upload_refreshes_reservation_activity() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+
+    let cache_id = 9i64;
+    let stale_at = now_unix() - PENDING_UPLOAD_TTL.as_secs() as i64 - 1;
+    {
+        let mut inner = state.inner.lock().await;
+        inner.pending_caches.insert(
+            cache_id,
+            PendingCache {
+                key: "k".into(),
+                namespace: "owner/repo".into(),
+                version: "v1".into(),
+                job_backend_id: String::new(),
+                bytes: Vec::new(),
+                created_unix: stale_at,
+            },
+        );
+    }
+
+    let headers = axum::http::HeaderMap::from_iter([(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {}", state.system_token).parse().unwrap(),
+    )]);
+    let ok = cache_upload(
+        axum::extract::State(shared.clone()),
+        headers,
+        axum::extract::Path(cache_id),
+        axum::body::Bytes::from(vec![0u8; 4]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok, StatusCode::ACCEPTED);
+
+    let inner = state.inner.lock().await;
+    assert!(
+        inner.pending_caches.get(&cache_id).unwrap().created_unix > stale_at,
+        "an accepted chunk must refresh the reservation's activity stamp"
     );
 }
 

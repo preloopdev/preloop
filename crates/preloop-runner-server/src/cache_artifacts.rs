@@ -77,6 +77,50 @@ pub(crate) fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<S
     }
 }
 
+/// R1-6: refuse a chunk that would push an in-flight upload past
+/// `max_bytes`. Split from `cache_upload` so tests can exercise the
+/// boundary with a small limit instead of allocating the production
+/// 512 MiB cap.
+pub(crate) fn ensure_cache_chunk_fits(
+    current_bytes: u64,
+    chunk_bytes: u64,
+    max_bytes: u64,
+) -> Result<(), ApiError> {
+    if current_bytes + chunk_bytes > max_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "cache upload exceeds the {} MiB per-upload cap",
+            max_bytes / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+/// R1-6: refuse a chunk that would push a job's *aggregate* pending bytes
+/// past `max_bytes`. The per-upload cap alone still lets a job hold
+/// `MAX_PENDING_PER_JOB` × 512 MiB; this bounds the job's total. Split out
+/// so tests can exercise the boundary with a small limit instead of
+/// allocating the production 1 GiB budget.
+pub(crate) fn ensure_pending_cache_bytes_fit(
+    inner: &InnerState,
+    job_backend_id: &str,
+    chunk_bytes: u64,
+    max_bytes: u64,
+) -> Result<(), ApiError> {
+    let job_bytes: u64 = inner
+        .pending_caches
+        .values()
+        .filter(|pending| pending.job_backend_id == job_backend_id)
+        .map(|pending| pending.bytes.len() as u64)
+        .sum();
+    if job_bytes + chunk_bytes > max_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "job exceeds the {} MiB pending-cache byte budget",
+            max_bytes / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn cache_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CachePutRequest>,
@@ -220,26 +264,49 @@ pub(crate) async fn cache_upload(
         auth::require_live_job(&shared.state, claims.job_id).await?;
     }
     let mut inner = shared.state.inner.lock().await;
+    {
+        let pending = inner
+            .pending_caches
+            .get(&cache_id)
+            .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+        if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
+            return Err(ApiError::forbidden(
+                "cache reservation belongs to another job",
+            ));
+        }
+        // R1-6: cap each in-flight upload's running total. Without this
+        // check a job could grow server RAM without bound by PATCHing
+        // chunks forever (~500 requests/GiB at the 2 MiB default body
+        // limit). The check runs before the vector grows so the refusal
+        // itself allocates nothing.
+        ensure_cache_chunk_fits(
+            pending.bytes.len() as u64,
+            bytes.len() as u64,
+            MAX_CACHE_UPLOAD_BYTES,
+        )?;
+        // R1-6: cap the job's *aggregate* pending bytes, not just each
+        // upload — MAX_PENDING_PER_JOB × MAX_CACHE_UPLOAD_BYTES would
+        // otherwise let one job hold ~16 GiB in reservations. The sum runs
+        // under the same lock as the append, so concurrent chunks cannot
+        // race past the budget.
+        if !pending.job_backend_id.is_empty() {
+            ensure_pending_cache_bytes_fit(
+                &inner,
+                &pending.job_backend_id,
+                bytes.len() as u64,
+                MAX_PENDING_CACHE_BYTES_PER_JOB,
+            )?;
+        }
+    }
     let pending = inner
         .pending_caches
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
-    if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
-        return Err(ApiError::forbidden(
-            "cache reservation belongs to another job",
-        ));
-    }
-    // R1-6: cap each in-flight upload's running total. Without this check a
-    // job could grow server RAM without bound by PATCHing chunks forever
-    // (~500 requests/GiB at the 2 MiB default body limit). The check runs
-    // before the vector grows so the refusal itself allocates nothing.
-    if pending.bytes.len() as u64 + bytes.len() as u64 > MAX_CACHE_UPLOAD_BYTES {
-        return Err(ApiError::payload_too_large(format!(
-            "cache upload exceeds the {} MiB per-upload cap",
-            MAX_CACHE_UPLOAD_BYTES / (1024 * 1024)
-        )));
-    }
     pending.bytes.extend_from_slice(&bytes);
+    // Refresh the activity stamp: the TTL sweeper frees reservations idle
+    // past PENDING_UPLOAD_TTL, and an active chunked upload must not be
+    // reaped between PATCHes.
+    pending.created_unix = crate::memory_caps::now_unix();
     // No write-through here on purpose: the in-flight payload is not durable
     // state (see `MetaSnapshot`), and snapshotting per chunk was quadratic in
     // cache size. The committed cache is persisted by `CacheStore` in
@@ -322,25 +389,31 @@ pub(crate) async fn cache_lookup(
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let key = query.key.unwrap_or_default();
-    let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
-    let git_ref = auth::job_git_ref_from_headers(&shared.state, &headers).await?;
+    let context = auth::job_cache_context_from_headers(&shared.state, &headers).await?;
     let restore_keys = parse_restore_keys(query.keys.as_deref());
-    // R1-5: a job reads its own ref's namespace, falling back to the default
-    // branch (GitHub semantics). Caches on unrelated branches stay invisible.
-    // The system token keeps the historical repository-only namespace.
-    let namespaces: Vec<String> = match (repository, git_ref) {
-        (Some(repository), Some(git_ref)) => {
-            let mut namespaces = vec![format!("{repository}\0{git_ref}")];
-            if git_ref != crate::results_twirp::DEFAULT_BRANCH_REF {
-                namespaces.push(format!(
-                    "{repository}\0{}",
-                    crate::results_twirp::DEFAULT_BRANCH_REF
-                ));
+    // R1-5: a job reads its own ref's namespace, then the PR base branch
+    // (pull_request runs), then the repository's real default branch —
+    // resolved from the event payload, not assumed to be `main`. Caches on
+    // unrelated branches stay invisible. The system token keeps the
+    // historical repository-only namespace.
+    let namespaces: Vec<String> = match context {
+        Some(context) => {
+            let mut namespaces = vec![format!("{}\0{}", context.repository, context.git_ref)];
+            for candidate in [context.base_ref, Some(context.default_branch_ref)]
+                .into_iter()
+                .flatten()
+            {
+                if candidate != context.git_ref
+                    && !namespaces
+                        .iter()
+                        .any(|ns| *ns == format!("{}\0{}", context.repository, candidate))
+                {
+                    namespaces.push(format!("{}\0{}", context.repository, candidate));
+                }
             }
             namespaces
         }
-        (Some(repository), None) => vec![repository],
-        (None, _) => vec![String::new()],
+        None => vec![String::new()],
     };
     let mut response = None;
     for namespace in &namespaces {

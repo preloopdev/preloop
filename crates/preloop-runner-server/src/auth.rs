@@ -1028,6 +1028,76 @@ pub(crate) async fn job_git_ref_from_headers(
     Ok(Some(git_ref))
 }
 
+/// Cache-scoping context resolved server-side from the job → run →
+/// submission chain. Every field comes from the run record the token's job
+/// belongs to — never from request bodies — so a compromised job cannot
+/// move its cache namespace across repositories or branches.
+#[derive(Debug, Clone)]
+pub(crate) struct JobCacheContext {
+    /// Repository the run belongs to (`owner/repo`).
+    pub(crate) repository: String,
+    /// Git ref the run executes on (`refs/heads/feature`,
+    /// `refs/pull/42/merge`, `refs/tags/v1`, …).
+    pub(crate) git_ref: String,
+    /// The repository's default branch as a full ref, taken from the event
+    /// payload's `repository.default_branch`. Falls back to
+    /// `refs/heads/main` only when the payload does not carry it (native
+    /// submissions, pre-payload fixtures).
+    pub(crate) default_branch_ref: String,
+    /// For `pull_request`/`pull_request_target` runs, the PR's base branch
+    /// as a full ref (`refs/heads/release`). `None` for non-PR events.
+    pub(crate) base_ref: Option<String>,
+}
+
+/// Resolve the cache-scoping context of the job behind a job runtime
+/// bearer. Returns `None` for the system token (the engine itself has no
+/// job); a job token that resolves to no live run fails closed.
+pub(crate) async fn job_cache_context_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<JobCacheContext>, ApiError> {
+    let Some(token) = bearer_from_headers(headers) else {
+        return Err(ApiError::unauthorized("job runtime token required"));
+    };
+    if token == state.system_token.as_str() {
+        return Ok(None);
+    }
+    let job_id = state
+        .job_uuid_from_token(token)
+        .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
+    let inner = state.inner.lock().await;
+    let run = inner
+        .agent_job_requests
+        .get(&job_id)
+        .and_then(|request_id| inner.job_requests.get(request_id))
+        .and_then(|record| inner.runs.get(&record.run_id))
+        .ok_or_else(|| {
+            ApiError::forbidden("job runtime token is not bound to a live workflow run")
+        })?;
+    let submission = &run.submission;
+    let default_branch = submission
+        .payload
+        .get("repository")
+        .and_then(|repo| repo.get("default_branch"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or("main");
+    let base_ref = submission
+        .payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .map(|branch| format!("refs/heads/{branch}"));
+    Ok(Some(JobCacheContext {
+        repository: submission.repository.clone(),
+        git_ref: submission.git_ref.clone(),
+        default_branch_ref: format!("refs/heads/{default_branch}"),
+        base_ref,
+    }))
+}
+
 pub(crate) fn job_runtime_claims_from_headers(
     state: &AppState,
     headers: &HeaderMap,
