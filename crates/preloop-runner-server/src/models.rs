@@ -695,6 +695,22 @@ pub(crate) struct ArtifactV2Pending {
     pub(crate) created_unix: i64,
 }
 
+/// Reserved diagnostic-log upload (Twirp `GetJobDiagLogsSignedBlobURL`).
+///
+/// The diag blob token is minted per call and handed to the runner, which
+/// PUTs to `/twirp-blob/diag/{token}` bearerless (Azure SDK compat). The
+/// registry binds the token to the owning job so the blob gate can reject
+/// writes from any other job. In-memory only: diag uploads happen
+/// immediately after minting, and the TTL sweeper bounds the map.
+#[derive(Debug, Clone)]
+pub(crate) struct DiagUploadToken {
+    /// Job backend id that reserved the upload (job UUID string), derived
+    /// from the runtime token scope; empty when minted by the system token.
+    pub(crate) job_id: String,
+    /// Unix seconds the reservation was made.
+    pub(crate) created_unix: i64,
+}
+
 /// Finalized artifact v2 entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ArtifactV2Entry {

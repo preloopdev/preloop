@@ -27,6 +27,8 @@ pub(crate) async fn twirp_workflow_steps_update(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
         .as_str()
@@ -152,6 +154,8 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     // The signed URL is the upload credential for `/replay/results/*` — a
     // bearerless route reachable from inside every runner VM. Only mint for
     // the plan/job the caller's token actually names, or workflow code could
@@ -177,15 +181,73 @@ pub(crate) async fn twirp_get_job_logs_signed_blob_url(
 }
 
 pub(crate) async fn twirp_get_job_diag_logs_signed_blob_url(
+    State(shared): State<Arc<SharedState>>,
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::auth::require_results_job(
         &identity,
         &request.workflow_run_backend_id,
         &request.workflow_job_run_backend_id,
     )?;
-    let token = uuid::Uuid::new_v4();
+    let job_id = match &identity {
+        crate::auth::ResultsIdentity::Job(job) => job.job_id.to_string(),
+        crate::auth::ResultsIdentity::System => String::new(),
+    };
+    // The bearerless upload token is a server-signed blob JWT: `job` binds it
+    // to the owning job so the blob gate can reject writes from any other job
+    // (R1-2) and from this job once it settles (R1-10). `jti` names the
+    // on-disk staging directory. The runner PUTs to this URL without a
+    // bearer (Azure SDK compat), so the signature — not a bearer — is the
+    // credential here.
+    let jti = uuid::Uuid::new_v4().to_string();
+    let token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "diag",
+            "job": job_id,
+            "jti": jti,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
+    {
+        let mut inner = shared.state.inner.lock().await;
+        // In-lock re-check: the job may have settled between the gate and
+        // this lock — a settled job must not mint a fresh upload credential.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
+        // Per-job cap, same bound as the other pending maps: a live job can
+        // otherwise mint unlimited diag URLs for the full TTL. Evict the
+        // oldest token for this job rather than rejecting — the runner may
+        // legitimately re-mint on retry.
+        let mut owned: Vec<(String, i64)> = inner
+            .diag_upload_tokens
+            .iter()
+            .filter(|(_, t)| t.job_id == job_id)
+            .map(|(k, t)| (k.clone(), t.created_unix))
+            .collect();
+        owned.sort_by_key(|(_, created)| *created);
+        while owned.len() >= crate::memory_caps::MAX_PENDING_PER_JOB {
+            if let Some((oldest, _)) = owned.first() {
+                inner.diag_upload_tokens.remove(oldest);
+            }
+            owned.remove(0);
+        }
+        inner.diag_upload_tokens.insert(
+            jti,
+            DiagUploadToken {
+                job_id,
+                created_unix: now_unix(),
+            },
+        );
+    }
     Ok(Json(json!({
         "blob_storage_type": "BLOB_STORAGE_TYPE_AZURE",
         "diag_logs_url": format!("{}/twirp-blob/diag/{token}?sv=2021-08-06&se=2028-01-01T00%3A00%3A00Z&sr=c&sp=rw&sig=dummy", runner_base_url()),
@@ -197,6 +259,8 @@ pub(crate) async fn twirp_get_step_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
@@ -230,6 +294,8 @@ pub(crate) async fn twirp_get_step_summary_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
@@ -291,6 +357,8 @@ pub(crate) async fn twirp_create_step_summary_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
         &request.workflow_run_backend_id,
@@ -337,6 +405,8 @@ pub(crate) async fn twirp_create_step_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let (Some(plan_id), Some(raw_job_id)) = (
         request.workflow_run_backend_id.as_deref(),
         request.workflow_job_run_backend_id.as_deref(),
@@ -385,6 +455,8 @@ pub(crate) async fn twirp_create_job_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let Some(raw_job_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
     };
@@ -745,9 +817,12 @@ fn cache_request_fields(
 
 pub(crate) async fn twirp_cache_v2_create(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let (key, version, _restore, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
@@ -781,19 +856,33 @@ pub(crate) async fn twirp_cache_v2_create(
             }),
         ));
     }
-    let token = uuid::Uuid::new_v4().to_string();
+    // The upload token is a server-signed blob JWT; `jti` names the staging
+    // directory and the pending-reservation map key.
+    let jti = uuid::Uuid::new_v4().to_string();
     let stage_dir = shared
         .state
         .state_dir
         .join("blobs")
         .join("cache")
-        .join(&token);
+        .join(&jti);
     tokio::fs::create_dir_all(&stage_dir)
         .await
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
+    let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
-        let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
+        // In-lock re-check: the job may have settled between the gate above
+        // and this lock acquisition — a settled job must not mint a fresh
+        // upload credential in that window.
+        if let crate::auth::ResultsIdentity::Job(job) = &identity {
+            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
+                drop(inner);
+                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                return Err(ApiError::forbidden(
+                    "job is not live; writes are rejected for completed or unknown jobs",
+                ));
+            }
+        }
         if inner
             .cache_v2_pending
             .values()
@@ -834,11 +923,11 @@ pub(crate) async fn twirp_cache_v2_create(
                 }
             }
             inner.cache_v2_pending.insert(
-                token.clone(),
+                jti.clone(),
                 CacheV2Pending {
                     key: storage_key.clone(),
                     version: version.clone(),
-                    job_backend_id: job_backend_id.unwrap_or_default(),
+                    job_backend_id: job_backend_id.clone().unwrap_or_default(),
                     created_unix: now_unix(),
                 },
             );
@@ -864,6 +953,15 @@ pub(crate) async fn twirp_cache_v2_create(
             }),
         ));
     }
+    let token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "cache",
+            "job": job_backend_id.unwrap_or_default(),
+            "jti": jti,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     let upload_url = format!("{}/twirp-blob/cache/{token}", runner_base_url());
     // The cache key is workflow-controlled content; never log it or the
     // version verbatim. A SHA-256 digest identifies the entry well enough to
@@ -886,9 +984,12 @@ pub(crate) async fn twirp_cache_v2_create(
 
 pub(crate) async fn twirp_cache_v2_finalize(
     State(shared): State<Arc<SharedState>>,
+    axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    // R1-10: reject writes from completed/unknown jobs.
+    crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let (key, version, _restore, scopes, client_repository) =
@@ -902,13 +1003,25 @@ pub(crate) async fn twirp_cache_v2_finalize(
     let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
     let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), Some(repository.as_str()));
 
-    // Find the pending upload token matching key+version.
+    // Find the pending upload token matching key+version, owned by the
+    // caller's job — a live job must not finalize another job's reservation
+    // (IDOR). The system identity bypasses the owner check.
+    let caller_job_id = match &identity {
+        crate::auth::ResultsIdentity::Job(job) => Some(job.job_id.to_string()),
+        crate::auth::ResultsIdentity::System => None,
+    };
     let token = {
         let inner = shared.state.inner.lock().await;
         inner
             .cache_v2_pending
             .iter()
-            .find(|(_, p)| p.key == storage_key && p.version == version)
+            .find(|(_, p)| {
+                p.key == storage_key
+                    && p.version == version
+                    && caller_job_id
+                        .as_deref()
+                        .is_none_or(|job_id| p.job_backend_id == job_id)
+            })
             .map(|(k, _)| k.clone())
     };
     let Some(token) = token else {
@@ -1064,19 +1177,31 @@ pub(crate) async fn twirp_cache_v2_get_dl_url(
         ));
     };
 
-    let dl_token = uuid::Uuid::new_v4().to_string();
+    // The download token is a server-signed blob JWT carrying (key, version)
+    // in its claims, so blob_get resolves the entry statelessly — a minted
+    // URL survives restarts, unlike the dl-token map (kept for accounting).
+    let dl_jti = uuid::Uuid::new_v4().to_string();
+    let dl_token = shared.state.local_jwt_with_lifetime(
+        json!({
+            "sub": "preloop-blob",
+            "kind": "cache",
+            "job": "",
+            "jti": dl_jti,
+            "key": entry.key,
+            "version": entry.version,
+        }),
+        crate::memory_caps::PENDING_UPLOAD_TTL,
+    )?;
     {
         let mut inner = shared.state.inner.lock().await;
         inner
             .cache_v2_dl_tokens
-            .insert(dl_token.clone(), (entry.key.clone(), entry.version.clone()));
+            .insert(dl_jti.clone(), (entry.key.clone(), entry.version.clone()));
         // F7: bound the minted-token map; the oldest tokens are evicted
         // first. A token that a runner has not yet fetched still works, so a
         // real workflow's few concurrent downloads are never affected.
-        inner.cache_v2_dl_tokens_order.push_back(dl_token.clone());
-        inner
-            .cache_v2_dl_tokens_created
-            .insert(dl_token.clone(), now_unix());
+        inner.cache_v2_dl_tokens_order.push_back(dl_jti.clone());
+        inner.cache_v2_dl_tokens_created.insert(dl_jti, now_unix());
         trim_cache_dl_tokens(&mut inner);
     }
     let download_url = format!("{}/twirp-blob/cache/{dl_token}", runner_base_url());

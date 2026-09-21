@@ -262,7 +262,7 @@ fn abstract_equal(left: &Value, right: &Value) -> bool {
         (Value::Null, Value::Null) => true,
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
-        (Value::String(left), Value::String(right)) => left.eq_ignore_ascii_case(right),
+        (Value::String(left), Value::String(right)) => eq_ordinal_ignore_case(left, right),
         (Value::Array(_), Value::Array(_)) | (Value::Object(_), Value::Object(_)) => {
             std::ptr::eq(left, right)
         }
@@ -281,24 +281,146 @@ fn compare_values(
     right_value: &Value,
     predicate: impl FnOnce(std::cmp::Ordering) -> bool,
 ) -> bool {
+    // Official runner (EvaluationResult.AbstractGreaterThan): when both
+    // operands are strings, they compare ordinally with OrdinalIgnoreCase —
+    // numeric-looking strings are NEVER coerced to numbers. Previously we
+    // tried numeric conversion first, which inverted results like
+    // '10' > '9' (we said true, official says false).
+    if let (Value::String(left), Value::String(right)) = (left_value, right_value) {
+        return predicate(compare_ordinal_ignore_case(left, right));
+    }
     if let (Some(left), Some(right)) = (numeric_value(left_value), numeric_value(right_value)) {
         if let Some(ordering) = left.partial_cmp(&right) {
             return predicate(ordering);
         }
         // A failed numeric conversion for mixed values is not a string
         // comparison; preserve the runner's false result for NaN.
-        if !matches!(
-            (left_value, right_value),
-            (Value::String(_), Value::String(_))
-        ) {
-            return false;
+        return false;
+    }
+    predicate(compare_ordinal_ignore_case(
+        &string_value(left_value),
+        &string_value(right_value),
+    ))
+}
+
+/// Simple uppercase mapping with no multi-character expansion.
+///
+/// Matches the per-character simple case mapping .NET uses for
+/// `StringComparison.OrdinalIgnoreCase`: a character whose uppercase form
+/// expands (e.g. 'ß' → "SS", 'İ' → 'i' + combining dot) keeps its original
+/// form, exactly as the invariant simple-case table does. Lowercasing the
+/// whole string instead would wrongly equate 'İ' with 'i\u{0307}' and miss
+/// equivalences like final sigma 'ς' == 'Σ'.
+fn to_simple_upper(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(mapped), None) => mapped,
+        // No mapping or an expanding mapping: keep the character as-is.
+        _ => c,
+    }
+}
+
+/// Case-insensitive ordinal string comparison.
+///
+/// Matches .NET `StringComparison.OrdinalIgnoreCase`: each character is
+/// mapped through the simple (non-expanding) uppercase mapping, then
+/// compared ordinally. Comparing scalar values is equivalent to comparing
+/// UTF-16 code units because UTF-16 preserves code point order.
+fn compare_ordinal_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if left.is_ascii() && right.is_ascii() {
+        return left.to_ascii_uppercase().cmp(&right.to_ascii_uppercase());
+    }
+    let mut left_chars = left.chars().map(to_simple_upper);
+    let mut right_chars = right.chars().map(to_simple_upper);
+    loop {
+        match (left_chars.next(), right_chars.next()) {
+            (Some(l), Some(r)) => match l.cmp(&r) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            },
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
         }
     }
-    predicate(
-        string_value(left_value)
-            .to_ascii_lowercase()
-            .cmp(&string_value(right_value).to_ascii_lowercase()),
-    )
+}
+
+/// Case-insensitive ordinal prefix test.
+/// Matches .NET `string.StartsWith(..., OrdinalIgnoreCase)`.
+fn starts_with_ordinal_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        let haystack = haystack.as_bytes();
+        let needle = needle.as_bytes();
+        return haystack.len() >= needle.len()
+            && haystack[..needle.len()]
+                .iter()
+                .zip(needle.iter())
+                .all(|(h, n)| h.eq_ignore_ascii_case(n));
+    }
+    let mut haystack_chars = haystack.chars().map(to_simple_upper);
+    needle
+        .chars()
+        .map(to_simple_upper)
+        .all(|n| match haystack_chars.next() {
+            Some(h) => h == n,
+            None => false,
+        })
+}
+
+/// Case-insensitive ordinal suffix test.
+/// Matches .NET `string.EndsWith(..., OrdinalIgnoreCase)`.
+fn ends_with_ordinal_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        let haystack = haystack.as_bytes();
+        let needle = needle.as_bytes();
+        return haystack.len() >= needle.len()
+            && haystack[haystack.len() - needle.len()..]
+                .iter()
+                .zip(needle.iter())
+                .all(|(h, n)| h.eq_ignore_ascii_case(n));
+    }
+    // The mapping is per-character, so comparing the reversed streams is
+    // equivalent to comparing the suffix.
+    let mut haystack_chars = haystack.chars().rev().map(to_simple_upper);
+    needle
+        .chars()
+        .rev()
+        .map(to_simple_upper)
+        .all(|n| match haystack_chars.next() {
+            Some(h) => h == n,
+            None => false,
+        })
+}
+
+/// Case-insensitive ordinal substring test.
+/// Matches .NET `string.Contains(..., OrdinalIgnoreCase)`.
+fn contains_ordinal_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle.is_ascii() {
+        return haystack
+            .to_ascii_uppercase()
+            .contains(&needle.to_ascii_uppercase());
+    }
+    let needle: Vec<char> = needle.chars().map(to_simple_upper).collect();
+    let haystack: Vec<char> = haystack.chars().map(to_simple_upper).collect();
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_slice())
+}
+
+/// Case-insensitive string equality, Unicode-aware.
+/// Matches .NET String.Equals(..., OrdinalIgnoreCase).
+fn eq_ordinal_ignore_case(left: &str, right: &str) -> bool {
+    compare_ordinal_ignore_case(left, right) == std::cmp::Ordering::Equal
 }
 
 fn numeric_value(value: &Value) -> Option<f64> {
@@ -411,21 +533,23 @@ fn eval_call(
                 |(haystack, needle)| contains(haystack, needle),
             )))
         }
-        "startswith" => Ok(Value::Bool(
-            string_arg(&values, 0)
-                .to_ascii_lowercase()
-                .starts_with(&string_arg(&values, 1).to_ascii_lowercase()),
-        )),
-        "endswith" => Ok(Value::Bool(
-            string_arg(&values, 0)
-                .to_ascii_lowercase()
-                .ends_with(&string_arg(&values, 1).to_ascii_lowercase()),
-        )),
+        "startswith" => Ok(Value::Bool({
+            // Unicode-aware case-insensitive (official: OrdinalIgnoreCase).
+            starts_with_ordinal_ignore_case(&string_arg(&values, 0), &string_arg(&values, 1))
+        })),
+        "endswith" => Ok(Value::Bool({
+            // Unicode-aware case-insensitive (official: OrdinalIgnoreCase).
+            ends_with_ordinal_ignore_case(&string_arg(&values, 0), &string_arg(&values, 1))
+        })),
         "format" => format_args(&values, budget).map(Value::String),
-        "fromjson" => Ok(values
-            .first()
-            .and_then(|value| serde_json::from_str(&string_value(value)).ok())
-            .unwrap_or(Value::Null)),
+        "fromjson" => {
+            // Official runner (FromJson.cs): JToken.ReadFrom throws on invalid
+            // JSON — the error propagates and fails the job. Previously we
+            // swallowed the error and returned null, letting workflows continue
+            // that official would fail.
+            let input = values.first().map(string_value).unwrap_or_default();
+            from_json_lenient(&input).map_err(ExpressionError::InvalidJson)
+        }
         "join" => join_args(&values, budget).map(Value::String),
         "hashfiles" => hash_files(&values, context).map(Value::String),
         "tojson" => Ok(Value::String(
@@ -437,12 +561,221 @@ fn eval_call(
 
 fn contains(haystack: &Value, needle: &Value) -> bool {
     match haystack {
-        Value::String(value) => value
-            .to_ascii_lowercase()
-            .contains(&string_value(needle).to_ascii_lowercase()),
+        // Unicode-aware case-insensitive contains (official: OrdinalIgnoreCase).
+        Value::String(value) => contains_ordinal_ignore_case(value, &string_value(needle)),
         Value::Array(values) => values.iter().any(|value| abstract_equal(value, needle)),
         _ => false,
     }
+}
+
+/// Parse JSON the way the official runner's `fromJSON` does.
+///
+/// The official implementation reads through Newtonsoft's `JsonTextReader`,
+/// which accepts two extensions over strict JSON: single-quoted strings
+/// (including property names) and trailing commas before `}`/`]`. Try strict
+/// parsing first; only when that fails, normalize those two extensions and
+/// retry. Anything else is still an error — unlike JSON5 we do not accept
+/// unquoted keys, comments, hex numbers, or `NaN`/`Infinity`.
+fn from_json_lenient(input: &str) -> Result<Value, String> {
+    match serde_json::from_str(input) {
+        Ok(value) => Ok(value),
+        Err(strict_error) => {
+            if let Some(normalized) = normalize_newtonsoft_json(input) {
+                if let Ok(value) = serde_json::from_str(&normalized) {
+                    return Ok(value);
+                }
+            }
+            Err(strict_error.to_string())
+        }
+    }
+}
+
+/// Rewrite the Newtonsoft `JsonTextReader` extensions into strict JSON:
+/// single-quoted strings become double-quoted, comments are removed, and
+/// trailing commas before `}`/`]` are dropped only after a value. Returns
+/// `None` when the input needed no rewriting, or when it contains an
+/// unterminated block comment.
+fn normalize_newtonsoft_json(input: &str) -> Option<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut containers: Vec<char> = Vec::new();
+    let mut previous_was_value = false;
+    let mut changed = false;
+    let mut index = 0;
+
+    // Find the next non-whitespace, non-comment character without consuming
+    // the original input. This lets comma handling distinguish `[1,]` from
+    // `[,]` and still recognize comments between a value and its closer.
+    let next_non_comment_character = |mut index: usize| -> Option<char> {
+        loop {
+            while chars
+                .get(index)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                index += 1;
+            }
+            match chars.get(index).copied() {
+                Some('/') if chars.get(index + 1) == Some(&'/') => {
+                    index += 2;
+                    while chars.get(index).is_some_and(|character| *character != '\n') {
+                        index += 1;
+                    }
+                }
+                Some('/') if chars.get(index + 1) == Some(&'*') => {
+                    index += 2;
+                    let mut closed = false;
+                    while index + 1 < chars.len() {
+                        if chars[index] == '*' && chars[index + 1] == '/' {
+                            index += 2;
+                            closed = true;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    if !closed {
+                        return None;
+                    }
+                }
+                Some(character) => return Some(character),
+                None => return None,
+            }
+        }
+    };
+
+    while index < chars.len() {
+        match chars[index] {
+            '"' => {
+                // Copy double-quoted strings verbatim (escapes included) so
+                // quotes and comment markers inside them stay data.
+                out.push('"');
+                index += 1;
+                let mut escaped = false;
+                while index < chars.len() {
+                    let character = chars[index];
+                    out.push(character);
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == '"' {
+                        break;
+                    }
+                }
+                previous_was_value = true;
+            }
+            '\'' => {
+                // Single-quoted string -> double-quoted string.
+                changed = true;
+                out.push('"');
+                index += 1;
+                let mut escaped = false;
+                while index < chars.len() {
+                    let character = chars[index];
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                        match character {
+                            '\'' => out.push('\''),
+                            '"' => out.push_str("\\\""),
+                            _ => {
+                                out.push('\\');
+                                out.push(character);
+                            }
+                        }
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == '\'' {
+                        out.push('"');
+                        break;
+                    } else if character == '"' {
+                        out.push_str("\\\"");
+                    } else {
+                        out.push(character);
+                    }
+                }
+                previous_was_value = true;
+            }
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                // Newtonsoft accepts both line and block comments. Replace
+                // comments with whitespace so adjacent tokens do not merge;
+                // preserve the line ending for line-comment formatting.
+                changed = true;
+                out.push(' ');
+                index += 2;
+                while chars.get(index).is_some_and(|character| *character != '\n') {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                changed = true;
+                out.push(' ');
+                index += 2;
+                let mut closed = false;
+                while index + 1 < chars.len() {
+                    if chars[index] == '*' && chars[index + 1] == '/' {
+                        index += 2;
+                        closed = true;
+                        break;
+                    }
+                    index += 1;
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            ',' => {
+                let trailing = matches!(
+                    (
+                        containers.last().copied(),
+                        next_non_comment_character(index + 1),
+                    ),
+                    (Some('{'), Some('}')) | (Some('['), Some(']'))
+                );
+                if previous_was_value && trailing {
+                    changed = true;
+                } else {
+                    out.push(',');
+                    previous_was_value = false;
+                }
+                index += 1;
+            }
+            '{' | '[' => {
+                let opener = chars[index];
+                containers.push(opener);
+                out.push(opener);
+                previous_was_value = false;
+                index += 1;
+            }
+            '}' | ']' => {
+                let closer = chars[index];
+                let opener = if closer == '}' { '{' } else { '[' };
+                if containers.last().copied() == Some(opener) {
+                    containers.pop();
+                }
+                out.push(closer);
+                previous_was_value = true;
+                index += 1;
+            }
+            ':' => {
+                out.push(':');
+                previous_was_value = false;
+                index += 1;
+            }
+            character if character.is_whitespace() => {
+                out.push(character);
+                index += 1;
+            }
+            character => {
+                // Numbers, literals, and invalid bare tokens are validated by
+                // the strict serde_json retry after normalization.
+                out.push(character);
+                previous_was_value = true;
+                index += 1;
+            }
+        }
+    }
+    changed.then_some(out)
 }
 
 fn string_arg(values: &[Value], index: usize) -> String {
@@ -669,17 +1002,57 @@ fn push_evaluation_capped(
     Ok(())
 }
 
+/// Confirm an opened handle still resolves under the workspace root.
+///
+/// Canonicalization gates the entry *before* open; a swapped alias, target,
+/// or parent directory in between would redirect a path-based open outside
+/// the root. Resolving `/proc/self/fd` reports the kernel's path for the
+/// handle itself, so verify-then-read shares one handle with no window.
+/// A `(deleted)` suffix (replaced entry) fails the prefix check, which is
+/// the safe direction. Non-Linux targets keep the pre-open gate only.
+#[cfg(target_os = "linux")]
+pub(crate) fn handle_under_root(file: &std::fs::File, workspace_root: &std::path::Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+    std::fs::read_link(fd_path)
+        .map(|p| p.starts_with(workspace_root))
+        .unwrap_or(false)
+}
+
 /// Implementation of `hashFiles(pattern, ...)` (F027).
 ///
 /// Globs each argument pattern relative to `context.workspace_dir`, collects
 /// all matching file paths (sorted), SHA-256 hashes each file, then
 /// SHA-256 hashes the concatenated hex digests. Returns `""` on no match.
 ///
+/// R1-7: every match is confined to the workspace. Absolute patterns and
+/// parent traversal are rejected outright via platform-native components
+/// (so Unix `/`/`..` and Windows `..\`, `C:\`, `\` all fail loudly rather
+/// than becoming a file-content oracle like `hashFiles('/etc/passwd')`),
+/// each candidate is canonicalized and required to stay under the canonical
+/// workspace root (so escaping symlinks are skipped), opened handles are
+/// re-verified against the root on Linux (no check-to-open window), and the
+/// visited entries, hashed files, and total input bytes are capped. Files
+/// are streamed through the hasher instead of being `fs::read` into memory
+/// whole.
+///
 /// F055: Supports `--follow-symbolic-links` as an optional first argument.
 /// When set, symbolic links are followed during file enumeration.
 /// Matches official `HashFilesFunction.cs:44-51`.
 fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionError> {
     use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+
+    /// Maximum files hashed per `hashFiles()` call. Bounds enumeration cost
+    /// of adversarial patterns like `**/*`.
+    const MAX_FILES: usize = 10_000;
+    /// Maximum entries visited while expanding patterns per `hashFiles()`
+    /// call. The file cap only bounds retained matches; a tree with
+    /// hundreds of thousands of entries would otherwise burn traversal
+    /// cost without ever tripping it.
+    const MAX_VISITED: usize = 100_000;
+    /// Maximum total bytes hashed per `hashFiles()` call (100 MiB).
+    const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
     let workspace = match &context.workspace_dir {
         Some(dir) => dir.as_str(),
@@ -709,35 +1082,89 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         patterns.push(s);
     }
 
-    let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+    // R1-7: dedup by matched path (overlapping patterns must not trip the
+    // file cap with duplicates) and bound the retained set so adversarial
+    // globs like `**/*` cannot grow it without limit. Canonicalization is
+    // only the confinement check — hashing/sorting keep the matched path so
+    // symlink aliases matching the same target hash per match like official.
+    let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+
+    // R1-7: canonical workspace root for the confinement check below. If the
+    // workspace itself cannot be canonicalized there is nothing safe to
+    // match, so return "" like the no-workspace case.
+    let workspace_root = match std::fs::canonicalize(workspace) {
+        Ok(root) => root,
+        Err(_) => return Ok(String::new()),
+    };
+
+    // Total glob entries pulled across all patterns; bounds traversal work
+    // even when few entries are retained.
+    let mut visited = 0usize;
+
     for pattern in &patterns {
-        // Make pattern relative to workspace
-        let abs_pattern = if std::path::Path::new(pattern).is_absolute() {
-            pattern.clone()
-        } else {
-            format!("{workspace}/{pattern}")
-        };
+        // R1-7: reject absolute patterns and `..` traversal outright.
+        // Silently remapping `/etc/passwd` to a workspace-relative path, or
+        // skipping escaping `../` matches, would hide attacker intent and
+        // turn hashFiles() into a quiet file-content oracle. Fail loudly.
+        // Platform-native components so Windows `..\`, `C:\`, `\` forms are
+        // rejected on Windows (on Unix they are literal filenames).
+        let disallowed = std::path::Path::new(pattern).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if disallowed {
+            return Err(ExpressionError::HashFilesDisallowedPattern(pattern.clone()));
+        }
+        let abs_pattern = format!("{workspace}/{pattern}");
         match glob::glob(&abs_pattern) {
             Ok(entries) => {
                 for entry in entries.flatten() {
-                    // F055: When follow_symlinks is true, also include symlinks
-                    // that point to regular files. `is_file()` already follows
-                    // symlinks via `fs::metadata`, so both paths include targets
-                    // of symlinks. The distinction matters for broken symlinks:
-                    // `is_file()` returns false for dangling symlinks but
-                    // `symlink_metadata().is_symlink()` would be true. We match
-                    // the official behavior which uses the globber's follow mode
-                    // (broken symlinks are silently skipped either way).
-                    if entry.is_file() {
-                        all_paths.push(entry);
-                    } else if follow_symlinks
-                        && entry
-                            .symlink_metadata()
-                            .map(|m| m.is_symlink())
-                            .unwrap_or(false)
-                    {
-                        // Broken symlink with follow mode — skip (matches official)
+                    visited += 1;
+                    if visited > MAX_VISITED {
+                        return Err(ExpressionError::HashFilesTraversalLimit(MAX_VISITED));
+                    }
+                    // Use symlink_metadata so symlinks are not followed
+                    // implicitly here; following is decided below.
+                    let metadata = match entry.symlink_metadata() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if metadata.file_type().is_symlink() {
+                        // F055: without --follow-symbolic-links, symlinks are
+                        // never followed.
+                        if !follow_symlinks {
+                            continue;
+                        }
+                        // With follow mode the target is resolved below and
+                        // must be a regular file under the workspace.
+                    } else if !metadata.is_file() {
                         continue;
+                    }
+                    // Canonicalize (resolves symlinks and `..`) and require
+                    // the result to stay under the workspace root; anything
+                    // escaping the workspace is skipped. The canonical path
+                    // is only the confinement check: the matched `entry` is
+                    // what gets hashed, so symlink aliases to the same target
+                    // stay distinct matches like official path-based hashing.
+                    let canonical = match std::fs::canonicalize(&entry) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if !canonical.starts_with(&workspace_root) {
+                        continue;
+                    }
+                    // A symlink to a directory must not contribute an empty
+                    // hash in follow mode.
+                    if !canonical.is_file() {
+                        continue;
+                    }
+                    if seen_paths.insert(entry) && seen_paths.len() > MAX_FILES {
+                        return Err(ExpressionError::HashFilesTooManyFiles(MAX_FILES));
                     }
                 }
             }
@@ -745,24 +1172,49 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         }
     }
 
-    if all_paths.is_empty() {
+    if seen_paths.is_empty() {
         return Ok(String::new());
     }
 
+    let mut all_paths: Vec<std::path::PathBuf> = seen_paths.into_iter().collect();
     all_paths.sort();
 
     // Hash each file's bytes; concatenate raw 32-byte binary digests (NOT hex strings).
     // Official hashFiles.ts:29-35 feeds binary digest bytes directly into the outer SHA-256.
     // Concatenating hex-string representations produces a completely different key.
+    //
+    // R1-7: stream each file through the hasher instead of fs::read()-ing it
+    // whole, enforcing the total byte budget so one huge match cannot OOM
+    // the evaluator.
     let mut combined: Vec<u8> = Vec::new();
+    let mut total_bytes: u64 = 0;
     for path in &all_paths {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let digest = Sha256::digest(&bytes);
-                combined.extend_from_slice(&digest);
-            }
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(_) => continue,
+        };
+        // The entry was canonicalized and confinement-checked before open;
+        // re-verify the OPEN handle so an alias, target, or parent swapped
+        // in between cannot redirect hashing outside the workspace. The
+        // verify-then-use pair shares one handle, leaving no window.
+        #[cfg(target_os = "linux")]
+        if !handle_under_root(&file, &workspace_root) {
+            continue;
         }
+        let budget = MAX_TOTAL_BYTES.saturating_sub(total_bytes);
+        // Read one byte past the remaining budget so an over-budget file is
+        // reported instead of silently truncated.
+        let mut limited = file.take(budget.saturating_add(1));
+        let mut hasher = Sha256::new();
+        let hashed = match std::io::copy(&mut limited, &mut hasher) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if hashed > budget {
+            return Err(ExpressionError::HashFilesTooLarge(MAX_TOTAL_BYTES));
+        }
+        total_bytes += hashed;
+        combined.extend_from_slice(&hasher.finalize());
     }
 
     if combined.is_empty() {

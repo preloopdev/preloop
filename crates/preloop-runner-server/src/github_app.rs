@@ -285,27 +285,64 @@ impl GitHubApps {
         &self.apps[self.default_index]
     }
 
-    /// Every webhook secret registered across the registry, plus the legacy
-    /// `AppState::webhook_secret`, deduplicated.
-    pub(crate) fn webhook_secrets(&self, legacy: Option<&str>) -> Vec<String> {
-        let mut secrets: Vec<String> = Vec::new();
-        if let Some(legacy) = legacy {
-            // An empty secret makes `X-Hub-Signature-256` verification pass
-            // for the empty key — forgeable by anyone — so blank values are
-            // never registered.
-            if !legacy.is_empty() {
-                secrets.push(legacy.to_owned());
-            }
+    /// The registered App with this id, if any.
+    ///
+    /// `WebhookSigner` carries only an App id so a webhook delivery never
+    /// clones App key material; the binding step resolves the credentials
+    /// here.
+    pub(crate) fn app_by_id(&self, app_id: &str) -> Option<&GitHubAppCredentials> {
+        self.apps.iter().find(|app| app.app_id == app_id)
+    }
+
+    /// Every registered webhook secret paired with the signer it belongs
+    /// to (M3). Each App's secret maps to that App; the legacy
+    /// `AppState::webhook_secret` (if set) maps to [`WebhookSigner::Legacy`].
+    /// Deduplicated: a secret equal to the legacy secret is attributed to
+    /// the legacy signer, since it is not uniquely the App's.
+    pub(crate) fn webhook_signers(&self, legacy: Option<&str>) -> Vec<(String, WebhookSigner)> {
+        let mut signers: Vec<(String, WebhookSigner)> = Vec::new();
+        // An empty secret makes `X-Hub-Signature-256` verification pass
+        // for the empty key — forgeable by anyone — so blank values are
+        // never registered.
+        if let Some(legacy) = legacy.filter(|secret| !secret.is_empty()) {
+            signers.push((legacy.to_owned(), WebhookSigner::Legacy));
         }
         for app in &self.apps {
             if let Some(secret) = &app.webhook_secret {
-                if !secret.is_empty() && !secrets.iter().any(|have| have == secret) {
-                    secrets.push(secret.clone());
+                if !secret.is_empty() && !signers.iter().any(|(have, _)| have == secret) {
+                    signers.push((secret.clone(), WebhookSigner::App(app.app_id.clone())));
                 }
             }
         }
-        secrets
+        signers
     }
+}
+
+/// Identity of the credential that verified a webhook payload's signature
+/// (M3). The signature alone only proves *some* registered credential sent
+/// the payload; the signer binds the claimed repository to the sender's
+/// installation coverage before any event is processed.
+///
+/// `Debug` is safe to derive now that the `App` variant carries only an id:
+/// the credentials (App private key, PAT fallback, webhook secret) stay in the
+/// registry and never enter a webhook request's memory more than the registry
+/// itself already holds them.
+#[derive(Clone, Debug)]
+pub(crate) enum WebhookSigner {
+    /// App id of the registered GitHub App whose webhook secret verified the
+    /// payload. The claimed repository must lie within this App's
+    /// installation coverage.
+    ///
+    /// The id, not the credentials: `GitHubAppCredentials` owns the App
+    /// private key, a PAT fallback, and the webhook secret, so carrying them
+    /// here would deep-copy key material on every delivery. The binding step
+    /// resolves them with [`GitHubApps::app_by_id`]. Because no secret is
+    /// held, `Debug` is safe to derive.
+    App(String),
+    /// The legacy single `webhook_secret`: no App identity, no binding —
+    /// with no registry there is no cross-App confusion, and a legacy
+    /// secret alongside a registry is the operator's own credential.
+    Legacy,
 }
 
 /// One minted installation token, as recorded in [`MintLedger`].
@@ -617,6 +654,73 @@ pub(crate) async fn candidate_apps_for_repo(
         );
     }
     candidates
+}
+
+/// Whether `app`'s installation covers the exact `repository` (M3).
+///
+/// `GET /repos/{owner}/{repo}/installation` authenticated with the App's JWT
+/// returns the installation of *that App* on *that repository*, or 404 when
+/// the App is not installed there. Owner-granularity checks
+/// ([`installation_id_for`]/[`candidate_apps_for_repo`]) are insufficient
+/// for webhook signer binding: a selected-repository installation on owner
+/// `acme` covering only `acme/repo1` still passes an owner check for
+/// `acme/repo2`, letting a payload signed by that App's secret claim a
+/// repository outside its installation.
+///
+/// Fail-closed: any transport error, unexpected status, or app-id mismatch
+/// returns false (the caller rejects with 403). Webhook deliveries are
+/// low-volume relative to App rate limits, so this lookup is not cached; the
+/// owner-granularity installation id it complements stays cached per App.
+pub(crate) async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str) -> bool {
+    let (owner, repo) = match split_repository(repository) {
+        Ok(parts) => parts,
+        Err(_) => return false,
+    };
+    let api_base = api_base();
+    let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
+        Ok(jwt) => jwt,
+        Err(_) => return false,
+    };
+    let url = format!("{api_base}/repos/{owner}/{repo}/installation");
+    let response = match CLIENT
+        .get(&url)
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(app_id = %app.app_id, repository = %repository, ?error, "M3: repository installation lookup failed");
+            return false;
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return false;
+    }
+    if !response.status().is_success() {
+        warn!(app_id = %app.app_id, repository = %repository, status = %response.status(), "M3: repository installation lookup returned unexpected status");
+        return false;
+    }
+    let body: serde_json::Value = match response.json().await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(app_id = %app.app_id, repository = %repository, ?error, "M3: cannot parse repository installation response");
+            return false;
+        }
+    };
+    // Defense in depth: App-JWT auth already scopes GitHub's response to
+    // the calling App, but verify the app id matches anyway.
+    let covers = body
+        .get("app_id")
+        .and_then(serde_json::Value::as_u64)
+        .map(|id| id.to_string() == app.app_id)
+        .unwrap_or(false);
+    if !covers {
+        warn!(app_id = %app.app_id, repository = %repository, "M3: repository installation belongs to a different App");
+    }
+    covers
 }
 
 /// Select the App whose installation covers `repository`'s owner (D6).

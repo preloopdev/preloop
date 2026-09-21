@@ -34,12 +34,18 @@ pub(crate) fn authorize_reporting_request(
         return Ok(());
     }
 
+    // Authenticate before authorizing: a token that fails verification is a
+    // 401 regardless of whether the target resolves; only a verified token
+    // that names a different job earns the 403.
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
     let Some(request) = request else {
         return Err(ApiError::forbidden(
             "job runtime token cannot resolve the reporting target",
         ));
     };
-    let authorized = state.verify_local_jwt_claims(token).is_some_and(|claims| {
+    let authorized = {
         let subject_job = claims
             .get("sub")
             .and_then(|value| value.as_str())
@@ -55,7 +61,7 @@ pub(crate) fn authorize_reporting_request(
                     "Actions.Results:{}:{}",
                     request.plan_id, request.agent_job_id
                 )
-    });
+    };
     if authorized {
         Ok(())
     } else {
@@ -89,6 +95,13 @@ pub(crate) async fn require_results_bearer(
         }
         return Ok(next.run(request).await);
     }
+    if path.starts_with("/twirp-blob/") {
+        // R1-2: this route used to fall through the `!/twirp/` check below
+        // with zero authentication, and blob_put/blob_get joined the raw
+        // segments into the filesystem. The gate now owns both problems.
+        let path = path.to_owned();
+        return authorize_blob_request(&shared.state, path, request, next).await;
+    }
     if !path.starts_with("/twirp/") {
         return Ok(next.run(request).await);
     }
@@ -102,6 +115,134 @@ pub(crate) async fn require_results_bearer(
     // re-parsing a bearer string independently.
     request.extensions_mut().insert(identity);
     Ok(next.run(request).await)
+}
+
+/// Authorize `/twirp-blob/{kind}/{token}` requests (R1-2).
+///
+/// The blob endpoints are bearerless by protocol design — the Azure SDK in
+/// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
+/// without attaching the job bearer — so the gate cannot simply require a
+/// bearer without breaking wire compatibility with the official toolkit.
+/// Instead it enforces three properties:
+///   1. the kind is allowlisted and the token is decode-then-validated, so no
+///      request can address outside `<state_dir>/blobs/{kind}/`;
+///   2. the token must be a server-signed blob JWT (`sub: preloop-blob`,
+///      `kind` matching the path) — arbitrary tokens address nothing, which
+///      kills the unauthenticated PUT-to-anything repro, and minted URLs
+///      survive engine restarts since validity is the signature, not a
+///      registration map;
+///   3. writes require the owning job to still be live: the JWT's `job`
+///      claim names the owner recorded at mint time, so a completed job's
+///      upload URL stops working immediately instead of at TTL sweep. A
+///      presented bearer is verified and must match the `job` claim.
+///
+/// Reads stay bearer-optional — the unguessable, server-minted URL is the
+/// credential, the same SAS-style model as `/replay/results/*` — because the
+/// download clients are equally bearerless.
+async fn authorize_blob_request(
+    state: &AppState,
+    path: String,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some((kind, token)) = crate::blob_store::parse_blob_path(&path) else {
+        return Err(ApiError::bad_request("invalid blob path"));
+    };
+    let is_write = request.method() == axum::http::Method::PUT;
+
+    // The signed token is the credential: `job` is the owner recorded at
+    // mint time ("" = minted via the system credential).
+    let Some(claims) = crate::blob_store::verify_blob_token(state, &kind, &token) else {
+        return Err(ApiError::not_found("blob not found"));
+    };
+    let owner = crate::blob_store::blob_token_job(&claims).unwrap_or_default();
+
+    match bearer_from_headers(request.headers()) {
+        Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
+        Some(bearer) => {
+            let job_id = match results_identity(state, bearer) {
+                Ok(ResultsIdentity::Job(identity)) => identity.job_id.to_string(),
+                _ => return Err(ApiError::unauthorized("results-service job token required")),
+            };
+            if is_write {
+                if !owner.is_empty() && owner == job_id {
+                    Ok(next.run(request).await)
+                } else {
+                    Err(ApiError::forbidden("blob token is not owned by this job"))
+                }
+            } else {
+                Ok(next.run(request).await)
+            }
+        }
+        // Bearerless Azure-SDK-style flow: the unguessable, server-minted URL
+        // is the credential. Writes additionally require the owning job to be
+        // live — a completed job's minted URL must not keep accepting data.
+        None => {
+            if is_write && !owner.is_empty() {
+                let job_uuid = owner
+                    .parse::<uuid::Uuid>()
+                    .map_err(|_| ApiError::forbidden("blob token owner is not a job"))?;
+                require_live_job(state, job_uuid).await?;
+            }
+            Ok(next.run(request).await)
+        }
+    }
+}
+
+/// R1-10: require the calling job to be live before a Results write.
+///
+/// Resolves the job's request record and rejects when the job is unknown
+/// (purged) or has settled/projected to a terminal status — the stale
+/// credential replay window. The system identity (engine) bypasses: it
+/// manages the lifecycle itself. Reads are unaffected; each handler decides
+/// whether it is a write.
+pub(crate) async fn require_live_results_job(
+    state: &AppState,
+    identity: &ResultsIdentity,
+) -> Result<(), ApiError> {
+    let job_uuid = match identity {
+        ResultsIdentity::Job(job) => job.job_id,
+        ResultsIdentity::System => return Ok(()),
+    };
+    require_live_job(state, job_uuid).await
+}
+
+/// Liveness predicate on the already-locked inner state — the in-lock
+/// re-check for handlers that mutate `inner`. Checking under a released
+/// lock leaves a check-then-mutate window where the job settles between
+/// the gate and the write; callers that hold `inner` should re-verify with
+/// this before committing the mutation.
+pub(crate) fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
+    inner
+        .agent_job_requests
+        .get(&job_uuid)
+        .copied()
+        .and_then(|request_id| inner.job_requests.get(&request_id))
+        .is_some_and(|record| !matches!(record.result, Some(status) if status.is_terminal()))
+}
+
+/// R1-10: require a job UUID to be live before a write, for handlers that
+/// authenticate from headers rather than a typed [`ResultsIdentity`]
+/// (the legacy `/_apis/artifactcache` cache write path). Same rule as
+/// [`require_live_results_job`]: the system identity bypasses, so callers
+/// must skip this helper for the system bearer themselves.
+pub(crate) async fn require_live_job(
+    state: &AppState,
+    job_uuid: uuid::Uuid,
+) -> Result<(), ApiError> {
+    let inner = state.inner.lock().await;
+    // Liveness follows the request record, not the projected run status:
+    // cancellation projects `run.jobs` to Cancelled immediately while the
+    // request stays unsettled until the runner finishes reporting — the
+    // window where its final step updates, logs, and uploads must still
+    // land. Only a settled (or purged) request is stale.
+    if job_is_live_locked(&inner, job_uuid) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ))
+    }
 }
 
 pub(crate) async fn require_test_api_token(

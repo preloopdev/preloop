@@ -18,6 +18,7 @@ use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
     WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -840,15 +841,25 @@ impl Envelope {
         }
     }
 
-    /// AES-256-CBC + HMAC-SHA256 over the migration domain, IV, and
-    /// ciphertext. Returns `(ciphertext, iv, tag)`.
+    /// AES-256-CBC + HMAC-SHA256 over the migration domain, associated data,
+    /// IV, and ciphertext. Returns `(ciphertext, iv, tag)`.
     pub(crate) fn encrypt_sealed(&self, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        self.encrypt_sealed_with_associated_data(plaintext, &[])
+    }
+
+    /// Encrypt and authenticate a blob with caller-provided associated data.
+    pub(crate) fn encrypt_sealed_with_associated_data(
+        &self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let cipher = SessionEncryption::from_key(self.aead.to_vec());
         let (ciphertext, iv) = cipher
             .encrypt(plaintext)
             .expect("AES-256-CBC encrypt is infallible for in-spec inputs");
         let mut mac = HmacSha256::new_from_slice(&self.mac).expect("HMAC accepts any key length");
         mac.update(MIGRATION_DOMAIN);
+        mac.update(associated_data);
         mac.update(&iv);
         mac.update(&ciphertext);
         (ciphertext, iv, mac.finalize().into_bytes().to_vec())
@@ -861,20 +872,42 @@ impl Envelope {
         iv: &[u8],
         tag: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        self.decrypt_sealed_with_associated_data(ciphertext, iv, tag, &[])
+    }
+
+    /// Verify and decrypt a blob with caller-provided associated data.
+    pub(crate) fn decrypt_sealed_with_associated_data(
+        &self,
+        ciphertext: &[u8],
+        iv: &[u8],
+        tag: &[u8],
+        associated_data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let mut mac = HmacSha256::new_from_slice(&self.mac).expect("HMAC accepts any key length");
         mac.update(MIGRATION_DOMAIN);
+        mac.update(associated_data);
         mac.update(iv);
         mac.update(ciphertext);
         mac.verify_slice(tag)
-            .map_err(|_| anyhow::anyhow!("store session-key envelope authentication failed"))?;
+            .map_err(|_| anyhow::anyhow!("store envelope authentication failed"))?;
         SessionEncryption::from_key(self.aead.to_vec())
             .decrypt(ciphertext, iv)
-            .map_err(|error| anyhow::anyhow!("store session-key decryption failed: {error}"))
+            .map_err(|error| anyhow::anyhow!("store envelope decryption failed: {error}"))
     }
 
     /// Seal a plaintext blob: `version || iv || ciphertext || tag`.
     pub(crate) fn seal(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let (ciphertext, iv, tag) = self.encrypt_sealed(plaintext);
+        self.seal_with_associated_data(plaintext, &[])
+    }
+
+    /// Seal a plaintext blob bound to associated data.
+    pub(crate) fn seal_with_associated_data(
+        &self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let (ciphertext, iv, tag) =
+            self.encrypt_sealed_with_associated_data(plaintext, associated_data);
         let mut sealed = Vec::with_capacity(1 + iv.len() + ciphertext.len() + tag.len());
         sealed.push(SNAPSHOT_FORMAT);
         sealed.extend_from_slice(&iv);
@@ -886,6 +919,15 @@ impl Envelope {
     /// Unseal a blob written by [`Envelope::seal`]. Rejects foreign envelope
     /// versions (v1 used a different, unauthenticated scheme).
     pub(crate) fn unseal(&self, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.unseal_with_associated_data(sealed, &[])
+    }
+
+    /// Unseal a blob and require the supplied associated data.
+    pub(crate) fn unseal_with_associated_data(
+        &self,
+        sealed: &[u8],
+        associated_data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(sealed.len() >= 1 + 16 + 32, "invalid store envelope");
         let version = sealed[0];
         if version != SNAPSHOT_FORMAT {
@@ -902,8 +944,120 @@ impl Envelope {
         let tag_start = sealed.len() - 32;
         let ciphertext = &sealed[17..tag_start];
         let tag = &sealed[tag_start..];
-        self.decrypt_sealed(ciphertext, iv, tag)
+        self.decrypt_sealed_with_associated_data(ciphertext, iv, tag, associated_data)
     }
+}
+
+const MESSAGE_PAYLOAD_AAD_DOMAIN: &str = "preloop-message-payload-aad-v1";
+
+/// The encoding found in a persisted broker/job-request payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessagePayloadEncoding {
+    Bound,
+    LegacySealed,
+    LegacyPlaintext,
+}
+
+/// Canonical associated data for a payload row. The table/type and every row
+/// identity are authenticated, so copying a valid ciphertext to another row
+/// cannot make it execute in the wrong broker context.
+pub(crate) fn message_payload_aad(
+    table: &str,
+    payload_type: &str,
+    session_id: Option<&str>,
+    message_id: Option<i64>,
+    request_id: Option<i64>,
+) -> Vec<u8> {
+    serde_json::to_vec(&(
+        MESSAGE_PAYLOAD_AAD_DOMAIN,
+        table,
+        payload_type,
+        session_id,
+        message_id,
+        request_id,
+    ))
+    .expect("message payload AAD tuple is serializable")
+}
+
+pub(crate) fn broker_message_payload_aad(session_id: &str, message_id: i64) -> Vec<u8> {
+    message_payload_aad(
+        "broker_messages",
+        "TaskAgentMessage",
+        Some(session_id),
+        Some(message_id),
+        None,
+    )
+}
+
+pub(crate) fn job_request_message_payload_aad(request_id: i64) -> Vec<u8> {
+    message_payload_aad(
+        "job_request_messages",
+        "AgentJobRequestMessage",
+        None,
+        None,
+        Some(request_id),
+    )
+}
+
+/// Seal a broker/job-request message payload for its specific row.
+pub(crate) fn seal_message_payload<T: serde::Serialize>(
+    cipher: &Envelope,
+    value: &T,
+    associated_data: &[u8],
+) -> anyhow::Result<String> {
+    let sealed = cipher.seal_with_associated_data(&serde_json::to_vec(value)?, associated_data)?;
+    Ok(serde_json::to_string(&BASE64_STANDARD.encode(&sealed))?)
+}
+
+/// Decode a payload for the one-time migration. Current rows are bound to
+/// `associated_data`; rows from the first sealing implementation used an
+/// authenticated but unbound envelope; older rows were plaintext JSON.
+pub(crate) fn decode_message_payload<T: serde::de::DeserializeOwned>(
+    cipher: &Envelope,
+    raw: &str,
+    associated_data: &[u8],
+) -> anyhow::Result<(T, MessagePayloadEncoding)> {
+    let parsed: serde_json::Value = serde_json::from_str(raw)?;
+    match parsed {
+        serde_json::Value::String(encoded) => {
+            let sealed = BASE64_STANDARD
+                .decode(&encoded)
+                .context("sealed message payload is not valid base64")?;
+            let (plaintext, encoding) = match cipher
+                .unseal_with_associated_data(&sealed, associated_data)
+            {
+                Ok(plaintext) => (plaintext, MessagePayloadEncoding::Bound),
+                Err(bound_error) => {
+                    let plaintext = cipher.unseal(&sealed).with_context(|| {
+                            format!(
+                                "sealed message payload is neither bound nor legacy-authenticated: {bound_error}"
+                            )
+                        })?;
+                    (plaintext, MessagePayloadEncoding::LegacySealed)
+                }
+            };
+            Ok((serde_json::from_slice(&plaintext)?, encoding))
+        }
+        value => Ok((
+            serde_json::from_value(value)?,
+            MessagePayloadEncoding::LegacyPlaintext,
+        )),
+    }
+}
+
+/// Read a current payload row. Legacy encodings are deliberately rejected
+/// here; startup migration must finish before normal restoration.
+pub(crate) fn unseal_message_payload<T: serde::de::DeserializeOwned>(
+    cipher: &Envelope,
+    raw: &str,
+    associated_data: &[u8],
+) -> anyhow::Result<T> {
+    let (value, encoding) = decode_message_payload(cipher, raw, associated_data)?;
+    anyhow::ensure!(
+        encoding == MessagePayloadEncoding::Bound,
+        "legacy message payload requires migration"
+    );
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1528,11 +1682,123 @@ impl SqliteStore {
             "#,
         )?;
         Self::migrate(&connection)?;
-        Ok(Self {
+        let store = Self {
             connection: Arc::new(StdMutex::new(connection)),
             cipher,
             checkpoint_counter: Arc::new(AtomicU64::new(0)),
-        })
+        };
+        store.migrate_legacy_message_payloads()?;
+        Ok(store)
+    }
+
+    /// Upgrade legacy plaintext/unbound message rows once, before normal
+    /// restoration starts. The marker is written only after the transaction
+    /// commits, so an interrupted migration retries safely on the next boot.
+    fn migrate_legacy_message_payloads(&self) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let completed: Option<i64> = connection
+            .query_row(
+                "SELECT completed_at_us FROM message_payload_migrations
+                 WHERE migration = ?1",
+                ["message-payloads-bound-v1"],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if completed.is_some() {
+            return Ok(());
+        }
+
+        let tx = connection.transaction()?;
+        let broker_rows: Vec<(String, i64, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT session_id, message_id, payload_json FROM broker_messages")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (session_id, message_id, payload_json) in broker_rows {
+            let associated_data = broker_message_payload_aad(&session_id, message_id);
+            match decode_message_payload::<azdo::TaskAgentMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
+                Ok((_, MessagePayloadEncoding::Bound)) => {}
+                Ok((message, _)) => {
+                    let migrated = seal_message_payload(&self.cipher, &message, &associated_data)?;
+                    tx.execute(
+                        "UPDATE broker_messages SET payload_json = ?1
+                         WHERE session_id = ?2 AND message_id = ?3",
+                        params![migrated, session_id, message_id],
+                    )?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id,
+                        message_id,
+                        %error,
+                        "dropping undecodable legacy broker message during migration"
+                    );
+                    tx.execute(
+                        "DELETE FROM broker_messages
+                         WHERE session_id = ?1 AND message_id = ?2",
+                        params![session_id, message_id],
+                    )?;
+                }
+            }
+        }
+
+        let job_request_rows: Vec<(i64, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT request_id, payload_json FROM job_request_messages")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (request_id, payload_json) in job_request_rows {
+            let associated_data = job_request_message_payload_aad(request_id);
+            match decode_message_payload::<azdo::AgentJobRequestMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
+                Ok((_, MessagePayloadEncoding::Bound)) => {}
+                Ok((message, _)) => {
+                    let migrated = seal_message_payload(&self.cipher, &message, &associated_data)?;
+                    tx.execute(
+                        "UPDATE job_request_messages SET payload_json = ?1
+                         WHERE request_id = ?2",
+                        params![migrated, request_id],
+                    )?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id,
+                        %error,
+                        "dropping undecodable legacy job request message during migration"
+                    );
+                    tx.execute(
+                        "DELETE FROM job_request_messages WHERE request_id = ?1",
+                        params![request_id],
+                    )?;
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO message_payload_migrations(migration, completed_at_us)
+             VALUES (?1, ?2)
+             ON CONFLICT(migration) DO NOTHING",
+            params!["message-payloads-bound-v1", now_us()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Post-commit WAL maintenance. Forces a truncating checkpoint only every
@@ -1617,11 +1883,29 @@ impl SqliteStore {
 
     pub(crate) fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
-        let mut run_stmt =
-            connection.prepare("SELECT record_blob FROM runs ORDER BY created_at_us")?;
-        let runs = run_stmt
+        // Restore every run still in flight plus the newest completed runs up
+        // to `MAX_COMPLETED_RUNS_RETAINED`. Loading the full history
+        // materializes a ~1 MiB RunRecord per row into heap forever (3203 runs
+        // ≈ 4.4 GiB observed); the durable table keeps everything, memory only
+        // needs live state plus recent history for the run APIs.
+        let mut run_stmt = connection.prepare(
+            "SELECT record_blob FROM runs WHERE completed_at_us IS NULL
+             ORDER BY created_at_us",
+        )?;
+        let mut runs = run_stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut completed_stmt = connection.prepare(
+            "SELECT record_blob FROM runs WHERE completed_at_us IS NOT NULL
+             ORDER BY created_at_us DESC LIMIT ?1",
+        )?;
+        let completed = completed_stmt
+            .query_map(
+                [crate::memory_caps::MAX_COMPLETED_RUNS_RETAINED as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        runs.extend(completed);
         for blob in runs {
             let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;
@@ -1650,6 +1934,13 @@ impl SqliteStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         for row in jobs {
+            // `jobs.run_id REFERENCES runs` — restoring a job for a run that
+            // `inner.runs` did not restore (evicted past the completed cap)
+            // makes the next `store_inner` snapshot violate the FK. Skip it;
+            // the durable row stays and live-run jobs are always present.
+            if !inner.runs.contains_key(&row.run_id) {
+                continue;
+            }
             let job: QueuedJob = serde_json::from_slice(&self.cipher.unseal(&row.payload)?)?;
             match row.queue_kind.as_str() {
                 "ready" => inner.queue.push_back(job),
@@ -1761,33 +2052,31 @@ impl SqliteStore {
                 .sessions
                 .insert(session.session_id.0.to_string(), session);
         }
-        // Restore `session_active_requests` so a restarted broker session
-        // knows which request it had claimed but not acked.
-        let mut sar_stmt = connection
-            .prepare("SELECT session_id, active_request_id FROM session_active_requests")?;
-        for row in sar_stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })? {
-            let (session_id, request_id) = row?;
-            inner.session_active_requests.insert(session_id, request_id);
-        }
         // Restore per-session broker message queues (dequeued but not yet
         // delivered to the runner) from the `broker_messages` table that
         // `store_inner` writes. `inner.broker_messages` (keyed by request_id)
         // is a separate map and comes back with the meta snapshot below.
-        let mut inflight_stmt = connection.prepare(
-            "SELECT session_id, message_id, payload_json FROM broker_messages
-             ORDER BY session_id, message_id",
-        )?;
-        for row in inflight_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })? {
-            let (session_id, message_id, payload_json) = row?;
-            match serde_json::from_str::<azdo::TaskAgentMessage>(&payload_json) {
+        let inflight_rows: Vec<(String, i64, String)> = {
+            let mut stmt = connection.prepare(
+                "SELECT session_id, message_id, payload_json FROM broker_messages
+                 ORDER BY session_id, message_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (session_id, message_id, payload_json) in inflight_rows {
+            let associated_data = broker_message_payload_aad(&session_id, message_id);
+            match unseal_message_payload::<azdo::TaskAgentMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
                 Ok(message) => {
                     inner
                         .inflight_messages
@@ -1797,25 +2086,42 @@ impl SqliteStore {
                 }
                 Err(error) => {
                     tracing::warn!(%session_id, message_id, %error, "dropping undecodable broker message");
+                    connection.execute(
+                        "DELETE FROM broker_messages
+                         WHERE session_id = ?1 AND message_id = ?2",
+                        params![session_id, message_id],
+                    )?;
                 }
             }
         }
         // Restore per-request job messages (request_id → message) from their
         // own table; `inner.broker_messages` is keyed by request_id and the
         // broker re-delivers from it after a restart.
-        let mut jrm_stmt = connection.prepare(
-            "SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id",
-        )?;
-        for row in jrm_stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (request_id, payload_json) = row?;
-            match serde_json::from_str::<azdo::AgentJobRequestMessage>(&payload_json) {
+        let job_request_rows: Vec<(i64, String)> = {
+            let mut stmt = connection.prepare(
+                "SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (request_id, payload_json) in job_request_rows {
+            let associated_data = job_request_message_payload_aad(request_id);
+            match unseal_message_payload::<azdo::AgentJobRequestMessage>(
+                &self.cipher,
+                &payload_json,
+                &associated_data,
+            ) {
                 Ok(message) => {
                     inner.broker_messages.insert(request_id, message);
                 }
                 Err(error) => {
                     tracing::warn!(request_id, %error, "dropping undecodable job request message");
+                    connection.execute(
+                        "DELETE FROM job_request_messages WHERE request_id = ?1",
+                        params![request_id],
+                    )?;
                 }
             }
         }
@@ -1826,6 +2132,16 @@ impl SqliteStore {
         })? {
             let (request_id, blob) = row?;
             let record = restore_request_snapshot(&self.cipher, &blob)?;
+            // `inner.runs` restores only in-flight runs plus the newest
+            // `MAX_COMPLETED_RUNS_RETAINED` completed ones; `job_requests`
+            // has `FOREIGN KEY (run_id) REFERENCES runs`, so restoring a
+            // request for an evicted run makes the next `store_inner`
+            // snapshot violate the constraint and every persist fails.
+            // Skip requests whose run is not in memory — the durable row
+            // stays, and a live run's requests are always present.
+            if !inner.runs.contains_key(&record.run_id) {
+                continue;
+            }
             inner
                 .inflight_requests
                 .insert(request_id, (record.run_id, record.job_id.clone()));
@@ -1839,6 +2155,23 @@ impl SqliteStore {
                 .timeline_requests
                 .insert(record.timeline_id, request_id);
             inner.job_requests.insert(request_id, record);
+        }
+        // Restore `session_active_requests` so a restarted broker session
+        // knows which request it had claimed but not acked.
+        let mut sar_stmt = connection
+            .prepare("SELECT session_id, active_request_id FROM session_active_requests")?;
+        for row in sar_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (session_id, request_id) = row?;
+            // `session_active_requests.active_request_id` references
+            // `job_requests(request_id)` — restoring a row for a request
+            // that `job_requests` did not restore (evicted run) makes the
+            // next `store_inner` snapshot violate the FK. Skip it.
+            if !inner.job_requests.contains_key(&request_id) {
+                continue;
+            }
+            inner.session_active_requests.insert(session_id, request_id);
         }
 
         if let Some(blob) = connection
@@ -1910,6 +2243,19 @@ impl SqliteStore {
                 tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
                 continue;
             };
+            // `job_steps.run_id REFERENCES runs` — restoring a step for a
+            // run that `inner.runs` did not restore (evicted past the
+            // completed cap) makes the next `store_inner` snapshot violate
+            // the FK. Map the attempt back to its run through
+            // `agent_job_requests` and skip if the run is not in memory.
+            let run_id = inner
+                .agent_job_requests
+                .get(&agent_job_id)
+                .and_then(|request_id| inner.job_requests.get(request_id))
+                .map(|record| record.run_id);
+            if run_id.is_none() || !inner.runs.contains_key(&run_id.unwrap()) {
+                continue;
+            }
             let name = match self.cipher.unseal(&name_blob) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(error) => {
@@ -1933,13 +2279,15 @@ impl SqliteStore {
                         "workflow" => crate::models::StepKind::Workflow,
                         _ => crate::models::StepKind::Synthetic,
                     },
-                    workflow_index: workflow_index.map(|index| index as usize),
-                    runner_number: runner_number.map(|number| number as u32),
+                    workflow_index: workflow_index.map(|value| value as usize),
+                    runner_number: runner_number.map(|value| value as u32),
                     context_name,
                     name,
                     conclusion,
-                    started_at: started_at_us.and_then(chrono::DateTime::from_timestamp_micros),
-                    finished_at: finished_at_us.and_then(chrono::DateTime::from_timestamp_micros),
+                    started_at: started_at_us
+                        .map(|us| chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()),
+                    finished_at: finished_at_us
+                        .map(|us| chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()),
                 });
         }
         // Log bytes live in their own table; rebuild the in-memory buffers
@@ -2470,7 +2818,8 @@ impl SqliteStore {
         }
         tx.execute("DELETE FROM broker_messages", [])?;
         for (session_id, message_id, payload) in inflight {
-            let payload_json = serde_json::to_string(payload)?;
+            let associated_data = broker_message_payload_aad(session_id, *message_id);
+            let payload_json = seal_message_payload(&self.cipher, payload, &associated_data)?;
             tx.execute(
                 "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us) VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, *message_id, payload_json, now_us()],
@@ -2478,7 +2827,8 @@ impl SqliteStore {
         }
         tx.execute("DELETE FROM job_request_messages", [])?;
         for (request_id, payload) in broker_request_messages {
-            let payload_json = serde_json::to_string(payload)?;
+            let associated_data = job_request_message_payload_aad(*request_id);
+            let payload_json = seal_message_payload(&self.cipher, payload, &associated_data)?;
             tx.execute(
                 "INSERT INTO job_request_messages(request_id, payload_json, written_at_us) VALUES (?1, ?2, ?3)",
                 params![*request_id, payload_json, now_us()],
@@ -3924,6 +4274,16 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         ALTER TABLE webhook_watchdog ADD COLUMN scan_cursor TEXT;
         "#,
     ),
+    (
+        12,
+        "message-payload-migration-marker",
+        r#"
+        CREATE TABLE IF NOT EXISTS message_payload_migrations (
+          migration TEXT PRIMARY KEY,
+          completed_at_us INTEGER NOT NULL
+        ) STRICT;
+        "#,
+    ),
 ];
 
 pub(crate) fn now_us() -> i64 {
@@ -4178,6 +4538,191 @@ mod tests {
         assert!(
             error.contains("predates the `job_steps.revision` column"),
             "the error must name the cause and the fix, got: {error}"
+        );
+    }
+
+    // --- R1-11: broker/job-request payloads sealed at rest ---
+
+    fn token_message() -> azdo::TaskAgentMessage {
+        azdo::TaskAgentMessage {
+            message_id: 7,
+            message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_string(),
+            // Mirrors what broker.rs persists: the SystemVssConnection
+            // authorization parameters, including the live AccessToken.
+            body: "SystemVssConnection AccessToken=live-runtime-token-abc123".to_string(),
+            iv: None,
+        }
+    }
+
+    /// New writes are sealed JSON strings bound to their table and row
+    /// identity: valid JSON, but the token is not recoverable from the row.
+    #[test]
+    fn broker_payloads_are_sealed_at_rest_and_row_bound() {
+        let cipher = Envelope::new(b"test-root-key");
+        let associated_data = broker_message_payload_aad("session-1", 7);
+        let sealed = seal_message_payload(&cipher, &token_message(), &associated_data).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&sealed).unwrap();
+        assert!(
+            parsed.is_string(),
+            "sealed payload must be a JSON string, got: {sealed}"
+        );
+        assert!(
+            !sealed.contains("live-runtime-token-abc123"),
+            "token recoverable from sealed row: {sealed}"
+        );
+        let back: azdo::TaskAgentMessage =
+            unseal_message_payload(&cipher, &sealed, &associated_data).unwrap();
+        assert_eq!(back.body, token_message().body);
+        assert_eq!(back.message_id, 7);
+        let wrong_row = broker_message_payload_aad("session-2", 7);
+        assert!(
+            unseal_message_payload::<azdo::TaskAgentMessage>(&cipher, &sealed, &wrong_row).is_err(),
+            "payload copied to another session must fail authentication"
+        );
+    }
+
+    /// Legacy rows are migration input, not a normal restoration format.
+    #[test]
+    fn broker_payloads_reject_legacy_plaintext_without_migration() {
+        let cipher = Envelope::new(b"test-root-key");
+        let associated_data = broker_message_payload_aad("session-1", 7);
+        let legacy = serde_json::to_string(&token_message()).unwrap();
+        assert!(legacy.contains("live-runtime-token-abc123"));
+        assert!(unseal_message_payload::<azdo::TaskAgentMessage>(
+            &cipher,
+            &legacy,
+            &associated_data
+        )
+        .is_err());
+    }
+
+    /// A sealed row under the wrong host key fails closed — the HMAC rejects
+    /// it instead of yielding a garbled message.
+    #[test]
+    fn broker_payloads_fail_closed_on_wrong_key() {
+        let associated_data = broker_message_payload_aad("session-1", 7);
+        let sealed =
+            seal_message_payload(&Envelope::new(b"key-a"), &token_message(), &associated_data)
+                .unwrap();
+        let result = unseal_message_payload::<azdo::TaskAgentMessage>(
+            &Envelope::new(b"key-b"),
+            &sealed,
+            &associated_data,
+        );
+        assert!(result.is_err(), "sealed payload unsealed with wrong key");
+    }
+
+    /// End-to-end through SQLite: the row on disk holds no plaintext token,
+    /// and a restart-style load restores the message.
+    #[test]
+    fn sqlite_broker_rows_hold_no_plaintext_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = SqliteStore::open(&db_path, Envelope::new(b"test-root-key")).unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let tx = connection.transaction().unwrap();
+            store
+                .write_claim_state_tx(
+                    &tx,
+                    &[],
+                    &[("session-1".to_string(), 7, token_message())],
+                    &[],
+                )
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let raw: String = {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .query_row("SELECT payload_json FROM broker_messages", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert!(
+            !raw.contains("live-runtime-token-abc123"),
+            "token in plaintext row: {raw}"
+        );
+        // Still valid JSON, so the json_valid CHECK constraint is satisfied.
+        assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        // Restart: load_into unseals the row back into the live message.
+        let mut inner = InnerState::default();
+        store.load_into(&mut inner).unwrap();
+        let restored = &inner.inflight_messages["session-1"][&7];
+        assert_eq!(restored.body, token_message().body);
+    }
+
+    /// Startup performs one bounded transaction that upgrades plaintext rows
+    /// and the first unbound sealed format, while dropping malformed rows.
+    #[test]
+    fn sqlite_migrates_legacy_message_rows_before_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let cipher = Envelope::new(b"test-root-key");
+        {
+            let connection = Connection::open(&db_path).unwrap();
+            SqliteStore::migrate(&connection).unwrap();
+            let legacy = serde_json::to_string(&token_message()).unwrap();
+            let unbound = serde_json::to_string(
+                &BASE64_STANDARD.encode(
+                    cipher
+                        .seal(&serde_json::to_vec(&token_message()).unwrap())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["session-1", 7, legacy, 0],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["session-1", 8, unbound, 0],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO broker_messages(session_id, message_id, payload_json, written_at_us)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params!["session-1", 9, r#"{"unexpected":true}"#, 0],
+                )
+                .unwrap();
+        }
+
+        let store = SqliteStore::open(&db_path, cipher).unwrap();
+        let rows: Vec<(i64, String)> = {
+            let connection = store.connection.lock().unwrap();
+            let mut stmt = connection
+                .prepare("SELECT message_id, payload_json FROM broker_messages ORDER BY message_id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(rows.len(), 2, "malformed legacy row was not dropped");
+        for (_, raw) in &rows {
+            assert!(!raw.contains("live-runtime-token-abc123"));
+            assert!(serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap()
+                .is_string());
+        }
+
+        let mut inner = InnerState::default();
+        store.load_into(&mut inner).unwrap();
+        assert_eq!(
+            inner.inflight_messages["session-1"][&7].body,
+            token_message().body
+        );
+        assert_eq!(
+            inner.inflight_messages["session-1"][&8].body,
+            token_message().body
         );
     }
 }

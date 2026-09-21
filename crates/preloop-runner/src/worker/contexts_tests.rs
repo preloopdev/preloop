@@ -168,6 +168,33 @@ proptest! {
     }
 }
 
+// H1: a multiline initial secret must be masked per line, not just as a
+// whole value. Log lines are masked individually, so without per-line
+// registration each line of a PEM key would leak verbatim while only the
+// (never emitted) whole value stayed masked.
+#[test]
+fn masking_multiline_initial_secret_redacts_each_line() {
+    let secret = "-----BEGIN PRIVATE KEY-----\nMIIEsecretline\n-----END PRIVATE KEY-----";
+    let ctx = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({
+            "PRIVATE_KEY": {"value": secret, "isSecret": true},
+        }),
+        serde_json::json!({}),
+    );
+    // Each emitted log line carries one secret line: all must be redacted.
+    for line in secret.split('\n') {
+        let masked = ctx.mask_secrets(&format!("log: {line}"));
+        assert_eq!(masked, "log: ***", "secret line leaked: {line}");
+    }
+    // The whole value stays masked too.
+    assert_eq!(ctx.mask_secrets(secret), "***");
+    // Idempotent: masking twice changes nothing.
+    let once = ctx.mask_secrets(&format!("log: {}", secret.split('\n').nth(1).unwrap()));
+    assert_eq!(ctx.mask_secrets(&once), once);
+}
+
 fn make_variables() -> serde_json::Value {
     serde_json::json!({
         "system.github.token": {

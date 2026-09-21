@@ -1,5 +1,7 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 /// A heartbeat or sampler snapshot older than this is stale: three sampler
 /// intervals of 5s. Single source so `/readyz` and `/api/v1/status` cannot
@@ -281,6 +283,288 @@ fn existing_webhook_run(
             run_number: run.run_number,
             queued_jobs: run.jobs.len(),
         })
+}
+
+/// Static-PAT permission enforcement (H3).
+///
+/// When no GitHub App is configured, the operator's static PAT
+/// (`PRELOOP_GITHUB_TOKEN` / `github.pat`) is embedded verbatim as every
+/// non-fork job's `GITHUB_TOKEN`. A classic PAT cannot be narrowed per
+/// request, so without a check here the workflow's `permissions:` block is
+/// silently ignored while `system.github.token.permissions` still advertises
+/// the declared set. `submit_run_inner` introspects the PAT's classic OAuth
+/// scopes (`X-OAuth-Scopes`) and refuses the run when the PAT is broader than
+/// a job declared; an invalid PAT is refused outright. `build_job_artifacts`
+/// publishes the token's real authority in `system.github.token.pat_scopes`,
+/// which the runner prints alongside the declared permission set.
+///
+/// What a job's `GITHUB_TOKEN` becomes in PAT mode (H3).
+///
+/// A static PAT cannot be narrowed per job, so it is embedded only when its
+/// classic OAuth scopes were introspected and do not exceed the job's declared
+/// `permissions:`. When its bounds cannot be established the credential is
+/// withheld: the job keeps the job-scoped runtime token, so a step that needs
+/// GitHub fails at the point of use instead of running with authority nobody
+/// could bound.
+#[derive(Clone, Debug)]
+pub(crate) enum PatToken {
+    /// Classic OAuth scopes introspected and no broader than declared.
+    Embed { token: String, scopes: Vec<String> },
+    /// Bounds unverifiable (no scopes header, cold scope cache, unreachable
+    /// API). The PAT is not embedded.
+    Withheld,
+}
+
+impl PatToken {
+    /// A PAT whose classic OAuth scopes were introspected: the wire variable
+    /// advertises the actual scopes.
+    pub(crate) fn with_scopes(token: String, scopes: Vec<String>) -> Self {
+        Self::Embed { token, scopes }
+    }
+
+    /// A PAT whose bounds could not be verified, so it is withheld.
+    pub(crate) fn withheld() -> Self {
+        Self::Withheld
+    }
+}
+
+/// How long introspected PAT scopes are trusted: the PAT is static process
+/// config, so a short TTL only bounds staleness after an out-of-band rotation.
+const PAT_SCOPE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Introspected classic OAuth scopes by PAT hash (hash, never the token).
+type PatScopeCache = Mutex<HashMap<String, (Instant, Vec<String>)>>;
+static PAT_SCOPE_CACHE: LazyLock<PatScopeCache> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Synchronous read of the PAT scope cache, for the synchronous scheduler
+/// expansion pipeline (`build_jobs` cannot do network I/O). Returns the
+/// cached scopes once the process has introduced them already: startup warms
+/// the cache and every submission refreshes it. `None` on a cold or expired
+/// entry.
+pub(crate) fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
+    use sha2::Digest as _;
+    let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
+    PAT_SCOPE_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+        .filter(|(at, _)| at.elapsed() < PAT_SCOPE_CACHE_TTL)
+        .map(|(_, scopes)| scopes)
+}
+
+/// Warm the process-wide PAT scope cache once at startup (H3).
+///
+/// The job expansion pipeline is synchronous and reads [`cached_pat_scopes`],
+/// so without a warm entry the first expansions after a restart would find a
+/// cold cache and have to withhold the PAT. The PAT is fixed for the process
+/// lifetime (read from config/env during state construction), so one lookup
+/// here covers every later expansion.
+///
+/// Failures are logged, never fatal: a server that cannot reach the GitHub API
+/// still serves, and the run path withholds the credential instead of
+/// embedding one whose bounds nobody established.
+pub(crate) async fn warm_pat_scope_cache(pat: &str) {
+    match pat_oauth_scopes(pat).await {
+        PatScopeOutcome::Known(scopes) => {
+            tracing::info!(
+                scope_count = scopes.len(),
+                "Warmed the static PAT OAuth scope cache"
+            );
+        }
+        PatScopeOutcome::Unverifiable { reason } => {
+            tracing::warn!(
+                reason = %reason,
+                "Could not introspect PRELOOP_GITHUB_TOKEN OAuth scopes at startup; jobs keep the \
+                 job-scoped runtime token until an introspection succeeds, so any step that needs \
+                 GitHub fails."
+            );
+        }
+        PatScopeOutcome::Invalid(error) => {
+            tracing::error!(
+                error = %error,
+                "PRELOOP_GITHUB_TOKEN was rejected by the GitHub API at startup; jobs keep the \
+                 job-scoped runtime token and any step that needs GitHub fails."
+            );
+        }
+    }
+}
+
+/// Outcome of PAT scope introspection.
+enum PatScopeOutcome {
+    /// Classic scopes positively determined: enforce declared-vs-PAT.
+    Known(Vec<String>),
+    /// No scopes header (fine-grained PAT), a quirky API root, or an
+    /// unreachable API: bounds unverifiable. The caller withholds the PAT
+    /// rather than embedding a credential whose authority nobody can bound:
+    /// the job still runs, on the job-scoped runtime token, and a step that
+    /// needs GitHub fails at the point of use. Refusing the whole run instead
+    /// would be a self-DoS when the control plane cannot reach the API
+    /// (proxies, air gaps).
+    Unverifiable { reason: String },
+    /// The PAT itself was rejected by the API: fail closed.
+    Invalid(anyhow::Error),
+}
+
+/// Introspect the static PAT's classic OAuth scopes via the `X-OAuth-Scopes`
+/// response header on an authenticated API-root request.
+///
+/// Returns [`PatScopeOutcome::Known`] with the scope list when GitHub answers
+/// successfully with an `X-OAuth-Scopes` header. An *absent* header is
+/// [`PatScopeOutcome::Unverifiable`], not an empty scope list: GitHub omits it
+/// for fine-grained PATs, so absence means the token's bounds are unknown
+/// rather than narrow. Results are cached per PAT (SHA-256 of the token) for
+/// [`PAT_SCOPE_CACHE_TTL`].
+async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
+    use sha2::Digest as _;
+    let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
+    if let Ok(cache) = PAT_SCOPE_CACHE.lock() {
+        if let Some((at, scopes)) = cache.get(&cache_key) {
+            if at.elapsed() < PAT_SCOPE_CACHE_TTL {
+                return PatScopeOutcome::Known(scopes.clone());
+            }
+        }
+    }
+    let url = format!("{}/", crate::github::github_api_base());
+    let response = match crate::shared_http::CLIENT
+        .get(&url)
+        .header("Authorization", format!("Bearer {pat}"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return PatScopeOutcome::Unverifiable {
+                reason: format!("GitHub API unreachable: {error:#}"),
+            };
+        }
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return PatScopeOutcome::Invalid(anyhow::anyhow!(
+            "PAT scope introspection rejected with {status}"
+        ));
+    }
+    if !status.is_success() {
+        return PatScopeOutcome::Unverifiable {
+            reason: format!("unexpected status {status} from the GitHub API root"),
+        };
+    }
+    let Some(header) = response.headers().get("x-oauth-scopes") else {
+        return PatScopeOutcome::Unverifiable {
+            reason: "GitHub returned no X-OAuth-Scopes header (fine-grained PAT, or a proxied API \
+                     root that drops it)"
+                .to_owned(),
+        };
+    };
+    let Ok(header) = header.to_str() else {
+        return PatScopeOutcome::Unverifiable {
+            reason: "X-OAuth-Scopes header was not valid UTF-8".to_owned(),
+        };
+    };
+    let scopes: Vec<String> = header
+        .split(',')
+        .map(|scope| scope.trim().to_owned())
+        .filter(|scope| !scope.is_empty())
+        .collect();
+    if let Ok(mut cache) = PAT_SCOPE_CACHE.lock() {
+        cache.insert(cache_key, (Instant::now(), scopes.clone()));
+    }
+    PatScopeOutcome::Known(scopes)
+}
+
+/// Whether the PAT's classic OAuth scopes confer authority beyond the job's
+/// effective `permissions:` block: any write-capable PAT scope without a
+/// declared `write`/`admin` grant, or any PAT authority at all against an
+/// empty (`permissions: {}`) declaration.
+///
+/// `pub(crate)` for the scope-matrix unit tests in `lib_tests.rs`.
+pub(crate) fn pat_exceeds_declared(
+    pat_scopes: &[String],
+    declared: &BTreeMap<String, String>,
+) -> bool {
+    // Mirror of `github_app::effective_permissions`: `id-token` and `models`
+    // are runner-authenticated and granted by the platform, not the token.
+    let declared_write = declared.iter().any(|(scope, level)| {
+        (level.eq_ignore_ascii_case("write") || level.eq_ignore_ascii_case("admin"))
+            && !crate::github_app::ACTIONS_ONLY_SCOPES.contains(&scope.as_str())
+    });
+    // A classic PAT scope counts as write-capable unless provably read-only.
+    // The safe direction: GitHub's classic scope list hides write grants
+    // under terse names (`public_repo` pushes to public repos, `repo:status`
+    // posts commit statuses, `gist` writes gists), so an unrecognized scope
+    // must not be assumed narrow.
+    let pat_write = pat_scopes
+        .iter()
+        .any(|scope| !classic_scope_is_read_only(scope));
+    if pat_write && !declared_write {
+        return true;
+    }
+    declared.is_empty() && !pat_scopes.is_empty()
+}
+
+/// Classic OAuth scopes that are provably read-only.
+fn classic_scope_is_read_only(scope: &str) -> bool {
+    scope.starts_with("read:") || scope == "user:email"
+}
+
+/// Reject the run when the static PAT's classic OAuth scopes confer
+/// authority beyond a non-fork job's effective (declared-or-default)
+/// `permissions:` block.
+///
+/// A PAT cannot be narrowed per request, so the only safe answers are a PAT
+/// no broader than declared, a GitHub App (installation tokens are minted
+/// with exactly the declared set), or no run at all. Fork-restricted jobs
+/// never receive the PAT, so they are exempt.
+pub(crate) fn enforce_pat_permissions(
+    jobs: &[preloop_gha_protocol::JobPlan],
+    submission: &preloop_gha_protocol::WorkflowSubmission,
+    pat_scopes: &[String],
+) -> Result<(), ApiError> {
+    let tier = crate::events::trust_tier::tier_of(submission);
+    let mut offenders: Vec<String> = Vec::new();
+    for job in jobs {
+        let policy = crate::events::trust_tier::job_authorization(
+            tier,
+            job.permissions.as_ref(),
+            job.oidc_id_token_granted,
+        );
+        if policy.fork_restricted {
+            continue;
+        }
+        if pat_exceeds_declared(pat_scopes, &policy.token_permissions) {
+            offenders.push(job.id.to_string());
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(format!(
+        "refusing run: PRELOOP_GITHUB_TOKEN is a static PAT with OAuth scopes [{}], \
+         which exceed the declared `permissions:` of job(s) [{}]. A PAT cannot be \
+         narrowed per job: configure a GitHub App so installation tokens are minted \
+         with exactly the declared permissions, or replace the PAT with a \
+         fine-grained PAT scoped no broader than the workflows' declared permissions",
+        pat_scopes.join(", "),
+        offenders.join(", "),
+    )))
+}
+
+/// Honest `system.github.token.pat_scopes` wire value for a PAT-backed
+/// `GITHUB_TOKEN`: the workflow's declared set is not honored in PAT mode, so
+/// the token's actual classic OAuth scopes (or their unverifiability) are
+/// stated here. `system.github.token.permissions` keeps its documented
+/// `{"<Permission>": "<level>"}` map shape, so consumers that parse it are not
+/// surprised by a key that is not a permission and a value that is prose.
+fn pat_scopes_wire_value(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        // The header was present but listed nothing: the token carries no
+        // classic scopes, which is narrower than any declaration. Distinct from
+        // an absent header, which is unverifiable and never reaches this path.
+        "no classic OAuth scopes reported; NOT the declared `permissions:` set".to_owned()
+    } else {
+        format!("static PAT OAuth scopes: {}", scopes.join(", "))
+    }
 }
 
 pub(crate) async fn submit_run_inner(
@@ -719,12 +1003,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| {
-            if submission.git_ref.len() == 40
-                && submission
-                    .git_ref
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit())
-            {
+            if preloop_gha_protocol::git_ref::is_commit_sha(&submission.git_ref) {
                 submission.git_ref.clone()
             } else {
                 "0000000000000000000000000000000000000000".to_owned()
@@ -1064,11 +1343,55 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // are deliberately minted later, when the broker dispatches each job, so
     // downstream jobs cannot sit in the queue until a short-lived token
     // expires.
-    let mut github_tokens: BTreeMap<JobId, String> = BTreeMap::new();
+    let mut github_tokens: BTreeMap<JobId, PatToken> = BTreeMap::new();
     if shared.state.github_app.is_none() {
         if let Some(pat) = shared.state.static_github_pat() {
-            info!(%run_id, "Using PRELOOP_GITHUB_TOKEN PAT for run jobs");
-            github_tokens.extend(jobs.iter().map(|job| (job.id.clone(), pat.clone())));
+            // H3: a static PAT cannot be narrowed per job, so a PAT broader
+            // than a job's declared `permissions:` would silently hand every
+            // non-fork job authority the workflow never claimed. Introspect
+            // the PAT's classic OAuth scopes and refuse the run on mismatch;
+            // an invalid PAT is refused outright, and a PAT whose bounds
+            // cannot be verified is withheld rather than embedded.
+            match pat_oauth_scopes(&pat).await {
+                PatScopeOutcome::Known(scopes) => {
+                    enforce_pat_permissions(&jobs, &submission, &scopes)?;
+                    tracing::warn!(
+                        %run_id,
+                        pat_scopes = %scopes.join(", "),
+                        "Using PRELOOP_GITHUB_TOKEN PAT for run jobs: workflow `permissions:` blocks are \
+                         NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
+                         GitHub App to mint least-privilege installation tokens."
+                    );
+                    github_tokens.extend(jobs.iter().map(|job| {
+                        (
+                            job.id.clone(),
+                            PatToken::with_scopes(pat.clone(), scopes.clone()),
+                        )
+                    }));
+                }
+                PatScopeOutcome::Unverifiable { reason } => {
+                    tracing::warn!(
+                        %run_id,
+                        reason = %reason,
+                        "Withholding PRELOOP_GITHUB_TOKEN for run jobs: its OAuth scopes could not be \
+                         introspected, so workflow `permissions:` blocks cannot be enforced and the \
+                         PAT is not embedded. Jobs keep the job-scoped runtime token, so any step that \
+                         needs GitHub fails. Configure a GitHub App to mint least-privilege installation \
+                         tokens, or make the GitHub API reachable so the scopes can be verified."
+                    );
+                    github_tokens.extend(
+                        jobs.iter()
+                            .map(|job| (job.id.clone(), PatToken::withheld())),
+                    );
+                }
+                PatScopeOutcome::Invalid(error) => {
+                    return Err(ApiError::forbidden(format!(
+                        "refusing run {run_id}: PRELOOP_GITHUB_TOKEN failed GitHub API \
+                         authentication ({error:#}); refusing to embed an invalid PAT as \
+                         job GITHUB_TOKENs"
+                    )));
+                }
+            }
         }
     }
 
@@ -2117,7 +2440,7 @@ pub(crate) fn build_job_artifacts(
     base_url: &str,
     workspace_snapshot: Option<&WorkspaceSnapshot>,
     job: &preloop_gha_protocol::JobPlan,
-    github_token_override: Option<String>,
+    github_token_override: Option<PatToken>,
 ) -> Result<BuiltJobArtifacts, ApiError> {
     // One policy drives every job-facing authority decision for this tier:
     // stored secrets, the runner-visible `system.github.token.permissions`
@@ -2131,6 +2454,34 @@ pub(crate) fn build_job_artifacts(
         job.permissions.as_ref(),
         job.oidc_id_token_granted,
     );
+
+    // M4: the environment registry. `environment:` names an
+    // operator-registered deployment tier; a workflow claiming an
+    // unregistered name gets nothing — no environment secrets, no
+    // environment OIDC subject — and the job fails closed rather than
+    // minting a token for a never-created, never-approved environment.
+    // This check runs ahead of `policy.allows_secrets` because the OIDC
+    // subject is minted for jobs even when secret injection is disabled.
+    // Note: expression-based names (`${{ needs.* }}`, `${{ vars.* }}`, …)
+    // arrive here as `None` — the parser only resolves `matrix.*` at build
+    // time — so they are not rejected here, but they also receive no
+    // environment secrets and no environment OIDC subject (both are keyed
+    // off this same field). The name later resolved by
+    // `hydrate_needs_context` is not re-validated against the registry;
+    // it only reaches the runner's deployment record.
+    if let Some(env_name) = job.oidc_environment.as_deref() {
+        if !shared
+            .state
+            .secrets
+            .read()
+            .is_environment_registered(&submission.repository, env_name)
+        {
+            return Err(ApiError::forbidden(format!(
+                "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
+                submission.repository
+            )));
+        }
+    }
 
     // Environment secrets are per-job: a job's `environment:` selects the
     // tier, so the overlay happens here, not in the submission-level merge.
@@ -2271,8 +2622,32 @@ pub(crate) fn build_job_artifacts(
     // authenticates only against this control plane.
     let github_token = if policy.fork_restricted {
         runtime_token.clone()
+    } else if let Some(pat) = github_token_override {
+        // PAT mode: the token carries the PAT's OAuth scopes, not the
+        // workflow's declared `permissions:`. `system.github.token.permissions`
+        // keeps its documented map shape (the declared set, as the message
+        // builder wrote it) so consumers that parse it are not surprised; the
+        // token's real authority goes in its own variable, which the runner
+        // prints inside the same `GITHUB_TOKEN Permissions` group.
+        let (token, authority) = match pat {
+            PatToken::Embed { token, scopes } => (token, pat_scopes_wire_value(&scopes)),
+            // H3: unverifiable authority means no PAT is embedded. The job
+            // keeps the runtime token, which authenticates only against this
+            // control plane, so a step that needs GitHub fails at the point of
+            // use rather than running with authority nobody could bound.
+            PatToken::Withheld => (
+                runtime_token.clone(),
+                "withheld: PAT authority unverifiable; NOT the declared `permissions:` set"
+                    .to_owned(),
+            ),
+        };
+        agent_msg.variables.insert(
+            "system.github.token.pat_scopes".to_owned(),
+            preloop_gha_protocol::azdo::VariableValue::new(authority),
+        );
+        token
     } else {
-        github_token_override.unwrap_or_else(|| runtime_token.clone())
+        runtime_token.clone()
     };
     agent_msg.variables.insert(
         "system.github.token".to_owned(),
@@ -3353,6 +3728,7 @@ mod tests {
             concurrency_cancel_in_progress: None,
             concurrency_queue: None,
             reusable_call: None,
+            timeout_minutes: None,
         };
 
         // A job defined in the caller contributes no second entry.
@@ -3649,5 +4025,90 @@ mod tests {
         );
 
         std::env::remove_var("PRELOOP_GITHUB_API_URL");
+    }
+
+    /// Submit a run through the public API against a config-file registry.
+    async fn submit_push_run(config_toml: &str, workflow_yaml: &str) -> (StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::{header, Method, Request};
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(&config_path, config_toml).unwrap();
+        let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+            .await
+            .unwrap();
+        let app = crate::app(state, CancellationToken::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow_yaml": workflow_yaml,
+                            "event": "push",
+                            "repository": "owner/repo",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    const ENV_WORKFLOW: &str = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo hi\n";
+
+    /// M4: `environment:` is an unvalidated string. A workflow claiming an
+    /// environment the operator never registered must fail closed — even
+    /// when that environment has secrets configured (the pentest shape: env
+    /// secret injected + OIDC `sub` asserting the unregistered environment).
+    #[tokio::test]
+    async fn unregistered_environment_rejects_run_submission() {
+        use axum::http::StatusCode;
+        let (status, body) = submit_push_run(
+            "[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
+            ENV_WORKFLOW,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a job claiming an unregistered environment must fail closed, got: {body}"
+        );
+        assert!(
+            body.contains("not registered"),
+            "the rejection must name the missing registration, got: {body}"
+        );
+    }
+
+    /// M4: an environment the operator registered in `[environments]` keeps
+    /// working — the registry gates existence, not legitimate use.
+    #[tokio::test]
+    async fn registered_environment_accepts_run_submission() {
+        use axum::http::StatusCode;
+        let (status, body) = submit_push_run(
+            "[environments]\n\"owner/repo\" = [\"production\"]\n[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
+            ENV_WORKFLOW,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a job claiming a registered environment must be accepted, got: {body}"
+        );
     }
 }

@@ -692,6 +692,13 @@ pub struct Job {
     /// Maps output name to value expression, e.g. `z: ${{ steps.step1.outputs.out1 }}`.
     #[serde(default)]
     pub outputs: BTreeMap<String, Value>,
+    /// Optional job timeout in minutes, literal or expression.
+    ///
+    /// GitHub's schema types `timeout-minutes` as `number` and allows an
+    /// expression; the value is resolved at expansion and carried to the
+    /// runner as `jobTimeout` (seconds) on the job request message.
+    #[serde(default, rename = "timeout-minutes")]
+    pub timeout_minutes: Option<DeferredNumber>,
 }
 
 /// `defaults:` block in a job definition.

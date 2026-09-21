@@ -14,7 +14,7 @@ impl AppState {
         self.local_jwt_with_lifetime(claims, LOCAL_JWT_LIFETIME)
     }
 
-    fn local_jwt_with_lifetime(
+    pub(crate) fn local_jwt_with_lifetime(
         &self,
         mut claims: serde_json::Value,
         lifetime: Duration,
@@ -33,6 +33,12 @@ impl AppState {
         claims.insert("iat".to_owned(), json!(now));
         claims.insert("nbf".to_owned(), json!(now));
         claims.insert("exp".to_owned(), json!(expires_at));
+        // R1-10: every minted token gets a unique id so identical claims
+        // minted in the same second do not produce byte-identical tokens.
+        // Callers that already set `jti` (e.g. the OAuth flow) keep theirs.
+        if !claims.contains_key("jti") {
+            claims.insert("jti".to_owned(), json!(uuid::Uuid::new_v4().to_string()));
+        }
         let header = json!({
             "alg": "HS256",
             "typ": "JWT",
@@ -556,6 +562,21 @@ pub(crate) struct SecretStore {
     /// `global` for jobs of that repository whose `environment:` resolves to
     /// that environment.
     pub env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    /// Registered environments, keyed by `owner/repo` then environment name.
+    /// A job's `environment:` must be registered for its repository; a job
+    /// claiming any other name fails closed before secrets are injected or
+    /// an OIDC environment subject is minted (M4).
+    pub environments: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl SecretStore {
+    /// Whether `environment:` `env` names a registered environment of
+    /// `repo` (M4). Jobs claiming an unregistered environment fail closed.
+    pub fn is_environment_registered(&self, repo: &str, env: &str) -> bool {
+        self.environments
+            .get(repo)
+            .is_some_and(|envs| envs.contains(env))
+    }
 }
 
 /// Redacting `Debug`: the store holds plaintext secret values, so a single
@@ -585,6 +606,7 @@ impl std::fmt::Debug for SecretStore {
             .field("global_names", &self.global.keys().collect::<Vec<_>>())
             .field("repo_names", &repo_names)
             .field("env_names", &env_names)
+            .field("environments", &self.environments)
             .finish()
     }
 }
@@ -991,6 +1013,7 @@ impl AppState {
             global: config.secrets,
             repo: config.repo_secrets,
             env: config.env_secrets,
+            environments: config.environments,
         }));
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
@@ -1192,7 +1215,13 @@ impl AppState {
         // (runner polling, heartbeats, other state mutations).
         if let Some(run_id) = run_id {
             let projection = {
-                let inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().await;
+                // A terminal RunStatus means this run just completed — bound
+                // retained completed-run records before projecting so the
+                // heap cannot grow one RunRecord (~1 MiB) per run forever.
+                if event.terminal_run_status().is_some() {
+                    crate::memory_caps::trim_completed_runs(&mut inner);
+                }
                 crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
             };
             if let Some(projection) = projection {
@@ -1591,6 +1620,11 @@ pub(crate) struct InnerState {
     pub(crate) log_order: VecDeque<String>,
     /// Artifact v2 Twirp pending uploads: upload_token → registry_key.
     pub(crate) artifact_v2_pending: BTreeMap<String, ArtifactV2Pending>,
+    /// Diagnostic-log upload tokens: token → owner. In-memory only; minted
+    /// by `GetJobDiagLogsSignedBlobURL` and consumed bearerless by the runner
+    /// (Azure SDK compat), so the blob gate binds the token to the owning
+    /// job instead of relying on a bearer.
+    pub(crate) diag_upload_tokens: BTreeMap<String, DiagUploadToken>,
     /// Artifact v2 finalized registry: registry_key → metadata.
     pub(crate) artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// Monotonic artifact v2 ID counter.

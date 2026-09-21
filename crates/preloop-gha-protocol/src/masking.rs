@@ -28,9 +28,31 @@ where
         .filter(|s| !exclude.contains(s))
         .collect();
     sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    let mut result = input.to_owned();
-    for secret in sorted {
-        result = result.replace(secret, MASK_MARKER);
+
+    // Scan the original input once. Generated markers are never fed back
+    // through the matcher, so a mask such as "*" cannot expand an existing
+    // "***" marker on a later retroactive pass.
+    let mut result = String::with_capacity(input.len());
+    let mut offset = 0;
+    while offset < input.len() {
+        let remaining = &input[offset..];
+        let matching_secret = sorted.iter().find(|secret| remaining.starts_with(**secret));
+        if remaining.starts_with(MASK_MARKER)
+            && matching_secret.is_none_or(|secret| secret.len() <= MASK_MARKER.len())
+        {
+            result.push_str(MASK_MARKER);
+            offset += MASK_MARKER.len();
+        } else if let Some(secret) = matching_secret {
+            result.push_str(MASK_MARKER);
+            offset += secret.len();
+        } else {
+            let character = remaining
+                .chars()
+                .next()
+                .expect("offset always points at a character boundary");
+            result.push(character);
+            offset += character.len_utf8();
+        }
     }
     result
 }
@@ -110,6 +132,15 @@ mod tests {
         let once = mask_secrets(input, ["secret"].iter().copied(), &[]);
         let twice = mask_secrets(&once, ["secret"].iter().copied(), &[]);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn wildcard_masks_do_not_expand_existing_markers() {
+        let input = "before *** after";
+        let once = mask_secrets(input, ["*"].iter().copied(), &[]);
+        let twice = mask_secrets(&once, ["*"].iter().copied(), &[]);
+        assert_eq!(once, input);
+        assert_eq!(twice, input);
     }
 
     #[test]

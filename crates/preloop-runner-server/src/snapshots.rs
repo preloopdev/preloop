@@ -1423,7 +1423,7 @@ async fn probe_workspace(workspace: &FsPath) -> Result<WorkspaceRevision, ApiErr
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|sha| sha.len() == 40);
+        .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha(sha));
     Ok(WorkspaceRevision {
         common_dir,
         source_head,
@@ -2847,12 +2847,47 @@ fn decode_git_request_body(
     Ok(decoded)
 }
 
+/// Parse the `:run_id` route segment, tolerating an optional `.git` suffix.
+///
+/// Git clients address the same snapshot both ways: fetch goes to
+/// `/snapshots/<run>/…` while git-lfs posts its batch to
+/// `/snapshots/<run>.git/info/lfs/…`. `RunId` is a bare UUID that cannot
+/// parse the suffixed form, so axum rejects the request before the handler
+/// runs and LFS checkouts die with an opaque client-side error. Strip one
+/// trailing `.git`, then parse strictly — anything else is still a 400.
+fn snapshot_route_run_id(raw: &str) -> Result<RunId, ApiError> {
+    let raw = raw.strip_suffix(".git").unwrap_or(raw);
+    let uuid = raw
+        .parse::<uuid::Uuid>()
+        .map_err(|_| ApiError::bad_request("invalid snapshot run id"))?;
+    Ok(RunId(uuid))
+}
+#[cfg(test)]
+mod route_run_id_tests {
+    use super::*;
+
+    /// The LFS batch shape (`<run>.git/info/lfs/…`) must resolve to the same
+    /// run as the fetch shape (`<run>/…`); otherwise axum rejects the batch
+    /// before the handler runs and LFS checkouts fail opaquely.
+    #[test]
+    fn git_suffixed_run_id_parses_like_bare() {
+        let bare = "658fa99d-0f4e-424a-a9df-549f4dbd6092";
+        let suffixed = format!("{bare}.git");
+        let from_bare = snapshot_route_run_id(bare).expect("bare UUID parses");
+        let from_suffixed = snapshot_route_run_id(&suffixed).expect(".git suffix parses");
+        assert_eq!(from_bare, from_suffixed);
+        assert!(snapshot_route_run_id("not-a-uuid").is_err());
+        assert!(snapshot_route_run_id("not-a-uuid.git").is_err());
+    }
+}
+
 /// Serve a snapshot bare repository through Git's read-only smart HTTP CGI.
 pub(crate) async fn snapshot_git_http(
     State(shared): State<Arc<SharedState>>,
-    Path((run_id, path)): Path<(RunId, String)>,
+    Path((run_id_raw, path)): Path<(String, String)>,
     request: Request,
 ) -> Result<Response<Body>, ApiError> {
+    let run_id = snapshot_route_run_id(&run_id_raw)?;
     let authorization_header = request
         .headers()
         .get(header::AUTHORIZATION)

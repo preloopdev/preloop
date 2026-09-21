@@ -2164,6 +2164,17 @@ async fn replay_flows_to_preloop_inner(
         };
         // Step 3: sign a client_assertion JWT (PS256) and exchange for a token
         let assertion_header = json!({"typ": "JWT", "alg": "PS256"});
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // The server requires exp/iat/aud on client assertions (R1-9): exp
+        // bounds the replay window, aud must name the token endpoint or the
+        // server base URL.
+        let token_endpoint = format!(
+            "{}/_apis/v1/oauth2/token",
+            preloop_url.trim_end_matches('/')
+        );
         let assertion_claims = json!({
             "sub": client_id,
             "iss": client_id,
@@ -2171,10 +2182,9 @@ async fn replay_flows_to_preloop_inner(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()),
-            "iat": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            "iat": now_secs,
+            "exp": now_secs + 300,
+            "aud": token_endpoint,
         });
         let assertion = match sign_jwt_ps256(&assertion_header, &assertion_claims, &params) {
             Ok(jwt) => jwt,

@@ -2310,8 +2310,41 @@ where
     let secrets_exposed = preloop_gha_protocol::masking::expose_all(&ctx.submission.secrets);
     // PATs are static: embed at build time. App installation tokens are minted
     // by the broker at dispatch.
+    //
+    // H3: the expansion pipeline is synchronous, so it cannot introspect the
+    // PAT's OAuth scopes itself; it enforces from the process-wide scope cache,
+    // which the server warms at startup and every submission refreshes. On a
+    // cold cache the bounds are unverifiable, so the PAT is withheld rather
+    // than embedded: the executor must not block on network I/O, and a
+    // credential nobody can bound must not reach a job.
     let pat_override = if shared.state.github_app.is_none() {
-        shared.state.static_github_pat()
+        match shared.state.static_github_pat() {
+            Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
+                Some(scopes) => {
+                    crate::runs::enforce_pat_permissions(plans, &ctx.submission, &scopes).map_err(
+                        |error| {
+                            tracing::warn!(
+                                run_id = %ctx.run_id,
+                                ?error,
+                                "refusing expansion: static PAT exceeds declared job permissions"
+                            );
+                            ExecutionStatus::Failure
+                        },
+                    )?;
+                    Some(crate::runs::PatToken::with_scopes(pat, scopes))
+                }
+                None => {
+                    tracing::warn!(
+                        run_id = %ctx.run_id,
+                        "Withholding the static PAT for this expansion: its OAuth scopes have not been \
+                         introspected, so workflow `permissions:` blocks cannot be enforced. Jobs keep \
+                         the job-scoped runtime token and any step that needs GitHub fails."
+                    );
+                    Some(crate::runs::PatToken::withheld())
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };

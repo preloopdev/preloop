@@ -232,6 +232,15 @@ pub async fn run_steps(
                         setup_lines.push(format!("{ts} {perm}: {level_str}"));
                     }
                 }
+                // H3: a static-PAT-backed GITHUB_TOKEN does not honor the
+                // workflow's `permissions:` block, so the declared set above is
+                // not what the token carries. State the token's real authority
+                // in the same group rather than leaving it to be inferred.
+                if let Some(pat_scopes) = job.get_variable("system.github.token.pat_scopes") {
+                    setup_lines.push(format!(
+                        "{ts} PAT mode: `permissions:` is NOT enforced; GITHUB_TOKEN authority: {pat_scopes}"
+                    ));
+                }
                 setup_lines.push(format!("{ts} ##[endgroup]"));
             }
         }
@@ -620,10 +629,10 @@ pub async fn run_steps(
         // Retry loop. Exactly one pass unless a debug controller says `retry`.
         let (conclusion_str, file_command_paths) = loop {
             let attempt_started = std::time::Instant::now();
-            // Track where this attempt's log output starts so diagnostics
-            // and exit-code extraction use only the current attempt's slice,
-            // not cumulative output from prior retries.
-            let attempt_log_offset = step_ctx.log_content().len();
+            // Track where this attempt's log output starts by logical line.
+            // Retroactive masking can change byte lengths, so a byte offset
+            // would become an invalid UTF-8/string boundary after retry.
+            let attempt_log_line = step_ctx.log_line_count();
             let attempt_annotation_offset = step_ctx.annotations.len();
 
             // Baseline for attributing workspace changes to *this* attempt.
@@ -798,13 +807,14 @@ pub async fn run_steps(
                     execute_step(&step.step_type, &mut step_ctx, workspace, exec_cancel_rx).await
                 }
             };
+            let durable_log_error = step_ctx.durable_log_error.clone();
             // F029: If the display name still contains unresolved expressions
             // after the pre-execution evaluation (e.g. `${{ needs.*.result }}`
             // or `${{ format(...) }}`), try to fix it now that the step has
             // executed and contexts may have been populated.
             if resolved_display_name.contains("${{") {
                 if let Some(group_line) = step_ctx
-                    .log_content()
+                    .log_head(super::execution_context::LOG_HEAD_SCAN_BYTES)
                     .lines()
                     .find_map(|line| line.split_once("##[group]Run ").map(|(_, name)| name))
                 {
@@ -882,6 +892,15 @@ pub async fn run_steps(
                 }
             };
 
+            if let Some(error) = &durable_log_error {
+                warn!(
+                    "Step '{}' failed because durable log masking could not complete: {error}",
+                    resolved_display_name
+                );
+                outcome_str = "Failure".to_string();
+                conclusion_str = "Failure".to_string();
+            }
+
             // Record a step result before applying file commands so GITHUB_OUTPUT can
             // attach outputs to this step.  If file-command parsing fails, official
             // runner behavior is to mark the step failed after process execution.
@@ -921,6 +940,14 @@ pub async fn run_steps(
                     step_result.conclusion = conclusion_str.clone();
                 }
             }
+            if durable_log_error.is_some() {
+                outcome_str = "Failure".to_string();
+                conclusion_str = "Failure".to_string();
+                if let Some(step_result) = step_ctx.job.steps.get_mut(&step.context_name) {
+                    step_result.outcome = outcome_str.clone();
+                    step_result.conclusion = conclusion_str.clone();
+                }
+            }
 
             // Pause on failure. The worker stays alive and blocks here, which is
             // what keeps the microVM — and every service, package, and warm cache
@@ -943,17 +970,16 @@ pub async fn run_steps(
                     let elapsed_ms = attempt_started.elapsed().as_millis() as u64;
                     // Use only this attempt's log/annotation slice so a retry
                     // does not report the prior attempt's exit code or errors.
-                    let full_log = step_ctx.log_content();
-                    let attempt_log = &full_log[attempt_log_offset..];
+                    let attempt_log = step_ctx.log_content_since(attempt_log_line);
                     let attempt_annotations = &step_ctx.annotations[attempt_annotation_offset..];
                     let diagnostics =
                         super::debug_pause::diagnostics_from_annotations(attempt_annotations, 10);
                     let log_excerpt = if diagnostics.is_empty() {
-                        super::debug_pause::log_excerpt(attempt_log, 20)
+                        super::debug_pause::log_excerpt(&attempt_log, 20)
                     } else {
                         None
                     };
-                    let exit_code = super::debug_pause::exit_code_from_log(attempt_log);
+                    let exit_code = super::debug_pause::exit_code_from_log(&attempt_log);
 
                     attempt_journal.push(preloop_gha_protocol::debug_session::AttemptRecord {
                         attempt,
