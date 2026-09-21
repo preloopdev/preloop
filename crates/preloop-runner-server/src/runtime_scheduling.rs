@@ -2,7 +2,7 @@ use super::*;
 
 /// Outcome of evaluating and acquiring a job-level concurrency gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JobGateOutcome {
+pub enum JobGateOutcome {
     /// No gate declared, or the gate was acquired — the job may be queued.
     Proceed,
     /// The gate is busy — park the job in `concurrency_blocked`; the group
@@ -21,7 +21,7 @@ pub(crate) enum JobGateOutcome {
 /// promote paths call it for needs-gated and held-run jobs that skipped the
 /// submit-time check (MC-S3), using the run record's `github`/`submission`
 /// context.
-pub(crate) fn try_acquire_job_gate(
+pub fn try_acquire_job_gate(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
@@ -75,7 +75,7 @@ pub(crate) fn try_acquire_job_gate(
 
 /// Enqueue a ready job, applying job-level concurrency if present.
 /// Returns Ok(true) if pushed to ready queue, Ok(false) if parked, Err if cancelled.
-pub(crate) fn try_enqueue_with_job_concurrency(
+pub fn try_enqueue_with_job_concurrency(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
@@ -106,11 +106,7 @@ pub(crate) fn try_enqueue_with_job_concurrency(
     }
 }
 /// Resolve the agent job GUID for an in-flight job, if any.
-pub(crate) fn agent_job_id_for(
-    inner: &InnerState,
-    run_id: RunId,
-    job_id: &JobId,
-) -> Option<uuid::Uuid> {
+pub fn agent_job_id_for(inner: &InnerState, run_id: RunId, job_id: &JobId) -> Option<uuid::Uuid> {
     inner
         .job_requests
         .values()
@@ -129,11 +125,7 @@ pub(crate) fn agent_job_id_for(
 /// Cancel a run: mark non-terminal jobs Cancelled, enqueue JobCancellation for
 /// in-flight jobs, remove from queues/held/blocked, and release concurrency.
 /// Returns the number of cancellation messages enqueued.
-pub(crate) fn cancel_run_inner(
-    inner: &mut InnerState,
-    run_id: RunId,
-    reason: Option<&str>,
-) -> usize {
+pub fn cancel_run_inner(inner: &mut InnerState, run_id: RunId, reason: Option<&str>) -> usize {
     // An expandable node (deferred reusable caller or needs-driven matrix)
     // never dispatches, but its submit-time request correlation is minted
     // like a real job's. Cancellation must settle it the way the completion
@@ -215,7 +207,7 @@ pub(crate) fn cancel_run_inner(
 /// the same group forever — the observed "run stuck at pending" stall after
 /// a restart. Pending entries whose runs are gone are dropped the same way;
 /// live holders and pending entries are untouched.
-pub(crate) fn reconcile_concurrency_groups(inner: &mut InnerState) {
+pub fn reconcile_concurrency_groups(inner: &mut InnerState) {
     let terminal = |run_id: &RunId| {
         inner.runs.get(run_id).is_none_or(|run| {
             matches!(
@@ -299,7 +291,7 @@ pub(crate) fn reconcile_concurrency_groups(inner: &mut InnerState) {
 /// The starvation sweep deliberately keeps such jobs queued forever (the
 /// host may appear), so the run never goes terminal on its own. Used to
 /// identify concurrency holders that would otherwise park the group forever.
-pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) -> bool {
+pub fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) -> bool {
     let Some(run) = inner.runs.get(run_id) else {
         return true;
     };
@@ -322,7 +314,7 @@ pub(crate) fn run_stuck_on_external_hosts(inner: &InnerState, run_id: &RunId) ->
 }
 
 /// Cancel a single job (job-level concurrency / fail-fast style).
-pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
+pub fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> usize {
     // MC-3: an expandable node cancelled before it dispatches never reaches
     // the completion path that settles its request correlation. Settle it
     // below exactly as completion would, with its own concluded status.
@@ -404,7 +396,7 @@ pub(crate) fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &J
     count
 }
 
-pub(crate) fn release_concurrency_for_run(inner: &mut InnerState, run_id: RunId) {
+pub fn release_concurrency_for_run(inner: &mut InnerState, run_id: RunId) {
     let keys: Vec<(String, String)> = inner.holder_keys.get(&run_id).cloned().unwrap_or_default();
     for key in keys {
         if let Some(group) = inner.concurrency_groups.get_mut(&key) {
@@ -433,7 +425,7 @@ pub(crate) fn release_concurrency_for_run(inner: &mut InnerState, run_id: RunId)
     inner.holder_keys.remove(&run_id);
 }
 
-pub(crate) fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id: &JobId) {
+pub fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id: &JobId) {
     let keys: Vec<(String, String)> = inner.concurrency_groups.keys().cloned().collect();
     for key in keys {
         let should_release = {
@@ -489,7 +481,7 @@ pub(crate) fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId,
 /// Release a single concurrency key acquired by a JobSet whose members all
 /// became terminal before any could dispatch (e.g. embedded gate overflow).
 /// Removes the running holder from the group and promotes the next pending.
-pub(crate) fn merge_jobset_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGate) {
+pub fn merge_jobset_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGate) {
     if let Some(existing) = gates.iter_mut().find(|existing| existing.key == gate.key) {
         existing.cancel_in_progress |= gate.cancel_in_progress;
         if gate.queue == preloop_gha_parser::ConcurrencyQueue::Single {
@@ -502,7 +494,7 @@ pub(crate) fn merge_jobset_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGat
     gates.sort_by(|left, right| left.key.cmp(&right.key));
 }
 
-pub(crate) fn release_holder_key(
+pub fn release_holder_key(
     inner: &mut InnerState,
     key: &(String, String),
     holder: &concurrency::Holder,
@@ -547,7 +539,7 @@ pub(crate) fn release_holder_key(
     }
 }
 
-pub(crate) fn release_jobset_admission(inner: &mut InnerState, id: &JobSetId) {
+pub fn release_jobset_admission(inner: &mut InnerState, id: &JobSetId) {
     let Some(admission) = inner.jobset_admissions.remove(id) else {
         return;
     };
@@ -557,7 +549,7 @@ pub(crate) fn release_jobset_admission(inner: &mut InnerState, id: &JobSetId) {
     }
 }
 
-pub(crate) fn advance_jobset_admission(
+pub fn advance_jobset_admission(
     inner: &mut InnerState,
     id: &JobSetId,
     promoted_key: Option<&(String, String)>,
@@ -608,7 +600,7 @@ pub(crate) fn advance_jobset_admission(
 }
 
 /// After a holder finishes, promote the next pending holder for the group.
-pub(crate) fn promote_next_from_group(
+pub fn promote_next_from_group(
     inner: &mut InnerState,
     key: &(String, String),
     _done: concurrency::Holder,
@@ -808,7 +800,7 @@ pub(crate) fn promote_next_from_group(
 /// - `Ok(false)` if parked as pending
 /// - `Err("cancelled")` if the arrival itself was cancelled (queue max overflow)
 /// - `Err(msg)` for evaluation / empty-group errors
-pub(crate) fn try_acquire_concurrency(
+pub fn try_acquire_concurrency(
     inner: &mut InnerState,
     key: (String, String),
     display_name: String,
@@ -917,7 +909,7 @@ pub(crate) fn try_acquire_concurrency(
     Ok(true)
 }
 
-pub(crate) fn track_holder_key(
+pub fn track_holder_key(
     inner: &mut InnerState,
     holder: &concurrency::Holder,
     key: (String, String),
@@ -929,11 +921,7 @@ pub(crate) fn track_holder_key(
     }
 }
 
-pub(crate) fn cancel_holder(
-    inner: &mut InnerState,
-    holder: &concurrency::Holder,
-    _reason: Option<&str>,
-) {
+pub fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reason: Option<&str>) {
     match holder {
         concurrency::Holder::Run(run_id) => {
             cancel_run_inner(inner, *run_id, Some("concurrency_cancelled"));
@@ -964,16 +952,16 @@ pub(crate) fn cancel_holder(
 }
 
 #[derive(Default)]
-pub(crate) struct SchedulingOutcome {
-    pub(crate) promoted: usize,
-    pub(crate) skipped: Vec<(RunId, JobId)>,
-    pub(crate) failed: Vec<(RunId, JobId)>,
+pub struct SchedulingOutcome {
+    pub promoted: usize,
+    pub skipped: Vec<(RunId, JobId)>,
+    pub failed: Vec<(RunId, JobId)>,
 }
 
 impl SchedulingOutcome {
     /// Fold a later sweep's result into this one, so a caller that promotes,
     /// expands and promotes again reports one combined outcome.
-    pub(crate) fn merge(&mut self, other: SchedulingOutcome) {
+    pub fn merge(&mut self, other: SchedulingOutcome) {
         self.promoted += other.promoted;
         self.skipped.extend(other.skipped);
         self.failed.extend(other.failed);
@@ -981,7 +969,7 @@ impl SchedulingOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DependencyDecision {
+pub enum DependencyDecision {
     Wait,
     Run,
     Skip,
@@ -994,7 +982,7 @@ pub(crate) enum DependencyDecision {
 /// dynamic-matrix node is handed to `inner.pending_expansions` so the heavy
 /// build happens outside the global lock. Callers run [`drain_expansions`]
 /// once they have released the guard.
-pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
+pub fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
     let mut outcome = SchedulingOutcome::default();
     loop {
         let mut promoted_by_base: BTreeMap<(RunId, String), u64> = BTreeMap::new();
@@ -1207,7 +1195,7 @@ pub(crate) fn promote_ready_jobs(inner: &mut InnerState) -> SchedulingOutcome {
     }
 }
 
-pub(crate) fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
+pub fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> DependencyDecision {
     if job.needs.is_empty() {
         return DependencyDecision::Run;
     }
@@ -1236,7 +1224,7 @@ pub(crate) fn dependency_decision(run: &RunRecord, job: &QueuedJob) -> Dependenc
     }
 }
 
-pub(crate) fn matching_need_ids(run: &RunRecord, need: &JobId) -> Vec<JobId> {
+pub fn matching_need_ids(run: &RunRecord, need: &JobId) -> Vec<JobId> {
     run.jobs
         .keys()
         .filter(|job_id| {
@@ -1250,14 +1238,14 @@ pub(crate) fn matching_need_ids(run: &RunRecord, need: &JobId) -> Vec<JobId> {
         .collect()
 }
 
-pub(crate) fn matching_need_statuses(run: &RunRecord, need: &JobId) -> Vec<ExecutionStatus> {
+pub fn matching_need_statuses(run: &RunRecord, need: &JobId) -> Vec<ExecutionStatus> {
     matching_need_ids(run, need)
         .iter()
         .filter_map(|job_id| run.jobs.get(job_id).copied())
         .collect()
 }
 
-pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<ExecutionStatus> {
+pub fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<ExecutionStatus> {
     let mut pending = job
         .needs
         .iter()
@@ -1308,7 +1296,7 @@ fn hosted_label_os(required: &str) -> Option<&'static str> {
 /// normal for an ephemeral pool. And a macOS label is only skipped when no
 /// macOS runner is registered — a Mac host serving `macos-latest` is a
 /// supported deployment, not an unsupported platform.
-pub(crate) fn unhostable_platform(
+pub fn unhostable_platform(
     job_labels: &[String],
     runners: impl IntoIterator<Item = &'static str>,
 ) -> Option<&'static str> {
@@ -1321,7 +1309,7 @@ pub(crate) fn unhostable_platform(
 }
 
 /// The operating systems registered runners declare, for [`unhostable_platform`].
-pub(crate) fn registered_runner_platforms(inner: &InnerState) -> Vec<&'static str> {
+pub fn registered_runner_platforms(inner: &InnerState) -> Vec<&'static str> {
     inner
         .runners
         .values()
@@ -1353,7 +1341,7 @@ pub(crate) fn registered_runner_platforms(inner: &InnerState) -> Vec<&'static st
 /// platform its workflow never targeted (a mac host claiming tokio's
 /// Linux-only `taskdump` build, say). A runner that declares no OS label at
 /// all stays eligible for any of them: it has told us nothing to contradict.
-pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]) -> bool {
+pub fn job_matches_runner(job_labels: &[String], runner_labels: &[String]) -> bool {
     if job_labels.is_empty() {
         return true;
     }
@@ -1384,10 +1372,7 @@ pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]
 /// Match an explicit job group against a registered runner's group.
 /// Group is separate from labels; missing metadata on a known runner is the
 /// default group (id 1, name `Default`).
-pub(crate) fn job_matches_runner_group(
-    required_group: Option<&str>,
-    runner: &RunnerCapabilities,
-) -> bool {
+pub fn job_matches_runner_group(required_group: Option<&str>, runner: &RunnerCapabilities) -> bool {
     let Some(required) = required_group.map(str::trim).filter(|v| !v.is_empty()) else {
         return true;
     };
@@ -1408,10 +1393,7 @@ pub(crate) fn job_matches_runner_group(
     }
 }
 
-pub(crate) fn job_matches_runner_capabilities(
-    job: &QueuedJob,
-    runner: &RunnerCapabilities,
-) -> bool {
+pub fn job_matches_runner_capabilities(job: &QueuedJob, runner: &RunnerCapabilities) -> bool {
     job_matches_runner(&job.runs_on, &runner.labels)
         && job_matches_runner_group(job.runner_group.as_deref(), runner)
 }
@@ -1441,7 +1423,7 @@ fn job_labels_covered_exactly(job_labels: &[String], runner_labels: &[String]) -
 /// an `ubuntu-22.04` job rather than let it sit — but only once no job it
 /// exactly matches is claimable, so the 22.04 job stays available for the
 /// machine the pool is building for it.
-pub(crate) fn take_matching_job(
+pub fn take_matching_job(
     inner: &mut InnerState,
     runner: &RunnerCapabilities,
     verified_runner_id: Option<i64>,
@@ -1517,14 +1499,14 @@ pub(crate) fn take_matching_job(
 /// How long an assignment or pool-pending mark stays authoritative. After
 /// expiry a job falls back to ordinary permissive scheduling so a crashed
 /// pool or dead machine can never wedge a queued job forever.
-pub(crate) const ASSIGNMENT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+pub const ASSIGNMENT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long a pre-claim assignment stays exclusive. Provisioning is bursty
 /// and pool runners exit unexpectedly; if the paired runner has not claimed
 /// within this window, any *verified* runner may take the job (and later
 /// registrations steal the pairing), because an already-dead owner can
 /// otherwise hold a job hostage for the full [`ASSIGNMENT_TTL`].
-pub(crate) const CLAIM_BINDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+pub const CLAIM_BINDING_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn assignment_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool {
     now.duration_since(at)
@@ -1599,7 +1581,7 @@ fn claim_permitted(inner: &InnerState, job: &QueuedJob, verified_runner_id: Opti
 ///
 /// With no pool and no strict flag this is a no-op, leaving external-runner
 /// installs on the historical first-poller-wins behavior.
-pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
+pub fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
     if !inner.pool_assignments_enabled && !inner.require_job_assignments {
         return;
     }
@@ -1662,21 +1644,21 @@ pub(crate) fn on_job_enqueued(inner: &mut InnerState, job: &QueuedJob) {
 
 /// Record the lifecycle transition where all `needs:` dependencies are
 /// satisfied. Jobs with no dependencies are stamped at construction time.
-pub(crate) fn stamp_dependencies_ready(job: &mut QueuedJob) {
+pub fn stamp_dependencies_ready(job: &mut QueuedJob) {
     if job.dependencies_ready_at_unix_nanos.is_none() {
         job.dependencies_ready_at_unix_nanos = Some(crate::models::now_unix_nanos());
     }
 }
 
 /// Record the first time a job waits behind a concurrency gate.
-pub(crate) fn stamp_concurrency_wait_started(job: &mut QueuedJob) {
+pub fn stamp_concurrency_wait_started(job: &mut QueuedJob) {
     if job.concurrency_wait_started_at_unix_nanos.is_none() {
         job.concurrency_wait_started_at_unix_nanos = Some(crate::models::now_unix_nanos());
     }
 }
 
 /// Record the first time an applicable concurrency gate admits this job.
-pub(crate) fn stamp_concurrency_acquired(job: &mut QueuedJob) {
+pub fn stamp_concurrency_acquired(job: &mut QueuedJob) {
     if job.concurrency_acquired_at_unix_nanos.is_none() {
         job.concurrency_acquired_at_unix_nanos = Some(crate::models::now_unix_nanos());
     }
@@ -1690,7 +1672,7 @@ pub(crate) fn stamp_concurrency_acquired(job: &mut QueuedJob) {
 /// where the job is pushed into `inner.queue` — stamp it. Requeues (a claimed
 /// job bouncing off a purged runner) preserve the original stamp so total
 /// queue time is still measured.
-pub(crate) fn stamp_ready_enqueue(job: &mut QueuedJob) {
+pub fn stamp_ready_enqueue(job: &mut QueuedJob) {
     stamp_dependencies_ready(job);
     job.enqueued_at_unix_nanos = crate::models::now_unix_nanos();
 }
@@ -1698,7 +1680,7 @@ pub(crate) fn stamp_ready_enqueue(job: &mut QueuedJob) {
 /// Pair a just-registered pool runner with the earliest pending job it can
 /// serve. Called from the registration path; the returned runner then claims
 /// the job by polling.
-pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
+pub fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
     if !inner.pool_assignments_enabled && !inner.require_job_assignments {
         return;
     }
@@ -1805,7 +1787,7 @@ pub(crate) fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
 }
 /// Sweep stale job bindings on a timer so an idle/wedged pool heals even when
 /// no runner is actively polling.
-pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::SystemTime) -> usize {
+pub fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::SystemTime) -> usize {
     let mut swept = 0;
     let queued_keys: std::collections::BTreeSet<(RunId, JobId)> = inner
         .queue
@@ -1873,7 +1855,7 @@ pub(crate) fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::Syste
 /// Drop the assignment for one job (requeue paths, deregistration purge).
 /// Returns whether the job is still queued so callers can re-mark it
 /// pool-pending when a replacement runner must be provisioned.
-pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> bool {
+pub fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -> bool {
     inner.job_assignments.remove(&(run_id, job_id.clone()));
     inner.pool_pending.remove(&(run_id, job_id.clone()));
     inner
@@ -1887,7 +1869,7 @@ pub(crate) fn clear_assignment(inner: &mut InnerState, run_id: RunId, job_id: &J
 /// Iterate only active session requests, not the historical request table.
 /// The latter retains completed records for late protocol reads and grows for
 /// the process lifetime.
-pub(crate) fn live_runner_assignments(
+pub fn live_runner_assignments(
     requests: &std::collections::BTreeMap<i64, crate::models::TaskAgentJobRequestRecord>,
     active_requests: &std::collections::BTreeMap<String, i64>,
     now: std::time::SystemTime,
@@ -1913,7 +1895,7 @@ pub(crate) fn live_runner_assignments(
     out.sort_by_key(|a| a.runner_id);
     out
 }
-pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
+pub fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     RunnerCapabilities {
         known: true,
         labels: runner.labels.clone(),
@@ -1922,7 +1904,7 @@ pub(crate) fn capabilities_of(runner: &RegisteredRunner) -> RunnerCapabilities {
     }
 }
 
-pub(crate) fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
+pub fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     let Some(max_parallel) = job.max_parallel else {
         return true;
     };
@@ -1948,7 +1930,7 @@ pub(crate) fn under_max_parallel(inner: &InnerState, job: &QueuedJob) -> bool {
     active_in_queue + active_running < max_parallel
 }
 
-pub(crate) fn apply_matrix_fail_fast(
+pub fn apply_matrix_fail_fast(
     inner: &mut InnerState,
     run_id: RunId,
     failed_job: &JobId,
@@ -2016,7 +1998,7 @@ pub(crate) fn apply_matrix_fail_fast(
     cancelled_jobs
 }
 
-pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
+pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
     let needs = job
         .needs
         .iter()
@@ -2067,7 +2049,7 @@ pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
         }
     }
 }
-pub(crate) fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
+pub fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
     let values = needs
         .iter()
         .filter_map(|need| {
@@ -2768,7 +2750,7 @@ fn fail_expansion_node(
 
 /// How to retire the request correlation an expandable node minted at submit.
 #[derive(Clone, Copy)]
-pub(crate) enum RequestRetirement {
+pub enum RequestRetirement {
     /// The node stays in the run as a terminal job: record the result and drop
     /// the live claim state (inflight + session claims), exactly as the
     /// completion path does for a job a runner actually finished.
@@ -2866,7 +2848,7 @@ fn expandable_job_ids(inner: &InnerState, run_id: RunId) -> BTreeSet<JobId> {
 ///
 /// Completed request records remain addressable for late runner reads, but
 /// lose every live-session and renewable-credential association.
-pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: ExecutionStatus) {
+pub fn settle_request(inner: &mut InnerState, request_id: i64, status: ExecutionStatus) {
     inner
         .session_active_requests
         .retain(|_, &mut rid| rid != request_id);
@@ -2889,7 +2871,7 @@ pub(crate) fn settle_request(inner: &mut InnerState, request_id: i64, status: Ex
 /// The abandoned attempt keeps its step manifest (log-blob mapping) and its
 /// live-log feed is closed so `logs -f` followers exit. The retry identity is
 /// seeded with a fresh pending manifest from the queued message.
-pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
+pub fn release_request_for_retry(inner: &mut InnerState, request_id: i64) {
     inner
         .session_active_requests
         .retain(|_, &mut rid| rid != request_id);
@@ -2974,7 +2956,7 @@ pub(crate) fn release_request_for_retry(inner: &mut InnerState, request_id: i64)
 /// things that clear `inflight_requests`. Without this the node's request
 /// stays inflight and renewable for the life of the process, resolvable to a
 /// job that expansion has already deleted from the run.
-pub(crate) fn retire_node_requests(
+pub fn retire_node_requests(
     inner: &mut InnerState,
     run_id: RunId,
     node_id: &JobId,
@@ -3139,7 +3121,7 @@ fn apply_expansion(
 /// workflow YAML and constructs a runner message plus a runtime token per
 /// inner job, which scales with the width of the callee matrix. Holding the
 /// mutex across that stalls every other request.
-pub(crate) async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
+pub async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
     let mut outcome = SchedulingOutcome::default();
     loop {
         // Phase 1 (locked): claim one node and snapshot its inputs.
@@ -3198,7 +3180,7 @@ pub(crate) async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome 
     }
 }
 
-pub(crate) fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
+pub fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
     if statuses.contains(&ExecutionStatus::Failure) {
         Some(ExecutionStatus::Failure)
     } else if statuses.contains(&ExecutionStatus::Cancelled) {
@@ -3216,7 +3198,7 @@ pub(crate) fn aggregate_need_status(statuses: &[ExecutionStatus]) -> Option<Exec
     }
 }
 
-pub(crate) fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextData> {
+pub fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::PipelineContextData> {
     let statuses = matching_need_statuses(run, need);
     let result = aggregate_need_status(&statuses)?;
     let mut outputs = BTreeMap::new();
@@ -3240,7 +3222,7 @@ pub(crate) fn need_context(run: &RunRecord, need: &JobId) -> Option<azdo::Pipeli
     Some(azdo::PipelineContextData::Dict(context))
 }
 
-pub(crate) fn status_string(status: ExecutionStatus) -> String {
+pub fn status_string(status: ExecutionStatus) -> String {
     match status {
         ExecutionStatus::Queued | ExecutionStatus::Pending | ExecutionStatus::InProgress => {
             "in_progress"
@@ -3257,7 +3239,7 @@ pub(crate) fn status_string(status: ExecutionStatus) -> String {
 /// the broker/results path do this in `complete_job_inner`; runs whose last
 /// transitions happen inside the scheduler (gated callers skipping, expansion
 /// failures) need it here too.
-pub(crate) fn finalize_run_if_complete(run: &mut RunRecord) {
+pub fn finalize_run_if_complete(run: &mut RunRecord) {
     if matches!(
         run.status,
         ExecutionStatus::Success
@@ -3272,7 +3254,7 @@ pub(crate) fn finalize_run_if_complete(run: &mut RunRecord) {
     }
 }
 
-pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
+pub fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> ExecutionStatus {
     let statuses = statuses.collect::<Vec<_>>();
     if statuses.iter().any(|status| {
         matches!(
@@ -3294,7 +3276,7 @@ pub(crate) fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> 
 ///
 /// Called after every claim so a co-hosted runner pool can select the correct
 /// base-image golden before provisioning the next runner.
-pub(crate) fn sync_next_job_labels(inner: &InnerState, shared: &std::sync::RwLock<Vec<String>>) {
+pub fn sync_next_job_labels(inner: &InnerState, shared: &std::sync::RwLock<Vec<String>>) {
     let labels = inner
         .queue
         .front()

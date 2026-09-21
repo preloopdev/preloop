@@ -3,7 +3,7 @@ use super::*;
 // ─── GHES org-prefixed wrapper handlers ─────────────────────────────────────
 // These extract the extra `:org` path parameter and delegate to the real handlers.
 
-pub(crate) async fn agent_lookup_org(
+pub async fn agent_lookup_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -11,7 +11,7 @@ pub(crate) async fn agent_lookup_org(
     agent_lookup(State(shared), Path(pool_id), Query(params)).await
 }
 
-pub(crate) async fn agent_lookup_by_id_org(
+pub async fn agent_lookup_by_id_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, agent_id)): Path<(String, i64, i64)>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -19,7 +19,7 @@ pub(crate) async fn agent_lookup_by_id_org(
     agent_lookup_by_id(State(shared), Path((pool_id, agent_id)), Query(params)).await
 }
 
-pub(crate) async fn register_runner_compat_org(
+pub async fn register_runner_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
     headers: axum::http::HeaderMap,
@@ -28,7 +28,7 @@ pub(crate) async fn register_runner_compat_org(
     register_runner_compat_pool_only(State(shared), Path(pool_id), headers, Json(request)).await
 }
 
-pub(crate) async fn register_runner_compat_org_2(
+pub async fn register_runner_compat_org_2(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, agent_id)): Path<(String, i64, String)>,
     headers: axum::http::HeaderMap,
@@ -42,7 +42,7 @@ pub(crate) async fn register_runner_compat_org_2(
     )
     .await
 }
-pub(crate) async fn replace_runner_compat_org_2(
+pub async fn replace_runner_compat_org_2(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, agent_id)): Path<(String, i64, String)>,
     headers: axum::http::HeaderMap,
@@ -57,7 +57,7 @@ pub(crate) async fn replace_runner_compat_org_2(
     .await
 }
 
-pub(crate) async fn create_session_compat_org(
+pub async fn create_session_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, session_id)): Path<(String, i64, String)>,
     headers: axum::http::HeaderMap,
@@ -75,7 +75,7 @@ pub(crate) async fn create_session_compat_org(
 }
 
 /// Session creation with only pool_id in path (no session_id — server generates it).
-pub(crate) async fn create_session_compat_pool_only(
+pub async fn create_session_compat_pool_only(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
     headers: axum::http::HeaderMap,
@@ -95,7 +95,7 @@ pub(crate) async fn create_session_compat_pool_only(
 }
 
 /// Org-prefixed session creation with only pool_id in path.
-pub(crate) async fn create_session_compat_org_pool_only(
+pub async fn create_session_compat_org_pool_only(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
     headers: axum::http::HeaderMap,
@@ -105,7 +105,7 @@ pub(crate) async fn create_session_compat_org_pool_only(
     create_session_compat_pool_only(State(shared), Path(pool_id), headers, identity, Json(body))
         .await
 }
-pub(crate) async fn delete_session_org(
+pub async fn delete_session_org(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -120,7 +120,7 @@ pub(crate) async fn delete_session_org(
     .await
 }
 
-pub(crate) async fn next_message_compat_org(
+pub async fn next_message_compat_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id)): Path<(String, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -129,7 +129,7 @@ pub(crate) async fn next_message_compat_org(
     next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await
 }
 
-pub(crate) async fn delete_pool_message_org(
+pub async fn delete_pool_message_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, message_id)): Path<(String, i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -144,7 +144,7 @@ pub(crate) async fn delete_pool_message_org(
     .await
 }
 
-pub(crate) async fn agent_request_get_org(
+pub async fn agent_request_get_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -152,7 +152,7 @@ pub(crate) async fn agent_request_get_org(
     agent_request_get(State(shared), Path((pool_id, request_id)), identity).await
 }
 
-pub(crate) async fn agent_request_ack_org(
+pub async fn agent_request_ack_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -160,7 +160,7 @@ pub(crate) async fn agent_request_ack_org(
     agent_request_ack(State(shared), Path((pool_id, request_id)), identity).await
 }
 
-pub(crate) async fn agent_request_patch_org(
+pub async fn agent_request_patch_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, pool_id, request_id)): Path<(String, i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -175,7 +175,7 @@ pub(crate) async fn agent_request_patch_org(
     .await
 }
 
-pub(crate) async fn patch_timeline_records_org(
+pub async fn patch_timeline_records_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
@@ -198,7 +198,7 @@ pub(crate) async fn patch_timeline_records_org(
     .await)
 }
 
-pub(crate) async fn get_timeline_records_org(
+pub async fn get_timeline_records_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
@@ -221,7 +221,7 @@ pub(crate) async fn get_timeline_records_org(
     .await)
 }
 
-pub(crate) async fn create_log_org(
+pub async fn create_log_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
     headers: HeaderMap,
@@ -232,7 +232,7 @@ pub(crate) async fn create_log_org(
     Ok(create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await)
 }
 
-pub(crate) async fn append_log_org(
+pub async fn append_log_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, log_id)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
@@ -243,7 +243,7 @@ pub(crate) async fn append_log_org(
     Ok(append_log(State(shared), Path((scope, hub, plan_id, log_id)), body).await)
 }
 
-pub(crate) async fn console_log_org(
+pub async fn console_log_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id, timeline_id, record_id)): Path<(
         String,
@@ -273,7 +273,7 @@ pub(crate) async fn console_log_org(
     .await)
 }
 
-pub(crate) async fn finish_job_org(
+pub async fn finish_job_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, scope, hub, plan_id)): Path<(String, String, String, String)>,
     headers: HeaderMap,
@@ -290,7 +290,7 @@ pub(crate) async fn finish_job_org(
     Ok(finish_job(State(shared), Path((scope, hub, plan_id)), Json(event)).await)
 }
 
-pub(crate) async fn action_download_info_org(
+pub async fn action_download_info_org(
     State(shared): State<Arc<SharedState>>,
     Path((_org, _scope, _hub, _plan_id)): Path<(String, String, String, String)>,
     Json(request): Json<serde_json::Value>,

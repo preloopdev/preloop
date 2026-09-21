@@ -56,7 +56,7 @@ const WORKER_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 /// Past the ceiling the job's normal timeout resumes ticking and the reaper
 /// cancels it through the ordinary path, so exhaustion needs no separate
 /// enforcement.
-pub(crate) const MAX_PAUSE_CREDIT: Duration = Duration::from_secs(4 * 60 * 60);
+pub const MAX_PAUSE_CREDIT: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// Sessions whose history is retained after close. Archives are read by
 /// reconnecting agents; without a bound they are a per-run memory leak for the
@@ -76,7 +76,7 @@ const MAX_COMPLETED_OPS: usize = 256;
 const AGENT_CONTROL_CAPABILITIES: &[&str] = &["step.retry", "job.retry_from", "job.abort"];
 
 #[derive(Debug, Clone)]
-pub(crate) struct AgentLease {
+pub struct AgentLease {
     lease_id: String,
     controller: String,
     capabilities: Vec<String>,
@@ -85,34 +85,34 @@ pub(crate) struct AgentLease {
 /// Server-side session record. The wire projection is
 /// [`preloop_gha_protocol::debug_session::DebugSession`].
 #[derive(Debug, Clone)]
-pub(crate) struct SessionRecord {
-    pub(crate) session: DebugSession,
+pub struct SessionRecord {
+    pub session: DebugSession,
     /// Job request this session pauses, so the reaper can find it.
-    pub(crate) request_id: i64,
+    pub request_id: i64,
     /// Agent job the session belongs to. Worker requests are authorized
     /// against this, so one job's runtime token cannot read, resolve, or
     /// close another job's session.
-    pub(crate) agent_job_id: uuid::Uuid,
+    pub agent_job_id: uuid::Uuid,
     /// Verdict awaiting pickup by the worker. Cleared once delivered.
-    pub(crate) pending_verdict: Option<Verdict>,
+    pub pending_verdict: Option<Verdict>,
     /// Revert policy the controller chose alongside the verdict.
-    pub(crate) pending_revert: preloop_gha_protocol::debug_session::RevertPolicy,
+    pub pending_revert: preloop_gha_protocol::debug_session::RevertPolicy,
     /// Source revision the controller supplied with the verdict.
-    pub(crate) pending_revision: Option<String>,
+    pub pending_revision: Option<String>,
     /// Step index to restart from, when the controller asked for retry-from.
-    pub(crate) pending_retry_from_step: Option<usize>,
+    pub pending_retry_from_step: Option<usize>,
     /// When the pause began; drives `paused_seconds`.
-    pub(crate) paused_since: Option<SystemTime>,
+    pub paused_since: Option<SystemTime>,
     /// Last time the worker polled. Detects an abandoned session.
-    pub(crate) worker_seen_at: SystemTime,
+    pub worker_seen_at: SystemTime,
     /// Single mutating agent controller, if one has leased the session.
-    pub(crate) agent_lease: Option<AgentLease>,
+    pub agent_lease: Option<AgentLease>,
     /// Structured events retained for reconnecting agents.
-    pub(crate) agent_events: Vec<AgentEvent>,
+    pub agent_events: Vec<AgentEvent>,
     /// Mutating agent operations, retained as an audit trail.
-    pub(crate) agent_audit: Vec<AgentAuditEntry>,
+    pub agent_audit: Vec<AgentAuditEntry>,
     /// Completed requests, so a retry of the same request ID is harmless.
-    pub(crate) completed_agent_ops: BTreeMap<String, AgentOperationResponse>,
+    pub completed_agent_ops: BTreeMap<String, AgentOperationResponse>,
 }
 
 impl SessionRecord {
@@ -193,7 +193,7 @@ impl SessionRecord {
 
 /// Registry of live debug sessions, keyed by session id.
 #[derive(Debug, Default)]
-pub(crate) struct DebugSessionRegistry {
+pub struct DebugSessionRegistry {
     sessions: BTreeMap<String, SessionRecord>,
     /// Retained structured history after a worker closes a session.
     agent_event_archive: BTreeMap<String, Vec<AgentEvent>>,
@@ -225,7 +225,7 @@ impl DebugSessionRegistry {
     /// Reopening for the same (run, job) replaces the prior record: a retry
     /// that fails again is the same debugging session continuing, and the
     /// attempt journal carries the history.
-    pub(crate) fn open(
+    pub fn open(
         &mut self,
         request_id: i64,
         req: OpenSessionRequest,
@@ -321,11 +321,7 @@ impl DebugSessionRegistry {
     }
 
     /// Record a controller's decision. Returns the updated session.
-    pub(crate) fn set_verdict(
-        &mut self,
-        session_id: &str,
-        req: &VerdictRequest,
-    ) -> Option<DebugSession> {
+    pub fn set_verdict(&mut self, session_id: &str, req: &VerdictRequest) -> Option<DebugSession> {
         let record = self.sessions.get_mut(session_id)?;
         record.pending_verdict = Some(req.verdict);
         record.pending_revert = req.revert;
@@ -345,7 +341,7 @@ impl DebugSessionRegistry {
         Some(record.session.clone())
     }
 
-    pub(crate) fn acquire_agent_lease(
+    pub fn acquire_agent_lease(
         &mut self,
         session_id: &str,
         req: &AgentLeaseRequest,
@@ -395,11 +391,7 @@ impl DebugSessionRegistry {
         Ok(response)
     }
 
-    pub(crate) fn release_agent_lease(
-        &mut self,
-        session_id: &str,
-        lease_id: &str,
-    ) -> Result<(), String> {
+    pub fn release_agent_lease(&mut self, session_id: &str, lease_id: &str) -> Result<(), String> {
         let record = self
             .sessions
             .get_mut(session_id)
@@ -417,7 +409,7 @@ impl DebugSessionRegistry {
         Ok(())
     }
 
-    pub(crate) fn agent_events(
+    pub fn agent_events(
         &self,
         session_id: &str,
         after: u64,
@@ -440,7 +432,7 @@ impl DebugSessionRegistry {
         })
     }
 
-    pub(crate) fn agent_audit(&self, session_id: &str) -> Result<Vec<AgentAuditEntry>, String> {
+    pub fn agent_audit(&self, session_id: &str) -> Result<Vec<AgentAuditEntry>, String> {
         self.sessions
             .get(session_id)
             .map(|record| record.agent_audit.clone())
@@ -448,7 +440,7 @@ impl DebugSessionRegistry {
             .ok_or_else(|| format!("no such session: {session_id}"))
     }
 
-    pub(crate) fn agent_operation(
+    pub fn agent_operation(
         &mut self,
         session_id: &str,
         req: AgentOperationRequest,
@@ -588,11 +580,7 @@ impl DebugSessionRegistry {
     ///
     /// Consuming the verdict is what banks the paused duration — the job
     /// resumes executing at this instant, so timeout accounting resumes too.
-    pub(crate) fn take_verdict(
-        &mut self,
-        session_id: &str,
-        now: SystemTime,
-    ) -> Option<VerdictResponse> {
+    pub fn take_verdict(&mut self, session_id: &str, now: SystemTime) -> Option<VerdictResponse> {
         let record = self.sessions.get_mut(session_id)?;
         record.worker_seen_at = now;
         let verdict = record.pending_verdict.take();
@@ -610,7 +598,7 @@ impl DebugSessionRegistry {
     }
 
     /// Close a session once the worker has acted on its verdict.
-    pub(crate) fn close(&mut self, session_id: &str, state: SessionState, now: SystemTime) {
+    pub fn close(&mut self, session_id: &str, state: SessionState, now: SystemTime) {
         let retain_for_agent_reconnect = state == SessionState::Resumed
             && self
                 .sessions
@@ -680,7 +668,7 @@ impl DebugSessionRegistry {
     /// because a job that failed, retried, and failed again banked time in each
     /// pause, then capped: a per-session ceiling would be trivially bypassed by
     /// failing repeatedly.
-    pub(crate) fn paused_for_request(&self, request_id: i64, now: SystemTime) -> Duration {
+    pub fn paused_for_request(&self, request_id: i64, now: SystemTime) -> Duration {
         self.sessions
             .values()
             .filter(|r| r.request_id == request_id)
@@ -701,7 +689,7 @@ impl DebugSessionRegistry {
     /// disconnect reaper: at that point the pause is no longer something the
     /// control plane is willing to wait for. The ceiling applies to the
     /// request's whole history, so reopening a session does not renew it.
-    pub(crate) fn is_paused(&self, request_id: i64, now: SystemTime) -> bool {
+    pub fn is_paused(&self, request_id: i64, now: SystemTime) -> bool {
         let held = self
             .sessions
             .values()
@@ -713,22 +701,22 @@ impl DebugSessionRegistry {
     ///
     /// Cloned out under the state lock once per poll, so waiting itself never
     /// touches the lock the whole control plane shares.
-    pub(crate) fn notify(&self) -> Arc<tokio::sync::Notify> {
+    pub fn notify(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.notify)
     }
 
     /// The agent job a session belongs to, for authorizing worker requests.
-    pub(crate) fn owner(&self, session_id: &str) -> Option<uuid::Uuid> {
+    pub fn owner(&self, session_id: &str) -> Option<uuid::Uuid> {
         self.sessions.get(session_id).map(|r| r.agent_job_id)
     }
 
     /// Session by id.
-    pub(crate) fn get(&self, session_id: &str) -> Option<&SessionRecord> {
+    pub fn get(&self, session_id: &str) -> Option<&SessionRecord> {
         self.sessions.get(session_id)
     }
 
     /// All open sessions, newest first.
-    pub(crate) fn list(&self) -> Vec<DebugSession> {
+    pub fn list(&self) -> Vec<DebugSession> {
         let mut out: Vec<_> = self
             .sessions
             .values()
@@ -746,7 +734,7 @@ impl DebugSessionRegistry {
     /// been cancelled or completed is the same situation arrived at from the
     /// other direction: its session can no longer be acted on, so retaining it
     /// only leaks memory and confuses `preloop debug`.
-    pub(crate) fn sweep_abandoned(
+    pub fn sweep_abandoned(
         &mut self,
         now: SystemTime,
         active_requests: &std::collections::BTreeSet<i64>,
@@ -782,7 +770,7 @@ impl DebugSessionRegistry {
 
     /// Resolve a user-supplied reference: full session id, or a unique prefix
     /// of a session id or run id.
-    pub(crate) fn resolve(&self, reference: &str) -> Option<String> {
+    pub fn resolve(&self, reference: &str) -> Option<String> {
         if self.sessions.contains_key(reference) || self.agent_event_archive.contains_key(reference)
         {
             return Some(reference.to_owned());
@@ -805,8 +793,8 @@ impl DebugSessionRegistry {
 
     /// Move a session's pause start into the past so timeout suspension can be
     /// exercised without sleeping.
-    #[cfg(test)]
-    pub(crate) fn backdate_pause_for_test(&mut self, session_id: &str, since: SystemTime) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn backdate_pause_for_test(&mut self, session_id: &str, since: SystemTime) {
         if let Some(record) = self.sessions.get_mut(session_id) {
             record.paused_since = Some(since);
         }
@@ -851,7 +839,7 @@ fn plausible_workspace(path: &str) -> bool {
 /// 5. The exchange is one-shot. The worker spends it during job setup, before
 ///    the first step runs, so a step that later replays the runtime token it
 ///    sees as `ACTIONS_RUNTIME_TOKEN` finds nothing left to spend.
-pub(crate) async fn issue_worker_token(
+pub async fn issue_worker_token(
     State(shared): State<Arc<SharedState>>,
     Extension(caller): Extension<JobRuntimeIdentity>,
     Json(req): Json<WorkerTokenRequest>,
@@ -938,7 +926,7 @@ pub(crate) async fn issue_worker_token(
 /// Authorized against the runtime token's own job: a worker may only pause
 /// itself. Without this a live job's token opens sessions for any other live
 /// job, suspending its timeout and publishing an invented failure.
-pub(crate) async fn open_session(
+pub async fn open_session(
     State(shared): State<Arc<SharedState>>,
     Extension(caller): Extension<WorkerJob>,
     Json(req): Json<OpenSessionRequest>,
@@ -990,7 +978,7 @@ pub(crate) async fn open_session(
 
 /// Query parameters for the worker's verdict long poll.
 #[derive(Debug, Deserialize)]
-pub(crate) struct VerdictPollQuery {
+pub struct VerdictPollQuery {
     /// Seconds to hold the request open. Clamped to [`VERDICT_POLL_MAX`].
     #[serde(default)]
     wait: Option<u64>,
@@ -1021,7 +1009,7 @@ fn owned_session(
 ///
 /// Returns `verdict: null` on timeout. A null is emphatically not an abort —
 /// conflating them would turn a flaky connection into a cancelled job.
-pub(crate) async fn poll_verdict(
+pub async fn poll_verdict(
     State(shared): State<Arc<SharedState>>,
     Extension(caller): Extension<WorkerJob>,
     Path(session_id): Path<String>,
@@ -1077,7 +1065,7 @@ pub(crate) async fn poll_verdict(
 
 /// Body of a worker's session close.
 #[derive(Debug, Deserialize)]
-pub(crate) struct CloseSessionRequest {
+pub struct CloseSessionRequest {
     /// Terminal state the worker reached. Absent means it resumed.
     #[serde(default = "resumed")]
     state: SessionState,
@@ -1088,7 +1076,7 @@ fn resumed() -> SessionState {
 }
 
 /// Worker: report that a verdict has been acted on.
-pub(crate) async fn close_session(
+pub async fn close_session(
     State(shared): State<Arc<SharedState>>,
     Extension(caller): Extension<WorkerJob>,
     Path(session_id): Path<String>,
@@ -1103,7 +1091,7 @@ pub(crate) async fn close_session(
 }
 
 /// Controller: list open sessions.
-pub(crate) async fn list_sessions(
+pub async fn list_sessions(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
@@ -1111,7 +1099,7 @@ pub(crate) async fn list_sessions(
 }
 
 /// Controller: fetch one session, by id or unique prefix.
-pub(crate) async fn get_session(
+pub async fn get_session(
     State(shared): State<Arc<SharedState>>,
     Path(reference): Path<String>,
 ) -> Result<Json<DebugSession>, ApiError> {
@@ -1128,7 +1116,7 @@ pub(crate) async fn get_session(
 }
 
 /// Controller: issue a verdict.
-pub(crate) async fn post_verdict(
+pub async fn post_verdict(
     State(shared): State<Arc<SharedState>>,
     Path(reference): Path<String>,
     Json(req): Json<VerdictRequest>,
@@ -1162,7 +1150,7 @@ pub(crate) async fn post_verdict(
 }
 
 /// Agent: acquire the single mutating controller lease.
-pub(crate) async fn agent_acquire_lease(
+pub async fn agent_acquire_lease(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
     Json(req): Json<AgentLeaseRequest>,
@@ -1180,7 +1168,7 @@ pub(crate) async fn agent_acquire_lease(
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AgentEventsQuery {
+pub struct AgentEventsQuery {
     #[serde(default)]
     after: u64,
     /// Seconds to wait for a new event when the cursor is current.
@@ -1189,7 +1177,7 @@ pub(crate) struct AgentEventsQuery {
 }
 
 /// Agent: fetch structured events after a sequence number.
-pub(crate) async fn agent_events(
+pub async fn agent_events(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
     Query(query): Query<AgentEventsQuery>,
@@ -1225,7 +1213,7 @@ pub(crate) async fn agent_events(
 }
 
 /// Agent: submit an idempotent, versioned operation.
-pub(crate) async fn agent_operation(
+pub async fn agent_operation(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
     Json(req): Json<AgentOperationRequest>,
@@ -1243,7 +1231,7 @@ pub(crate) async fn agent_operation(
 }
 
 /// Agent: release the controller lease without changing job state.
-pub(crate) async fn agent_release_lease(
+pub async fn agent_release_lease(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
     Json(req): Json<serde_json::Value>,
@@ -1265,7 +1253,7 @@ pub(crate) async fn agent_release_lease(
 }
 
 /// Agent: retrieve the mutation audit trail for an open session.
-pub(crate) async fn agent_audit(
+pub async fn agent_audit(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Vec<AgentAuditEntry>>, ApiError> {
@@ -1282,7 +1270,7 @@ pub(crate) async fn agent_audit(
 }
 
 /// Sweep sessions the reaper can no longer justify keeping.
-pub(crate) fn sweep(
+pub fn sweep(
     registry: &mut DebugSessionRegistry,
     now: SystemTime,
     active_requests: &std::collections::BTreeSet<i64>,
@@ -1293,8 +1281,8 @@ pub(crate) fn sweep(
 }
 
 /// Build an [`OpenSessionRequest`] for tests in other modules.
-#[cfg(test)]
-pub(crate) fn test_open_request(
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_open_request(
     run_id: preloop_gha_protocol::RunId,
     job_id: preloop_gha_protocol::JobId,
 ) -> OpenSessionRequest {

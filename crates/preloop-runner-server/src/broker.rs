@@ -1,15 +1,15 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunnerAuthSource {
+pub enum RunnerAuthSource {
     RunnerListenToken,
     RuntimeJwt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AuthenticatedRunnerId {
-    pub(crate) runner_id: i64,
-    pub(crate) auth_source: RunnerAuthSource,
+pub struct AuthenticatedRunnerId {
+    pub runner_id: i64,
+    pub auth_source: RunnerAuthSource,
 }
 ///
 /// The two are deliberately separate counters. `Lifecycle` records a
@@ -19,16 +19,12 @@ pub(crate) struct AuthenticatedRunnerId {
 /// `acquirejob`, where the listen token is the only credential it has. Folding
 /// these into one counter would make that zero-gate unreachable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ListenerTokenProbe {
+pub enum ListenerTokenProbe {
     Lifecycle,
     Acquire,
 }
 
-pub(crate) fn record_listener_token_use(
-    state: &AppState,
-    probe: ListenerTokenProbe,
-    route: &'static str,
-) {
+pub fn record_listener_token_use(state: &AppState, probe: ListenerTokenProbe, route: &'static str) {
     use std::sync::atomic::Ordering::Relaxed;
     match probe {
         ListenerTokenProbe::Lifecycle => {
@@ -53,7 +49,7 @@ pub(crate) fn record_listener_token_use(
     }
 }
 
-pub(crate) async fn authenticated_runner_id_with_source(
+pub async fn authenticated_runner_id_with_source(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     expected_runner_id: Option<i64>,
@@ -85,32 +81,32 @@ pub(crate) async fn authenticated_runner_id_with_source(
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BrokerAcquireJobRequest {
-    pub(crate) job_message_id: uuid::Uuid,
+pub struct BrokerAcquireJobRequest {
+    pub job_message_id: uuid::Uuid,
     // serde: accepted from the runner but not needed by acquisition logic.
     #[allow(dead_code)]
-    pub(crate) billing_owner_id: Option<String>,
+    pub billing_owner_id: Option<String>,
     // serde: accepted from the runner but not needed by acquisition logic.
     #[allow(dead_code)]
-    pub(crate) runner_os: Option<String>,
+    pub runner_os: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BrokerRenewJobRequest {
-    pub(crate) job_id: uuid::Uuid,
+pub struct BrokerRenewJobRequest {
+    pub job_id: uuid::Uuid,
     #[serde(rename = "planId")]
-    pub(crate) _plan_id: String,
-    pub(crate) conclusion: Option<String>,
+    pub _plan_id: String,
+    pub conclusion: Option<String>,
     #[serde(default)]
-    pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+    pub outputs: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
-    pub(crate) annotations: Vec<serde_json::Value>,
+    pub annotations: Vec<serde_json::Value>,
     #[serde(default)]
-    pub(crate) step_results: Vec<preloop_gha_protocol::CompletionStepResult>,
+    pub step_results: Vec<preloop_gha_protocol::CompletionStepResult>,
 }
 
-pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
+pub fn execution_status_from_runner_result(result: &str) -> Option<ExecutionStatus> {
     match result.to_ascii_lowercase().as_str() {
         "success" | "succeeded" | "succeededwithissues" => Some(ExecutionStatus::Success),
         "failure" | "failed" => Some(ExecutionStatus::Failure),
@@ -124,7 +120,7 @@ pub(crate) fn execution_status_from_runner_result(result: &str) -> Option<Execut
     }
 }
 
-pub(crate) fn broker_run_service_url(runner_id: i64) -> String {
+pub fn broker_run_service_url(runner_id: i64) -> String {
     format!("{}/broker/{runner_id}/", runner_base_url())
 }
 
@@ -135,21 +131,21 @@ pub(crate) fn broker_run_service_url(runner_id: i64) -> String {
 /// listen origin so in-VM runners and their jobs reach the host exclusively
 /// via the mounted control socket and in-guest loopback bridge, never the
 /// public tunnel.
-pub(crate) fn runner_base_url() -> String {
+pub fn runner_base_url() -> String {
     std::env::var("PRELOOP_RUNNER_URL")
         .unwrap_or_else(|_| public_base_url())
         .trim_end_matches('/')
         .to_owned()
 }
 
-pub(crate) fn public_base_url() -> String {
+pub fn public_base_url() -> String {
     std::env::var("PRELOOP_PUBLIC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_owned())
         .trim_end_matches('/')
         .to_owned()
 }
 
-pub(crate) fn format_reusable_workflow_ref(
+pub fn format_reusable_workflow_ref(
     repository: &str,
     workflow_ref: &str,
     caller_ref: &str,
@@ -164,7 +160,7 @@ pub(crate) fn format_reusable_workflow_ref(
     workflow_ref.to_owned()
 }
 
-pub(crate) fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
+pub fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
     let issuer = value.trim_end_matches('/').to_owned();
     if issuer.is_empty()
         || !(issuer.starts_with("https://") || issuer.starts_with("http://"))
@@ -178,7 +174,7 @@ pub(crate) fn normalize_oidc_issuer(value: String) -> anyhow::Result<String> {
 
 /// Return the effective OIDC issuer URL, falling back to
 /// `{public_base_url}/oidc` when not explicitly configured.
-pub(crate) fn oidc_issuer_url(inner: &InnerState) -> String {
+pub fn oidc_issuer_url(inner: &InnerState) -> String {
     if inner.oidc_issuer.is_empty() {
         format!("{}/oidc", runner_base_url())
     } else {
@@ -186,7 +182,7 @@ pub(crate) fn oidc_issuer_url(inner: &InnerState) -> String {
     }
 }
 
-pub(crate) fn websocket_base_url() -> String {
+pub fn websocket_base_url() -> String {
     let base = runner_base_url();
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -197,7 +193,7 @@ pub(crate) fn websocket_base_url() -> String {
     }
 }
 
-pub(crate) fn runner_server_url() -> String {
+pub fn runner_server_url() -> String {
     format!("{}/runner/server", runner_base_url())
 }
 
@@ -206,14 +202,11 @@ pub(crate) fn runner_server_url() -> String {
 /// The official runner treats these settings as optional and applies its own
 /// defaults when the endpoint is unavailable. Returning an explicit default
 /// response keeps that negotiation deterministic for self-hosted deployments.
-pub(crate) async fn runner_settings() -> Json<azdo::RunnerServerSettings> {
+pub async fn runner_settings() -> Json<azdo::RunnerServerSettings> {
     Json(azdo::RunnerServerSettings::default())
 }
 
-pub(crate) fn broker_job_ref(
-    request: &TaskAgentJobRequestRecord,
-    runner_id: i64,
-) -> serde_json::Value {
+pub fn broker_job_ref(request: &TaskAgentJobRequestRecord, runner_id: i64) -> serde_json::Value {
     json!({
         "messageId": request.request_id,
         "messageType": "RunnerJobRequest",
@@ -226,7 +219,7 @@ pub(crate) fn broker_job_ref(
     })
 }
 
-pub(crate) fn broker_job_ref_root(
+pub fn broker_job_ref_root(
     request: &TaskAgentJobRequestRecord,
     runner_id: i64,
 ) -> serde_json::Value {
@@ -247,7 +240,7 @@ pub(crate) fn broker_job_ref_root(
 
 /// Allocate a session-unique broker message id that cannot collide with
 /// `request_id` values used as RunnerJobRequest messageIds.
-pub(crate) fn next_broker_message_id(inner: &mut InnerState) -> i64 {
+pub fn next_broker_message_id(inner: &mut InnerState) -> i64 {
     // request_ids start at 1 and increase; keep message ids in a separate high
     // range so cancels never reuse a past/future request_id.
     const MESSAGE_ID_BASE: i64 = 1_000_000;
@@ -289,7 +282,7 @@ fn runner_version_deprecated_response(
     )
 }
 
-pub(crate) async fn next_message_broker_ref(
+pub async fn next_message_broker_ref(
     State(shared): State<Arc<SharedState>>,
     Path(_pool_id): Path<i64>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -461,7 +454,7 @@ pub(crate) async fn next_message_broker_ref(
 /// in `azdo_sessions` and receive the full encrypted `PipelineAgentJobRequest`
 /// message via `next_message_compat`.  All other sessions (broker-hybrid tests,
 /// legacy broker flow) get the lightweight `RunnerJobRequest` broker ref.
-pub(crate) async fn next_message_disttask(
+pub async fn next_message_disttask(
     State(shared): State<Arc<SharedState>>,
     Path(pool_id): Path<i64>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -488,7 +481,7 @@ pub(crate) async fn next_message_disttask(
     }
 }
 
-pub(crate) async fn broker_session_root(
+pub async fn broker_session_root(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
@@ -557,7 +550,7 @@ fn record_claim_queue_wait(shared: &Arc<SharedState>, claimed: &Option<QueuedJob
         .record_queue_wait("claimed", elapsed);
 }
 
-pub(crate) async fn broker_delete_session_root(
+pub async fn broker_delete_session_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -581,7 +574,7 @@ pub(crate) async fn broker_delete_session_root(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(crate) async fn broker_delete_session_by_path(
+pub async fn broker_delete_session_by_path(
     State(shared): State<Arc<SharedState>>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
@@ -597,7 +590,7 @@ pub(crate) async fn broker_delete_session_by_path(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(crate) async fn remove_broker_session(
+pub async fn remove_broker_session(
     shared: &Arc<SharedState>,
     session_id: &str,
     runner_id: i64,
@@ -616,7 +609,7 @@ pub(crate) async fn remove_broker_session(
         None => Err(ApiError::not_found("broker session not found")),
     }
 }
-pub(crate) async fn authenticated_runner_id(
+pub async fn authenticated_runner_id(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     expected_runner_id: Option<i64>,
@@ -637,7 +630,7 @@ pub(crate) async fn authenticated_runner_id(
 /// Authenticate a broker renew/complete call with the runtime token for the
 /// exact agent job in the body. The runner listen token is deliberately
 /// observed and rejected: acquirejob is its only broker lifecycle call.
-pub(crate) async fn authenticated_runner_id_for_job(
+pub async fn authenticated_runner_id_for_job(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     expected_runner_id: i64,
@@ -693,7 +686,7 @@ pub(crate) async fn authenticated_runner_id_for_job(
     Ok(expected_runner_id)
 }
 
-pub(crate) fn ensure_broker_request_owner(
+pub fn ensure_broker_request_owner(
     inner: &InnerState,
     request_id: i64,
     runner_id: i64,
@@ -746,7 +739,7 @@ pub(crate) fn ensure_broker_request_owner(
     }
 }
 
-pub(crate) async fn next_message_broker_ref_root(
+pub async fn next_message_broker_ref_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
@@ -872,7 +865,7 @@ pub(crate) async fn next_message_broker_ref_root(
     }
 }
 
-pub(crate) async fn broker_acknowledge_root(
+pub async fn broker_acknowledge_root(
     State(_shared): State<Arc<SharedState>>,
     Query(_params): Query<std::collections::HashMap<String, String>>,
 ) -> StatusCode {
@@ -883,7 +876,7 @@ pub(crate) async fn broker_acknowledge_root(
     StatusCode::OK
 }
 
-pub(crate) async fn broker_acquire_job(
+pub async fn broker_acquire_job(
     State(shared): State<Arc<SharedState>>,
     Path(runner_id): Path<i64>,
     headers: HeaderMap,
@@ -1206,7 +1199,7 @@ pub(crate) async fn broker_acquire_job(
 /// Returns the number of steps refreshed. The pinned ids travel on the
 /// message ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]),
 /// so this deliberately matches by step id rather than by token shape.
-pub(crate) fn re_mint_snapshot_tokens(
+pub fn re_mint_snapshot_tokens(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     state: &AppState,
 ) -> usize {
@@ -1234,9 +1227,9 @@ pub(crate) fn re_mint_snapshot_tokens(
 /// A dispatched job's `GITHUB_TOKEN` and, when the App installation could not
 /// grant everything requested, the set the token actually carries.
 #[derive(Debug)]
-pub(crate) struct MintedGitHubToken {
-    pub(crate) token: String,
-    pub(crate) effective_permissions: Option<BTreeMap<String, String>>,
+pub struct MintedGitHubToken {
+    pub token: String,
+    pub effective_permissions: Option<BTreeMap<String, String>>,
 }
 
 /// Apply a freshly minted dispatch token to the job message: inject the two
@@ -1356,7 +1349,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
 /// released for redelivery without concluding the retry. The latter also
 /// migrates snapshots written by versions that requeued the job but left its
 /// old runner ownership live.
-pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
+pub async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usize {
     let (recovered, unclaimable) = {
         let mut inner = shared.state.inner.lock().await;
         let live_requests: std::collections::BTreeSet<i64> = inner
@@ -1446,7 +1439,7 @@ pub(crate) async fn reconcile_orphaned_claims(shared: &Arc<SharedState>) -> usiz
     recovered + unclaimable.len()
 }
 
-pub(crate) async fn mint_dispatch_github_token(
+pub async fn mint_dispatch_github_token(
     shared: &Arc<SharedState>,
     request: &GitHubTokenRequest,
 ) -> Result<Option<MintedGitHubToken>, ApiError> {
@@ -1591,7 +1584,7 @@ fn wire_scope_to_kebab(scope: &str) -> String {
     out
 }
 
-pub(crate) async fn broker_renew_job(
+pub async fn broker_renew_job(
     State(shared): State<Arc<SharedState>>,
     Path(runner_id): Path<i64>,
     headers: HeaderMap,
@@ -1629,7 +1622,7 @@ pub(crate) async fn broker_renew_job(
     Ok(Json(json!({"lockedUntil": record.locked_until})))
 }
 
-pub(crate) async fn broker_complete_job(
+pub async fn broker_complete_job(
     State(shared): State<Arc<SharedState>>,
     Path(runner_id): Path<i64>,
     headers: HeaderMap,

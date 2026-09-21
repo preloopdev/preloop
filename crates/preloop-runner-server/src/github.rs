@@ -27,9 +27,9 @@ use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowS
 /// GitHub, rather than Preloop, owns. This keeps release and artifact-publish
 /// workflows out of the local webhook dispatcher while leaving the default
 /// generic forges-only behavior unchanged.
-pub(crate) const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
+pub const GITHUB_OWNED_WORKFLOWS_ENV: &str = "PRELOOP_GITHUB_SKIP_WORKFLOWS";
 
-pub(crate) fn configured_github_owned_workflows() -> BTreeSet<String> {
+pub fn configured_github_owned_workflows() -> BTreeSet<String> {
     std::env::var(GITHUB_OWNED_WORKFLOWS_ENV)
         .ok()
         .map(|value| {
@@ -43,7 +43,7 @@ pub(crate) fn configured_github_owned_workflows() -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-pub(crate) fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<String>) -> bool {
+pub fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<String>) -> bool {
     let path = format!(".github/workflows/{filename}");
     configured
         .iter()
@@ -52,76 +52,76 @@ pub(crate) fn is_github_owned_workflow(filename: &str, configured: &BTreeSet<Str
 
 /// Webhook push event payload.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct PushEvent {
+pub struct PushEvent {
     /// Git reference for the push event.
     #[serde(rename = "ref")]
-    pub(crate) git_ref: String,
+    pub git_ref: String,
     /// Previous commit SHA.
-    pub(crate) before: String,
+    pub before: String,
     /// Current commit SHA.
-    pub(crate) after: String,
+    pub after: String,
     /// Repository info.
-    pub(crate) repository: RepositoryInfo,
+    pub repository: RepositoryInfo,
     /// Commits in this push.
-    pub(crate) commits: Vec<CommitInfo>,
+    pub commits: Vec<CommitInfo>,
 }
 
 /// Repository info.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct RepositoryInfo {
+pub struct RepositoryInfo {
     /// Full repository name (e.g. owner/repo).
-    pub(crate) full_name: String,
+    pub full_name: String,
     /// Default branch (e.g. main).
-    pub(crate) default_branch: Option<String>,
+    pub default_branch: Option<String>,
 }
 
 /// Commit info.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct CommitInfo {
+pub struct CommitInfo {
     /// Commit ID.
-    pub(crate) id: String,
+    pub id: String,
     /// Added files.
-    pub(crate) added: Vec<String>,
+    pub added: Vec<String>,
     /// Modified files.
-    pub(crate) modified: Vec<String>,
+    pub modified: Vec<String>,
     /// Removed files.
-    pub(crate) removed: Vec<String>,
+    pub removed: Vec<String>,
 }
 
 /// Webhook pull request event payload.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct PullRequestEvent {
+pub struct PullRequestEvent {
     /// Webhook action type.
-    pub(crate) action: String,
+    pub action: String,
     /// PR number.
-    pub(crate) number: u64,
+    pub number: u64,
     /// PR details.
-    pub(crate) pull_request: PullRequestDetails,
+    pub pull_request: PullRequestDetails,
     /// Repository info.
-    pub(crate) repository: RepositoryInfo,
+    pub repository: RepositoryInfo,
 }
 
 /// Pull request details.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct PullRequestDetails {
+pub struct PullRequestDetails {
     /// Head reference.
-    pub(crate) head: GitReference,
+    pub head: GitReference,
     /// Base reference.
-    pub(crate) base: GitReference,
+    pub base: GitReference,
 }
 
 /// Git reference.
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub(crate) struct GitReference {
+pub struct GitReference {
     /// Git reference name.
     #[serde(rename = "ref")]
-    pub(crate) git_ref: String,
+    pub git_ref: String,
     /// Commit SHA.
-    pub(crate) sha: String,
+    pub sha: String,
 }
 
 /// Verify X-Hub-Signature-256 webhook signature.
-pub(crate) fn verify_signature(secret: &str, payload: &[u8], signature_header: &str) -> bool {
+pub fn verify_signature(secret: &str, payload: &[u8], signature_header: &str) -> bool {
     let signature_hex = match signature_header.strip_prefix("sha256=") {
         Some(hex) => hex,
         None => return false,
@@ -154,7 +154,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, &'static str> {
 
 /// GitHub REST root, overridable for GHES and for tests that point the server
 /// at a stub API.
-pub(crate) fn github_api_base() -> String {
+pub fn github_api_base() -> String {
     std::env::var("PRELOOP_GITHUB_API_URL")
         .ok()
         .map(|base| base.trim_end_matches('/').to_owned())
@@ -242,14 +242,14 @@ async fn send_github_check_request(
     Ok(val)
 }
 
-pub(crate) fn run_details_url(run_id: RunId) -> Option<String> {
+pub fn run_details_url(run_id: RunId) -> Option<String> {
     std::env::var("PRELOOP_PUBLIC_URL")
         .ok()
         .map(|base| format!("{}/runs/{run_id}", base.trim_end_matches('/')))
 }
 
 /// Report a queued check run to GitHub or simulate it locally.
-pub(crate) async fn report_check_run_queued(
+pub async fn report_check_run_queued(
     shared: &Arc<SharedState>,
     repo: &str,
     sha: &str,
@@ -380,7 +380,7 @@ fn is_check_run_not_found(error: &anyhow::Error) -> bool {
 }
 
 /// Move an existing GitHub check run back to the queue after a rerequest.
-pub(crate) async fn report_existing_check_run_queued(
+pub async fn report_existing_check_run_queued(
     shared: &Arc<SharedState>,
     repo: &str,
     job_id: &JobId,
@@ -466,7 +466,7 @@ async fn find_existing_check_run(
 /// The check name and head SHA are the idempotency key. A retry after a crash
 /// first finds the existing check and patches it, avoiding duplicate failed
 /// checks in GitHub's UI.
-pub(crate) async fn report_check_run_permanent_failure(
+pub async fn report_check_run_permanent_failure(
     shared: &Arc<SharedState>,
     repo: &str,
     sha: &str,
@@ -508,7 +508,7 @@ pub(crate) async fn report_check_run_permanent_failure(
 }
 
 /// Publish queued/completed checks for a native rerun.
-pub(crate) async fn report_check_runs_for_run(
+pub async fn report_check_runs_for_run(
     shared: &Arc<SharedState>,
     run_id: RunId,
     reused_check_run: Option<(JobId, u64)>,
@@ -564,7 +564,7 @@ pub(crate) async fn report_check_runs_for_run(
 }
 
 /// Report check run status to in_progress on GitHub or simulate it locally.
-pub(crate) async fn report_check_run_in_progress(
+pub async fn report_check_run_in_progress(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &JobId,
@@ -688,7 +688,7 @@ fn check_summary(
 }
 
 /// Report check run status to completed on GitHub or simulate it locally.
-pub(crate) async fn report_check_run_completed(
+pub async fn report_check_run_completed(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &JobId,
@@ -864,7 +864,7 @@ pub(crate) async fn report_check_run_completed(
 }
 
 /// Fetch workflows helper.
-pub(crate) async fn fetch_workflows(
+pub async fn fetch_workflows(
     shared: &Arc<SharedState>,
     repo: &str,
     git_ref: &str,
@@ -873,7 +873,7 @@ pub(crate) async fn fetch_workflows(
     fetch_workflows_at(shared, repo, git_ref, &api_base).await
 }
 
-pub(crate) async fn fetch_workflows_at(
+pub async fn fetch_workflows_at(
     shared: &Arc<SharedState>,
     repo: &str,
     git_ref: &str,
@@ -1082,7 +1082,7 @@ async fn fetch_remote_workflows(
 /// queries the GitHub commits API. Returns `Ok(None)` when the ref does not
 /// resolve (unknown ref, offline without a workspace) — the caller decides
 /// what that means.
-pub(crate) async fn resolve_ref_sha(
+pub async fn resolve_ref_sha(
     shared: &Arc<SharedState>,
     repository: &str,
     git_ref: &str,
@@ -1204,7 +1204,7 @@ async fn get_pr_changed_files(
 ///
 /// The workflow-inventory token is not reused: it is scoped to
 /// `contents: read`, and listing pull request files needs `pull_requests`.
-pub(crate) async fn resolve_pr_changed_files_at(
+pub async fn resolve_pr_changed_files_at(
     shared: &Arc<SharedState>,
     repo: &str,
     pr_number: u64,
@@ -1251,7 +1251,7 @@ const WEBHOOK_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// workflow file momentarily unreadable, or a snapshot not yet visible. The
 /// rest stretches so a broken dependency is not hammered, and the attempt cap
 /// dead-letters a delivery long before the ladder could become a hot loop.
-pub(crate) const WEBHOOK_RETRY_BACKOFF: &[Duration] = &[
+pub const WEBHOOK_RETRY_BACKOFF: &[Duration] = &[
     Duration::from_secs(1),
     Duration::from_secs(1),
     Duration::from_secs(5),
@@ -1280,7 +1280,7 @@ fn webhook_retry_backoff(ladder: &[Duration], attempts: u32) -> Duration {
 /// queue worker both mutates the queue and already talks to the store, so it
 /// hands over what it read and the snapshot reads memory instead of taking the
 /// store's single connection for a query that usually reports "unchanged".
-pub(crate) async fn refresh_webhook_queue_stats(state: &crate::state::AppState) -> bool {
+pub async fn refresh_webhook_queue_stats(state: &crate::state::AppState) -> bool {
     match state.store.webhook_queue_stats().await {
         Ok(stats) => {
             state.webhook_status.set_queue_stats(stats);
@@ -1358,7 +1358,7 @@ fn claimed_repository(body: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub(crate) async fn handle_github_webhook(
+pub async fn handle_github_webhook(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     body: bytes::Bytes,
@@ -1723,7 +1723,7 @@ async fn run_webhook_lease_heartbeat(
 }
 
 /// Background task that continuously drains the durable webhook queue.
-pub(crate) async fn run_webhook_queue_worker(
+pub async fn run_webhook_queue_worker(
     shared: Arc<SharedState>,
     heartbeat: preloop_observability::HeartbeatHandle,
 ) {
@@ -1801,7 +1801,7 @@ pub(crate) async fn run_webhook_queue_worker(
 }
 
 /// Drain pending webhook deliveries in FIFO order by `received_at_us`.
-pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
+pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
     // Claim one row at a time so every processing lease is heartbeated; a
     // claimed batch could let later rows expire while earlier ones run.
     const BATCH_SIZE: usize = 1;
@@ -1856,10 +1856,7 @@ async fn drain_webhook_queue_with_heartbeat(
 }
 
 /// Process one claimed delivery and update its state according to the failure taxonomy.
-pub(crate) async fn process_one_delivery(
-    shared: &Arc<SharedState>,
-    delivery: &WebhookDeliveryRecord,
-) {
+pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookDeliveryRecord) {
     let Some(lease_token) = delivery.lease_token.as_deref() else {
         error!(
             delivery_id = %delivery.delivery_id,
@@ -2693,7 +2690,7 @@ pub fn manifest_default_events() -> Vec<String> {
 }
 
 /// Serve registration page for GitHub App Manifest flow.
-pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
+pub async fn github_register(headers: HeaderMap) -> impl IntoResponse {
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
@@ -2758,12 +2755,12 @@ pub(crate) async fn github_register(headers: HeaderMap) -> impl IntoResponse {
 
 /// Query parameters for GitHub callback.
 #[derive(Debug, Deserialize)]
-pub(crate) struct CallbackQuery {
+pub struct CallbackQuery {
     code: String,
 }
 
 /// Callback endpoint for GitHub App Manifest conversion.
-pub(crate) async fn github_callback(
+pub async fn github_callback(
     // The App credentials are handed to the operator through the one-time HTML
     // response below; `AppState` is immutable behind an `Arc`, so nothing here
     // can persist them into the running server.

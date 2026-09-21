@@ -12,8 +12,8 @@ use super::*;
 /// would evict the entire existing tail for one batch, and broadcasting it
 /// would amplify across every subscriber.
 #[derive(Clone)]
-pub(crate) struct LiveLogBuffer {
-    pub(crate) lines: VecDeque<LiveLogFeedLinesWrapper>,
+pub struct LiveLogBuffer {
+    pub lines: VecDeque<LiveLogFeedLinesWrapper>,
     bytes: usize,
     max_bytes: usize,
 }
@@ -22,9 +22,9 @@ impl LiveLogBuffer {
     /// Default per-job cap on retained live feed bytes. The accounting covers
     /// the wrapper struct, the step id, and every line string (header plus
     /// bytes), so it bounds heap use regardless of wrapper shape.
-    pub(crate) const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+    pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-    pub(crate) fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             lines: VecDeque::new(),
             bytes: 0,
@@ -32,21 +32,21 @@ impl LiveLogBuffer {
         }
     }
 
-    pub(crate) fn total_bytes(&self) -> usize {
+    pub fn total_bytes(&self) -> usize {
         self.bytes
     }
 
     /// Whether a single wrapper is small enough to be retained on its own,
     /// regardless of any eviction it may trigger. Used to reject oversized
     /// batches before they are cloned for the buffer.
-    pub(crate) fn fits(&self, wrapper: &LiveLogFeedLinesWrapper) -> bool {
+    pub fn fits(&self, wrapper: &LiveLogFeedLinesWrapper) -> bool {
         Self::wrapper_bytes(wrapper) <= self.max_bytes
     }
 
     /// Append a wrapper, tail-dropping the oldest wrappers once the byte cap
     /// is exceeded. Returns `false` (storing nothing) when a single wrapper
     /// exceeds the whole budget.
-    pub(crate) fn push(&mut self, wrapper: LiveLogFeedLinesWrapper) -> bool {
+    pub fn push(&mut self, wrapper: LiveLogFeedLinesWrapper) -> bool {
         let size = Self::wrapper_bytes(&wrapper);
         if size > self.max_bytes {
             return false;
@@ -63,7 +63,7 @@ impl LiveLogBuffer {
     }
     /// Discard a completed attempt's retained tail before a retry reuses the
     /// same agent-job key, without changing the configured byte budget.
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.lines.clear();
         self.bytes = 0;
     }
@@ -106,7 +106,7 @@ impl IntoIterator for LiveLogBuffer {
     }
 }
 
-pub(crate) async fn live_logs_sse(
+pub async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
     headers: HeaderMap,
@@ -166,7 +166,7 @@ async fn authorize_live_log_read(
 /// Mirrors `RunLogsQuery::job` so `--job` means the same thing whether the
 /// caller is reading a finished log or following a running one.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct LiveLogsQuery {
+pub struct LiveLogsQuery {
     #[serde(default)]
     job: Option<String>,
 }
@@ -180,7 +180,7 @@ pub(crate) struct LiveLogsQuery {
 ///
 /// `job` may be omitted when the run has exactly one job; with more, the
 /// candidates are named rather than one being chosen arbitrarily.
-pub(crate) async fn live_run_logs_sse(
+pub async fn live_run_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
     Query(query): Query<LiveLogsQuery>,
@@ -276,16 +276,12 @@ async fn live_log_stream(
     Ok(Sse::new(snapshot_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
-pub(crate) fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
+pub fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
     let data = serde_json::to_string(wrapper).unwrap_or_else(|_| "{}".to_string());
     Event::default().event("live-log").data(data)
 }
 
-pub(crate) fn live_log_key_for_job(
-    inner: &InnerState,
-    run_id: RunId,
-    job_id: &str,
-) -> Option<String> {
+pub fn live_log_key_for_job(inner: &InnerState, run_id: RunId, job_id: &str) -> Option<String> {
     let run = inner.runs.get(&run_id)?;
     // `job_requests` is keyed by monotonic request id, so `find` would return
     // the oldest attempt and follow a dead feed after a re-dispatch. A logical
@@ -328,7 +324,7 @@ fn live_log_is_closed(inner: &InnerState, run_id: RunId, job_id: &str, key: &str
     run_terminal || logical_job_terminal
 }
 
-pub(crate) fn live_log_sender(
+pub fn live_log_sender(
     inner: &mut InnerState,
     key: &str,
 ) -> broadcast::Sender<LiveLogFeedLinesWrapper> {
@@ -352,12 +348,12 @@ pub(crate) fn live_log_sender(
 /// channel that would never speak again.
 ///
 /// Idempotent, and safe to call for a job that never streamed a line.
-pub(crate) fn close_live_log(inner: &mut InnerState, key: &str) {
+pub fn close_live_log(inner: &mut InnerState, key: &str) {
     inner.live_log_closed.insert(key.to_string());
     inner.live_log_tx.remove(key);
 }
 
-pub(crate) async fn ws_live_logs(
+pub async fn ws_live_logs(
     State(shared): State<Arc<SharedState>>,
     Path(job_id): Path<String>,
     headers: HeaderMap,
@@ -397,7 +393,7 @@ pub(crate) async fn ws_live_logs(
     Ok(ws.on_upgrade(move |socket| handle_live_log_socket(socket, job_id, shared)))
 }
 
-pub(crate) async fn handle_live_log_socket(
+pub async fn handle_live_log_socket(
     mut socket: WebSocket,
     job_id: String,
     shared: Arc<SharedState>,
@@ -442,7 +438,7 @@ pub(crate) async fn handle_live_log_socket(
 /// the retained-buffer push and broadcast. `live_log_stream` uses the same
 /// ordering for its snapshot/subscription pair, which makes the handoff
 /// atomic from a follower's perspective.
-pub(crate) async fn record_live_log_wrapper(
+pub async fn record_live_log_wrapper(
     shared: &Arc<SharedState>,
     job_id: &str,
     wrapper: LiveLogFeedLinesWrapper,
@@ -476,7 +472,7 @@ pub(crate) async fn record_live_log_wrapper(
 }
 
 /// Resolve a logical job key to its run-scoped live-log key before recording.
-pub(crate) async fn record_live_log_wrapper_for_run(
+pub async fn record_live_log_wrapper_for_run(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &str,

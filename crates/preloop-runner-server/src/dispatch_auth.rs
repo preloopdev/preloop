@@ -55,18 +55,18 @@ const PRELOOP_PAT_ACTOR: &str = "preloop-pat";
 
 /// The identity a dispatch request authenticated as (D2).
 #[derive(Debug, Clone)]
-pub(crate) struct DispatchIdentity {
+pub struct DispatchIdentity {
     /// Resolved sender login for the synthesized `sender` / `github.actor`.
-    pub(crate) actor: String,
+    pub actor: String,
     /// Trust tier stamped on dispatched runs. Installation-token dispatches
     /// get [`TrustTier::AppDispatch`]; everything else [`TrustTier::AdminManual`].
-    pub(crate) tier: TrustTier,
+    pub tier: TrustTier,
     /// Which channel of the D2 chain authenticated the request.
-    pub(crate) kind: DispatchAuthKind,
+    pub kind: DispatchAuthKind,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum DispatchAuthKind {
+pub enum DispatchAuthKind {
     /// Native `PRELOOP_SYSTEM_TOKEN`.
     SystemBearer,
     /// `PRELOOP_GITHUB_TOKEN` / config `github.pat`.
@@ -79,18 +79,18 @@ pub(crate) enum DispatchAuthKind {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct InstallationTokenAuth {
-    pub(crate) installation_id: u64,
+pub struct InstallationTokenAuth {
+    pub installation_id: u64,
     /// Numeric App id; `None` when github.com did not return one.
-    pub(crate) app_id: Option<String>,
+    pub app_id: Option<String>,
     /// The installation's account login.
-    pub(crate) account_login: String,
+    pub account_login: String,
     /// Permission scopes the token carries (snake_case keys, GitHub levels).
-    pub(crate) permissions: BTreeMap<String, String>,
+    pub permissions: BTreeMap<String, String>,
     /// Repos the token can access as `owner/repo` slugs. `None` means every
     /// repository (an "all repositories" installation); `Some(list)` means
     /// exactly those.
-    pub(crate) accessible_repositories: Option<Vec<String>>,
+    pub accessible_repositories: Option<Vec<String>>,
 }
 
 impl DispatchIdentity {
@@ -99,7 +99,7 @@ impl DispatchIdentity {
     /// System bearer, PAT, and own-App JWT are operator credentials and hold
     /// every action; an installation token only holds what its installation
     /// granted it.
-    pub(crate) fn has_actions_write(&self) -> bool {
+    pub fn has_actions_write(&self) -> bool {
         match &self.kind {
             DispatchAuthKind::InstallationToken(token) => {
                 let level = token
@@ -118,7 +118,7 @@ impl DispatchIdentity {
     /// System bearer, PAT, and own-App JWT are operator credentials and hold
     /// every action; an installation token only holds what its installation
     /// granted it.
-    pub(crate) fn has_contents_write(&self) -> bool {
+    pub fn has_contents_write(&self) -> bool {
         match &self.kind {
             DispatchAuthKind::InstallationToken(token) => {
                 let level = token
@@ -135,7 +135,7 @@ impl DispatchIdentity {
     /// Whether an installation token may reach `owner/repo`. Operator
     /// credentials always may; an installation token only the repos it can
     /// access (all repositories when the installation selected "all").
-    pub(crate) fn covers_repository(&self, owner: &str, repo: &str) -> bool {
+    pub fn covers_repository(&self, owner: &str, repo: &str) -> bool {
         match &self.kind {
             DispatchAuthKind::InstallationToken(token) => match &token.accessible_repositories {
                 None => true,
@@ -152,7 +152,7 @@ impl DispatchIdentity {
 ///
 /// Mandatory (github.com returns 401 without a token). On success the
 /// [`DispatchIdentity`] is inserted as a request extension for the handler.
-pub(crate) async fn require_dispatch_auth(
+pub async fn require_dispatch_auth(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,
     next: Next,
@@ -279,7 +279,7 @@ async fn authenticate(
 
 /// Everything learned from a successful github.com installation round-trip.
 #[derive(Debug, Clone)]
-pub(crate) struct InstallationInfo {
+pub struct InstallationInfo {
     installation_id: u64,
     account_login: String,
     app_id: Option<String>,
@@ -691,7 +691,7 @@ fn sha256_hex(value: &str) -> String {
 
 /// Short-TTL cache of validated installation tokens, keyed by token hash.
 #[derive(Debug, Default)]
-pub(crate) struct InstallationTokenCache {
+pub struct InstallationTokenCache {
     inner: parking_lot::Mutex<HashMap<String, CachedInstallation>>,
 }
 
@@ -702,7 +702,7 @@ struct CachedInstallation {
 }
 
 impl InstallationTokenCache {
-    pub(crate) fn get(&self, key: &str) -> Option<InstallationInfo> {
+    pub fn get(&self, key: &str) -> Option<InstallationInfo> {
         let inner = self.inner.lock();
         inner.get(key).and_then(|cached| {
             cached
@@ -714,7 +714,7 @@ impl InstallationTokenCache {
         })
     }
 
-    pub(crate) fn put(&self, key: String, info: InstallationInfo) {
+    pub fn put(&self, key: String, info: InstallationInfo) {
         let mut inner = self.inner.lock();
         let now = SystemTime::now();
         inner.retain(|_, cached| {
@@ -736,12 +736,12 @@ impl InstallationTokenCache {
 
 /// Short-TTL cache of resolved actor logins (PAT `GET /user`, App `GET /app`).
 #[derive(Debug, Default)]
-pub(crate) struct DispatchActorCache {
+pub struct DispatchActorCache {
     inner: parking_lot::Mutex<HashMap<String, (SystemTime, String)>>,
 }
 
 impl DispatchActorCache {
-    pub(crate) fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&self, key: &str) -> Option<String> {
         let inner = self.inner.lock();
         inner.get(key).and_then(|(resolved_at, actor)| {
             resolved_at
@@ -752,7 +752,7 @@ impl DispatchActorCache {
         })
     }
 
-    pub(crate) fn put(&self, key: String, actor: String) {
+    pub fn put(&self, key: String, actor: String) {
         let mut inner = self.inner.lock();
         let now = SystemTime::now();
         inner.retain(|_, (resolved_at, _)| {

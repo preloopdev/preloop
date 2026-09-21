@@ -26,7 +26,7 @@ fn is_step_record(record: &azdo::TimelineRecord) -> bool {
 }
 
 /// PATCH timeline records — runner updates step/job state.
-pub(crate) async fn patch_timeline_records(
+pub async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
@@ -300,7 +300,7 @@ pub(crate) async fn patch_timeline_records(
 
     Json(json!({ "count": response_records.len(), "value": response_records }))
 }
-pub(crate) fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
+pub fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
         Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => {
             Some(ExecutionStatus::Success)
@@ -316,7 +316,7 @@ pub(crate) fn timeline_status(record: &azdo::TimelineRecord) -> Option<Execution
     }
 }
 
-pub(crate) fn issue_level(issue_type: azdo::IssueType) -> AnnotationLevel {
+pub fn issue_level(issue_type: azdo::IssueType) -> AnnotationLevel {
     match issue_type {
         azdo::IssueType::Error => AnnotationLevel::Error,
         azdo::IssueType::Warning => AnnotationLevel::Warning,
@@ -325,7 +325,7 @@ pub(crate) fn issue_level(issue_type: azdo::IssueType) -> AnnotationLevel {
 }
 
 /// POST create log file — runner creates a log container.
-pub(crate) async fn create_log(
+pub async fn create_log(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
@@ -358,7 +358,7 @@ pub(crate) async fn create_log(
 }
 
 /// POST append log — runner appends lines to a log file.
-pub(crate) async fn append_log(
+pub async fn append_log(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, log_id)): Path<(String, String, String, String)>,
     body: Bytes,
@@ -436,11 +436,11 @@ pub(crate) async fn append_log(
     StatusCode::ACCEPTED
 }
 
-pub(crate) fn log_key(plan_id: &str, log_id: &str) -> String {
+pub fn log_key(plan_id: &str, log_id: &str) -> String {
     format!("{plan_id}/{log_id}")
 }
 
-pub(crate) fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
+pub fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
     let text = String::from_utf8_lossy(body);
     let resolved_run_id = resolve_callback_job(inner, plan_id, None, None)
         .map(|(_, run_id, _)| run_id)
@@ -462,7 +462,7 @@ pub(crate) fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> 
 }
 
 /// POST console log — runner streams live console output.
-pub(crate) async fn console_log(
+pub async fn console_log(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, _timeline_id, _record_id)): Path<(
         String,
@@ -496,7 +496,7 @@ pub(crate) async fn console_log(
 }
 
 /// POST finish job — runner reports final result + outputs.
-pub(crate) async fn finish_job(
+pub async fn finish_job(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(event): Json<azdo::JobCompletedEvent>,
@@ -573,7 +573,7 @@ pub(crate) async fn finish_job(
 // The logic is identical to the existing handlers above.
 
 /// PATCH `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
-pub(crate) async fn patch_timeline_records_plan(
+pub async fn patch_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
@@ -589,15 +589,15 @@ pub(crate) async fn patch_timeline_records_plan(
 /// F6 — pagination controls for timeline GET. `top` is clamped to
 /// [`MAX_TOP_RECORDS`] server-side; `skip` pages further.
 #[derive(Debug, Deserialize)]
-pub(crate) struct TimelineQuery {
+pub struct TimelineQuery {
     #[serde(default)]
-    pub(crate) top: Option<usize>,
+    pub top: Option<usize>,
     #[serde(default)]
-    pub(crate) skip: Option<usize>,
+    pub skip: Option<usize>,
 }
 
 /// GET `/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id` — read back the timeline.
-pub(crate) async fn get_timeline_records(
+pub async fn get_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Query(query): Query<TimelineQuery>,
@@ -632,7 +632,7 @@ pub(crate) async fn get_timeline_records(
 }
 
 /// GET `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
-pub(crate) async fn get_timeline_records_plan(
+pub async fn get_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     Query(query): Query<TimelineQuery>,
@@ -646,7 +646,7 @@ pub(crate) async fn get_timeline_records_plan(
 }
 
 /// POST `/_apis/v1/plans/:plan_id/logs`
-pub(crate) async fn create_log_plan(
+pub async fn create_log_plan(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     Json(log): Json<azdo::TaskLog>,
@@ -660,7 +660,7 @@ pub(crate) async fn create_log_plan(
 }
 
 /// PUT `/_apis/v1/plans/:plan_id/logs/:log_id`
-pub(crate) async fn append_log_plan(
+pub async fn append_log_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, log_id)): Path<(String, String)>,
     body: Bytes,
@@ -678,7 +678,7 @@ pub(crate) async fn append_log_plan(
 /// Handles the `JobCompleted` event sent by the runner's AzDO reporting path.
 /// The body shape is `{name, jobId, requestId, result, outputs}` — slightly
 /// different from the scoped `finish_job` path which uses `JobCompletedEvent`.
-pub(crate) async fn finish_job_plan(
+pub async fn finish_job_plan(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     Json(event): Json<serde_json::Value>,
@@ -745,7 +745,7 @@ pub(crate) async fn finish_job_plan(
     Json(serde_json::Value::Null)
 }
 
-pub(crate) async fn authorize_reporting_callback(
+pub async fn authorize_reporting_callback(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
     plan_id: &str,
@@ -765,7 +765,7 @@ pub(crate) async fn authorize_reporting_callback(
     crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
 }
 
-pub(crate) async fn patch_timeline_records_authenticated(
+pub async fn patch_timeline_records_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(String, String, String, String)>,
     headers: HeaderMap,
@@ -776,7 +776,7 @@ pub(crate) async fn patch_timeline_records_authenticated(
     Ok(patch_timeline_records(State(shared), Path(path), Json(wrapper)).await)
 }
 
-pub(crate) async fn get_timeline_records_authenticated(
+pub async fn get_timeline_records_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(String, String, String, String)>,
     headers: HeaderMap,
@@ -787,7 +787,7 @@ pub(crate) async fn get_timeline_records_authenticated(
     Ok(get_timeline_records(State(shared), Path(path), Query(query)).await)
 }
 
-pub(crate) async fn create_log_authenticated(
+pub async fn create_log_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -797,7 +797,7 @@ pub(crate) async fn create_log_authenticated(
     Ok(create_log(State(shared), Path(path), Json(log)).await)
 }
 
-pub(crate) async fn append_log_authenticated(
+pub async fn append_log_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(String, String, String, String)>,
     headers: HeaderMap,
@@ -807,7 +807,7 @@ pub(crate) async fn append_log_authenticated(
     Ok(append_log(State(shared), Path(path), body).await)
 }
 
-pub(crate) async fn console_log_authenticated(
+pub async fn console_log_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
@@ -818,7 +818,7 @@ pub(crate) async fn console_log_authenticated(
     Ok(console_log(State(shared), Path(path), body).await)
 }
 
-pub(crate) async fn finish_job_authenticated(
+pub async fn finish_job_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(String, String, String)>,
     headers: HeaderMap,
@@ -828,7 +828,7 @@ pub(crate) async fn finish_job_authenticated(
     Ok(finish_job(State(shared), Path(path), Json(event)).await)
 }
 
-pub(crate) async fn finish_job_plan_authenticated(
+pub async fn finish_job_plan_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     headers: HeaderMap,
@@ -842,7 +842,7 @@ pub(crate) async fn finish_job_plan_authenticated(
     Ok(finish_job_plan(State(shared), Path(plan_id), Json(event)).await)
 }
 
-pub(crate) async fn patch_timeline_records_plan_authenticated(
+pub async fn patch_timeline_records_plan_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -856,7 +856,7 @@ pub(crate) async fn patch_timeline_records_plan_authenticated(
     )
 }
 
-pub(crate) async fn get_timeline_records_plan_authenticated(
+pub async fn get_timeline_records_plan_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     headers: HeaderMap,
@@ -867,7 +867,7 @@ pub(crate) async fn get_timeline_records_plan_authenticated(
     Ok(get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await)
 }
 
-pub(crate) async fn create_log_plan_authenticated(
+pub async fn create_log_plan_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     headers: HeaderMap,
@@ -877,7 +877,7 @@ pub(crate) async fn create_log_plan_authenticated(
     Ok(create_log_plan(State(shared), Path(plan_id), Json(log)).await)
 }
 
-pub(crate) async fn append_log_plan_authenticated(
+pub async fn append_log_plan_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, log_id)): Path<(String, String)>,
     headers: HeaderMap,

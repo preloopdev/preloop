@@ -47,7 +47,7 @@ fn expected_webhook_url() -> Option<String> {
 }
 
 /// Background loop; one check per interval until shutdown.
-pub(crate) async fn run_webhook_health_monitor(shared: Arc<SharedState>) {
+pub async fn run_webhook_health_monitor(shared: Arc<SharedState>) {
     let interval = health_interval();
     loop {
         if shared.shutdown.is_cancelled() {
@@ -74,9 +74,7 @@ pub(crate) async fn run_webhook_health_monitor(shared: Arc<SharedState>) {
 
 /// Read every configured App's webhook subscription and delivery config, and
 /// publish the comparison. Returns what was published.
-pub(crate) async fn check_webhook_config_once(
-    shared: &Arc<SharedState>,
-) -> Vec<AppWebhookConfigStatus> {
+pub async fn check_webhook_config_once(shared: &Arc<SharedState>) -> Vec<AppWebhookConfigStatus> {
     let apps = crate::github_app::registered_apps(&shared.state);
     if apps.is_empty() {
         shared

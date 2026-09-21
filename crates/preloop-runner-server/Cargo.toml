@@ -76,6 +76,58 @@ prost = "0.14.3"
 name = "preloop-server"
 path = "src/main.rs"
 
+[features]
+# Exposes the deterministic test hooks (fixed system token, fixed local JWT
+# signing key, TestEnvVar) that `#[cfg(test)]` normally gates. Integration
+# tests under `tests/` link against the non-test lib build, so they need this
+# feature to see the same hooks the in-crate unit tests used. Never enable for
+# a production build — it pins the admin token to a well-known value.
+test-support = []
+
+# The split integration-test crates need the deterministic hooks behind
+# `test-support`. `required-features` keeps `cargo test`/`nextest` from trying
+# to build them without the feature (they'd fail to resolve the gated items);
+# CI runs them via `cargo test -p preloop-runner-server --features test-support`.
+[[test]]
+name = "recovery"
+path = "tests/recovery.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "runs_api"
+path = "tests/runs_api.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "logs"
+path = "tests/logs.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "registration"
+path = "tests/registration.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "broker"
+path = "tests/broker.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "security"
+path = "tests/security.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "webhooks"
+path = "tests/webhooks.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "concurrency"
+path = "tests/concurrency.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true

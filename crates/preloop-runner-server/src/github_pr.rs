@@ -23,7 +23,7 @@ use serde_json::Value;
 /// Best-effort entry point. Runs detached from the completion path so a
 /// GitHub outage never affects the run's own result; failures are logged,
 /// never returned.
-pub(crate) async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
+pub async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
     if let Err(error) = maybe_open_pr_inner(&shared, run_id).await {
         tracing::warn!(%run_id, ?error, "auto-PR: not opened");
     }

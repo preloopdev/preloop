@@ -286,7 +286,7 @@ fn arb_case() -> impl Strategy<Value = GenCase> {
 // ─── Test module ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-pub(crate) mod http_sequences {
+pub mod http_sequences {
     use super::*;
 
     /// Property: pending runs (held in held_runs) expose no dispatchable broker job.

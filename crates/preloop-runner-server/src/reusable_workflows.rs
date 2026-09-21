@@ -4,7 +4,7 @@ use super::*;
 /// caller's recorded `workflow_call` outputs and flip the caller node to its
 /// aggregate status. Returns the caller ids that became terminal in this pass
 /// so `complete_job_inner` can release their JobSet concurrency gates.
-pub(crate) fn propagate_reusable_outputs(run: &mut RunRecord) -> Vec<JobId> {
+pub fn propagate_reusable_outputs(run: &mut RunRecord) -> Vec<JobId> {
     let mut finalized = Vec::new();
     // A single pass can only fold one nesting level: an ancestor caller's
     // `all_complete` check reads the *recorded* status of its callee, and a

@@ -681,7 +681,7 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
 /// the `PRELOOP_GITHUB_*` environment variables as its escape hatch, and
 /// failing the load would take `preloop secret` and server startup down with
 /// it. A reachable backend that fails an individual read is still an error.
-pub(crate) fn resolve_credential_references(
+pub fn resolve_credential_references(
     config: &mut ConfigFile,
     store: &impl CredentialStore,
 ) -> anyhow::Result<()> {
@@ -1096,7 +1096,7 @@ pub fn write_config_to(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
 }
 
 /// First value that is `Some`, used to layer config under env overrides.
-pub(crate) fn env_or<T>(env_value: Option<T>, config_value: Option<T>) -> Option<T> {
+pub fn env_or<T>(env_value: Option<T>, config_value: Option<T>) -> Option<T> {
     env_value.or(config_value)
 }
 

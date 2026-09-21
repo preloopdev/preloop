@@ -29,7 +29,7 @@ use tokio_postgres::{connect, Client, NoTls};
 const MIGRATION_LOCK_KEY: i64 = 0x616b_7368_5f6d_6772; // "preloop_mgr"
 
 /// Postgres backend: one client behind a mutex.
-pub(crate) struct PgStore {
+pub struct PgStore {
     connection: Arc<tokio::sync::Mutex<Client>>,
     cipher: Envelope,
 }
@@ -38,7 +38,7 @@ pub(crate) struct PgStore {
 /// `verify-ca`, or `verify-full`); `None` for `sslmode=disable` or when no
 /// `sslmode` is present. Chain + hostname verification always use the system
 /// root store, so `verify-full` semantics apply to every TLS mode.
-pub(crate) fn tls_connector(url: &str) -> anyhow::Result<Option<MakeTlsConnector>> {
+pub fn tls_connector(url: &str) -> anyhow::Result<Option<MakeTlsConnector>> {
     let query = url.split('?').nth(1).unwrap_or("");
     let sslmode = query
         .split('&')
@@ -74,7 +74,7 @@ pub(crate) fn tls_connector(url: &str) -> anyhow::Result<Option<MakeTlsConnector
 /// `verify-full` are libpq extensions that tokio-postgres rejects; the
 /// rustls connector always performs full chain + hostname verification, so
 /// mapping them onto `require` (TLS stays mandatory) loses nothing.
-pub(crate) fn connect_url(url: &str) -> String {
+pub fn connect_url(url: &str) -> String {
     let (before, after) = match url.split_once("sslmode=verify-") {
         Some((before, after)) => (before, after),
         None => return url.to_owned(),
@@ -108,7 +108,7 @@ fn spawn_connection_task(
 
 impl PgStore {
     /// Connect, apply pending migrations, and return the store.
-    pub(crate) async fn open(url: &str, cipher: Envelope) -> anyhow::Result<Self> {
+    pub async fn open(url: &str, cipher: Envelope) -> anyhow::Result<Self> {
         let connect_url = connect_url(url);
         let mut client = match tls_connector(url)? {
             Some(tls) => {

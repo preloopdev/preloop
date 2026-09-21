@@ -146,7 +146,7 @@ pub fn all_event_names() -> &'static [&'static str] {
 /// Build `EffectiveEvent` vec for events that use the repository default
 /// branch as the ref and `payload.action` as the activity type.
 /// Mirrors MessageController.cs:6287 (* default case).
-pub(crate) fn make_default_branch_events(event_name: &str, payload: &Value) -> Vec<EffectiveEvent> {
+pub fn make_default_branch_events(event_name: &str, payload: &Value) -> Vec<EffectiveEvent> {
     let default_branch = payload
         .get("repository")
         .and_then(|r| r.get("default_branch"))

@@ -3,48 +3,48 @@ use super::*;
 // ─── Artifact v2 Twirp (github.actions.results.api.v1.ArtifactService) ────────
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactV2CreateRequest {
-    pub(crate) workflow_run_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) name: String,
+pub struct ArtifactV2CreateRequest {
+    pub workflow_run_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactV2FinalizeRequest {
-    pub(crate) workflow_run_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) name: String,
+pub struct ArtifactV2FinalizeRequest {
+    pub workflow_run_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub name: String,
     #[serde(default)]
-    pub(crate) size: serde_json::Value, // proto3 JSON: int64 as string
+    pub size: serde_json::Value, // proto3 JSON: int64 as string
     #[serde(default)]
-    pub(crate) hash: Option<serde_json::Value>, // StringValue: plain string or wrapped object
+    pub hash: Option<serde_json::Value>, // StringValue: plain string or wrapped object
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactV2ListRequest {
-    pub(crate) workflow_run_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
+pub struct ArtifactV2ListRequest {
+    pub workflow_run_backend_id: String,
+    pub workflow_job_run_backend_id: String,
     #[serde(default)]
-    pub(crate) name_filter: Option<serde_json::Value>, // StringValue: plain string in proto3 JSON
+    pub name_filter: Option<serde_json::Value>, // StringValue: plain string in proto3 JSON
     #[serde(default)]
-    pub(crate) id_filter: Option<serde_json::Value>, // Int64Value: string in proto3 JSON
+    pub id_filter: Option<serde_json::Value>, // Int64Value: string in proto3 JSON
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactV2GetSignedUrlRequest {
-    pub(crate) workflow_run_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) name: String,
+pub struct ArtifactV2GetSignedUrlRequest {
+    pub workflow_run_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactV2DeleteRequest {
-    pub(crate) workflow_run_backend_id: String,
-    pub(crate) workflow_job_run_backend_id: String,
-    pub(crate) name: String,
+pub struct ArtifactV2DeleteRequest {
+    pub workflow_run_backend_id: String,
+    pub workflow_job_run_backend_id: String,
+    pub name: String,
 }
 
-pub(crate) fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
+pub fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
     format!("{run_id}/{name}")
 }
 
@@ -58,11 +58,7 @@ pub(crate) fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
 /// uploads invisible to the consumer (found via scenario 206). Map the plan id
 /// to the recorded run id when it is known; fall back to the request value for
 /// unknown plans (control-plane callers, tests).
-pub(crate) fn canonical_artifact_scope(
-    inner: &InnerState,
-    plan_id: &str,
-    fallback: &str,
-) -> String {
+pub fn canonical_artifact_scope(inner: &InnerState, plan_id: &str, fallback: &str) -> String {
     if let Some(request_id) = inner.plan_requests.get(plan_id) {
         if let Some(record) = inner.job_requests.get(request_id) {
             return record.run_id.to_string();
@@ -133,9 +129,7 @@ fn artifact_v2_job_from_headers(
         .ok_or_else(|| ApiError::unauthorized("artifact access requires a valid job token"))
 }
 
-pub(crate) async fn save_artifact_v2_registry(
-    shared: &Arc<SharedState>,
-) -> Result<(), std::io::Error> {
+pub async fn save_artifact_v2_registry(shared: &Arc<SharedState>) -> Result<(), std::io::Error> {
     let registry_path = shared.state.state_dir.join("artifact_v2_registry.json");
     let serialized = {
         let inner = shared.state.inner.lock().await;
@@ -145,7 +139,7 @@ pub(crate) async fn save_artifact_v2_registry(
     Ok(())
 }
 
-pub(crate) async fn twirp_artifact_v2_create(
+pub async fn twirp_artifact_v2_create(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactV2CreateRequest>,
@@ -264,7 +258,7 @@ pub(crate) async fn twirp_artifact_v2_create(
     Ok(Json(json!({ "ok": true, "signed_upload_url": upload_url })))
 }
 
-pub(crate) async fn twirp_artifact_v2_finalize(
+pub async fn twirp_artifact_v2_finalize(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactV2FinalizeRequest>,
@@ -368,7 +362,7 @@ pub(crate) async fn twirp_artifact_v2_finalize(
     ))
 }
 
-pub(crate) async fn twirp_artifact_v2_list(
+pub async fn twirp_artifact_v2_list(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactV2ListRequest>,
@@ -423,7 +417,7 @@ pub(crate) async fn twirp_artifact_v2_list(
     Ok(Json(json!({ "artifacts": artifacts })))
 }
 
-pub(crate) async fn twirp_artifact_v2_get_signed_url(
+pub async fn twirp_artifact_v2_get_signed_url(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactV2GetSignedUrlRequest>,
@@ -459,7 +453,7 @@ pub(crate) async fn twirp_artifact_v2_get_signed_url(
     Ok(Json(json!({ "signed_url": signed_url })))
 }
 
-pub(crate) async fn twirp_artifact_v2_delete(
+pub async fn twirp_artifact_v2_delete(
     State(shared): State<Arc<SharedState>>,
     headers: HeaderMap,
     Json(request): Json<ArtifactV2DeleteRequest>,

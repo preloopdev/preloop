@@ -12,14 +12,14 @@ use utoipa::{
 
 /// Native API error envelope.
 #[derive(Debug, ToSchema)]
-pub(crate) struct ApiErrorResponse {
+pub struct ApiErrorResponse {
     /// Human-readable error message.
     pub error: String,
 }
 
 /// Result returned after accepting a workflow run.
 #[derive(Debug, ToSchema)]
-pub(crate) struct RunAcceptedResponse {
+pub struct RunAcceptedResponse {
     /// UUID of the created run.
     pub run_id: String,
     /// Monotonic run number for this workflow path.
@@ -33,7 +33,7 @@ pub(crate) struct RunAcceptedResponse {
 /// Only `workflow_yaml`, `event`, and `repository` are required.
 /// All other fields have sensible defaults.
 #[derive(Debug, ToSchema)]
-pub(crate) struct WorkflowSubmissionRequest {
+pub struct WorkflowSubmissionRequest {
     /// Raw YAML workflow contents.
     pub workflow_yaml: String,
     /// GitHub event name (e.g. `push`, `workflow_dispatch`).
@@ -80,7 +80,7 @@ pub(crate) struct WorkflowSubmissionRequest {
 /// The `submission` field contains the original submission with secret
 /// values redacted to `<redacted>`.
 #[derive(Debug, ToSchema)]
-pub(crate) struct RunResponse {
+pub struct RunResponse {
     /// Run UUID.
     pub run_id: String,
     /// Evaluated run name (from `run-name:` in the workflow).
@@ -197,7 +197,7 @@ pub(crate) struct RunResponse {
     ),
     modifiers(&SecuritySchemes)
 )]
-pub(crate) struct ApiDoc;
+pub struct ApiDoc;
 
 struct SecuritySchemes;
 

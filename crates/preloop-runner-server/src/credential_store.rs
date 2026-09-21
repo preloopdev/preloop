@@ -556,7 +556,7 @@ impl CredentialStore for MemoryCredentialStore {
 /// A backend that is reachable by nobody, standing in for a headless host.
 #[cfg(test)]
 #[derive(Clone, Copy, Default)]
-pub(crate) struct UnavailableCredentialStore;
+pub struct UnavailableCredentialStore;
 
 #[cfg(test)]
 impl CredentialStore for UnavailableCredentialStore {
@@ -608,7 +608,7 @@ impl CredentialStore for NonPersistingCredentialStore {
 /// A backend that accepts writes but cannot read them back.
 #[cfg(test)]
 #[derive(Clone, Copy, Default)]
-pub(crate) struct WriteOnlyCredentialStore;
+pub struct WriteOnlyCredentialStore;
 
 #[cfg(test)]
 impl CredentialStore for WriteOnlyCredentialStore {

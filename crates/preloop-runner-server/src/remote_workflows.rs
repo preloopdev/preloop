@@ -26,7 +26,7 @@ struct GithubCommitResponse {
 /// or the config file's `github.pat` — the caller resolves the precedence),
 /// attached as a bearer header so private `uses: owner/repo/...` references
 /// resolve without a separately exported token.
-pub(crate) async fn resolve_remote_workflows(
+pub async fn resolve_remote_workflows(
     submission: &mut WorkflowSubmission,
     root_workflow: &preloop_gha_parser::Workflow,
     github_token: Option<&str>,
