@@ -19,6 +19,15 @@ use tokio_util::io::ReaderStream;
 const SNAPSHOT_REF: &str = "refs/heads/snapshot";
 const MAX_GIT_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
+/// TTL for cached GitHub repository metadata (numeric ID + visibility).
+/// Repo metadata changes rarely; five minutes bounds staleness for renames
+/// while keeping repeated local submissions off the network.
+const REPO_META_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Shorter TTL for failed lookups so an offline or rate-limited forge does
+/// not stall every run creation on the full request timeout.
+const REPO_META_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Storage lifetime for one snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -101,23 +110,29 @@ pub(crate) struct WorkspaceSnapshot {
 
 /// Parse a GitHub `owner/repo` slug from a git remote URL.
 ///
-/// Handles the common remote forms:
-/// - `https://github.com/owner/repo.git` (and without `.git`)
-/// - `git@github.com:owner/repo.git` (and without `.git`)
-/// - `ssh://git@github.com/owner/repo.git`
+/// `github_host` is the configured forge host (`github.com`, or a GHES
+/// hostname from `PRELOOP_GITHUB_SERVER_URL`). Handles the common remote
+/// forms:
+/// - `https://<host>/owner/repo.git` (and without `.git`)
+/// - `git@<host>:owner/repo.git` (and without `.git`)
+/// - `ssh://git@<host>/owner/repo.git`
 ///
-/// Returns `None` for non-GitHub hosts, malformed URLs, or paths that are
-/// not exactly `owner/repo`. Case is preserved; GitHub slugs are
+/// Returns `None` for other hosts, malformed URLs, or paths that are not
+/// exactly `owner/repo`. Case is preserved; GitHub slugs are
 /// case-insensitive but the API canonicalizes them.
-fn parse_github_remote_slug(remote_url: &str) -> Option<String> {
+fn parse_github_remote_slug(remote_url: &str, github_host: &str) -> Option<String> {
     let remote_url = remote_url.trim();
+    let ssh_scp = format!("git@{github_host}:");
+    let ssh_url = format!("ssh://git@{github_host}/");
+    let https = format!("https://{github_host}/");
+    let http = format!("http://{github_host}/");
     let path = remote_url
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote_url.strip_prefix("ssh://git@github.com/"))
+        .strip_prefix(&ssh_scp)
+        .or_else(|| remote_url.strip_prefix(&ssh_url))
         .or_else(|| {
             remote_url
-                .strip_prefix("https://github.com/")
-                .or_else(|| remote_url.strip_prefix("http://github.com/"))
+                .strip_prefix(&https)
+                .or_else(|| remote_url.strip_prefix(&http))
         })?;
     let path = path.strip_suffix(".git").unwrap_or(path);
     let path = path.trim_matches('/');
@@ -145,17 +160,49 @@ fn parse_github_remote_slug(remote_url: &str) -> Option<String> {
 /// limit, renamed repo). The ID survives renames and owner transfers that
 /// would stale the slug. Prefers a GitHub App installation token when the
 /// server has one for the repository, then the provided PAT, then anonymous
-/// access (which works for public repositories).
+/// access (which works for public repositories). Results are cached on the
+/// engine state so repeated local submissions do not each pay the API
+/// latency — including a short negative TTL so an offline forge does not
+/// stall every run creation.
 async fn resolve_github_repo_meta(
     shared: Option<&SharedState>,
     slug: &str,
     github_pat: Option<&str>,
 ) -> (Option<u64>, Option<bool>) {
+    // The cache key includes the credential fingerprint: a PAT-scoped
+    // answer (e.g. private visibility) must not leak into a later anonymous
+    // lookup for the same slug.
+    let pat_fp = github_pat.map(|pat| {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(pat.as_bytes()))
+    });
+    let cache_key = (slug.to_owned(), pat_fp);
+    if let Some(shared) = shared {
+        if let Ok(cache) = shared.state.repo_meta_cache.lock() {
+            if let Some((meta, at)) = cache.get(&cache_key) {
+                let ttl = if meta.0.is_some() || meta.1.is_some() {
+                    REPO_META_CACHE_TTL
+                } else {
+                    REPO_META_NEGATIVE_TTL
+                };
+                if at.elapsed() < ttl {
+                    return *meta;
+                }
+            }
+        }
+    }
     // Prefer the App registry: a private repository configured App-only has
     // no PAT, and the installation token is the only credential that can
     // read its metadata.
     let mut app_token: Option<String> = None;
+    let mut api_url = "https://api.github.com".to_owned();
     if let Some(shared) = shared {
+        api_url = shared
+            .state
+            .github_urls
+            .api_url
+            .trim_end_matches('/')
+            .to_owned();
         if let Some(app) = crate::github_app::select_app_for_repo(shared, slug).await {
             let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
             app_token = crate::github_app::get_or_mint_token(&app, slug, &permissions)
@@ -164,7 +211,7 @@ async fn resolve_github_repo_meta(
         }
     }
     let mut request = crate::shared_http::CLIENT
-        .get(format!("https://api.github.com/repos/{slug}"))
+        .get(format!("{api_url}/repos/{slug}"))
         .header("User-Agent", "preloop-runner-server")
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(10));
@@ -187,25 +234,77 @@ async fn resolve_github_repo_meta(
         .and_then(|id| id.as_u64())
         .filter(|id| *id > 0);
     let private = body.get("private").and_then(|private| private.as_bool());
-    (id, private)
+    let meta = (id, private);
+    if let Some(shared) = shared {
+        if let Ok(mut cache) = shared.state.repo_meta_cache.lock() {
+            cache.retain(|_, (_, at)| at.elapsed() < REPO_META_CACHE_TTL);
+            cache.insert(cache_key, (meta, std::time::Instant::now()));
+        }
+    }
+    meta
 }
 
-/// Detect the workspace's GitHub upstream from its `origin` remote.
+/// Pick the GitHub `owner/repo` slug from `git remote -v` output.
+///
+/// `github_host` is the configured forge host (`github.com`, or a GHES
+/// hostname). `origin` wins when it points at the forge; otherwise the
+/// first remote in configuration order that parses as a forge URL is used
+/// — a workspace whose GitHub remote is named `private` or `upstream`
+/// still gets on-demand LFS fetching. Only fetch URLs are considered: a
+/// push-only mirror is not the upstream the objects came from.
+fn github_remote_slug(remote_v: &str, github_host: &str) -> Option<String> {
+    let mut first_github: Option<String> = None;
+    for line in remote_v.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(url)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        // `git remote -v` appends "(fetch)"/"(push)"; accept a bare URL too
+        // so the parser stays useful on trimmed input.
+        if let Some(marker) = fields.next() {
+            if marker != "(fetch)" {
+                continue;
+            }
+        }
+        let Some(slug) = parse_github_remote_slug(url, github_host) else {
+            continue;
+        };
+        if name == "origin" {
+            return Some(slug);
+        }
+        if first_github.is_none() {
+            first_github = Some(slug);
+        }
+    }
+    first_github
+}
+
+/// Host (with port) of the configured forge server URL, lowercased.
+/// `github.com` when the URL cannot be parsed — the parser then simply
+/// matches nothing rather than guessing a host.
+fn configured_github_host(shared: Option<&SharedState>) -> String {
+    shared
+        .and_then(|shared| url_download_host(&shared.state.github_urls.server_url))
+        .unwrap_or_else(|| "github.com".to_owned())
+}
+
+/// Detect the workspace's GitHub upstream from its remotes.
 ///
 /// Returns `(slug, repository_id, private)`: the `owner/repo` slug parsed
 /// from the remote URL, the stable numeric repository ID, and the
-/// repository's visibility, resolved via the GitHub API. Each element may
+/// repository's visibility, resolved via the forge API. Each element may
 /// be `None` independently — a slug without an ID still enables on-demand
-/// LFS fetching; unknown visibility fails closed (treated as private).
-/// Returns `None` when the workspace has no `origin` remote or it does not
-/// point at github.com.
+/// LFS fetching; unknown visibility is treated as public so an anonymous
+/// fetch is attempted (a private repo simply 404s into the same fallback).
+/// Returns `None` when the workspace has no remote pointing at the
+/// configured forge host.
 async fn detect_workspace_upstream(
     workspace: &FsPath,
     shared: Option<&SharedState>,
     github_pat: Option<&str>,
 ) -> Option<(String, Option<u64>, Option<bool>)> {
     let output = tokio::process::Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
+        .args(["remote", "-v"])
         .current_dir(workspace)
         .output()
         .await
@@ -213,8 +312,8 @@ async fn detect_workspace_upstream(
     if !output.status.success() {
         return None;
     }
-    let remote_url = String::from_utf8_lossy(&output.stdout);
-    let slug = parse_github_remote_slug(&remote_url)?;
+    let remote_v = String::from_utf8_lossy(&output.stdout);
+    let slug = github_remote_slug(&remote_v, &configured_github_host(shared))?;
     let (repository_id, private) = resolve_github_repo_meta(shared, &slug, github_pat).await;
     Some((slug, repository_id, private))
 }
@@ -3191,7 +3290,12 @@ pub(crate) async fn snapshot_git_http(
                         (
                             upstream,
                             snapshot.upstream_repository_id,
-                            snapshot.upstream_private.unwrap_or(true),
+                            // Unknown visibility is treated as public so an
+                            // anonymous fetch is attempted — a private repo
+                            // 404s into the same fallback either way, while
+                            // a public repo with no configured credential
+                            // would otherwise never fetch.
+                            snapshot.upstream_private.unwrap_or(false),
                         )
                     })
                 })
@@ -4867,7 +4971,7 @@ mod github_remote_slug_tests {
     #[test]
     fn https_with_git_suffix_parses() {
         assert_eq!(
-            parse_github_remote_slug("https://github.com/owner/repo.git"),
+            parse_github_remote_slug("https://github.com/owner/repo.git", "github.com"),
             Some("owner/repo".to_owned())
         );
     }
@@ -4875,7 +4979,7 @@ mod github_remote_slug_tests {
     #[test]
     fn https_without_git_suffix_parses() {
         assert_eq!(
-            parse_github_remote_slug("https://github.com/owner/repo"),
+            parse_github_remote_slug("https://github.com/owner/repo", "github.com"),
             Some("owner/repo".to_owned())
         );
     }
@@ -4883,7 +4987,7 @@ mod github_remote_slug_tests {
     #[test]
     fn ssh_scp_form_parses() {
         assert_eq!(
-            parse_github_remote_slug("git@github.com:owner/repo.git"),
+            parse_github_remote_slug("git@github.com:owner/repo.git", "github.com"),
             Some("owner/repo".to_owned())
         );
     }
@@ -4891,45 +4995,128 @@ mod github_remote_slug_tests {
     #[test]
     fn ssh_url_form_parses() {
         assert_eq!(
-            parse_github_remote_slug("ssh://git@github.com/owner/repo.git"),
+            parse_github_remote_slug("ssh://git@github.com/owner/repo.git", "github.com"),
             Some("owner/repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn ghes_host_parses() {
+        // A configured GHES host is the forge: remotes on it parse, and
+        // github.com URLs are rejected when the forge is enterprise.
+        assert_eq!(
+            parse_github_remote_slug(
+                "https://ghes.example.com/owner/repo.git",
+                "ghes.example.com"
+            ),
+            Some("owner/repo".to_owned())
+        );
+        assert_eq!(
+            parse_github_remote_slug("git@ghes.example.com:owner/repo.git", "ghes.example.com"),
+            Some("owner/repo".to_owned())
+        );
+        assert_eq!(
+            parse_github_remote_slug("https://github.com/owner/repo.git", "ghes.example.com"),
+            None
         );
     }
 
     #[test]
     fn non_github_hosts_rejected() {
         assert_eq!(
-            parse_github_remote_slug("https://gitlab.com/owner/repo.git"),
+            parse_github_remote_slug("https://gitlab.com/owner/repo.git", "github.com"),
             None
         );
         assert_eq!(
-            parse_github_remote_slug("git@gitlab.com:owner/repo.git"),
+            parse_github_remote_slug("git@gitlab.com:owner/repo.git", "github.com"),
             None
         );
         assert_eq!(
-            parse_github_remote_slug("https://github.example.com/owner/repo.git"),
+            parse_github_remote_slug("https://github.example.com/owner/repo.git", "github.com"),
             None
         );
     }
 
     #[test]
     fn malformed_paths_rejected() {
-        assert_eq!(parse_github_remote_slug("https://github.com/owner"), None);
         assert_eq!(
-            parse_github_remote_slug("https://github.com/owner/repo/extra"),
+            parse_github_remote_slug("https://github.com/owner", "github.com"),
             None
         );
-        assert_eq!(parse_github_remote_slug("https://github.com//repo"), None);
-        assert_eq!(parse_github_remote_slug("https://github.com/owner/"), None);
-        assert_eq!(parse_github_remote_slug("not a url"), None);
-        assert_eq!(parse_github_remote_slug(""), None);
+        assert_eq!(
+            parse_github_remote_slug("https://github.com/owner/repo/extra", "github.com"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote_slug("https://github.com//repo", "github.com"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote_slug("https://github.com/owner/", "github.com"),
+            None
+        );
+        assert_eq!(parse_github_remote_slug("not a url", "github.com"), None);
+        assert_eq!(parse_github_remote_slug("", "github.com"), None);
     }
 
     #[test]
     fn whitespace_is_trimmed() {
         assert_eq!(
-            parse_github_remote_slug("https://github.com/owner/repo.git\n"),
+            parse_github_remote_slug("https://github.com/owner/repo.git\n", "github.com"),
             Some("owner/repo".to_owned())
         );
+    }
+}
+
+#[cfg(test)]
+mod github_remote_slug_selection_tests {
+    use super::github_remote_slug;
+
+    #[test]
+    fn origin_wins_when_it_is_github() {
+        let remote_v = "upstream\thttps://github.com/other/repo.git (fetch)\n\
+                        origin\thttps://github.com/owner/repo.git (fetch)\n\
+                        origin\thttps://github.com/owner/repo.git (push)\n";
+        assert_eq!(
+            github_remote_slug(remote_v, "github.com"),
+            Some("owner/repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn first_github_remote_wins_when_origin_is_not_github() {
+        let remote_v = "origin\thttps://gitlab.com/owner/repo.git (fetch)\n\
+                        private\tgit@github.com:owner/repo.git (fetch)\n\
+                        private\tgit@github.com:owner/repo.git (push)\n";
+        assert_eq!(
+            github_remote_slug(remote_v, "github.com"),
+            Some("owner/repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn ghes_remote_is_matched() {
+        // With a GHES forge configured, remotes on that host parse and
+        // github.com remotes do not.
+        let remote_v = "origin\thttps://ghes.example.com/owner/repo.git (fetch)\n";
+        assert_eq!(
+            github_remote_slug(remote_v, "ghes.example.com"),
+            Some("owner/repo".to_owned())
+        );
+        assert_eq!(github_remote_slug(remote_v, "github.com"), None);
+    }
+
+    #[test]
+    fn push_only_urls_are_ignored() {
+        let remote_v = "origin\thttps://github.com/owner/repo.git (push)\n";
+        assert_eq!(github_remote_slug(remote_v, "github.com"), None);
+    }
+
+    #[test]
+    fn no_github_remote_returns_none() {
+        let remote_v = "origin\thttps://gitlab.com/owner/repo.git (fetch)\n\
+                        backup\thttps://bitbucket.org/owner/repo.git (fetch)\n";
+        assert_eq!(github_remote_slug(remote_v, "github.com"), None);
+        assert_eq!(github_remote_slug("", "github.com"), None);
     }
 }
