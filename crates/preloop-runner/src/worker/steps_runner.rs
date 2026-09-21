@@ -1165,8 +1165,11 @@ pub async fn run_steps(
                         }
                         Some(preloop_gha_protocol::debug_session::Verdict::Continue) => {
                             // The step still failed; the controller accepted it.
-                            // Mirrors runtime `continue-on-error`, and is reported
-                            // as such rather than laundered into a success.
+                            // Mirrors runtime `continue-on-error`, except a
+                            // durable masking failure must never be laundered
+                            // into success by an interactive verdict.
+                            let continued_conclusion =
+                                interactive_continue_conclusion(durable_log_error.is_some());
                             warn!(
                                 "Step '{}' failed but was continued interactively",
                                 resolved_display_name
@@ -1175,9 +1178,9 @@ pub async fn run_steps(
                             if let Some(step_result) =
                                 step_ctx.job.steps.get_mut(&step.context_name)
                             {
-                                step_result.conclusion = "Success".to_string();
+                                step_result.conclusion = continued_conclusion.to_string();
                             }
-                            break ("Success".to_string(), file_command_paths);
+                            break (continued_conclusion.to_string(), file_command_paths);
                         }
                         Some(preloop_gha_protocol::debug_session::Verdict::Abort) => {
                             // The step keeps its failure and the job unwinds
@@ -1570,6 +1573,15 @@ fn should_pause_on_failure(
     declined: bool,
 ) -> bool {
     outcome == "Failure" && !cancelled && !is_background && !declined
+}
+/// Interactive Continue may tolerate an execution failure, but it cannot
+/// override a durable masking failure.
+fn interactive_continue_conclusion(masking_failed: bool) -> &'static str {
+    if masking_failed {
+        "Failure"
+    } else {
+        "Success"
+    }
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.

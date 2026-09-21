@@ -295,6 +295,26 @@ impl JobContext {
         )
     }
 
+    /// Like [`Self::mask_secrets_with`], but a secret spanning N lines is
+    /// replaced with one `***` per line instead of a single marker, so the
+    /// physical record count of the output is unchanged.
+    ///
+    /// Retroactive masking rewrites the durable log after line checkpoints
+    /// were captured; collapsing records would invalidate them (see
+    /// `StepContext::log_content_since`).
+    pub fn mask_secrets_preserving_lines_with(&self, input: &str, secrets: &[String]) -> String {
+        let exclude: &[&str] = if self.dap_debugger.is_some() {
+            preloop_dap::DAP_PROTOCOL_KEYWORDS
+        } else {
+            &[]
+        };
+        preloop_gha_protocol::masking::mask_secrets_preserving_lines(
+            input,
+            secrets.iter().map(String::as_str),
+            exclude,
+        )
+    }
+
     /// Mask secret values in a string (longest secrets first to prevent partial matches).
     pub fn mask_secrets(&self, input: &str) -> String {
         let exclude: &[&str] = if self.dap_debugger.is_some() {
