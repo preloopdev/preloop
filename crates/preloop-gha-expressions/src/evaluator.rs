@@ -552,9 +552,9 @@ fn eval_call(
         }
         "join" => join_args(&values, budget).map(Value::String),
         "hashfiles" => hash_files(&values, context).map(Value::String),
-        "tojson" => Ok(Value::String(
-            serde_json::to_string(values.first().unwrap_or(&Value::Null)).unwrap_or_default(),
-        )),
+        "tojson" => {
+            to_json_pretty(values.first().unwrap_or(&Value::Null), budget).map(Value::String)
+        }
         _ => Err(ExpressionError::UnknownFunction(name.to_owned())),
     }
 }
@@ -863,6 +863,70 @@ fn string_value_capped<'a>(
     })
 }
 
+/// Serialize a value the way the official runner's `toJSON` does.
+///
+/// Official (ToJson.cs) writes through Newtonsoft's `JsonTextWriter` with
+/// `Formatting.Indented`: two-space indent and `Environment.NewLine`
+/// separators — `\r\n` on Windows, `\n` elsewhere. serde_json always emits
+/// `\n`, so on Windows the bytes pass through a translating writer.
+///
+/// Serialization is bounded by the remaining evaluation budget: pretty
+/// indentation can multiply the size of a deeply nested value, and an
+/// uncapped `to_string_pretty` would allocate the whole string before the
+/// result is charged, defeating the temporary-memory ceiling.
+fn to_json_pretty(value: &Value, budget: &EvalBudget) -> Result<String, ExpressionError> {
+    let too_large = || ExpressionError::EvaluationTooLarge(MAX_EVALUATED_VALUE_BYTES);
+    let bytes = to_json_pretty_bytes(value, budget.remaining()).map_err(|_| too_large())?;
+    String::from_utf8(bytes).map_err(|_| too_large())
+}
+
+#[cfg(not(windows))]
+fn to_json_pretty_bytes(value: &Value, limit: usize) -> Result<Vec<u8>, serde_json::Error> {
+    let mut writer = CappedJsonWriter {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    Ok(writer.bytes)
+}
+
+#[cfg(windows)]
+fn to_json_pretty_bytes(value: &Value, limit: usize) -> Result<Vec<u8>, serde_json::Error> {
+    let mut writer = CrLfWriter {
+        inner: CappedJsonWriter {
+            bytes: Vec::new(),
+            limit,
+        },
+    };
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    Ok(writer.inner.bytes)
+}
+
+/// Translates `\n` into `\r\n` so pretty JSON uses `Environment.NewLine`
+/// like the official runner's `JsonTextWriter` on Windows.
+#[cfg(windows)]
+struct CrLfWriter {
+    inner: CappedJsonWriter,
+}
+
+#[cfg(windows)]
+impl Write for CrLfWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.inner.write_all(b"\r\n")?;
+            } else {
+                self.inner.write_all(&[byte])?;
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Cap on the output of `format()`.
 ///
 /// Nested `format()` calls multiply output per level — each `{0}{0}{0}`
@@ -964,12 +1028,20 @@ fn format_args(values: &[Value], budget: &EvalBudget) -> Result<String, Expressi
     Ok(output)
 }
 
-fn join_args(values: &[Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
-    let separator = string_value_capped(values.get(1).unwrap_or(&Value::Null), budget.remaining())?;
+fn join_args<'a>(values: &'a [Value], budget: &EvalBudget) -> Result<String, ExpressionError> {
+    // Official runner (Join.cs): the separator defaults to "," and is only
+    // honored when the provided value IsPrimitive — arrays and objects fall
+    // back to ",". A non-array, non-primitive first argument (e.g. an
+    // object) yields "". Live-verified against GitHub-hosted runners
+    // 2026-09-19: join(['a','b'], ['x']) == 'a,b', join({'a':1}) == ''.
+    let separator: Cow<'a, str> = match values.get(1) {
+        Some(value) if is_primitive(value) => string_value_capped(value, budget.remaining())?,
+        _ => Cow::Borrowed(","),
+    };
     let mut output = String::new();
     match values.first() {
-        Some(Value::Array(values)) => {
-            for (index, value) in values.iter().enumerate() {
+        Some(Value::Array(items)) => {
+            for (index, value) in items.iter().enumerate() {
                 if index > 0 {
                     push_evaluation_capped(&mut output, separator.as_ref(), budget)?;
                 }
@@ -978,14 +1050,23 @@ fn join_args(values: &[Value], budget: &EvalBudget) -> Result<String, Expression
                 push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
             }
         }
-        Some(value) => {
-            let rendered =
-                string_value_capped(value, budget.remaining().saturating_sub(output.len()))?;
+        Some(value) if is_primitive(value) => {
+            let rendered = string_value_capped(value, budget.remaining())?;
             push_evaluation_capped(&mut output, rendered.as_ref(), budget)?;
         }
-        None => {}
+        // Objects and other non-primitives → empty string per official.
+        _ => {}
     }
     Ok(output)
+}
+
+/// Matches official EvaluationResult.IsPrimitive: null, booleans, numbers,
+/// and strings — not arrays or objects.
+fn is_primitive(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    )
 }
 
 fn push_evaluation_capped(
