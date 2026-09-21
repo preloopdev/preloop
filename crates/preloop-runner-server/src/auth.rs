@@ -226,10 +226,7 @@ pub fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
 /// (the legacy `/_apis/artifactcache` cache write path). Same rule as
 /// [`require_live_results_job`]: the system identity bypasses, so callers
 /// must skip this helper for the system bearer themselves.
-pub async fn require_live_job(
-    state: &AppState,
-    job_uuid: uuid::Uuid,
-) -> Result<(), ApiError> {
+pub async fn require_live_job(state: &AppState, job_uuid: uuid::Uuid) -> Result<(), ApiError> {
     let inner = state.inner.lock().await;
     // Liveness follows the request record, not the projected run status:
     // cancellation projects `run.jobs` to Cancelled immediately while the
@@ -739,11 +736,7 @@ pub fn results_identity(
     Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
-pub fn results_identity_binds_job(
-    identity: &ResultsIdentity,
-    plan_id: &str,
-    job_id: &str,
-) -> bool {
+pub fn results_identity_binds_job(identity: &ResultsIdentity, plan_id: &str, job_id: &str) -> bool {
     match identity {
         ResultsIdentity::System => true,
         ResultsIdentity::Job(identity) => {
@@ -866,10 +859,7 @@ fn debug_session_member(path: &str, suffix: &str) -> bool {
 /// every runner VM, so anything not part of the runner/broker protocol is
 /// refused there. Native management and GUI API prefixes have no legitimate
 /// use from a guest.
-pub async fn runner_surface_only(
-    mut request: Request,
-    next: Next,
-) -> Result<Response, ApiError> {
+pub async fn runner_surface_only(mut request: Request, next: Next) -> Result<Response, ApiError> {
     const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/"];
     let path = request.uri().path();
     let worker_debug_route = is_worker_debug_route(request.method(), path);

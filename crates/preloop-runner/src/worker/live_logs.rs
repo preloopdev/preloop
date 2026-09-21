@@ -6,8 +6,8 @@
 
 use futures::SinkExt;
 use rand::Rng;
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -49,6 +49,13 @@ impl std::fmt::Debug for LiveLogQueue {
 
 pub struct LiveLogQueue {
     lines: Mutex<VecDeque<ConsoleLineInfo>>,
+    masks: Arc<RwLock<HashSet<String>>>,
+    /// Gate synchronizing mask registration with transmission. The
+    /// `::add-mask::` path holds it for writing across registration while
+    /// each WebSocket batch holds it for reading across the final mask
+    /// snapshot and the send, so a batch can never go out with a mask
+    /// snapshot taken before a registration that completed first.
+    mask_gate: Arc<tokio::sync::RwLock<()>>,
     ws: tokio::sync::Mutex<Option<WebSocketSender>>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -63,10 +70,16 @@ impl LiveLogQueue {
     /// step, so an unreachable feed endpoint delayed every job by ~1s. Lines
     /// produced before the socket is up stay queued and go out on the first
     /// drain after it connects.
-    pub fn connect(feed_url: String, access_token: String) -> Arc<Self> {
+    pub fn connect(
+        feed_url: String,
+        access_token: String,
+        masks: Arc<RwLock<HashSet<String>>>,
+    ) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let queue = Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
+            masks,
+            mask_gate: Arc::new(tokio::sync::RwLock::new(())),
             ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
         });
@@ -94,9 +107,26 @@ impl LiveLogQueue {
         let (shutdown_tx, _) = watch::channel(false);
         Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
+            masks: Arc::new(RwLock::new(HashSet::new())),
+            mask_gate: Arc::new(tokio::sync::RwLock::new(())),
             ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
         })
+    }
+
+    /// Acquire the mask gate for writing, for use from sync code.
+    ///
+    /// `handle_command` runs on step-output threads that may sit inside the
+    /// tokio runtime, where `blocking_write()` would panic, so this acquires
+    /// cooperatively. The read critical section is one batch send, making
+    /// the spin uncontended in practice.
+    pub fn acquire_mask_gate_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        loop {
+            match Arc::clone(&self.mask_gate).try_write_owned() {
+                Ok(guard) => return guard,
+                Err(_) => std::thread::sleep(std::time::Duration::from_micros(100)),
+            }
+        }
     }
 
     /// Enqueue one console line. Lines above the official 1024-entry threshold
@@ -118,12 +148,9 @@ impl LiveLogQueue {
     /// Lines already dequeued cannot be recalled from the WebSocket.
     pub fn remask_with(&self, secrets: &[String]) {
         let mut lines = self.lines.lock().expect("live log queue poisoned");
-        for entry in &mut *lines {
-            entry.line = preloop_gha_protocol::masking::mask_secrets(
-                &entry.line,
-                secrets.iter().map(String::as_str),
-                &[],
-            );
+        let masked = mask_lines(lines.iter().map(|entry| entry.line.as_str()), secrets);
+        for (entry, line) in lines.iter_mut().zip(masked) {
+            entry.line = line;
         }
     }
 
@@ -207,10 +234,19 @@ impl LiveLogQueue {
     }
 
     async fn send_grouped(&self, lines: Vec<ConsoleLineInfo>) {
-        for wrapper in wrappers_from_lines(lines) {
+        let batches = line_batches(lines);
+        for index in 0..batches.len() {
             let mut ws = self.ws.lock().await;
-            if let Some(sender) = ws.as_mut() {
-                if !sender.send(&wrapper).await && sender.should_disable() {
+            let Some(sender) = ws.as_mut() else {
+                drop(ws);
+                self.requeue_front(&batches[index..]);
+                return;
+            };
+            let wrapper = wrapper_from_lines(&batches[index]);
+            let sent = sender.send(&wrapper, self).await;
+            if !sent {
+                let disable = sender.should_disable();
+                if disable {
                     warn!(
                         url = %sender.url,
                         failed = sender.failed_batches,
@@ -219,6 +255,20 @@ impl LiveLogQueue {
                     );
                     *ws = None;
                 }
+                drop(ws);
+                // Keep unsent lines available for a later drain. They remain
+                // remaskable until a batch is actually transmitted.
+                self.requeue_front(&batches[index..]);
+                return;
+            }
+        }
+    }
+
+    fn requeue_front(&self, batches: &[Vec<ConsoleLineInfo>]) {
+        let mut queue = self.lines.lock().expect("live log queue poisoned");
+        for batch in batches.iter().rev() {
+            for line in batch.iter().rev() {
+                queue.push_front(line.clone());
             }
         }
     }
@@ -254,19 +304,44 @@ impl WebSocketSender {
         }
     }
 
-    async fn send(&mut self, wrapper: &TimelineRecordFeedLinesWrapper) -> bool {
+    async fn send(
+        &mut self,
+        wrapper: &TimelineRecordFeedLinesWrapper,
+        queue: &LiveLogQueue,
+    ) -> bool {
         self.total_batches += 1;
-        let payload = match serde_json::to_string(wrapper) {
-            Ok(payload) => payload,
-            Err(error) => {
-                warn!(%error, "serializing live log wrapper failed");
-                self.failed_batches += 1;
-                return false;
-            }
-        };
 
         for attempt in 0..RETRIES {
-            if self.ws.send(Message::Text(payload.clone())).await.is_ok() {
+            // Hold the mask gate for reading across the final mask snapshot
+            // and the send: a concurrent `::add-mask::` registration either
+            // completes fully before this snapshot (and is included in it) or
+            // waits until the send finishes, so a batch can never go out with
+            // a snapshot taken before a completed registration. The guard is
+            // scoped to one attempt so backoff/reconnect between attempts do
+            // not block mask registration.
+            let sent = {
+                // `tokio::sync::RwLock` guards are `Send`, unlike the std /
+                // parking_lot ones, so this can be held across the await.
+                let _gate = queue.mask_gate.read().await;
+                let masked = match mask_wrapper(wrapper, &queue.masks) {
+                    Some(wrapper) => wrapper,
+                    None => {
+                        warn!("live log mask set is unavailable; refusing to transmit batch");
+                        self.failed_batches += 1;
+                        return false;
+                    }
+                };
+                let payload = match serde_json::to_string(&masked) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(%error, "serializing live log wrapper failed");
+                        self.failed_batches += 1;
+                        return false;
+                    }
+                };
+                self.ws.send(Message::Text(payload)).await.is_ok()
+            };
+            if sent {
                 return true;
             }
 
@@ -341,27 +416,77 @@ fn truncate_line(line: &str) -> String {
     truncated
 }
 
-fn wrappers_from_lines(lines: Vec<ConsoleLineInfo>) -> Vec<TimelineRecordFeedLinesWrapper> {
+/// Re-mask a sequence of physical log lines against the current secrets.
+///
+/// Lines are joined, masked, and split so a secret spanning a line boundary
+/// still matches. `mask_secrets_preserving_lines` re-emits every newline
+/// inside a matched secret, so the output line count always equals the input
+/// line count and the split is one-to-one.
+fn mask_lines<'a, I>(lines: I, secrets: &[String]) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let joined = lines.into_iter().collect::<Vec<_>>().join("\n");
+    if joined.is_empty() {
+        return Vec::new();
+    }
+    preloop_gha_protocol::masking::mask_secrets_preserving_lines(
+        &joined,
+        secrets.iter().map(String::as_str),
+        &[],
+    )
+    .split('\n')
+    .map(str::to_owned)
+    .collect()
+}
+
+fn mask_wrapper(
+    wrapper: &TimelineRecordFeedLinesWrapper,
+    masks: &Arc<RwLock<HashSet<String>>>,
+) -> Option<TimelineRecordFeedLinesWrapper> {
+    let masks = masks.read().ok()?;
+    let secrets: Vec<String> = masks.iter().cloned().collect();
+    let value = mask_lines(wrapper.value.iter().map(String::as_str), &secrets);
+    Some(TimelineRecordFeedLinesWrapper {
+        step_id: wrapper.step_id.clone(),
+        start_line: wrapper.start_line,
+        count: wrapper.count,
+        value,
+    })
+}
+
+fn line_batches(lines: Vec<ConsoleLineInfo>) -> Vec<Vec<ConsoleLineInfo>> {
     let mut grouped: BTreeMap<String, Vec<ConsoleLineInfo>> = BTreeMap::new();
     for line in lines {
         grouped.entry(line.step_id.clone()).or_default().push(line);
     }
 
-    let mut wrappers = Vec::new();
-    for (step_id, lines) in grouped {
+    let mut batches = Vec::new();
+    for lines in grouped.into_values() {
         for chunk in lines.chunks(LINES_PER_BATCH) {
-            if chunk.is_empty() {
-                continue;
+            if !chunk.is_empty() {
+                batches.push(chunk.to_vec());
             }
-            wrappers.push(TimelineRecordFeedLinesWrapper {
-                step_id: step_id.clone(),
-                start_line: chunk[0].line_number,
-                count: chunk.len(),
-                value: chunk.iter().map(|line| line.line.clone()).collect(),
-            });
         }
     }
-    wrappers
+    batches
+}
+
+fn wrapper_from_lines(lines: &[ConsoleLineInfo]) -> TimelineRecordFeedLinesWrapper {
+    TimelineRecordFeedLinesWrapper {
+        step_id: lines[0].step_id.clone(),
+        start_line: lines[0].line_number,
+        count: lines.len(),
+        value: lines.iter().map(|line| line.line.clone()).collect(),
+    }
+}
+
+#[cfg(test)]
+fn wrappers_from_lines(lines: Vec<ConsoleLineInfo>) -> Vec<TimelineRecordFeedLinesWrapper> {
+    line_batches(lines)
+        .iter()
+        .map(|batch| wrapper_from_lines(batch))
+        .collect()
 }
 
 fn tail_by_step(lines: Vec<ConsoleLineInfo>, limit: usize) -> Vec<ConsoleLineInfo> {
@@ -451,6 +576,58 @@ mod tests {
         let lines = queue.dequeue(DRAIN_LIMIT);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].line, "token ***");
+    }
+    #[test]
+    fn dequeued_batches_are_remasked_from_current_masks() {
+        let masks = Arc::new(RwLock::new(HashSet::new()));
+        let wrapper = TimelineRecordFeedLinesWrapper {
+            step_id: "step".to_owned(),
+            start_line: 1,
+            count: 1,
+            value: vec!["token hunter2-secret".to_owned()],
+        };
+
+        assert_eq!(
+            mask_wrapper(&wrapper, &masks).unwrap().value,
+            vec!["token hunter2-secret"]
+        );
+        masks.write().unwrap().insert("hunter2-secret".to_owned());
+        assert_eq!(
+            mask_wrapper(&wrapper, &masks).unwrap().value,
+            vec!["token ***"]
+        );
+    }
+    #[test]
+    fn remasked_batch_redacts_secret_spanning_lines() {
+        let masks = Arc::new(RwLock::new(HashSet::new()));
+        let wrapper = TimelineRecordFeedLinesWrapper {
+            step_id: "step".to_owned(),
+            start_line: 1,
+            count: 3,
+            value: vec![
+                "prefix token-a".to_owned(),
+                "token-b suffix".to_owned(),
+                "unrelated".to_owned(),
+            ],
+        };
+
+        masks.write().unwrap().insert("token-a\ntoken-b".to_owned());
+        let masked = mask_wrapper(&wrapper, &masks).unwrap();
+        assert_eq!(masked.value, vec!["prefix ***", "*** suffix", "unrelated"]);
+        assert_eq!(masked.count, 3);
+    }
+
+    #[test]
+    fn queued_lines_remask_secret_spanning_lines() {
+        let queue = LiveLogQueue::disconnected();
+        queue.enqueue("step", "prefix token-a", 1);
+        queue.enqueue("step", "token-b suffix", 2);
+        queue.remask_with(&["token-a\ntoken-b".to_owned()]);
+
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, "prefix ***");
+        assert_eq!(lines[1].line, "*** suffix");
     }
 
     #[test]
