@@ -1118,7 +1118,7 @@ pub fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reas
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SchedulingOutcome {
     pub promoted: usize,
     pub skipped: Vec<(RunId, JobId)>,

@@ -41,6 +41,7 @@ pub mod runs;
 use runs::*;
 pub mod runtime_scheduling;
 use runtime_scheduling::*;
+pub mod control;
 pub mod timeline_logs;
 use timeline_logs::*;
 pub mod routes;

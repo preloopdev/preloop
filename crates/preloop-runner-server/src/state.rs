@@ -428,6 +428,10 @@ impl Drop for TestEnvVar {
 #[derive(Clone)]
 pub struct AppState {
     pub inner: Arc<Mutex<InnerState>>,
+    /// The database-authoritative control plane: scheduling state lives
+    /// here, not in `inner`. `Arc<Backend>` (concrete enum) so
+    /// `Backend::transact` stays generic.
+    pub backend: Arc<crate::control::Backend>,
     pub store: Arc<dyn Store>,
     pub events: broadcast::Sender<NdjsonEvent>,
     pub message_notify: Arc<Notify>,
@@ -1151,8 +1155,24 @@ impl AppState {
                 .map(str::to_owned)
                 .collect();
         }
+        // The database-authoritative control plane. Scheduling state lives
+        // here, not in `inner`; the backend is selected by the same
+        // `store_url` as the legacy store (postgres:// → Postgres, else
+        // SQLite at `<state_dir>/control.db`). Config flags come from the
+        // recovered `inner` before it moves into the Mutex.
+        let backend = Arc::new(
+            crate::control::Backend::open(
+                store_url,
+                &state_dir,
+                inner.pool_assignments_enabled,
+                inner.require_job_assignments,
+                inner.runner_liveness_timeout,
+            )
+            .await?,
+        );
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            backend,
             store,
             events,
             message_notify: Arc::new(Notify::new()),

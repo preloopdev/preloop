@@ -1,0 +1,602 @@
+//! The backend-neutral command bodies: the load→sched→write-back glue that
+//! runs every `ControlBackend` command against a [`TxState`] working set.
+//!
+//! Both backends (SQLite and Postgres) load the same `TxState`, call these
+//! functions, and write the delta back — so the scheduling semantics live in
+//! exactly one place and a backend can never diverge from them. These are
+//! pure Rust over the working set; they never touch SQL.
+
+use super::backend::*;
+use super::sched;
+use super::txstate::TxState;
+use super::types::*;
+use crate::concurrency;
+use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId, SessionId};
+use std::collections::BTreeMap;
+
+fn system_to_us(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+fn parse_uuid(s: &str) -> uuid::Uuid {
+    s.parse().unwrap_or_default()
+}
+
+pub(crate) fn submit_run_tx(
+    tx: &mut TxState,
+    submit: SubmitRun,
+) -> Result<SubmitOutcome, ControlError> {
+    // Idempotent replay: a webhook delivery that already produced a run
+    // returns that run instead of a duplicate.
+    if let Some(delivery_id) = &submit.record.webhook_delivery_id {
+        if let Some(existing) = tx
+            .runs
+            .values()
+            .find(|r| r.webhook_delivery_id.as_deref() == Some(delivery_id.as_str()))
+            .cloned()
+        {
+            return Ok(SubmitOutcome {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: 0,
+                status: existing.status,
+                concluded: Vec::new(),
+                held: false,
+                rejected: None,
+                existing: Some(Box::new(existing)),
+            });
+        }
+    }
+
+    let run_id = submit.record.run_id;
+    let mut record = submit.record;
+    let mut concluded = Vec::new();
+    let mut queued_count = 0usize;
+
+    // Reject outright on an empty concurrency group.
+    if submit.empty_concurrency_group {
+        record.status = ExecutionStatus::Failure;
+        return Ok(SubmitOutcome {
+            run_id,
+            run_number: record.run_number,
+            queued_jobs: 0,
+            status: record.status,
+            concluded: vec![(
+                JobId("*".to_owned()),
+                ExecutionStatus::Failure,
+                Some("empty concurrency group".to_owned()),
+            )],
+            held: false,
+            rejected: Some(ExecutionStatus::Failure),
+            existing: None,
+        });
+    }
+
+    // Workflow-level concurrency gate.
+    let mut held = false;
+    if let Some(wf) = &submit.workflow_concurrency {
+        let key = concurrency::concurrency_key(&record.submission.repository, &wf.group);
+        let holder = concurrency::Holder::Run(run_id);
+        match sched::try_acquire_concurrency(
+            tx,
+            key,
+            wf.group.clone(),
+            holder,
+            wf.cancel_in_progress,
+            wf.queue,
+        ) {
+            Ok(true) => {}
+            Ok(false) => held = true,
+            Err(_) => {
+                record.status = ExecutionStatus::Failure;
+                return Ok(SubmitOutcome {
+                    run_id,
+                    run_number: record.run_number,
+                    queued_jobs: 0,
+                    status: record.status,
+                    concluded: vec![(
+                        JobId("*".to_owned()),
+                        ExecutionStatus::Failure,
+                        Some("workflow concurrency rejected".to_owned()),
+                    )],
+                    held: false,
+                    rejected: Some(ExecutionStatus::Failure),
+                    existing: None,
+                });
+            }
+        }
+    }
+
+    // Unhostable-platform check against live runners.
+    let platforms = sched::registered_runner_platforms(tx);
+
+    // Insert the run record, then classify each job.
+    record.status = if held {
+        ExecutionStatus::Pending
+    } else {
+        ExecutionStatus::Queued
+    };
+    tx.runs.insert(run_id, record.clone());
+    if let Some(wf) = &submit.workflow_concurrency {
+        tx.run_concurrency.insert(run_id, wf.raw.clone());
+    }
+
+    let mut held_jobs = Vec::new();
+    for submit_job in submit.jobs {
+        let job = submit_job.queued;
+        let job_id = job.job_id.clone();
+
+        // Unhostable platform: conclude immediately.
+        if submit.check_hostable {
+            if let Some(platform) = sched::unhostable_platform(&job.runs_on, platforms.clone()) {
+                record.jobs.insert(job_id.clone(), ExecutionStatus::Failure);
+                concluded.push((
+                    job_id.clone(),
+                    ExecutionStatus::Failure,
+                    Some(format!("no {platform} runner registered")),
+                ));
+                continue;
+            }
+        }
+
+        // Correlation records for dispatchable jobs. The broker message the
+        // acquire path hands back is the job's own AgentJobRequestMessage,
+        // keyed by request id.
+        if let Some(request) = submit_job.request {
+            let request_id = request.request_id;
+            tx.insert_request(request);
+            tx.broker_messages.insert(request_id, job.message.clone());
+        }
+        if let Some(token_request) = submit_job.token_request {
+            if let Some(request_id) = tx
+                .job_requests
+                .values()
+                .find(|r| r.run_id == run_id && r.job_id == job_id)
+                .map(|r| r.request_id)
+            {
+                tx.github_token_requests.insert(request_id, token_request);
+            }
+        }
+        tx.id_token_grants
+            .insert((run_id, job_id.clone()), submit_job.id_token_granted);
+        if let Some(oidc) = submit_job.oidc_context {
+            tx.oidc_job_contexts.insert((run_id, job_id.clone()), oidc);
+        }
+        if !submit_job.step_manifest.is_empty() {
+            if let Some(agent_job_id) = tx
+                .job_requests
+                .values()
+                .find(|r| r.run_id == run_id && r.job_id == job_id)
+                .map(|r| r.agent_job_id)
+            {
+                tx.job_steps.insert(agent_job_id, submit_job.step_manifest);
+            }
+        }
+
+        if submit_job.initially_skipped {
+            record.jobs.insert(job_id.clone(), ExecutionStatus::Skipped);
+            concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
+            continue;
+        }
+
+        // Deferred nodes (reusable caller / dynamic matrix) never dispatch:
+        // they go to pending_expansions and the expansion path materializes
+        // them.
+        if job.reusable_call.is_some() || job.deferred_matrix.is_some() {
+            record.jobs.insert(job_id.clone(), ExecutionStatus::Pending);
+            tx.pending_expansions.push_back(job);
+            continue;
+        }
+
+        // Needs-gated jobs wait in pending_jobs.
+        if !job.needs.is_empty() {
+            record.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
+            tx.pending_jobs.push_back(job);
+            continue;
+        }
+
+        if held {
+            record.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
+            held_jobs.push(job);
+            continue;
+        }
+
+        // Ready job: evaluate the job-level gate, then enqueue.
+        let mut statuses = BTreeMap::new();
+        let submission = record.submission.clone();
+        let github = record.github.clone();
+        match sched::try_enqueue_with_job_concurrency(tx, &github, &submission, job, &mut statuses)
+        {
+            Ok(true) => {
+                queued_count += 1;
+                record.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
+            }
+            Ok(false) => {
+                record.jobs.insert(job_id.clone(), ExecutionStatus::Pending);
+            }
+            Err(()) => {
+                let status = statuses
+                    .get(&job_id)
+                    .copied()
+                    .unwrap_or(ExecutionStatus::Failure);
+                record.jobs.insert(job_id.clone(), status);
+                concluded.push((job_id.clone(), status, None));
+            }
+        }
+    }
+
+    if held {
+        tx.held_runs.insert(run_id, held_jobs);
+    }
+
+    // Promote any needs-gated jobs already satisfiable.
+    let promoted = sched::promote_ready_jobs(tx);
+    queued_count += promoted.promoted;
+    for (rid, jid) in promoted.skipped.iter().chain(promoted.failed.iter()) {
+        if *rid == run_id {
+            if let Some(s) = record.jobs.get(jid) {
+                concluded.push((jid.clone(), *s, None));
+            }
+        }
+    }
+
+    record.status = sched::summarize_run(record.jobs.values().copied());
+    sched::finalize_run_if_complete(&mut record);
+    tx.runs.insert(run_id, record.clone());
+
+    Ok(SubmitOutcome {
+        run_id,
+        run_number: record.run_number,
+        queued_jobs: queued_count,
+        status: record.status,
+        concluded,
+        held,
+        rejected: None,
+        existing: None,
+    })
+}
+
+pub(crate) fn poll_session_tx(
+    tx: &mut TxState,
+    poll: PollRequest,
+) -> Result<PollOutcome, ControlError> {
+    tx.mark_session_seen(&poll.session_id);
+
+    // Redeliver an unacknowledged inflight message first.
+    if let Some(message) = tx
+        .inflight_messages
+        .get(&poll.session_id)
+        .and_then(|messages| messages.values().next().cloned())
+    {
+        return Ok(PollOutcome::Inflight(message));
+    }
+
+    // A queued cancellation for this session's active job wins over new work.
+    if let Some(request_id) = tx.session_active_requests.get(&poll.session_id).copied() {
+        if let Some(request) = tx.job_requests.get(&request_id).cloned() {
+            if let Some(pos) = tx
+                .cancellation_queue
+                .iter()
+                .position(|c| c.run_id == request.run_id && c.job_id == request.job_id)
+            {
+                let cancellation = tx.cancellation_queue.remove(pos).unwrap();
+                let message = broker_message(
+                    tx,
+                    &poll.session_id,
+                    azdo::message_type::JOB_CANCELLED,
+                    concurrency::job_cancel_body(cancellation.agent_job_id),
+                );
+                return Ok(PollOutcome::Cancel(message));
+            }
+            if request.result.is_none() {
+                return Ok(PollOutcome::ActiveRequest {
+                    request,
+                    runner_id: poll.verified_runner_id.unwrap_or_default(),
+                });
+            }
+            tx.session_active_requests.remove(&poll.session_id);
+        } else {
+            tx.session_active_requests.remove(&poll.session_id);
+        }
+    }
+
+    // Pick a claimable job.
+    let Some(pos) = sched::choose_claim_position(tx, &poll.runner, poll.verified_runner_id) else {
+        return Ok(PollOutcome::Empty);
+    };
+    let Some(job) = sched::apply_claim(tx, pos) else {
+        return Ok(PollOutcome::Empty);
+    };
+
+    // Find the request record for this job's live attempt.
+    let request_id = tx
+        .job_requests
+        .values()
+        .find(|r| r.run_id == job.run_id && r.job_id == job.job_id && r.result.is_none())
+        .map(|r| r.request_id)
+        .or_else(|| {
+            tx.job_requests
+                .values()
+                .find(|r| r.run_id == job.run_id && r.job_id == job.job_id)
+                .map(|r| r.request_id)
+        });
+    let Some(request_id) = request_id else {
+        return Ok(PollOutcome::Empty);
+    };
+    if let Some(record) = tx.job_requests.get_mut(&request_id) {
+        record.owner_runner_id = poll.verified_runner_id;
+        record.claimed_at = Some(std::time::SystemTime::now());
+        record.locked_until = crate::distributed_task::agent_request_locked_until();
+    }
+    tx.session_active_requests
+        .insert(poll.session_id.clone(), request_id);
+    if let Some(run) = tx.runs.get_mut(&job.run_id) {
+        run.jobs
+            .insert(job.job_id.clone(), ExecutionStatus::InProgress);
+        if run.started_at.is_none() {
+            run.started_at = Some(chrono::Utc::now());
+        }
+        run.status = ExecutionStatus::InProgress;
+    }
+    let request = tx
+        .job_requests
+        .get(&request_id)
+        .cloned()
+        .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
+    Ok(PollOutcome::Claimed(Box::new(ClaimedJob {
+        queued: job,
+        request,
+        runner_id: poll.verified_runner_id.unwrap_or_default(),
+        queue_depth: tx.ready_index.len() + tx.queue.len(),
+        next_runs_on: sched::next_job_labels(tx),
+    })))
+}
+
+/// Mint a session-unique broker message and park it in inflight for
+/// redelivery-until-ack.
+pub(crate) fn broker_message(
+    tx: &mut TxState,
+    session_id: &str,
+    message_type: &str,
+    body_json: String,
+) -> azdo::TaskAgentMessage {
+    tx.next_message_id += 1;
+    let message_id = tx.next_message_id;
+    let message = azdo::TaskAgentMessage {
+        message_id,
+        message_type: message_type.to_owned(),
+        body: body_json,
+        iv: None,
+    };
+    tx.inflight_messages
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(message_id, message.clone());
+    message
+}
+
+pub(crate) fn complete_job_tx(
+    tx: &mut TxState,
+    completion: JobCompletionInput,
+) -> Result<CompleteOutcome, ControlError> {
+    let run_id = completion.run_id;
+    let job_id = completion.job_id.clone();
+
+    // Settle the request for this attempt.
+    let request_id = completion
+        .agent_job_id
+        .and_then(|id| tx.agent_job_requests.get(&id).copied())
+        .or_else(|| {
+            tx.job_requests
+                .values()
+                .find(|r| r.run_id == run_id && r.job_id == job_id && r.result.is_none())
+                .map(|r| r.request_id)
+        });
+    if let Some(request_id) = request_id {
+        sched::settle_request(tx, request_id, completion.status);
+    }
+
+    // Flip the job and run status, record outputs.
+    let was_terminal_success = tx
+        .runs
+        .get(&run_id)
+        .map(|r| r.status == ExecutionStatus::Success)
+        .unwrap_or(false);
+    let run = tx
+        .runs
+        .get_mut(&run_id)
+        .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+    let prior = run.jobs.get(&job_id).copied();
+    let replayed = matches!(
+        prior,
+        Some(ExecutionStatus::Success)
+            | Some(ExecutionStatus::Failure)
+            | Some(ExecutionStatus::Skipped)
+            | Some(ExecutionStatus::Cancelled)
+    );
+    let effective_status = if replayed {
+        prior.unwrap()
+    } else {
+        run.jobs.insert(job_id.clone(), completion.status);
+        completion.status
+    };
+    if !completion.outputs.is_empty() {
+        run.job_outputs
+            .insert(job_id.clone(), completion.outputs.clone());
+    }
+    run.status = sched::summarize_run(run.jobs.values().copied());
+    sched::finalize_run_if_complete(run);
+    let newly_terminal_success = !was_terminal_success && run.status == ExecutionStatus::Success;
+    let run = run.clone();
+
+    // Fail-fast siblings, concurrency release, dependency promotion.
+    let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
+        sched::apply_matrix_fail_fast(tx, run_id, &job_id)
+    } else {
+        Vec::new()
+    };
+    sched::release_concurrency_for_job(tx, run_id, &job_id);
+    tx.claimed_jobs.remove(&(run_id, job_id.clone()));
+    let scheduling = sched::promote_ready_jobs(tx);
+
+    Ok(CompleteOutcome {
+        record: run,
+        effective_status,
+        newly_terminal_success,
+        cancelled_siblings,
+        scheduling,
+        live_log_key: format!("{}:{}", run_id.0, job_id.0),
+        queue_nonempty: !tx.ready_index.is_empty()
+            || !tx.queue.is_empty()
+            || !tx.cancellation_queue.is_empty(),
+        queue_depth: tx.ready_index.len() + tx.queue.len(),
+        replayed,
+    })
+}
+
+pub(crate) fn register_runner_tx(
+    tx: &mut TxState,
+    reg: RegisterRunner,
+) -> Result<RunnerRow, ControlError> {
+    // Dedup on client_id: a re-register returns the existing runner.
+    if let Some(client_id) = &reg.client_id {
+        if let Some(runner_id) = tx.runner_client_ids.get(client_id).copied() {
+            if let Some(runner) = tx.runners.get(&runner_id).cloned() {
+                return Ok(RunnerRow {
+                    runner,
+                    rsa_public_key: tx.runner_rsa_public_keys.get(&runner_id).cloned(),
+                    client_id: Some(client_id.clone()),
+                    pool_proven: tx.pool_proven_runners.contains(&runner_id),
+                    registered_at_us: tx
+                        .runner_registered_at
+                        .get(&runner_id)
+                        .map(|t| system_to_us(*t))
+                        .unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    tx.next_runner_id += 1;
+    let runner_id = tx.next_runner_id;
+    let runner = preloop_gha_protocol::RegisteredRunner {
+        id: runner_id,
+        name: reg.name,
+        labels: reg.labels,
+        ephemeral: reg.ephemeral,
+        public_key: reg.public_key,
+        runner_group_id: reg.runner_group_id,
+        runner_group_name: reg.runner_group_name,
+    };
+    tx.runners.insert(runner_id, runner.clone());
+    tx.runner_registered_at
+        .insert(runner_id, std::time::SystemTime::now());
+    if let Some(key) = reg.rsa_public_key {
+        tx.runner_rsa_public_keys.insert(runner_id, key);
+    }
+    if let Some(client_id) = &reg.client_id {
+        tx.runner_client_ids.insert(client_id.clone(), runner_id);
+    }
+    if reg.pool_proven {
+        tx.pool_proven_runners.insert(runner_id);
+    }
+    sched::pair_registered_runner(tx, runner_id);
+    Ok(RunnerRow {
+        runner,
+        rsa_public_key: tx.runner_rsa_public_keys.get(&runner_id).cloned(),
+        client_id: reg.client_id,
+        pool_proven: reg.pool_proven,
+        registered_at_us: system_to_us(std::time::SystemTime::now()),
+    })
+}
+
+pub(crate) fn create_session_tx(
+    tx: &mut TxState,
+    session: CreateSession,
+) -> Result<SessionRow, ControlError> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let encryption = session.encryption;
+    match session.protocol {
+        SessionProtocol::Broker => {
+            tx.broker_session_runners
+                .insert(session_id.clone(), session.runner_id);
+        }
+        SessionProtocol::Azdo => {
+            tx.sessions.insert(
+                session_id.clone(),
+                preloop_gha_protocol::RunnerSession {
+                    session_id: SessionId(parse_uuid(&session_id)),
+                    runner_id: session.runner_id,
+                },
+            );
+            tx.azdo_sessions.insert(session_id.clone());
+        }
+    }
+    if let Some(enc) = &encryption {
+        tx.session_keys.insert(session_id.clone(), enc.clone());
+    }
+    tx.mark_session_seen(&session_id);
+    Ok(SessionRow {
+        session_id,
+        runner_id: session.runner_id,
+        protocol: session.protocol,
+        client_id: session.client_id,
+        encryption,
+        active_request_id: None,
+        last_seen_at_us: Some(system_to_us(std::time::SystemTime::now())),
+    })
+}
+
+pub(crate) fn delete_session_tx(tx: &mut TxState, session_id: &str) {
+    // Release the session's active request so it can be redelivered.
+    if let Some(request_id) = tx.session_active_requests.get(session_id).copied() {
+        sched::release_request_for_retry(tx, request_id);
+    }
+    tx.session_active_requests.remove(session_id);
+    tx.broker_session_runners.remove(session_id);
+    tx.sessions.remove(session_id);
+    tx.azdo_sessions.remove(session_id);
+    tx.session_keys.remove(session_id);
+    tx.session_last_seen.remove(session_id);
+    tx.inflight_messages.remove(session_id);
+}
+
+pub(crate) fn purge_runner_tx(tx: &mut TxState, runner_id: i64) {
+    tx.runners.remove(&runner_id);
+    tx.runner_client_ids.retain(|_, id| *id != runner_id);
+    tx.runner_rsa_public_keys.remove(&runner_id);
+    tx.pool_proven_runners.remove(&runner_id);
+    tx.runner_registered_at.remove(&runner_id);
+    let doomed: Vec<String> = tx
+        .broker_session_runners
+        .iter()
+        .filter(|(_, id)| **id == runner_id)
+        .map(|(s, _)| s.clone())
+        .chain(
+            tx.sessions
+                .iter()
+                .filter(|(_, s)| s.runner_id == runner_id)
+                .map(|(s, _)| s.clone()),
+        )
+        .collect();
+    for session_id in doomed {
+        delete_session_tx(tx, &session_id);
+    }
+    // Requeue this runner's claimed jobs so a replacement can pick them up.
+    let requeue: Vec<(RunId, JobId)> = tx
+        .claimed_jobs
+        .keys()
+        .filter(|key| tx.job_assignments.get(key).and_then(|r| r.runner_id) == Some(runner_id))
+        .cloned()
+        .collect();
+    for key in requeue {
+        if let Some(job) = tx.claimed_jobs.remove(&key) {
+            sched::clear_assignment(tx, key.0, &key.1);
+            tx.push_ready(job);
+        }
+    }
+    tx.job_assignments
+        .retain(|_, record| record.runner_id != Some(runner_id));
+}

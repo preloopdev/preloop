@@ -1251,6 +1251,13 @@ pub fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
 /// Unseal + parse a run blob written by [`run_record_value`].
 pub fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
     let value: serde_json::Value = serde_json::from_slice(&cipher.unseal(blob)?)?;
+    run_record_from_value(value)
+}
+
+/// Parse a run blob produced by [`run_record_value`] that is already
+/// unsealed — the control backend stores the same JSON without the legacy
+/// envelope, so it restores through this entry point.
+pub(crate) fn run_record_from_value(value: serde_json::Value) -> anyhow::Result<RunRecord> {
     let mut run: RunRecord = serde_json::from_value(value.clone())?;
     if let Some(object) = value.as_object() {
         run.webhook_delivery_id = serde_json::from_value(
