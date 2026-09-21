@@ -134,7 +134,7 @@ pub fn generate_self_signed_cert() -> anyhow::Result<SelfSignedCert> {
     })
 }
 
-pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
+pub async fn reap_once(shared: &Arc<SharedState>) {
     let (expired_cache_tokens, expired_artifact_tokens) = {
         let mut inner = shared.state.inner.lock().await;
         // Migrate legacy pending entries that restored with `created_unix == 0`
@@ -407,15 +407,50 @@ pub(crate) async fn reap_once(shared: &Arc<SharedState>) {
         }
 
         // 2. Check Lease Expiration / Disconnect Reaper
+        //
+        // Two distinct clocks guard a claimed job. The job lease
+        // (`last_renewed_at`) is the *worker* heartbeat — the runner renews it
+        // every ~60s from a dedicated task. The session poll
+        // (`session_last_seen`) is the *listener* heartbeat — the runner polls
+        // the broker on a separate thread. A hung worker stops renewing while
+        // its listener keeps polling, so the session looks alive and the slot
+        // is held until the full lease elapses. Detect that divergence —
+        // fresh session, stale lease — and reap on the worker's own cadence
+        // instead of waiting out the disconnect timeout. Requiring the session
+        // to be live is what separates a wedged worker from a guest network
+        // partition, which would silence both clocks at once.
         if let Some(last_renewed_at) = last_renewed_at {
             let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
-            if elapsed >= Duration::from_secs(JOB_LEASE_SECONDS) {
+            let session_live = inner
+                .session_active_requests
+                .iter()
+                .find(|(_, active)| **active == request_id)
+                .and_then(|(session_id, _)| inner.session_last_seen.get(session_id))
+                .is_some_and(|seen| {
+                    std::time::Instant::now().duration_since(*seen) < inner.runner_liveness_timeout
+                });
+            // A healthy worker renews every ~60s; three missed renewals while
+            // the session still polls means the renew task is dead, not slow.
+            let hung_worker =
+                session_live && elapsed >= Duration::from_secs(HUNG_WORKER_LEASE_SECONDS);
+            let lease_expired = elapsed >= Duration::from_secs(JOB_LEASE_SECONDS);
+            if hung_worker || lease_expired {
+                let cause = if hung_worker {
+                    format!(
+                        "worker stopped renewing {}s ago but its session is still polling; treating as hung",
+                        elapsed.as_secs()
+                    )
+                } else {
+                    format!(
+                        "Runner lease expired (last renewed {}s ago)",
+                        elapsed.as_secs()
+                    )
+                };
                 info!(
                     %run_id,
                     %job_id,
                     request_id,
-                    "Runner lease expired (last renewed {}s ago). Marking job as failed.",
-                    elapsed.as_secs()
+                    "{cause}. Marking job as failed."
                 );
                 if let Some(req) = inner.job_requests.get_mut(&request_id) {
                     req.result = Some(ExecutionStatus::Failure);
@@ -1439,6 +1474,18 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // standalone `preloop-server` binary, which passes no handle.
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
+    }
+    // H3: warm the static-PAT OAuth scope cache once at startup. Job expansion
+    // is synchronous and cannot introspect the PAT itself, so without this the
+    // first expansions after a restart would find a cold cache and withhold the
+    // credential. The PAT is read from config/env during state construction and
+    // is fixed for the process lifetime, so one lookup here covers every later
+    // expansion. A failure is logged, not fatal: the run path withholds the PAT
+    // rather than embedding one whose bounds could not be established.
+    if state.github_app.is_none() {
+        if let Some(pat) = state.static_github_pat() {
+            crate::runs::warm_pat_scope_cache(&pat).await;
+        }
     }
     // Resolve the effective store URL exactly once, mirroring `open_store`
     // precedence: the explicit URL wins, then the environment, then SQLite at

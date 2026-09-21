@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) async fn next_message(
+pub async fn next_message(
     State(shared): State<Arc<SharedState>>,
     identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -195,14 +195,14 @@ pub(crate) async fn next_message(
     }
 }
 
-pub(crate) async fn delete_session_message(
+pub async fn delete_session_message(
     State(shared): State<Arc<SharedState>>,
     Path((session_id, message_id)): Path<(String, i64)>,
 ) -> StatusCode {
     ack_message(shared, &session_id, message_id).await
 }
 
-pub(crate) fn build_task_agent_message(
+pub fn build_task_agent_message(
     inner: &mut InnerState,
     session_id: &str,
     message_type: &str,
@@ -237,7 +237,7 @@ pub(crate) fn build_task_agent_message(
     Ok(message)
 }
 
-pub(crate) fn build_broker_plaintext_message(
+pub fn build_broker_plaintext_message(
     inner: &mut InnerState,
     session_id: &str,
     message_type: &str,
@@ -259,7 +259,7 @@ pub(crate) fn build_broker_plaintext_message(
     message
 }
 
-pub(crate) async fn delete_pool_message(
+pub async fn delete_pool_message(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, message_id)): Path<(i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -275,7 +275,7 @@ pub(crate) async fn delete_pool_message(
     ack_message(shared, session_id, message_id).await
 }
 
-pub(crate) async fn ack_message(
+pub async fn ack_message(
     shared: Arc<SharedState>,
     session_id: &str,
     message_id: i64,
@@ -290,14 +290,14 @@ pub(crate) async fn ack_message(
     StatusCode::NO_CONTENT
 }
 
-pub(crate) async fn complete_job(
+pub async fn complete_job(
     State(shared): State<Arc<SharedState>>,
     Json(completion): Json<JobCompletion>,
 ) -> Result<Json<RunRecord>, ApiError> {
     complete_job_inner(shared, completion).await
 }
 
-pub(crate) async fn complete_job_compat(
+pub async fn complete_job_compat(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
     Json(body): Json<serde_json::Value>,
@@ -324,7 +324,7 @@ pub(crate) async fn complete_job_compat(
     )
     .await
 }
-pub(crate) async fn complete_job_compat_authenticated(
+pub async fn complete_job_compat_authenticated(
     State(shared): State<Arc<SharedState>>,
     Path(path): Path<(RunId, String)>,
     headers: HeaderMap,
@@ -366,7 +366,7 @@ fn runner_owns_agent_request(inner: &InnerState, request_id: i64, runner_id: i64
 /// safely move on; the request's retained owner keeps this post-completion read
 /// bound to the runner that handled the attempt. 404/405 makes it cancel the
 /// worker and can poison matrix runs.
-pub(crate) async fn agent_request_get(
+pub async fn agent_request_get(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, request_id)): Path<(i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -387,7 +387,7 @@ pub(crate) async fn agent_request_get(
 }
 
 /// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
-pub(crate) async fn agent_request_ack(
+pub async fn agent_request_ack(
     State(shared): State<Arc<SharedState>>,
     Path((_pool_id, request_id)): Path<(i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -407,7 +407,7 @@ pub(crate) async fn agent_request_ack(
 
 /// PATCH /_apis/v1/AgentRequest/:pool_id/:request_id — renew or complete job request.
 /// The runner sends this to renew the job lock or report completion.
-pub(crate) async fn agent_request_patch(
+pub async fn agent_request_patch(
     State(shared): State<Arc<SharedState>>,
     Path((pool_id, request_id)): Path<(i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
@@ -548,7 +548,7 @@ pub(crate) async fn agent_request_patch(
     ))
 }
 
-pub(crate) async fn agent_request_response(
+pub async fn agent_request_response(
     shared: &Arc<SharedState>,
     pool_id: i64,
     request_id: i64,
@@ -567,10 +567,7 @@ pub(crate) async fn agent_request_response(
         })
 }
 
-pub(crate) fn agent_request_json(
-    pool_id: i64,
-    request: &TaskAgentJobRequestRecord,
-) -> serde_json::Value {
+pub fn agent_request_json(pool_id: i64, request: &TaskAgentJobRequestRecord) -> serde_json::Value {
     json!({
         "requestId": request.request_id,
         "poolId": pool_id,
@@ -583,7 +580,7 @@ pub(crate) fn agent_request_json(
     })
 }
 
-pub(crate) fn agent_request_result(status: ExecutionStatus) -> &'static str {
+pub fn agent_request_result(status: ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Success => "succeeded",
         ExecutionStatus::Failure => "failed",
@@ -604,13 +601,20 @@ pub(crate) fn agent_request_result(status: ExecutionStatus) -> &'static str {
 /// automatic retry (`run_attempt` stayed 1). 2700 s matches that window;
 /// the runner-side renew loop still gives up at LockedUntil + 5 min grace,
 /// mirroring the official dispatcher.
-pub(crate) const JOB_LEASE_SECONDS: u64 = 2700;
+pub const JOB_LEASE_SECONDS: u64 = 2700;
 
-pub(crate) fn agent_request_locked_until() -> String {
+/// How stale a job lease may grow while its session still polls before the
+/// worker is declared hung. The runner renews every ~60s; three missed
+/// renewals is a wedged renew task, not a slow one. Far below
+/// [`JOB_LEASE_SECONDS`] because the live session already proves the guest is
+/// reachable — the lease is only stale because the worker died.
+pub const HUNG_WORKER_LEASE_SECONDS: u64 = 180;
+
+pub fn agent_request_locked_until() -> String {
     server_iso_at(SystemTime::now() + Duration::from_secs(JOB_LEASE_SECONDS))
 }
 
-pub(crate) fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
+pub fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
     match result {
         azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues => {
             ExecutionStatus::Success
@@ -624,7 +628,7 @@ pub(crate) fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
     }
 }
 
-pub(crate) fn resolve_callback_job(
+pub fn resolve_callback_job(
     inner: &InnerState,
     plan_id: &str,
     timeline_id: Option<uuid::Uuid>,
@@ -640,7 +644,7 @@ pub(crate) fn resolve_callback_job(
     Some((request_id, request.run_id, request.job_id.clone()))
 }
 
-pub(crate) fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
+pub fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
     let mut active = inner
         .session_active_requests
         .values()
@@ -657,10 +661,7 @@ pub(crate) fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> 
     }
     None
 }
-pub(crate) fn job_request_tuple(
-    inner: &InnerState,
-    request_id: i64,
-) -> Option<(i64, RunId, JobId)> {
+pub fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
     let request = inner.job_requests.get(&request_id)?;
     Some((request_id, request.run_id, request.job_id.clone()))
 }
@@ -718,7 +719,7 @@ fn completion_step_conclusion(wire: &preloop_gha_protocol::CompletionStepResult)
     Some(conclusion.to_owned())
 }
 
-pub(crate) async fn complete_job_inner(
+pub async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {

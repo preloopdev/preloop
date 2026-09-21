@@ -92,24 +92,24 @@ impl TrustTier {
 /// installation-token request carry, and whether `id-token: write` yields an
 /// OIDC request URL and token grant. Nothing downstream re-derives the tier
 /// ad hoc, so a handler special case cannot drift from this policy.
-pub(crate) struct JobAuthorization {
+pub struct JobAuthorization {
     /// Stored repository secrets may be injected into the job.
-    pub(crate) allows_secrets: bool,
+    pub allows_secrets: bool,
     /// The resolved policy permission set in workflow spelling. It retains
     /// Actions-only declarations for the dedicated OIDC decision; the wire
     /// renderer removes those from `GITHUB_TOKEN Permissions`.
-    pub(crate) token_permissions: BTreeMap<String, String>,
+    pub token_permissions: BTreeMap<String, String>,
     /// The permission set sent to the GitHub App installation-token mint.
     /// Excludes the Actions-only scopes (`id-token`, `models`) that the
     /// installation API rejects, so the registered request carries only real
     /// App repository permissions — for trusted and fork jobs alike.
-    pub(crate) app_permissions: BTreeMap<String, String>,
+    pub app_permissions: BTreeMap<String, String>,
     /// `id-token: write` is honored: an OIDC request URL is emitted and the
     /// `oidctoken` endpoint will mint for this job.
-    pub(crate) id_token_granted: bool,
+    pub id_token_granted: bool,
     /// The job runs code from an untrusted source; its token authority is
     /// restricted to the GitHub fork profile and no fallback may widen it.
-    pub(crate) fork_restricted: bool,
+    pub fork_restricted: bool,
 }
 
 /// Resolve a submission's trust tier.
@@ -118,7 +118,7 @@ pub(crate) struct JobAuthorization {
 /// that fails to parse is treated the same way, matching the pre-existing
 /// secret policy. The webhook dispatcher is the only producer of tier
 /// strings and always writes a serialized [`TrustTier`].
-pub(crate) fn tier_of(submission: &preloop_gha_protocol::WorkflowSubmission) -> Option<TrustTier> {
+pub fn tier_of(submission: &preloop_gha_protocol::WorkflowSubmission) -> Option<TrustTier> {
     submission
         .trust_tier
         .as_deref()
@@ -139,7 +139,7 @@ pub(crate) fn tier_of(submission: &preloop_gha_protocol::WorkflowSubmission) -> 
 /// or purged while the worker still holds the runtime JWT — fails closed to
 /// `Some(true)`: the tier can no longer be proven, so the write is refused
 /// rather than granted on the strength of a bookkeeping gap.
-pub(crate) async fn fork_restricted_from_token(
+pub async fn fork_restricted_from_token(
     state: &crate::state::AppState,
     token: &str,
 ) -> Option<bool> {
@@ -181,7 +181,7 @@ pub(crate) async fn fork_restricted_from_token(
 /// the read handlers never call this. The system token and other
 /// non-job-shaped bearers are the control plane's own calls and always pass;
 /// a job-shaped token that no longer resolves fails closed instead.
-pub(crate) async fn ensure_cache_write_allowed(
+pub async fn ensure_cache_write_allowed(
     state: &crate::state::AppState,
     headers: &axum::http::HeaderMap,
 ) -> Result<(), crate::ApiError> {
@@ -205,7 +205,7 @@ pub(crate) async fn ensure_cache_write_allowed(
 /// semantics, not a repository read permission — remains only in the internal
 /// policy decision, `id-token: write` produces no OIDC grant, and stored
 /// secrets stay denied. All other tiers keep the declared set verbatim.
-pub(crate) fn job_authorization(
+pub fn job_authorization(
     tier: Option<TrustTier>,
     declared_permissions: Option<&BTreeMap<String, String>>,
     declared_id_token_granted: bool,

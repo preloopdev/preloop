@@ -26,7 +26,7 @@ fn recorded_header_value(
     })
 }
 
-pub(crate) async fn record_flows_middleware(
+pub async fn record_flows_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
@@ -124,11 +124,11 @@ pub(crate) async fn record_flows_middleware(
     response
 }
 
-pub(crate) fn server_iso_now() -> String {
+pub fn server_iso_now() -> String {
     server_iso_at(SystemTime::now())
 }
 
-pub(crate) fn server_iso_at(time: SystemTime) -> String {
+pub fn server_iso_at(time: SystemTime) -> String {
     let now = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs();
     let millis = now.subsec_millis();

@@ -1,22 +1,22 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OidcTokenQuery {
-    pub(crate) audience: Option<String>,
+pub struct OidcTokenQuery {
+    pub audience: Option<String>,
     #[serde(rename = "api-version")]
-    pub(crate) _api_version: Option<String>,
+    pub _api_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OidcTokenResponse {
-    pub(crate) value: String,
+pub struct OidcTokenResponse {
+    pub value: String,
 }
 
 /// `GET /runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken`
 ///
 /// Mints a GitHub-compatible RS256-signed OIDC id-token JWT. Looks up the
 /// originating workflow run to populate claims, and enforces `id-token: write`.
-pub(crate) async fn oidc_token_run_service(
+pub async fn oidc_token_run_service(
     State(shared): State<Arc<SharedState>>,
     Path((_orchestration_id, plan_id, job_id)): Path<(String, String, String)>,
     Query(query): Query<OidcTokenQuery>,
@@ -31,7 +31,7 @@ pub(crate) async fn oidc_token_run_service(
     .await
 }
 
-pub(crate) async fn oidc_token(
+pub async fn oidc_token(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, job_id)): Path<(String, String)>,
     Query(query): Query<OidcTokenQuery>,
@@ -221,12 +221,7 @@ pub(crate) async fn oidc_token(
                 reference
                     .rsplit_once('@')
                     .map(|(_, git_ref)| git_ref)
-                    .filter(|git_ref| {
-                        git_ref.len() == 40
-                            && git_ref
-                                .chars()
-                                .all(|character| character.is_ascii_hexdigit())
-                    })
+                    .filter(|git_ref| preloop_gha_protocol::git_ref::is_commit_sha(git_ref))
                     .map(str::to_owned)
             })
             .or_else(|| job_workflow_ref.as_ref().map(|_| sha.clone()))
@@ -280,7 +275,7 @@ pub(crate) async fn oidc_token(
 }
 
 /// `GET /.well-known/openid-configuration` — OIDC discovery document.
-pub(crate) async fn oidc_discovery(
+pub async fn oidc_discovery(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
@@ -290,7 +285,7 @@ pub(crate) async fn oidc_discovery(
 }
 
 /// `GET /.well-known/jwks` — JSON Web Key Set for OIDC token verification.
-pub(crate) async fn oidc_jwks(
+pub async fn oidc_jwks(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let inner = shared.state.inner.lock().await;
@@ -301,7 +296,7 @@ pub(crate) async fn oidc_jwks(
     Ok(Json(kp.jwks()))
 }
 
-pub(crate) fn base64_url_json(value: &serde_json::Value) -> Result<String, ApiError> {
+pub fn base64_url_json(value: &serde_json::Value) -> Result<String, ApiError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| ApiError::bad_request(format!("failed to encode jwt json: {error}")))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))

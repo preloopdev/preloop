@@ -70,7 +70,11 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4]
     env:
-      CARGO_BUILD_JOBS: "6"
+      # 4 GiB runner guests OOM (SIGKILL) when too many rustc/linker jobs run
+      # at once — the preloop-runner-server lib test is the largest unit and
+      # was killed on shard 1 while the other three passed. 6 jobs was tuned
+      # for a bigger box; 4 keeps parallel peak memory inside the guest.
+      CARGO_BUILD_JOBS: "4"
       PROPTEST_CASES: "8"
       RUST_TEST_THREADS: "6"
     steps:
@@ -156,6 +160,34 @@ jobs:
           "$HOME/.local/bin/cargo-nextest" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4
+        env:
+          RUSTFLAGS: "-A warnings"
+      # The preloop-runner-server integration tests were split out of the lib
+      # into separate tests/*.rs crates (the single ~27k-line unit OOMed the
+      # 4 GiB guest). They need the `test-support` feature for the deterministic
+      # hooks, so they run under `cargo test` here — nextest can't scope a
+      # feature to one package in a --workspace run. Partition by test-file
+      # name hash so the shard split still holds.
+      - name: Server integration tests (test-support)
+        run: |
+          set -euo pipefail
+          shard=${{ matrix.shard }}
+          crates="recovery runs_api logs registration broker security webhooks concurrency"
+          selected=""
+          for c in $crates; do
+            h=$(printf '%s' "$c" | md5sum | cut -c1-8)
+            if [ $(( (16#$h) % 4 + 1 )) -eq "$shard" ]; then
+              selected="$selected $c"
+            fi
+          done
+          if [ -z "${selected# }" ]; then
+            echo "no server integration crates hashed to shard $shard"
+            exit 0
+          fi
+          for c in $selected; do
+            echo "=== shard $shard: cargo test --test $c ==="
+            cargo test --locked -p preloop-runner-server --features test-support --test "$c"
+          done
         env:
           RUSTFLAGS: "-A warnings"
 

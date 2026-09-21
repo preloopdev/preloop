@@ -19,7 +19,7 @@ use crate::errors::ApiError;
 use crate::state::SharedState;
 
 /// Secret names mirror GitHub: UPPER_SNAKE (letters, digits, underscore).
-pub(crate) fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
@@ -27,14 +27,14 @@ pub(crate) fn valid_name(name: &str) -> bool {
 }
 
 /// Repository scope must look like `owner/repo`.
-pub(crate) fn valid_repo(repo: &str) -> bool {
+pub fn valid_repo(repo: &str) -> bool {
     repo.split_once('/')
         .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty())
 }
 
 /// Environment scope mirrors GitHub: letters, digits, hyphens, and
 /// underscores, at most 255 characters, never starting with `-` or `_`.
-pub(crate) fn valid_env(env: &str) -> bool {
+pub fn valid_env(env: &str) -> bool {
     !env.is_empty()
         && env.len() <= 255
         && !env.starts_with(['-', '_'])
@@ -72,7 +72,7 @@ fn credential_scope_conflict(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct SetSecretBody {
+pub struct SetSecretBody {
     #[serde(default)]
     pub value: Option<String>,
     /// `owner/repo` scope; absent = global.
@@ -84,7 +84,7 @@ pub(crate) struct SetSecretBody {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct SecretQuery {
+pub struct SecretQuery {
     #[serde(default)]
     pub repo: Option<String>,
     #[serde(default)]
@@ -92,7 +92,7 @@ pub(crate) struct SecretQuery {
 }
 
 /// List stored secret names (never values), scoped by repo when asked.
-pub(crate) async fn list_secrets(
+pub async fn list_secrets(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<SecretQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -161,7 +161,7 @@ pub(crate) async fn list_secrets(
 }
 
 /// Store a secret (global or per-repo) in memory and in the config file.
-pub(crate) async fn set_secret(
+pub async fn set_secret(
     State(shared): State<Arc<SharedState>>,
     Path(name): Path<String>,
     Json(body): Json<SetSecretBody>,
@@ -233,6 +233,15 @@ pub(crate) async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name.clone(), value.clone());
+            // Storing an environment secret creates the environment, as on
+            // GitHub: the environment becomes claimable by `environment:`.
+            // Only this operator-held endpoint can register names this way;
+            // workflow authors cannot self-approve an environment (M4).
+            config
+                .environments
+                .entry(repo.clone())
+                .or_default()
+                .insert(env.clone());
         }
         (Some(repo), None) => {
             config
@@ -263,6 +272,13 @@ pub(crate) async fn set_secret(
                 .entry(env.clone())
                 .or_default()
                 .insert(name, value);
+            // Mirror the persisted registration above: storing an
+            // environment secret creates the environment (M4).
+            store
+                .environments
+                .entry(repo.clone())
+                .or_default()
+                .insert(env.clone());
         }
         (Some(repo), None) => {
             store
@@ -280,7 +296,7 @@ pub(crate) async fn set_secret(
 }
 
 /// Remove a stored secret. 404 when the name is not stored in that scope.
-pub(crate) async fn delete_secret(
+pub async fn delete_secret(
     State(shared): State<Arc<SharedState>>,
     Path(name): Path<String>,
     Query(query): Query<SecretQuery>,

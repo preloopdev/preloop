@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CachePutRequest {
+pub struct CachePutRequest {
     key: String,
     version: String,
     #[serde(default)]
@@ -9,14 +9,14 @@ pub(crate) struct CachePutRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct CacheQuery {
+pub struct CacheQuery {
     key: Option<String>,
     keys: Option<String>,
     version: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct CacheLookupResponse {
+pub struct CacheLookupResponse {
     hit: bool,
     key: Option<String>,
     version: Option<String>,
@@ -26,26 +26,26 @@ pub(crate) struct CacheLookupResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CacheReserveRequest {
+pub struct CacheReserveRequest {
     key: String,
     version: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CacheReserveResponse {
+pub struct CacheReserveResponse {
     cache_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CacheCommitRequest {
+pub struct CacheCommitRequest {
     #[serde(default)]
     size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ArtifactPutRequest {
+pub struct ArtifactPutRequest {
     run_id: RunId,
     name: String,
     file_name: String,
@@ -55,7 +55,7 @@ pub(crate) struct ArtifactPutRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArtifactCreateRequest {
+pub struct ArtifactCreateRequest {
     name: String,
     #[serde(default = "default_artifact_file_name")]
     file_name: String,
@@ -65,7 +65,63 @@ fn default_artifact_file_name() -> String {
     "artifact.bin".to_owned()
 }
 
-pub(crate) async fn cache_put(
+/// R1-5: include the job's git ref in the legacy cache namespace so one
+/// branch cannot poison another branch's entries (first write wins on an
+/// exact key+version). The system token keeps the historical
+/// repository-only namespace.
+pub fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<String>) -> String {
+    match (repository, git_ref) {
+        (Some(repository), Some(git_ref)) => format!("{repository}\0{git_ref}"),
+        (Some(repository), None) => repository,
+        (None, _) => String::new(),
+    }
+}
+
+/// R1-6: refuse a chunk that would push an in-flight upload past
+/// `max_bytes`. Split from `cache_upload` so tests can exercise the
+/// boundary with a small limit instead of allocating the production
+/// 512 MiB cap.
+pub fn ensure_cache_chunk_fits(
+    current_bytes: u64,
+    chunk_bytes: u64,
+    max_bytes: u64,
+) -> Result<(), ApiError> {
+    if current_bytes + chunk_bytes > max_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "cache upload exceeds the {} MiB per-upload cap",
+            max_bytes / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+/// R1-6: refuse a chunk that would push a job's *aggregate* pending bytes
+/// past `max_bytes`. The per-upload cap alone still lets a job hold
+/// `MAX_PENDING_PER_JOB` × 512 MiB; this bounds the job's total. Split out
+/// so tests can exercise the boundary with a small limit instead of
+/// allocating the production 1 GiB budget.
+pub fn ensure_pending_cache_bytes_fit(
+    inner: &InnerState,
+    job_backend_id: &str,
+    chunk_bytes: u64,
+    max_bytes: u64,
+) -> Result<(), ApiError> {
+    let job_bytes: u64 = inner
+        .pending_caches
+        .values()
+        .filter(|pending| pending.job_backend_id == job_backend_id)
+        .map(|pending| pending.bytes.len() as u64)
+        .sum();
+    if job_bytes + chunk_bytes > max_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "job exceeds the {} MiB pending-cache byte budget",
+            max_bytes / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+pub async fn cache_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<CachePutRequest>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
@@ -84,7 +140,7 @@ pub(crate) async fn cache_put(
     }))
 }
 
-pub(crate) async fn cache_get(
+pub async fn cache_get(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<CacheLookupResponse>, ApiError> {
@@ -113,13 +169,14 @@ pub(crate) async fn cache_get(
     }))
 }
 
-pub(crate) async fn cache_reserve(
+pub async fn cache_reserve(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Json(request): Json<CacheReserveRequest>,
 ) -> Result<Json<CacheReserveResponse>, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
+    let git_ref = auth::job_git_ref_from_headers(&shared.state, &headers).await?;
     let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
     // R1-10: a stale job token must not reserve new uploads after its job
     // completes. The system bearer manages the lifecycle itself and bypasses;
@@ -145,15 +202,38 @@ pub(crate) async fn cache_reserve(
             ));
         }
     }
+    // R1-6: bound in-flight legacy reservations per job, mirroring the v2
+    // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
+    // unbounded reservation state in server RAM.
+    if !job_backend_id.is_empty() {
+        let in_flight = inner
+            .pending_caches
+            .values()
+            .filter(|pending| pending.job_backend_id == job_backend_id)
+            .count();
+        if in_flight >= MAX_PENDING_PER_JOB {
+            return Err(ApiError::bad_request(format!(
+                "job has {in_flight} pending cache uploads (cap {MAX_PENDING_PER_JOB})"
+            )));
+        }
+    }
+    inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
     inner.pending_caches.insert(
         cache_id,
         PendingCache {
             key: request.key,
-            namespace: repository.unwrap_or_default(),
+            // R1-5: the reservation is bound to the job's git ref, not just
+            // the repository, so a branch run cannot squat another branch's
+            // key namespace.
+            namespace: ref_scoped_namespace(repository, git_ref),
             version: request.version,
             bytes: Vec::new(),
             job_backend_id,
+            // R1-6: stamp the reservation so the TTL sweeper can free it if
+            // the job never commits (previously abandoned reservations held
+            // their bytes forever).
+            created_unix: crate::memory_caps::now_unix(),
         },
     );
     let meta = crate::store::build_meta_snapshot(&inner);
@@ -163,7 +243,7 @@ pub(crate) async fn cache_reserve(
     Ok(Json(CacheReserveResponse { cache_id }))
 }
 
-pub(crate) async fn cache_upload(
+pub async fn cache_upload(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
@@ -184,16 +264,49 @@ pub(crate) async fn cache_upload(
         auth::require_live_job(&shared.state, claims.job_id).await?;
     }
     let mut inner = shared.state.inner.lock().await;
+    {
+        let pending = inner
+            .pending_caches
+            .get(&cache_id)
+            .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+        if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
+            return Err(ApiError::forbidden(
+                "cache reservation belongs to another job",
+            ));
+        }
+        // R1-6: cap each in-flight upload's running total. Without this
+        // check a job could grow server RAM without bound by PATCHing
+        // chunks forever (~500 requests/GiB at the 2 MiB default body
+        // limit). The check runs before the vector grows so the refusal
+        // itself allocates nothing.
+        ensure_cache_chunk_fits(
+            pending.bytes.len() as u64,
+            bytes.len() as u64,
+            MAX_CACHE_UPLOAD_BYTES,
+        )?;
+        // R1-6: cap the job's *aggregate* pending bytes, not just each
+        // upload — MAX_PENDING_PER_JOB × MAX_CACHE_UPLOAD_BYTES would
+        // otherwise let one job hold ~16 GiB in reservations. The sum runs
+        // under the same lock as the append, so concurrent chunks cannot
+        // race past the budget.
+        if !pending.job_backend_id.is_empty() {
+            ensure_pending_cache_bytes_fit(
+                &inner,
+                &pending.job_backend_id,
+                bytes.len() as u64,
+                MAX_PENDING_CACHE_BYTES_PER_JOB,
+            )?;
+        }
+    }
     let pending = inner
         .pending_caches
         .get_mut(&cache_id)
         .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
-    if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
-        return Err(ApiError::forbidden(
-            "cache reservation belongs to another job",
-        ));
-    }
     pending.bytes.extend_from_slice(&bytes);
+    // Refresh the activity stamp: the TTL sweeper frees reservations idle
+    // past PENDING_UPLOAD_TTL, and an active chunked upload must not be
+    // reaped between PATCHes.
+    pending.created_unix = crate::memory_caps::now_unix();
     // No write-through here on purpose: the in-flight payload is not durable
     // state (see `MetaSnapshot`), and snapshotting per chunk was quadratic in
     // cache size. The committed cache is persisted by `CacheStore` in
@@ -201,7 +314,7 @@ pub(crate) async fn cache_upload(
     Ok(StatusCode::ACCEPTED)
 }
 
-pub(crate) async fn cache_commit(
+pub async fn cache_commit(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
@@ -270,24 +383,49 @@ pub(crate) async fn cache_commit(
     }))
 }
 
-pub(crate) async fn cache_lookup(
+pub async fn cache_lookup(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CacheQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let key = query.key.unwrap_or_default();
-    let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
+    let context = auth::job_cache_context_from_headers(&shared.state, &headers).await?;
     let restore_keys = parse_restore_keys(query.keys.as_deref());
-    let response = shared
-        .state
-        .cache
-        .get_scoped(
-            repository.as_deref().unwrap_or_default(),
-            &key,
-            &query.version,
-            &restore_keys,
-        )
-        .await?;
+    // R1-5: a job reads its own ref's namespace, then the PR base branch
+    // (pull_request runs), then the repository's real default branch —
+    // resolved from the event payload, not assumed to be `main`. Caches on
+    // unrelated branches stay invisible. The system token keeps the
+    // historical repository-only namespace.
+    let namespaces: Vec<String> = match context {
+        Some(context) => {
+            let mut namespaces = vec![format!("{}\0{}", context.repository, context.git_ref)];
+            for candidate in [context.base_ref, Some(context.default_branch_ref)]
+                .into_iter()
+                .flatten()
+            {
+                if candidate != context.git_ref
+                    && !namespaces
+                        .iter()
+                        .any(|ns| *ns == format!("{}\0{}", context.repository, candidate))
+                {
+                    namespaces.push(format!("{}\0{}", context.repository, candidate));
+                }
+            }
+            namespaces
+        }
+        None => vec![String::new()],
+    };
+    let mut response = None;
+    for namespace in &namespaces {
+        response = shared
+            .state
+            .cache
+            .get_scoped(namespace, &key, &query.version, &restore_keys)
+            .await?;
+        if response.is_some() {
+            break;
+        }
+    }
     if let Some((entry, _bytes)) = response {
         Ok(Json(json!({
             "cacheKey": entry.key,
@@ -299,7 +437,7 @@ pub(crate) async fn cache_lookup(
     }
 }
 
-pub(crate) async fn artifact_put(
+pub async fn artifact_put(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<ArtifactPutRequest>,
 ) -> Result<Json<ArtifactRecord>, ApiError> {
@@ -314,7 +452,7 @@ pub(crate) async fn artifact_put(
     .await
 }
 
-pub(crate) async fn artifact_create(
+pub async fn artifact_create(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(run_id): Path<RunId>,
@@ -334,7 +472,7 @@ pub(crate) async fn artifact_create(
     put_artifact(shared, run_id, request.name, request.file_name, Vec::new()).await
 }
 
-pub(crate) async fn put_artifact(
+pub async fn put_artifact(
     shared: Arc<SharedState>,
     run_id: RunId,
     name: String,
@@ -363,21 +501,21 @@ pub(crate) async fn put_artifact(
     Ok(Json(record))
 }
 
-pub(crate) async fn artifact_get(
+pub async fn artifact_get(
     State(shared): State<Arc<SharedState>>,
     Path(artifact_id): Path<String>,
 ) -> Result<Response, ApiError> {
     read_artifact(shared, artifact_id).await
 }
 
-pub(crate) async fn artifact_get_compat(
+pub async fn artifact_get_compat(
     State(shared): State<Arc<SharedState>>,
     Path((_run_id, artifact_id)): Path<(RunId, String)>,
 ) -> Result<Response, ApiError> {
     read_artifact(shared, artifact_id).await
 }
 
-pub(crate) async fn read_artifact(
+pub async fn read_artifact(
     shared: Arc<SharedState>,
     artifact_id: String,
 ) -> Result<Response, ApiError> {
@@ -396,7 +534,7 @@ pub(crate) async fn read_artifact(
         .expect("static response builder"))
 }
 
-pub(crate) async fn artifact_list(
+pub async fn artifact_list(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Json<serde_json::Value> {
@@ -412,7 +550,7 @@ pub(crate) async fn artifact_list(
     }))
 }
 
-pub(crate) fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
+pub fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
     keys.unwrap_or_default()
         .split(',')
         .filter(|key| !key.is_empty())
@@ -420,7 +558,7 @@ pub(crate) fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
+pub fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
     BASE64_STANDARD
         .decode(value)
         .map_err(|error| ApiError::bad_request(format!("invalid base64 content: {error}")))

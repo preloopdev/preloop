@@ -23,7 +23,7 @@ use serde_json::Value;
 /// Best-effort entry point. Runs detached from the completion path so a
 /// GitHub outage never affects the run's own result; failures are logged,
 /// never returned.
-pub(crate) async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
+pub async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
     if let Err(error) = maybe_open_pr_inner(&shared, run_id).await {
         tracing::warn!(%run_id, ?error, "auto-PR: not opened");
     }
@@ -499,11 +499,23 @@ mod tests {
     async fn native_push_submission_never_auto_opens_a_pr() {
         use axum::body::{to_bytes, Body};
         use axum::http::{header, Method, Request, StatusCode};
+        use axum::{routing::get, Router};
         use tokio_util::sync::CancellationToken;
         use tower::ServiceExt;
 
         // A native `/api/v1/runs` caller may set `event = "push"`; without a
         // webhook-stamped trust tier the run must never auto-open a PR.
+        // The PAT scope introspection hits the configured API root; stub it
+        // so the fake PAT resolves as unverifiable rather than invalid.
+        let stub = Router::new().route("/", get(|| async { axum::http::StatusCode::OK }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, stub).await.unwrap();
+        });
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _api_url =
+            crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://{addr}"));
         let temp = tempfile::tempdir().unwrap();
         let mut state = crate::AppState::new(temp.path().to_path_buf())
             .await

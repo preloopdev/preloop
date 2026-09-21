@@ -446,7 +446,11 @@ pub async fn run_job(
             .as_ref()
             .map(|rpt| rpt.token())
             .unwrap_or_default();
-        Some(super::live_logs::LiveLogQueue::connect(feed_url, token))
+        Some(super::live_logs::LiveLogQueue::connect(
+            feed_url,
+            token,
+            job_ctx.live_masks.clone(),
+        ))
     } else {
         None
     };
@@ -456,7 +460,10 @@ pub async fn run_job(
         job_id.to_string(),
         plan_id.clone(),
     )));
-    let job_timeout_minutes: u64 = job_message
+    // `jobTimeout` is seconds on the wire (azdo::job documents it as seconds).
+    // `plan.jobTimeoutInMinutes` is the legacy minutes fallback. Default 360
+    // minutes matches the official runner when neither is present.
+    let job_timeout_seconds: u64 = job_message
         .get("jobTimeout")
         .and_then(|v| v.as_u64())
         .or_else(|| {
@@ -464,9 +471,10 @@ pub async fn run_job(
                 .get("plan")
                 .and_then(|p| p.get("jobTimeoutInMinutes"))
                 .and_then(|v| v.as_u64())
+                .map(|minutes| minutes * 60)
         })
-        .unwrap_or(360);
-    info!("Job timeout: {job_timeout_minutes} minutes");
+        .unwrap_or(360 * 60);
+    info!("Job timeout: {} minutes", job_timeout_seconds / 60);
     // v2.336.0 (#4538): log effective cache mode when present
     if let Some(cache_mode) = job_ctx.env.get("ACTIONS_CACHE_MODE") {
         if !cache_mode.is_empty() {
@@ -534,7 +542,7 @@ pub async fn run_job(
     let timeout_flag = timed_out.clone();
     let timer_paused = debug_paused.clone();
     let timeout_handle = tokio::spawn(async move {
-        let budget = std::time::Duration::from_secs(job_timeout_minutes * 60);
+        let budget = std::time::Duration::from_secs(job_timeout_seconds);
         let deadline = tokio::time::Instant::now() + budget;
         let mut paused_total = std::time::Duration::ZERO;
         let tick = std::time::Duration::from_secs(1);
@@ -551,7 +559,10 @@ pub async fn run_job(
                 break;
             }
         }
-        warn!("Job timeout ({job_timeout_minutes} minutes) reached — cancelling");
+        warn!(
+            "Job timeout ({} minutes) reached — cancelling",
+            job_timeout_seconds / 60
+        );
         timeout_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = timeout_tx.send(true);
     });
@@ -698,7 +709,8 @@ pub async fn run_job(
     // If the job timed out, override status to Failure with timeout message
     if was_timeout {
         let msg = format!(
-            "Job {job_name} exceeded the maximum execution time of {job_timeout_minutes} minutes"
+            "Job {job_name} exceeded the maximum execution time of {} minutes",
+            job_timeout_seconds / 60
         );
         error!("{msg}");
         job_ctx.job_status = super::contexts::JobStatus::Failure;

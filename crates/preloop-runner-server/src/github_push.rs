@@ -15,16 +15,16 @@ use super::*;
 
 /// Result of a completed sync, returned to the client.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct SyncResponse {
-    pub(crate) status: &'static str,
-    pub(crate) pr_number: Option<u64>,
-    pub(crate) pr_url: Option<String>,
+pub struct SyncResponse {
+    pub status: &'static str,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
 }
 
 /// `POST /api/v1/runs/:run_id/push` — publish a terminal run's result to
 /// GitHub. Idempotent: re-running after success is a no-op, and every
 /// external effect is guarded by a check-before-create.
-pub(crate) async fn push_run(
+pub async fn push_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
     body: Bytes,
@@ -65,9 +65,9 @@ pub(crate) async fn push_run(
 
 /// Per-sync override of the submission's PR intent (`POST /push` body).
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct PushOverride {
-    pub(crate) create_pr: Option<bool>,
-    pub(crate) draft: Option<bool>,
+pub struct PushOverride {
+    pub create_pr: Option<bool>,
+    pub draft: Option<bool>,
 }
 
 /// The run that already tested `sha` for `workflow_path` through push-back,
@@ -89,7 +89,7 @@ pub(crate) struct PushOverride {
 /// A dirty-tree run's submission sha is the *base* commit, not the commit
 /// the push webhook carries; once the sync ran, the published (materialized)
 /// commit is recorded in `push_state.effective_sha` and matched here too.
-pub(crate) async fn already_published(
+pub async fn already_published(
     shared: &Arc<SharedState>,
     repository: &str,
     sha: &str,
@@ -116,7 +116,7 @@ pub(crate) async fn already_published(
         .map(|run| run.run_id)
 }
 
-pub(crate) async fn push_run_to_github(
+pub async fn push_run_to_github(
     shared: &Arc<SharedState>,
     run_id: RunId,
     override_pr: Option<PushOverride>,
@@ -449,7 +449,7 @@ pub(crate) async fn push_run_to_github(
 
 /// A sync target must be a real GitHub branch at a real commit: a local-only
 /// repository or an unpushed SHA can never produce a PR or honest checks.
-pub(crate) fn validate_push_target(
+pub fn validate_push_target(
     repository: &str,
     sha: &str,
     git_ref: &str,
@@ -471,7 +471,7 @@ pub(crate) fn validate_push_target(
             "--push supports branch refs only (got `{git_ref}`)"
         )));
     }
-    if !(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) && sha != ZERO_SHA) {
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
         return Err(ApiError::bad_request(
             "--push requires a committed HEAD (submit from a git checkout)",
         ));
@@ -485,8 +485,6 @@ pub(crate) fn validate_push_target(
     Ok(())
 }
 
-const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
-
 /// Installation token covering everything the sync touches, or the ambient
 /// PAT when no App is configured.
 ///
@@ -495,7 +493,7 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// `PRELOOP_GITHUB_TOKEN` directly instead would leave a server configured
 /// by `preloop setup github --via pat` able to run CI but never able to push
 /// its result back, because that flow only ever writes the config file.
-pub(crate) async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
+pub async fn push_token(shared: &Arc<SharedState>, repository: &str) -> Option<String> {
     let permissions = std::collections::BTreeMap::from([
         ("checks".to_owned(), "write".to_owned()),
         ("pull_requests".to_owned(), "write".to_owned()),
@@ -515,7 +513,7 @@ pub(crate) async fn push_token(shared: &Arc<SharedState>, repository: &str) -> O
 
 /// One GitHub REST call returning the parsed JSON body. Errors carry the
 /// HTTP status so [`classify`] can tell user mistakes from outages.
-pub(crate) async fn github_json(
+pub async fn github_json(
     token: &str,
     repository: &str,
     method: &str,

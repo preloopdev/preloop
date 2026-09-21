@@ -53,15 +53,15 @@ const OPEN_REPAIR_SCAN_LIMIT: usize = 1000;
 
 /// What one full watchdog pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct WatchdogPollOutcome {
+pub struct WatchdogPollOutcome {
     /// Deliveries old enough to judge, and judged.
-    pub(crate) examined: u64,
+    pub examined: u64,
     /// Examined deliveries with no local row, whatever GitHub thinks.
-    pub(crate) missing_locally: u64,
+    pub missing_locally: u64,
     /// Redelivery attempts actually requested from GitHub.
-    pub(crate) redelivered: u64,
+    pub redelivered: u64,
     /// Deliveries too young to judge yet.
-    pub(crate) skipped_grace: u64,
+    pub skipped_grace: u64,
 }
 
 impl WatchdogPollOutcome {
@@ -193,7 +193,7 @@ fn redelivery_backoff_us(attempts: u32) -> i64 {
 
 /// Background loop. One pass per interval, plus status publication so a
 /// stalled watchdog is visible instead of silently absent.
-pub(crate) async fn run_webhook_watchdog(shared: Arc<SharedState>) {
+pub async fn run_webhook_watchdog(shared: Arc<SharedState>) {
     let interval = poll_interval();
     loop {
         if shared.shutdown.is_cancelled() {
@@ -221,9 +221,7 @@ pub(crate) async fn run_webhook_watchdog(shared: Arc<SharedState>) {
 }
 
 /// One pass over every configured App's delivery history.
-pub(crate) async fn watchdog_poll_once(
-    shared: &Arc<SharedState>,
-) -> anyhow::Result<WatchdogPollOutcome> {
+pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<WatchdogPollOutcome> {
     let apps = crate::github_app::registered_apps(&shared.state);
     if apps.is_empty() || !watchdog_enabled() {
         // No App JWT means no delivery history to read. Report it as

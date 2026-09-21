@@ -31,7 +31,7 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ListQuery {
+pub struct ListQuery {
     state: Option<String>,
     limit: Option<usize>,
 }
@@ -55,7 +55,7 @@ fn stats_json(stats: &WebhookQueueStats, now: i64) -> Value {
 }
 
 /// `GET /api/v1/webhooks/deliveries`
-pub(crate) async fn list_webhook_deliveries(
+pub async fn list_webhook_deliveries(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
@@ -115,7 +115,7 @@ pub(crate) async fn list_webhook_deliveries(
 /// Requeues the retained local payload. Distinguishing "unknown" from
 /// "already queued" matters: the first means the payload is gone and only
 /// GitHub can help, the second means the work is already coming.
-pub(crate) async fn replay_webhook_delivery(
+pub async fn replay_webhook_delivery(
     State(shared): State<Arc<SharedState>>,
     Path(delivery_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
@@ -152,7 +152,7 @@ pub(crate) async fn replay_webhook_delivery(
 }
 
 /// `GET /api/v1/webhooks/health`
-pub(crate) async fn webhook_health(
+pub async fn webhook_health(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<Value>, ApiError> {
     let now = now_us();

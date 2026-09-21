@@ -8,10 +8,10 @@ use serde_json::Value;
 /// `{ "error": ... }` shape; this middleware is path-scoped to the protocol
 /// surfaces only.
 /// Explicit fallback keeps unmatched runner paths inside the middleware stack.
-pub(crate) async fn protocol_not_found() -> Response {
+pub async fn protocol_not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
-pub(crate) async fn protocol_error_envelope(request: Request, next: Next) -> Response {
+pub async fn protocol_error_envelope(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let response = next.run(request).await;
     let status = response.status();
@@ -141,7 +141,7 @@ fn twirp_error_payload(status: StatusCode, message: &str) -> Value {
 /// rendered message text. Handlers that must branch on a specific failure
 /// (rather than parse a message string) match on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ApiErrorKind {
+pub enum ApiErrorKind {
     /// Default classification for ordinary errors.
     #[default]
     BadRequest,
@@ -160,21 +160,21 @@ pub struct ApiError {
 
 impl ApiError {
     /// Human-readable error text, for handlers that render their own response.
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         &self.message
     }
 
     /// HTTP status this error maps to.
-    pub(crate) fn status(&self) -> StatusCode {
+    pub fn status(&self) -> StatusCode {
         self.status
     }
 
     /// Programmatic classification of this error.
-    pub(crate) fn kind(&self) -> ApiErrorKind {
+    pub fn kind(&self) -> ApiErrorKind {
         self.kind
     }
 
-    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
+    pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -187,7 +187,7 @@ impl ApiError {
     /// `submit_run_inner` returns this exact error; the dispatch adapter
     /// recognizes it by [`ApiErrorKind::TriggerMismatch`] so per-workflow
     /// trigger failures stay visible without message-text matching.
-    pub(crate) fn trigger_mismatch(message: impl Into<String>) -> Self {
+    pub fn trigger_mismatch(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -195,7 +195,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
+    pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
@@ -203,7 +203,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+    pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
@@ -211,7 +211,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
+    pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
@@ -219,7 +219,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+    pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
@@ -227,7 +227,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn unprocessable(message: impl Into<String>) -> Self {
+    pub fn unprocessable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message: message.into(),
@@ -235,7 +235,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
@@ -243,7 +243,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn internal(message: impl Into<String>) -> Self {
+    pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
@@ -251,7 +251,7 @@ impl ApiError {
         }
     }
 
-    pub(crate) fn bad_gateway(message: impl Into<String>) -> Self {
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),

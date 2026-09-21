@@ -5,10 +5,10 @@ use utoipa::OpenApi;
 // registration here and `auth::is_worker_debug_route`, which decides what the
 // guest control socket may reach. Shared constants keep the two from
 // drifting when a route is added or renamed.
-pub(crate) const DEBUG_WORKER_TOKEN_PATH: &str = "/api/v1/debug/worker-token";
-pub(crate) const DEBUG_SESSIONS_PATH: &str = "/api/v1/debug/sessions";
-pub(crate) const DEBUG_SESSION_VERDICT_SUFFIX: &str = "/verdict";
-pub(crate) const DEBUG_SESSION_CLOSE_SUFFIX: &str = "/close";
+pub const DEBUG_WORKER_TOKEN_PATH: &str = "/api/v1/debug/worker-token";
+pub const DEBUG_SESSIONS_PATH: &str = "/api/v1/debug/sessions";
+pub const DEBUG_SESSION_VERDICT_SUFFIX: &str = "/verdict";
+pub const DEBUG_SESSION_CLOSE_SUFFIX: &str = "/close";
 
 /// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
@@ -27,7 +27,7 @@ pub fn app_with_test_api(
     build_app(state, shutdown, Some(token.into()))
 }
 
-pub(crate) fn build_app(
+pub fn build_app(
     state: AppState,
     shutdown: CancellationToken,
     test_api_token: Option<String>,

@@ -75,6 +75,10 @@ fn evaluate_template_inner(
                         e,
                         preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_)
                             | preloop_gha_expressions::ExpressionError::EvaluationTooLarge(_)
+                            // Invalid JSON is a hard failure in the official
+                            // runner (FromJson throws) — it must not be
+                            // silently preserved inside a run script.
+                            | preloop_gha_expressions::ExpressionError::InvalidJson(_)
                     ) {
                         return Err(e.into());
                     }
@@ -474,5 +478,21 @@ mod tests {
             condition_error.downcast_ref::<preloop_gha_expressions::ExpressionError>(),
             Some(preloop_gha_expressions::ExpressionError::FormatOutputTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn invalid_json_propagates_from_lenient_templates() {
+        // The official runner fails the job when fromJSON gets invalid JSON,
+        // even inside a run: script — the error must not be preserved as a
+        // literal token the way other lenient failures are.
+        let ctx = make_ctx();
+        let error = evaluate_template("true # ${{ fromJSON('bad') }}", &ctx).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<preloop_gha_expressions::ExpressionError>(),
+            Some(preloop_gha_expressions::ExpressionError::InvalidJson(_))
+        ));
+        // Ordinary lenient failures still degrade gracefully.
+        let ok = evaluate_template("echo ${{ bogus_function('x') }}", &ctx).unwrap();
+        assert_eq!(ok, "echo ${{ bogus_function('x') }}");
     }
 }

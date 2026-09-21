@@ -6,7 +6,7 @@ use preloop_gha_protocol::azdo::{
 use std::collections::BTreeMap;
 
 /// POST action download info — resolve action references to download URLs.
-pub(crate) async fn action_download_info(
+pub async fn action_download_info(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -14,7 +14,7 @@ pub(crate) async fn action_download_info(
     Json(serde_json::to_value(collection).unwrap_or_else(|_| json!({ "actions": {} })))
 }
 
-pub(crate) async fn runnerresolve_actions(
+pub async fn runnerresolve_actions(
     State(shared): State<Arc<SharedState>>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -26,18 +26,18 @@ pub(crate) async fn runnerresolve_actions(
 
 /// How long a minted archive ticket stays valid. Actions are fetched during
 /// job setup, so this only has to outlive a queue wait, not a whole run.
-pub(crate) const ACTION_TICKET_TTL_SECS: u64 = 6 * 60 * 60;
+pub const ACTION_TICKET_TTL_SECS: u64 = 6 * 60 * 60;
 /// How long a resolved action ref→SHA binding is trusted before the ref is
 /// re-resolved. Matches the freshness GitHub gives a `@main`-style reference:
 /// a new push to the ref is picked up after at most one TTL window.
-pub(crate) const ACTION_SHA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+pub const ACTION_SHA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 /// How long a *failed* ref resolution is remembered before it is retried.
 ///
 /// Shorter than the success TTL so a transient outage heals quickly, but long
 /// enough that an offline server does not pay the client's 10s connect timeout
 /// once per `uses:` on every single job dispatch. Without this the lookup is
 /// retried forever and lands directly on the cold-start path.
-pub(crate) const ACTION_SHA_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const ACTION_SHA_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether a cached entry recorded at `at` is still fresh, given that a
 /// negative entry expires sooner than a positive one.
@@ -61,12 +61,9 @@ async fn resolve_ref_to_sha(
     repo: &str,
     git_ref: &str,
 ) -> Option<String> {
-    // Already a full SHA — no lookup needed.
-    if git_ref.len() == 40
-        && git_ref
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
+    // Already a full SHA: no lookup needed. The all-zero sentinel is not a
+    // real commit, so it must not short-circuit as "resolved".
+    if preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
         return Some(git_ref.to_owned());
     }
     let cache_key = (owner.to_owned(), repo.to_owned(), git_ref.to_owned());
@@ -104,7 +101,7 @@ async fn resolve_ref_to_sha(
             .and_then(|body| {
                 body.get("sha")
                     .and_then(|value| value.as_str())
-                    .filter(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
+                    .filter(|sha| preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha))
                     .map(str::to_owned)
             })
     } else {
@@ -123,7 +120,7 @@ async fn resolve_ref_to_sha(
 }
 
 /// Percent-encode a path component for RFC 3986 URL safety.
-pub(crate) fn percent_encode_path_segment(input: &str) -> String {
+pub fn percent_encode_path_segment(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
@@ -139,14 +136,14 @@ pub(crate) fn percent_encode_path_segment(input: &str) -> String {
 }
 
 #[derive(serde::Deserialize)]
-pub(crate) struct ActionTicketQuery {
+pub struct ActionTicketQuery {
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
     sig: Option<String>,
 }
 
-pub(crate) async fn download_action_tarball(
+pub async fn download_action_tarball(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, git_ref)): Path<(String, String, String)>,
     Query(ticket): Query<ActionTicketQuery>,
@@ -318,7 +315,7 @@ pub(crate) async fn download_action_tarball(
     Ok(res)
 }
 
-pub(crate) fn action_download_ticket(
+pub fn action_download_ticket(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
@@ -386,11 +383,11 @@ pub(crate) fn action_download_ticket(
 }
 
 /// Maximum number of actions accepted in a single resolution batch to bound memory.
-pub(crate) const MAX_ACTION_BATCH_SIZE: usize = 256;
+pub const MAX_ACTION_BATCH_SIZE: usize = 256;
 /// Maximum concurrent outbound GitHub ref resolution requests.
-pub(crate) const MAX_ACTION_CONCURRENCY: usize = 16;
+pub const MAX_ACTION_CONCURRENCY: usize = 16;
 
-pub(crate) async fn collect_runnerresolve_refs(
+pub async fn collect_runnerresolve_refs(
     state: &AppState,
     value: &serde_json::Value,
     actions: &mut serde_json::Map<String, serde_json::Value>,
@@ -413,7 +410,7 @@ pub(crate) async fn collect_runnerresolve_refs(
 }
 
 /// Batch collector for the official JobServer `ActionDownloadInfo` endpoint.
-pub(crate) async fn collect_action_download_infos(
+pub async fn collect_action_download_infos(
     state: &AppState,
     value: &serde_json::Value,
 ) -> ActionDownloadInfoCollection {
@@ -531,28 +528,31 @@ async fn resolve_action_download(
     Some((key, name, git_ref, pinned, tar_url))
 }
 
-pub(crate) async fn runnerresolve_action(
+pub async fn runnerresolve_action(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
 ) -> Option<(String, serde_json::Value)> {
     let (key, name, git_ref, resolved_sha_opt, tar_url) =
         resolve_action_download(state, action, version_override).await?;
-    let resolved_sha = resolved_sha_opt.unwrap_or_else(|| git_ref.clone());
-    Some((
-        key,
-        json!({
-            "name": name,
-            "version": git_ref,
-            "resolved_sha": resolved_sha,
-            "tar_url": tar_url,
-            "authentication": null,
-        }),
-    ))
+    // M2: never echo the mutable ref back as `resolved_sha`. A caller that trusts the
+    // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
+    // explicit on the wire, and the runner refuses the download instead of fetching
+    // the mutable ref.
+    let mut entry = json!({
+        "name": name,
+        "version": git_ref,
+        "tar_url": tar_url,
+        "authentication": null,
+    });
+    if let Some(resolved_sha) = resolved_sha_opt {
+        entry["resolved_sha"] = json!(resolved_sha);
+    }
+    Some((key, entry))
 }
 
 /// One `ActionDownloadInfo` entry in the official `ActionDownloadInfoCollection` wire shape.
-pub(crate) async fn action_download_info_entry(
+pub async fn action_download_info_entry(
     state: &AppState,
     action: &str,
     version_override: Option<&str>,
