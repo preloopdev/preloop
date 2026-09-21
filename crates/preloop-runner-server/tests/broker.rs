@@ -2155,11 +2155,6 @@ async fn pat_only_config_supplies_job_github_token() {
 /// The job keeps the job-scoped runtime token, so a step that needs GitHub
 /// fails at the point of use instead of running with authority nobody could
 /// bound, and the wire variable discloses the withholding.
-
-/// H3: a PAT whose OAuth scopes cannot be introspected must not be embedded.
-/// The job keeps the job-scoped runtime token, so a step that needs GitHub
-/// fails at the point of use instead of running with authority nobody could
-/// bound, and the wire variable discloses the withholding.
 #[tokio::test]
 async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
