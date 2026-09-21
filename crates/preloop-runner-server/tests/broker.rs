@@ -2155,11 +2155,6 @@ async fn pat_only_config_supplies_job_github_token() {
 /// The job keeps the job-scoped runtime token, so a step that needs GitHub
 /// fails at the point of use instead of running with authority nobody could
 /// bound, and the wire variable discloses the withholding.
-
-/// H3: a PAT whose OAuth scopes cannot be introspected must not be embedded.
-/// The job keeps the job-scoped runtime token, so a step that needs GitHub
-/// fails at the point of use instead of running with authority nobody could
-/// bound, and the wire variable discloses the withholding.
 #[tokio::test]
 async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -2200,10 +2195,13 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
 
     let inner = state.inner.lock().await;
     let message = queued_message_for(&inner, &run_id);
-    let runtime_token = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    // Compare the token's job identity, not its bytes: local JWTs carry a
+    // randomized `jti`, so two mints of identical claims never match.
+    let token = variable_value(&message, "system.github.token")
+        .expect("the job message carries a GitHub token variable");
     assert_eq!(
-        variable_value(&message, "system.github.token"),
-        Some(runtime_token.as_str()),
+        jwt_sub(token).as_deref(),
+        Some(format!("preloop-job-{}", message.job_id).as_str()),
         "an unverifiable PAT is withheld in favour of the job-scoped runtime token"
     );
     assert_ne!(
