@@ -88,6 +88,22 @@ pub(crate) const MAX_TOP_RECORDS: usize = 500;
 /// evade the cap by inventing other job ids in request bodies.
 pub(crate) const MAX_PENDING_PER_JOB: usize = 32;
 
+/// R1-6 — cap on a single in-flight legacy cache upload
+/// (`PendingCache::bytes`). `cache_upload` appends every PATCH body with no
+/// running total; without this cap a job could grow server RAM without bound
+/// by PATCHing chunks forever (~500 requests/GiB at the 2 MiB default body
+/// limit). Matches the 512 MiB body limit on the Twirp blob upload route.
+pub(crate) const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// R1-6 — per-job aggregate cap on in-flight legacy cache upload bytes.
+/// `MAX_CACHE_UPLOAD_BYTES` bounds one reservation; without an aggregate
+/// budget a job could still hold `MAX_PENDING_PER_JOB` × 512 MiB (~16 GiB)
+/// in `pending_caches`. 1 GiB leaves headroom for two full-size uploads
+/// while keeping a hostile job's worst case bounded. Enforced under the
+/// `inner` lock in `cache_upload`, so concurrent chunks cannot race past
+/// it; bytes are released when the reservation commits or is swept.
+pub(crate) const MAX_PENDING_CACHE_BYTES_PER_JOB: u64 = 1024 * 1024 * 1024;
+
 /// F7 — global cap on minted cache download tokens; the oldest are evicted.
 pub(crate) const MAX_CACHE_DL_TOKENS: usize = 1024;
 
@@ -614,7 +630,10 @@ pub(crate) fn trim_artifact_registry(inner: &mut InnerState) {
 /// F7 — TTL sweep for pending uploads and download tokens. Entries with
 /// `created_unix == 0` (restored from a persisted meta, or engine-token
 /// reservations made before timestamps existed) are left alone, matching the
-/// session-liveness sweep's treatment of restored state.
+/// session-liveness sweep's treatment of restored state. R1-6: the legacy
+/// artifactcache reservations (`pending_caches`) are in-memory only and were
+/// never swept — an abandoned reservation held its bytes forever — so they
+/// are covered by the same TTL.
 pub(crate) fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
     let cutoff = now_unix_secs.saturating_sub(PENDING_UPLOAD_TTL.as_secs() as i64);
     let stale_cache: Vec<String> = inner
@@ -634,6 +653,17 @@ pub(crate) fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) 
         .collect();
     for token in stale_artifact {
         inner.artifact_v2_pending.remove(&token);
+    }
+    // R1-6: legacy reservations are freed too; only `cache_commit` removed
+    // them before, so abandoned uploads accumulated RAM without bound.
+    let stale_legacy: Vec<i64> = inner
+        .pending_caches
+        .iter()
+        .filter(|(_, pending)| pending.created_unix > 0 && pending.created_unix < cutoff)
+        .map(|(cache_id, _)| *cache_id)
+        .collect();
+    for cache_id in stale_legacy {
+        inner.pending_caches.remove(&cache_id);
     }
     let stale_dl: Vec<String> = inner
         .cache_v2_dl_tokens_created
