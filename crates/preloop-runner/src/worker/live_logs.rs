@@ -148,12 +148,9 @@ impl LiveLogQueue {
     /// Lines already dequeued cannot be recalled from the WebSocket.
     pub fn remask_with(&self, secrets: &[String]) {
         let mut lines = self.lines.lock().expect("live log queue poisoned");
-        for entry in &mut *lines {
-            entry.line = preloop_gha_protocol::masking::mask_secrets(
-                &entry.line,
-                secrets.iter().map(String::as_str),
-                &[],
-            );
+        let masked = mask_lines(lines.iter().map(|entry| entry.line.as_str()), secrets);
+        for (entry, line) in lines.iter_mut().zip(masked) {
+            entry.line = line;
         }
     }
 
@@ -419,18 +416,37 @@ fn truncate_line(line: &str) -> String {
     truncated
 }
 
+/// Re-mask a sequence of physical log lines against the current secrets.
+///
+/// Lines are joined, masked, and split so a secret spanning a line boundary
+/// still matches. `mask_secrets_preserving_lines` re-emits every newline
+/// inside a matched secret, so the output line count always equals the input
+/// line count and the split is one-to-one.
+fn mask_lines<'a, I>(lines: I, secrets: &[String]) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let joined = lines.into_iter().collect::<Vec<_>>().join("\n");
+    if joined.is_empty() {
+        return Vec::new();
+    }
+    preloop_gha_protocol::masking::mask_secrets_preserving_lines(
+        &joined,
+        secrets.iter().map(String::as_str),
+        &[],
+    )
+    .split('\n')
+    .map(str::to_owned)
+    .collect()
+}
+
 fn mask_wrapper(
     wrapper: &TimelineRecordFeedLinesWrapper,
     masks: &Arc<RwLock<HashSet<String>>>,
 ) -> Option<TimelineRecordFeedLinesWrapper> {
     let masks = masks.read().ok()?;
-    let value = wrapper
-        .value
-        .iter()
-        .map(|line| {
-            preloop_gha_protocol::masking::mask_secrets(line, masks.iter().map(String::as_str), &[])
-        })
-        .collect();
+    let secrets: Vec<String> = masks.iter().cloned().collect();
+    let value = mask_lines(wrapper.value.iter().map(String::as_str), &secrets);
     Some(TimelineRecordFeedLinesWrapper {
         step_id: wrapper.step_id.clone(),
         start_line: wrapper.start_line,
@@ -580,6 +596,38 @@ mod tests {
             mask_wrapper(&wrapper, &masks).unwrap().value,
             vec!["token ***"]
         );
+    }
+    #[test]
+    fn remasked_batch_redacts_secret_spanning_lines() {
+        let masks = Arc::new(RwLock::new(HashSet::new()));
+        let wrapper = TimelineRecordFeedLinesWrapper {
+            step_id: "step".to_owned(),
+            start_line: 1,
+            count: 3,
+            value: vec![
+                "prefix token-a".to_owned(),
+                "token-b suffix".to_owned(),
+                "unrelated".to_owned(),
+            ],
+        };
+
+        masks.write().unwrap().insert("token-a\ntoken-b".to_owned());
+        let masked = mask_wrapper(&wrapper, &masks).unwrap();
+        assert_eq!(masked.value, vec!["prefix ***", "*** suffix", "unrelated"]);
+        assert_eq!(masked.count, 3);
+    }
+
+    #[test]
+    fn queued_lines_remask_secret_spanning_lines() {
+        let queue = LiveLogQueue::disconnected();
+        queue.enqueue("step", "prefix token-a", 1);
+        queue.enqueue("step", "token-b suffix", 2);
+        queue.remask_with(&["token-a\ntoken-b".to_owned()]);
+
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, "prefix ***");
+        assert_eq!(lines[1].line, "*** suffix");
     }
 
     #[test]
