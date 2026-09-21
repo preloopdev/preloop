@@ -410,7 +410,10 @@ pub(crate) enum PatScopeOutcome {
 /// Plain HTTP is allowed only to loopback hosts in test builds, where the
 /// suite serves mock API endpoints over `http://127.0.0.1`. Any other
 /// cleartext URL would expose the PAT on the network (CWE-319).
-fn github_api_url_allows_credential(url: &reqwest::Url) -> bool {
+///
+/// Shared with the GitHub App auth path (`github_app.rs`), which sends the
+/// signed App JWT under the same rule.
+pub(crate) fn github_api_url_allows_credential(url: &reqwest::Url) -> bool {
     if url.scheme() == "https" {
         return true;
     }
@@ -421,7 +424,8 @@ fn github_api_url_allows_credential(url: &reqwest::Url) -> bool {
 
 /// Scheme and host only: a configured API URL may embed userinfo or secret
 /// query parameters, which must never be copied into log-facing reasons.
-fn redacted_api_url(url: &reqwest::Url) -> String {
+/// Shared with the GitHub App auth path (`github_app.rs`).
+pub(crate) fn redacted_api_url(url: &reqwest::Url) -> String {
     match (url.host_str(), url.port()) {
         (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
         (Some(host), None) => format!("{}://{host}", url.scheme()),
@@ -468,34 +472,12 @@ pub(crate) async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
     // The shared client's default redirect policy would follow an `http://`
     // redirect target with the Authorization header still attached on a
     // same-host downgrade, re-opening the cleartext PAT leak (CWE-319) the
-    // scheme check above closes. This introspection request therefore only
-    // follows redirects that stay credential-safe; a downgrade attempt
-    // surfaces as a 3xx below and the PAT is withheld.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent("preloop-runner-server")
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            // Custom policies bypass reqwest's built-in redirect limit, so
-            // cap the chain explicitly; a longer chain is a loop or an
-            // attack, not a healthy API root.
-            if attempt.previous().len() >= 10 {
-                attempt.stop()
-            } else if github_api_url_allows_credential(attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build();
-    let client = match client {
-        Ok(client) => client,
-        Err(error) => {
-            return PatScopeOutcome::Unverifiable {
-                reason: format!("GitHub API client build failed: {error:#}"),
-            };
-        }
-    };
+    // scheme check above closes. This introspection request therefore uses
+    // the credential-safe client, which only follows redirects that stay
+    // credential-safe (10-hop cap); a downgrade attempt surfaces as a 3xx
+    // below and the PAT is withheld. The GitHub App auth path
+    // (`github_app.rs`) uses the same client for the same reason.
+    let client = &*crate::shared_http::CREDENTIAL_SAFE_CLIENT;
     let response = match client
         .get(url)
         .header("Authorization", format!("Bearer {pat}"))

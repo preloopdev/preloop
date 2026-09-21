@@ -15631,6 +15631,91 @@ async fn pat_scope_introspection_redacts_credentials_in_rejection_reason() {
     }
 }
 
+/// GitHub App auth follow-up: the App JWT is a bearer credential like the
+/// PAT, and the API base URL is operator-configured (`PRELOOP_GITHUB_API_URL`),
+/// so a cleartext non-loopback base must be refused before the JWT is sent.
+/// Minting against `http://192.0.2.1` (TEST-NET-1, never routable) must fail
+/// in the guard, before any network access.
+#[tokio::test]
+async fn app_auth_rejects_cleartext_non_loopback_api_base() {
+    let error = crate::github_app::mint_installation_token(
+        "http://192.0.2.1",
+        "fake-app-jwt",
+        123,
+        "someowner/somerepo",
+        &BTreeMap::new(),
+    )
+    .await
+    .expect_err("a cleartext non-loopback API base must be refused before sending the App JWT");
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {message}"
+    );
+}
+
+/// GitHub App auth follow-up: a redirect from the API base to a cleartext
+/// URL must not receive the App JWT. The credential-safe client stops at
+/// the 3xx instead of following the downgrade.
+#[tokio::test]
+async fn app_auth_does_not_follow_cleartext_redirects() {
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    // TEST-NET-1 is never routable: if the redirect were followed, the
+    // request would fail trying to connect there instead of stopping at
+    // the 302.
+    let mock = axum::Router::new().route(
+        "/app/installations",
+        axum::routing::get(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://192.0.2.1/")],
+                "",
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let error = crate::github_app::find_installation(&api_base, "fake-app-jwt", "someowner")
+        .await
+        .expect_err("a cleartext redirect target must not be followed");
+    let message = error.to_string();
+    assert!(
+        message.contains("302"),
+        "downgrade redirect must stop at the 3xx without following it, got: {message}"
+    );
+}
+
+/// GitHub App auth follow-up: a rejected API base that embeds credentials
+/// must not leak them into the error, which lands in startup and per-run
+/// logs.
+#[tokio::test]
+async fn app_auth_redacts_credentials_in_rejection_reason() {
+    let error = crate::github_app::find_installation(
+        "http://operator:s3cret-pw@192.0.2.1:8080/api?token=abc",
+        "fake-app-jwt",
+        "someowner",
+    )
+    .await
+    .expect_err("a cleartext non-loopback API base must be refused before sending the App JWT");
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {message}"
+    );
+    assert!(
+        message.contains("http://192.0.2.1:8080"),
+        "reason should identify the offending scheme/host, got: {message}"
+    );
+    for secret in ["operator", "s3cret-pw", "token=abc"] {
+        assert!(
+            !message.contains(secret),
+            "credential material must be redacted from the reason, got: {message}"
+        );
+    }
+}
+
 /// H3: scope-mismatch matrix for the static-PAT permission check. A classic
 /// PAT carrying write authority must never back a job whose effective
 /// `permissions:` are read-only (or empty); a PAT no broader than declared
