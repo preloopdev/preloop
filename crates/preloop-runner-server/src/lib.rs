@@ -20,6 +20,7 @@ pub mod github_pr;
 pub mod github_push;
 pub mod scheduler;
 pub mod shared_http;
+pub mod token_ceiling;
 pub mod webhook_api;
 pub mod webhook_health;
 pub mod webhook_status;
