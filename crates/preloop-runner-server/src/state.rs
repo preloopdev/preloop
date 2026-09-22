@@ -333,6 +333,19 @@ pub type ActionShaCache = std::sync::Mutex<
     std::collections::HashMap<(String, String, String), (Option<String>, std::time::Instant)>,
 >;
 
+/// (slug, PAT fingerprint) → repository metadata with the instant it was
+/// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
+/// visibility) from leaking into a later anonymous lookup for the same
+/// slug. `None` elements are cached *unknowns*: without them an offline or
+/// rate-limited forge re-attempts every submission and pays the full
+/// connect timeout each time.
+pub(crate) type RepoMetaCache = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, Option<String>),
+        ((Option<u64>, Option<bool>), std::time::Instant),
+    >,
+>;
+
 /// Serializes tests that mutate the process-global GitHub URL environment
 /// variables.
 ///
@@ -505,6 +518,12 @@ pub struct AppState {
     /// and bounds GitHub API pressure; entries expire after
     /// [`ACTION_SHA_CACHE_TTL`].
     pub action_sha_cache: Arc<ActionShaCache>,
+    /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
+    /// fingerprint) → `(repository_id, private)` with the instant it was
+    /// recorded. Keeps local snapshot creation from paying a forge API call
+    /// per submission; entries expire after `REPO_META_CACHE_TTL`
+    /// (failures after `REPO_META_NEGATIVE_TTL`).
+    pub repo_meta_cache: Arc<RepoMetaCache>,
     /// Stored job secrets from the config file (`[secrets]` + per-repo
     /// tables), injected into every job whose trust tier allows secrets
     /// (mirroring GitHub org/repo secrets). Submission-provided secrets
@@ -1102,6 +1121,7 @@ impl AppState {
             dispatch_token_cache: Arc::new(crate::dispatch_auth::InstallationTokenCache::default()),
             dispatch_actor_cache: Arc::new(crate::dispatch_auth::DispatchActorCache::default()),
             github_pat,
+            repo_meta_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             github_urls,
             pr_config,
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
