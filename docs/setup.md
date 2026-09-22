@@ -18,6 +18,24 @@ curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh 
   `.wslconfig` (`[wsl2] nestedVirtualization=true`) so `/dev/kvm` is exposed.
 - Without it, `preloop runner` still works (jobs run as WSL processes); only the VM pool needs KVM.
 
+## Just the runner
+
+If you only want `preloop-runner` — a drop-in Rust replacement for
+`actions/runner` that registers against GitHub (or a preloop server) the same
+way — every release publishes standalone binaries:
+
+```sh
+# linux x86_64 / aarch64, macOS x86_64 / arm64, windows x86_64
+curl -fsSLO https://github.com/preloopdev/preloop/releases/latest/download/preloop-runner-<triple>
+chmod +x preloop-runner-<triple>
+./preloop-runner-<triple> configure --url https://github.com/owner/repo --token <registration-token>
+./preloop-runner-<triple> run
+```
+
+Or the container image: `docker run ghcr.io/preloopdev/preloop-runner:latest
+configure --url … --token …`. Each binary ships with a CycloneDX SBOM
+(`preloop-runner-<triple>.cdx.json`) and a sha256 checksum.
+
 ## Quick start
 
 ```sh

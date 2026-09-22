@@ -134,8 +134,10 @@ docs/internal/
 skills-lock.json
 .claude/
 
-# Release build output — 863 MB golden artifact, never tracked
+# Release build output 
 /dist/
+# CycloneDX SBOM output — generated at release time, never tracked
+*.cdx.json
 
 # Internal planning notes — kept local, like docs/internal/
 /goals/

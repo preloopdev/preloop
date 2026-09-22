@@ -56,6 +56,12 @@ git_version = "2.54.0"
 git_lfs_version = "3.7.1"
 docker_version = "28.0.4"
 docker_buildx_version = "0.35.0"
+# Docker CLI baked into the standalone preloop-runner container image
+# (ci/runner.Dockerfile, published by release-runner.yml). Tracks the official
+# actions/runner image's pins — NOT the golden's docker_version above, which
+# follows the ubuntu-24.04 toolset.
+runner_image_docker_version = "29.6.1"
+runner_image_buildx_version = "0.35.0"
 docker_compose_version = "2.38.2"
 clang_versions = "16 17 18"
 clang_default_version = "18"
