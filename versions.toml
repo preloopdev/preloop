@@ -26,7 +26,7 @@ smolvm_golden_version = "1.16.1"
  # apt-indices-refresh workflow rebuilds the goldens past this age.
  # Quoted: build.rs only picks up quoted values (and Renovate's regex
  # manager expects flat `key = "value"` lines).
- apt_indices_max_age_days = "7"
+apt_indices_max_age_days = "7"
 
 # Image inputs for the runner golden. The OCI bases are immutable filesystem
 # inputs. `github_runner_image_version` is the actions/runner-images snapshot
