@@ -798,6 +798,12 @@ jobs:
 
 #[tokio::test]
 async fn overflowed_run_settles_deferred_matrix_node_requests() {
+    // The job VM injects a real PRELOOP_GITHUB_TOKEN; without clearing it the
+    // 101 submits below each hit live PAT scope introspection and the run is
+    // refused with 403 once the token fails auth. Hold the env lock so the
+    // unset cannot race a parallel test that needs the token.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
     // MC-3: a run cancelled at submit by a workflow-concurrency queue
     // overflow never dispatches anything, yet the deferred-matrix node's
     // submit-time request records were minted before the gate check. They
