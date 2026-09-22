@@ -2290,6 +2290,21 @@ async fn process_delivery_payload_with_lease(
             continue;
         }
 
+        // Fork-PR workflow policy: the operator kill switch for fork
+        // pull-request workflows. Skips the event before any workflow is
+        // fetched or matched. `pull_request_target` is unaffected — it runs
+        // with base-repo trust (see execution protections for that knob).
+        if effective.trust_tier
+            == Some(crate::events::trust_tier::TrustTier::UntrustedForkPullRequest)
+            && !shared.state.fork_policy.run_fork_workflows
+        {
+            info!(
+                event = %effective.event,
+                "fork policy skipped fork pull-request event (run_fork_workflows = false)"
+            );
+            continue;
+        }
+
         let default_branch = payload_val
             .get("repository")
             .and_then(|r| r.get("default_branch"))

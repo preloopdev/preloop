@@ -13,6 +13,7 @@ pub mod config;
 pub mod credential_store;
 pub mod errors;
 pub mod events;
+pub mod fork_policy;
 pub mod github;
 pub mod github_app;
 pub mod github_breaker;

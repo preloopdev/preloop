@@ -1126,6 +1126,20 @@ pub fn promote_ready_jobs(
         let mut settled = false;
 
         while let Some(mut job) = inner.pending_jobs.pop_front() {
+            // Fork-PR workflow policy: a run awaiting fork approval holds
+            // every job here until the operator approves the run
+            // (`POST /api/v1/runs/:run_id/approve-fork`). The job keeps its
+            // `Pending` status and is re-considered on the next sweep.
+            // Approval-window expiry is handled by the reaper sweep, which
+            // fails the run closed after 24 hours.
+            if inner
+                .runs
+                .get(&job.run_id)
+                .is_some_and(|run| run.fork_approval_pending)
+            {
+                remaining.push_back(job);
+                continue;
+            }
             let decision = inner
                 .runs
                 .get(&job.run_id)
@@ -3703,6 +3717,10 @@ mod assignment_tests {
                 conclusion: None,
                 push_state: None,
                 snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
                 status: ExecutionStatus::Queued,
             },
         );

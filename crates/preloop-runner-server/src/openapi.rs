@@ -7,6 +7,7 @@ use utoipa::{
 };
 
 use crate::runs::{ApproveJobRequest, ApproveJobResponse};
+use crate::runs::{ApproveForkRequest, ApproveForkResponse};
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -156,6 +157,7 @@ pub struct RunResponse {
         cancel_run,
         rerun_run,
         approve_job,
+        approve_fork,
         run_events,
         register_dap_port,
         dap_debug,
@@ -446,6 +448,27 @@ fn rerun_run() {}
     security(("native_bearer" = []))
 )]
 fn approve_job() {}
+/// Approve a run held by the fork-PR workflow policy.
+///
+/// Releases a run waiting on `[fork_policy] require_approval = true` so its
+/// jobs may start. The approver is whoever holds the system bearer token —
+/// preloop has no user identities — so for a single-operator server this is
+/// a deliberate confirmation step, not a second human. A run not approved
+/// within 24 hours of entering the hold fails closed.
+#[utoipa::path(
+    post, path = "/api/v1/runs/{run_id}/approve-fork", tag = "Runs",
+    params(
+        ("run_id" = String, Path, description = "Run UUID")
+    ),
+    request_body(content = ApproveForkRequest, description = "Optional operator note"),
+    responses(
+        (status = 200, description = "Approval recorded; run released", body = ApproveForkResponse),
+        (status = 404, description = "Run not found", body = ApiErrorResponse),
+        (status = 409, description = "Run is terminal, not awaiting fork approval, or the approval window expired", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn approve_fork() {}
 
 /// Stream run events (NDJSON).
 ///

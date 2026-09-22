@@ -198,6 +198,13 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     let now = SystemTime::now();
     let mut cancellations = Vec::new();
     let mut disconnected_completions = Vec::new();
+    // Fork-PR workflow policy: fail closed runs whose 24h approval window
+    // expired while waiting for operator approval. Emitted below, after the
+    // lock is released.
+    let expired_fork_approvals = crate::fork_policy::sweep_expired_fork_approvals(
+        &mut inner,
+        crate::models::now_unix_nanos(),
+    );
     // Jobs failed by the starvation sweep, emitted after the lock is
     // released so the event fan-out never runs under the state lock.
     let mut starved: Vec<(RunId, JobId, String)> = Vec::new();
@@ -555,8 +562,20 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     }
 
     // Notify if cancellations or starvation failures occurred
-    if cancellation_count > 0 || !starved.is_empty() {
+    if cancellation_count > 0 || !starved.is_empty() || !expired_fork_approvals.is_empty() {
         shared.state.message_notify.notify_waiters();
+    }
+
+    // Surface fork-PR runs failed closed by the expired approval window.
+    for run_id in &expired_fork_approvals {
+        shared
+            .state
+            .emit(NdjsonEvent::RunStatus {
+                run_id: *run_id,
+                status: ExecutionStatus::Failure,
+                reason: Some("fork-PR approval window expired".to_owned()),
+            })
+            .await;
     }
 
     // Surface why a queued job was failed. Without this the only record is a

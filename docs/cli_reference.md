@@ -154,6 +154,13 @@ an optional `--note` is stored with the approval for the audit trail.
 Requires the server system token; preloop has no user identities, so the
 approver is whoever holds the operator credential. For a single-operator
 server this is a deliberate confirmation step, not a second human.
+## `preloop approve-fork <RUN_ID> [--note ...]`
+
+Release a run held by the fork-PR workflow policy (`[fork_policy]
+require_approval = true`). The run was created and queued, but every job held
+in `Pending` until the operator confirms it. `--note` records an optional
+audit note with the approval. A run not approved within 24 hours of entering
+the hold fails closed.
 
 ## `preloop secret <COMMAND>`
 

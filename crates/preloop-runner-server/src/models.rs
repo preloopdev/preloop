@@ -336,6 +336,21 @@ pub struct RunRecord {
     /// submissions that snapshot a workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_timing: Option<SnapshotTiming>,
+    /// Fork-PR workflow policy: the run is held at scheduler admission until
+    /// the operator approves it (`POST /api/v1/runs/:run_id/approve-fork`).
+    /// Stamped at submission when the fork policy requires approval.
+    #[serde(default)]
+    pub fork_approval_pending: bool,
+    /// When the fork-approval hold started (unix nanos). A run not approved
+    /// within 24 hours of this stamp fails closed via the reaper sweep.
+    #[serde(default)]
+    pub fork_approval_requested_at_unix_nanos: Option<i64>,
+    /// When the fork-approval hold was released (unix nanos), if approved.
+    #[serde(default)]
+    pub fork_approved_at_unix_nanos: Option<i64>,
+    /// Optional operator note recorded with the fork approval.
+    #[serde(default)]
+    pub fork_approval_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]

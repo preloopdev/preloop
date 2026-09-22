@@ -566,6 +566,11 @@ pub struct AppState {
     /// unchanged. A config change takes effect on restart, like the other
     /// policy tables in the config file.
     pub token_permissions_ceiling: Option<crate::config::TokenPermissionsCeiling>,
+    /// Fork pull-request workflow policy loaded from the config file at
+    /// startup. Empty by default: fork-PR workflows run as today until the
+    /// operator writes `[fork_policy]` rules. A config change takes effect
+    /// on restart, like the other policy tables in the config file.
+    pub fork_policy: crate::config::ForkPolicyConfig,
     /// One-time provision tokens issued by the embedded runner pool, one per
     /// machine provisioning event, forwarded by the runner's `configure`
     /// call inside the fresh VM. Registration presenting a matching token is
@@ -1146,6 +1151,7 @@ impl AppState {
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
+            fork_policy: config.fork_policy.clone(),
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         })
     }

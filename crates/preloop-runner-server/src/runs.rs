@@ -666,6 +666,16 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     webhook_delivery_id: Option<&str>,
 ) -> Result<RunAccepted, ApiError> {
     let webhook_delivery_id = webhook_delivery_id.map(str::to_owned);
+    // Fork-PR workflow policy: runs from fork pull-request events wait for
+    // explicit operator approval before any job may start. The trust tier is
+    // stamped by the webhook path before submission; native submissions carry
+    // no tier and are never held.
+    let fork_approval_pending = crate::fork_policy::fork_approval_required(
+        &shared.state.fork_policy,
+        crate::events::trust_tier::tier_of(&submission),
+    );
+    let fork_approval_requested_at_unix_nanos =
+        fork_approval_pending.then(crate::models::now_unix_nanos);
     if let (Some(delivery_id), Some(workflow_path)) = (
         webhook_delivery_id.as_deref(),
         submission.workflow_path.as_deref(),
@@ -1612,6 +1622,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     conclusion: Some("failure".to_owned()),
                     push_state: None,
                     snapshot_timing: None,
+                    fork_approval_pending,
+                    fork_approval_requested_at_unix_nanos,
+                    fork_approved_at_unix_nanos: None,
+                    fork_approval_note: None,
                 },
             );
             drop(inner);
@@ -1827,6 +1841,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                             conclusion: Some("cancelled".to_owned()),
                             push_state: None,
                             snapshot_timing: None,
+                            fork_approval_pending,
+                            fork_approval_requested_at_unix_nanos,
+                            fork_approved_at_unix_nanos: None,
+                            fork_approval_note: None,
                         },
                     );
                     // The run died on arrival: nothing will ever dispatch,
@@ -1917,6 +1935,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     conclusion: None,
                     push_state: None,
                     snapshot_timing: None,
+                    fork_approval_pending,
+                    fork_approval_requested_at_unix_nanos,
+                    fork_approved_at_unix_nanos: None,
+                    fork_approval_note: None,
                 },
             );
             drop(inner);
@@ -1980,6 +2002,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 snapshot_timing: workspace_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.snapshot_timing),
+                fork_approval_pending,
+                fork_approval_requested_at_unix_nanos,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
             },
         );
 
@@ -2141,6 +2167,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 conclusion: None,
                 push_state: None,
                 snapshot_timing,
+                fork_approval_pending,
+                fork_approval_requested_at_unix_nanos,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
             },
         );
         // Deferred reusable-caller nodes whose needs are already satisfied
@@ -3634,6 +3664,88 @@ pub async fn rerun_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunAccepted>, ApiError> {
     rerun_run_inner(&shared, run_id, None).await.map(Json)
+}
+
+/// Request body for approving a run held by the fork-PR workflow policy.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApproveForkRequest {
+    /// Optional operator note recorded with the approval (audit trail).
+    pub note: Option<String>,
+}
+
+/// Response for a fork-PR approval.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApproveForkResponse {
+    pub run_id: String,
+    /// Whether the run was awaiting fork approval and is now released.
+    pub approved: bool,
+}
+
+/// Approve a run held by the fork-PR workflow policy
+/// (`POST /api/v1/runs/:run_id/approve-fork`). Requires the system (native)
+/// bearer token: preloop has no user identities, so the approver is whoever
+/// holds the operator credential. For a single-operator server this is a
+/// deliberate confirmation step, not a second human — it stops a fork PR
+/// from executing code without an explicit go-ahead. A run not approved
+/// within 24 hours of entering the hold fails closed.
+pub async fn approve_fork(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    Json(body): Json<ApproveForkRequest>,
+) -> Result<Json<ApproveForkResponse>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get_mut(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    if run.status.is_terminal() {
+        return Err(ApiError::conflict("run is already terminal"));
+    }
+    if !run.fork_approval_pending {
+        return Err(ApiError::conflict("run is not awaiting fork approval"));
+    }
+    // Fail closed on an expired window before recording anything.
+    if let Some(requested_at) = run.fork_approval_requested_at_unix_nanos {
+        if crate::models::now_unix_nanos().saturating_sub(requested_at)
+            > crate::fork_policy::FORK_APPROVAL_WINDOW_NANOS
+        {
+            let expired = crate::fork_policy::sweep_expired_fork_approvals(
+                &mut inner,
+                crate::models::now_unix_nanos(),
+            );
+            drop(inner);
+            if !expired.is_empty() {
+                shared.state.message_notify.notify_waiters();
+            }
+            return Err(ApiError::conflict(
+                "approval window expired; the run was failed closed",
+            ));
+        }
+    }
+    let run = inner.runs.get_mut(&run_id).expect("run exists");
+    run.fork_approval_pending = false;
+    run.fork_approved_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    run.fork_approval_note = body.note.clone();
+    tracing::info!(
+        run_id = %run_id.0,
+        note = body.note.as_deref().unwrap_or_default(),
+        "fork-PR approval recorded; run released"
+    );
+    let outcome = crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    let promoted = outcome.promoted;
+    drop(inner);
+    if promoted > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
+    Ok(Json(ApproveForkResponse {
+        run_id: run_id.0.to_string(),
+        approved: true,
+    }))
 }
 
 /// Upper bound on how long an event stream waits for the next event.
