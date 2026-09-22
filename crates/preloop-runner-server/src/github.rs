@@ -2305,6 +2305,38 @@ async fn process_delivery_payload_with_lease(
             continue;
         }
 
+        // Workflow execution protections: admin-level deny policy on which
+        // events and actors may trigger workflows. Unscoped rules deny the
+        // whole event here, before any workflow is matched; scoped rules are
+        // evaluated per workflow file below.
+        let protection_actor = payload_val
+            .get("sender")
+            .and_then(|sender| sender.get("login"))
+            .and_then(|login| login.as_str());
+        if let Some(hit) = crate::execution_protection::denies_event(
+            &shared.state.execution_protection,
+            &effective.event,
+            protection_actor,
+        ) {
+            match shared.state.execution_protection.mode {
+                crate::config::ProtectionMode::Enforce => {
+                    info!(
+                        event = %effective.event,
+                        rule = %hit.describe(),
+                        "execution protection denied event"
+                    );
+                    continue;
+                }
+                crate::config::ProtectionMode::Evaluate => {
+                    info!(
+                        event = %effective.event,
+                        rule = %hit.describe(),
+                        "execution protection would deny event (evaluate mode)"
+                    );
+                }
+            }
+        }
+
         let default_branch = payload_val
             .get("repository")
             .and_then(|r| r.get("default_branch"))
@@ -2439,6 +2471,35 @@ async fn process_delivery_payload_with_lease(
                     "Skipping workflow owned by GitHub"
                 );
                 continue;
+            }
+
+            // Per-file execution protections: scoped deny rules for this
+            // event/actor/workflow file.
+            if let Some(hit) = crate::execution_protection::denies_workflow(
+                &shared.state.execution_protection,
+                &effective.event,
+                protection_actor,
+                &filename,
+            ) {
+                match shared.state.execution_protection.mode {
+                    crate::config::ProtectionMode::Enforce => {
+                        info!(
+                            workflow = %filename,
+                            event = %effective.event,
+                            rule = %hit.describe(),
+                            "execution protection denied workflow"
+                        );
+                        continue;
+                    }
+                    crate::config::ProtectionMode::Evaluate => {
+                        info!(
+                            workflow = %filename,
+                            event = %effective.event,
+                            rule = %hit.describe(),
+                            "execution protection would deny workflow (evaluate mode)"
+                        );
+                    }
+                }
             }
 
             match preloop_gha_parser::parse_workflow(&content) {

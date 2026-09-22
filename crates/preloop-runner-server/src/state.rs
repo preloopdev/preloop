@@ -571,6 +571,11 @@ pub struct AppState {
     /// operator writes `[fork_policy]` rules. A config change takes effect
     /// on restart, like the other policy tables in the config file.
     pub fork_policy: crate::config::ForkPolicyConfig,
+    /// Workflow execution protections loaded from the config file at
+    /// startup. Empty by default: no triggers are denied until the operator
+    /// writes `[execution_protection]` rules. A config change takes effect
+    /// on restart, like the other policy tables in the config file.
+    pub execution_protection: crate::config::ExecutionProtectionConfig,
     /// One-time provision tokens issued by the embedded runner pool, one per
     /// machine provisioning event, forwarded by the runner's `configure`
     /// call inside the fresh VM. Registration presenting a matching token is
@@ -1152,6 +1157,7 @@ impl AppState {
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),
+            execution_protection: config.execution_protection.clone(),
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         })
     }

@@ -460,6 +460,74 @@ pub struct TokenPermissionsCeiling {
     /// cannot create or approve pull requests.
     #[serde(default)]
     pub allow_create_approve_pr: bool,
+/// Enforcement mode for workflow execution protections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtectionMode {
+    /// Log what would be denied without denying it. The safe default for
+    /// rolling policy out: nothing changes until the operator flips to
+    /// `enforce`.
+    #[default]
+    Evaluate,
+    /// Deny matching triggers.
+    Enforce,
+}
+
+/// The only rule action supported today. Unknown actions fail config
+/// parsing so a typo can never silently weaken policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyRuleAction {
+    #[default]
+    Deny,
+}
+
+/// Deny rule on the event that may trigger a workflow, e.g.
+/// `pull_request_target`. Mirrors GitHub's event rules.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EventRule {
+    /// Event name, e.g. `pull_request_target`, `workflow_dispatch`.
+    pub event: String,
+    /// Workflow filename globs (e.g. `deploy.yml`, `release/*.yml`),
+    /// matched against the bare filename and `.github/workflows/<name>`.
+    /// Omitted or empty = every workflow.
+    #[serde(default)]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: PolicyRuleAction,
+}
+
+/// Deny rule on the actor that may trigger a workflow. The actor is the
+/// webhook payload's `sender.login`. Mirrors GitHub's actor rules.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActorRule {
+    /// Sender login, compared case-insensitively.
+    pub actor: String,
+    /// Workflow filename globs, as in [`EventRule::workflows`].
+    /// Omitted or empty = every workflow.
+    #[serde(default)]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: PolicyRuleAction,
+}
+
+/// Workflow execution protections: admin-level deny policy on which events
+/// and which actors may trigger workflows. Mirrors GitHub's execution
+/// protections (event rules, actor rules, per-file targeting,
+/// evaluate/enforce modes).
+///
+/// Rules live in the operator's server config — never in workflow repos —
+/// so workflow authors cannot weaken the policy that constrains them.
+/// A `pull_request_target` kill is an event rule with
+/// `event = "pull_request_target"`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExecutionProtectionConfig {
+    #[serde(default)]
+    pub mode: ProtectionMode,
+    #[serde(default)]
+    pub event_rules: Vec<EventRule>,
+    #[serde(default)]
+    pub actor_rules: Vec<ActorRule>,
 }
 
 /// Fork pull-request workflow policy, mirroring GitHub's "Fork pull request
@@ -556,6 +624,11 @@ pub struct ConfigFile {
     /// policy.
     #[serde(default)]
     pub fork_policy: ForkPolicyConfig,
+    /// Workflow execution protections (`[execution_protection]`), mirroring
+    /// GitHub's admin-level event/actor rules. Empty by default: no triggers
+    /// are denied until the operator writes rules.
+    #[serde(default)]
+    pub execution_protection: ExecutionProtectionConfig,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -782,7 +855,7 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?} }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
@@ -797,7 +870,10 @@ impl std::fmt::Debug for ConfigFile {
                     ceiling.scopes.len()
                 )
             ),
-            self.fork_policy
+            self.fork_policy,
+            self.execution_protection.mode,
+            self.execution_protection.event_rules.len(),
+            self.execution_protection.actor_rules.len()
         )
     }
 }
@@ -1362,6 +1438,7 @@ mod tests {
             token_permissions_ceiling: None,
             environment_rules: BTreeMap::new(),
             fork_policy: ForkPolicyConfig::default(),
+            execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }

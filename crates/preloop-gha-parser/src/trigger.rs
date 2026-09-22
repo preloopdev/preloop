@@ -487,7 +487,7 @@ pub(crate) fn matches_filter_with_default(filter: &Value, value: &str, default: 
 }
 
 /// GitHub-style glob matching anchored to the whole value.
-pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
+pub fn glob_match(pattern: &str, value: &str) -> bool {
     fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
         if pi == pattern.len() {
             return vi == value.len();

@@ -477,6 +477,47 @@ repos. All of the tables below are optional and empty by default; an empty
 table preserves today's behavior exactly. Policy is read at startup — edit
 the file and restart the server to apply changes.
 
+### 8.1 Workflow execution protections
+
+Admin-level deny policy on which events and which actors may trigger
+workflows, mirroring GitHub's execution protections (event rules, actor
+rules, per-file targeting). Evaluated in the webhook intake path before
+workflow matching.
+
+```toml
+[execution_protection]
+mode = "evaluate"  # "evaluate" (log only, default) or "enforce" (deny)
+
+# Headline example: kill pull_request_target entirely, GitHub's default
+# policy for public repos.
+[[execution_protection.event_rules]]
+event = "pull_request_target"
+# action = "deny" is the default and the only supported action;
+# unknown actions fail config parsing rather than silently weakening policy.
+
+# Scoped variant: deny the event only for specific workflow files.
+# Patterns are GitHub-style globs matched against the bare filename
+# (deploy.yml) and the repo-relative path (.github/workflows/deploy.yml).
+# Omitted or empty `workflows` = every workflow.
+[[execution_protection.event_rules]]
+event = "workflow_dispatch"
+workflows = ["deploy.yml", "release/*.yml"]
+
+# Actor rules match the webhook payload's sender.login (case-insensitive).
+[[execution_protection.actor_rules]]
+actor = "mallory"
+workflows = ["deploy.yml"]
+```
+
+Semantics:
+
+- Unscoped rules (no `workflows`) deny the whole event before any workflow
+  is fetched or matched. Scoped rules deny individual workflow files during
+  matching; other workflows for the same event still run.
+- `evaluate` mode logs `execution protection would deny …` and continues —
+  roll policy out in `evaluate`, watch the logs, then flip to `enforce`.
+- `enforce` mode skips the denied event/workflow and logs
+  `execution protection denied …` naming the rule that fired.
 ### 8.2 Token permissions ceiling
 
 A hard operator cap on `GITHUB_TOKEN` permissions, mirroring GitHub's
@@ -555,6 +596,7 @@ runner:
 
 Removing an environment's rules releases its armed gates. Gate denials and
 approvals are logged with run, job, and environment.
+
 
 ## See also
 
