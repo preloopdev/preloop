@@ -58,7 +58,13 @@ pub(crate) async fn resolve_remote_workflows(
             };
             if let Some(contents) = submission.reusable_workflows.get(reference).cloned() {
                 if visited.insert(reference.to_owned()) {
-                    queue.push((preloop_gha_parser::parse_workflow(&contents)?, depth + 1));
+                    let workflow =
+                        preloop_gha_parser::parse_workflow(&contents).map_err(|error| {
+                            ApiError::bad_request(format!(
+                                "reusable workflow `{reference}` is not valid workflow YAML: {error}"
+                            ))
+                        })?;
+                    queue.push((workflow, depth + 1));
                 }
                 continue;
             }
@@ -142,7 +148,17 @@ pub(crate) async fn resolve_remote_workflows(
             submission
                 .reusable_workflow_shas
                 .insert(reference.to_owned(), commit.sha);
-            queue.push((preloop_gha_parser::parse_workflow(&contents)?, depth + 1));
+            // Name the reference and show the head of the offending content:
+            // a bare YAML error is unactionable when the bytes came from a
+            // remote mock or a private repo, and once cost a flake
+            // investigation its only lead.
+            let workflow = preloop_gha_parser::parse_workflow(&contents).map_err(|error| {
+                let head: String = contents.chars().take(160).collect();
+                ApiError::bad_request(format!(
+                    "reusable workflow `{reference}` fetched from GitHub is not valid workflow YAML: {error}; content began with {head:?}"
+                ))
+            })?;
+            queue.push((workflow, depth + 1));
         }
     }
     Ok(())

@@ -30,7 +30,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore};
-use crate::shared_http::CLIENT;
+use crate::shared_http::CREDENTIAL_SAFE_CLIENT;
 /// Private-key environment variables, highest precedence first. The flag marks
 /// a variable that holds a path to a PEM file rather than the PEM itself.
 ///
@@ -677,12 +677,16 @@ pub(crate) async fn app_covers_repository(app: &GitHubAppCredentials, repository
         Err(_) => return false,
     };
     let api_base = api_base();
+    if let Err(error) = ensure_api_base_allows_credential(&api_base) {
+        warn!(app_id = %app.app_id, repository = %repository, %error, "M3: repository installation lookup refused: API base must use HTTPS");
+        return false;
+    }
     let app_jwt = match sign_app_jwt(&app.app_id, &app.private_key) {
         Ok(jwt) => jwt,
         Err(_) => return false,
     };
     let url = format!("{api_base}/repos/{owner}/{repo}/installation");
-    let response = match CLIENT
+    let response = match CREDENTIAL_SAFE_CLIENT
         .get(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
@@ -884,8 +888,9 @@ async fn installation_grants(
     app_jwt: &str,
     installation_id: u64,
 ) -> anyhow::Result<BTreeMap<String, String>> {
+    ensure_api_base_allows_credential(api_base)?;
     let url = format!("{api_base}/app/installations/{installation_id}");
-    let response = CLIENT
+    let response = CREDENTIAL_SAFE_CLIENT
         .get(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
@@ -970,10 +975,11 @@ pub(crate) async fn find_installation(
     app_jwt: &str,
     owner: &str,
 ) -> anyhow::Result<u64> {
+    ensure_api_base_allows_credential(api_base)?;
     for page in 1..=MAX_INSTALLATION_PAGES {
         let url =
             format!("{api_base}/app/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}");
-        let response = CLIENT
+        let response = CREDENTIAL_SAFE_CLIENT
             .get(&url)
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {app_jwt}"))
@@ -1023,6 +1029,7 @@ pub(crate) async fn mint_installation_token(
     repository: &str,
     permissions: &BTreeMap<String, String>,
 ) -> anyhow::Result<(String, SystemTime)> {
+    ensure_api_base_allows_credential(api_base)?;
     let url = format!("{api_base}/app/installations/{installation_id}/access_tokens");
     // Both fields are always present. Omitting `repositories` grants access to
     // every repository the installation can reach, and omitting `permissions`
@@ -1032,7 +1039,7 @@ pub(crate) async fn mint_installation_token(
         "repositories": [repository],
         "permissions": installation_permissions(permissions),
     });
-    let response = CLIENT
+    let response = CREDENTIAL_SAFE_CLIENT
         .post(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
@@ -1131,8 +1138,9 @@ async fn verify_override_installation_owner(
              the GitHub App installation id override does not cover {owner}"
         );
     }
+    ensure_api_base_allows_credential(api_base)?;
     let url = format!("{api_base}/app/installations/{installation_id}");
-    let response = CLIENT
+    let response = CREDENTIAL_SAFE_CLIENT
         .get(&url)
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))
@@ -1238,6 +1246,26 @@ fn api_base() -> String {
     env_non_empty("PRELOOP_GITHUB_API_URL")
         .map(|base| base.trim_end_matches('/').to_owned())
         .unwrap_or_else(|| "https://api.github.com".to_owned())
+}
+
+/// Refuse to send App credentials (the signed App JWT, a bearer credential)
+/// to a cleartext, non-loopback API base (CWE-319). Same rule as the PAT
+/// introspection guard: HTTPS always, loopback HTTP only in test builds for
+/// the suite's mock API servers. Call before building any
+/// App-credential-bearing request; the base URL is operator-configured
+/// (`PRELOOP_GITHUB_API_URL`), so a misconfigured or tampered value must
+/// not receive the JWT.
+fn ensure_api_base_allows_credential(api_base: &str) -> anyhow::Result<()> {
+    match reqwest::Url::parse(api_base) {
+        Ok(url) if crate::runs::github_api_url_allows_credential(&url) => Ok(()),
+        Ok(url) => anyhow::bail!(
+            "GitHub API base URL must use HTTPS to receive App credentials: {}",
+            crate::runs::redacted_api_url(&url)
+        ),
+        // Never echo the raw base: it may embed userinfo or secret query
+        // parameters.
+        Err(_) => anyhow::bail!("invalid GitHub API base URL for App credentials"),
+    }
 }
 
 /// Read an environment variable, treating blank and whitespace-only as unset.
@@ -1424,7 +1452,11 @@ async fn set_app_webhook_config_at(
 ) -> anyhow::Result<()> {
     let creds = credentials_for(app_id, pem)?;
     let app_jwt = sign_app_jwt(&creds.app_id, &creds.private_key)?;
-    let response = crate::shared_http::CLIENT
+    // This PATCH carries the App JWT *and* the webhook secret in its body:
+    // it gets the same cleartext refusal as every other App-credential
+    // request.
+    ensure_api_base_allows_credential(api_base)?;
+    let response = crate::shared_http::CREDENTIAL_SAFE_CLIENT
         .patch(format!("{api_base}/app/hook/config"))
         .bearer_auth(&app_jwt)
         .header("Accept", "application/vnd.github+json")
@@ -1649,8 +1681,9 @@ async fn read_app_json_at(
     private_key: &rsa::RsaPrivateKey,
     breaker: Option<&crate::github_breaker::GithubBreaker>,
 ) -> anyhow::Result<serde_json::Value> {
+    ensure_api_base_allows_credential(api_base)?;
     let app_jwt = sign_app_jwt(app_id, private_key)?;
-    let request = CLIENT
+    let request = CREDENTIAL_SAFE_CLIENT
         .get(format!("{api_base}{path}"))
         .header("User-Agent", "preloop")
         .header("Authorization", format!("Bearer {app_jwt}"))

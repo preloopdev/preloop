@@ -6362,6 +6362,60 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
     );
 }
 
+/// A fetched reusable workflow that is not valid YAML must fail with an
+/// error that names the reference and shows the offending content: a bare
+/// parse error once cost a flake investigation its only lead.
+#[tokio::test]
+async fn remote_workflow_parse_failure_names_reference_and_content() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new()
+        .route(
+            "/repos/:owner/:repo/commits/:git_ref",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+            }),
+        )
+        .route(
+            "/repos/:owner/:repo/contents/*path",
+            axum::routing::get(|| async {
+                // base64("jobs:\n  b: \"oops-not-a-mapping\"\n") — a job
+                // must be a mapping, so this is not valid workflow YAML.
+                axum::Json(serde_json::json!({
+                    "content": "am9iczoKICBiOiAib29wcy1ub3QtYS1tYXBwaW5nIgo=",
+                    "encoding": "base64",
+                }))
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let root_yaml = "on: push\njobs:\n  caller:\n    uses: someowner/somerepo/.github/workflows/callee.yml@main\n";
+    let workflow = preloop_gha_parser::parse_workflow(root_yaml).unwrap();
+    let reference = "someowner/somerepo/.github/workflows/callee.yml@main";
+    let mut submission = preloop_gha_protocol::WorkflowSubmission {
+        workflow_yaml: root_yaml.to_owned(),
+        event: "push".to_owned(),
+        repository: "owner/repo".to_owned(),
+        ..Default::default()
+    };
+    let error = crate::remote_workflows::resolve_remote_workflows(&mut submission, &workflow, None)
+        .await
+        .expect_err("invalid fetched workflow YAML must fail resolution");
+    let message = error.message();
+    assert!(
+        message.contains(reference),
+        "error must name the failing reference, got: {message}"
+    );
+    assert!(
+        message.contains("oops-not-a-mapping"),
+        "error must show the offending content head, got: {message}"
+    );
+}
+
 #[tokio::test]
 async fn resolve_ref_to_sha_omits_pat_over_http() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -15983,6 +16037,188 @@ async fn unverifiable_pat_scopes_withhold_the_pat_from_jobs() {
         authority.contains("withheld"),
         "the wire variable must disclose the withheld PAT, got: {authority}"
     );
+}
+
+/// H3 follow-up (CodeRabbit): PAT scope introspection must not send the PAT
+/// over cleartext HTTP. A non-HTTPS, non-loopback API base is refused before
+/// any request is made, so the PAT never leaves the host in the clear; HTTP
+/// loopback stays permitted in test builds for the suite's mock API servers.
+#[tokio::test]
+async fn pat_scope_introspection_rejects_cleartext_non_loopback_api_url() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    // TEST-NET-1 is never routable, and the guard must fire before dialing it.
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", "http://192.0.2.1/");
+    // A distinct PAT value: the scope cache is process-global and keyed by
+    // the token hash, so reusing another test's PAT could return a cached
+    // verdict instead of exercising the URL guard.
+    let reason = match crate::runs::pat_oauth_scopes("https-guard-test-pat").await {
+        crate::runs::PatScopeOutcome::Unverifiable { reason } => reason,
+        _ => panic!("a cleartext non-loopback API URL must be refused before sending the PAT"),
+    };
+    assert!(
+        reason.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {reason}"
+    );
+}
+
+/// P1 follow-up (Codex): an API root that redirects to a cleartext URL must
+/// not receive the PAT. The introspection request only follows redirects
+/// that stay credential-safe; a downgrade surfaces as a 3xx and the PAT is
+/// withheld instead of being sent to the redirect target.
+#[tokio::test]
+async fn pat_scope_introspection_does_not_follow_cleartext_redirects() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    // TEST-NET-1 is never routable: if the redirect were followed, the
+    // request would fail trying to connect there instead of stopping at
+    // the 302.
+    let mock = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://192.0.2.1/")],
+                "",
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+    // A distinct PAT value: the scope cache is process-global and keyed by
+    // the token hash, so reusing another test's PAT could return a cached
+    // verdict instead of exercising the redirect policy.
+    match crate::runs::pat_oauth_scopes("redirect-guard-test-pat").await {
+        crate::runs::PatScopeOutcome::Unverifiable { reason } => {
+            assert!(
+                reason.contains("302"),
+                "downgrade redirect must stop at the 3xx without following it, got: {reason}"
+            );
+        }
+        other => panic!("a cleartext redirect target must not be followed, got: {other:?}"),
+    }
+}
+
+/// P2 follow-up (Codex): a rejected API URL that embeds credentials must not
+/// leak them into the reason string, which lands in startup and per-run logs.
+#[tokio::test]
+async fn pat_scope_introspection_redacts_credentials_in_rejection_reason() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _api_url = crate::state::TestEnvVar::set(
+        "PRELOOP_GITHUB_API_URL",
+        "http://operator:s3cret-pw@192.0.2.1:8080/api?token=abc",
+    );
+    // A distinct PAT value: the scope cache is process-global and keyed by
+    // the token hash, so reusing another test's PAT could return a cached
+    // verdict instead of exercising the URL guard.
+    let reason = match crate::runs::pat_oauth_scopes("redaction-test-pat").await {
+        crate::runs::PatScopeOutcome::Unverifiable { reason } => reason,
+        _ => panic!("a cleartext non-loopback API URL must be refused before sending the PAT"),
+    };
+    assert!(
+        reason.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {reason}"
+    );
+    assert!(
+        reason.contains("http://192.0.2.1:8080"),
+        "reason should identify the offending scheme/host, got: {reason}"
+    );
+    for secret in ["operator", "s3cret-pw", "token=abc"] {
+        assert!(
+            !reason.contains(secret),
+            "credential material must be redacted from the reason, got: {reason}"
+        );
+    }
+}
+
+/// GitHub App auth follow-up: the App JWT is a bearer credential like the
+/// PAT, and the API base URL is operator-configured (`PRELOOP_GITHUB_API_URL`),
+/// so a cleartext non-loopback base must be refused before the JWT is sent.
+/// Minting against `http://192.0.2.1` (TEST-NET-1, never routable) must fail
+/// in the guard, before any network access.
+#[tokio::test]
+async fn app_auth_rejects_cleartext_non_loopback_api_base() {
+    let error = crate::github_app::mint_installation_token(
+        "http://192.0.2.1",
+        "fake-app-jwt",
+        123,
+        "someowner/somerepo",
+        &BTreeMap::new(),
+    )
+    .await
+    .expect_err("a cleartext non-loopback API base must be refused before sending the App JWT");
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {message}"
+    );
+}
+
+/// GitHub App auth follow-up: a redirect from the API base to a cleartext
+/// URL must not receive the App JWT. The credential-safe client stops at
+/// the 3xx instead of following the downgrade.
+#[tokio::test]
+async fn app_auth_does_not_follow_cleartext_redirects() {
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    // TEST-NET-1 is never routable: if the redirect were followed, the
+    // request would fail trying to connect there instead of stopping at
+    // the 302.
+    let mock = axum::Router::new().route(
+        "/app/installations",
+        axum::routing::get(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://192.0.2.1/")],
+                "",
+            )
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let error = crate::github_app::find_installation(&api_base, "fake-app-jwt", "someowner")
+        .await
+        .expect_err("a cleartext redirect target must not be followed");
+    let message = error.to_string();
+    assert!(
+        message.contains("302"),
+        "downgrade redirect must stop at the 3xx without following it, got: {message}"
+    );
+}
+
+/// GitHub App auth follow-up: a rejected API base that embeds credentials
+/// must not leak them into the error, which lands in startup and per-run
+/// logs.
+#[tokio::test]
+async fn app_auth_redacts_credentials_in_rejection_reason() {
+    let error = crate::github_app::find_installation(
+        "http://operator:s3cret-pw@192.0.2.1:8080/api?token=abc",
+        "fake-app-jwt",
+        "someowner",
+    )
+    .await
+    .expect_err("a cleartext non-loopback API base must be refused before sending the App JWT");
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTPS"),
+        "refusal must name the HTTPS requirement, got: {message}"
+    );
+    assert!(
+        message.contains("http://192.0.2.1:8080"),
+        "reason should identify the offending scheme/host, got: {message}"
+    );
+    for secret in ["operator", "s3cret-pw", "token=abc"] {
+        assert!(
+            !message.contains(secret),
+            "credential material must be redacted from the reason, got: {message}"
+        );
+    }
 }
 
 /// H3: scope-mismatch matrix for the static-PAT permission check. A classic
