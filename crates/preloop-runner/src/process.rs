@@ -818,7 +818,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert_eq!(result.lines, vec!["out-1", "err-1", "out-2", "err-2"]);
+        // `lines` is the *observed* merge of two pipes; the reader may drain
+        // one stream twice before the other's first read under load, so exact
+        // interleave order is not a contract. What is: every line arrives, and
+        // each stream's entries keep their own order inside the merged view.
+        let stdout_in_merged: Vec<&str> = result
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("out-"))
+            .map(String::as_str)
+            .collect();
+        let stderr_in_merged: Vec<&str> = result
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("err-"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(result.lines.len(), 4, "all lines captured: {:?}", result.lines);
+        assert_eq!(stdout_in_merged, ["out-1", "out-2"]);
+        assert_eq!(stderr_in_merged, ["err-1", "err-2"]);
         assert_eq!(
             result.stdout_lines,
             vec!["out-1", "out-2"],
