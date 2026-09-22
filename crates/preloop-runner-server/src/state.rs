@@ -474,6 +474,10 @@ pub struct AppState {
     pub local_workspace: Option<PathBuf>,
     /// Effective checkout-object retention policy. Off by default.
     pub checkout_cache: crate::config::CheckoutCacheConfig,
+    /// How long a terminal run's workspace snapshot is retained for late
+    /// checkouts before housekeeping deletes it. Zero discards immediately.
+    /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
+    pub snapshot_retention_seconds: u64,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
     /// Native API administrator credential for this server instance.
@@ -1107,6 +1111,10 @@ impl AppState {
             webhook_secret,
             local_workspace,
             checkout_cache,
+            snapshot_retention_seconds: env::var("PRELOOP_SNAPSHOT_RETENTION_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30 * 60),
             state_dir,
             system_token,
             registration_policy: RegistrationPolicy::from_env(),

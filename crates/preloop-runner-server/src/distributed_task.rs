@@ -1109,12 +1109,14 @@ pub async fn complete_job_inner(
         // plane restart), and deleting the repository immediately makes the
         // otherwise-valid checkout fail with "workspace snapshot not found".
         // The retention is bounded housekeeping; it does not change run
-        // semantics and keeps object-cache reuse intact.
-        if cfg!(test) {
+        // semantics and keeps object-cache reuse intact. Zero discards at
+        // once — tests set it so completion is observable synchronously.
+        let retention = shared.state.snapshot_retention_seconds;
+        if retention == 0 {
             discard_workspace_snapshot(&state_dir, completion.run_id).await;
         } else {
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(retention)).await;
                 discard_workspace_snapshot(&state_dir, completion.run_id).await;
             });
         }

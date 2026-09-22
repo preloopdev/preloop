@@ -70,6 +70,7 @@ async fn terminal_run_discards_workspace_snapshot_but_preserves_object_cache() {
     let (state_dir, workspace) = create_snapshot_fixture(temp.path());
     let mut state = AppState::new(state_dir.clone()).await.unwrap();
     state.local_workspace = Some(workspace);
+    state.snapshot_retention_seconds = 0;
     let app = app(state.clone(), CancellationToken::new());
 
     let accepted = submit_yaml(
