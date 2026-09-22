@@ -834,7 +834,12 @@ mod tests {
             .filter(|l| l.starts_with("err-"))
             .map(String::as_str)
             .collect();
-        assert_eq!(result.lines.len(), 4, "all lines captured: {:?}", result.lines);
+        assert_eq!(
+            result.lines.len(),
+            4,
+            "all lines captured: {:?}",
+            result.lines
+        );
         assert_eq!(stdout_in_merged, ["out-1", "out-2"]);
         assert_eq!(stderr_in_merged, ["err-1", "err-2"]);
         assert_eq!(
