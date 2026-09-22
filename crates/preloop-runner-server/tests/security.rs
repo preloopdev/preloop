@@ -2930,7 +2930,7 @@ async fn shallow_workspace_snapshot_preserves_upstream_shas() {
     let state_dir = temp.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
     let run_id: RunId = "22222222-2222-4222-8222-222222222222".parse().unwrap();
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None)
         .await
         .expect("snapshot creation should succeed");
 
@@ -2966,7 +2966,7 @@ async fn workspace_snapshot_survives_refs_with_missing_objects() {
     .unwrap();
 
     let run_id: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None)
         .await
         .expect("a dangling ref must not fail snapshot creation");
     assert_eq!(snapshot.commit_sha.len(), 40);
@@ -3001,7 +3001,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
 
     fs::create_dir_all(&state_dir).unwrap();
     let first_run: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
-    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None)
+    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None, None)
         .await
         .expect("snapshot with an unresolvable gitlink should succeed");
     let first_repository = state_dir.join(&first.repository);
@@ -3028,7 +3028,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     )
     .unwrap();
     let second_run: RunId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
-    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None)
+    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None, None)
         .await
         .expect("snapshot with a registered submodule should succeed");
     let second_repository = state_dir.join(&second.repository);
@@ -3056,7 +3056,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     )
     .unwrap();
     let third_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
-    let third = create_workspace_snapshot(&state_dir, &workspace, third_run, None)
+    let third = create_workspace_snapshot(&state_dir, &workspace, third_run, None, None)
         .await
         .expect("snapshot with a logically-named submodule should succeed");
     let third_repository = state_dir.join(&third.repository);
@@ -3118,7 +3118,7 @@ async fn snapshot_gitlink_resolution_matches_git() {
 
     fs::create_dir_all(&state_dir).unwrap();
     let run_id: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None)
         .await
         .expect("snapshot with mixed gitlink registrations should succeed");
     let repository = state_dir.join(&snapshot.repository);
@@ -3171,7 +3171,7 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
     };
     let index_before = fs::read(&index_path).unwrap();
 
-    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None)
+    let snapshot = create_workspace_snapshot(&state_dir, &workspace, run_id, None, None)
         .await
         .expect("snapshot creation should succeed");
 

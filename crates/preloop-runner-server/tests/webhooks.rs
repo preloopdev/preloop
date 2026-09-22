@@ -37,7 +37,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
     // Clean tree: the change under test is the last commit, so the diff base
     // is HEAD^ (an equal-tree HEAD..S would be empty).
     let clean_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
-    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run, None)
+    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run, None, None)
         .await
         .expect("clean-tree snapshot should succeed");
     assert_eq!(
@@ -50,7 +50,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
     // base is HEAD itself.
     fs::write(workspace.join("file.txt"), "three (uncommitted)\n").unwrap();
     let dirty_run: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
-    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run, None)
+    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run, None, None)
         .await
         .expect("dirty-tree snapshot should succeed");
     assert_ne!(
@@ -228,10 +228,10 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     let second_run: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
     let changed_run: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
 
-    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None)
+    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None, None)
         .await
         .expect("first snapshot should succeed");
-    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None)
+    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None, None)
         .await
         .expect("second unchanged snapshot should succeed");
     let first_repository = state_dir.join(&first.repository);
@@ -263,7 +263,7 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     fs::create_dir_all(workspace.join("ignored-dir")).unwrap();
     fs::write(workspace.join("ignored-dir/hidden.txt"), b"ignored\n").unwrap();
 
-    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run, None)
+    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run, None, None)
         .await
         .expect("changed snapshot should succeed");
     let changed_repository = state_dir.join(&changed.repository);
