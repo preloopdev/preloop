@@ -6,6 +6,8 @@ use utoipa::{
     Modify, OpenApi, ToSchema,
 };
 
+use crate::runs::{ApproveJobRequest, ApproveJobResponse};
+
 // ---------------------------------------------------------------------------
 // Schemas
 // ---------------------------------------------------------------------------
@@ -153,6 +155,7 @@ pub struct RunResponse {
         live_run_logs,
         cancel_run,
         rerun_run,
+        approve_job,
         run_events,
         register_dap_port,
         dap_debug,
@@ -420,6 +423,29 @@ fn cancel_run() {}
     security(("native_bearer" = []))
 )]
 fn rerun_run() {}
+
+/// Approve a job waiting on its environment's required-reviewer gate.
+///
+/// Records one approval for the pending environment protection gate. The
+/// approver is whoever holds the system bearer token — preloop has no user
+/// identities — so for a single-operator server this is a deliberate
+/// confirmation step, not a second human. A job not approved within 24
+/// hours of entering the gate fails closed.
+#[utoipa::path(
+    post, path = "/api/v1/runs/{run_id}/jobs/{job_id}/approve", tag = "Runs",
+    params(
+        ("run_id" = String, Path, description = "Run UUID"),
+        ("job_id" = String, Path, description = "Job ID within the run")
+    ),
+    request_body(content = ApproveJobRequest, description = "Optional operator note"),
+    responses(
+        (status = 200, description = "Approval recorded", body = ApproveJobResponse),
+        (status = 404, description = "Run not found, or job is not waiting in the scheduler", body = ApiErrorResponse),
+        (status = 409, description = "Job is terminal or not awaiting environment approval", body = ApiErrorResponse)
+    ),
+    security(("native_bearer" = []))
+)]
+fn approve_job() {}
 
 /// Stream run events (NDJSON).
 ///

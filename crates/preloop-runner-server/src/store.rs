@@ -40,7 +40,11 @@ type HmacSha256 = Hmac<Sha256>;
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Restore the persisted state into `inner` (startup path).
-    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()>;
+    async fn load_into(
+        &self,
+        inner: &mut InnerState,
+        environment_rules: &crate::config::EnvironmentRulesMap,
+    ) -> anyhow::Result<()>;
     /// Full snapshot: rewrite every table from a captured [`StoreSnapshot`]
     /// in one transaction.
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()>;
@@ -253,9 +257,17 @@ impl InstrumentedStore {
 
 #[async_trait]
 impl Store for InstrumentedStore {
-    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+    async fn load_into(
+        &self,
+        inner: &mut InnerState,
+        environment_rules: &crate::config::EnvironmentRulesMap,
+    ) -> anyhow::Result<()> {
         let start = Instant::now();
-        self.record("load_into", start, self.inner.load_into(inner).await)
+        self.record(
+            "load_into",
+            start,
+            self.inner.load_into(inner, environment_rules).await,
+        )
     }
 
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
@@ -1461,7 +1473,11 @@ pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
 }
 
 /// Apply a restored metadata snapshot onto in-memory state.
-pub fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
+pub fn apply_meta_snapshot(
+    inner: &mut InnerState,
+    meta: MetaSnapshot,
+    environment_rules: &crate::config::EnvironmentRulesMap,
+) {
     inner.workflow_run_counters = meta.workflow_run_counters;
     inner.next_runner_id = meta.next_runner_id;
     inner.next_cache_id = meta.next_cache_id;
@@ -1489,7 +1505,7 @@ pub fn apply_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
     // before anything dispatches, and re-promote whatever the freed slots
     // unblock.
     crate::runtime_scheduling::reconcile_concurrency_groups(inner);
-    crate::runtime_scheduling::promote_ready_jobs(inner);
+    crate::runtime_scheduling::promote_ready_jobs(inner, environment_rules);
     inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
     inner.run_concurrency = meta.run_concurrency.into_iter().collect();
     inner.holder_keys = meta.holder_keys.into_iter().collect();
@@ -1874,7 +1890,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+    pub fn load_into(
+        &self,
+        inner: &mut InnerState,
+        environment_rules: &crate::config::EnvironmentRulesMap,
+    ) -> anyhow::Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         // Restore every run still in flight plus the newest completed runs up
         // to `MAX_COMPLETED_RUNS_RETAINED`. Loading the full history
@@ -2176,7 +2196,7 @@ impl SqliteStore {
             .optional()?
         {
             let meta: MetaSnapshot = serde_json::from_slice(&self.cipher.unseal(&blob)?)?;
-            apply_meta_snapshot(inner, meta);
+            apply_meta_snapshot(inner, meta, environment_rules);
         }
         let mut counters = connection.prepare(
             "SELECT workflow_path, next_run_number
@@ -3628,8 +3648,12 @@ fn parse_redelivery_row(
 
 #[async_trait]
 impl Store for SqliteStore {
-    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
-        SqliteStore::load_into(self, inner)
+    async fn load_into(
+        &self,
+        inner: &mut InnerState,
+        environment_rules: &crate::config::EnvironmentRulesMap,
+    ) -> anyhow::Result<()> {
+        SqliteStore::load_into(self, inner, environment_rules)
     }
 
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
@@ -4637,7 +4661,7 @@ mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
         // Restart: load_into unseals the row back into the live message.
         let mut inner = InnerState::default();
-        store.load_into(&mut inner).unwrap();
+        store.load_into(&mut inner, &Default::default()).unwrap();
         let restored = &inner.inflight_messages["session-1"][&7];
         assert_eq!(restored.body, token_message().body);
     }
@@ -4704,7 +4728,7 @@ mod tests {
         }
 
         let mut inner = InnerState::default();
-        store.load_into(&mut inner).unwrap();
+        store.load_into(&mut inner, &Default::default()).unwrap();
         assert_eq!(
             inner.inflight_messages["session-1"][&7].body,
             token_message().body

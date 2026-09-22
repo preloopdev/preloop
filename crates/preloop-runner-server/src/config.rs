@@ -352,6 +352,40 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// Operator protection rules for one registered environment, mirroring
+/// GitHub's environment protection rules. Every field is optional and
+/// empty/zero by default: a missing `[environment_rules."owner/repo".env]`
+/// table (or an empty one) means "no rules" and preserves today's behavior.
+/// Rules are enforced at scheduler admission, before environment secrets are
+/// injected — a job that fails the branch policy never sees the environment's
+/// secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentRules {
+    /// Git refs allowed to deploy to this environment. Compared against the
+    /// run's `git_ref` after stripping a leading `refs/heads/` from both
+    /// sides, so `main` matches `refs/heads/main`. Empty means any ref may
+    /// deploy. A run on a disallowed ref fails the job closed at admission.
+    #[serde(default)]
+    pub deployment_branches: Vec<String>,
+    /// Minutes a job waits after becoming eligible before it may start.
+    /// The wait is visible (job status `pending`) and cancellable. Zero
+    /// means no wait.
+    #[serde(default)]
+    pub wait_timer_minutes: u64,
+    /// Number of explicit approvals required before the job may start.
+    /// Approvals are recorded via
+    /// `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system token) or
+    /// `preloop approve`. Zero means no approval gate. A job not approved
+    /// within 24 hours of entering the gate fails closed.
+    #[serde(default)]
+    pub required_reviewers: u32,
+}
+
+/// `[environment_rules]` table shape: `owner/repo` -> environment name ->
+/// protection rules.
+pub type EnvironmentRulesMap = BTreeMap<String, BTreeMap<String, EnvironmentRules>>;
+
 impl Default for CheckoutCacheConfig {
     fn default() -> Self {
         Self {
@@ -452,7 +486,10 @@ pub struct ConfigFile {
     /// the job fails closed: no environment secrets are injected and no
     /// environment OIDC subject is minted. Required reviewers, wait timers,
     /// and deployment-branch policies are not enforced yet; the registry
-    /// currently gates existence.
+    /// currently gates existence. Protection rules (required reviewers, wait
+    /// timers, deployment-branch policies) live in the separate
+    /// `[environment_rules]` table, enforced at scheduler admission before
+    /// environment secrets are injected.
     #[serde(default)]
     pub environments: BTreeMap<String, BTreeSet<String>>,
     /// Token permissions ceiling (`[token_permissions_ceiling]`), mirroring
@@ -460,6 +497,12 @@ pub struct ConfigFile {
     /// `None` (absent table) = no ceiling; today's behavior is unchanged.
     #[serde(default)]
     pub token_permissions_ceiling: Option<TokenPermissionsCeiling>,
+    /// Per-environment protection rules (`[environment_rules."owner/repo".env]`),
+    /// mirroring GitHub's environment protection rules. Each rule set is
+    /// optional and empty by default; a missing entry means "no rules" and
+    /// preserves today's behavior.
+    #[serde(default)]
+    pub environment_rules: EnvironmentRulesMap,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -686,12 +729,13 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, token_permissions_ceiling: {} }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {} }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
             self.env_secrets.len(),
             self.environments.len(),
+            self.environment_rules.len(),
             self.token_permissions_ceiling.as_ref().map_or(
                 "none".to_owned(),
                 |ceiling| format!(
@@ -1224,6 +1268,7 @@ mod tests {
             )]),
             environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
             token_permissions_ceiling: None,
+            environment_rules: BTreeMap::new(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }
