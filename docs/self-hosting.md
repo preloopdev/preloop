@@ -469,6 +469,52 @@ Semantics:
   at warn with scope, requested, and granted levels.
 - The PAT fallback is the operator's own credential and ignores
   `permissions:` by design; the ceiling does not apply to it.
+### 8.3 Environment protection rules
+
+Per-environment branch policies, wait timers, and required reviewers,
+mirroring GitHub's environment protection rules. The existing `[environments]`
+registry keeps gating existence (bare names stay valid); rules are additive:
+
+```toml
+[environments]
+"owner/repo" = ["prod"]
+
+[environment_rules."owner/repo".prod]
+deployment_branches = ["main"]  # refs/heads/ prefix optional; empty = any ref
+wait_timer_minutes = 10         # 0 = no wait
+required_reviewers = 1          # 0 = no approval gate
+```
+
+Enforcement happens at scheduler admission, before concurrency gating and
+before the job is queued — so a denied or waiting job never occupies a
+concurrency slot, and a denied job's environment secrets never reach a
+runner:
+
+- **Branch policy.** The run's `git_ref` must match `deployment_branches`
+  (compared after stripping a leading `refs/heads/` from both sides, so
+  `main` matches `refs/heads/main`). A run on any other ref fails the job
+  closed at admission.
+- **Wait timer.** After the job becomes eligible it waits the configured
+  minutes before it may start. The wait is visible (the job reports status
+  `pending`) and cancellable (`preloop cancel`, run/job cancel APIs). The
+  deadline is stamped on the job and survives restarts; the 10-second
+  background sweep re-runs admission so timers release without waiting for
+  another scheduling event.
+- **Required reviewers.** The job waits in a pending-approval state until
+  the configured number of approvals is recorded. Approvals are explicit and
+  human-driven: `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system
+  bearer token; optional `{"note": "..."}` for the audit trail) or
+  `preloop approve <run-id> <job-id> [--note ...]`. Preloop has no user
+  identities — the approver is whoever holds the operator credential — so
+  for a single-operator server this is a deliberate confirmation step, not
+  a second human. Because one token holder could satisfy any quorum alone
+  by calling the approval endpoint repeatedly, `required_reviewers` is
+  capped at 1; values above 1 are rejected at config load (fail closed).
+  A job not approved within 24 hours of entering the gate
+  fails closed.
+
+Removing an environment's rules releases its armed gates. Gate denials and
+approvals are logged with run, job, and environment.
 
 ## See also
 

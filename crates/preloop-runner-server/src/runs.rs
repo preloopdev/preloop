@@ -2,6 +2,7 @@ use super::*;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+use utoipa::ToSchema;
 
 /// A heartbeat or sampler snapshot older than this is stale: three sampler
 /// intervals of 5s. Single source so `/readyz` and `/api/v1/status` cannot
@@ -1739,6 +1740,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     .collect(),
                 deferred_matrix: job.deferred_matrix.clone(),
                 reusable_call: job.reusable_call.clone(),
+                environment_gate: None,
             };
             built_jobs.push(queued_job);
         }
@@ -2145,7 +2147,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // (typically none) are reified by a first promote sweep: needs-free
         // callers acquire their JobSet gates and materialize their callee
         // subtree immediately.
-        promote_ready_jobs(&mut inner);
+        promote_ready_jobs(&mut inner, &shared.state.environment_rules);
         // A submission whose every job concluded before it reached the queue
         // (all skipped by `if:`, or none hostable) never passes through the
         // completion path, so nothing else would ever stamp `completed_at` and
@@ -3467,6 +3469,127 @@ pub async fn cancel_run(
         })
         .await;
     Ok(Json(record))
+}
+
+/// Request body for approving a pending environment protection gate.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApproveJobRequest {
+    /// Optional operator note recorded with the approval (audit trail).
+    pub note: Option<String>,
+}
+
+/// Response for an environment approval.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApproveJobResponse {
+    pub run_id: String,
+    pub job_id: String,
+    pub approvals: usize,
+    pub required: u32,
+    /// Whether the approval gate is now satisfied (the job may proceed).
+    pub satisfied: bool,
+}
+
+/// Record one approval for a job waiting on its environment's
+/// required-reviewer gate (`POST /api/v1/runs/:run_id/jobs/:job_id/approve`).
+/// Requires the system (native) bearer token: preloop has no user
+/// identities, so the approver is whoever holds the operator credential.
+/// For a single-operator server this is a deliberate confirmation step, not
+/// a second human — it stops a compromised workflow or a misclicked
+/// re-run from deploying without an explicit go-ahead.
+pub async fn approve_job(
+    State(shared): State<Arc<SharedState>>,
+    Path((run_id, job_id)): Path<(RunId, JobId)>,
+    Json(body): Json<ApproveJobRequest>,
+) -> Result<Json<ApproveJobResponse>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    if run
+        .jobs
+        .get(&job_id)
+        .is_some_and(|status| status.is_terminal())
+    {
+        return Err(ApiError::conflict("job is already terminal"));
+    }
+    let repository = run.submission.repository.clone();
+    let job = inner
+        .pending_jobs
+        .iter_mut()
+        .find(|job| job.run_id == run_id && job.job_id == job_id)
+        .ok_or_else(|| ApiError::not_found("job is not waiting in the scheduler"))?;
+    let gate = job
+        .environment_gate
+        .as_mut()
+        .filter(|gate| gate.approval_requested_at_unix_nanos.is_some())
+        .ok_or_else(|| ApiError::conflict("job is not awaiting environment approval"))?;
+    let env_name = match job.environment.as_ref() {
+        Some(serde_json::Value::String(name)) => name.clone(),
+        Some(serde_json::Value::Object(map)) => map
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        _ => String::new(),
+    };
+    let required = shared
+        .state
+        .environment_rules
+        .get(&repository)
+        .and_then(|envs| envs.get(&env_name))
+        .map(|rule| rule.required_reviewers)
+        .unwrap_or(0);
+    // Fail closed on an expired window before recording anything.
+    if let Some(requested_at) = gate.approval_requested_at_unix_nanos {
+        if crate::models::now_unix_nanos().saturating_sub(requested_at)
+            > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
+        {
+            crate::runtime_scheduling::promote_ready_jobs(
+                &mut inner,
+                &shared.state.environment_rules,
+            );
+            crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                crate::runtime_scheduling::finalize_run_if_complete(run);
+            }
+            return Err(ApiError::conflict(
+                "approval window expired; the job was failed closed",
+            ));
+        }
+    }
+    gate.approvals_unix_nanos
+        .push(crate::models::now_unix_nanos());
+    let approvals = gate.approvals_unix_nanos.len();
+    let satisfied = required > 0 && (approvals as u32) >= required;
+    tracing::info!(
+        run_id = %run_id.0,
+        job_id = %job_id.0,
+        environment = env_name,
+        approvals,
+        required,
+        note = body.note.as_deref().unwrap_or_default(),
+        "environment approval recorded"
+    );
+    let outcome =
+        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    let promoted = outcome.promoted;
+    drop(inner);
+    if promoted > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
+    Ok(Json(ApproveJobResponse {
+        run_id: run_id.0.to_string(),
+        job_id: job_id.0.clone(),
+        approvals,
+        required,
+        satisfied,
+    }))
 }
 pub async fn rerun_run_inner(
     shared: &Arc<SharedState>,

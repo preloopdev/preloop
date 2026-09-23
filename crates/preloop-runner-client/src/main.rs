@@ -91,6 +91,16 @@ enum Command {
     Cancel {
         run_id: RunId,
     },
+    /// Approve a job waiting on its environment's required-reviewer gate.
+    Approve {
+        /// Run id.
+        run_id: RunId,
+        /// Job id within the run.
+        job_id: String,
+        /// Optional note recorded with the approval.
+        #[arg(long)]
+        note: Option<String>,
+    },
     Rerun {
         run_id: RunId,
     },
@@ -219,6 +229,25 @@ async fn main() -> anyhow::Result<()> {
                     .bearer_auth(native_api_token)
                     .send()
                     .await?,
+            )
+            .await?;
+        }
+        Command::Approve {
+            run_id,
+            job_id,
+            note,
+        } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let body = serde_json::json!({ "note": note });
+            print_response(
+                http.post(
+                    cli.server
+                        .join(&format!("/api/v1/runs/{run_id}/jobs/{job_id}/approve"))?,
+                )
+                .bearer_auth(native_api_token)
+                .json(&body)
+                .send()
+                .await?,
             )
             .await?;
         }

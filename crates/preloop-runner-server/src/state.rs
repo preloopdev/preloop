@@ -478,6 +478,9 @@ pub struct AppState {
     /// checkouts before housekeeping deletes it. Zero discards immediately.
     /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: u64,
+    /// Per-environment protection rules (`[environment_rules]`), loaded at
+    /// startup. Empty by default (no rules).
+    pub environment_rules: crate::config::EnvironmentRulesMap,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
     /// Native API administrator credential for this server instance.
@@ -860,6 +863,7 @@ impl AppState {
         } else {
             (BTreeMap::new(), 0)
         };
+        let mut config = crate::config::load_config_from(&config_path)?;
         let inner = InnerState {
             agent_keypair: Some(keypair),
             artifact_v2_registry: registry,
@@ -876,7 +880,9 @@ impl AppState {
         };
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
-        store.load_into(&mut recovered).await?;
+        store
+            .load_into(&mut recovered, &config.environment_rules)
+            .await?;
         // An attempt dispatched but not yet reported has no persisted step
         // rows: seeding happens in memory, and only a runner report writes
         // them. The request message it was built from *is* persisted, so
@@ -958,7 +964,6 @@ impl AppState {
                 )
             })
             .unwrap_or(false);
-        let mut config = crate::config::load_config_from(&config_path)?;
         // systemd credentials (`LoadCredential=preloop-secrets:…`, encrypted
         // at rest, decrypted into a memfd by systemd) override the config
         // file's stored secrets per name. The file may hold nothing at all
@@ -1120,6 +1125,7 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+            environment_rules: config.environment_rules.clone(),
             state_dir,
             system_token,
             registration_policy: RegistrationPolicy::from_env(),

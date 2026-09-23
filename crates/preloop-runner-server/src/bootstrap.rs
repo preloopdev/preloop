@@ -584,6 +584,28 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     for (_, completion) in disconnected_completions {
         let _ = complete_job_inner(shared.clone(), completion).await;
     }
+
+    // Environment protection gates: wait timers expire and approval windows
+    // close on wall-clock time, not on scheduling events. Re-run promotion
+    // so newly-satisfied gates release their jobs and expired approval
+    // windows fail closed. Skipped entirely when no job carries gate state.
+    {
+        let mut inner = shared.state.inner.lock().await;
+        if inner
+            .pending_jobs
+            .iter()
+            .any(|job| job.environment_gate.is_some())
+        {
+            crate::runtime_scheduling::promote_ready_jobs(
+                &mut inner,
+                &shared.state.environment_rules,
+            );
+            shared
+                .state
+                .queue_depth
+                .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 async fn run_background_reaper(shared: Arc<SharedState>) {

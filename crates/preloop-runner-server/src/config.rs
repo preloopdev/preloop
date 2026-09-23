@@ -352,6 +352,46 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// Operator protection rules for one registered environment, mirroring
+/// GitHub's environment protection rules. Every field is optional and
+/// empty/zero by default: a missing `[environment_rules."owner/repo".env]`
+/// table (or an empty one) means "no rules" and preserves today's behavior.
+/// Rules are enforced at scheduler admission, before environment secrets are
+/// injected — a job that fails the branch policy never sees the environment's
+/// secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentRules {
+    /// Git refs allowed to deploy to this environment. Compared against the
+    /// run's `git_ref` after stripping a leading `refs/heads/` from both
+    /// sides, so `main` matches `refs/heads/main`. Empty means any ref may
+    /// deploy. A run on a disallowed ref fails the job closed at admission.
+    #[serde(default)]
+    pub deployment_branches: Vec<String>,
+    /// Minutes a job waits after becoming eligible before it may start.
+    /// The wait is visible (job status `pending`) and cancellable. Zero
+    /// means no wait.
+    #[serde(default)]
+    pub wait_timer_minutes: u64,
+    /// Number of explicit approvals required before the job may start.
+    /// Approvals are recorded via
+    /// `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system token) or
+    /// `preloop approve`. Zero means no approval gate. A job not approved
+    /// within 24 hours of entering the gate fails closed.
+    ///
+    /// Preloop has no user identities: every approval is authenticated with
+    /// the single operator system token, so an approval is a deliberate
+    /// operator confirmation, not a distinct human reviewer. Values above 1
+    /// would imply a separation-of-duties guarantee that cannot exist, so
+    /// config loading rejects them (fail closed).
+    #[serde(default)]
+    pub required_reviewers: u32,
+}
+
+/// `[environment_rules]` table shape: `owner/repo` -> environment name ->
+/// protection rules.
+pub type EnvironmentRulesMap = BTreeMap<String, BTreeMap<String, EnvironmentRules>>;
+
 impl Default for CheckoutCacheConfig {
     fn default() -> Self {
         Self {
@@ -452,7 +492,10 @@ pub struct ConfigFile {
     /// the job fails closed: no environment secrets are injected and no
     /// environment OIDC subject is minted. Required reviewers, wait timers,
     /// and deployment-branch policies are not enforced yet; the registry
-    /// currently gates existence.
+    /// currently gates existence. Protection rules (required reviewers, wait
+    /// timers, deployment-branch policies) live in the separate
+    /// `[environment_rules]` table, enforced at scheduler admission before
+    /// environment secrets are injected.
     #[serde(default)]
     pub environments: BTreeMap<String, BTreeSet<String>>,
     /// Token permissions ceiling (`[token_permissions_ceiling]`), mirroring
@@ -460,6 +503,12 @@ pub struct ConfigFile {
     /// `None` (absent table) = no ceiling; today's behavior is unchanged.
     #[serde(default)]
     pub token_permissions_ceiling: Option<TokenPermissionsCeiling>,
+    /// Per-environment protection rules (`[environment_rules."owner/repo".env]`),
+    /// mirroring GitHub's environment protection rules. Each rule set is
+    /// optional and empty by default; a missing entry means "no rules" and
+    /// preserves today's behavior.
+    #[serde(default)]
+    pub environment_rules: EnvironmentRulesMap,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -686,12 +735,13 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, token_permissions_ceiling: {} }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {} }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
             self.env_secrets.len(),
             self.environments.len(),
+            self.environment_rules.len(),
             self.token_permissions_ceiling.as_ref().map_or(
                 "none".to_owned(),
                 |ceiling| format!(
@@ -1106,6 +1156,8 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
     };
     let mut config: ConfigFile =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    validate_environment_rules(&config)
+        .with_context(|| format!("validating config {}", path.display()))?;
     resolve_credential_references(&mut config, &OsCredentialStore)?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1114,6 +1166,42 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
             .with_context(|| format!("unsealing secrets in config {}", path.display()))?;
     }
     Ok(config)
+}
+
+/// Reject environment protection rules that promise more than the
+/// single-operator trust model can deliver.
+///
+/// Approvals are authenticated only with the shared system token, so
+/// `required_reviewers > 1` cannot mean distinct reviewers: one token holder
+/// could satisfy the quorum alone by calling the approval endpoint
+/// repeatedly. Fail the config load closed rather than run with a
+/// misleading gate.
+///
+/// Wait timers are also range-checked: the gate converts minutes to i64
+/// nanoseconds, and a `u64` value above `i64::MAX` would cast to a negative
+/// delay (bypassing the wait). TOML integers top out at `i64::MAX`, so no
+/// config file can trigger this today, but the bound is enforced anyway so
+/// the cast site stays total.
+fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
+    /// Largest whole minutes representable as i64 nanoseconds.
+    const MAX_WAIT_TIMER_MINUTES: u64 = (i64::MAX as u64) / 60_000_000_000;
+    for (repo, envs) in &config.environment_rules {
+        for (env, rules) in envs {
+            anyhow::ensure!(
+                rules.required_reviewers <= 1,
+                "environment_rules[{repo}][{env}]: required_reviewers = {} is not supported; \
+                 preloop has no user identities, so at most 1 operator approval can be required",
+                rules.required_reviewers
+            );
+            anyhow::ensure!(
+                rules.wait_timer_minutes <= MAX_WAIT_TIMER_MINUTES,
+                "environment_rules[{repo}][{env}]: wait_timer_minutes = {} is too large; \
+                 the wait must fit in i64 nanoseconds (max {MAX_WAIT_TIMER_MINUTES} minutes)",
+                rules.wait_timer_minutes
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Atomically write the config file with mode 0600.
@@ -1224,6 +1312,7 @@ mod tests {
             )]),
             environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
             token_permissions_ceiling: None,
+            environment_rules: BTreeMap::new(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }
@@ -1271,6 +1360,90 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "not [ valid toml ==").unwrap();
         assert!(load_config_from(&path).is_err());
+    }
+
+    #[test]
+    fn required_reviewers_above_one_is_rejected() {
+        // One system token can approve repeatedly, so a quorum above 1 would
+        // imply distinct reviewers that cannot exist. Fail closed at load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[environment_rules.\"owner/repo\".prod]\nrequired_reviewers = 2\n",
+        )
+        .unwrap();
+        let err = load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("required_reviewers"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn required_reviewers_zero_or_one_is_accepted() {
+        for reviewers in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[environment_rules.\"owner/repo\".prod]\nrequired_reviewers = {reviewers}\n"
+                ),
+            )
+            .unwrap();
+            let config = load_config_from(&path).unwrap();
+            assert_eq!(
+                config.environment_rules["owner/repo"]["prod"].required_reviewers,
+                reviewers
+            );
+        }
+    }
+
+    #[test]
+    fn wait_timer_minutes_overflow_is_rejected() {
+        // The gate casts minutes to i64 nanoseconds; a u64 above i64::MAX
+        // would cast negative and bypass the wait. TOML integers top out at
+        // i64::MAX so no config file can hit this today, but the bound is
+        // enforced at load so the cast site stays total.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // i64::MAX minutes is TOML-representable but not as i64 nanoseconds.
+        std::fs::write(
+            &path,
+            "[environment_rules.\"owner/repo\".prod]\nwait_timer_minutes = 9223372036854775807\n",
+        )
+        .unwrap();
+        let err = load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("wait_timer_minutes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn wait_timer_minutes_boundary_is_accepted() {
+        // Largest whole minutes that fit in i64 nanoseconds: the cast in the
+        // gate is the identity and saturating_mul cannot saturate.
+        let max_minutes = (i64::MAX as u64) / 60_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[environment_rules.\"owner/repo\".prod]\nwait_timer_minutes = {max_minutes}\n"
+            ),
+        )
+        .unwrap();
+        let config = load_config_from(&path).unwrap();
+        assert_eq!(
+            config.environment_rules["owner/repo"]["prod"].wait_timer_minutes,
+            max_minutes
+        );
+        assert_eq!(
+            (max_minutes as i64).saturating_mul(60_000_000_000) / 60_000_000_000,
+            max_minutes as i64
+        );
     }
 
     use crate::credential_store::{

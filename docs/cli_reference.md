@@ -17,6 +17,7 @@ Usage: preloop <COMMAND>
 | `status` | Show active and recent runs |
 | `logs` | Show run logs (defaults to the most recent run) |
 | `cancel` | Cancel the current run |
+| `approve` | Approve a job waiting on an environment protection gate |
 | `secret` | Manage the local secret store |
 | `setup` | Configure GitHub credentials (App or fine-grained PAT) |
 | `doctor` | Verify the GitHub credential configuration |
@@ -144,6 +145,15 @@ preloop logs -f --job test            # tail it live
 ## `preloop cancel [RUN_ID]`
 
 Cancel a run. `RUN_ID` defaults to the most recent active run.
+
+## `preloop approve <RUN_ID> <JOB_ID> [--note <NOTE>]`
+
+Approve a job waiting on its environment's required-reviewer gate (see
+"Environment protection rules" in `self-hosting.md`). Records one approval;
+an optional `--note` is stored with the approval for the audit trail.
+Requires the server system token; preloop has no user identities, so the
+approver is whoever holds the operator credential. For a single-operator
+server this is a deliberate confirmation step, not a second human.
 
 ## `preloop secret <COMMAND>`
 
