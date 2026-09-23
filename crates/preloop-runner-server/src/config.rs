@@ -352,6 +352,46 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// Operator protection rules for one registered environment, mirroring
+/// GitHub's environment protection rules. Every field is optional and
+/// empty/zero by default: a missing `[environment_rules."owner/repo".env]`
+/// table (or an empty one) means "no rules" and preserves today's behavior.
+/// Rules are enforced at scheduler admission, before environment secrets are
+/// injected — a job that fails the branch policy never sees the environment's
+/// secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentRules {
+    /// Git refs allowed to deploy to this environment. Compared against the
+    /// run's `git_ref` after stripping a leading `refs/heads/` from both
+    /// sides, so `main` matches `refs/heads/main`. Empty means any ref may
+    /// deploy. A run on a disallowed ref fails the job closed at admission.
+    #[serde(default)]
+    pub deployment_branches: Vec<String>,
+    /// Minutes a job waits after becoming eligible before it may start.
+    /// The wait is visible (job status `pending`) and cancellable. Zero
+    /// means no wait.
+    #[serde(default)]
+    pub wait_timer_minutes: u64,
+    /// Number of explicit approvals required before the job may start.
+    /// Approvals are recorded via
+    /// `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system token) or
+    /// `preloop approve`. Zero means no approval gate. A job not approved
+    /// within 24 hours of entering the gate fails closed.
+    ///
+    /// Preloop has no user identities: every approval is authenticated with
+    /// the single operator system token, so an approval is a deliberate
+    /// operator confirmation, not a distinct human reviewer. Values above 1
+    /// would imply a separation-of-duties guarantee that cannot exist, so
+    /// config loading rejects them (fail closed).
+    #[serde(default)]
+    pub required_reviewers: u32,
+}
+
+/// `[environment_rules]` table shape: `owner/repo` -> environment name ->
+/// protection rules.
+pub type EnvironmentRulesMap = BTreeMap<String, BTreeMap<String, EnvironmentRules>>;
+
 impl Default for CheckoutCacheConfig {
     fn default() -> Self {
         Self {
@@ -359,6 +399,187 @@ impl Default for CheckoutCacheConfig {
             run_retention_seconds: 3_600,
             repository_retention_seconds: 7 * 24 * 60 * 60,
             max_bytes: 100 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Permission level for the token permissions ceiling. Strict: an unknown
+/// level string fails config parsing rather than silently weakening policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionLevel {
+    None,
+    #[default]
+    Read,
+    Write,
+    Admin,
+}
+
+impl PermissionLevel {
+    /// Authority rank: none < read < write < admin. Matches the ranking used
+    /// when clamping minted tokens to the App installation's grants.
+    pub fn rank(self) -> u8 {
+        match self {
+            PermissionLevel::None => 0,
+            PermissionLevel::Read => 1,
+            PermissionLevel::Write => 2,
+            PermissionLevel::Admin => 3,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionLevel::None => "none",
+            PermissionLevel::Read => "read",
+            PermissionLevel::Write => "write",
+            PermissionLevel::Admin => "admin",
+        }
+    }
+}
+
+/// Operator ceiling on `GITHUB_TOKEN` permissions (`[token_permissions_ceiling]`),
+/// mirroring GitHub's workflow-permissions defaults as a hard cap: a workflow
+/// may declare less than the ceiling, never more. The effective permission
+/// per scope is the minimum of the workflow-declared set, this ceiling, the
+/// fork-restricted profile (which stays the floor for fork PR jobs), and the
+/// GitHub App installation's grants.
+///
+/// Absent by default: no ceiling is applied and today's behavior is unchanged.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TokenPermissionsCeiling {
+    /// Cap applied to scopes not explicitly listed. Default `read`.
+    #[serde(default)]
+    pub r#default: PermissionLevel,
+    /// Per-scope caps, e.g. `contents = "read"`. Remaining keys are scope
+    /// names; unknown keys become scope caps (caps only ever reduce).
+    #[serde(flatten)]
+    pub scopes: BTreeMap<String, PermissionLevel>,
+    /// Mirror of GitHub's "Allow GitHub Actions to create and approve pull
+    /// requests" toggle. When false (default), `pull-requests` is capped at
+    /// `read` no matter what the ceiling table says, so the minted token
+    /// cannot create or approve pull requests.
+    #[serde(default)]
+    pub allow_create_approve_pr: bool,
+}
+
+/// Enforcement mode for workflow execution protections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtectionMode {
+    /// Log what would be denied without denying it. The safe default for
+    /// rolling policy out: nothing changes until the operator flips to
+    /// `enforce`.
+    #[default]
+    Evaluate,
+    /// Deny matching triggers.
+    Enforce,
+}
+
+/// The only rule action supported today. Unknown actions fail config
+/// parsing so a typo can never silently weaken policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyRuleAction {
+    #[default]
+    Deny,
+}
+
+/// Deny rule on the event that may trigger a workflow, e.g.
+/// `pull_request_target`. Mirrors GitHub's event rules.
+///
+/// Unknown fields are rejected at parse time: a typo must fail closed
+/// rather than silently leave the policy weaker than written.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventRule {
+    /// Event name, e.g. `pull_request_target`, `workflow_dispatch`.
+    pub event: String,
+    /// Workflow filename globs (e.g. `deploy.yml`, `release/*.yml`),
+    /// matched against the bare filename and `.github/workflows/<name>`.
+    /// Only `*`, `**`, and `?` are supported — character classes like
+    /// `[0-9]` are rejected at config load. Omitted or empty = every workflow.
+    #[serde(default)]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: PolicyRuleAction,
+}
+
+/// Deny rule on the actor that may trigger a workflow. The actor is the
+/// webhook payload's `sender.login`. Mirrors GitHub's actor rules.
+///
+/// Unknown fields are rejected at parse time, as in [`EventRule`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorRule {
+    /// Sender login, compared case-insensitively.
+    pub actor: String,
+    /// Workflow filename globs, as in [`EventRule::workflows`].
+    /// Omitted or empty = every workflow.
+    #[serde(default)]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: PolicyRuleAction,
+}
+
+/// Workflow execution protections: admin-level deny policy on which events
+/// and which actors may trigger workflows. Mirrors GitHub's execution
+/// protections (event rules, actor rules, per-file targeting,
+/// evaluate/enforce modes).
+///
+/// Rules live in the operator's server config — never in workflow repos —
+/// so workflow authors cannot weaken the policy that constrains them.
+/// A `pull_request_target` kill is an event rule with
+/// `event = "pull_request_target"`.
+///
+/// Unknown fields are rejected at parse time, as in [`EventRule`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProtectionConfig {
+    #[serde(default)]
+    pub mode: ProtectionMode,
+    #[serde(default)]
+    pub event_rules: Vec<EventRule>,
+    #[serde(default)]
+    pub actor_rules: Vec<ActorRule>,
+}
+
+/// Fork pull-request workflow policy, mirroring GitHub's "Fork pull request
+/// workflows" admin settings. Rules live in the operator's server config —
+/// never in workflow repos — so a fork author cannot weaken the policy that
+/// constrains their own workflows.
+///
+/// Deliberately narrow: GitHub's "send write tokens" and "send secrets"
+/// toggles are not knobs here — preloop never sends secrets or write tokens
+/// to fork-PR workflows (the [`TrustTier::UntrustedForkPullRequest`] tier
+/// hardcodes the safe answer), so there is nothing to configure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForkPolicyConfig {
+    /// Whether workflows may run at all for fork pull-request events
+    /// (`pull_request` / `pull_request_review` from a fork). `false` skips
+    /// the event in the webhook intake path before any workflow is matched.
+    /// Default `true` preserves today's behavior.
+    #[serde(default = "default_true")]
+    pub run_fork_workflows: bool,
+    /// Whether fork-PR workflow runs wait for explicit operator approval
+    /// before any job may start. The run is created and held at scheduler
+    /// admission; approve it with
+    /// `POST /api/v1/runs/:run_id/approve-fork` (system Bearer <redacted>) or
+    /// `preloop approve-fork`. A run not approved within 24 hours fails
+    /// closed. Default `false` preserves today's behavior.
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ForkPolicyConfig {
+    fn default() -> Self {
+        Self {
+            run_fork_workflows: true,
+            require_approval: false,
         }
     }
 }
@@ -393,9 +614,34 @@ pub struct ConfigFile {
     /// the job fails closed: no environment secrets are injected and no
     /// environment OIDC subject is minted. Required reviewers, wait timers,
     /// and deployment-branch policies are not enforced yet; the registry
-    /// currently gates existence.
+    /// currently gates existence. Protection rules (required reviewers, wait
+    /// timers, deployment-branch policies) live in the separate
+    /// `[environment_rules]` table, enforced at scheduler admission before
+    /// environment secrets are injected.
     #[serde(default)]
     pub environments: BTreeMap<String, BTreeSet<String>>,
+    /// Token permissions ceiling (`[token_permissions_ceiling]`), mirroring
+    /// GitHub's workflow-permissions defaults as a hard operator cap.
+    /// `None` (absent table) = no ceiling; today's behavior is unchanged.
+    #[serde(default)]
+    pub token_permissions_ceiling: Option<TokenPermissionsCeiling>,
+    /// Per-environment protection rules (`[environment_rules."owner/repo".env]`),
+    /// mirroring GitHub's environment protection rules. Each rule set is
+    /// optional and empty by default; a missing entry means "no rules" and
+    /// preserves today's behavior.
+    #[serde(default)]
+    pub environment_rules: EnvironmentRulesMap,
+    /// Fork pull-request workflow policy (`[fork_policy]`), mirroring
+    /// GitHub's "Fork pull request workflows" admin settings. Empty by
+    /// default: fork-PR workflows run as today until the operator writes
+    /// policy.
+    #[serde(default)]
+    pub fork_policy: ForkPolicyConfig,
+    /// Workflow execution protections (`[execution_protection]`), mirroring
+    /// GitHub's admin-level event/actor rules. Empty by default: no triggers
+    /// are denied until the operator writes rules.
+    #[serde(default)]
+    pub execution_protection: ExecutionProtectionConfig,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -622,12 +868,25 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
             self.env_secrets.len(),
-            self.environments.len()
+            self.environments.len(),
+            self.environment_rules.len(),
+            self.token_permissions_ceiling.as_ref().map_or(
+                "none".to_owned(),
+                |ceiling| format!(
+                    "default={} ({} scoped)",
+                    ceiling.r#default.as_str(),
+                    ceiling.scopes.len()
+                )
+            ),
+            self.fork_policy,
+            self.execution_protection.mode,
+            self.execution_protection.event_rules.len(),
+            self.execution_protection.actor_rules.len()
         )
     }
 }
@@ -1034,6 +1293,10 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
     };
     let mut config: ConfigFile =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    validate_environment_rules(&config)
+        .with_context(|| format!("validating config {}", path.display()))?;
+    validate_execution_protection(&config)
+        .with_context(|| format!("validating config {}", path.display()))?;
     resolve_credential_references(&mut config, &OsCredentialStore)?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1042,6 +1305,73 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
             .with_context(|| format!("unsealing secrets in config {}", path.display()))?;
     }
     Ok(config)
+}
+
+/// Reject environment protection rules that promise more than the
+/// single-operator trust model can deliver.
+///
+/// Approvals are authenticated only with the shared system token, so
+/// `required_reviewers > 1` cannot mean distinct reviewers: one token holder
+/// could satisfy the quorum alone by calling the approval endpoint
+/// repeatedly. Fail the config load closed rather than run with a
+/// misleading gate.
+///
+/// Wait timers are also range-checked: the gate converts minutes to i64
+/// nanoseconds, and a `u64` value above `i64::MAX` would cast to a negative
+/// delay (bypassing the wait). TOML integers top out at `i64::MAX`, so no
+/// config file can trigger this today, but the bound is enforced anyway so
+/// the cast site stays total.
+fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
+    /// Largest whole minutes representable as i64 nanoseconds.
+    const MAX_WAIT_TIMER_MINUTES: u64 = (i64::MAX as u64) / 60_000_000_000;
+    for (repo, envs) in &config.environment_rules {
+        for (env, rules) in envs {
+            anyhow::ensure!(
+                rules.required_reviewers <= 1,
+                "environment_rules[{repo}][{env}]: required_reviewers = {} is not supported; \
+                 preloop has no user identities, so at most 1 operator approval can be required",
+                rules.required_reviewers
+            );
+            anyhow::ensure!(
+                rules.wait_timer_minutes <= MAX_WAIT_TIMER_MINUTES,
+                "environment_rules[{repo}][{env}]: wait_timer_minutes = {} is too large; \
+                 the wait must fit in i64 nanoseconds (max {MAX_WAIT_TIMER_MINUTES} minutes)",
+                rules.wait_timer_minutes
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reject execution-protection rules the matcher cannot honor.
+///
+/// `workflows` patterns are matched with [`preloop_gha_parser::glob_match`],
+/// which implements `*`, `**`, and `?` only. A GitHub-style character class
+/// like `deploy-[0-9].yml` would parse but match literally, silently missing
+/// the intended workflow — so fail the config load closed instead.
+fn validate_execution_protection(config: &ConfigFile) -> anyhow::Result<()> {
+    let policy = &config.execution_protection;
+    let mut rules: Vec<(&str, &str, &Option<Vec<String>>)> = Vec::new();
+    for rule in &policy.event_rules {
+        rules.push(("event rule", rule.event.as_str(), &rule.workflows));
+    }
+    for rule in &policy.actor_rules {
+        rules.push(("actor rule", rule.actor.as_str(), &rule.workflows));
+    }
+    for (kind, target, workflows) in rules {
+        if let Some(patterns) = workflows {
+            for pattern in patterns {
+                anyhow::ensure!(
+                    !pattern.contains(['[', ']']),
+                    "execution_protection {kind} ({target:?}): workflow pattern \
+                     {pattern:?} uses character classes, which the matcher does \
+                     not support (only `*`, `**`, `?`); rewrite the pattern or \
+                     remove the rule",
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Atomically write the config file with mode 0600.
@@ -1151,6 +1481,10 @@ mod tests {
                 )]),
             )]),
             environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
+            token_permissions_ceiling: None,
+            environment_rules: BTreeMap::new(),
+            fork_policy: ForkPolicyConfig::default(),
+            execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }
@@ -1198,6 +1532,90 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "not [ valid toml ==").unwrap();
         assert!(load_config_from(&path).is_err());
+    }
+
+    #[test]
+    fn required_reviewers_above_one_is_rejected() {
+        // One system token can approve repeatedly, so a quorum above 1 would
+        // imply distinct reviewers that cannot exist. Fail closed at load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[environment_rules.\"owner/repo\".prod]\nrequired_reviewers = 2\n",
+        )
+        .unwrap();
+        let err = load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("required_reviewers"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn required_reviewers_zero_or_one_is_accepted() {
+        for reviewers in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[environment_rules.\"owner/repo\".prod]\nrequired_reviewers = {reviewers}\n"
+                ),
+            )
+            .unwrap();
+            let config = load_config_from(&path).unwrap();
+            assert_eq!(
+                config.environment_rules["owner/repo"]["prod"].required_reviewers,
+                reviewers
+            );
+        }
+    }
+
+    #[test]
+    fn wait_timer_minutes_overflow_is_rejected() {
+        // The gate casts minutes to i64 nanoseconds; a u64 above i64::MAX
+        // would cast negative and bypass the wait. TOML integers top out at
+        // i64::MAX so no config file can hit this today, but the bound is
+        // enforced at load so the cast site stays total.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // i64::MAX minutes is TOML-representable but not as i64 nanoseconds.
+        std::fs::write(
+            &path,
+            "[environment_rules.\"owner/repo\".prod]\nwait_timer_minutes = 9223372036854775807\n",
+        )
+        .unwrap();
+        let err = load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("wait_timer_minutes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn wait_timer_minutes_boundary_is_accepted() {
+        // Largest whole minutes that fit in i64 nanoseconds: the cast in the
+        // gate is the identity and saturating_mul cannot saturate.
+        let max_minutes = (i64::MAX as u64) / 60_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[environment_rules.\"owner/repo\".prod]\nwait_timer_minutes = {max_minutes}\n"
+            ),
+        )
+        .unwrap();
+        let config = load_config_from(&path).unwrap();
+        assert_eq!(
+            config.environment_rules["owner/repo"]["prod"].wait_timer_minutes,
+            max_minutes
+        );
+        assert_eq!(
+            (max_minutes as i64).saturating_mul(60_000_000_000) / 60_000_000_000,
+            max_minutes as i64
+        );
     }
 
     use crate::credential_store::{

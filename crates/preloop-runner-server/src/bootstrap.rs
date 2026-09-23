@@ -198,6 +198,13 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     let now = SystemTime::now();
     let mut cancellations = Vec::new();
     let mut disconnected_completions = Vec::new();
+    // Fork-PR workflow policy: fail closed runs whose 24h approval window
+    // expired while waiting for operator approval. Emitted below, after the
+    // lock is released.
+    let expired_fork_approvals = crate::fork_policy::sweep_expired_fork_approvals(
+        &mut inner,
+        crate::models::now_unix_nanos(),
+    );
     // Jobs failed by the starvation sweep, emitted after the lock is
     // released so the event fan-out never runs under the state lock.
     let mut starved: Vec<(RunId, JobId, String)> = Vec::new();
@@ -555,8 +562,49 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     }
 
     // Notify if cancellations or starvation failures occurred
-    if cancellation_count > 0 || !starved.is_empty() {
+    if cancellation_count > 0 || !starved.is_empty() || !expired_fork_approvals.is_empty() {
         shared.state.message_notify.notify_waiters();
+    }
+
+    // Surface fork-PR runs failed closed by the expired approval window.
+    // Like the starvation loop below, emit per-job status and complete the
+    // GitHub check runs: without this a check run created at webhook intake
+    // stays `queued` on GitHub indefinitely for a terminal run.
+    for run_id in &expired_fork_approvals {
+        let failed_jobs: Vec<JobId> = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(run_id)
+                .map(|run| run.jobs.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        for job_id in failed_jobs {
+            shared
+                .state
+                .emit(NdjsonEvent::JobStatus {
+                    run_id: *run_id,
+                    job_id: job_id.clone(),
+                    status: ExecutionStatus::Failure,
+                    reason: Some("fork-PR approval window expired".to_owned()),
+                })
+                .await;
+            crate::github::report_check_run_completed(
+                shared,
+                *run_id,
+                &job_id,
+                ExecutionStatus::Failure,
+            )
+            .await;
+        }
+        shared
+            .state
+            .emit(NdjsonEvent::RunStatus {
+                run_id: *run_id,
+                status: ExecutionStatus::Failure,
+                reason: Some("fork-PR approval window expired".to_owned()),
+            })
+            .await;
     }
 
     // Surface why a queued job was failed. Without this the only record is a
@@ -583,6 +631,28 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // Process completions for disconnected runners
     for (_, completion) in disconnected_completions {
         let _ = complete_job_inner(shared.clone(), completion).await;
+    }
+
+    // Environment protection gates: wait timers expire and approval windows
+    // close on wall-clock time, not on scheduling events. Re-run promotion
+    // so newly-satisfied gates release their jobs and expired approval
+    // windows fail closed. Skipped entirely when no job carries gate state.
+    {
+        let mut inner = shared.state.inner.lock().await;
+        if inner
+            .pending_jobs
+            .iter()
+            .any(|job| job.environment_gate.is_some())
+        {
+            crate::runtime_scheduling::promote_ready_jobs(
+                &mut inner,
+                &shared.state.environment_rules,
+            );
+            shared
+                .state
+                .queue_depth
+                .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+        }
     }
 }
 

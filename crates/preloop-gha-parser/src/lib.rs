@@ -24,7 +24,7 @@ pub use expand::{
     MAX_WORKFLOW_DEPTH, PERMISSION_SCOPES,
 };
 pub use models::*;
-pub use trigger::TriggerMismatch;
+pub use trigger::{glob_match, TriggerMismatch};
 pub use yaml::{parse_action_metadata, parse_workflow};
 
 #[cfg(test)]

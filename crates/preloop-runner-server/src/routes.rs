@@ -627,8 +627,22 @@ pub fn build_app(
             )),
         )
         .route(
+            "/api/v1/runs/:run_id/jobs/:job_id/approve",
+            post(approve_job).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
             "/api/v1/runs/:run_id/rerun",
             post(rerun_run).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_native_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/runs/:run_id/approve-fork",
+            post(approve_fork).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),

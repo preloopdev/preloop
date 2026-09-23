@@ -207,6 +207,46 @@ build, checksum, publishing, and runtime configuration flow, see
 Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.
 
+### GitHub admin controls
+
+On GitHub, an organization's admins set workflow policy from the Actions
+settings page: which events may trigger workflows, what the `GITHUB_TOKEN` may
+do, which environments need approvals, and how fork pull-request workflows are
+treated. On a self-hosted Preloop server there is no settings page and no
+organization layer — the operator **is** the admin, and these policies live in
+the server config file (`PRELOOP_CONFIG`, default `$PRELOOP_HOME/config.toml`).
+They are deliberately server-side, never repository-controlled: anyone who can
+merge a workflow change could otherwise relax the policy the change is subject
+to.
+
+```toml
+[fork_policy]
+# Fork pull-request workflows are the classic untrusted-code vector: the
+# workflow file comes from the fork, so it runs before any merge review.
+run_fork_workflows = true   # false = drop fork-PR events before any workflow is fetched or matched
+require_approval = false    # true = run is created but all jobs hold until the operator approves it
+```
+
+- `run_fork_workflows` defaults to `true` (existing behavior); setting it to
+  `false` is a kill switch. Dropped events are logged and never create runs.
+- `require_approval` defaults to `false`. When `true`, a fork-PR run is created
+  and queued normally, but every job holds in `Pending` until the operator
+  releases it with `preloop approve-fork <run-id> [--note ...]` or
+  `POST /api/v1/runs/:run_id/approve-fork` (system bearer). A run not approved
+  within 24 hours fails closed. Timers hold jobs visibly in `Pending` and stay
+  cancellable.
+- Only the fork pull-request trust tier (`pull_request` from a fork) is
+  affected. `pull_request_target` always runs with base-repository trust and
+  is never treated as a fork-PR workflow by this policy, regardless of the
+  event that triggered it.
+- Secrets and write tokens for fork-PR workflows stay hardcoded off by the
+  trust tier — there is no knob for them. The policy only decides whether the
+  workflow runs at all, and whether a human says go first.
+- Preloop has no user identities: an approval means whoever holds the system
+  token approved. For a single operator this is a deliberate confirmation step,
+  not a second person — it stops fork code from executing without an explicit
+  go-ahead.
+
 ---
 ## 5. Exposure options
 
@@ -424,6 +464,140 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 | `401` from the CLI | `PRELOOP_TOKEN` must match the server's `PRELOOP_SYSTEM_TOKEN` |
 
 ---
+
+## 8. GitHub admin controls (codified policy)
+
+GitHub's admin surface — execution protections, token permission defaults,
+environment protection rules, fork PR policies — lives in repo/org settings,
+deliberately outside workflow files: whoever writes a workflow must not be
+able to weaken the policy that constrains it. Preloop mirrors that split by
+putting the equivalent controls in the operator's server config
+(`$PRELOOP_CONFIG`, default `~/.preloop/config.toml`), never in workflow
+repos. All of the tables below are optional and empty by default; an empty
+table preserves today's behavior exactly. Policy is read at startup — edit
+the file and restart the server to apply changes.
+
+### 8.1 Workflow execution protections
+
+Admin-level deny policy on which events and which actors may trigger
+workflows, mirroring GitHub's execution protections (event rules, actor
+rules, per-file targeting). Evaluated in the webhook intake path before
+workflow matching.
+
+```toml
+[execution_protection]
+mode = "evaluate"  # "evaluate" (log only, default) or "enforce" (deny)
+
+# Headline example: kill pull_request_target entirely, GitHub's default
+# policy for public repos.
+[[execution_protection.event_rules]]
+event = "pull_request_target"
+# action = "deny" is the default and the only supported action;
+# unknown actions fail config parsing rather than silently weakening policy.
+
+# Scoped variant: deny the event only for specific workflow files.
+# Patterns support `*`, `**`, and `?`, matched against the bare filename
+# (deploy.yml) and the repo-relative path (.github/workflows/deploy.yml).
+# Character classes like `[0-9]` are rejected at config load.
+# Omitted or empty `workflows` = every workflow.
+[[execution_protection.event_rules]]
+event = "workflow_dispatch"
+workflows = ["deploy.yml", "release/*.yml"]
+
+# Actor rules match the webhook payload's sender.login (case-insensitive).
+[[execution_protection.actor_rules]]
+actor = "mallory"
+workflows = ["deploy.yml"]
+```
+
+Semantics:
+
+- Unscoped rules (no `workflows`) deny the whole event before any workflow
+  is fetched or matched. Scoped rules deny individual workflow files during
+  matching; other workflows for the same event still run.
+- `evaluate` mode logs `execution protection would deny …` and continues —
+  roll policy out in `evaluate`, watch the logs, then flip to `enforce`.
+- `enforce` mode skips the denied event/workflow and logs
+  `execution protection denied …` naming the rule that fired.
+### 8.2 Token permissions ceiling
+
+A hard operator cap on `GITHUB_TOKEN` permissions, mirroring GitHub's
+workflow-permissions defaults. A workflow may declare less than the ceiling,
+never more. Effective permissions per scope are the minimum of the
+workflow-declared set, this ceiling, the fork-restricted profile (which stays
+the floor for fork PR jobs), and the GitHub App installation's grants.
+
+```toml
+[token_permissions_ceiling]
+default = "read"        # cap for scopes not listed below (default "read")
+contents = "read"       # per-scope caps
+pull-requests = "write"
+allow_create_approve_pr = false  # default false, like GitHub's toggle
+```
+
+Semantics:
+
+- Omit the table entirely for today's behavior (no ceiling). Writing the
+  table activates it; `default` caps every scope not explicitly listed.
+- Levels are `none` < `read` < `write` < `admin`. Unknown level strings fail
+  config parsing (fail closed); an unknown *requested* level clamps down to
+  the cap instead of slipping past it.
+- `allow_create_approve_pr = false` caps `pull-requests` at `read` no matter
+  what the table says, so the minted token cannot create or approve pull
+  requests — the scope-model approximation of GitHub's toggle.
+- The ceiling is applied to the permission map requested from GitHub *before*
+  the installation token is minted, and the clamped set is what the wire
+  `system.github.token.permissions` variable reports. Every clamp is logged
+  at warn with scope, requested, and granted levels.
+- The PAT fallback is the operator's own credential and ignores
+  `permissions:` by design; the ceiling does not apply to it.
+### 8.3 Environment protection rules
+
+Per-environment branch policies, wait timers, and required reviewers,
+mirroring GitHub's environment protection rules. The existing `[environments]`
+registry keeps gating existence (bare names stay valid); rules are additive:
+
+```toml
+[environments]
+"owner/repo" = ["prod"]
+
+[environment_rules."owner/repo".prod]
+deployment_branches = ["main"]  # refs/heads/ prefix optional; empty = any ref
+wait_timer_minutes = 10         # 0 = no wait
+required_reviewers = 1          # 0 = no approval gate
+```
+
+Enforcement happens at scheduler admission, before concurrency gating and
+before the job is queued — so a denied or waiting job never occupies a
+concurrency slot, and a denied job's environment secrets never reach a
+runner:
+
+- **Branch policy.** The run's `git_ref` must match `deployment_branches`
+  (compared after stripping a leading `refs/heads/` from both sides, so
+  `main` matches `refs/heads/main`). A run on any other ref fails the job
+  closed at admission.
+- **Wait timer.** After the job becomes eligible it waits the configured
+  minutes before it may start. The wait is visible (the job reports status
+  `pending`) and cancellable (`preloop cancel`, run/job cancel APIs). The
+  deadline is stamped on the job and survives restarts; the 10-second
+  background sweep re-runs admission so timers release without waiting for
+  another scheduling event.
+- **Required reviewers.** The job waits in a pending-approval state until
+  the configured number of approvals is recorded. Approvals are explicit and
+  human-driven: `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system
+  bearer token; optional `{"note": "..."}` for the audit trail) or
+  `preloop approve <run-id> <job-id> [--note ...]`. Preloop has no user
+  identities — the approver is whoever holds the operator credential — so
+  for a single-operator server this is a deliberate confirmation step, not
+  a second human. Because one token holder could satisfy any quorum alone
+  by calling the approval endpoint repeatedly, `required_reviewers` is
+  capped at 1; values above 1 are rejected at config load (fail closed).
+  A job not approved within 24 hours of entering the gate
+  fails closed.
+
+Removing an environment's rules releases its armed gates. Gate denials and
+approvals are logged with run, job, and environment.
+
 
 ## See also
 

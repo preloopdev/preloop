@@ -600,7 +600,11 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn load_into(&self, inner: &mut InnerState) -> anyhow::Result<()> {
+    async fn load_into(
+        &self,
+        inner: &mut InnerState,
+        environment_rules: &crate::config::EnvironmentRulesMap,
+    ) -> anyhow::Result<()> {
         let client = self.connection.lock().await;
         // Same bound as the SQLite backend: every in-flight run plus the
         // newest completed runs up to `MAX_COMPLETED_RUNS_RETAINED`. The full
@@ -929,7 +933,7 @@ impl Store for PgStore {
         {
             let blob: Vec<u8> = row.get(0);
             let meta: MetaSnapshot = serde_json::from_slice(&self.cipher.unseal(&blob)?)?;
-            apply_meta_snapshot(inner, meta);
+            apply_meta_snapshot(inner, meta, environment_rules);
         }
         let rows = client
             .query(

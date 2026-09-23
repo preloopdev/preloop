@@ -2,6 +2,7 @@ use super::*;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+use utoipa::ToSchema;
 
 /// A heartbeat or sampler snapshot older than this is stale: three sampler
 /// intervals of 5s. Single source so `/readyz` and `/api/v1/status` cannot
@@ -566,6 +567,43 @@ pub async fn submit_run_inner(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
+    // Workflow execution protections: every non-webhook submission path
+    // funnels through here (native `POST /api/v1/runs`, REST dispatch, the
+    // scheduler, native reruns), so the event/actor check lives at this
+    // choke point. The webhook intake enforces separately upstream via
+    // `denies_event` / `denies_workflow` and calls
+    // `submit_run_inner_with_webhook_delivery` directly, so this does not
+    // double-fire there.
+    if let Some(hit) = crate::execution_protection::denies_submission(
+        &shared.state.execution_protection,
+        &submission.event,
+        Some(&submission.actor),
+        submission.workflow_file.as_deref(),
+    ) {
+        match shared.state.execution_protection.mode {
+            crate::config::ProtectionMode::Enforce => {
+                info!(
+                    event = %submission.event,
+                    actor = %submission.actor,
+                    rule = %hit.describe(),
+                    "execution protection denied submission"
+                );
+                return Err(ApiError::forbidden(format!(
+                    "execution protection denied {}: {}",
+                    submission.event,
+                    hit.describe()
+                )));
+            }
+            crate::config::ProtectionMode::Evaluate => {
+                info!(
+                    event = %submission.event,
+                    actor = %submission.actor,
+                    rule = %hit.describe(),
+                    "execution protection would deny submission (evaluate mode)"
+                );
+            }
+        }
+    }
     submit_run_inner_with_webhook_delivery(shared, submission, None).await
 }
 
@@ -665,6 +703,16 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     webhook_delivery_id: Option<&str>,
 ) -> Result<RunAccepted, ApiError> {
     let webhook_delivery_id = webhook_delivery_id.map(str::to_owned);
+    // Fork-PR workflow policy: runs from fork pull-request events wait for
+    // explicit operator approval before any job may start. The trust tier is
+    // stamped by the webhook path before submission; native submissions carry
+    // no tier and are never held.
+    let fork_approval_pending = crate::fork_policy::fork_approval_required(
+        &shared.state.fork_policy,
+        crate::events::trust_tier::tier_of(&submission),
+    );
+    let fork_approval_requested_at_unix_nanos =
+        fork_approval_pending.then(crate::models::now_unix_nanos);
     if let (Some(delivery_id), Some(workflow_path)) = (
         webhook_delivery_id.as_deref(),
         submission.workflow_path.as_deref(),
@@ -1611,6 +1659,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     conclusion: Some("failure".to_owned()),
                     push_state: None,
                     snapshot_timing: None,
+                    fork_approval_pending,
+                    fork_approval_requested_at_unix_nanos,
+                    fork_approved_at_unix_nanos: None,
+                    fork_approval_note: None,
                 },
             );
             drop(inner);
@@ -1739,6 +1791,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     .collect(),
                 deferred_matrix: job.deferred_matrix.clone(),
                 reusable_call: job.reusable_call.clone(),
+                environment_gate: None,
             };
             built_jobs.push(queued_job);
         }
@@ -1825,6 +1878,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                             conclusion: Some("cancelled".to_owned()),
                             push_state: None,
                             snapshot_timing: None,
+                            fork_approval_pending,
+                            fork_approval_requested_at_unix_nanos,
+                            fork_approved_at_unix_nanos: None,
+                            fork_approval_note: None,
                         },
                     );
                     // The run died on arrival: nothing will ever dispatch,
@@ -1915,6 +1972,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     conclusion: None,
                     push_state: None,
                     snapshot_timing: None,
+                    fork_approval_pending,
+                    fork_approval_requested_at_unix_nanos,
+                    fork_approved_at_unix_nanos: None,
+                    fork_approval_note: None,
                 },
             );
             drop(inner);
@@ -1978,6 +2039,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 snapshot_timing: workspace_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.snapshot_timing),
+                fork_approval_pending,
+                fork_approval_requested_at_unix_nanos,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
             },
         );
 
@@ -2035,7 +2100,17 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             let under_mp = max_parallel
                 .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
 
-            if needs_empty && under_mp {
+            // Fork-PR workflow policy: a run awaiting fork approval holds
+            // every job in pending_jobs until the operator approves the run.
+            // The needs-empty fast path must not bypass that hold by
+            // enqueueing straight to inner.queue (or parking in
+            // concurrency_blocked): the fork gate in promote_ready_jobs only
+            // inspects pending_jobs.
+            let fork_held = inner
+                .runs
+                .get(&run_id)
+                .is_some_and(|run| run.fork_approval_pending);
+            if needs_empty && under_mp && !fork_held {
                 // Job-level concurrency gate (needs/max_parallel already satisfied).
                 match try_enqueue_with_job_concurrency(
                     &mut inner,
@@ -2074,7 +2149,15 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     }
                 }
             } else {
-                statuses.insert(job_id, ExecutionStatus::Queued);
+                // Fork-held jobs wait visibly in Pending until the operator
+                // approves the run; everything else queues normally for the
+                // scheduler.
+                let status = if fork_held {
+                    ExecutionStatus::Pending
+                } else {
+                    ExecutionStatus::Queued
+                };
+                statuses.insert(job_id, status);
                 inner.pending_jobs.push_back(queued_job);
             }
         }
@@ -2139,13 +2222,17 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 conclusion: None,
                 push_state: None,
                 snapshot_timing,
+                fork_approval_pending,
+                fork_approval_requested_at_unix_nanos,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
             },
         );
         // Deferred reusable-caller nodes whose needs are already satisfied
         // (typically none) are reified by a first promote sweep: needs-free
         // callers acquire their JobSet gates and materialize their callee
         // subtree immediately.
-        promote_ready_jobs(&mut inner);
+        promote_ready_jobs(&mut inner, &shared.state.environment_rules);
         // A submission whose every job concluded before it reached the queue
         // (all skipped by `if:`, or none hostable) never passes through the
         // completion path, so nothing else would ever stamp `completed_at` and
@@ -3468,6 +3555,127 @@ pub async fn cancel_run(
         .await;
     Ok(Json(record))
 }
+
+/// Request body for approving a pending environment protection gate.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApproveJobRequest {
+    /// Optional operator note recorded with the approval (audit trail).
+    pub note: Option<String>,
+}
+
+/// Response for an environment approval.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApproveJobResponse {
+    pub run_id: String,
+    pub job_id: String,
+    pub approvals: usize,
+    pub required: u32,
+    /// Whether the approval gate is now satisfied (the job may proceed).
+    pub satisfied: bool,
+}
+
+/// Record one approval for a job waiting on its environment's
+/// required-reviewer gate (`POST /api/v1/runs/:run_id/jobs/:job_id/approve`).
+/// Requires the system (native) bearer token: preloop has no user
+/// identities, so the approver is whoever holds the operator credential.
+/// For a single-operator server this is a deliberate confirmation step, not
+/// a second human — it stops a compromised workflow or a misclicked
+/// re-run from deploying without an explicit go-ahead.
+pub async fn approve_job(
+    State(shared): State<Arc<SharedState>>,
+    Path((run_id, job_id)): Path<(RunId, JobId)>,
+    Json(body): Json<ApproveJobRequest>,
+) -> Result<Json<ApproveJobResponse>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    if run
+        .jobs
+        .get(&job_id)
+        .is_some_and(|status| status.is_terminal())
+    {
+        return Err(ApiError::conflict("job is already terminal"));
+    }
+    let repository = run.submission.repository.clone();
+    let job = inner
+        .pending_jobs
+        .iter_mut()
+        .find(|job| job.run_id == run_id && job.job_id == job_id)
+        .ok_or_else(|| ApiError::not_found("job is not waiting in the scheduler"))?;
+    let gate = job
+        .environment_gate
+        .as_mut()
+        .filter(|gate| gate.approval_requested_at_unix_nanos.is_some())
+        .ok_or_else(|| ApiError::conflict("job is not awaiting environment approval"))?;
+    let env_name = match job.environment.as_ref() {
+        Some(serde_json::Value::String(name)) => name.clone(),
+        Some(serde_json::Value::Object(map)) => map
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        _ => String::new(),
+    };
+    let required = shared
+        .state
+        .environment_rules
+        .get(&repository)
+        .and_then(|envs| envs.get(&env_name))
+        .map(|rule| rule.required_reviewers)
+        .unwrap_or(0);
+    // Fail closed on an expired window before recording anything.
+    if let Some(requested_at) = gate.approval_requested_at_unix_nanos {
+        if crate::models::now_unix_nanos().saturating_sub(requested_at)
+            > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
+        {
+            crate::runtime_scheduling::promote_ready_jobs(
+                &mut inner,
+                &shared.state.environment_rules,
+            );
+            crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+            if let Some(run) = inner.runs.get_mut(&run_id) {
+                crate::runtime_scheduling::finalize_run_if_complete(run);
+            }
+            return Err(ApiError::conflict(
+                "approval window expired; the job was failed closed",
+            ));
+        }
+    }
+    gate.approvals_unix_nanos
+        .push(crate::models::now_unix_nanos());
+    let approvals = gate.approvals_unix_nanos.len();
+    let satisfied = required > 0 && (approvals as u32) >= required;
+    tracing::info!(
+        run_id = %run_id.0,
+        job_id = %job_id.0,
+        environment = env_name,
+        approvals,
+        required,
+        note = body.note.as_deref().unwrap_or_default(),
+        "environment approval recorded"
+    );
+    let outcome =
+        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    let promoted = outcome.promoted;
+    drop(inner);
+    if promoted > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
+    Ok(Json(ApproveJobResponse {
+        run_id: run_id.0.to_string(),
+        job_id: job_id.0.clone(),
+        approvals,
+        required,
+        satisfied,
+    }))
+}
 pub async fn rerun_run_inner(
     shared: &Arc<SharedState>,
     run_id: RunId,
@@ -3511,6 +3719,90 @@ pub async fn rerun_run(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunAccepted>, ApiError> {
     rerun_run_inner(&shared, run_id, None).await.map(Json)
+}
+
+/// Request body for approving a run held by the fork-PR workflow policy.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApproveForkRequest {
+    /// Optional operator note recorded with the approval (audit trail).
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Response for a fork-PR approval.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApproveForkResponse {
+    pub run_id: String,
+    /// Whether the run was awaiting fork approval and is now released.
+    pub approved: bool,
+}
+
+/// Approve a run held by the fork-PR workflow policy
+/// (`POST /api/v1/runs/:run_id/approve-fork`). Requires the system (native)
+/// bearer token: preloop has no user identities, so the approver is whoever
+/// holds the operator credential. For a single-operator server this is a
+/// deliberate confirmation step, not a second human — it stops a fork PR
+/// from executing code without an explicit go-ahead. A run not approved
+/// within 24 hours of entering the hold fails closed.
+pub async fn approve_fork(
+    State(shared): State<Arc<SharedState>>,
+    Path(run_id): Path<RunId>,
+    Json(body): Json<ApproveForkRequest>,
+) -> Result<Json<ApproveForkResponse>, ApiError> {
+    let mut inner = shared.state.inner.lock().await;
+    let run = inner
+        .runs
+        .get_mut(&run_id)
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    if run.status.is_terminal() {
+        return Err(ApiError::conflict("run is already terminal"));
+    }
+    if !run.fork_approval_pending {
+        return Err(ApiError::conflict("run is not awaiting fork approval"));
+    }
+    // Fail closed on an expired window before recording anything.
+    if let Some(requested_at) = run.fork_approval_requested_at_unix_nanos {
+        if crate::models::now_unix_nanos().saturating_sub(requested_at)
+            > crate::fork_policy::FORK_APPROVAL_WINDOW_NANOS
+        {
+            let expired = crate::fork_policy::sweep_expired_fork_approvals(
+                &mut inner,
+                crate::models::now_unix_nanos(),
+            );
+            drop(inner);
+            if !expired.is_empty() {
+                shared.state.message_notify.notify_waiters();
+            }
+            return Err(ApiError::conflict(
+                "approval window expired; the run was failed closed",
+            ));
+        }
+    }
+    let run = inner.runs.get_mut(&run_id).expect("run exists");
+    run.fork_approval_pending = false;
+    run.fork_approved_at_unix_nanos = Some(crate::models::now_unix_nanos());
+    run.fork_approval_note = body.note.clone();
+    tracing::info!(
+        run_id = %run_id.0,
+        note = body.note.as_deref().unwrap_or_default(),
+        "fork-PR approval recorded; run released"
+    );
+    let outcome =
+        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    shared
+        .state
+        .queue_depth
+        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+    let promoted = outcome.promoted;
+    drop(inner);
+    if promoted > 0 {
+        shared.state.message_notify.notify_waiters();
+    }
+    Ok(Json(ApproveForkResponse {
+        run_id: run_id.0.to_string(),
+        approved: true,
+    }))
 }
 
 /// Upper bound on how long an event stream waits for the next event.
@@ -4106,5 +4398,83 @@ mod tests {
             StatusCode::OK,
             "a job claiming a registered environment must be accepted, got: {body}"
         );
+    }
+
+    #[test]
+    fn approve_fork_request_accepts_empty_object() {
+        // The note is optional: `{}` must deserialize (the field was missing
+        // #[serde(default)], so `{}` failed with "missing field `note`").
+        let req: ApproveForkRequest = serde_json::from_str("{}").expect("{} must parse");
+        assert!(req.note.is_none());
+        let req: ApproveForkRequest =
+            serde_json::from_str(r#"{"note":"lgtm"}"#).expect("note must parse");
+        assert_eq!(req.note.as_deref(), Some("lgtm"));
+    }
+
+    /// The native `POST /api/v1/runs` endpoint, the scheduler, and the
+    /// native rerun endpoint all call `submit_run_inner` directly, bypassing
+    /// the webhook intake's per-event checks. Enforcement lives at this
+    /// choke point so none of those paths can sidestep an enforced rule.
+    async fn state_with_push_deny(
+        temp: &std::path::Path,
+        mode: crate::config::ProtectionMode,
+    ) -> std::sync::Arc<crate::SharedState> {
+        let mut state = crate::AppState::new(temp.to_path_buf()).await.unwrap();
+        state.execution_protection = crate::config::ExecutionProtectionConfig {
+            mode,
+            event_rules: vec![crate::config::EventRule {
+                event: "push".to_owned(),
+                workflows: None,
+                action: crate::config::PolicyRuleAction::Deny,
+            }],
+            actor_rules: vec![],
+        };
+        state.shared()
+    }
+
+    fn push_submission() -> preloop_gha_protocol::WorkflowSubmission {
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_run_inner_denies_denied_event_in_enforce_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared =
+            state_with_push_deny(temp.path(), crate::config::ProtectionMode::Enforce).await;
+        let error = submit_run_inner(&shared, push_submission())
+            .await
+            .expect_err("a denied event must not submit in enforce mode");
+        assert!(
+            error.message().contains("execution protection"),
+            "unexpected error: {}",
+            error.message()
+        );
+        let inner = shared.state.inner.lock().await;
+        assert!(
+            inner.runs.is_empty(),
+            "denied submission must not create a run"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_run_inner_allows_denied_event_in_evaluate_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared =
+            state_with_push_deny(temp.path(), crate::config::ProtectionMode::Evaluate).await;
+        let accepted = submit_run_inner(&shared, push_submission())
+            .await
+            .expect("evaluate mode must not block submission");
+        let inner = shared.state.inner.lock().await;
+        assert!(inner.runs.contains_key(&accepted.run_id));
     }
 }

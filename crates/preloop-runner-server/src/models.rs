@@ -336,6 +336,21 @@ pub struct RunRecord {
     /// submissions that snapshot a workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_timing: Option<SnapshotTiming>,
+    /// Fork-PR workflow policy: the run is held at scheduler admission until
+    /// the operator approves it (`POST /api/v1/runs/:run_id/approve-fork`).
+    /// Stamped at submission when the fork policy requires approval.
+    #[serde(default)]
+    pub fork_approval_pending: bool,
+    /// When the fork-approval hold started (unix nanos). A run not approved
+    /// within 24 hours of this stamp fails closed via the reaper sweep.
+    #[serde(default)]
+    pub fork_approval_requested_at_unix_nanos: Option<i64>,
+    /// When the fork-approval hold was released (unix nanos), if approved.
+    #[serde(default)]
+    pub fork_approved_at_unix_nanos: Option<i64>,
+    /// Optional operator note recorded with the fork approval.
+    #[serde(default)]
+    pub fork_approval_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +446,34 @@ pub struct QueuedJob {
     /// Deferred reusable-workflow invocation, expanded on gate pass. This
     /// node is scheduling-only: it never reaches `inner.queue`.
     pub reusable_call: Option<preloop_gha_protocol::ReusableCallPlan>,
+    /// Environment protection gate state, armed when the job first reaches
+    /// scheduler admission with `[environment_rules]` configured for its
+    /// `environment:`. Stamps the wait-timer deadline, the approval request
+    /// time, and recorded approvals. Survives the persisted job snapshot so
+    /// a restart cannot silently drop an armed gate (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_gate: Option<EnvironmentGateState>,
+}
+
+/// Progress markers for one job's environment protection gates. All
+/// timestamps are unix nanoseconds. The stamps travel in the persisted job
+/// snapshot (`payload_blob`) so a restart re-arms an armed wait timer or
+/// approval gate instead of dropping it — and every stamp is fail-closed
+/// under snapshot loss: a lost wait deadline re-arms the wait, a lost
+/// approval re-arms the approval, never the reverse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnvironmentGateState {
+    /// When the wait timer expires. `None` once satisfied or when no wait
+    /// timer is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_until_unix_nanos: Option<i64>,
+    /// When the job first entered the required-reviewer gate. `None` when
+    /// no approval gate is (or was) armed for this job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_requested_at_unix_nanos: Option<i64>,
+    /// Unix-nanos timestamps of recorded approvals, oldest first.
+    #[serde(default)]
+    pub approvals_unix_nanos: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
