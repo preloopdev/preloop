@@ -37,6 +37,13 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// `SubmitOutcome::existing` instead of a second run.
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError>;
 
+    /// Allocate the next run number for a workflow path from the durable
+    /// counter. Called before the job messages are built (the number is
+    /// embedded in `github.run_number`), so it is its own transaction — a
+    /// crash between this and `submit_run` burns a number, which is
+    /// acceptable (run numbers may have gaps).
+    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError>;
+
     /// Claim the next dispatchable job for a session. Marks the session
     /// seen, picks a ready job the runner may claim (capability + binding
     /// rules), mints its request/message correlation, and returns the
@@ -121,12 +128,6 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     // ── Reaper / reconcile ────────────────────────────────────────────
 
-    /// One reaper sweep: expire stale bindings, starved sessions, dead
-    /// runners, timed-out requests and expired pending uploads. Returns the
-    /// cancellations and expired requests the caller must act on.
-    async fn sweep_expired(&self, now: std::time::SystemTime)
-        -> Result<SweepOutcome, ControlError>;
-
     /// Startup reconcile: drop concurrency holders whose runs are terminal
     /// or missing, and recover or fail claims orphaned by the restart.
     async fn reconcile_on_boot(&self) -> Result<ReconcileOutcome, ControlError>;
@@ -162,6 +163,9 @@ pub(crate) struct PollRequest {
     pub(crate) verified_runner_id: Option<i64>,
     /// Capabilities resolved for the session's runner.
     pub(crate) runner: crate::models::RunnerCapabilities,
+    /// Runner self-reports busy (`status=busy`): deliver inflight/cancel/
+    /// active-request outcomes but do NOT claim new work.
+    pub(crate) busy: bool,
     /// Long-poll: the caller may hold the request until work appears. The
     /// backend returns `PollOutcome::Empty` immediately; the handler decides
     /// whether to wait on the notify channel.
@@ -224,21 +228,6 @@ pub(crate) enum RequestKey {
     TimelineId(uuid::Uuid),
 }
 
-/// What the reaper found and wants the caller to act on.
-#[derive(Debug, Default)]
-pub(crate) struct SweepOutcome {
-    /// Stale bindings released.
-    pub(crate) bindings_swept: usize,
-    /// Sessions expired (runner considered dead).
-    pub(crate) dead_sessions: Vec<String>,
-    /// Runners purged as dead.
-    pub(crate) dead_runners: Vec<i64>,
-    /// Requests that timed out and need failing.
-    pub(crate) expired_requests: Vec<i64>,
-    /// Jobs requeued from dead runners.
-    pub(crate) requeued: usize,
-}
-
 /// What boot reconcile recovered.
 #[derive(Debug, Default)]
 pub(crate) struct ReconcileOutcome {
@@ -280,6 +269,7 @@ impl Backend {
     pub(crate) async fn open(
         store_url: Option<&str>,
         state_dir: &std::path::Path,
+        cipher: crate::store::Envelope,
         pool_assignments_enabled: bool,
         require_job_assignments: bool,
         runner_liveness_timeout: std::time::Duration,
@@ -289,6 +279,7 @@ impl Backend {
         {
             let backend = super::postgres::PostgresBackend::connect(
                 url,
+                cipher,
                 pool_assignments_enabled,
                 require_job_assignments,
                 runner_liveness_timeout,
@@ -299,6 +290,7 @@ impl Backend {
         let path = state_dir.join("control.db");
         let backend = super::sqlite::SqliteBackend::open(
             &path,
+            cipher,
             pool_assignments_enabled,
             require_job_assignments,
             runner_liveness_timeout,
@@ -333,6 +325,176 @@ impl Backend {
             Self::Postgres(backend) => backend.read(f).await,
         }
     }
+
+    /// `read` under an explicit [`TxScope`] — loads only that working set on
+    /// a pooled read connection. Hot read paths (`append_log`, `console_log`)
+    /// use a narrow scope instead of materializing the full working set.
+    pub(crate) async fn read_scoped<T>(
+        &self,
+        scope: &super::txstate::TxScope,
+        f: impl FnOnce(&super::txstate::TxState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.read_scoped(scope, f),
+            Self::Postgres(backend) => backend.read_scoped(scope, f).await,
+        }
+    }
+
+    /// `transact` under an explicit [`TxScope`] — loads only that working
+    /// set. Used by the boot import (full scope) and hot paths that opt into
+    /// a narrow scope.
+    pub(crate) async fn transact_scoped<T>(
+        &self,
+        scope: &super::txstate::TxScope,
+        f: impl FnOnce(&mut super::txstate::TxState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.transact_scoped(scope, f),
+            Self::Postgres(backend) => backend.transact_scoped(scope, f).await,
+        }
+    }
+
+    /// Find the run a webhook delivery already produced, by its durable
+    /// `(delivery_id, workflow_path)` dedup key. O(1) via `runs_delivery` —
+    /// the submit path calls this before `transact_scoped` so the replay
+    /// check never scans the whole `runs` table.
+    pub(crate) async fn find_run_by_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<crate::models::RunRecord>, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.find_run_by_delivery(delivery_id, workflow_path),
+            Self::Postgres(backend) => {
+                backend
+                    .find_run_by_delivery(delivery_id, workflow_path)
+                    .await
+            }
+        }
+    }
+
+    /// Resolve a request's `(request_id, run_id)` from its `agent_job_id`.
+    /// O(1) via `job_requests_agent` — the broker complete path calls this
+    /// before `transact_scoped` so the working set stays narrow.
+    pub(crate) async fn find_request_by_agent_job_id(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<(i64, RunId)>, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.find_request_by_agent_job_id(agent_job_id),
+            Self::Postgres(backend) => backend.find_request_by_agent_job_id(agent_job_id).await,
+        }
+    }
+
+    /// The session that owns the request for `agent_job_id`. `complete_job`
+    /// resolves this before `transact_scoped` so `settle_request` can drop
+    /// the moot cancellation from the owner session's inflight messages.
+    pub(crate) async fn find_session_by_agent_job_id(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.find_session_by_agent_job_id(agent_job_id),
+            Self::Postgres(backend) => backend.find_session_by_agent_job_id(agent_job_id).await,
+        }
+    }
+
+    /// Every session owning a request of `run_id`. `cancel_run`/`cancel_job`
+    /// resolve these before `transact_scoped` so `settle_request` can drop
+    /// moot cancellations from each owner session's inflight messages.
+    pub(crate) async fn find_sessions_by_run(
+        &self,
+        run_id: RunId,
+    ) -> Result<std::collections::BTreeSet<String>, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.find_sessions_by_run(run_id),
+            Self::Postgres(backend) => backend.find_sessions_by_run(run_id).await,
+        }
+    }
+
+    /// `(run_id, owner_session)` for `request_id`. `acquire_context` resolves
+    /// this before `read_scoped` so the read stays narrow.
+    pub(crate) async fn find_request_context(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<(RunId, Option<String>)>, ControlError> {
+        match self {
+            Self::Sqlite(backend) => backend.find_request_context(request_id),
+            Self::Postgres(backend) => backend.find_request_context(request_id).await,
+        }
+    }
+
+    /// Update the scheduling config after open. Bootstrap applies the real
+    /// server config here once known — `open` only receives the recovered
+    /// defaults.
+    pub(crate) fn set_config(
+        &self,
+        pool_assignments_enabled: bool,
+        require_job_assignments: bool,
+        runner_liveness_timeout: std::time::Duration,
+    ) {
+        match self {
+            Self::Sqlite(backend) => backend.set_config(
+                pool_assignments_enabled,
+                require_job_assignments,
+                runner_liveness_timeout,
+            ),
+            Self::Postgres(backend) => backend.set_config(
+                pool_assignments_enabled,
+                require_job_assignments,
+                runner_liveness_timeout,
+            ),
+        }
+    }
+
+    /// Current scheduling config — the counterpart to [`Backend::set_config`]
+    /// for callers that need to flip one flag without knowing the rest.
+    #[cfg(test)]
+    pub(crate) fn config(&self) -> (bool, bool, std::time::Duration) {
+        match self {
+            Self::Sqlite(backend) => backend.config(),
+            Self::Postgres(backend) => backend.config(),
+        }
+    }
+
+    /// One-time legacy→control import, atomic and idempotent.
+    ///
+    /// Inside a single full-scope writer transaction, seeds the control
+    /// schema from a recovered legacy `InnerState` **only if the schema is
+    /// empty**. The emptiness check runs inside the same transaction as the
+    /// write, so two engines racing a fresh database cannot both seed, and a
+    /// restart against a live `control.db` never re-imports stale `preloop.db`
+    /// state over committed work.
+    ///
+    /// Returns `true` when this call performed the import, `false` when the
+    /// schema already held rows (nothing written).
+    pub(crate) async fn import_from_tx_if_empty(
+        &self,
+        seed: super::txstate::TxState,
+    ) -> Result<bool, ControlError> {
+        self.transact_scoped(&super::txstate::TxScope::full(), move |tx| {
+            let empty = tx.runs.is_empty()
+                && tx.job_requests.is_empty()
+                && tx.runners.is_empty()
+                && tx.ready_index.is_empty()
+                && tx.sessions.is_empty();
+            if !empty {
+                return Ok(false);
+            }
+            *tx = seed;
+            // A restored concurrency group may name a holder whose run is
+            // already terminal (the snapshot predates the completion) or
+            // missing entirely; leaving it parks every later submission in
+            // that group forever. Reconcile before anything dispatches, then
+            // re-promote whatever the freed slots unblock. Runs on `tx` so it
+            // sees the fully-populated working set (jobset admissions, run
+            // concurrency, holder keys).
+            super::sched::reconcile_concurrency_groups(tx);
+            super::sched::promote_ready_jobs(tx);
+            Ok(true)
+        })
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -341,6 +503,12 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.submit_run(submit).await,
             Self::Postgres(b) => b.submit_run(submit).await,
+        }
+    }
+    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.allocate_run_number(workflow_path).await,
+            Self::Postgres(b) => b.allocate_run_number(workflow_path).await,
         }
     }
     async fn poll_session(&self, poll: PollRequest) -> Result<PollOutcome, ControlError> {
@@ -394,6 +562,12 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.renew_request(request_id, runner_id).await,
         }
     }
+    async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.request(key).await,
+            Self::Postgres(b) => b.request(key).await,
+        }
+    }
     async fn release_request(&self, request_id: i64) -> Result<(), ControlError> {
         match self {
             Self::Sqlite(b) => b.release_request(request_id).await,
@@ -439,15 +613,6 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.apply_expansion(claim).await,
         }
     }
-    async fn sweep_expired(
-        &self,
-        now: std::time::SystemTime,
-    ) -> Result<SweepOutcome, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.sweep_expired(now).await,
-            Self::Postgres(b) => b.sweep_expired(now).await,
-        }
-    }
     async fn reconcile_on_boot(&self) -> Result<ReconcileOutcome, ControlError> {
         match self {
             Self::Sqlite(b) => b.reconcile_on_boot().await,
@@ -458,12 +623,6 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.run_record(run_id).await,
             Self::Postgres(b) => b.run_record(run_id).await,
-        }
-    }
-    async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.request(key).await,
-            Self::Postgres(b) => b.request(key).await,
         }
     }
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
