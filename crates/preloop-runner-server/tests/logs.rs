@@ -885,6 +885,63 @@ async fn blob_block_upload_still_rejects_blocks_over_cap() {
 }
 
 #[tokio::test]
+async fn blob_block_upload_midstream_cap_rejects_without_temp_file() {
+    // The early Content-Length check only fires when the client sends the
+    // header. Without it, stream_body_to_file must enforce the per-block cap
+    // mid-stream with 413 and leave no temp file behind. Memory-light: only
+    // one 1 MiB chunk is live at a time.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    let bearer = format!("Bearer {token}");
+    let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+
+    let chunk_bytes = 1024 * 1024usize;
+    let n_chunks = (memory_caps::MAX_BLOCK_BYTES + 1).div_ceil(chunk_bytes);
+    let chunk = bytes::Bytes::from(vec![0u8; chunk_bytes]);
+    let chunks =
+        (0..n_chunks).map(move |_| Ok::<bytes::Bytes, std::convert::Infallible>(chunk.clone()));
+    let streamed = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "/twirp-blob/cache/{blob_jwt}?comp=block&blockid=c3RyZWFtZWQ"
+                ))
+                .header(header::AUTHORIZATION, bearer)
+                .body(Body::from_stream(futures::stream::iter(chunks)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(streamed.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The failed block must not leave a temp file in its staging dir.
+    let blocks_dir = temp
+        .path()
+        .join("blobs")
+        .join("cache")
+        .join(&jti)
+        .join("blocks");
+    let mut leftovers = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&blocks_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".tmp.") {
+                leftovers.push(name);
+            }
+        }
+    }
+    assert!(
+        leftovers.is_empty(),
+        "streamed over-cap block left temp files behind: {leftovers:?}"
+    );
+}
+
+#[tokio::test]
 async fn native_api_rejects_job_runtime_token() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
