@@ -496,7 +496,6 @@ pub fn resolve_engine_token_with_store(
     Ok(token)
 }
 
-
 fn load_engine_token_with_store(
     storage_dir: &Path,
     store: &dyn CredentialStore,

@@ -2769,6 +2769,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "keyring",
+ "libc",
  "opentelemetry",
  "parking_lot",
  "percent-encoding",
