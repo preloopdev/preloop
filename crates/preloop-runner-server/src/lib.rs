@@ -27,6 +27,7 @@ pub mod webhook_api;
 pub mod webhook_health;
 pub mod webhook_status;
 pub mod webhook_watchdog;
+pub(crate) use crate::control::backend::ControlBackend;
 pub use errors::ApiError;
 pub mod actions;
 use actions::*;
