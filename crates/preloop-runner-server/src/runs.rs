@@ -2095,6 +2095,33 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 continue;
             }
 
+            // Full label validation against the co-hosted pool's advertised
+            // labels: when the pool has published them, a `runs-on` it can
+            // never satisfy fails at enqueue rather than starving in the
+            // queue. Skipped when the pool hasn't published (external-only
+            // deployments, or a pool that predates the field) — the
+            // starvation sweep remains the backstop there.
+            let pool_labels = shared.state.pool_status.snapshot().labels;
+            if !pool_labels.is_empty()
+                && !crate::runtime_scheduling::job_matches_runner(&queued_job.runs_on, &pool_labels)
+            {
+                let reason = format!(
+                    "the runner pool's advertised labels ({}) can never satisfy \
+                     `runs-on: {}`, so the job cannot be scheduled",
+                    pool_labels.join(", "),
+                    queued_job.runs_on.join(", ")
+                );
+                tracing::warn!(
+                    job = %job_id.0,
+                    labels = ?queued_job.runs_on,
+                    pool_labels = ?pool_labels,
+                    "runs-on unsatisfiable by runner pool; failing the job at enqueue"
+                );
+                unhostable_reasons.push((job_id.clone(), reason));
+                statuses.insert(job_id, ExecutionStatus::Failure);
+                continue;
+            }
+
             let needs_empty = queued_job.needs.is_empty();
             let max_parallel = queued_job.max_parallel;
             let under_mp = max_parallel

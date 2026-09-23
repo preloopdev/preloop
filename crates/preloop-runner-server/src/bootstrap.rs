@@ -254,17 +254,13 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // MAX_QUEUED_GRACE (see below), measured from ready-enqueue, so continuous
     // provisioning cannot protect an unschedulable job forever.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
-    // Absolute backstop, measured from ready-enqueue, on how long
-    // provisioning/preparing may pause a job's starvation clock. It protects
-    // a job whose runner is genuinely on the way, but keeps continuous
-    // successor prebuilds or a provision that fails and retries forever from
-    // masking an unschedulable job (bad `runs-on`, or a persistently broken
-    // provision) indefinitely.
-    // A fresh CoW runner may need to install a missing toolchain before it
-    // registers. With two concurrent forks, a large matrix can spend several
-    // minutes in that warm-up; the old ten-minute cap killed legitimate
-    // queued jobs while their runners were already booting.
-    const MAX_QUEUED_GRACE: Duration = Duration::from_secs(1800);
+    // Absolute backstop, measured from ready-enqueue, on how long a job whose
+    // labels the pool *can* satisfy may wait for a matching runner. It only
+    // fires when provisioning is genuinely stuck (e.g. every fork/exec fails
+    // and retries forever) — a job that merely outlives a slow warm is not
+    // unschedulable. One hour covers a full golden rebuild plus several
+    // failed provision rounds with headroom.
+    const MAX_QUEUED_GRACE: Duration = Duration::from_secs(3600);
     let pool_status = shared.state.pool_status.snapshot();
     let pool_preparing = shared
         .state
@@ -310,6 +306,36 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .duration_since(enqueued_at)
             .map(|age| age >= MAX_QUEUED_GRACE)
             .unwrap_or(true);
+        // Early label validation: when the co-hosted pool has published its
+        // advertised labels, a job whose `runs-on` the pool can never satisfy
+        // fails fast instead of starving. A job that *does* match is exempt
+        // from the short grace path entirely — its runner is guaranteed to
+        // appear once the pool warms, so only the absolute backstop applies.
+        if !pool_status.labels.is_empty() {
+            if crate::runtime_scheduling::job_matches_runner(&job.runs_on, &pool_status.labels) {
+                if !enqueue_age_expired {
+                    inner.queued_at.remove(&key);
+                    continue;
+                }
+            } else {
+                let reason = format!(
+                    "no runner is registered for `runs-on: {}` and the runner \
+                     pool's advertised labels ({}) can never satisfy it, so \
+                     the job cannot be scheduled",
+                    job.runs_on.join(", "),
+                    pool_status.labels.join(", ")
+                );
+                tracing::warn!(
+                    run_id = %job.run_id,
+                    job_id = %job.job_id.0,
+                    labels = ?job.runs_on,
+                    pool_labels = ?pool_status.labels,
+                    "queued job failed fast: runs-on unsatisfiable by runner pool"
+                );
+                starved_keys.push((job.run_id, job.job_id.clone(), reason));
+                continue;
+            }
+        }
         let grace = if pool_preparing {
             // A restart restores the queue's original enqueue timestamps but
             // destroys every pool VM. Give the replacement pool one process-
@@ -507,6 +533,39 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             run.jobs.insert(job_id.clone(), ExecutionStatus::Failure);
             run.status = crate::runtime_scheduling::summarize_run(run.jobs.values().copied());
             crate::runtime_scheduling::finalize_run_if_complete(run);
+        }
+    }
+
+    // Record queue-wait for every starved job so the histogram covers all
+    // terminal outcomes, not just `claimed`. `unschedulable` = the pool's
+    // advertised labels can never match; `starved` = a matching runner
+    // never appeared inside the backstop.
+    for (run_id, job_id, reason) in &starved {
+        let outcome = if reason.contains("can never satisfy") {
+            "unschedulable"
+        } else {
+            "starved"
+        };
+        if let Some(job) = queued_jobs
+            .iter()
+            .find(|job| job.run_id == *run_id && job.job_id == *job_id)
+        {
+            let elapsed_nanos = (std::time::SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i128)
+                .saturating_sub(job.enqueued_at_unix_nanos as i128);
+            if elapsed_nanos > 0 {
+                shared
+                    .state
+                    .observability
+                    .metrics()
+                    .lifecycle
+                    .record_queue_wait(
+                        outcome,
+                        std::time::Duration::from_nanos(elapsed_nanos as u64),
+                    );
+            }
         }
     }
 

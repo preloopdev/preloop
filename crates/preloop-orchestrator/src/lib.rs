@@ -1413,7 +1413,8 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
          mkdir -p /run/user/{uid} /opt/hostedtoolcache /usr/local/rustup /usr/local/cargo; \
          chown {uid}:{uid} /run/user/{uid} {root} 2>/dev/null; \
          chown -R {uid}:{uid} /usr/local/rustup /usr/local/cargo 2>/dev/null; \
-         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
+           chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
            printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          getent group docker >/dev/null 2>&1 && usermod -aG docker {user} 2>/dev/null || true",
@@ -2650,6 +2651,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
         if let Some(ps) = &self.config.pool_status {
             ps.set_preparing(true);
+            // Publish the labels this pool advertises so the server's
+            // starvation sweep can tell "runner still warming" apart from
+            // "no runner can ever match these labels".
+            ps.set_labels(self.config.labels.clone());
         }
         // Any error exit below (host externals, artifact prep, stale-machine
         // cleanup, golden bake) must clear the flag again; the guard is
@@ -5172,7 +5177,8 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
          chown {uid}:{uid} /run/user/{uid} 2>/dev/null || true; \
          if [ -d /usr/local/rustup ]; then chown -R {uid}:{uid} /usr/local/rustup; fi; \
          if [ -d /usr/local/cargo ]; then chown -R {uid}:{uid} /usr/local/cargo; fi; \
-         chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
+         [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || \
+           chmod -R 777 /opt/hostedtoolcache 2>/dev/null; \
          grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || \
            printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
          mkdir -p /run/preloop-control 2>/dev/null; chmod 777 /run/preloop-control 2>/dev/null; \

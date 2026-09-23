@@ -154,6 +154,12 @@ pub struct PoolSnapshot {
     /// Count of stale job bindings released back to the waitlist.
     #[serde(default)]
     pub released_bindings: u64,
+    /// Runner labels the pool advertises (pool -> server). The starvation
+    /// sweep and enqueue validation match `runs-on` against this set: a job
+    /// whose labels the pool can never satisfy fails fast instead of
+    /// starving, and a matching job is exempt while the pool warms.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 impl Default for PoolSnapshot {
@@ -169,10 +175,11 @@ impl Default for PoolSnapshot {
             paused: 0,
             consecutive_provision_failures: 0,
             last_transition_at: None,
-            released_bindings: 0,
             queue_depth: 0,
             next_job_runs_on: Vec::new(),
             pending_registrations: 0,
+            released_bindings: 0,
+            labels: Vec::new(),
         }
     }
 }
@@ -257,6 +264,14 @@ impl PoolStatus {
 
     pub fn set_next_job_runs_on(&self, labels: Vec<String>) {
         self.inner.write().next_job_runs_on = labels;
+    }
+
+    /// Publish the runner labels this pool advertises. Set once at pool
+    /// construction; the server's starvation sweep and enqueue validation
+    /// read it to distinguish "runner not ready yet" from "no runner can
+    /// ever match".
+    pub fn set_labels(&self, labels: Vec<String>) {
+        self.inner.write().labels = labels;
     }
 
     pub fn insert_pending(&self, token: String, at: std::time::SystemTime) {
