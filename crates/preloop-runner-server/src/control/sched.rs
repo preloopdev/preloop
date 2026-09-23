@@ -49,17 +49,24 @@ fn binding_fresh(at: std::time::SystemTime, now: std::time::SystemTime) -> bool 
 
 /// Iterate the global ready queue: every persisted ready row (`ready_index`)
 /// followed by jobs this transaction newly enqueued (`queue`).
-fn ready_jobs(tx: &TxState) -> impl Iterator<Item = &QueuedJob> {
+pub(crate) fn ready_jobs(tx: &TxState) -> impl Iterator<Item = &QueuedJob> {
     tx.ready_index.iter().chain(tx.queue.iter())
 }
 
 /// The `runs-on` labels of the global queue front, for the pool's next-image
-/// selection (`sync_next_job_labels` in the old code).
+/// selection (`sync_next_job_labels` in the old code). When the ready queue
+/// was loaded this transaction, the live front is exact — it reflects the
+/// claim that just ran and any new enqueues. When the scope skipped the
+/// ready queue, fall back to the unscoped load-time snapshot so a narrow
+/// scope never names the wrong platform.
 pub(crate) fn next_job_labels(tx: &TxState) -> Vec<String> {
-    ready_jobs(tx)
-        .next()
-        .map(|job| job.runs_on.clone())
-        .unwrap_or_default()
+    if tx.ready_queue_loaded {
+        return ready_jobs(tx)
+            .next()
+            .map(|j| j.runs_on.clone())
+            .unwrap_or_default();
+    }
+    tx.next_queue_labels.clone()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -508,6 +515,28 @@ pub(crate) fn clear_assignment(tx: &mut TxState, run_id: RunId, job_id: &JobId) 
     ready_jobs(tx).any(|job| job.run_id == run_id && job.job_id == *job_id)
 }
 
+/// Requeue a claimed job back onto the ready queue after its owner runner is
+/// gone (crash recovery, runner purge). Releases the assignment, resets the
+/// job's canonical status to `Queued` and recomputes the run summary — the
+/// job returns to the dispatch queue for a fresh runner, no longer
+/// `in_progress` under the dead runner's claim. Returns `true` if the job was
+/// claimed and requeued.
+pub(crate) fn requeue_claimed(tx: &mut TxState, run_id: RunId, job_id: &JobId) -> bool {
+    let key = (run_id, job_id.clone());
+    let Some(job) = tx.claimed_jobs.remove(&key) else {
+        return false;
+    };
+    clear_assignment(tx, run_id, job_id);
+    // `set_job_status` records the override even when the run isn't loaded
+    // (a widened requeue), and mirrors into `run.jobs` when it is.
+    tx.set_job_status(run_id, job_id.clone(), ExecutionStatus::Queued);
+    if let Some(run) = tx.runs.get_mut(&run_id) {
+        run.status = summarize_run(run.jobs.values().copied());
+    }
+    tx.push_ready(job);
+    true
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Job-level concurrency gate
 // ─────────────────────────────────────────────────────────────────────────
@@ -641,6 +670,9 @@ pub(crate) fn cancel_run_inner(tx: &mut TxState, run_id: RunId, reason: Option<&
                 *status = ExecutionStatus::Cancelled;
             }
         }
+        // A cancelled run is terminal: stamp completion metadata so the
+        // record carries `completed_at`/`conclusion` like the old handler did.
+        finalize_run_if_complete(record);
     }
 
     let mut cancellations = Vec::new();
@@ -656,8 +688,7 @@ pub(crate) fn cancel_run_inner(tx: &mut TxState, run_id: RunId, reason: Option<&
     let count = cancellations.len();
     tx.cancellation_queue.extend(cancellations);
 
-    tx.queue.retain(|job| job.run_id != run_id);
-    tx.ready_index.retain(|job| job.run_id != run_id);
+    tx.retain_ready(|job| job.run_id != run_id);
     tx.pending_jobs.retain(|job| job.run_id != run_id);
     tx.held_runs.remove(&run_id);
     tx.job_assignments.retain(|(id, _), _| *id != run_id);
@@ -711,10 +742,7 @@ pub(crate) fn cancel_job_inner(tx: &mut TxState, run_id: RunId, job_id: &JobId) 
             count = 1;
         }
     }
-    tx.queue
-        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
-    tx.ready_index
-        .retain(|j| !(j.run_id == run_id && j.job_id == *job_id));
+    tx.retain_ready(|j| !(j.run_id == run_id && j.job_id == *job_id));
     tx.job_assignments
         .retain(|(id, jid), _| !(*id == run_id && *jid == *job_id));
     tx.pool_pending
@@ -969,15 +997,23 @@ pub(crate) fn promote_next_from_group(
         return;
     };
 
-    if !matches!(&next, concurrency::Holder::Job { .. }) {
+    // Mark the group running for Job/JobSet holders up front. `Holder::Run`
+    // is marked inside its arm only after `held_runs.remove` confirms the
+    // run's held jobs are actually loaded — a foreign run (not in this tx's
+    // scope) has no `held_runs` entry, and marking the group running while
+    // its jobs stay persisted `held` would strand them and wedge the slot.
+    if matches!(&next, concurrency::Holder::JobSet { .. }) {
         if let Some(group) = tx.concurrency_groups.get_mut(key) {
             group.running = Some(next.clone());
         }
     }
-
     match next {
         concurrency::Holder::Run(run_id) => {
             if let Some(jobs) = tx.held_runs.remove(&run_id) {
+                // The run's held jobs are loaded — safe to occupy the slot.
+                if let Some(group) = tx.concurrency_groups.get_mut(key) {
+                    group.running = Some(concurrency::Holder::Run(run_id));
+                }
                 for mut job in jobs {
                     if let Some(run) = tx.runs.get_mut(&run_id) {
                         run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
@@ -1003,6 +1039,7 @@ pub(crate) fn promote_next_from_group(
                                 if let Some(run) = tx.runs.get_mut(&run_id) {
                                     hydrate_needs_context(&mut job, run);
                                 }
+                                sync_broker_message(tx, &job);
                                 stamp_ready_enqueue(&mut job);
                                 on_job_enqueued(tx, &job);
                                 tx.push_ready(job);
@@ -1032,10 +1069,20 @@ pub(crate) fn promote_next_from_group(
                 }
                 if let Some(run) = tx.runs.get_mut(&run_id) {
                     if run.status == ExecutionStatus::Pending {
-                        run.status = ExecutionStatus::Queued;
+                        run.status = ExecutionStatus::InProgress;
                     }
                 }
+            } else if !tx.runs.contains_key(&run_id) {
+                // Foreign run: its held jobs aren't in this tx's scope, so
+                // `held_runs` has no entry. Don't mark the group running or
+                // drop the holder — push it back to the FRONT of pending so a
+                // later transaction that DOES load the run promotes it.
+                if let Some(group) = tx.concurrency_groups.get_mut(key) {
+                    group.pending.push_front(concurrency::Holder::Run(run_id));
+                }
             }
+            // else: run IS loaded but has no held jobs left (already
+            // promoted) — consume the holder; nothing to requeue.
         }
         concurrency::Holder::Job { run_id, job_id } => {
             let pos = tx
@@ -1056,10 +1103,14 @@ pub(crate) fn promote_next_from_group(
             if let Some(group) = tx.concurrency_groups.get_mut(key) {
                 group.running = Some(concurrency::Holder::Job { run_id, job_id });
             }
+            // `set_job_status` records the override even when the run isn't
+            // loaded (a widened promotion), and mirrors into `run.jobs` when
+            // it is — a blocked job promoted to ready becomes `queued`.
+            tx.set_job_status(run_id, job.job_id.clone(), ExecutionStatus::Queued);
             if let Some(run) = tx.runs.get_mut(&run_id) {
-                run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                 hydrate_needs_context(&mut job, run);
             }
+            sync_broker_message(tx, &job);
             stamp_concurrency_acquired(&mut job);
             stamp_ready_enqueue(&mut job);
             on_job_enqueued(tx, &job);
@@ -1096,25 +1147,21 @@ pub(crate) fn promote_next_from_group(
             for mut job in to_queue {
                 stamp_concurrency_acquired(&mut job);
                 if job.reusable_call.is_some() {
-                    if let Some(run) = tx.runs.get_mut(&run_id) {
-                        run.jobs
-                            .insert(job.job_id.clone(), ExecutionStatus::Pending);
-                    }
+                    tx.set_job_status(run_id, job.job_id.clone(), ExecutionStatus::Pending);
                     tx.pending_jobs.push_back(job);
                     continue;
                 }
                 if under_max_parallel(tx, &job) {
+                    tx.set_job_status(run_id, job.job_id.clone(), ExecutionStatus::Queued);
                     if let Some(run) = tx.runs.get_mut(&run_id) {
-                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
                         hydrate_needs_context(&mut job, run);
                     }
+                    sync_broker_message(tx, &job);
                     stamp_ready_enqueue(&mut job);
                     on_job_enqueued(tx, &job);
                     tx.push_ready(job);
                 } else {
-                    if let Some(run) = tx.runs.get_mut(&run_id) {
-                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                    }
+                    tx.set_job_status(run_id, job.job_id.clone(), ExecutionStatus::Queued);
                     tx.pending_jobs.push_back(job);
                 }
             }
@@ -1456,6 +1503,7 @@ pub(crate) fn promote_ready_jobs(tx: &mut TxState) -> SchedulingOutcome {
                     if let Some(run) = tx.runs.get(&job.run_id) {
                         hydrate_needs_context(&mut job, run);
                     }
+                    sync_broker_message(tx, &job);
                     let gate = tx
                         .runs
                         .get(&job.run_id)
@@ -1652,10 +1700,7 @@ pub(crate) fn apply_matrix_fail_fast(
         }
     }
     run.status = summarize_run(run.jobs.values().copied());
-    tx.queue
-        .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
-    tx.ready_index
-        .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
+    tx.retain_ready(|job| !(job.run_id == run_id && job.base_id == base_id));
     tx.pending_jobs
         .retain(|job| !(job.run_id == run_id && job.base_id == base_id));
     cancellations.retain_mut(|c| {
@@ -1714,6 +1759,19 @@ pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
                 "deployment environment expression failed to evaluate after needs completed"
             );
         }
+    }
+}
+
+/// Mirror a hydrated job message into `broker_messages` so `acquirejob`
+/// serves the post-hydration payload. `submit_run_tx` stores the message at
+/// submit time (needs context empty); `hydrate_needs_context` mutates the
+/// `QueuedJob` copy at promotion. Without this sync the delivered message
+/// keeps the empty `needs` context and `needs:`-gated consumers see no
+/// upstream outputs.
+pub(crate) fn sync_broker_message(tx: &mut TxState, job: &QueuedJob) {
+    let request_id = job.message.request_id;
+    if request_id != 0 {
+        tx.broker_messages.insert(request_id, job.message.clone());
     }
 }
 
@@ -1807,7 +1865,7 @@ fn is_expandable_node(tx: &TxState, run_id: RunId, job_id: &JobId) -> bool {
 }
 
 /// The ids of every expandable node in a run (ported verbatim).
-fn expandable_job_ids(tx: &TxState, run_id: RunId) -> BTreeSet<JobId> {
+pub(crate) fn expandable_job_ids(tx: &TxState, run_id: RunId) -> BTreeSet<JobId> {
     let mut ids = BTreeSet::new();
     for job in tx
         .pending_jobs
@@ -1832,7 +1890,7 @@ fn expandable_job_ids(tx: &TxState, run_id: RunId) -> BTreeSet<JobId> {
     ids
 }
 
-fn node_settle_status(tx: &TxState, run_id: RunId, node_id: &JobId) -> ExecutionStatus {
+pub(crate) fn node_settle_status(tx: &TxState, run_id: RunId, node_id: &JobId) -> ExecutionStatus {
     tx.runs
         .get(&run_id)
         .and_then(|run| run.jobs.get(node_id).copied())
@@ -1851,10 +1909,27 @@ pub(crate) enum RequestRetirement {
 
 /// Settle one request whose logical job is terminal (ported verbatim).
 pub(crate) fn settle_request(tx: &mut TxState, request_id: i64, status: ExecutionStatus) {
+    // Capture the session that owned this request before releasing it: a
+    // `JobCancellation` still sitting in that session's inflight messages is
+    // moot once the job settles — the runner already stopped the work — so it
+    // must not be redelivered on the next (busy) poll.
+    let owner_session = tx
+        .session_active_requests
+        .iter()
+        .find(|(_, &rid)| rid == request_id)
+        .map(|(sid, _)| sid.clone());
     tx.session_active_requests
         .retain(|_, &mut rid| rid != request_id);
     tx.inflight_requests.remove(&request_id);
     tx.github_token_requests.remove(&request_id);
+    if let Some(session_id) = owner_session {
+        if let Some(messages) = tx.inflight_messages.get_mut(&session_id) {
+            messages.retain(|_, msg| msg.message_type != azdo::message_type::JOB_CANCELLED);
+            if messages.is_empty() {
+                tx.inflight_messages.remove(&session_id);
+            }
+        }
+    }
     if let Some(record) = tx.job_requests.get_mut(&request_id) {
         if record.result.is_none() {
             record.result = Some(status);
@@ -2294,7 +2369,7 @@ fn register_expanded_jobs(tx: &mut TxState, run_id: RunId, jobs: Vec<BuiltJob>) 
     for BuiltJob {
         plan,
         condition_context,
-        artifacts,
+        mut artifacts,
     } in jobs
     {
         if let Some(platform) = unhostable_platform(&plan.runs_on, platforms.clone()) {
@@ -2315,6 +2390,13 @@ fn register_expanded_jobs(tx: &mut TxState, run_id: RunId, jobs: Vec<BuiltJob>) 
             }
             continue;
         }
+        // Mint the `job_requests` primary key inside the writer transaction
+        // (cross-process-safe) and stamp it on both the request record and
+        // the runner-facing message — `build_job_artifacts` leaves a
+        // placeholder (0) because it runs outside the transaction.
+        let request_id = tx.alloc_request_id();
+        artifacts.job_request.request_id = request_id;
+        artifacts.agent_msg.request_id = request_id;
         let job_request = artifacts.job_request;
         tx.id_token_grants
             .insert((run_id, plan.id.clone()), artifacts.id_token_granted);
