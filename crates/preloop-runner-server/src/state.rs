@@ -333,6 +333,18 @@ pub type ActionShaCache = std::sync::Mutex<
     std::collections::HashMap<(String, String, String), (Option<String>, std::time::Instant)>,
 >;
 
+/// Engine-authoritative action archive-checksum pins: (`owner`, `repo`,
+/// `sha`) (lowercased) → lowercase hex SHA-256 of the downloaded tarball
+/// bytes.
+///
+/// The digest pins the exact archive bytes the engine fetched for a
+/// commit, hashed while streaming the fetch and before any extraction, so
+/// a known pin is compared before any destination tree exists. Pins are
+/// minted only by the engine itself — never by job VMs — so workflow code
+/// cannot poison them.
+pub type ActionArchiveSha256Pins =
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -525,6 +537,16 @@ pub struct AppState {
     /// and bounds GitHub API pressure; entries expire after
     /// [`ACTION_SHA_CACHE_TTL`].
     pub action_sha_cache: Arc<ActionShaCache>,
+    /// Trust-on-first-use pins of action archive checksums
+    /// (`owner`, `repo`, `sha`) → hex SHA-256 of the tarball bytes. The
+    /// engine computes the digest while fetching the tarball from the
+    /// forge and pins it here; later downloads must match it or fail
+    /// closed before extraction. Keys are lowercased (GitHub owner/repo
+    /// are case-insensitive). In-memory like `action_sha_cache`: an engine
+    /// restart rebuilds pins from the on-disk digest sidecars on the next
+    /// cache hit, so the first download after a restart is trusted —
+    /// guarded by the engine's TLS fetch like any other download.
+    pub action_archive_sha256_pins: Arc<ActionArchiveSha256Pins>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1154,6 +1176,9 @@ impl AppState {
             github_urls,
             pr_config,
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            action_archive_sha256_pins: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),

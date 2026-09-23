@@ -99,9 +99,18 @@ fn runner_volumes(
     config: &RunnerPoolConfig,
     machine: &MachineName,
     mount_externals: bool,
-) -> Vec<VolumeMount> {
+) -> Result<Vec<VolumeMount>, OrchestratorError> {
+    // #294: the bundle mounted at `/opt/preloop/bin` is selected fail-closed.
+    // `ensure_host_externals` (pool warm) downloads and materializes the node
+    // externals before any golden is created, so by the time volumes are
+    // computed the bundle is complete; if it ever is not — wiped or damaged
+    // between warm and a later machine creation — selecting a bundle refuses
+    // instead of mounting an externals-less bundle into the golden, which
+    // used to boot node-less runners that failed every JS action step with
+    // `bundled nodeXX is missing`. This stays a pure volume-list builder:
+    // the download lives in `ensure_host_externals`, not here.
     let mut volumes = vec![VolumeMount {
-        host: effective_runner_bundle(config),
+        host: effective_runner_bundle(config)?,
         guest: PathBuf::from("/opt/preloop/bin"),
         read_only: true,
     }];
@@ -109,15 +118,16 @@ fn runner_volumes(
     // built from a registry base image — never baked into a machine image nor
     // downloaded per runner (that is what the `--no-externals` configure flag
     // enforces). Artifact-based machines (packed golden and create-per-runner)
-    // skip the mount: the packed artifact already carries the externals baked
-    // into its rootfs, and every virtio device consumes one of libkrun's 11
-    // x86_64 IRQ lines — the packed launcher is already the device-heaviest
-    // config (root + layers virtiofs + 2 disks + mounts + vsock + net +
-    // console), so a third mount pushes it past the budget and the golden
-    // fails to start (`RegisterNetDevice(IrqsExhausted)`). When the pack is
-    // rebuilt without the baked externals, fold the mount back in (e.g. a
-    // guest symlink `<root>/externals -> /opt/preloop/bin/externals` pointing
-    // at an `externals/` dir shipped inside the runner bundle).
+    // skip the mount: the packed artifact carries only the
+    // `<root>/externals -> /opt/preloop/bin/externals` symlink and every
+    // virtio device consumes one of libkrun's 11 x86_64 IRQ lines — the
+    // packed launcher is already the device-heaviest config (root + layers
+    // virtiofs + 2 disks + mounts + vsock + net + console), so a third mount
+    // pushes it past the budget and the golden fails to start
+    // (`RegisterNetDevice(IrqsExhausted)`). The real externals ride the
+    // `/opt/preloop/bin` bundle mount above, which is guaranteed complete:
+    // `ensure_host_externals` materializes it at pool warm and the
+    // fail-closed selection here refuses anything less.
     if mount_externals {
         volumes.push(VolumeMount {
             host: config.externals_dir.join("externals"),
@@ -141,7 +151,7 @@ fn runner_volumes(
             read_only: false,
         });
     }
-    volumes
+    Ok(volumes)
 }
 
 /// Populate the host-side externals directory, validating the manifest and
@@ -282,17 +292,29 @@ fn mirror_bundle_dir(config: &RunnerPoolConfig) -> PathBuf {
 ///
 /// Prefers the release directory and falls back to the engine-owned mirror,
 /// which `materialize_mirror_bundle` only leaves in place when it is complete.
-fn effective_runner_bundle(config: &RunnerPoolConfig) -> PathBuf {
+///
+/// #294: fails closed instead of returning an externals-less bundle. Mounting
+/// an incomplete bundle used to boot goldens and fallback runners whose baked
+/// `<root>/externals` symlink dangled, so every JS action step failed with
+/// `bundled nodeXX is missing` long after the pool reported itself ready.
+fn effective_runner_bundle(config: &RunnerPoolConfig) -> Result<PathBuf, OrchestratorError> {
     if externals_complete(&config.runner_bundle.join("externals")) {
-        return config.runner_bundle.clone();
+        return Ok(config.runner_bundle.clone());
     }
     let mirror = mirror_bundle_dir(config);
     if mirror.join(&config.runner_binary_name).is_file()
         && externals_complete(&mirror.join("externals"))
     {
-        return mirror;
+        return Ok(mirror);
     }
-    config.runner_bundle.clone()
+    Err(OrchestratorError::Config(format!(
+        "no runner bundle with complete node externals: release bundle {} and \
+         engine-owned mirror {} are both incomplete; check network egress to \
+         nodejs.org and the host externals at {}",
+        config.runner_bundle.display(),
+        mirror.display(),
+        config.externals_dir.join("externals").display(),
+    )))
 }
 
 /// Publish an engine-owned bundle carrying the runner binary and the validated
@@ -2405,26 +2427,92 @@ fn remove_golden_record(config: &RunnerPoolConfig, golden: &MachineName) {
     }
 }
 
-/// Whether `golden` is already booted as a fork base for `fingerprint`.
+/// Adoption outcome for an existing golden machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoldenAdopt {
+    /// Already booted as a fork base with a matching fingerprint; use as-is.
+    Reusable,
+    /// Stopped with a matching fingerprint; needs `start_forkable` to serve
+    /// forks again. This is the normal state after a graceful engine shutdown,
+    /// which stops (not deletes) goldens so the next start can adopt them.
+    Rearm,
+    /// No adoptable golden; bake or unpack a fresh one.
+    Rebuild,
+}
+
+/// How `golden` can serve as the fork base for `fingerprint`, if at all.
 ///
 /// Deliberately host-side: the golden is frozen as SmolVM's fork base, and
 /// probing it through the guest would touch the very snapshot every clone is
-/// taken from.
-async fn golden_is_reusable<P: VmProvider>(
+/// taken from. The golden registry is in-memory, so without adoption an
+/// engine restart rebakes a golden that is still sitting there fully baked —
+/// apt plus rustup, five to eleven minutes, before the first job can run.
+async fn golden_adopt_state<P: VmProvider>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
     golden: &MachineName,
     fingerprint: &str,
-) -> bool {
-    if !matches!(provider.status(golden).await, Ok(MachineState::Running)) {
-        return false;
+) -> GoldenAdopt {
+    let state = provider.status(golden).await;
+    if !matches!(state, Ok(MachineState::Running) | Ok(MachineState::Stopped)) {
+        return GoldenAdopt::Rebuild;
     }
     let Some(path) = golden_record_path(config, golden) else {
-        return false;
+        return GoldenAdopt::Rebuild;
     };
-    std::fs::read_to_string(path)
+    let matched = std::fs::read_to_string(path)
         .map(|recorded| recorded.trim() == fingerprint)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !matched {
+        return GoldenAdopt::Rebuild;
+    }
+    match state {
+        Ok(MachineState::Running) => GoldenAdopt::Reusable,
+        _ => GoldenAdopt::Rearm,
+    }
+}
+
+/// Adopt an existing golden instead of baking or unpacking a fresh one.
+/// Returns `true` when the golden is ready to serve forks.
+async fn adopt_golden<P: VmProvider>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+    fingerprint: &str,
+    kind: &str,
+) -> Result<bool, OrchestratorError> {
+    match golden_adopt_state(provider, config, golden, fingerprint).await {
+        GoldenAdopt::Reusable => {
+            info!(
+                machine = golden.as_str(),
+                fingerprint = %fingerprint,
+                "adopted the existing {kind} fork base"
+            );
+            Ok(true)
+        }
+        GoldenAdopt::Rearm => {
+            info!(
+                machine = golden.as_str(),
+                fingerprint = %fingerprint,
+                "re-arming stopped {kind} fork base left by the previous engine run"
+            );
+            if let Err(error) = provider.start_forkable(golden).await {
+                warn!(
+                    machine = golden.as_str(),
+                    %error,
+                    "golden re-arm failed; rebuilding"
+                );
+                return Ok(false);
+            }
+            info!(
+                machine = golden.as_str(),
+                fingerprint = %fingerprint,
+                "adopted the existing {kind} fork base"
+            );
+            Ok(true)
+        }
+        GoldenAdopt::Rebuild => Ok(false),
+    }
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
@@ -2438,16 +2526,11 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
 ) -> Result<(), OrchestratorError> {
-    // The golden registry is in-memory, so without this every engine restart
-    // rebakes a golden that is still sitting there fully baked and forkable —
+    // The golden registry is in-memory, so without adoption every engine
+    // restart rebakes a golden that is still sitting there fully baked —
     // apt plus rustup, five to eleven minutes, before the first job of that
     // environment can run, paid again on every deploy.
-    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
-        info!(
-            machine = golden.as_str(),
-            fingerprint = %env_spec.fingerprint,
-            "adopted the existing golden fork base"
-        );
+    if adopt_golden(provider, config, golden, &env_spec.fingerprint, "golden").await? {
         return Ok(());
     }
     // Any record must die before the machine does: a rebake interrupted
@@ -2466,7 +2549,7 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, true),
+        volumes: runner_volumes(config, golden, true)?,
         sockets: config
             .control_socket
             .iter()
@@ -2552,16 +2635,19 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     golden: &MachineName,
 ) -> Result<(), OrchestratorError> {
     // Same adoption rule as the baked-golden path: an engine restart must not
-    // re-unpack a multi-GiB packed golden that is still sitting there forkable
-    // and fingerprint-matched. Without this every `serve` restart pays the
+    // re-unpack a multi-GiB packed golden that is still sitting there
+    // fingerprint-matched. Without this every `serve` restart pays the
     // full unpack (tens of GB of storage writes) before the first job.
     let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
-    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
-        info!(
-            machine = golden.as_str(),
-            fingerprint = %env_spec.fingerprint,
-            "adopted the existing packed golden fork base"
-        );
+    if adopt_golden(
+        provider,
+        config,
+        golden,
+        &env_spec.fingerprint,
+        "packed golden",
+    )
+    .await?
+    {
         return Ok(());
     }
     remove_golden_record(config, golden);
@@ -2582,7 +2668,7 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         storage_gib: config.storage_gib,
         overlay_gib: config.overlay_gib,
         network: NetworkPolicy::PublicOnly,
-        volumes: runner_volumes(config, golden, false),
+        volumes: runner_volumes(config, golden, false)?,
         sockets: config
             .control_socket
             .iter()
@@ -2627,6 +2713,23 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         vm_telemetry_deregister(config, golden);
         let _ = provider.delete(golden).await;
         return Err(error.into());
+    }
+    // Issue #295: smolvm's pack export leaves ~29 GB of intermediates
+    // (`storage.ext4`, `layers/*.tar`) beside the finished `storage.raw`,
+    // and every fork copies the golden's whole data directory. Prune them
+    // now that the disk is written. Best-effort: never fail the golden
+    // over disk hygiene.
+    match provider.prune_pack_intermediates(golden).await {
+        Ok(true) => info!(
+            machine = golden.as_str(),
+            "pruned pack/ build intermediates from packed golden"
+        ),
+        Ok(false) => {}
+        Err(error) => warn!(
+            machine = golden.as_str(),
+            %error,
+            "failed to prune pack/ build intermediates from packed golden"
+        ),
     }
     write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
@@ -2817,10 +2920,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
 
         while slots.join_next().await.is_some() {}
-        // Clean up every environment-specific golden fork base.
+        // Stop, don't delete, every environment-specific golden fork base: the
+        // machine directory (fork snapshot) must survive so the next engine
+        // start can adopt it instead of rebaking. `remove_stale_machines`
+        // spares recorded goldens; the fingerprint record gates adoption.
         for golden in golden_registry.all_names().await {
             vm_telemetry_deregister(&self.config, &golden);
-            let _ = self.provider.delete(&golden).await;
+            if let Err(error) = self.provider.stop(&golden).await {
+                warn!(
+                    machine = golden.as_str(),
+                    %error,
+                    "failed to stop golden on shutdown; the next start will rebake it"
+                );
+            }
         }
         self.remove_stale_machines().await?;
         Ok(())
@@ -2968,9 +3080,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
         // Drain remaining runners on shutdown.
         while slots.join_next().await.is_some() {}
+        // Stop, don't delete, golden fork bases: the machine directory (fork
+        // snapshot) must survive so the next engine start can adopt the golden
+        // instead of rebaking it. `remove_stale_machines` spares recorded
+        // goldens; the fingerprint record gates adoption.
         for golden in golden_registry.all_names().await {
             vm_telemetry_deregister(&self.config, &golden);
-            let _ = self.provider.delete(&golden).await;
+            if let Err(error) = self.provider.stop(&golden).await {
+                warn!(
+                    machine = golden.as_str(),
+                    %error,
+                    "failed to stop golden on shutdown; the next start will rebake it"
+                );
+            }
         }
         self.remove_stale_machines().await?;
         Ok(())
@@ -3222,6 +3344,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 .as_str()
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
+                // A golden fork base recorded by a previous engine run is not
+                // stale: its machine directory plus the fingerprint record are
+                // exactly what the startup adoption path needs. Deleting it
+                // here forced a full rebake on every restart (#293); the
+                // prepare path rebuilds it anyway when the fingerprint no
+                // longer matches.
+                if golden_record_path(&self.config, &name).is_some_and(|path| path.is_file()) {
+                    continue;
+                }
                 notify_runner_gone(&self.config, &name).await;
                 vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
@@ -4932,7 +5063,7 @@ async fn provision_runner<P: VmProvider + 'static>(
             storage_gib: config.storage_gib,
             overlay_gib: config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
-            volumes: runner_volumes(config, name, !uses_packed_artifact),
+            volumes: runner_volumes(config, name, !uses_packed_artifact)?,
             sockets: config
                 .control_socket
                 .iter()
@@ -5472,6 +5603,8 @@ mod lifecycle_tests {
         /// Whether this provider claims runtime-preserving suspension. When
         /// set, the debug watcher may park the machine via `stop`.
         suspends: bool,
+        /// Names passed to `prune_pack_intermediates`, in call order.
+        prune_pack_calls: Mutex<Vec<String>>,
     }
 
     impl TestProvider {
@@ -5501,6 +5634,7 @@ mod lifecycle_tests {
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
                 suspends: false,
+                prune_pack_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -6452,9 +6586,15 @@ chmod +x "$dest/bin/node"
         config.runner_bundle = release.path().to_path_buf();
         config.externals_dir = home.path().to_path_buf();
 
-        // The release bundle carries no externals, so the guest would resolve
-        // its baked symlink onto nothing.
-        assert_eq!(effective_runner_bundle(&config), release.path());
+        // The release bundle carries no externals and no mirror exists yet:
+        // selecting a bundle must fail closed instead of mounting an
+        // externals-less bundle into the golden (#294).
+        let error = effective_runner_bundle(&config)
+            .expect_err("an incomplete bundle must not be selected silently");
+        assert!(
+            format!("{error}").contains("complete node externals"),
+            "unexpected error: {error}"
+        );
 
         materialize_mirror_bundle(&config, &host_externals)
             .expect("the engine-owned mirror is publishable");
@@ -6463,7 +6603,10 @@ chmod +x "$dest/bin/node"
         assert!(externals_complete(&mirror.join("externals")));
         assert!(mirror.join("runner").is_file());
         // Every guest now mounts the mirror instead of the incomplete release.
-        assert_eq!(effective_runner_bundle(&config), mirror);
+        assert_eq!(
+            effective_runner_bundle(&config).expect("mirror is complete"),
+            mirror
+        );
     }
 
     /// Starting a pool whose bundle cannot resolve node reports ready and then
@@ -6487,11 +6630,92 @@ chmod +x "$dest/bin/node"
             format!("{error}").contains("incomplete"),
             "unexpected error: {error}"
         );
-        // The release bundle stays selected; no half-published mirror is mounted.
-        assert_eq!(effective_runner_bundle(&config), release.path());
+        // Nothing complete remains: selecting a bundle fails closed instead of
+        // mounting the incomplete release bundle (#294).
+        effective_runner_bundle(&config).expect_err("no complete bundle may be selected silently");
+    }
+
+    /// #294: first start after a wiped store. The host externals were just
+    /// (re)downloaded but the release bundle is still empty. The startup
+    /// sequence — `ensure_host_externals` materializing the bundle, then
+    /// `runner_volumes` selecting it — must hand the golden a bundle that
+    /// carries node, never an externals-less mount.
+    #[test]
+    fn startup_materializes_bundle_before_golden_volumes_are_computed() {
+        let home = tempfile::tempdir().unwrap();
+        let release = tempfile::tempdir().unwrap();
+        std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
+        // The wiped store was recreated: host externals valid, bundle empty.
+        let host_externals = home.path().join("externals").join("externals");
+        write_valid_externals(&host_externals);
+
+        let mut config = test_config(false);
+        config.runner_bundle = release.path().to_path_buf();
+        config.externals_dir = home.path().join("externals");
+
+        // Startup order: install/materialize first, then compute volumes.
+        ensure_host_externals(&config).expect("bundle materialization must succeed");
+        assert!(
+            externals_complete(&release.path().join("externals")),
+            "the release bundle must be materialized before any golden is created"
+        );
+
+        let machine = MachineName::new("preloop-runner-golden").unwrap();
+        let volumes = runner_volumes(&config, &machine, false)
+            .expect("volumes must be computable after a wipe");
+        let bundle = volumes
+            .iter()
+            .find(|volume| volume.guest.as_path() == std::path::Path::new("/opt/preloop/bin"))
+            .expect("the bundle mount is always present");
+        assert!(
+            externals_complete(&bundle.host.join("externals")),
+            "the mounted bundle must carry node externals, got {}",
+            bundle.host.display()
+        );
+    }
+
+    /// #294: a guest volume spec must never resolve to a bundle that cannot
+    /// serve node. With no complete bundle anywhere, `runner_volumes` fails
+    /// instead of returning an externals-less mount.
+    #[test]
+    fn runner_volumes_refuses_externals_less_bundle() {
+        let home = tempfile::tempdir().unwrap();
+        let release = tempfile::tempdir().unwrap();
+        std::fs::write(release.path().join("runner"), b"#!/bin/sh\nexit 0\n").unwrap();
+        // Host externals are valid (so nothing needs downloading) but the
+        // release bundle is empty and no mirror was published.
+        let host_externals = home.path().join("externals").join("externals");
+        write_valid_externals(&host_externals);
+
+        let mut config = test_config(false);
+        config.runner_bundle = release.path().to_path_buf();
+        config.externals_dir = home.path().join("externals");
+
+        let machine = MachineName::new("preloop-runner-golden").unwrap();
+        let error = runner_volumes(&config, &machine, false)
+            .expect_err("an externals-less machine must not be specced");
+        assert!(
+            format!("{error}").contains("no runner bundle with complete node externals"),
+            "unexpected error: {error}"
+        );
     }
 
     fn test_config(control_socket: bool) -> RunnerPoolConfig {
+        // #294: machine creation now refuses externals-less bundles, so the
+        // fixture seeds a complete bundle the way `ensure_host_externals`
+        // guarantees in production. The directory is per-process and under
+        // `temp_dir()` (TMPDIR-aware): parallel `cargo test` invocations must
+        // not share or race on it.
+        static DIRS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+        let (runner_bundle, externals_dir) = DIRS
+            .get_or_init(|| {
+                let base = std::env::temp_dir()
+                    .join(format!("preloop-lifecycle-test-{}", std::process::id()));
+                let runner_bundle = base.join("bundle");
+                write_valid_externals(&runner_bundle.join("externals"));
+                (runner_bundle, base.join("externals"))
+            })
+            .clone();
         RunnerPoolConfig {
             size: 1,
             use_fork: false,
@@ -6501,8 +6725,8 @@ chmod +x "$dest/bin/node"
             workspace: None,
             artifact_stem: PathBuf::from("/tmp/lifecycle-artifact"),
             release_version: "9.9.9".to_owned(),
-            runner_bundle: PathBuf::from("/tmp"),
-            externals_dir: PathBuf::from("/tmp/lifecycle-externals"),
+            runner_bundle,
+            externals_dir,
             runner_binary_name: "runner".to_owned(),
             server_url: "https://runner.test".to_owned(),
             control_origin: None,
@@ -6585,6 +6809,14 @@ chmod +x "$dest/bin/node"
 
         async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
             self.start(name).await
+        }
+
+        async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
+            self.prune_pack_calls
+                .lock()
+                .await
+                .push(name.as_str().to_owned());
+            Ok(true)
         }
 
         async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
@@ -6997,6 +7229,57 @@ chmod +x "$dest/bin/node"
         assert!(provider.has_machine(&name).await);
     }
 
+    /// Issue #295: once the packed golden is forkable, the pool must ask the
+    /// provider to drop the pack/ build intermediates that sit beside the
+    /// finished disk. A failed prune is best-effort and must not fail the
+    /// golden — but the hook itself must fire exactly once per preparation.
+    #[tokio::test]
+    async fn packed_golden_prepare_prunes_pack_intermediates() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        // Keep the golden fingerprint record off /tmp: the test only needs a
+        // writable directory, not the hardcoded lifecycle paths.
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+
+        prepare_packed_golden(&provider, &config, &golden)
+            .await
+            .expect("packed golden preparation succeeds");
+
+        assert_eq!(
+            *provider.prune_pack_calls.lock().await,
+            vec![golden.as_str().to_owned()],
+            "prune hook fires exactly once for the golden"
+        );
+        let events = provider.events().await;
+        let forkable = format!("start:{}", golden.as_str());
+        assert!(
+            events.iter().any(|event| event == &forkable),
+            "golden was started forkable before the prune: {events:?}"
+        );
+    }
+
+    /// The prune hook must not fire when the golden never becomes forkable:
+    /// `prepare_packed_golden` returns before the hook on any earlier failure.
+    #[tokio::test]
+    async fn packed_golden_prepare_skips_prune_on_start_failure() {
+        let provider = Arc::new(TestProvider::new(true, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+
+        prepare_packed_golden(&provider, &config, &golden)
+            .await
+            .expect_err("start failure aborts golden preparation");
+
+        assert!(
+            provider.prune_pack_calls.lock().await.is_empty(),
+            "prune hook must not fire when the golden never started"
+        );
+    }
+
     /// A spent fork base with no surviving clones is re-armed (stop, start
     /// forkable) and the fork retried — the queue recovers in seconds instead
     /// of stalling until someone restarts the engine and rebuilds the golden.
@@ -7356,20 +7639,25 @@ chmod +x "$dest/bin/node"
     }
 
     /// The golden registry dies with the process, so a restart would rebake a
-    /// golden that is still running and still correct. The host-side record is
+    /// golden that is still sitting there fully baked. The host-side record is
     /// what makes adoption safe: it must match the requested fingerprint, and
-    /// the machine must actually be up to serve as a fork base.
+    /// the machine must exist. A stopped golden — the state a graceful
+    /// shutdown leaves, since shutdown stops rather than deletes goldens — is
+    /// re-armed; a running one is used as-is (#293).
     #[tokio::test]
-    async fn golden_is_adopted_only_when_running_and_recorded() {
+    async fn golden_adopt_state_covers_restart_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_config(false);
         config.artifact_stem = temp.path().join("runner-image");
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         let golden = MachineName::new("lifecycle-test-golden-abc123").unwrap();
 
-        // Recorded, but the machine was never started.
+        // Recorded, but the machine was never started: rebuild.
         write_golden_record(&config, &golden, "fp-1");
-        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Rebuild
+        );
 
         provider
             .create(&MachineSpec {
@@ -7389,12 +7677,44 @@ chmod +x "$dest/bin/node"
             .unwrap();
         provider.start(&golden).await.unwrap();
 
-        assert!(golden_is_reusable(&provider, &config, &golden, "fp-1").await);
-        // A base-image or toolchain bump changes the fingerprint: rebake.
-        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-2").await);
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Reusable
+        );
+        // A base-image or toolchain bump changes the fingerprint: rebuild.
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-2").await,
+            GoldenAdopt::Rebuild
+        );
+
+        // Graceful shutdown stops the golden instead of deleting it; the next
+        // start re-arms it as a fork base rather than rebaking.
+        provider.stop(&golden).await.unwrap();
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Rearm
+        );
+        assert!(adopt_golden(&provider, &config, &golden, "fp-1", "golden")
+            .await
+            .unwrap());
+        assert_eq!(
+            provider.status(&golden).await.unwrap(),
+            MachineState::Running
+        );
+        assert!(
+            provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("start:{}", golden.as_str())),
+            "re-arm must restart the stopped golden as forkable"
+        );
 
         remove_golden_record(&config, &golden);
-        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Rebuild
+        );
     }
 
     #[tokio::test]

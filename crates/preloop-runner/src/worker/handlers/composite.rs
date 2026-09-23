@@ -20,17 +20,36 @@ const MAX_COMPOSITE_DEPTH: u32 = 10;
 ///
 /// Official composite nested `$/` refs resolve against the parent action's
 /// repository (already on disk under `_actions/`).
+///
+/// Windows runners use `\` separators, so the path is normalized to `/`
+/// before marker matching; without this, repository-root detection fails on
+/// Windows and legitimate sub-action paths are rejected.
 pub(crate) fn actions_tarball_root(action_dir: &Path) -> Option<std::path::PathBuf> {
     let s = action_dir.to_str()?;
+    actions_tarball_root_str(s, std::path::MAIN_SEPARATOR).map(std::path::PathBuf::from)
+}
+
+/// String-level root detection, parameterized by path separator so the
+/// Windows behavior is unit-testable on any host. Returns the
+/// `_actions/{owner}/{repo}/{sha}` prefix with `/` separators (Windows
+/// `Path` accepts `/`).
+fn actions_tarball_root_str(s: &str, separator: char) -> Option<String> {
+    // Normalize the platform separator so the `_actions/` marker matches on
+    // Windows (`C:\...\​_actions\owner\repo\sha`) as well as Unix.
+    let normalized: String = if separator == '/' {
+        s.to_owned()
+    } else {
+        s.replace(separator, "/")
+    };
     let marker = "_actions/";
-    let pos = s.find(marker)?;
-    let after = &s[pos + marker.len()..];
+    let pos = normalized.find(marker)?;
+    let after = &normalized[pos + marker.len()..];
     let parts: Vec<&str> = after.split('/').collect();
     if parts.len() < 3 {
         return None;
     }
-    let base = &s[..pos + marker.len()];
-    Some(Path::new(base).join(parts[0]).join(parts[1]).join(parts[2]))
+    let base = &normalized[..pos + marker.len()];
+    Some(format!("{base}{}/{}/{}", parts[0], parts[1], parts[2]))
 }
 
 /// Build the expression context for composite inner steps: the job context
@@ -658,6 +677,45 @@ mod tests {
     use super::*;
     use crate::worker::contexts::JobContext;
     use crate::worker::execution_context::StepContext;
+
+    /// Unix paths resolve the `_actions/{owner}/{repo}/{sha}` root,
+    /// including sub-action directories beneath it.
+    #[test]
+    fn actions_tarball_root_unix_path() {
+        assert_eq!(
+            actions_tarball_root_str("/work/_actions/owner/repo/abc123", '/'),
+            Some("/work/_actions/owner/repo/abc123".to_string())
+        );
+        assert_eq!(
+            actions_tarball_root_str("/work/_actions/owner/repo/abc123/dist/restore-only", '/'),
+            Some("/work/_actions/owner/repo/abc123".to_string())
+        );
+        assert_eq!(actions_tarball_root_str("/work/other/path", '/'), None);
+        // Fewer than owner/repo/sha components: no root.
+        assert_eq!(
+            actions_tarball_root_str("/work/_actions/owner/repo", '/'),
+            None
+        );
+    }
+
+    /// Windows paths (`\` separators) resolve the same root. Without
+    /// separator normalization the literal `_actions/` marker never
+    /// matches and legitimate sub-action paths are rejected.
+    #[test]
+    fn actions_tarball_root_windows_path() {
+        assert_eq!(
+            actions_tarball_root_str(
+                r"C:\work\_actions\owner\repo\abc123\dist\restore-only",
+                '\\'
+            ),
+            Some("C:/work/_actions/owner/repo/abc123".to_string())
+        );
+        assert_eq!(
+            actions_tarball_root_str(r"C:\work\_actions\owner\repo\abc123", '\\'),
+            Some("C:/work/_actions/owner/repo/abc123".to_string())
+        );
+        assert_eq!(actions_tarball_root_str(r"C:\work\other\path", '\\'), None);
+    }
 
     fn composite_manifest(steps: Vec<serde_json::Value>) -> ActionManifest {
         ActionManifest {

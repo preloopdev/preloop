@@ -158,14 +158,16 @@ pub(crate) async fn prepare_remote_actions(
                 .map(|m| m.tar_url.as_str())
                 .filter(|url| !url.is_empty());
             let auth_token = meta.and_then(|m| m.auth_token.as_deref());
+            let archive_pin = meta.map(|m| m.archive_sha256.clone()).unwrap_or_default();
 
-            let action_root = super::actions::manager::download_action(
+            let (action_root, _) = super::actions::manager::download_action(
                 &parsed.owner,
                 &parsed.repo,
                 dir_ref,
                 &actions_dir,
                 download_url,
                 auth_token,
+                archive_pin,
             )
             .await?;
 

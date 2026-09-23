@@ -27,6 +27,35 @@ pub struct ResolvedAction {
     pub resolved_sha: String,
     pub tar_url: String,
     pub auth_token: Option<String>,
+    /// Archive checksum pin state for this action version (see
+    /// [`ArchiveDigestPin`]).
+    pub archive_sha256: ArchiveDigestPin,
+}
+
+/// Whether the server supports action archive-checksum pinning, and the pin
+/// state for one resolved action.
+///
+/// The digest is the SHA-256 of the *downloaded tarball bytes*, hashed
+/// before extraction. Pinning the archive bytes (rather than the extracted
+/// tree) means a known pin is compared before `extract_tarball` ever runs,
+/// so tampered bytes fail closed without creating an executable tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ArchiveDigestPin {
+    /// The server predates checksum support (no `archive_sha256` key in the
+    /// resolve response). The runner must behave exactly as before: no
+    /// verification, no digest report, no cache eviction.
+    #[default]
+    Unsupported,
+    /// The server supports checksums but has no pin for this (owner, repo,
+    /// sha) yet: the engine has not fetched this version itself. The
+    /// runner uses any existing local cache as-is — no eviction, no
+    /// verification — and downloads normally on a cache miss; the engine
+    /// pins the version when it serves the bytes.
+    Unpinned,
+    /// The server has a pin for this (owner, repo, sha): the downloaded
+    /// archive's SHA-256 must equal this hex digest or the download fails
+    /// closed before extraction.
+    Pinned(String),
 }
 
 /// Client for action resolution and download.
@@ -35,6 +64,11 @@ pub struct ActionsResolveClient {
     /// Base URL from `system.github.launch_endpoint` variable.
     /// Golden 10: `https://launch.actions.githubusercontent.com`
     launch_base_url: Option<String>,
+}
+
+/// Returns true for a well-formed archive digest: 64 hex chars.
+fn valid_archive_sha256(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl ActionsResolveClient {
@@ -151,6 +185,22 @@ impl ActionsResolveClient {
                     .get("authentication")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                // Key presence (not value) signals server support: older
+                // servers omit `archive_sha256` entirely, in which case the
+                // runner keeps the legacy unverified behavior.
+                let archive_sha256 = match info.get("archive_sha256") {
+                    None => ArchiveDigestPin::Unsupported,
+                    Some(serde_json::Value::Null) => ArchiveDigestPin::Unpinned,
+                    Some(serde_json::Value::String(digest)) if valid_archive_sha256(digest) => {
+                        ArchiveDigestPin::Pinned(digest.to_ascii_lowercase())
+                    }
+                    Some(other) => {
+                        tracing::warn!(
+                            "ignoring malformed archive_sha256 pin {other:?}; treating as unpinned"
+                        );
+                        ArchiveDigestPin::Unpinned
+                    }
+                };
 
                 if !tar_url.is_empty() {
                     result.insert(
@@ -161,6 +211,7 @@ impl ActionsResolveClient {
                             resolved_sha,
                             tar_url,
                             auth_token,
+                            archive_sha256,
                         },
                     );
                 }
@@ -301,5 +352,73 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("HTTP 401 Unauthorized"));
+    }
+
+    /// `archive_sha256` key presence signals server support: a well-formed
+    /// digest string becomes a pin, explicit null means supported but
+    /// unpinned, and a missing key means a pre-checksum server (legacy
+    /// unverified behavior). Malformed digests are treated as unpinned so a
+    /// bad pin can never fail closed or mint a bogus pin.
+    #[tokio::test]
+    async fn resolve_batch_parses_archive_sha256_pin_states() {
+        let body = serde_json::json!({
+            "actions": {
+                "actions/checkout@v4": {
+                    "name": "actions/checkout",
+                    "version": "v4",
+                    "resolved_sha": "abc123",
+                    "tar_url": "https://example.invalid/checkout.tar.gz",
+                    "archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                "actions/setup-node@v4": {
+                    "name": "actions/setup-node",
+                    "version": "v4",
+                    "resolved_sha": "def456",
+                    "tar_url": "https://example.invalid/node.tar.gz",
+                    "archive_sha256": null
+                },
+                "actions/cache@v4": {
+                    "name": "actions/cache",
+                    "version": "v4",
+                    "resolved_sha": "123abc",
+                    "tar_url": "https://example.invalid/cache.tar.gz"
+                },
+                "actions/bad@v4": {
+                    "name": "actions/bad",
+                    "version": "v4",
+                    "resolved_sha": "456def",
+                    "tar_url": "https://example.invalid/bad.tar.gz",
+                    "archive_sha256": "not-hex"
+                }
+            }
+        })
+        .to_string();
+        let base = serve_once("200 OK", &body).await;
+        let client = ActionsResolveClient::new(HttpClient::new(None).unwrap(), Some(base));
+
+        let result = client
+            .resolve_batch("token", "plan", "job", &[("actions/checkout", "v4")])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["actions/checkout@v4"].archive_sha256,
+            ArchiveDigestPin::Pinned(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+            )
+        );
+        assert_eq!(
+            result["actions/setup-node@v4"].archive_sha256,
+            ArchiveDigestPin::Unpinned
+        );
+        assert_eq!(
+            result["actions/cache@v4"].archive_sha256,
+            ArchiveDigestPin::Unsupported
+        );
+        assert_eq!(
+            result["actions/bad@v4"].archive_sha256,
+            ArchiveDigestPin::Unpinned,
+            "malformed pin must not become a Pinned digest"
+        );
     }
 }
