@@ -208,13 +208,18 @@ pub(crate) async fn ensure_remote_action_staged(
     let auth_token = resolved
         .as_ref()
         .and_then(|meta| meta.auth_token.as_deref());
-    let action_root = crate::worker::actions::manager::download_action(
+    let archive_pin = resolved
+        .as_ref()
+        .map(|meta| meta.archive_sha256.clone())
+        .unwrap_or_default();
+    let (action_root, _) = crate::worker::actions::manager::download_action(
         owner,
         repo,
         dir_ref,
         &actions_dir,
         download_url,
         auth_token,
+        archive_pin,
     )
     .await?;
     let action_dir = if subpath.is_empty() {

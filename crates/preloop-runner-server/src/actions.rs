@@ -3,6 +3,7 @@ use futures::StreamExt;
 use preloop_gha_protocol::azdo::{
     ActionDownloadInfo, ActionDownloadInfoCollection, ActionReferenceList,
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// POST action download info — resolve action references to download URLs.
@@ -22,6 +23,122 @@ pub async fn runnerresolve_actions(
     collect_runnerresolve_refs(&shared.state, &request, &mut actions).await;
 
     Json(json!({ "actions": actions }))
+}
+
+/// Maximum archive-checksum pins held in memory. Pins are minted only by
+/// the engine when it fetches an action tarball (never by job VMs), so the
+/// table grows with the engine's own action cache, not with attacker
+/// input. When full, new fetches simply stay unpinned — fail open on the
+/// cap, never on verification; pins already held keep enforcing.
+const MAX_DIGEST_PINS: usize = 50_000;
+
+/// SHA-256 hex digest of action tarball bytes, lowercase. Kept in sync
+/// with the runner's `archive_sha256_hex`: the pin the engine computes
+/// must compare equal to the digest the runner computes over the same
+/// bytes.
+fn archive_sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Response header attesting the engine-observed SHA-256 of the action
+/// tarball being served. Lets the runner verify downloaded bytes even
+/// when the resolve-time pin was Unpinned (P2): the digest is computed
+/// by the engine over the exact bytes it serves, never by a job VM.
+pub const ACTION_ARCHIVE_SHA256_HEADER: &str = "x-preloop-action-archive-sha256";
+
+/// Pin-table key for an action archive checksum: `(owner, repo, sha)`,
+/// lowercased. Returns `None` when the ref is not a resolved commit SHA —
+/// mutable refs (branches, tags like `v4`) are never pinned, because the
+/// bytes they name can change.
+fn archive_pin_key(owner: &str, repo: &str, git_ref: &str) -> Option<(String, String, String)> {
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
+        return None;
+    }
+    Some((
+        owner.to_lowercase(),
+        repo.to_lowercase(),
+        git_ref.to_lowercase(),
+    ))
+}
+
+/// Sidecar recording the SHA-256 of the engine's cached action tarball:
+/// `<cache_dir>/action.tar.gz.sha256`. Lets the in-memory pin table be
+/// rebuilt after an engine restart without re-downloading.
+fn action_archive_digest_sidecar(cache_dir: &std::path::Path) -> std::path::PathBuf {
+    cache_dir.join("action.tar.gz.sha256")
+}
+
+/// Ensure the in-memory archive-checksum pin for a cached action tarball,
+/// returning the digest that was ensured (or `None` when no pin applies).
+///
+/// `observed` is the digest computed while streaming the fetch
+/// (cache-miss path); on the cache-hit path it is `None` and the pin is
+/// backfilled from the sidecar. Only commit SHAs are pinned. A missing or
+/// malformed sidecar simply leaves the action unpinned — it never fails
+/// the download.
+fn ensure_action_archive_pin(
+    state: &AppState,
+    cache_dir: &std::path::Path,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+    observed: Option<&str>,
+) -> Option<String> {
+    let key = archive_pin_key(owner, repo, git_ref)?;
+    let digest: String = match observed {
+        Some(digest) => digest.to_owned(),
+        None => {
+            let raw = std::fs::read_to_string(action_archive_digest_sidecar(cache_dir)).ok()?;
+            let digest = raw.trim().to_ascii_lowercase();
+            if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                digest
+            } else {
+                return None;
+            }
+        }
+    };
+    let mut pins = state.action_archive_sha256_pins.lock().ok()?;
+    if let Some(existing) = pins.get(&key) {
+        return Some(existing.clone());
+    }
+    if pins.len() >= MAX_DIGEST_PINS {
+        tracing::warn!(
+            "action archive digest pin table full; skipping pin for {owner}/{repo}@{git_ref}"
+        );
+        // The digest is still authoritative for this response even when the
+        // pin table is full: attest it in the download header so the
+        // runner can verify these bytes.
+        return Some(digest);
+    }
+    pins.insert(key, digest.clone());
+    Some(digest)
+}
+
+/// Build the tarball download response, attesting the engine-observed
+/// archive digest in [`ACTION_ARCHIVE_SHA256_HEADER`] whenever one is
+/// known. The runner verifies the bytes it receives against this
+/// attestation even when its resolve-time pin was Unpinned (P2): a
+/// poisoned local cache is evicted and the fresh download is checked
+/// before extraction. A missing digest (old pre-feature cache entry)
+/// simply omits the header — it never fails the download.
+fn action_tarball_response(
+    repo: &str,
+    git_ref: &str,
+    body: Body,
+    digest: Option<&str>,
+) -> Result<Response, ApiError> {
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
+        );
+    if let Some(digest) = digest {
+        builder = builder.header(ACTION_ARCHIVE_SHA256_HEADER, digest);
+    }
+    builder
+        .body(body)
+        .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))
 }
 
 /// How long a minted archive ticket stays valid. Actions are fetched during
@@ -198,20 +315,18 @@ pub async fn download_action_tarball(
     let cached_path = cache_dir.join("action.tar.gz");
 
     if cached_path.exists() {
+        // Restart resilience: the pin table is in-memory, so rebuild it
+        // from the sidecar the fetch wrote. A missing or malformed sidecar
+        // leaves the action unpinned without failing the download.
+        let digest =
+            ensure_action_archive_pin(&shared.state, &cache_dir, &owner, &repo, &git_ref, None);
         let file = tokio::fs::File::open(&cached_path)
             .await
             .map_err(|e| ApiError::internal(format!("failed to open cached action: {e}")))?;
         let stream = tokio_util::io::ReaderStream::new(file);
         let body = Body::from_stream(stream);
 
-        let res = Response::builder()
-            .header(header::CONTENT_TYPE, "application/gzip")
-            .header(
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
-            )
-            .body(body)
-            .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+        let res = action_tarball_response(&repo, &git_ref, body, digest.as_deref())?;
         return Ok(res);
     }
 
@@ -271,32 +386,63 @@ pub async fn download_action_tarball(
         .await
         .map_err(|e| ApiError::internal(format!("failed to create temporary action file: {e}")))?;
 
+    let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
             ApiError::internal(format!("failed to read chunk from GitHub response: {e}"))
         })?;
+        // Hash the archive bytes as they arrive, so the digest the engine
+        // pins is computed over exactly the bytes written to the cache —
+        // no second read, no TOCTOU between write and hash.
+        hasher.update(&chunk);
         tokio::io::copy(&mut &chunk[..], &mut temp_file)
             .await
             .map_err(|e| {
                 ApiError::internal(format!("failed to write chunk to temporary file: {e}"))
             })?;
     }
+    let digest = format!("{:x}", hasher.finalize());
 
     // Atomically rename to final target path. A concurrent request may have
     // published the same action first — then the cached file is the winner's
     // (byte-identical) download and ours is discarded.
-    if let Err(error) = tokio::fs::rename(&temp_path, &cached_path).await {
+    let published_by_us = tokio::fs::rename(&temp_path, &cached_path).await.is_ok();
+    if published_by_us {
+        info!(cached_path = ?cached_path, "Action cached successfully on server");
+        // Record the authoritative archive checksum next to the published
+        // file: the engine fetched these bytes over TLS itself, so this
+        // digest — not any job-VM report — is what later downloads are
+        // verified against.
+        let sidecar = action_archive_digest_sidecar(&cache_dir);
+        if let Err(error) = tokio::fs::write(&sidecar, digest.as_bytes()).await {
+            warn!(
+                sidecar = %sidecar.display(), %error,
+                "failed to write action archive digest sidecar"
+            );
+        }
+    } else {
         let _ = tokio::fs::remove_file(&temp_path).await;
         if !cached_path.exists() {
-            return Err(ApiError::internal(format!(
-                "failed to rename cached action file: {error}"
-            )));
+            return Err(ApiError::internal(
+                "failed to rename cached action file".to_string(),
+            ));
         }
         info!(cached_path = ?cached_path, "Action cache published by a concurrent request");
-    } else {
-        info!(cached_path = ?cached_path, "Action cached successfully on server");
     }
+    // Populate the in-memory pin from our streaming digest (or, on the
+    // concurrent-loser path, from the winner's sidecar once it lands —
+    // later requests backfill it). The returned digest is attested in the
+    // download response header so the runner can verify these bytes even
+    // when its resolve-time pin was Unpinned.
+    let digest = ensure_action_archive_pin(
+        &shared.state,
+        &cache_dir,
+        &owner,
+        &repo,
+        &git_ref,
+        Some(&digest),
+    );
 
     let file = tokio::fs::File::open(&cached_path)
         .await
@@ -304,14 +450,7 @@ pub async fn download_action_tarball(
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
-    let res = Response::builder()
-        .header(header::CONTENT_TYPE, "application/gzip")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
-        )
-        .body(body)
-        .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+    let res = action_tarball_response(&repo, &git_ref, body, digest.as_deref())?;
     Ok(res)
 }
 
@@ -528,6 +667,33 @@ async fn resolve_action_download(
     Some((key, name, git_ref, pinned, tar_url))
 }
 
+/// Look up the engine-authoritative archive checksum pin for a resolved
+/// action. Returns `Some(digest)` when the engine has fetched this exact
+/// (owner, repo, sha) tarball itself and pinned its SHA-256, `None` when
+/// the server supports checksums but has no pin for this (owner, repo,
+/// sha) yet. The caller serializes `None` as an explicit JSON null so
+/// runners can distinguish "supported but unpinned" from a pre-checksum
+/// server that omits the key.
+pub fn archive_sha256_pin_for(
+    state: &AppState,
+    name: &str,
+    resolved_sha_opt: Option<&str>,
+) -> Option<String> {
+    let sha = resolved_sha_opt?;
+    let (owner, repo) = name.split_once('/')?;
+    let key = (
+        owner.to_lowercase(),
+        repo.to_lowercase(),
+        sha.to_lowercase(),
+    );
+    state
+        .action_archive_sha256_pins
+        .lock()
+        .ok()?
+        .get(&key)
+        .cloned()
+}
+
 pub async fn runnerresolve_action(
     state: &AppState,
     action: &str,
@@ -539,11 +705,21 @@ pub async fn runnerresolve_action(
     // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
     // explicit on the wire, and the runner refuses the download instead of fetching
     // the mutable ref.
+    //
+    // `archive_sha256` carries the engine-authoritative pin for this exact
+    // (owner, repo, sha): the SHA-256 the engine computed while fetching
+    // the tarball itself. A present null means the server supports
+    // checksums but has not fetched this version yet — the engine pins it
+    // during the download this resolve triggers, so later resolves hand
+    // the runner a pin to verify against. The key is always present so
+    // runners can distinguish "supported" from a pre-checksum server.
+    let archive_sha256_pin = archive_sha256_pin_for(state, &name, resolved_sha_opt.as_deref());
     let mut entry = json!({
         "name": name,
         "version": git_ref,
         "tar_url": tar_url,
         "authentication": null,
+        "archive_sha256": archive_sha256_pin,
     });
     if let Some(resolved_sha) = resolved_sha_opt {
         entry["resolved_sha"] = json!(resolved_sha);
@@ -576,4 +752,184 @@ pub async fn action_download_info_entry(
             package_details: None,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn test_state() -> AppState {
+        let temp = tempfile::tempdir().unwrap();
+        AppState::new(temp.path().to_path_buf()).await.unwrap()
+    }
+
+    /// `archive_sha256_hex` is the lowercase hex SHA-256 of the bytes —
+    /// the same value the runner computes over the downloaded archive.
+    #[test]
+    fn archive_sha256_hex_matches_known_vector() {
+        // SHA-256("abc").
+        assert_eq!(
+            archive_sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(archive_sha256_hex(b"").len(), 64);
+    }
+
+    /// `archive_pin_key` only keys commit SHAs, lowercased. Mutable refs,
+    /// the all-zero sentinel, and empty refs are never pinned.
+    #[test]
+    fn archive_pin_key_only_for_commit_shas() {
+        assert_eq!(
+            archive_pin_key("Actions", "Checkout", &SHA.to_uppercase()),
+            Some((
+                "actions".to_string(),
+                "checkout".to_string(),
+                SHA.to_string()
+            ))
+        );
+        assert_eq!(archive_pin_key("actions", "checkout", "v4"), None);
+        assert_eq!(archive_pin_key("actions", "checkout", "main"), None);
+        assert_eq!(
+            archive_pin_key("actions", "checkout", &"0".repeat(40)),
+            None
+        );
+        assert_eq!(archive_pin_key("actions", "checkout", ""), None);
+    }
+
+    /// The engine pins the digest it computed while fetching: after
+    /// `ensure_action_archive_pin` with an observed digest,
+    /// `archive_sha256_pin_for` returns it, so runnerresolve hands the
+    /// runner an authoritative pin.
+    #[tokio::test]
+    async fn engine_fetch_establishes_pin() {
+        let state = test_state().await;
+        let cache_dir = state
+            .state_dir
+            .join("actions")
+            .join("o")
+            .join("r")
+            .join(SHA);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        ensure_action_archive_pin(&state, &cache_dir, "o", "r", SHA, Some(DIGEST_A));
+
+        assert_eq!(
+            archive_sha256_pin_for(&state, "o/r", Some(SHA)),
+            Some(DIGEST_A.to_string())
+        );
+        // Unknown actions stay unpinned.
+        assert_eq!(archive_sha256_pin_for(&state, "o/other", Some(SHA)), None);
+        // No pin without a resolved SHA, and mutable refs never pin.
+        assert_eq!(archive_sha256_pin_for(&state, "o/r", None), None);
+        ensure_action_archive_pin(&state, &cache_dir, "o", "r", "v4", Some(DIGEST_A));
+        assert_eq!(archive_sha256_pin_for(&state, "o/r", Some("v4")), None);
+    }
+
+    /// Restart resilience: the in-memory pin table is rebuilt from the
+    /// on-disk digest sidecar on the next cache hit, without re-downloading.
+    #[tokio::test]
+    async fn pin_backfills_from_sidecar_on_cache_hit() {
+        let state = test_state().await;
+        let cache_dir = state
+            .state_dir
+            .join("actions")
+            .join("o")
+            .join("r")
+            .join(SHA);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(action_archive_digest_sidecar(&cache_dir), DIGEST_A).unwrap();
+
+        // Fresh state: no pin yet (as after an engine restart).
+        assert_eq!(archive_sha256_pin_for(&state, "o/r", Some(SHA)), None);
+
+        ensure_action_archive_pin(&state, &cache_dir, "o", "r", SHA, None);
+
+        assert_eq!(
+            archive_sha256_pin_for(&state, "o/r", Some(SHA)),
+            Some(DIGEST_A.to_string())
+        );
+    }
+
+    /// A missing or malformed sidecar leaves the action unpinned instead of
+    /// failing — the download still works, just unverified.
+    #[tokio::test]
+    async fn missing_or_malformed_sidecar_leaves_unpinned() {
+        let state = test_state().await;
+        let cache_dir = state
+            .state_dir
+            .join("actions")
+            .join("o")
+            .join("r")
+            .join(SHA);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        ensure_action_archive_pin(&state, &cache_dir, "o", "r", SHA, None);
+        assert_eq!(archive_sha256_pin_for(&state, "o/r", Some(SHA)), None);
+
+        std::fs::write(action_archive_digest_sidecar(&cache_dir), "not-a-digest").unwrap();
+        ensure_action_archive_pin(&state, &cache_dir, "o", "r", SHA, None);
+        assert_eq!(archive_sha256_pin_for(&state, "o/r", Some(SHA)), None);
+    }
+
+    /// The pin table is bounded: when full, new pins are skipped (fail open
+    /// on the cap) while existing pins keep enforcing.
+    #[tokio::test]
+    async fn pin_table_cap_skips_new_pins_when_full() {
+        let state = test_state().await;
+        {
+            let mut pins = state.action_archive_sha256_pins.lock().unwrap();
+            for i in 0..MAX_DIGEST_PINS {
+                let sha = format!("{i:040x}");
+                pins.insert(
+                    ("o".to_string(), "r".to_string(), sha),
+                    DIGEST_A.to_string(),
+                );
+            }
+        }
+        let cache_dir = state
+            .state_dir
+            .join("actions")
+            .join("o")
+            .join("r")
+            .join(SHA);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        ensure_action_archive_pin(&state, &cache_dir, "o", "r", SHA, Some(DIGEST_B));
+        assert_eq!(
+            archive_sha256_pin_for(&state, "o/r", Some(SHA)),
+            None,
+            "a full pin table must not accept new pins"
+        );
+        // Existing pins still enforce.
+        let first_sha = format!("{:040x}", 0);
+        assert_eq!(
+            archive_sha256_pin_for(&state, "o/r", Some(&first_sha)),
+            Some(DIGEST_A.to_string())
+        );
+    }
+
+    /// `action_tarball_response` attests the engine-observed digest in the
+    /// download header when known, and omits the header otherwise — a
+    /// missing digest never fails the download.
+    #[tokio::test]
+    async fn tarball_response_attests_digest_header() {
+        let res =
+            action_tarball_response("repo", SHA, Body::from("bytes"), Some(DIGEST_A)).unwrap();
+        assert_eq!(
+            res.headers()
+                .get(ACTION_ARCHIVE_SHA256_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(DIGEST_A)
+        );
+
+        let res = action_tarball_response("repo", SHA, Body::from("bytes"), None).unwrap();
+        assert!(
+            res.headers().get(ACTION_ARCHIVE_SHA256_HEADER).is_none(),
+            "no digest must mean no header, not a failed download"
+        );
+    }
 }
