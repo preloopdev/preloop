@@ -462,6 +462,87 @@ pub struct TokenPermissionsCeiling {
     pub allow_create_approve_pr: bool,
 }
 
+/// Enforcement mode for workflow execution protections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtectionMode {
+    /// Log what would be denied without denying it. The safe default for
+    /// rolling policy out: nothing changes until the operator flips to
+    /// `enforce`.
+    #[default]
+    Evaluate,
+    /// Deny matching triggers.
+    Enforce,
+}
+
+/// The only rule action supported today. Unknown actions fail config
+/// parsing so a typo can never silently weaken policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyRuleAction {
+    #[default]
+    Deny,
+}
+
+/// Deny rule on the event that may trigger a workflow, e.g.
+/// `pull_request_target`. Mirrors GitHub's event rules.
+///
+/// Unknown fields are rejected at parse time: a typo must fail closed
+/// rather than silently leave the policy weaker than written.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventRule {
+    /// Event name, e.g. `pull_request_target`, `workflow_dispatch`.
+    pub event: String,
+    /// Workflow filename globs (e.g. `deploy.yml`, `release/*.yml`),
+    /// matched against the bare filename and `.github/workflows/<name>`.
+    /// Only `*`, `**`, and `?` are supported — character classes like
+    /// `[0-9]` are rejected at config load. Omitted or empty = every workflow.
+    #[serde(default)]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: PolicyRuleAction,
+}
+
+/// Deny rule on the actor that may trigger a workflow. The actor is the
+/// webhook payload's `sender.login`. Mirrors GitHub's actor rules.
+///
+/// Unknown fields are rejected at parse time, as in [`EventRule`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorRule {
+    /// Sender login, compared case-insensitively.
+    pub actor: String,
+    /// Workflow filename globs, as in [`EventRule::workflows`].
+    /// Omitted or empty = every workflow.
+    #[serde(default)]
+    pub workflows: Option<Vec<String>>,
+    #[serde(default)]
+    pub action: PolicyRuleAction,
+}
+
+/// Workflow execution protections: admin-level deny policy on which events
+/// and which actors may trigger workflows. Mirrors GitHub's execution
+/// protections (event rules, actor rules, per-file targeting,
+/// evaluate/enforce modes).
+///
+/// Rules live in the operator's server config — never in workflow repos —
+/// so workflow authors cannot weaken the policy that constrains them.
+/// A `pull_request_target` kill is an event rule with
+/// `event = "pull_request_target"`.
+///
+/// Unknown fields are rejected at parse time, as in [`EventRule`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProtectionConfig {
+    #[serde(default)]
+    pub mode: ProtectionMode,
+    #[serde(default)]
+    pub event_rules: Vec<EventRule>,
+    #[serde(default)]
+    pub actor_rules: Vec<ActorRule>,
+}
+
 /// Fork pull-request workflow policy, mirroring GitHub's "Fork pull request
 /// workflows" admin settings. Rules live in the operator's server config —
 /// never in workflow repos — so a fork author cannot weaken the policy that
@@ -556,6 +637,11 @@ pub struct ConfigFile {
     /// policy.
     #[serde(default)]
     pub fork_policy: ForkPolicyConfig,
+    /// Workflow execution protections (`[execution_protection]`), mirroring
+    /// GitHub's admin-level event/actor rules. Empty by default: no triggers
+    /// are denied until the operator writes rules.
+    #[serde(default)]
+    pub execution_protection: ExecutionProtectionConfig,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -782,7 +868,7 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?} }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
@@ -797,7 +883,10 @@ impl std::fmt::Debug for ConfigFile {
                     ceiling.scopes.len()
                 )
             ),
-            self.fork_policy
+            self.fork_policy,
+            self.execution_protection.mode,
+            self.execution_protection.event_rules.len(),
+            self.execution_protection.actor_rules.len()
         )
     }
 }
@@ -1206,6 +1295,8 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
     validate_environment_rules(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
+    validate_execution_protection(&config)
+        .with_context(|| format!("validating config {}", path.display()))?;
     resolve_credential_references(&mut config, &OsCredentialStore)?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1247,6 +1338,37 @@ fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
                  the wait must fit in i64 nanoseconds (max {MAX_WAIT_TIMER_MINUTES} minutes)",
                 rules.wait_timer_minutes
             );
+        }
+    }
+    Ok(())
+}
+
+/// Reject execution-protection rules the matcher cannot honor.
+///
+/// `workflows` patterns are matched with [`preloop_gha_parser::glob_match`],
+/// which implements `*`, `**`, and `?` only. A GitHub-style character class
+/// like `deploy-[0-9].yml` would parse but match literally, silently missing
+/// the intended workflow — so fail the config load closed instead.
+fn validate_execution_protection(config: &ConfigFile) -> anyhow::Result<()> {
+    let policy = &config.execution_protection;
+    let mut rules: Vec<(&str, &str, &Option<Vec<String>>)> = Vec::new();
+    for rule in &policy.event_rules {
+        rules.push(("event rule", rule.event.as_str(), &rule.workflows));
+    }
+    for rule in &policy.actor_rules {
+        rules.push(("actor rule", rule.actor.as_str(), &rule.workflows));
+    }
+    for (kind, target, workflows) in rules {
+        if let Some(patterns) = workflows {
+            for pattern in patterns {
+                anyhow::ensure!(
+                    !pattern.contains(['[', ']']),
+                    "execution_protection {kind} ({target:?}): workflow pattern \
+                     {pattern:?} uses character classes, which the matcher does \
+                     not support (only `*`, `**`, `?`); rewrite the pattern or \
+                     remove the rule",
+                );
+            }
         }
     }
     Ok(())
@@ -1362,6 +1484,7 @@ mod tests {
             token_permissions_ceiling: None,
             environment_rules: BTreeMap::new(),
             fork_policy: ForkPolicyConfig::default(),
+            execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }

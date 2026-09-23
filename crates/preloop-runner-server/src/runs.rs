@@ -567,6 +567,43 @@ pub async fn submit_run_inner(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
 ) -> Result<RunAccepted, ApiError> {
+    // Workflow execution protections: every non-webhook submission path
+    // funnels through here (native `POST /api/v1/runs`, REST dispatch, the
+    // scheduler, native reruns), so the event/actor check lives at this
+    // choke point. The webhook intake enforces separately upstream via
+    // `denies_event` / `denies_workflow` and calls
+    // `submit_run_inner_with_webhook_delivery` directly, so this does not
+    // double-fire there.
+    if let Some(hit) = crate::execution_protection::denies_submission(
+        &shared.state.execution_protection,
+        &submission.event,
+        Some(&submission.actor),
+        submission.workflow_file.as_deref(),
+    ) {
+        match shared.state.execution_protection.mode {
+            crate::config::ProtectionMode::Enforce => {
+                info!(
+                    event = %submission.event,
+                    actor = %submission.actor,
+                    rule = %hit.describe(),
+                    "execution protection denied submission"
+                );
+                return Err(ApiError::forbidden(format!(
+                    "execution protection denied {}: {}",
+                    submission.event,
+                    hit.describe()
+                )));
+            }
+            crate::config::ProtectionMode::Evaluate => {
+                info!(
+                    event = %submission.event,
+                    actor = %submission.actor,
+                    rule = %hit.describe(),
+                    "execution protection would deny submission (evaluate mode)"
+                );
+            }
+        }
+    }
     submit_run_inner_with_webhook_delivery(shared, submission, None).await
 }
 
@@ -4372,5 +4409,72 @@ mod tests {
         let req: ApproveForkRequest =
             serde_json::from_str(r#"{"note":"lgtm"}"#).expect("note must parse");
         assert_eq!(req.note.as_deref(), Some("lgtm"));
+    }
+
+    /// The native `POST /api/v1/runs` endpoint, the scheduler, and the
+    /// native rerun endpoint all call `submit_run_inner` directly, bypassing
+    /// the webhook intake's per-event checks. Enforcement lives at this
+    /// choke point so none of those paths can sidestep an enforced rule.
+    async fn state_with_push_deny(
+        temp: &std::path::Path,
+        mode: crate::config::ProtectionMode,
+    ) -> std::sync::Arc<crate::SharedState> {
+        let mut state = crate::AppState::new(temp.to_path_buf()).await.unwrap();
+        state.execution_protection = crate::config::ExecutionProtectionConfig {
+            mode,
+            event_rules: vec![crate::config::EventRule {
+                event: "push".to_owned(),
+                workflows: None,
+                action: crate::config::PolicyRuleAction::Deny,
+            }],
+            actor_rules: vec![],
+        };
+        state.shared()
+    }
+
+    fn push_submission() -> preloop_gha_protocol::WorkflowSubmission {
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_run_inner_denies_denied_event_in_enforce_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared =
+            state_with_push_deny(temp.path(), crate::config::ProtectionMode::Enforce).await;
+        let error = submit_run_inner(&shared, push_submission())
+            .await
+            .expect_err("a denied event must not submit in enforce mode");
+        assert!(
+            error.message().contains("execution protection"),
+            "unexpected error: {}",
+            error.message()
+        );
+        let inner = shared.state.inner.lock().await;
+        assert!(
+            inner.runs.is_empty(),
+            "denied submission must not create a run"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_run_inner_allows_denied_event_in_evaluate_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared =
+            state_with_push_deny(temp.path(), crate::config::ProtectionMode::Evaluate).await;
+        let accepted = submit_run_inner(&shared, push_submission())
+            .await
+            .expect("evaluate mode must not block submission");
+        let inner = shared.state.inner.lock().await;
+        assert!(inner.runs.contains_key(&accepted.run_id));
     }
 }

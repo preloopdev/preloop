@@ -525,6 +525,12 @@ fn tier_string(tier: TrustTier) -> String {
 
 /// Submit a dispatched run and report queued/completed check runs exactly
 /// like the webhook path does.
+///
+/// Workflow execution protections are enforced inside
+/// [`crate::submit_run_inner`], the choke point every non-webhook
+/// submission path funnels through — the REST dispatch endpoints bypass the
+/// webhook intake, so without that check an enforced event/actor rule could
+/// be sidestepped by an authorized REST caller.
 async fn submit_and_report(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,

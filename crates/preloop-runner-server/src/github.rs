@@ -1563,17 +1563,68 @@ async fn process_check_run_rerequest(
                         .map(|name| JobId(name.to_owned()))
                         .filter(|job_id| run.jobs.contains_key(job_id))
                 })?;
-            Some((run_id, job_id))
+            Some((
+                run_id,
+                job_id,
+                run.submission.event.clone(),
+                run.submission.actor.clone(),
+                run.submission.workflow_file.clone(),
+            ))
         })
     };
 
-    let Some((run_id, job_id)) = target else {
+    let Some((run_id, job_id, event, actor, workflow_file)) = target else {
         warn!(
             repository,
             check_run_id, "check_run rerequest does not match a known terminal run"
         );
         return Ok((StatusCode::OK, Json(serde_json::json!([]))));
     };
+
+    // Workflow execution protections: a rerequest re-triggers the original
+    // run, so the original trigger must still pass policy — and so must the
+    // user who sent the rerequest. Actor rules match the webhook sender's
+    // login, so a blocked actor could otherwise re-run someone else's
+    // terminal run by clicking "Re-run". Deny if either matches; a denial
+    // is not transient and must not retry.
+    let rerequest_sender = payload
+        .get("sender")
+        .and_then(|sender| sender.get("login"))
+        .and_then(Value::as_str);
+    let denied = [Some(actor.as_str()), rerequest_sender]
+        .into_iter()
+        .flatten()
+        .find_map(|protection_actor| {
+            crate::execution_protection::denies_submission(
+                &shared.state.execution_protection,
+                &event,
+                Some(protection_actor),
+                workflow_file.as_deref(),
+            )
+        });
+    if let Some(hit) = denied {
+        match shared.state.execution_protection.mode {
+            crate::config::ProtectionMode::Enforce => {
+                info!(
+                    %run_id,
+                    %job_id,
+                    event = %event,
+                    rule = %hit.describe(),
+                    "execution protection denied check_run rerequest"
+                );
+                return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+            }
+            crate::config::ProtectionMode::Evaluate => {
+                info!(
+                    %run_id,
+                    %job_id,
+                    event = %event,
+                    rule = %hit.describe(),
+                    "execution protection would deny check_run rerequest (evaluate mode)"
+                );
+            }
+        }
+    }
 
     let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
         .await
@@ -2222,6 +2273,53 @@ async fn process_delivery_payload_with_lease(
         return WebhookOutcome::Success;
     }
 
+    // Workflow execution protections (unscoped): admin-level deny rules on
+    // the event/actor are evaluated here, before the PR changed-files lookup
+    // below — a denied delivery must not burn a GitHub API call (and retries)
+    // on a lookup whose result can never be used. Scoped per-workflow rules
+    // are still evaluated during workflow matching further down.
+    let protection_actor = payload_val
+        .get("sender")
+        .and_then(|sender| sender.get("login"))
+        .and_then(|login| login.as_str());
+    let mut live_events = Vec::with_capacity(effective_events.len());
+    for effective in effective_events {
+        if effective.skip {
+            live_events.push(effective);
+            continue;
+        }
+        match crate::execution_protection::denies_event(
+            &shared.state.execution_protection,
+            &effective.event,
+            protection_actor,
+        ) {
+            Some(hit) => match shared.state.execution_protection.mode {
+                crate::config::ProtectionMode::Enforce => {
+                    info!(
+                        event = %effective.event,
+                        rule = %hit.describe(),
+                        "execution protection denied event"
+                    );
+                }
+                crate::config::ProtectionMode::Evaluate => {
+                    info!(
+                        event = %effective.event,
+                        rule = %hit.describe(),
+                        "execution protection would deny event (evaluate mode)"
+                    );
+                    live_events.push(effective);
+                }
+            },
+            None => live_events.push(effective),
+        }
+    }
+    // Every remaining event is skip-flagged, or every live event was denied
+    // in enforce mode: nothing downstream can use the PR lookup.
+    if live_events.iter().all(|effective| effective.skip) {
+        return WebhookOutcome::Success;
+    }
+    let effective_events = live_events;
+
     let repo_full_name = match payload_val
         .get("repository")
         .and_then(|r| r.get("full_name"))
@@ -2304,6 +2402,14 @@ async fn process_delivery_payload_with_lease(
             );
             continue;
         }
+
+        // Unscoped execution-protection rules were already applied to every
+        // effective event before the PR changed-files lookup above; scoped
+        // per-workflow rules are evaluated during workflow matching below.
+        let protection_actor = payload_val
+            .get("sender")
+            .and_then(|sender| sender.get("login"))
+            .and_then(|login| login.as_str());
 
         let default_branch = payload_val
             .get("repository")
@@ -2439,6 +2545,35 @@ async fn process_delivery_payload_with_lease(
                     "Skipping workflow owned by GitHub"
                 );
                 continue;
+            }
+
+            // Per-file execution protections: scoped deny rules for this
+            // event/actor/workflow file.
+            if let Some(hit) = crate::execution_protection::denies_workflow(
+                &shared.state.execution_protection,
+                &effective.event,
+                protection_actor,
+                &filename,
+            ) {
+                match shared.state.execution_protection.mode {
+                    crate::config::ProtectionMode::Enforce => {
+                        info!(
+                            workflow = %filename,
+                            event = %effective.event,
+                            rule = %hit.describe(),
+                            "execution protection denied workflow"
+                        );
+                        continue;
+                    }
+                    crate::config::ProtectionMode::Evaluate => {
+                        info!(
+                            workflow = %filename,
+                            event = %effective.event,
+                            rule = %hit.describe(),
+                            "execution protection would deny workflow (evaluate mode)"
+                        );
+                    }
+                }
             }
 
             match preloop_gha_parser::parse_workflow(&content) {
@@ -4096,5 +4231,92 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// A check_run rerequest is a new trigger by the webhook sender, so both
+    /// the original run's actor and the sender must pass actor rules. Here
+    /// the original actor (alice) is clean but the sender (mallory) is
+    /// denied: the rerequest must not resubmit.
+    async fn rerequest_fixture() -> (tempfile::TempDir, std::sync::Arc<crate::SharedState>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.execution_protection = crate::config::ExecutionProtectionConfig {
+            mode: crate::config::ProtectionMode::Enforce,
+            event_rules: vec![],
+            actor_rules: vec![crate::config::ActorRule {
+                actor: "mallory".to_owned(),
+                workflows: None,
+                action: crate::config::PolicyRuleAction::Deny,
+            }],
+        };
+        let shared = state.shared();
+        // Seed a terminal run owned by alice with a known check run id.
+        let submission = WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            resolved_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
+            ..Default::default()
+        };
+        let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
+        {
+            let mut inner = shared.state.inner.lock().await;
+            let run = inner.runs.get_mut(&accepted.run_id).unwrap();
+            run.status = preloop_gha_protocol::ExecutionStatus::Success;
+            run.job_check_run_ids
+                .insert(JobId("build".to_owned()), 12345);
+        }
+        // Keep the TempDir alive for the state's lifetime.
+        (temp, shared)
+    }
+
+    fn rerequest_payload(sender: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": "rerequested",
+            "check_run": {
+                "id": 12345,
+                "name": "build",
+                "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            },
+            "repository": {"full_name": "owner/repo"},
+            "sender": {"login": sender},
+        })
+    }
+
+    #[tokio::test]
+    async fn check_run_rerequest_denies_blocked_sender() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let (status, body) = process_check_run_rerequest(&shared, &rerequest_payload("mallory"))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0, serde_json::json!([]));
+        let inner = shared.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "blocked sender must not resubmit the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_run_rerequest_allows_clean_sender() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let (status, body) = process_check_run_rerequest(&shared, &rerequest_payload("alice"))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(body.0, serde_json::json!([]), "clean sender must resubmit");
+        let inner = shared.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            2,
+            "clean sender's rerequest must create a run"
+        );
     }
 }
