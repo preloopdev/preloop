@@ -11,16 +11,200 @@
 //! - `jobs.status` (the `ExecutionStatus` in the run record) is canonical
 //!   workflow truth; `queue_kind` is the derived dispatch copy — never
 //!   independently mutable.
-//! - Every claim/lease carries a fencing carrier (`claim_generation`,
-//!   `expand_generation`, `lease_until_us` + owner) so a stale worker racing
-//!   a successor loses the write.
+//! - Every claim/lease carries a fencing carrier (`expand_generation`,
+//!   `lease_until_us` + owner) so a stale worker racing a successor loses
+//!   the write.
 //! - Payloads a command never inspects (job message, submission, request
 //!   blob) are opaque sealed/JSON blobs; columns exist only for what the
 //!   backend itself must query (status, queue position, owner, lease).
 
 /// SQLite schema version. Bumped on any DDL change; `PRAGMA user_version`
 /// records what a database was created/migrated to.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 1;
+///
+/// - 2: `runner_sessions.runner_id` nullable for compatibility sessions.
+/// - 3: `runner_sessions.runner_id` foreign key dropped. The binding is a
+///   *claimed* id recorded at session-create time; the runner may register
+///   later or never. Runner teardown removes sessions explicitly.
+/// - 4: `runs_delivery` widened to `(webhook_delivery_id, workflow_path)` —
+///   one delivery legitimately fans out to several workflow files, so the
+///   dedup key is the pair, not the delivery alone.
+/// - 5: `runner_sessions.verified` marks sessions created under a verified
+///   listen token; only they count toward the duplicate live-session conflict.
+/// - 6: `jobs.claim_generation` dropped — job-claim fencing lives on
+///   `job_requests.locked_until_us` + `owner_runner_id`, never this column.
+/// - 7: `outbox` dropped — declared but never read or written.
+/// - 8: SQLite text primary keys made explicitly `NOT NULL`; unlike
+///   PostgreSQL, SQLite rowid tables otherwise accept `NULL` in a
+///   non-integer primary key.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 8;
+
+/// SQLite migrations as `(version, sql)` steps, applied in order to any
+/// database whose `user_version` predates them — the same append-only model
+/// as `store.rs::MIGRATIONS`. Each step is one `execute_batch`; the runner
+/// holds `foreign_keys` off for the whole pass (the v3 table rebuild needs
+/// it) and re-enables it after. The idempotent [`SQLITE_DDL`] then runs to
+/// create fresh tables/indexes, and `user_version` is stamped to
+/// [`SQLITE_SCHEMA_VERSION`].
+///
+/// Steps are append-only and idempotent: a step only runs when the database
+/// is older than its version, so `IF NOT EXISTS` guards are unnecessary
+/// (unlike the DDL, which runs every open).
+pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
+    // v3: `runner_sessions.runner_id` had an FK into `runners` and (in v1)
+    // was NOT NULL. Neither is correct — the session→runner binding is a
+    // claimed id recorded at session-create time, before the runner may
+    // exist. SQLite cannot ALTER COLUMN/drop constraints, so rebuild the
+    // table preserving rows. (`broker_messages` holds an FK into
+    // `runner_sessions`; the runner disables FK enforcement for the pass.)
+    (
+        3,
+        "CREATE TABLE runner_sessions_v3 (
+            session_id          TEXT PRIMARY KEY,
+            runner_id           INTEGER,
+            protocol            TEXT NOT NULL DEFAULT 'broker',
+            client_id           TEXT,
+            encryption_blob     BLOB,
+            active_request_id   INTEGER,
+            last_seen_at_us     INTEGER,
+            created_at_us       INTEGER NOT NULL
+        );
+        INSERT INTO runner_sessions_v3
+            SELECT session_id, runner_id, protocol, client_id, encryption_blob,
+                   active_request_id, last_seen_at_us, created_at_us
+            FROM runner_sessions;
+        DROP TABLE runner_sessions;
+        ALTER TABLE runner_sessions_v3 RENAME TO runner_sessions;",
+    ),
+    // v4: `runs_delivery` widened to `(webhook_delivery_id, workflow_path)` —
+    // one delivery fans out to several workflow files. Drop the single-column
+    // index; the DDL recreates the composite one.
+    (4, "DROP INDEX IF EXISTS runs_delivery;"),
+    // v5: `runner_sessions.verified` marks sessions created under a verified
+    // listen token. Existing rows predate the flag; they keep the default 0
+    // (unverified) — a stale unverified row can only fail to conflict, never
+    // wrongly block a runner.
+    (
+        5,
+        "ALTER TABLE runner_sessions ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;",
+    ),
+    // v6: `jobs.claim_generation` dropped — job-claim fencing lives on
+    // `job_requests.locked_until_us` + `owner_runner_id`; the column was
+    // declared but never read or written.
+    (6, "ALTER TABLE jobs DROP COLUMN claim_generation;"),
+    // v7: `outbox` dropped — the transactional-outbox table was declared but
+    // never read or written (no producer or consumer exists).
+    (7, "DROP TABLE IF EXISTS outbox;"),
+    // v8: SQLite preserves a historical quirk for rowid tables: `TEXT
+    // PRIMARY KEY` does not imply `NOT NULL`. Rebuild the affected tables so
+    // the SQLite schema enforces the same identity invariant as Postgres.
+    //
+    // The migration runner disables foreign keys for the transaction. Build
+    // each replacement under a temporary name, drop the old table, then
+    // rename the replacement so child FK declarations keep targeting the
+    // stable table name. The idempotent DDL recreates dropped indexes.
+    (
+        8,
+        r#"
+        CREATE TABLE runs_v8 (
+            run_id              TEXT PRIMARY KEY NOT NULL,
+            namespace           TEXT NOT NULL DEFAULT 'default',
+            status              TEXT NOT NULL,
+            run_number          INTEGER NOT NULL,
+            run_attempt         INTEGER NOT NULL DEFAULT 1,
+            run_name            TEXT,
+            event               TEXT NOT NULL DEFAULT '',
+            workflow_path       TEXT NOT NULL DEFAULT '',
+            conclusion          TEXT,
+            webhook_delivery_id TEXT,
+            record_blob         BLOB NOT NULL,
+            created_at_us       INTEGER NOT NULL,
+            started_at_us       INTEGER,
+            completed_at_us     INTEGER
+        );
+        INSERT INTO runs_v8 (
+            run_id, namespace, status, run_number, run_attempt, run_name,
+            event, workflow_path, conclusion, webhook_delivery_id, record_blob,
+            created_at_us, started_at_us, completed_at_us
+        )
+        SELECT
+            run_id, namespace, status, run_number, run_attempt, run_name,
+            event, workflow_path, conclusion, webhook_delivery_id, record_blob,
+            created_at_us, started_at_us, completed_at_us
+        FROM runs;
+        DROP TABLE runs;
+        ALTER TABLE runs_v8 RENAME TO runs;
+
+        CREATE TABLE job_steps_v8 (
+            agent_job_id TEXT PRIMARY KEY NOT NULL,
+            steps_blob   BLOB NOT NULL,
+            revision     INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO job_steps_v8 (agent_job_id, steps_blob, revision)
+        SELECT agent_job_id, steps_blob, revision FROM job_steps;
+        DROP TABLE job_steps;
+        ALTER TABLE job_steps_v8 RENAME TO job_steps;
+
+        CREATE TABLE runner_sessions_v8 (
+            session_id       TEXT PRIMARY KEY NOT NULL,
+            runner_id        INTEGER,
+            protocol         TEXT NOT NULL DEFAULT 'broker',
+            client_id        TEXT,
+            encryption_blob  BLOB,
+            active_request_id INTEGER,
+            last_seen_at_us  INTEGER,
+            verified         INTEGER NOT NULL DEFAULT 0,
+            created_at_us    INTEGER NOT NULL
+        );
+        INSERT INTO runner_sessions_v8 (
+            session_id, runner_id, protocol, client_id, encryption_blob,
+            active_request_id, last_seen_at_us, verified, created_at_us
+        )
+        SELECT
+            session_id, runner_id, protocol, client_id, encryption_blob,
+            active_request_id, last_seen_at_us, verified, created_at_us
+        FROM runner_sessions;
+        DROP TABLE runner_sessions;
+        ALTER TABLE runner_sessions_v8 RENAME TO runner_sessions;
+
+        CREATE TABLE run_concurrency_v8 (
+            run_id          TEXT PRIMARY KEY NOT NULL,
+            concurrency_blob BLOB NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+        INSERT INTO run_concurrency_v8 (run_id, concurrency_blob)
+        SELECT run_id, concurrency_blob FROM run_concurrency;
+        DROP TABLE run_concurrency;
+        ALTER TABLE run_concurrency_v8 RENAME TO run_concurrency;
+
+        CREATE TABLE counters_v8 (
+            name  TEXT PRIMARY KEY NOT NULL,
+            value INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO counters_v8 (name, value)
+        SELECT name, value FROM counters;
+        DROP TABLE counters;
+        ALTER TABLE counters_v8 RENAME TO counters;
+
+        CREATE TABLE workflow_run_counters_v8 (
+            key   TEXT PRIMARY KEY NOT NULL,
+            value INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO workflow_run_counters_v8 (key, value)
+        SELECT key, value FROM workflow_run_counters;
+        DROP TABLE workflow_run_counters;
+        ALTER TABLE workflow_run_counters_v8 RENAME TO workflow_run_counters;
+
+        CREATE TABLE meta_v8 (
+            key   TEXT PRIMARY KEY NOT NULL,
+            value BLOB NOT NULL
+        );
+        INSERT INTO meta_v8 (key, value)
+        SELECT key, value FROM meta;
+        DROP TABLE meta;
+        ALTER TABLE meta_v8 RENAME TO meta;
+        "#,
+    ),
+];
 
 /// The SQLite DDL, applied as one migration. `IF NOT EXISTS` makes it
 /// idempotent for a fresh database; the migration runner records
@@ -36,7 +220,7 @@ PRAGMA synchronous = NORMAL;
 -- derived from the `jobs` table so a job transition is one row update,
 -- not a whole-record rewrite. Everything else is the run's own state.
 CREATE TABLE IF NOT EXISTS runs (
-    run_id              TEXT PRIMARY KEY,           -- RunId (uuid string)
+    run_id              TEXT PRIMARY KEY NOT NULL,  -- RunId (uuid string)
     namespace           TEXT NOT NULL DEFAULT 'default',
     status              TEXT NOT NULL,              -- ExecutionStatus
     run_number          INTEGER NOT NULL,
@@ -55,7 +239,7 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at_us     INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
-CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id)
+CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id, workflow_path)
     WHERE webhook_delivery_id IS NOT NULL;
 
 -- ── Jobs ─────────────────────────────────────────────────────────────
@@ -77,7 +261,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     reaper_first_seen_us INTEGER,                   -- starvation clock
     claimed_by          INTEGER,                    -- runner_id holding claim
     claimed_at_us       INTEGER,                    -- when the claim was taken
-    claim_generation    INTEGER NOT NULL DEFAULT 0, -- fencing
     expand_generation   INTEGER NOT NULL DEFAULT 0, -- expansion fencing
     payload_blob        BLOB,                       -- QueuedJob (sealed JSON)
     PRIMARY KEY (run_id, job_id),
@@ -143,7 +326,7 @@ CREATE TABLE IF NOT EXISTS oidc_job_contexts (
 
 -- Step manifests per attempt, with a revision for conditional updates.
 CREATE TABLE IF NOT EXISTS job_steps (
-    agent_job_id        TEXT PRIMARY KEY,           -- uuid
+    agent_job_id        TEXT PRIMARY KEY NOT NULL,  -- uuid
     steps_blob          BLOB NOT NULL,              -- Vec<StepRecord>
     revision            INTEGER NOT NULL DEFAULT 0
 );
@@ -166,15 +349,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS runners_client ON runners(client_id)
     WHERE client_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS runner_sessions (
-    session_id          TEXT PRIMARY KEY,
-    runner_id           INTEGER NOT NULL,
-    protocol            TEXT NOT NULL DEFAULT 'broker', -- broker | azdo
+    session_id          TEXT PRIMARY KEY NOT NULL,
+    -- NULL for compatibility sessions (e.g. the implicit `default` session)
+    -- that have no registered runner. No FK: the binding is a claimed id
+    -- recorded at session-create time; the runner may register later or
+    -- never. Runner teardown removes sessions explicitly.
+    runner_id           INTEGER,
+    protocol            TEXT NOT NULL DEFAULT 'broker', -- broker | azdo | compat
     client_id           TEXT,
     encryption_blob     BLOB,                       -- sealed SessionEncryption
     active_request_id   INTEGER,
     last_seen_at_us     INTEGER,
-    created_at_us       INTEGER NOT NULL,
-    FOREIGN KEY (runner_id) REFERENCES runners(runner_id) ON DELETE CASCADE
+    -- 1 when the session was created under a verified listen token (the token
+    -- named the runner). Only verified sessions count toward the duplicate
+    -- live-session conflict; unverified compat sessions never block a runner.
+    verified            INTEGER NOT NULL DEFAULT 0,
+    created_at_us       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_runner ON runner_sessions(runner_id);
 CREATE INDEX IF NOT EXISTS sessions_active ON runner_sessions(active_request_id)
@@ -221,7 +411,7 @@ CREATE TABLE IF NOT EXISTS jobset_ready (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS run_concurrency (
-    run_id              TEXT PRIMARY KEY,
+    run_id              TEXT PRIMARY KEY NOT NULL,
     concurrency_blob    BLOB NOT NULL,              -- parser::Concurrency
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -256,39 +446,80 @@ CREATE TABLE IF NOT EXISTS cancellation_queue (
 
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
-    name                TEXT PRIMARY KEY,
+    name                TEXT PRIMARY KEY NOT NULL,
     value               INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS workflow_run_counters (
-    key                 TEXT PRIMARY KEY,           -- repo+workflow dedup
+    key                 TEXT PRIMARY KEY NOT NULL,  -- repo+workflow dedup
     value               INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meta (
-    key                 TEXT PRIMARY KEY,
+    key                 TEXT PRIMARY KEY NOT NULL,
     value               BLOB NOT NULL
 );
 
--- ── Transactional outbox ─────────────────────────────────────────────
--- Durable effects committed with a state transition. Workers lease rows
--- per sink and acknowledge by generation; a crash replays, never loses.
-CREATE TABLE IF NOT EXISTS outbox (
-    effect_id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace           TEXT NOT NULL DEFAULT 'default',
-    kind                TEXT NOT NULL,              -- check_run|event|token|…
-    payload             BLOB NOT NULL,
-    lease_generation    INTEGER NOT NULL DEFAULT 0,
-    leased_by           TEXT,
-    lease_until_us      INTEGER,
-    attempts            INTEGER NOT NULL DEFAULT 0,
-    created_at_us       INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS outbox_lease ON outbox(kind, lease_until_us);
 "#;
 
 /// Postgres schema version. Bumped on any DDL change; the
 /// `control.schema_migrations` table records what a database was migrated
 /// to (Postgres has no `PRAGMA user_version`).
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 1;
+///
+/// - 2: `runner_sessions.runner_id` nullable for compatibility sessions.
+/// - 3: `runner_sessions.runner_id` foreign key dropped (claimed binding,
+///   not a referential constraint; see the SQLite history note).
+/// - 4: `runs_delivery` widened to `(webhook_delivery_id, workflow_path)` —
+///   one delivery legitimately fans out to several workflow files, so the
+///   dedup key is the pair, not the delivery alone.
+/// - 5: `runner_sessions.verified` marks sessions created under a verified
+///   listen token; only they count toward the duplicate live-session conflict.
+/// - 6: `jobs.claim_generation` dropped — job-claim fencing lives on
+///   `job_requests.locked_until_us` + `owner_runner_id`, never this column.
+/// - 7: `outbox` dropped — declared but never read or written.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 7;
+
+/// Postgres migrations as `(version, sql)` steps, applied in order to any
+/// database whose `schema_migrations` max predates them — the same
+/// append-only model as [`SQLITE_MIGRATIONS`]. Postgres drops constraints in
+/// place, so no table rebuild is needed; every step is a plain
+/// `batch_execute`. The idempotent [`POSTGRES_DDL`] then runs to create
+/// fresh tables/indexes, and the version is recorded in
+/// `control.schema_migrations`.
+pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
+    // v2: `runner_sessions.runner_id` nullable for compatibility sessions.
+    (
+        2,
+        "ALTER TABLE control.runner_sessions \
+         ALTER COLUMN runner_id DROP NOT NULL",
+    ),
+    // v3: `runner_sessions.runner_id` foreign key dropped (claimed binding,
+    // not a referential constraint; see the SQLite history note).
+    (
+        3,
+        "ALTER TABLE control.runner_sessions \
+         DROP CONSTRAINT IF EXISTS runner_sessions_runner_id_fkey",
+    ),
+    // v4: `runs_delivery` widened to `(webhook_delivery_id, workflow_path)` —
+    // one delivery fans out to several workflow files. Drop the single-column
+    // index; the DDL recreates the composite one.
+    (4, "DROP INDEX IF EXISTS control.runs_delivery"),
+    // v5: `runner_sessions.verified` marks sessions created under a verified
+    // listen token. Existing rows keep the default 0.
+    (
+        5,
+        "ALTER TABLE control.runner_sessions \
+         ADD COLUMN IF NOT EXISTS verified BIGINT NOT NULL DEFAULT 0",
+    ),
+    // v6: `jobs.claim_generation` dropped — job-claim fencing lives on
+    // `job_requests.locked_until_us` + `owner_runner_id`; the column was
+    // declared but never read or written.
+    (
+        6,
+        "ALTER TABLE control.jobs DROP COLUMN IF EXISTS claim_generation",
+    ),
+    // v7: `outbox` dropped — the transactional-outbox table was declared but
+    // never read or written (no producer or consumer exists).
+    (7, "DROP TABLE IF EXISTS control.outbox"),
+];
 
 /// The Postgres DDL: the same table families as [`SQLITE_DDL`] in Postgres
 /// dialect. `AUTOINCREMENT` → `BIGSERIAL`, `BLOB` → `BYTEA`, `INTEGER` →
@@ -314,7 +545,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 -- ── Runs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS runs (
-    run_id              TEXT PRIMARY KEY,
+    run_id              TEXT PRIMARY KEY NOT NULL,
     namespace           TEXT NOT NULL DEFAULT 'default',
     status              TEXT NOT NULL,
     run_number          BIGINT NOT NULL,
@@ -330,7 +561,7 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at_us     BIGINT
 );
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
-CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id)
+CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id, workflow_path)
     WHERE webhook_delivery_id IS NOT NULL;
 
 -- ── Jobs ─────────────────────────────────────────────────────────────
@@ -348,7 +579,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     reaper_first_seen_us BIGINT,
     claimed_by          BIGINT,
     claimed_at_us       BIGINT,
-    claim_generation    BIGINT NOT NULL DEFAULT 0,
     expand_generation   BIGINT NOT NULL DEFAULT 0,
     payload_blob        BYTEA,
     PRIMARY KEY (run_id, job_id),
@@ -405,7 +635,7 @@ CREATE TABLE IF NOT EXISTS oidc_job_contexts (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS job_steps (
-    agent_job_id        TEXT PRIMARY KEY,
+    agent_job_id        TEXT PRIMARY KEY NOT NULL,
     steps_blob          BYTEA NOT NULL,
     revision            BIGINT NOT NULL DEFAULT 0
 );
@@ -424,18 +654,22 @@ CREATE TABLE IF NOT EXISTS runners (
     pool_proven         BIGINT NOT NULL DEFAULT 0,
     registered_at_us    BIGINT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS runners_client ON runners(client_id)
-    WHERE client_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS runner_sessions (
-    session_id          TEXT PRIMARY KEY,
-    runner_id           BIGINT NOT NULL,
+    session_id          TEXT PRIMARY KEY NOT NULL,
+    -- NULL for compatibility sessions (e.g. the implicit `default` session)
+    -- that have no registered runner. No FK: the binding is a claimed id
+    -- recorded at session-create time; the runner may register later or
+    -- never. Runner teardown removes sessions explicitly.
+    runner_id           BIGINT,
     protocol            TEXT NOT NULL DEFAULT 'broker',
     client_id           TEXT,
     encryption_blob     BYTEA,
     active_request_id   BIGINT,
     last_seen_at_us     BIGINT,
-    created_at_us       BIGINT NOT NULL,
-    FOREIGN KEY (runner_id) REFERENCES runners(runner_id) ON DELETE CASCADE
+    -- 1 when created under a verified listen token; only verified sessions
+    -- count toward the duplicate live-session conflict.
+    verified            BIGINT NOT NULL DEFAULT 0,
+    created_at_us       BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_runner ON runner_sessions(runner_id);
 CREATE INDEX IF NOT EXISTS sessions_active ON runner_sessions(active_request_id)
@@ -480,7 +714,7 @@ CREATE TABLE IF NOT EXISTS jobset_ready (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS run_concurrency (
-    run_id              TEXT PRIMARY KEY,
+    run_id              TEXT PRIMARY KEY NOT NULL,
     concurrency_blob    BYTEA NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -509,29 +743,16 @@ CREATE TABLE IF NOT EXISTS cancellation_queue (
 
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
-    name                TEXT PRIMARY KEY,
+    name                TEXT PRIMARY KEY NOT NULL,
     value               BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS workflow_run_counters (
-    key                 TEXT PRIMARY KEY,
+    key                 TEXT PRIMARY KEY NOT NULL,
     value               BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meta (
-    key                 TEXT PRIMARY KEY,
+    key                 TEXT PRIMARY KEY NOT NULL,
     value               BYTEA NOT NULL
 );
 
--- ── Transactional outbox ─────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS outbox (
-    effect_id           BIGSERIAL PRIMARY KEY,
-    namespace           TEXT NOT NULL DEFAULT 'default',
-    kind                TEXT NOT NULL,
-    payload             BYTEA NOT NULL,
-    lease_generation    BIGINT NOT NULL DEFAULT 0,
-    leased_by           TEXT,
-    lease_until_us      BIGINT,
-    attempts            BIGINT NOT NULL DEFAULT 0,
-    created_at_us       BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS outbox_lease ON outbox(kind, lease_until_us);
 "#;
