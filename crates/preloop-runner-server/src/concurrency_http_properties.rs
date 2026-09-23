@@ -306,10 +306,10 @@ pub mod http_sequences {
         let _b = submit(&app, yaml, "owner/repo").await;
         let a_id = a["run_id"].as_str().unwrap();
 
-        let inner = state.inner.lock().await;
-        // B's jobs should be in held_runs, not in the queue.
-        let queue_run_ids: Vec<String> = inner.queue.iter().map(|j| j.run_id.to_string()).collect();
-        let held_run_ids: Vec<String> = inner.held_runs.keys().map(|id| id.to_string()).collect();
+        let tx = state.test_tx().await;
+        // B's jobs should be in held_runs, not in the ready queue.
+        let queue_run_ids: Vec<String> = tx.ready().map(|j| j.run_id.to_string()).collect();
+        let held_run_ids: Vec<String> = tx.held_runs.keys().map(|id| id.to_string()).collect();
         for held_id in &held_run_ids {
             assert!(
                 !queue_run_ids.contains(held_id),
@@ -355,8 +355,8 @@ pub mod http_sequences {
         assert_eq!(a_run["status"], "cancelled");
 
         // Count cancellation messages for A.
-        let inner = state.inner.lock().await;
-        let cancel_count = inner
+        let tx = state.test_tx().await;
+        let cancel_count = tx
             .cancellation_queue
             .iter()
             .filter(|c| c.run_id.to_string() == a_id)
@@ -364,7 +364,7 @@ pub mod http_sequences {
 
         // Exactly one cancellation (or zero if already drained by poll).
         // Check inflight messages too.
-        let msg_cancel_count: usize = inner
+        let msg_cancel_count: usize = tx
             .inflight_messages
             .values()
             .flat_map(|msgs| msgs.values())
@@ -377,7 +377,7 @@ pub mod http_sequences {
             "GH-CANCEL-01: expected exactly 1 cancellation message for A, got {total_cancels} \
              (queue={cancel_count}, inflight={msg_cancel_count})"
         );
-        drop(inner);
+        drop(tx);
 
         // B should be running/queued, not cancelled.
         let b_run = get_run(&app, b_id).await;
@@ -415,13 +415,13 @@ pub mod http_sequences {
 
         // No cancellation messages should exist for B, because B was never
         // dispatched to a runner.
-        let inner = state.inner.lock().await;
-        let b_cancels = inner
+        let tx = state.test_tx().await;
+        let b_cancels = tx
             .cancellation_queue
             .iter()
             .filter(|c| c.run_id.to_string() == b_id)
             .count();
-        let _b_inflight_cancels: usize = inner
+        let _b_inflight_cancels: usize = tx
             .inflight_messages
             .values()
             .flat_map(|msgs| msgs.values())
@@ -470,8 +470,8 @@ pub mod http_sequences {
         );
 
         // B's jobs should be in the queue.
-        let inner = state.inner.lock().await;
-        let b_in_queue = inner.queue.iter().any(|j| j.run_id.to_string() == b_id);
+        let tx = state.test_tx().await;
+        let b_in_queue = tx.ready().any(|j| j.run_id.to_string() == b_id);
         assert!(b_in_queue, "B's job must be in the dispatch queue");
     }
 
@@ -588,10 +588,12 @@ pub mod http_sequences {
         // Bind the legacy session to the runner before polling so the claimed
         // request records the same owner the runtime token must prove.
         {
-            let mut inner = state.inner.lock().await;
-            inner
-                .broker_session_runners
-                .insert("sess-broker".to_owned(), 1);
+            state
+                .test_tx_mutate(|tx| {
+                    tx.broker_session_runners
+                        .insert("sess-broker".to_owned(), 1);
+                })
+                .await;
         }
 
         // Dispatch A via polling so it becomes InProgress.
@@ -599,8 +601,8 @@ pub mod http_sequences {
         assert!(!msg.is_null(), "A should be dispatchable");
         assert_eq!(get_run(&app, a_id).await["jobs"]["build"], "in_progress");
         let runtime_token = {
-            let inner = state.inner.lock().await;
-            let request = inner
+            let tx = state.test_tx().await;
+            let request = tx
                 .job_requests
                 .values()
                 .find(|request| request.run_id.to_string() == a_id)
@@ -611,8 +613,8 @@ pub mod http_sequences {
         // Complete via broker path.
         // We need to find the agent_job_id and plan_id.
         let (plan_id, agent_job_id) = {
-            let inner = state.inner.lock().await;
-            let req = inner
+            let tx = state.test_tx().await;
+            let req = tx
                 .job_requests
                 .values()
                 .find(|r| r.run_id.to_string() == a_id)
@@ -782,10 +784,10 @@ pub mod http_sequences {
                 }
 
                 // ── After-operation invariant checks ────────────────────
-                let inner = state.inner.lock().await;
+                let tx = state.test_tx().await;
 
                 // INV-1: GH-SLOT-01 — at most one running holder per group.
-                for (key, group) in &inner.concurrency_groups {
+                for (key, group) in &tx.concurrency_groups {
                     assert!(
                         group.running.as_ref().is_none_or(|_| true),
                         "op {op_idx}: group {key:?} has multiple running holders"
@@ -794,8 +796,8 @@ pub mod http_sequences {
                 }
 
                 // INV-2: Pending runs (held_runs) must not have jobs in queue.
-                for held_run_id in inner.held_runs.keys() {
-                    let in_queue = inner.queue.iter().any(|j| j.run_id == *held_run_id);
+                for held_run_id in tx.held_runs.keys() {
+                    let in_queue = tx.ready().any(|j| j.run_id == *held_run_id);
                     assert!(
                         !in_queue,
                         "op {op_idx}: held run {held_run_id} has jobs in dispatch queue"
@@ -803,15 +805,12 @@ pub mod http_sequences {
                 }
 
                 // INV-3: Terminal runs have no entries in dispatch/concurrency queues.
-                for (run_id, run) in &inner.runs {
+                for (run_id, run) in &tx.runs {
                     if run.status.is_terminal() {
-                        let in_queue = inner.queue.iter().any(|j| &j.run_id == run_id);
-                        let in_pending = inner.pending_jobs.iter().any(|j| &j.run_id == run_id);
-                        let in_blocked = inner
-                            .concurrency_blocked
-                            .iter()
-                            .any(|j| &j.run_id == run_id);
-                        let in_held = inner.held_runs.contains_key(run_id);
+                        let in_queue = tx.ready().any(|j| &j.run_id == run_id);
+                        let in_pending = tx.pending_jobs.iter().any(|j| &j.run_id == run_id);
+                        let in_blocked = tx.concurrency_blocked.iter().any(|j| &j.run_id == run_id);
+                        let in_held = tx.held_runs.contains_key(run_id);
                         assert!(
                             !in_queue && !in_pending && !in_blocked && !in_held,
                             "op {op_idx}: terminal run {run_id} still in queues \
@@ -823,7 +822,7 @@ pub mod http_sequences {
                 // INV-4: No duplicate (run_id, job_id) in queue.
                 {
                     let mut seen = std::collections::HashSet::new();
-                    for j in &inner.queue {
+                    for j in tx.ready() {
                         assert!(
                             seen.insert((j.run_id, j.job_id.clone())),
                             "op {op_idx}: duplicate ({}, {}) in queue",
@@ -836,7 +835,7 @@ pub mod http_sequences {
                 // INV-5: No duplicate (run_id, job_id) in pending_jobs.
                 {
                     let mut seen = std::collections::HashSet::new();
-                    for j in &inner.pending_jobs {
+                    for j in &tx.pending_jobs {
                         assert!(
                             seen.insert((j.run_id, j.job_id.clone())),
                             "op {op_idx}: duplicate ({}, {}) in pending_jobs",
@@ -849,7 +848,7 @@ pub mod http_sequences {
                 // INV-6: No duplicate (run_id, job_id) in concurrency_blocked.
                 {
                     let mut seen = std::collections::HashSet::new();
-                    for j in &inner.concurrency_blocked {
+                    for j in &tx.concurrency_blocked {
                         assert!(
                             seen.insert((j.run_id, j.job_id.clone())),
                             "op {op_idx}: duplicate ({}, {}) in concurrency_blocked",
@@ -859,7 +858,7 @@ pub mod http_sequences {
                     }
                 }
 
-                drop(inner);
+                drop(tx);
             }
         });
     }

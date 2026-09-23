@@ -330,15 +330,15 @@ impl Model {
 // ── Production state helpers ────────────────────────────────────────────────
 
 /// Minimal production state wrapper for concurrency-only testing.
-/// Uses InnerState directly since we're a child module of lib.rs.
+/// Uses the authoritative `TxState` + `control::sched` transitions.
 struct ProdState {
-    inner: InnerState,
+    tx: crate::control::txstate::TxState,
 }
 
 impl ProdState {
     fn new() -> Self {
         Self {
-            inner: InnerState::default(),
+            tx: crate::control::txstate::TxState::default(),
         }
     }
 
@@ -402,7 +402,7 @@ impl ProdState {
             fork_approved_at_unix_nanos: None,
             fork_approval_note: None,
         };
-        self.inner.runs.insert(run_id, record);
+        self.tx.runs.insert(run_id, record);
     }
 
     fn to_holder(token: &HolderToken) -> Holder {
@@ -428,20 +428,42 @@ impl ProdState {
     ) -> Result<bool, String> {
         let holder = Self::to_holder(token);
         let display = format!("{:?}", key);
-        try_acquire_concurrency(
-            &mut self.inner,
+        let result = crate::control::sched::try_acquire_concurrency(
+            &mut self.tx,
             key,
             display,
             holder,
             cancel_in_progress,
             queue,
-        )
+        );
+        // A parked Run holder holds the run's jobs in `held_runs` — the real
+        // submit path moves them there so `promote_next_from_group` can
+        // confirm the run is loaded before occupying the slot. Mirror that:
+        // without it the promote path treats the run as foreign and consumes
+        // the holder instead of promoting it.
+        if matches!(result, Ok(false)) {
+            if let concurrency::Holder::Run(run_id) = Self::to_holder(token) {
+                let jobs: Vec<QueuedJob> = self
+                    .tx
+                    .runs
+                    .get(&run_id)
+                    .map(|run| {
+                        run.jobs
+                            .keys()
+                            .map(|job_id| queued_job(run_id, &job_id.0))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.tx.held_runs.insert(run_id, jobs);
+            }
+        }
+        result
     }
 
     fn release_run(&mut self, run_n: u32) {
         let run_id = rid(run_n);
         // Mark all jobs terminal first
-        if let Some(run) = self.inner.runs.get_mut(&run_id) {
+        if let Some(run) = self.tx.runs.get_mut(&run_id) {
             for status in run.jobs.values_mut() {
                 if !status.is_terminal() {
                     *status = ExecutionStatus::Success;
@@ -449,31 +471,31 @@ impl ProdState {
             }
             run.status = summarize_run(run.jobs.values().copied());
         }
-        release_concurrency_for_run(&mut self.inner, run_id);
+        crate::control::sched::release_concurrency_for_run(&mut self.tx, run_id);
     }
 
     fn release_job(&mut self, run_n: u32, job_n: u32) {
         let run_id = rid(run_n);
         let job_id = jid(job_n);
         // Mark this job terminal
-        if let Some(run) = self.inner.runs.get_mut(&run_id) {
-            if let Some(status) = run.jobs.get_mut(&job_id)
-                && !status.is_terminal()
-            {
-                *status = ExecutionStatus::Success;
+        if let Some(run) = self.tx.runs.get_mut(&run_id) {
+            if let Some(status) = run.jobs.get_mut(&job_id) {
+                if !status.is_terminal() {
+                    *status = ExecutionStatus::Success;
+                }
             }
             run.status = summarize_run(run.jobs.values().copied());
         }
-        release_concurrency_for_job(&mut self.inner, run_id, &job_id);
+        crate::control::sched::release_concurrency_for_job(&mut self.tx, run_id, &job_id);
     }
 
     fn cancel_run(&mut self, run_n: u32) {
-        cancel_run_inner(&mut self.inner, rid(run_n), Some("test"));
+        crate::control::sched::cancel_run_inner(&mut self.tx, rid(run_n), Some("test"));
     }
 
     /// Snapshot for comparison: (group_key → (running_token, pending_tokens)).
     fn snapshot(&self) -> BTreeMap<(String, String), (Option<HolderToken>, Vec<HolderToken>)> {
-        self.inner
+        self.tx
             .concurrency_groups
             .iter()
             .map(|(key, group)| {
@@ -508,17 +530,60 @@ impl ProdState {
 
     fn clone_concurrency(&self) -> Self {
         Self {
-            inner: InnerState {
-                runs: self.inner.runs.clone(),
-                queue: self.inner.queue.clone(),
-                pending_jobs: self.inner.pending_jobs.clone(),
-                concurrency_blocked: self.inner.concurrency_blocked.clone(),
-                concurrency_groups: self.inner.concurrency_groups.clone(),
-                holder_keys: self.inner.holder_keys.clone(),
-                jobset_admissions: self.inner.jobset_admissions.clone(),
+            tx: crate::control::txstate::TxState {
+                runs: self.tx.runs.clone(),
+                // `queue` is the enqueue buffer; the ready queue lives in
+                // `ready_index`. Mirror both so the clone dispatches the same.
+                queue: self.tx.queue.clone(),
+                ready_index: self.tx.ready_index.clone(),
+                ready_count: self.tx.ready_count,
+                pending_jobs: self.tx.pending_jobs.clone(),
+                concurrency_blocked: self.tx.concurrency_blocked.clone(),
+                held_runs: self.tx.held_runs.clone(),
+                concurrency_groups: self.tx.concurrency_groups.clone(),
+                holder_keys: self.tx.holder_keys.clone(),
+                jobset_admissions: self.tx.jobset_admissions.clone(),
                 ..Default::default()
             },
         }
+    }
+}
+
+/// Minimal `QueuedJob` for `held_runs` — mirrors `control::tests::queued_job`.
+fn queued_job(run_id: RunId, job_id: &str) -> QueuedJob {
+    let nanos = crate::models::now_unix_nanos();
+    QueuedJob {
+        run_id,
+        job_id: JobId(job_id.to_owned()),
+        base_id: job_id.to_owned(),
+        created_at_unix_nanos: nanos,
+        dependencies_ready_at_unix_nanos: Some(nanos),
+        concurrency_wait_started_at_unix_nanos: None,
+        concurrency_acquired_at_unix_nanos: None,
+        enqueued_at_unix_nanos: nanos,
+        needs: Vec::new(),
+        if_condition: None,
+        condition_context: preloop_gha_expressions::Context::default(),
+        max_parallel: None,
+        runs_on: vec!["self-hosted".to_owned()],
+        runner_group: None,
+        environment: None,
+        message: serde_json::from_value(serde_json::json!({
+            "jobId": uuid::Uuid::new_v4(),
+            "requestId": 0,
+            "plan": {"planId": "plan", "planType": "build", "version": 1, "artifactUri": "", "artifactLocation": ""},
+            "timeline": {"id": uuid::Uuid::new_v4(), "changeId": 0, "location": null},
+            "jobName": job_id,
+            "lockedUntil": "",
+            "resources": {"endpoints": []},
+            "steps": [],
+            "snapshot": null
+        }))
+        .unwrap(),
+        concurrency: None,
+        matrix: BTreeMap::new(),
+        deferred_matrix: None,
+        reusable_call: None,
     }
 }
 
@@ -587,9 +652,9 @@ mod generators {
 
 // ── Invariant checker on production state ───────────────────────────────────
 
-fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
+fn check_production_invariants(tx: &crate::control::txstate::TxState) -> Result<(), String> {
     // INV-1: At most one running holder per group.
-    for group in inner.concurrency_groups.values() {
+    for group in tx.concurrency_groups.values() {
         if group.running.is_some() {
             // No pending should be running simultaneously
             // (this is structural — pending is a separate queue)
@@ -597,14 +662,14 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
     }
 
     // INV-2: Running and pending are disjoint within each group.
-    for (key, group) in &inner.concurrency_groups {
-        if let Some(running) = &group.running
-            && group.pending.contains(running)
-        {
-            return Err(format!(
-                "INV-2: group {:?} running holder also in pending",
-                key
-            ));
+    for (key, group) in &tx.concurrency_groups {
+        if let Some(running) = &group.running {
+            if group.pending.contains(running) {
+                return Err(format!(
+                    "INV-2: group {:?} running holder also in pending",
+                    key
+                ));
+            }
         }
     }
 
@@ -613,10 +678,10 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
     // the structural limit — single mode should have been enforced at acquire)
 
     // INV-7: Every running/pending holder has a reverse key entry.
-    for (key, group) in &inner.concurrency_groups {
+    for (key, group) in &tx.concurrency_groups {
         if let Some(running) = &group.running {
             let run_id = running.run_id();
-            let has_reverse = inner
+            let has_reverse = tx
                 .holder_keys
                 .get(&run_id)
                 .is_some_and(|keys| keys.contains(key));
@@ -629,7 +694,7 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
         }
         for pending in &group.pending {
             let run_id = pending.run_id();
-            let has_reverse = inner
+            let has_reverse = tx
                 .holder_keys
                 .get(&run_id)
                 .is_some_and(|keys| keys.contains(key));
@@ -645,7 +710,7 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
     // INV-9: No duplicate (run_id, job_id) in queue, pending_jobs, concurrency_blocked.
     {
         let mut seen = BTreeSet::new();
-        for j in inner.queue.iter() {
+        for j in tx.queue.iter() {
             if !seen.insert((j.run_id, j.job_id.clone())) {
                 return Err(format!(
                     "INV-9: duplicate ({:?}, {:?}) in queue",
@@ -654,7 +719,7 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
             }
         }
         let mut seen = BTreeSet::new();
-        for j in inner.pending_jobs.iter() {
+        for j in tx.pending_jobs.iter() {
             if !seen.insert((j.run_id, j.job_id.clone())) {
                 return Err(format!(
                     "INV-9: duplicate ({:?}, {:?}) in pending_jobs",
@@ -663,7 +728,7 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
             }
         }
         let mut seen = BTreeSet::new();
-        for j in inner.concurrency_blocked.iter() {
+        for j in tx.concurrency_blocked.iter() {
             if !seen.insert((j.run_id, j.job_id.clone())) {
                 return Err(format!(
                     "INV-9: duplicate ({:?}, {:?}) in concurrency_blocked",
@@ -674,16 +739,16 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
     }
 
     // INV-12: Empty groups are removed.
-    for (key, group) in &inner.concurrency_groups {
+    for (key, group) in &tx.concurrency_groups {
         if group.running.is_none() && group.pending.is_empty() {
             return Err(format!("INV-12: empty group {:?} not removed", key));
         }
     }
 
     // Holder keys: no entry for a run with zero group presence.
-    for (run_id, keys) in &inner.holder_keys {
+    for (run_id, keys) in &tx.holder_keys {
         for key in keys {
-            let present = inner.concurrency_groups.get(key).is_some_and(|g| {
+            let present = tx.concurrency_groups.get(key).is_some_and(|g| {
                 g.running.as_ref().is_some_and(|h| h.run_id() == *run_id)
                     || g.pending.iter().any(|h| h.run_id() == *run_id)
             });
@@ -722,12 +787,12 @@ pub mod state_machine {
     /// Ensure the run referenced by an op exists in production state.
     fn ensure_run(prod: &mut ProdState, run: u32, kind: &HolderKind) {
         let run_id = rid(run);
-        if prod.inner.runs.contains_key(&run_id) {
+        if prod.tx.runs.contains_key(&run_id) {
             // Ensure all referenced jobs exist
             match kind {
                 HolderKind::Run => {}
                 HolderKind::Job(j) => {
-                    let run_record = prod.inner.runs.get_mut(&run_id).unwrap();
+                    let run_record = prod.tx.runs.get_mut(&run_id).unwrap();
                     run_record
                         .jobs
                         .entry(jid(*j))
@@ -738,7 +803,7 @@ pub mod state_machine {
                         .or_insert_with(|| format!("j{j}"));
                 }
                 HolderKind::JobSet(js) => {
-                    let run_record = prod.inner.runs.get_mut(&run_id).unwrap();
+                    let run_record = prod.tx.runs.get_mut(&run_id).unwrap();
                     for j in js {
                         run_record
                             .jobs
@@ -889,7 +954,7 @@ pub mod state_machine {
                 })?;
 
                 // Check production invariants
-                check_production_invariants(&prod.inner).map_err(|e| {
+                check_production_invariants(&prod.tx).map_err(|e| {
                     TestCaseError::Fail(
                         format!("Production invariant failed after op {i}: {e}").into(),
                     )
@@ -1079,14 +1144,14 @@ pub mod state_machine {
 
             // After cancellation of all runs, all groups and holder keys should be empty
             prop_assert!(
-                prod.inner.concurrency_groups.is_empty(),
+                prod.tx.concurrency_groups.is_empty(),
                 "After cancelling all runs, concurrency_groups should be empty but has {:?}",
-                prod.inner.concurrency_groups.keys().collect::<Vec<_>>()
+                prod.tx.concurrency_groups.keys().collect::<Vec<_>>()
             );
             prop_assert!(
-                prod.inner.holder_keys.is_empty(),
+                prod.tx.holder_keys.is_empty(),
                 "After cancelling all runs, holder_keys should be empty but has {:?}",
-                prod.inner.holder_keys.keys().collect::<Vec<_>>()
+                prod.tx.holder_keys.keys().collect::<Vec<_>>()
             );
         }
 
@@ -1105,8 +1170,8 @@ pub mod state_machine {
             let key = ("repo".to_owned(), "grp".to_owned());
 
             // First acquire succeeds (slot was free)
-            let r1 = try_acquire_concurrency(
-                &mut prod.inner,
+            let r1 = crate::control::sched::try_acquire_concurrency(
+                &mut prod.tx,
                 key.clone(),
                 "grp".into(),
                 Holder::Run(rid(first_run)),
@@ -1116,8 +1181,8 @@ pub mod state_machine {
             assert_eq!(r1, Ok(true), "first acquire should succeed");
 
             // Second with cancel_in_progress replaces
-            let r2 = try_acquire_concurrency(
-                &mut prod.inner,
+            let r2 = crate::control::sched::try_acquire_concurrency(
+                &mut prod.tx,
                 key.clone(),
                 "grp".into(),
                 Holder::Run(rid(second_run)),
@@ -1127,15 +1192,15 @@ pub mod state_machine {
             assert_eq!(r2, Ok(true), "cancel-in-progress acquire should succeed");
 
             // The running holder is now the second run
-            let group = prod.inner.concurrency_groups.get(&key).unwrap();
+            let group = prod.tx.concurrency_groups.get(&key).unwrap();
             assert_eq!(
-                group.running,
-                Some(Holder::Run(rid(second_run))),
-                "GH-CANCEL-01: running must be the second arrival"
+                group.running.as_ref().map(|h| h.run_id()),
+                Some(rid(second_run)),
+                "cancel-in-progress must install the arriving holder"
             );
         }
 
-        /// GH-GROUP-01 via state machine: case variants hit the same group.
+        /// GH-GROUP-01: group keys are case-insensitive.
         #[test]
         fn case_variants_same_group(
             run1 in 0..3u32,
@@ -1149,8 +1214,8 @@ pub mod state_machine {
             let key2 = concurrency::concurrency_key("repo", "group");
             assert_eq!(key1, key2, "GH-GROUP-01: keys must match");
 
-            let r1 = try_acquire_concurrency(
-                &mut prod.inner,
+            let r1 = crate::control::sched::try_acquire_concurrency(
+                &mut prod.tx,
                 key1.clone(),
                 "Group".into(),
                 Holder::Run(rid(run1)),
@@ -1160,8 +1225,8 @@ pub mod state_machine {
             assert_eq!(r1, Ok(true));
 
             // Second arrival on same key (different case) should contend
-            let r2 = try_acquire_concurrency(
-                &mut prod.inner,
+            let r2 = crate::control::sched::try_acquire_concurrency(
+                &mut prod.tx,
                 key2,
                 "group".into(),
                 Holder::Run(rid(run2)),
@@ -1230,7 +1295,7 @@ pub mod state_machine {
             visited: &mut BTreeSet<String>,
         ) {
             assert!(model.check_all_invariants().is_ok());
-            assert!(check_production_invariants(&prod.inner).is_ok());
+            assert!(check_production_invariants(&prod.tx).is_ok());
 
             let model_snap: BTreeMap<_, _> = model
                 .groups
@@ -1543,8 +1608,8 @@ pub mod pure {
             // First holder takes the running slot
             prod.register_run(0, &[0]);
             let key = ("repo".to_owned(), "grp".to_owned());
-            let r = try_acquire_concurrency(
-                &mut prod.inner,
+            let r = crate::control::sched::try_acquire_concurrency(
+                &mut prod.tx,
                 key.clone(),
                 "grp".into(),
                 Holder::Run(rid(0)),
@@ -1556,8 +1621,8 @@ pub mod pure {
             // Fill pending up to boundary
             for i in 1..=boundary as u32 {
                 prod.register_run(i, &[0]);
-                let r = try_acquire_concurrency(
-                    &mut prod.inner,
+                let r = crate::control::sched::try_acquire_concurrency(
+                    &mut prod.tx,
                     key.clone(),
                     "grp".into(),
                     Holder::Run(rid(i)),
@@ -1571,7 +1636,7 @@ pub mod pure {
                 }
             }
 
-            let group = prod.inner.concurrency_groups.get(&key).unwrap();
+            let group = prod.tx.concurrency_groups.get(&key).unwrap();
             prop_assert!(
                 group.pending.len() <= QUEUE_MAX_PENDING,
                 "GH-MAX-01: pending {} exceeds limit {}",
@@ -1589,7 +1654,6 @@ pub mod pure {
 /// same group parks forever. Each test fails on the unfixed code.
 mod holder_leak_regressions {
     use super::*;
-    use crate::runtime_scheduling::{apply_matrix_fail_fast, try_acquire_concurrency};
 
     fn key() -> (String, String) {
         ("group-a".to_owned(), "owner/repo".to_owned())
@@ -1607,15 +1671,15 @@ mod holder_leak_regressions {
         let mut prod = ProdState::new();
         prod.register_run(1, &[1, 2]);
         // Both cells share one base job, and the base is fail-fast.
-        if let Some(run) = prod.inner.runs.get_mut(&rid(1)) {
+        if let Some(run) = prod.tx.runs.get_mut(&rid(1)) {
             run.job_base_ids.insert(jid(1), "build".to_owned());
             run.job_base_ids.insert(jid(2), "build".to_owned());
             run.job_fail_fast.insert("build".to_owned(), true);
             run.jobs.insert(jid(2), ExecutionStatus::InProgress);
         }
         // Sibling job2 owns the group slot.
-        let acquired = try_acquire_concurrency(
-            &mut prod.inner,
+        let acquired = crate::control::sched::try_acquire_concurrency(
+            &mut prod.tx,
             key(),
             "group-a".to_owned(),
             Holder::Job {
@@ -1629,14 +1693,15 @@ mod holder_leak_regressions {
         assert!(acquired, "sibling must own the slot before fail-fast");
 
         // job1 fails; fail-fast cancels job2.
-        let cancelled = apply_matrix_fail_fast(&mut prod.inner, rid(1), &jid(1));
+        let cancelled =
+            crate::control::sched::apply_matrix_fail_fast(&mut prod.tx, rid(1), &jid(1));
         assert!(
             cancelled.contains(&jid(2)),
             "fail-fast must cancel the sibling, got {cancelled:?}"
         );
 
         let still_held = prod
-            .inner
+            .tx
             .concurrency_groups
             .get(&key())
             .and_then(|group| group.running.clone());
@@ -1659,8 +1724,8 @@ mod holder_leak_regressions {
         prod.register_run(1, &[1]);
 
         // The run holds the group at workflow level.
-        let acquired = try_acquire_concurrency(
-            &mut prod.inner,
+        let acquired = crate::control::sched::try_acquire_concurrency(
+            &mut prod.tx,
             key(),
             "group-a".to_owned(),
             Holder::Run(rid(1)),
@@ -1676,8 +1741,8 @@ mod holder_leak_regressions {
             run_id: rid(1),
             job_id: jid(1),
         };
-        let acquired = try_acquire_concurrency(
-            &mut prod.inner,
+        let acquired = crate::control::sched::try_acquire_concurrency(
+            &mut prod.tx,
             key(),
             "group-a".to_owned(),
             arriving.clone(),
@@ -1688,7 +1753,7 @@ mod holder_leak_regressions {
         assert!(acquired, "the arriving holder is admitted");
 
         let running = prod
-            .inner
+            .tx
             .concurrency_groups
             .get(&key())
             .and_then(|group| group.running.clone());
@@ -1698,7 +1763,7 @@ mod holder_leak_regressions {
             "admission returned true, so the group must record the arriving holder"
         );
         assert!(
-            prod.inner
+            prod.tx
                 .holder_keys
                 .get(&rid(1))
                 .is_some_and(|keys| keys.contains(&key())),

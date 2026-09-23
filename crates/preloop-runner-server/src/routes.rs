@@ -243,11 +243,11 @@ pub fn build_app(
     let protected_admin_apis = Router::new()
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
+            delete(delete_agent).put(update_agent),
         )
         .route(
             "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
-            delete(delete_agent),
+            delete(delete_agent).put(update_agent),
         )
         .route(
             "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
