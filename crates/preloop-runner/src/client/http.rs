@@ -278,6 +278,31 @@ impl HttpClient {
             .with_context(|| format!("reading body of GET {url}"))
     }
 
+    /// GET request returning raw bytes plus the response headers, so
+    /// callers can read server attestations (e.g. the action archive
+    /// digest header) without a second request.
+    pub async fn get_bytes_with_headers(
+        &self,
+        url: &str,
+    ) -> Result<(bytes::Bytes, reqwest::header::HeaderMap)> {
+        let resp = self
+            .client_for(url)
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("GET {url} returned {status}");
+        }
+        let headers = resp.headers().clone();
+        let bytes = resp
+            .bytes()
+            .await
+            .with_context(|| format!("reading body of GET {url}"))?;
+        Ok((bytes, headers))
+    }
+
     /// POST JSON with custom authorization header, returning JSON.
     /// P1.7: Retries up to 3 times on transient 5xx or network errors with exponential backoff.
     pub async fn post_json_with_auth<T: serde::de::DeserializeOwned>(

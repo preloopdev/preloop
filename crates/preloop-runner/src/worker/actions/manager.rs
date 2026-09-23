@@ -57,6 +57,26 @@ fn read_cached_archive_digest(sidecar: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Response header in which the engine attests the SHA-256 of the action
+/// tarball bytes it serves. Must match the server's
+/// `ACTION_ARCHIVE_SHA256_HEADER` in `preloop-runner-server`.
+const ACTION_ARCHIVE_SHA256_HEADER: &str = "x-preloop-action-archive-sha256";
+
+/// Parse and validate the engine-attested archive digest from download
+/// response headers. Returns `None` when the header is absent (older
+/// engine) or malformed — a missing attestation never fails the
+/// download, it just leaves Unpinned downloads unverified.
+fn header_archive_digest(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let value = headers.get(ACTION_ARCHIVE_SHA256_HEADER)?;
+    let digest = value.to_str().ok()?.trim().to_ascii_lowercase();
+    if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(digest)
+    } else {
+        tracing::warn!("ignoring malformed {ACTION_ARCHIVE_SHA256_HEADER} response header");
+        None
+    }
+}
+
 /// Remove a cached action tree and its digest sidecar. Fails closed: if the
 /// eviction itself fails the caller must not run the suspect tree.
 fn evict_action_cache(dest: &Path, sidecar: &Path) -> Result<()> {
@@ -83,14 +103,23 @@ fn evict_action_cache(dest: &Path, sidecar: &Path) -> Result<()> {
 ///
 /// `digest_pin` carries the server's archive-checksum pin for this action
 /// version ([`ArchiveDigestPin`]). The SHA-256 of the downloaded archive
-/// bytes is computed immediately after download and compared against a known
-/// pin *before* `extract_tarball` runs: a mismatch fails closed and no
-/// destination tree is created, so tampered bytes are never executed. On a
-/// successful fresh download the observed digest is returned, and a
-/// digest sidecar is written after successful extraction so later cache
-/// hits can be checked against it without re-downloading. Nothing is
-/// reported back to the server: pins are minted by the engine when it
-/// fetches the tarball itself, never by job VMs.
+/// bytes is computed immediately after download and compared *before*
+/// `extract_tarball` runs: a mismatch fails closed and no destination
+/// tree is created, so tampered bytes are never executed. The expected
+/// digest is the resolve-time pin when Pinned; otherwise the engine
+/// attests the digest in the `x-preloop-action-archive-sha256` download
+/// response header, so even an Unpinned download is verified against the
+/// exact bytes the engine served. On a successful fresh download the
+/// observed digest is returned, and a digest sidecar is written after
+/// successful extraction so later cache hits can be checked against it
+/// without re-downloading. Nothing is reported back to the server: pins
+/// are minted by the engine when it fetches the tarball itself, never by
+/// job VMs.
+///
+/// A cache entry whose sidecar does not match a known pin — or any cache
+/// entry at all when Unpinned, since its provenance is unknown and job
+/// containers mount this directory read-write — is evicted and replaced
+/// by a fresh verified download, never executed.
 ///
 /// These checks run before the cache lookup so a stale mutable-ref cache
 /// entry cannot bypass them, and before any network access.
@@ -151,18 +180,20 @@ pub async fn download_action(
                 evict_action_cache(&dest, &sidecar)?;
             }
             ArchiveDigestPin::Unpinned => {
-                // The engine has not pinned this version yet (it has not
-                // fetched it itself). The runner is not in a position to
-                // establish the pin — it verifies *against* pins, never
-                // mints them — so the existing cache is used as-is: no
-                // eviction, no verification. A poisoned or stale cache is
-                // the runner's own local trust decision, unchanged from
-                // pre-checksum behavior.
-                info!(
-                    "Action {owner}/{repo}@{git_ref} already cached at {} (server has no pin yet)",
-                    dest.display()
+                // The engine had not pinned this version at resolve time, so
+                // a cache entry of unknown provenance cannot be trusted: a
+                // job container gets this directory mounted read-write
+                // (`{runner_actions}:/__w/_actions`), so a previous job's
+                // workflow could have modified the extracted tree. Evict it
+                // and re-download; the fresh bytes are verified against the
+                // engine-attested digest header before extraction (P2).
+                // The runner verifies *against* pins and attestations, it
+                // never mints them.
+                tracing::warn!(
+                    "action {owner}/{repo}@{git_ref} cached but server has no pin yet: \
+                     evicting cache of unknown provenance and re-downloading"
                 );
-                return Ok((dest, read_cached_archive_digest(&sidecar)));
+                evict_action_cache(&dest, &sidecar)?;
             }
             ArchiveDigestPin::Unsupported => {
                 info!(
@@ -181,7 +212,7 @@ pub async fn download_action(
     info!("Downloading action {owner}/{repo}@{git_ref} from {url}");
 
     let client = crate::client::http::HttpClient::new(None)?;
-    let bytes = if let Some(token) = auth_token {
+    let (bytes, attested_digest) = if let Some(token) = auth_token {
         // Authenticated download (GitHub codeload or private actions)
         let resp = client
             .client_for(&url)
@@ -194,9 +225,12 @@ pub async fn download_action(
         if !resp.status().is_success() {
             anyhow::bail!("Action download failed: {} {}", resp.status(), url);
         }
-        resp.bytes().await?
+        let attested = header_archive_digest(resp.headers());
+        let bytes = resp.bytes().await?;
+        (bytes, attested)
     } else {
-        client.get_bytes(&url).await?
+        let (bytes, headers) = client.get_bytes_with_headers(&url).await?;
+        (bytes, header_archive_digest(&headers))
     };
 
     // Extract tarball, stripping top-level directory (standard GitHub tarball layout)
@@ -206,13 +240,34 @@ pub async fn download_action(
         bytes.len()
     );
 
-    // Hash the downloaded archive bytes immediately, and compare a known
-    // pin BEFORE creating any destination tree: a mismatch fails closed
-    // here, so tampered bytes never reach `extract_tarball` and no
-    // executable destination is left behind.
+    // Hash the downloaded archive bytes immediately, and compare against
+    // the expected digest BEFORE creating any destination tree: a mismatch
+    // fails closed here, so tampered bytes never reach `extract_tarball`
+    // and no executable destination is left behind.
+    //
+    // The expected digest is the resolve-time pin when Pinned; otherwise
+    // the engine-attested digest from the download response header (P2):
+    // the engine computed it over the exact bytes it serves, so even an
+    // Unpinned download is verified. When neither exists (older engine),
+    // the download proceeds unverified with a warning — legacy behavior.
+    let expected_digest: Option<String> = match &digest_pin {
+        ArchiveDigestPin::Pinned(expected) => Some(expected.clone()),
+        ArchiveDigestPin::Unpinned => attested_digest.clone(),
+        ArchiveDigestPin::Unsupported => None,
+    };
+    // A pin/attestation disagreement means the engine attested different
+    // bytes than it pinned: fail closed rather than guess which to trust.
+    if let (ArchiveDigestPin::Pinned(expected), Some(attested)) = (&digest_pin, &attested_digest) {
+        if attested != expected {
+            anyhow::bail!(
+                "action archive sha256 attestation mismatch for {owner}/{repo}@{git_ref}: \
+                 pinned {expected} but engine attested {attested}; refusing to extract"
+            );
+        }
+    }
     let observed_digest = if verifying {
         let observed = archive_sha256_hex(&bytes);
-        if let ArchiveDigestPin::Pinned(expected) = &digest_pin {
+        if let Some(expected) = &expected_digest {
             if &observed != expected {
                 anyhow::bail!(
                     "action archive sha256 mismatch for {owner}/{repo}@{git_ref}: \
@@ -221,6 +276,11 @@ pub async fn download_action(
                 );
             }
             info!("Action {owner}/{repo}@{git_ref} archive checksum verified: {observed}");
+        } else {
+            tracing::warn!(
+                "action {owner}/{repo}@{git_ref}: no archive digest pin or attestation \
+                 available; proceeding unverified (older engine)"
+            );
         }
         Some(observed)
     } else {
@@ -1065,15 +1125,34 @@ mod tests {
     }
 
     /// Serve `tar_bytes` on a loopback axum server; returns the tarball URL.
-    async fn serve_test_tarball(tar_bytes: Vec<u8>) -> String {
-        use axum::{routing::get, Router};
-        let app = Router::new().route("/tarball", get(|| async move { tar_bytes }));
+    /// When `digest` is `Some`, the engine attestation header is set, like
+    /// `download_action_tarball` does for a pinned fetch.
+    async fn serve_test_tarball_with_digest(tar_bytes: Vec<u8>, digest: Option<String>) -> String {
+        use axum::{http::HeaderMap, routing::get, Router};
+        let app = Router::new().route(
+            "/tarball",
+            get(|| async move {
+                let mut headers = HeaderMap::new();
+                if let Some(digest) = digest {
+                    headers.insert(
+                        super::ACTION_ARCHIVE_SHA256_HEADER,
+                        digest.parse().expect("valid header value"),
+                    );
+                }
+                (headers, tar_bytes)
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}/tarball")
+    }
+
+    /// Serve `tar_bytes` on a loopback axum server; returns the tarball URL.
+    async fn serve_test_tarball(tar_bytes: Vec<u8>) -> String {
+        serve_test_tarball_with_digest(tar_bytes, None).await
     }
 
     const TEST_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1382,11 +1461,16 @@ mod tests {
         assert_eq!(observed.as_deref(), Some(pin.as_str()));
     }
 
-    /// An unpinned cache hit is used as-is: the runner verifies against
-    /// pins but never mints them, so an existing cache is trusted exactly
-    /// as before checksum support — no eviction, no re-download.
+    /// P2: an Unpinned cache hit is NOT trusted as-is. The cache entry is
+    /// of unknown provenance (job containers mount this directory
+    /// read-write), so it is evicted and replaced by a fresh download
+    /// verified against the engine-attested digest header — never executed
+    /// unverified.
     #[tokio::test]
-    async fn download_action_unpinned_uses_existing_cache_without_download() {
+    async fn download_action_unpinned_cache_hit_evicts_and_redownloads() {
+        let tarball = test_action_tarball();
+        let digest = super::archive_sha256_hex(&tarball);
+        let url = serve_test_tarball_with_digest(tarball, Some(digest.clone())).await;
         let temp = TempDir::new().unwrap();
         let actions_dir = temp.path().join("actions");
 
@@ -1395,9 +1479,47 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("action.yml"), b"name: Existing\n").unwrap();
 
-        // The URL is unreachable: any network attempt would fail. Success
-        // proves the cache was used without downloading.
-        let (cached_dest, observed) = download_action(
+        let (fresh_dest, observed) = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            ArchiveDigestPin::Unpinned,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh_dest, dest);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("action.yml")).unwrap(),
+            "name: Checkout\n",
+            "stale unpinned cache must be replaced by a verified download"
+        );
+        assert_eq!(observed.as_deref(), Some(digest.as_str()));
+        // The fresh download was verified against the attestation, so its
+        // sidecar is trustworthy for later Pinned cache hits.
+        let sidecar = actions_dir
+            .join("owner")
+            .join("repo")
+            .join(format!("{TEST_SHA}.sha256"));
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap().trim(), digest);
+    }
+
+    /// P2: when the Unpinned re-download fails, the stale cache is still
+    /// evicted — the failure surfaces as an error rather than silently
+    /// executing the unknown-provenance tree.
+    #[tokio::test]
+    async fn download_action_unpinned_cache_hit_evicts_even_when_download_fails() {
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let dest = actions_dir.join("owner").join("repo").join(TEST_SHA);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("action.yml"), b"name: Existing\n").unwrap();
+
+        // Unreachable URL: the download must be attempted and fail; the
+        // stale cache must not be used as a fallback.
+        let error = download_action(
             "owner",
             "repo",
             TEST_SHA,
@@ -1407,16 +1529,108 @@ mod tests {
             ArchiveDigestPin::Unpinned,
         )
         .await
-        .unwrap();
-        assert_eq!(cached_dest, dest);
-        assert_eq!(
-            std::fs::read_to_string(dest.join("action.yml")).unwrap(),
-            "name: Existing\n",
-            "unpinned cache must be used as-is, not evicted"
+        .expect_err("unpinned cache must not be used without verification");
+        assert!(
+            !dest.exists(),
+            "stale cache must be evicted, not executed: {error:#}"
+        );
+    }
+
+    /// P2: a download whose bytes do not match the engine-attested digest
+    /// fails closed before extraction, even when Unpinned — no tree left.
+    #[tokio::test]
+    async fn download_action_fails_closed_on_attestation_mismatch() {
+        let url = serve_test_tarball_with_digest(test_action_tarball(), Some("0".repeat(64))).await;
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let dest = actions_dir.join("owner").join("repo").join(TEST_SHA);
+
+        let error = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            ArchiveDigestPin::Unpinned,
+        )
+        .await
+        .expect_err("attestation mismatch must fail closed");
+        assert!(
+            error.to_string().contains("sha256 mismatch"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !dest.exists(),
+            "mismatched download must leave no destination behind"
+        );
+    }
+
+    /// A Pinned download whose engine attestation disagrees with the pin
+    /// fails closed: the engine attested different bytes than it pinned.
+    #[tokio::test]
+    async fn download_action_fails_closed_on_pin_attestation_disagreement() {
+        let tarball = test_action_tarball();
+        let pin = super::archive_sha256_hex(&tarball);
+        let url = serve_test_tarball_with_digest(tarball, Some("f".repeat(64))).await;
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+        let dest = actions_dir.join("owner").join("repo").join(TEST_SHA);
+
+        let error = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            ArchiveDigestPin::Pinned(pin),
+        )
+        .await
+        .expect_err("pin/attestation disagreement must fail closed");
+        assert!(
+            error.to_string().contains("attestation mismatch"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !dest.exists(),
+            "disagreeing download must leave no destination behind"
+        );
+    }
+
+    /// The attestation header parser accepts exactly 64 lowercase hex
+    /// chars, normalizing case; absent or malformed headers verify nothing.
+    #[test]
+    fn header_archive_digest_validates_shape() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::header_archive_digest(&headers), None);
+
+        headers.insert(
+            super::ACTION_ARCHIVE_SHA256_HEADER,
+            HeaderValue::from_static("abc"),
         );
         assert_eq!(
-            observed, None,
-            "an unpinned cache entry of unknown provenance carries no digest"
+            super::header_archive_digest(&headers),
+            None,
+            "too short is not an attestation"
+        );
+
+        let lower = "a".repeat(64);
+        headers.insert(
+            super::ACTION_ARCHIVE_SHA256_HEADER,
+            HeaderValue::from_str(&lower).unwrap(),
+        );
+        assert_eq!(super::header_archive_digest(&headers), Some(lower));
+
+        headers.insert(
+            super::ACTION_ARCHIVE_SHA256_HEADER,
+            HeaderValue::from_str(&"A".repeat(64)).unwrap(),
+        );
+        assert_eq!(
+            super::header_archive_digest(&headers),
+            Some("a".repeat(64)),
+            "uppercase attestation is normalized, matching pin comparison"
         );
     }
 }

@@ -40,6 +40,12 @@ fn archive_sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Response header attesting the engine-observed SHA-256 of the action
+/// tarball being served. Lets the runner verify downloaded bytes even
+/// when the resolve-time pin was Unpinned (P2): the digest is computed
+/// by the engine over the exact bytes it serves, never by a job VM.
+pub const ACTION_ARCHIVE_SHA256_HEADER: &str = "x-preloop-action-archive-sha256";
+
 /// Pin-table key for an action archive checksum: `(owner, repo, sha)`,
 /// lowercased. Returns `None` when the ref is not a resolved commit SHA —
 /// mutable refs (branches, tags like `v4`) are never pinned, because the
@@ -62,7 +68,8 @@ fn action_archive_digest_sidecar(cache_dir: &std::path::Path) -> std::path::Path
     cache_dir.join("action.tar.gz.sha256")
 }
 
-/// Ensure the in-memory archive-checksum pin for a cached action tarball.
+/// Ensure the in-memory archive-checksum pin for a cached action tarball,
+/// returning the digest that was ensured (or `None` when no pin applies).
 ///
 /// `observed` is the digest computed while streaming the fetch
 /// (cache-miss path); on the cache-hit path it is `None` and the pin is
@@ -76,39 +83,62 @@ fn ensure_action_archive_pin(
     repo: &str,
     git_ref: &str,
     observed: Option<&str>,
-) {
-    let Some(key) = archive_pin_key(owner, repo, git_ref) else {
-        return;
-    };
+) -> Option<String> {
+    let key = archive_pin_key(owner, repo, git_ref)?;
     let digest: String = match observed {
         Some(digest) => digest.to_owned(),
         None => {
-            let raw = match std::fs::read_to_string(action_archive_digest_sidecar(cache_dir)) {
-                Ok(raw) => raw,
-                Err(_) => return,
-            };
+            let raw = std::fs::read_to_string(action_archive_digest_sidecar(cache_dir)).ok()?;
             let digest = raw.trim().to_ascii_lowercase();
             if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                 digest
             } else {
-                return;
+                return None;
             }
         }
     };
-    let mut pins = match state.action_archive_sha256_pins.lock() {
-        Ok(pins) => pins,
-        Err(_) => return,
-    };
-    if pins.contains_key(&key) {
-        return;
+    let mut pins = state.action_archive_sha256_pins.lock().ok()?;
+    if let Some(existing) = pins.get(&key) {
+        return Some(existing.clone());
     }
     if pins.len() >= MAX_DIGEST_PINS {
         tracing::warn!(
             "action archive digest pin table full; skipping pin for {owner}/{repo}@{git_ref}"
         );
-        return;
+        // The digest is still authoritative for this response even when the
+        // pin table is full: attest it in the download header so the
+        // runner can verify these bytes.
+        return Some(digest);
     }
-    pins.insert(key, digest);
+    pins.insert(key, digest.clone());
+    Some(digest)
+}
+
+/// Build the tarball download response, attesting the engine-observed
+/// archive digest in [`ACTION_ARCHIVE_SHA256_HEADER`] whenever one is
+/// known. The runner verifies the bytes it receives against this
+/// attestation even when its resolve-time pin was Unpinned (P2): a
+/// poisoned local cache is evicted and the fresh download is checked
+/// before extraction. A missing digest (old pre-feature cache entry)
+/// simply omits the header — it never fails the download.
+fn action_tarball_response(
+    repo: &str,
+    git_ref: &str,
+    body: Body,
+    digest: Option<&str>,
+) -> Result<Response, ApiError> {
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
+        );
+    if let Some(digest) = digest {
+        builder = builder.header(ACTION_ARCHIVE_SHA256_HEADER, digest);
+    }
+    builder
+        .body(body)
+        .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))
 }
 
 /// How long a minted archive ticket stays valid. Actions are fetched during
@@ -288,21 +318,15 @@ pub async fn download_action_tarball(
         // Restart resilience: the pin table is in-memory, so rebuild it
         // from the sidecar the fetch wrote. A missing or malformed sidecar
         // leaves the action unpinned without failing the download.
-        ensure_action_archive_pin(&shared.state, &cache_dir, &owner, &repo, &git_ref, None);
+        let digest =
+            ensure_action_archive_pin(&shared.state, &cache_dir, &owner, &repo, &git_ref, None);
         let file = tokio::fs::File::open(&cached_path)
             .await
             .map_err(|e| ApiError::internal(format!("failed to open cached action: {e}")))?;
         let stream = tokio_util::io::ReaderStream::new(file);
         let body = Body::from_stream(stream);
 
-        let res = Response::builder()
-            .header(header::CONTENT_TYPE, "application/gzip")
-            .header(
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
-            )
-            .body(body)
-            .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+        let res = action_tarball_response(&repo, &git_ref, body, digest.as_deref())?;
         return Ok(res);
     }
 
@@ -408,8 +432,10 @@ pub async fn download_action_tarball(
     }
     // Populate the in-memory pin from our streaming digest (or, on the
     // concurrent-loser path, from the winner's sidecar once it lands —
-    // later requests backfill it).
-    ensure_action_archive_pin(
+    // later requests backfill it). The returned digest is attested in the
+    // download response header so the runner can verify these bytes even
+    // when its resolve-time pin was Unpinned.
+    let digest = ensure_action_archive_pin(
         &shared.state,
         &cache_dir,
         &owner,
@@ -424,14 +450,7 @@ pub async fn download_action_tarball(
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
-    let res = Response::builder()
-        .header(header::CONTENT_TYPE, "application/gzip")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{repo}-{git_ref}.tar.gz\""),
-        )
-        .body(body)
-        .map_err(|e| ApiError::internal(format!("failed to build response: {e}")))?;
+    let res = action_tarball_response(&repo, &git_ref, body, digest.as_deref())?;
     Ok(res)
 }
 
@@ -890,6 +909,27 @@ mod tests {
         assert_eq!(
             archive_sha256_pin_for(&state, "o/r", Some(&first_sha)),
             Some(DIGEST_A.to_string())
+        );
+    }
+
+    /// `action_tarball_response` attests the engine-observed digest in the
+    /// download header when known, and omits the header otherwise — a
+    /// missing digest never fails the download.
+    #[tokio::test]
+    async fn tarball_response_attests_digest_header() {
+        let res =
+            action_tarball_response("repo", SHA, Body::from("bytes"), Some(DIGEST_A)).unwrap();
+        assert_eq!(
+            res.headers()
+                .get(ACTION_ARCHIVE_SHA256_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(DIGEST_A)
+        );
+
+        let res = action_tarball_response("repo", SHA, Body::from("bytes"), None).unwrap();
+        assert!(
+            res.headers().get(ACTION_ARCHIVE_SHA256_HEADER).is_none(),
+            "no digest must mean no header, not a failed download"
         );
     }
 }
