@@ -868,65 +868,69 @@ pub async fn issue_worker_token(
             "a job may only acquire its own debug-worker token",
         ));
     }
-    let mut inner = shared.state.inner.lock().await;
-
     // Keyed on the agent job GUID for the same reason `open_session` is: it is
     // what the worker knows itself as, and it separates matrix legs sharing a
-    // workflow-level job id.
-    let request_id = inner
-        .agent_job_requests
-        .get(&req.agent_job_id)
-        .copied()
-        .filter(|id| {
-            inner
+    // workflow-level job id. The liveness check, the preserve-on-failure gate
+    // and the one-shot `debug_token_issued` mark commit as one transaction.
+    let (run_id, plan_id) = shared
+        .state
+        .backend
+        .transact(move |tx| {
+            let request_id = tx
+                .agent_job_requests
+                .get(&req.agent_job_id)
+                .copied()
+                .filter(|id| {
+                    tx.job_requests
+                        .get(id)
+                        .is_some_and(|record| record.result.is_none())
+                })
+                .ok_or_else(|| {
+                    crate::control::ControlError::NotFound(format!(
+                        "no active job request for agent job {}",
+                        req.agent_job_id
+                    ))
+                })?;
+
+            let record = tx
                 .job_requests
-                .get(id)
-                .is_some_and(|record| record.result.is_none())
+                .get(&request_id)
+                .expect("request id came from a liveness-filtered lookup");
+            let (run_id, plan_id, already_issued) = (
+                record.run_id,
+                record.plan_id.clone(),
+                record.debug_token_issued,
+            );
+
+            // The runner only builds a pause client under
+            // `preloopPreserveOnFailure`, so gating on the same flag issues
+            // the credential exactly when it is used, and never otherwise.
+            let preserve = tx
+                .runs
+                .get(&run_id)
+                .is_some_and(|run| run.submission.preserve_on_failure);
+            if !preserve {
+                return Err(crate::control::ControlError::Forbidden(
+                    "this run did not enable pause-on-failure".to_owned(),
+                ));
+            }
+            if already_issued {
+                // Distinct from a 403 so a worker can tell "someone beat me
+                // to it" from "not allowed at all" in its log.
+                return Err(crate::control::ControlError::Conflict(format!(
+                    "debug-worker token already issued for agent job {}",
+                    req.agent_job_id
+                )));
+            }
+
+            tx.job_requests
+                .get_mut(&request_id)
+                .expect("request id came from a liveness-filtered lookup")
+                .debug_token_issued = true;
+            Ok((run_id, plan_id))
         })
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "no active job request for agent job {}",
-                req.agent_job_id
-            ))
-        })?;
-
-    let record = inner
-        .job_requests
-        .get(&request_id)
-        .expect("request id came from a liveness-filtered lookup");
-    let (run_id, plan_id, already_issued) = (
-        record.run_id,
-        record.plan_id.clone(),
-        record.debug_token_issued,
-    );
-
-    // The runner only builds a pause client under `preloopPreserveOnFailure`,
-    // so gating on the same flag issues the credential exactly when it is
-    // used, and never otherwise.
-    let preserve = inner
-        .runs
-        .get(&run_id)
-        .is_some_and(|run| run.submission.preserve_on_failure);
-    if !preserve {
-        return Err(ApiError::forbidden(
-            "this run did not enable pause-on-failure",
-        ));
-    }
-    if already_issued {
-        // Distinct from a 403 so a worker can tell "someone beat me to it"
-        // from "not allowed at all" in its log.
-        return Err(ApiError::conflict(format!(
-            "debug-worker token already issued for agent job {}",
-            req.agent_job_id
-        )));
-    }
-
-    inner
-        .job_requests
-        .get_mut(&request_id)
-        .expect("request id came from a liveness-filtered lookup")
-        .debug_token_issued = true;
-    drop(inner);
+        .await
+        .map_err(ApiError::from)?;
 
     info!(
         %run_id,
@@ -956,26 +960,32 @@ pub async fn open_session(
         ));
     }
     let now = SystemTime::now();
-    let mut inner = shared.state.inner.lock().await;
+    let agent_job_id = req.agent_job_id;
 
     // Keyed on the agent job GUID: it is what the worker knows itself as, and
     // it disambiguates matrix legs that share a workflow-level job id.
-    let request_id = inner
-        .agent_job_requests
-        .get(&req.agent_job_id)
-        .copied()
-        .filter(|id| {
-            inner
-                .job_requests
-                .get(id)
-                .is_some_and(|record| record.result.is_none())
+    let request_id = shared
+        .state
+        .backend
+        .read(move |tx| {
+            tx.agent_job_requests
+                .get(&agent_job_id)
+                .copied()
+                .filter(|id| {
+                    tx.job_requests
+                        .get(id)
+                        .is_some_and(|record| record.result.is_none())
+                })
+                .ok_or_else(|| {
+                    crate::control::ControlError::NotFound(format!(
+                        "no active job request for agent job {agent_job_id}"
+                    ))
+                })
         })
-        .ok_or_else(|| {
-            ApiError::not_found(format!(
-                "no active job request for agent job {}",
-                req.agent_job_id
-            ))
-        })?;
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut inner = shared.state.inner.lock().await;
 
     let run_id = req.run_id;
     let job_name = req.job_name.clone();
@@ -1061,16 +1071,28 @@ pub async fn poll_verdict(
                 // the time a human answers. Mint a replacement now so the
                 // replayed checkout authenticates. The worker only applies
                 // it to steps the message marks as pinned.
-                if response.verdict == Some(Verdict::Retry)
-                    && response.snapshot_token.is_none()
-                    && let Some(record) = inner.debug_sessions.get(&session_id)
-                    && let Some(request) = inner.job_requests.get(&record.request_id)
-                {
-                    response.snapshot_token = Some(
-                        shared
+                if response.verdict == Some(Verdict::Retry) && response.snapshot_token.is_none() {
+                    let record = inner
+                        .debug_sessions
+                        .get(&session_id)
+                        .map(|record| (record.request_id, record.agent_job_id));
+                    if let Some((request_id, agent_job_id)) = record {
+                        let plan_id = shared
                             .state
-                            .mint_runtime_token(&request.plan_id, &record.agent_job_id),
-                    );
+                            .backend
+                            .read(move |tx| {
+                                Ok(tx
+                                    .job_requests
+                                    .get(&request_id)
+                                    .map(|request| request.plan_id.clone()))
+                            })
+                            .await
+                            .map_err(ApiError::from)?;
+                        if let Some(plan_id) = plan_id {
+                            response.snapshot_token =
+                                Some(shared.state.mint_runtime_token(&plan_id, &agent_job_id));
+                        }
+                    }
                 }
                 return Ok(Json(response));
             }

@@ -16,21 +16,32 @@ pub async fn register_dap_port(
             "DAP port must be an unprivileged local port",
         ));
     }
-    let mut inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    let status = run
-        .jobs
-        .get(&payload.job_id)
-        .copied()
-        .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
+    // Backend: run + job status. Node-local: `dap_ports` registration.
+    let (run_exists, status) = {
+        let job_id = payload.job_id.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| {
+                let run = tx.runs.get(&run_id);
+                Ok((
+                    run.is_some(),
+                    run.and_then(|run| run.jobs.get(&job_id).copied()),
+                ))
+            })
+            .await
+            .map_err(ApiError::from)?
+    };
+    if !run_exists {
+        return Err(ApiError::not_found("run not found"));
+    }
+    let status = status.ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
     if !matches!(status, ExecutionStatus::InProgress) {
         return Err(ApiError::bad_request(
             "DAP port can only be registered for an in-progress job",
         ));
     }
+    let mut inner = shared.state.inner.lock().await;
     inner.dap_ports.insert(
         run_id,
         DapPortRegistration {

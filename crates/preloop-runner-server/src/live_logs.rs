@@ -191,24 +191,31 @@ pub async fn live_run_logs_sse(
     let job_id = match query.job {
         Some(job) => job,
         None => {
-            let inner = shared.state.inner.lock().await;
-            let run = inner
-                .runs
-                .get(&run_id)
-                .ok_or_else(|| ApiError::not_found("run not found"))?;
-            let mut jobs: Vec<String> = run.jobs.keys().map(|job_id| job_id.0.clone()).collect();
-            jobs.extend(
-                inner
-                    .job_requests
-                    .values()
-                    .filter(|request| request.run_id == run_id)
-                    .map(|request| request.job_id.0.clone()),
-            );
-            jobs.sort_unstable();
-            jobs.dedup();
+            // Backend: `runs`/`job_requests` are TxState, not InnerState.
+            let jobs = shared
+                .state
+                .backend
+                .read(move |tx| {
+                    let run = tx.runs.get(&run_id).ok_or_else(|| {
+                        crate::control::ControlError::NotFound("run not found".to_owned())
+                    })?;
+                    let mut jobs: Vec<String> =
+                        run.jobs.keys().map(|job_id| job_id.0.clone()).collect();
+                    jobs.extend(
+                        tx.job_requests
+                            .values()
+                            .filter(|request| request.run_id == run_id)
+                            .map(|request| request.job_id.0.clone()),
+                    );
+                    jobs.sort_unstable();
+                    jobs.dedup();
+                    Ok(jobs)
+                })
+                .await
+                .map_err(ApiError::from)?;
             match jobs.len() {
                 0 => return Err(ApiError::not_found("run has no jobs to follow")),
-                1 => jobs.pop().expect("one job was counted"),
+                1 => jobs.into_iter().next().expect("one job was counted"),
                 _ => {
                     return Err(ApiError::bad_request(format!(
                         "`job` needs a value when a run has {} jobs: {}",
@@ -234,21 +241,32 @@ async fn live_log_stream(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &str,
-    key: &str,
-) -> Result<
-    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>>,
-    ApiError,
-> {
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    // Backend: resolve the live-log key and the run/job terminal flag
+    // (`runs`/`job_requests` are TxState). Scoped to this one run.
+    let (key, run_terminal) = shared
+        .state
+        .backend
+        .read_scoped(&crate::control::txstate::TxScope::run(run_id), {
+            let job_id = job_id.to_owned();
+            move |tx| {
+                let terminal = live_log_run_terminal(tx, run_id, &job_id);
+                Ok(live_log_key_for_job(tx, run_id, &job_id).map(|key| (key, terminal)))
+            }
+        })
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+
+    // Node-local: snapshot the retained lines and subscribe unless the feed
+    // is closed (`live_log_*` are node-local).
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
-        let lines_arc = inner
-            .live_log_lines
-            .entry(key.to_owned())
-            .or_default()
-            .clone();
+        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
         let lines = lines_arc.lock().await;
         let snapshot = lines.clone();
-        let subscription = if live_log_is_closed(&inner, run_id, job_id, key) {
+        let closed = inner.live_log_closed.contains(&key) || run_terminal;
+        let subscription = if closed {
             None
         } else {
             Some(live_log_sender(&mut inner, key).subscribe())
@@ -287,13 +305,17 @@ pub fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
     Event::default().event("live-log").data(data)
 }
 
-pub fn live_log_key_for_job(inner: &InnerState, run_id: RunId, job_id: &str) -> Option<String> {
-    let run = inner.runs.get(&run_id)?;
+pub fn live_log_key_for_job(
+    tx: &crate::control::txstate::TxState,
+    run_id: RunId,
+    job_id: &str,
+) -> Option<String> {
+    let run = tx.runs.get(&run_id)?;
     // `job_requests` is keyed by monotonic request id, so `find` would return
     // the oldest attempt and follow a dead feed after a re-dispatch. A logical
     // job key means "the current attempt"; an explicit agent job id matches one
     // record either way.
-    if let Some(record) = inner
+    if let Some(record) = tx
         .job_requests
         .values()
         .filter(|record| {
@@ -313,16 +335,19 @@ pub fn live_log_key_for_job(inner: &InnerState, run_id: RunId, job_id: &str) -> 
         .then(|| job_id.to_owned())
 }
 
-/// Whether a live stream for this run/job must end after its snapshot.
-fn live_log_is_closed(inner: &InnerState, run_id: RunId, job_id: &str, key: &str) -> bool {
-    if inner.live_log_closed.contains(key) {
-        return true;
-    }
-    let run_terminal = inner
+/// Whether the run or the logical job has reached a terminal state — the
+/// backend half of `live_log_is_closed`. The node-local `live_log_closed`
+/// mark is checked separately under `inner`.
+fn live_log_run_terminal(
+    tx: &crate::control::txstate::TxState,
+    run_id: RunId,
+    job_id: &str,
+) -> bool {
+    let run_terminal = tx
         .runs
         .get(&run_id)
         .is_some_and(|run| run.status.is_terminal());
-    let logical_job_terminal = inner
+    let logical_job_terminal = tx
         .runs
         .get(&run_id)
         .and_then(|run| run.jobs.get(&JobId(job_id.to_owned())))
@@ -484,10 +509,18 @@ pub async fn record_live_log_wrapper_for_run(
     job_id: &str,
     wrapper: LiveLogFeedLinesWrapper,
 ) {
-    let key = {
-        let inner = shared.state.inner.lock().await;
-        live_log_key_for_job(&inner, run_id, job_id).unwrap_or_else(|| job_id.to_owned())
-    };
+    // Backend: resolve the run-scoped live-log key (`runs`/`job_requests` are
+    // TxState). Scoped to this one run; falls back to the raw job key.
+    let key = shared
+        .state
+        .backend
+        .read_scoped(&crate::control::txstate::TxScope::run(run_id), {
+            let job_id = job_id.to_owned();
+            move |tx| Ok(live_log_key_for_job(tx, run_id, &job_id))
+        })
+        .await
+        .unwrap_or(None)
+        .unwrap_or_else(|| job_id.to_owned());
     record_live_log_wrapper(shared, &key, wrapper).await;
 }
 

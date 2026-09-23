@@ -4055,20 +4055,24 @@ async fn authorize_snapshot_token(
         }
     };
 
-    let inner = state.inner.lock().await;
-    let Some(request) = inner
-        .agent_job_requests
-        .get(&identity.job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-    else {
-        return Err(ApiError::forbidden(
-            "snapshot Git token is not bound to a live job",
-        ));
-    };
-    if request.run_id != run_id
-        || request.plan_id != identity.plan_id
-        || request.agent_job_id != identity.job_id
-    {
+    // Backend: agent_job → request → run membership check (`job_requests`
+    // and its derived `agent_job_requests` are TxState, scoped to this run).
+    let belongs_to_run = state
+        .backend
+        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+            Ok(tx
+                .agent_job_requests
+                .get(&identity.job_id)
+                .and_then(|request_id| tx.job_requests.get(request_id))
+                .is_some_and(|request| {
+                    request.run_id == run_id
+                        && request.plan_id == identity.plan_id
+                        && request.agent_job_id == identity.job_id
+                }))
+        })
+        .await
+        .map_err(ApiError::from)?;
+    if !belongs_to_run {
         return Err(ApiError::forbidden(
             "snapshot Git token does not belong to this run",
         ));
@@ -4504,6 +4508,8 @@ mod deepen_and_redirect_tests {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .status()
             .expect("git runs in tests");
