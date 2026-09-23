@@ -460,6 +460,8 @@ pub struct TokenPermissionsCeiling {
     /// cannot create or approve pull requests.
     #[serde(default)]
     pub allow_create_approve_pr: bool,
+}
+
 /// Enforcement mode for workflow execution protections.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -484,13 +486,18 @@ pub enum PolicyRuleAction {
 
 /// Deny rule on the event that may trigger a workflow, e.g.
 /// `pull_request_target`. Mirrors GitHub's event rules.
+///
+/// Unknown fields are rejected at parse time: a typo must fail closed
+/// rather than silently leave the policy weaker than written.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventRule {
     /// Event name, e.g. `pull_request_target`, `workflow_dispatch`.
     pub event: String,
     /// Workflow filename globs (e.g. `deploy.yml`, `release/*.yml`),
     /// matched against the bare filename and `.github/workflows/<name>`.
-    /// Omitted or empty = every workflow.
+    /// Only `*`, `**`, and `?` are supported — character classes like
+    /// `[0-9]` are rejected at config load. Omitted or empty = every workflow.
     #[serde(default)]
     pub workflows: Option<Vec<String>>,
     #[serde(default)]
@@ -499,7 +506,10 @@ pub struct EventRule {
 
 /// Deny rule on the actor that may trigger a workflow. The actor is the
 /// webhook payload's `sender.login`. Mirrors GitHub's actor rules.
+///
+/// Unknown fields are rejected at parse time, as in [`EventRule`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActorRule {
     /// Sender login, compared case-insensitively.
     pub actor: String,
@@ -520,7 +530,10 @@ pub struct ActorRule {
 /// so workflow authors cannot weaken the policy that constrains them.
 /// A `pull_request_target` kill is an event rule with
 /// `event = "pull_request_target"`.
+///
+/// Unknown fields are rejected at parse time, as in [`EventRule`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionProtectionConfig {
     #[serde(default)]
     pub mode: ProtectionMode,
@@ -1282,6 +1295,8 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
     validate_environment_rules(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
+    validate_execution_protection(&config)
+        .with_context(|| format!("validating config {}", path.display()))?;
     resolve_credential_references(&mut config, &OsCredentialStore)?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1323,6 +1338,37 @@ fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
                  the wait must fit in i64 nanoseconds (max {MAX_WAIT_TIMER_MINUTES} minutes)",
                 rules.wait_timer_minutes
             );
+        }
+    }
+    Ok(())
+}
+
+/// Reject execution-protection rules the matcher cannot honor.
+///
+/// `workflows` patterns are matched with [`preloop_gha_parser::glob_match`],
+/// which implements `*`, `**`, and `?` only. A GitHub-style character class
+/// like `deploy-[0-9].yml` would parse but match literally, silently missing
+/// the intended workflow — so fail the config load closed instead.
+fn validate_execution_protection(config: &ConfigFile) -> anyhow::Result<()> {
+    let policy = &config.execution_protection;
+    let mut rules: Vec<(&str, &str, &Option<Vec<String>>)> = Vec::new();
+    for rule in &policy.event_rules {
+        rules.push(("event rule", rule.event.as_str(), &rule.workflows));
+    }
+    for rule in &policy.actor_rules {
+        rules.push(("actor rule", rule.actor.as_str(), &rule.workflows));
+    }
+    for (kind, target, workflows) in rules {
+        if let Some(patterns) = workflows {
+            for pattern in patterns {
+                anyhow::ensure!(
+                    !pattern.contains(['[', ']']),
+                    "execution_protection {kind} ({target:?}): workflow pattern \
+                     {pattern:?} uses character classes, which the matcher does \
+                     not support (only `*`, `**`, `?`); rewrite the pattern or \
+                     remove the rule",
+                );
+            }
         }
     }
     Ok(())

@@ -496,8 +496,9 @@ event = "pull_request_target"
 # unknown actions fail config parsing rather than silently weakening policy.
 
 # Scoped variant: deny the event only for specific workflow files.
-# Patterns are GitHub-style globs matched against the bare filename
+# Patterns support `*`, `**`, and `?`, matched against the bare filename
 # (deploy.yml) and the repo-relative path (.github/workflows/deploy.yml).
+# Character classes like `[0-9]` are rejected at config load.
 # Omitted or empty `workflows` = every workflow.
 [[execution_protection.event_rules]]
 event = "workflow_dispatch"

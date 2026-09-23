@@ -1563,17 +1563,55 @@ async fn process_check_run_rerequest(
                         .map(|name| JobId(name.to_owned()))
                         .filter(|job_id| run.jobs.contains_key(job_id))
                 })?;
-            Some((run_id, job_id))
+            Some((
+                run_id,
+                job_id,
+                run.submission.event.clone(),
+                run.submission.actor.clone(),
+                run.submission.workflow_file.clone(),
+            ))
         })
     };
 
-    let Some((run_id, job_id)) = target else {
+    let Some((run_id, job_id, event, actor, workflow_file)) = target else {
         warn!(
             repository,
             check_run_id, "check_run rerequest does not match a known terminal run"
         );
         return Ok((StatusCode::OK, Json(serde_json::json!([]))));
     };
+
+    // Workflow execution protections: a rerequest re-triggers the original
+    // run, so the original trigger must still pass policy. Deny before
+    // resubmitting; a denial is not transient and must not retry.
+    if let Some(hit) = crate::execution_protection::denies_submission(
+        &shared.state.execution_protection,
+        &event,
+        Some(&actor),
+        workflow_file.as_deref(),
+    ) {
+        match shared.state.execution_protection.mode {
+            crate::config::ProtectionMode::Enforce => {
+                info!(
+                    %run_id,
+                    %job_id,
+                    event = %event,
+                    rule = %hit.describe(),
+                    "execution protection denied check_run rerequest"
+                );
+                return Ok((StatusCode::OK, Json(serde_json::json!([]))));
+            }
+            crate::config::ProtectionMode::Evaluate => {
+                info!(
+                    %run_id,
+                    %job_id,
+                    event = %event,
+                    rule = %hit.describe(),
+                    "execution protection would deny check_run rerequest (evaluate mode)"
+                );
+            }
+        }
+    }
 
     let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
         .await
@@ -2222,6 +2260,53 @@ async fn process_delivery_payload_with_lease(
         return WebhookOutcome::Success;
     }
 
+    // Workflow execution protections (unscoped): admin-level deny rules on
+    // the event/actor are evaluated here, before the PR changed-files lookup
+    // below — a denied delivery must not burn a GitHub API call (and retries)
+    // on a lookup whose result can never be used. Scoped per-workflow rules
+    // are still evaluated during workflow matching further down.
+    let protection_actor = payload_val
+        .get("sender")
+        .and_then(|sender| sender.get("login"))
+        .and_then(|login| login.as_str());
+    let mut live_events = Vec::with_capacity(effective_events.len());
+    for effective in effective_events {
+        if effective.skip {
+            live_events.push(effective);
+            continue;
+        }
+        match crate::execution_protection::denies_event(
+            &shared.state.execution_protection,
+            &effective.event,
+            protection_actor,
+        ) {
+            Some(hit) => match shared.state.execution_protection.mode {
+                crate::config::ProtectionMode::Enforce => {
+                    info!(
+                        event = %effective.event,
+                        rule = %hit.describe(),
+                        "execution protection denied event"
+                    );
+                }
+                crate::config::ProtectionMode::Evaluate => {
+                    info!(
+                        event = %effective.event,
+                        rule = %hit.describe(),
+                        "execution protection would deny event (evaluate mode)"
+                    );
+                    live_events.push(effective);
+                }
+            },
+            None => live_events.push(effective),
+        }
+    }
+    // Every remaining event is skip-flagged, or every live event was denied
+    // in enforce mode: nothing downstream can use the PR lookup.
+    if live_events.iter().all(|effective| effective.skip) {
+        return WebhookOutcome::Success;
+    }
+    let effective_events = live_events;
+
     let repo_full_name = match payload_val
         .get("repository")
         .and_then(|r| r.get("full_name"))
@@ -2305,37 +2390,13 @@ async fn process_delivery_payload_with_lease(
             continue;
         }
 
-        // Workflow execution protections: admin-level deny policy on which
-        // events and actors may trigger workflows. Unscoped rules deny the
-        // whole event here, before any workflow is matched; scoped rules are
-        // evaluated per workflow file below.
+        // Unscoped execution-protection rules were already applied to every
+        // effective event before the PR changed-files lookup above; scoped
+        // per-workflow rules are evaluated during workflow matching below.
         let protection_actor = payload_val
             .get("sender")
             .and_then(|sender| sender.get("login"))
             .and_then(|login| login.as_str());
-        if let Some(hit) = crate::execution_protection::denies_event(
-            &shared.state.execution_protection,
-            &effective.event,
-            protection_actor,
-        ) {
-            match shared.state.execution_protection.mode {
-                crate::config::ProtectionMode::Enforce => {
-                    info!(
-                        event = %effective.event,
-                        rule = %hit.describe(),
-                        "execution protection denied event"
-                    );
-                    continue;
-                }
-                crate::config::ProtectionMode::Evaluate => {
-                    info!(
-                        event = %effective.event,
-                        rule = %hit.describe(),
-                        "execution protection would deny event (evaluate mode)"
-                    );
-                }
-            }
-        }
 
         let default_branch = payload_val
             .get("repository")

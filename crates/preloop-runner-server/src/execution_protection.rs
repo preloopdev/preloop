@@ -44,9 +44,11 @@ fn is_unscoped(workflows: &Option<Vec<String>>) -> bool {
         .is_none_or(|patterns| patterns.is_empty())
 }
 
-/// GitHub-style glob match of a rule's `workflows` patterns against a
-/// candidate workflow file. Patterns match the bare filename (`deploy.yml`)
-/// and the repo-relative path (`.github/workflows/deploy.yml`).
+/// Glob match of a rule's `workflows` patterns against a candidate workflow
+/// file. Patterns match the bare filename (`deploy.yml`) and the
+/// repo-relative path (`.github/workflows/deploy.yml`). Only `*`, `**`, and
+/// `?` are supported; character classes are rejected at config load (see
+/// [`crate::config::validate_execution_protection`]).
 fn workflow_matches(patterns: &[String], filename: &str) -> bool {
     let path = format!(".github/workflows/{filename}");
     patterns.iter().any(|pattern| {
@@ -136,6 +138,27 @@ pub fn denies_workflow(
                     scope: scope_of(&rule.workflows),
                 });
             }
+        }
+    }
+    None
+}
+
+/// Denial for a submission-shaped trigger: unscoped event/actor rules first,
+/// then scoped rules when the workflow file is known. Used by the trigger
+/// paths that bypass the webhook intake's per-event/per-file checks (REST
+/// dispatch, check_run rerequest).
+pub fn denies_submission(
+    policy: &ExecutionProtectionConfig,
+    event: &str,
+    actor: Option<&str>,
+    workflow_file: Option<&str>,
+) -> Option<RuleHit> {
+    if let Some(hit) = denies_event(policy, event, actor) {
+        return Some(hit);
+    }
+    if let Some(file) = workflow_file {
+        if let Some(hit) = denies_workflow(policy, event, actor, file) {
+            return Some(hit);
         }
     }
     None
@@ -349,5 +372,92 @@ workflows = ["deploy.yml"]
             "[[execution_protection.event_rules]]\nevent = \"push\"\naction = \"allow\"\n",
         );
         assert!(result.is_err(), "unknown action must fail closed");
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        // A typo like `mdoe` must fail closed, not silently leave the policy
+        // in evaluate mode with no rules.
+        for toml in [
+            "[execution_protection]\nmdoe = \"enforce\"\n",
+            "[[execution_protection.event_rules]]\nevent = \"push\"\nevnts = \"x\"\n",
+            "[[execution_protection.actor_rules]]\nactor = \"mallory\"\nactors = \"x\"\n",
+            "[[execution_protection.event_rules]]\nevent = \"push\"\nworkflow = [\"a.yml\"]\n",
+        ] {
+            let result = toml::from_str::<crate::config::ConfigFile>(toml);
+            assert!(result.is_err(), "unknown field must fail closed: {toml:?}");
+        }
+    }
+
+    #[test]
+    fn character_class_workflow_pattern_is_rejected_at_load() {
+        // `[0-9]` looks like a GitHub glob but the matcher treats brackets
+        // literally, so the rule would silently miss. Fail closed instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[execution_protection]\nmode = \"enforce\"\n\
+             [[execution_protection.event_rules]]\nevent = \"push\"\n\
+             workflows = [\"deploy-[0-9].yml\"]\n",
+        )
+        .unwrap();
+        let err = crate::config::load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("character classes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn supported_glob_patterns_are_accepted_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[execution_protection]\nmode = \"enforce\"\n\
+             [[execution_protection.event_rules]]\nevent = \"push\"\n\
+             workflows = [\"deploy.yml\", \"release/*.yml\", \"**/test-?.yml\"]\n",
+        )
+        .unwrap();
+        let config = crate::config::load_config_from(&path).unwrap();
+        assert_eq!(config.execution_protection.event_rules.len(), 1);
+    }
+
+    #[test]
+    fn denies_submission_combines_unscoped_and_scoped_rules() {
+        let policy = policy_with(
+            vec![
+                event_rule("push", None),
+                event_rule("workflow_dispatch", Some(vec!["deploy.yml"])),
+            ],
+            vec![],
+        );
+        // Unscoped event rule hits without a workflow file.
+        assert!(denies_submission(&policy, "push", Some("alice"), None)
+            .is_some_and(|hit| hit.kind == "event"));
+        // Scoped event rule hits only for the matching file.
+        assert!(denies_submission(
+            &policy,
+            "workflow_dispatch",
+            Some("alice"),
+            Some("deploy.yml")
+        )
+        .is_some());
+        assert!(
+            denies_submission(&policy, "workflow_dispatch", Some("alice"), Some("ci.yml"))
+                .is_none()
+        );
+
+        let policy = policy_with(
+            vec![],
+            vec![actor_rule("mallory", Some(vec!["secret.yml"]))],
+        );
+        // Scoped actor rule hits for the matching file and actor only.
+        assert!(denies_submission(&policy, "push", Some("mallory"), Some("secret.yml")).is_some());
+        assert!(denies_submission(&policy, "push", Some("mallory"), Some("other.yml")).is_none());
+        assert!(denies_submission(&policy, "push", Some("alice"), Some("secret.yml")).is_none());
+        // Without a workflow file, scoped rules cannot match.
+        assert!(denies_submission(&policy, "push", Some("mallory"), None).is_none());
     }
 }
