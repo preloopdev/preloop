@@ -526,45 +526,17 @@ fn tier_string(tier: TrustTier) -> String {
 /// Submit a dispatched run and report queued/completed check runs exactly
 /// like the webhook path does.
 ///
-/// Workflow execution protections are enforced here: the REST dispatch
-/// endpoints bypass the webhook intake, so without this check an enforced
-/// event/actor rule could be sidestepped by an authorized REST caller.
+/// Workflow execution protections are enforced inside
+/// [`crate::submit_run_inner`], the choke point every non-webhook
+/// submission path funnels through — the REST dispatch endpoints bypass the
+/// webhook intake, so without that check an enforced event/actor rule could
+/// be sidestepped by an authorized REST caller.
 async fn submit_and_report(
     shared: &Arc<SharedState>,
     submission: WorkflowSubmission,
     repository: &str,
     sha: &str,
 ) -> Result<RunAccepted, ApiError> {
-    if let Some(hit) = crate::execution_protection::denies_submission(
-        &shared.state.execution_protection,
-        &submission.event,
-        Some(&submission.actor),
-        submission.workflow_file.as_deref(),
-    ) {
-        match shared.state.execution_protection.mode {
-            crate::config::ProtectionMode::Enforce => {
-                info!(
-                    event = %submission.event,
-                    actor = %submission.actor,
-                    rule = %hit.describe(),
-                    "execution protection denied dispatch"
-                );
-                return Err(ApiError::forbidden(format!(
-                    "execution protection denied {}: {}",
-                    submission.event,
-                    hit.describe()
-                )));
-            }
-            crate::config::ProtectionMode::Evaluate => {
-                info!(
-                    event = %submission.event,
-                    actor = %submission.actor,
-                    rule = %hit.describe(),
-                    "execution protection would deny dispatch (evaluate mode)"
-                );
-            }
-        }
-    }
     let accepted = crate::submit_run_inner(shared, submission).await?;
     let run_id = accepted.run_id;
     let jobs = {

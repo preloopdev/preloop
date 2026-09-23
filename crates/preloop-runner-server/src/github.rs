@@ -1582,14 +1582,27 @@ async fn process_check_run_rerequest(
     };
 
     // Workflow execution protections: a rerequest re-triggers the original
-    // run, so the original trigger must still pass policy. Deny before
-    // resubmitting; a denial is not transient and must not retry.
-    if let Some(hit) = crate::execution_protection::denies_submission(
-        &shared.state.execution_protection,
-        &event,
-        Some(&actor),
-        workflow_file.as_deref(),
-    ) {
+    // run, so the original trigger must still pass policy — and so must the
+    // user who sent the rerequest. Actor rules match the webhook sender's
+    // login, so a blocked actor could otherwise re-run someone else's
+    // terminal run by clicking "Re-run". Deny if either matches; a denial
+    // is not transient and must not retry.
+    let rerequest_sender = payload
+        .get("sender")
+        .and_then(|sender| sender.get("login"))
+        .and_then(Value::as_str);
+    let denied = [Some(actor.as_str()), rerequest_sender]
+        .into_iter()
+        .flatten()
+        .find_map(|protection_actor| {
+            crate::execution_protection::denies_submission(
+                &shared.state.execution_protection,
+                &event,
+                Some(protection_actor),
+                workflow_file.as_deref(),
+            )
+        });
+    if let Some(hit) = denied {
         match shared.state.execution_protection.mode {
             crate::config::ProtectionMode::Enforce => {
                 info!(
@@ -4218,5 +4231,92 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// A check_run rerequest is a new trigger by the webhook sender, so both
+    /// the original run's actor and the sender must pass actor rules. Here
+    /// the original actor (alice) is clean but the sender (mallory) is
+    /// denied: the rerequest must not resubmit.
+    async fn rerequest_fixture() -> (tempfile::TempDir, std::sync::Arc<crate::SharedState>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.execution_protection = crate::config::ExecutionProtectionConfig {
+            mode: crate::config::ProtectionMode::Enforce,
+            event_rules: vec![],
+            actor_rules: vec![crate::config::ActorRule {
+                actor: "mallory".to_owned(),
+                workflows: None,
+                action: crate::config::PolicyRuleAction::Deny,
+            }],
+        };
+        let shared = state.shared();
+        // Seed a terminal run owned by alice with a known check run id.
+        let submission = WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            resolved_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
+            ..Default::default()
+        };
+        let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
+        {
+            let mut inner = shared.state.inner.lock().await;
+            let run = inner.runs.get_mut(&accepted.run_id).unwrap();
+            run.status = preloop_gha_protocol::ExecutionStatus::Success;
+            run.job_check_run_ids
+                .insert(JobId("build".to_owned()), 12345);
+        }
+        // Keep the TempDir alive for the state's lifetime.
+        (temp, shared)
+    }
+
+    fn rerequest_payload(sender: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action": "rerequested",
+            "check_run": {
+                "id": 12345,
+                "name": "build",
+                "head_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            },
+            "repository": {"full_name": "owner/repo"},
+            "sender": {"login": sender},
+        })
+    }
+
+    #[tokio::test]
+    async fn check_run_rerequest_denies_blocked_sender() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let (status, body) = process_check_run_rerequest(&shared, &rerequest_payload("mallory"))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0, serde_json::json!([]));
+        let inner = shared.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            1,
+            "blocked sender must not resubmit the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_run_rerequest_allows_clean_sender() {
+        let (_temp, shared) = rerequest_fixture().await;
+        let (status, body) = process_check_run_rerequest(&shared, &rerequest_payload("alice"))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(body.0, serde_json::json!([]), "clean sender must resubmit");
+        let inner = shared.state.inner.lock().await;
+        assert_eq!(
+            inner.runs.len(),
+            2,
+            "clean sender's rerequest must create a run"
+        );
     }
 }
