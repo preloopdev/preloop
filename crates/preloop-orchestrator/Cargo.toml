@@ -28,6 +28,7 @@ sha2 = "0.10"
 hex = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

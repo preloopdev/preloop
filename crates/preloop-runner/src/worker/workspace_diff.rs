@@ -403,6 +403,11 @@ mod tests {
                 let status = Command::new("git")
                     .arg("-C")
                     .arg(&path)
+                    // Test fixtures must not depend on the developer's
+                    // signing setup — a broken or locked signing agent
+                    // (e.g. 1Password) would otherwise fail every commit.
+                    .arg("-c")
+                    .arg("commit.gpgsign=false")
                     .args(args)
                     .output()
                     .unwrap();
@@ -455,6 +460,8 @@ mod tests {
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.path)
+                .arg("-c")
+                .arg("commit.gpgsign=false")
                 .args(args)
                 .output()
                 .unwrap();
