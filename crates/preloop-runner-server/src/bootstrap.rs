@@ -567,7 +567,36 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     }
 
     // Surface fork-PR runs failed closed by the expired approval window.
+    // Like the starvation loop below, emit per-job status and complete the
+    // GitHub check runs: without this a check run created at webhook intake
+    // stays `queued` on GitHub indefinitely for a terminal run.
     for run_id in &expired_fork_approvals {
+        let failed_jobs: Vec<JobId> = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get(run_id)
+                .map(|run| run.jobs.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        for job_id in failed_jobs {
+            shared
+                .state
+                .emit(NdjsonEvent::JobStatus {
+                    run_id: *run_id,
+                    job_id: job_id.clone(),
+                    status: ExecutionStatus::Failure,
+                    reason: Some("fork-PR approval window expired".to_owned()),
+                })
+                .await;
+            crate::github::report_check_run_completed(
+                shared,
+                *run_id,
+                &job_id,
+                ExecutionStatus::Failure,
+            )
+            .await;
+        }
         shared
             .state
             .emit(NdjsonEvent::RunStatus {

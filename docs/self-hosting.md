@@ -235,9 +235,10 @@ require_approval = false    # true = run is created but all jobs hold until the 
   `POST /api/v1/runs/:run_id/approve-fork` (system bearer). A run not approved
   within 24 hours fails closed. Timers hold jobs visibly in `Pending` and stay
   cancellable.
-- Only the `pull_request`/`pull_request_target`-from-a-fork trust tier is
-  affected. `pull_request_target` runs with base-repository trust and is not
-  treated as a fork-PR workflow by this policy.
+- Only the fork pull-request trust tier (`pull_request` from a fork) is
+  affected. `pull_request_target` always runs with base-repository trust and
+  is never treated as a fork-PR workflow by this policy, regardless of the
+  event that triggered it.
 - Secrets and write tokens for fork-PR workflows stay hardcoded off by the
   trust tier — there is no knob for them. The policy only decides whether the
   workflow runs at all, and whether a human says go first.

@@ -2063,7 +2063,17 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             let under_mp = max_parallel
                 .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
 
-            if needs_empty && under_mp {
+            // Fork-PR workflow policy: a run awaiting fork approval holds
+            // every job in pending_jobs until the operator approves the run.
+            // The needs-empty fast path must not bypass that hold by
+            // enqueueing straight to inner.queue (or parking in
+            // concurrency_blocked): the fork gate in promote_ready_jobs only
+            // inspects pending_jobs.
+            let fork_held = inner
+                .runs
+                .get(&run_id)
+                .is_some_and(|run| run.fork_approval_pending);
+            if needs_empty && under_mp && !fork_held {
                 // Job-level concurrency gate (needs/max_parallel already satisfied).
                 match try_enqueue_with_job_concurrency(
                     &mut inner,
@@ -2102,7 +2112,15 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     }
                 }
             } else {
-                statuses.insert(job_id, ExecutionStatus::Queued);
+                // Fork-held jobs wait visibly in Pending until the operator
+                // approves the run; everything else queues normally for the
+                // scheduler.
+                let status = if fork_held {
+                    ExecutionStatus::Pending
+                } else {
+                    ExecutionStatus::Queued
+                };
+                statuses.insert(job_id, status);
                 inner.pending_jobs.push_back(queued_job);
             }
         }
@@ -3670,6 +3688,7 @@ pub async fn rerun_run(
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ApproveForkRequest {
     /// Optional operator note recorded with the approval (audit trail).
+    #[serde(default)]
     pub note: Option<String>,
 }
 
@@ -3731,7 +3750,8 @@ pub async fn approve_fork(
         note = body.note.as_deref().unwrap_or_default(),
         "fork-PR approval recorded; run released"
     );
-    let outcome = crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    let outcome =
+        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
     shared
         .state
         .queue_depth
@@ -4341,5 +4361,16 @@ mod tests {
             StatusCode::OK,
             "a job claiming a registered environment must be accepted, got: {body}"
         );
+    }
+
+    #[test]
+    fn approve_fork_request_accepts_empty_object() {
+        // The note is optional: `{}` must deserialize (the field was missing
+        // #[serde(default)], so `{}` failed with "missing field `note`").
+        let req: ApproveForkRequest = serde_json::from_str("{}").expect("{} must parse");
+        assert!(req.note.is_none());
+        let req: ApproveForkRequest =
+            serde_json::from_str(r#"{"note":"lgtm"}"#).expect("note must parse");
+        assert_eq!(req.note.as_deref(), Some("lgtm"));
     }
 }

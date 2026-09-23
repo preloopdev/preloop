@@ -6,8 +6,8 @@ use utoipa::{
     Modify, OpenApi, ToSchema,
 };
 
-use crate::runs::{ApproveJobRequest, ApproveJobResponse};
 use crate::runs::{ApproveForkRequest, ApproveForkResponse};
+use crate::runs::{ApproveJobRequest, ApproveJobResponse};
 
 // ---------------------------------------------------------------------------
 // Schemas

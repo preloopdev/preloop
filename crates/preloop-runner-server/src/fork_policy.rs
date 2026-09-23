@@ -45,9 +45,12 @@ pub fn fork_approval_required(policy: &ForkPolicyConfig, tier: Option<TrustTier>
 ///
 /// Held jobs never left `pending_jobs`, so expiry removes them there, marks
 /// every non-terminal job `Failure`, clears the hold, and finalizes the run.
-/// Returns the failed run ids for logging. A run whose hold stamp is missing
-/// is left held (the operator can still approve or cancel it) — a
-/// bookkeeping gap must not auto-fail a run.
+/// Jobs that reached other scheduling queues (the submit-time fast path or a
+/// workflow-level concurrency hold in `held_runs`) are removed there too,
+/// and the run's concurrency holder is released so the group is not wedged
+/// by a run that will never start. Returns the failed run ids for logging.
+/// A run whose hold stamp is missing is left held (the operator can still
+/// approve or cancel it) — a bookkeeping gap must not auto-fail a run.
 pub fn sweep_expired_fork_approvals(inner: &mut InnerState, now_unix_nanos: i64) -> Vec<RunId> {
     let expired: Vec<RunId> = inner
         .runs
@@ -64,7 +67,16 @@ pub fn sweep_expired_fork_approvals(inner: &mut InnerState, now_unix_nanos: i64)
         .map(|(run_id, _)| *run_id)
         .collect();
     for run_id in &expired {
+        // A fork run awaiting approval must never dispatch after expiry:
+        // drop it from every scheduling queue, not just pending_jobs, so a
+        // later concurrency release cannot resurrect its jobs.
         inner.pending_jobs.retain(|job| job.run_id != *run_id);
+        inner.queue.retain(|job| job.run_id != *run_id);
+        inner
+            .concurrency_blocked
+            .retain(|job| job.run_id != *run_id);
+        inner.held_runs.remove(run_id);
+        crate::runtime_scheduling::release_concurrency_for_run(inner, *run_id);
         if let Some(run) = inner.runs.get_mut(run_id) {
             for status in run.jobs.values_mut() {
                 if !status.is_terminal() {
@@ -235,6 +247,7 @@ mod tests {
             matrix: BTreeMap::new(),
             deferred_matrix: None,
             reusable_call: None,
+            environment_gate: None,
         });
         let expired = sweep_expired_fork_approvals(
             &mut inner,
@@ -313,5 +326,241 @@ mod tests {
         let restored: RunRecord = serde_json::from_value(legacy).expect("deserialize legacy");
         assert!(!restored.fork_approval_pending);
         assert!(restored.fork_approval_requested_at_unix_nanos.is_none());
+    }
+
+    fn test_queued_job(run_id: RunId, job_id: &str) -> crate::models::QueuedJob {
+        crate::models::QueuedJob {
+            run_id,
+            job_id: JobId(job_id.to_owned()),
+            base_id: job_id.to_owned(),
+            created_at_unix_nanos: 0,
+            dependencies_ready_at_unix_nanos: None,
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
+            enqueued_at_unix_nanos: 0,
+            needs: Vec::new(),
+            if_condition: None,
+            condition_context: preloop_gha_expressions::Context::default(),
+            max_parallel: None,
+            runs_on: vec!["self-hosted".to_owned()],
+            runner_group: None,
+            message: serde_json::from_value(serde_json::json!({
+                "jobId": "00000000-0000-0000-0000-000000000001",
+                "requestId": 1,
+                "plan": {"planId": "plan", "planType": "build", "version": 1, "artifactUri": "", "artifactLocation": ""},
+                "timeline": {"id": "00000000-0000-0000-0000-000000000002", "changeId": 0, "location": null},
+                "jobName": job_id,
+                "lockedUntil": "",
+                "resources": {"endpoints": []},
+                "variables": {},
+                "mask": [],
+                "steps": []
+            }))
+            .unwrap(),
+            environment: None,
+            concurrency: None,
+            matrix: BTreeMap::new(),
+            deferred_matrix: None,
+            reusable_call: None,
+            environment_gate: None,
+        }
+    }
+
+    /// An expired fork run must be scrubbed from every scheduling queue —
+    /// not just `pending_jobs` — and its concurrency holder released, so a
+    /// later promotion cannot resurrect jobs from a failed-closed run.
+    #[test]
+    fn expired_sweep_clears_all_queues_and_releases_holder() {
+        use crate::concurrency::{ConcurrencyGroup, Holder};
+        use std::collections::VecDeque;
+
+        let mut inner = InnerState::default();
+        let now = 1_700_000_000_000_000_000;
+        let run = held_run(true, Some(now), ExecutionStatus::Queued);
+        let run_id = run.run_id;
+        inner.runs.insert(run_id, run);
+
+        // Jobs scattered across every scheduling queue the submit and
+        // concurrency paths can place them in.
+        inner
+            .pending_jobs
+            .push_back(test_queued_job(run_id, "pending-job"));
+        inner.queue.push_back(test_queued_job(run_id, "queued-job"));
+        inner
+            .concurrency_blocked
+            .push_back(test_queued_job(run_id, "blocked-job"));
+        inner
+            .held_runs
+            .insert(run_id, vec![test_queued_job(run_id, "held-job")]);
+
+        // The run holds a workflow-level concurrency slot, with a successor
+        // waiting behind it.
+        let other_run_id = RunId::new();
+        let key = ("owner/repo".to_owned(), "deploy".to_owned());
+        inner.holder_keys.insert(run_id, vec![key.clone()]);
+        inner.concurrency_groups.insert(
+            key.clone(),
+            ConcurrencyGroup {
+                display_name: "deploy".to_owned(),
+                running: Some(Holder::Run(run_id)),
+                pending: VecDeque::from([Holder::Run(other_run_id)]),
+            },
+        );
+
+        let expired =
+            sweep_expired_fork_approvals(&mut inner, now + FORK_APPROVAL_WINDOW_NANOS + 1);
+        assert_eq!(expired, vec![run_id]);
+
+        assert!(
+            inner.pending_jobs.iter().all(|j| j.run_id != run_id),
+            "expired run must leave pending_jobs"
+        );
+        assert!(
+            inner.queue.iter().all(|j| j.run_id != run_id),
+            "expired run must leave the ready queue"
+        );
+        assert!(
+            inner.concurrency_blocked.iter().all(|j| j.run_id != run_id),
+            "expired run must leave concurrency_blocked"
+        );
+        assert!(
+            !inner.held_runs.contains_key(&run_id),
+            "expired run must leave held_runs"
+        );
+
+        let group = &inner.concurrency_groups[&key];
+        assert!(
+            !matches!(group.running, Some(Holder::Run(id)) if id == run_id),
+            "expired run must release its concurrency holder"
+        );
+        assert!(
+            matches!(group.running, Some(Holder::Run(id)) if id == other_run_id),
+            "the waiting holder must be promoted"
+        );
+
+        // Even if something re-triggers promotion, the terminal run's jobs
+        // are gone from every queue: nothing can dispatch.
+        let job_ids: Vec<&str> = ["pending-job", "queued-job", "blocked-job", "held-job"]
+            .into_iter()
+            .collect();
+        for queue in [
+            &inner.pending_jobs,
+            &inner.queue,
+            &inner.concurrency_blocked,
+        ] {
+            for job in queue.iter() {
+                assert!(
+                    !job_ids.contains(&job.job_id.0.as_str()),
+                    "no expired-run job may remain schedulable"
+                );
+            }
+        }
+        assert!(inner.runs[&run_id].status.is_terminal());
+    }
+
+    /// A fork run that wins a workflow-concurrency slot while still awaiting
+    /// approval must not dispatch: promotion routes its jobs back to
+    /// `pending_jobs` (held by the fork gate) instead of the ready queue.
+    #[test]
+    fn concurrency_promotion_holds_fork_pending_run() {
+        use crate::concurrency::{ConcurrencyGroup, Holder};
+        use crate::runtime_scheduling::promote_next_from_group;
+        use std::collections::VecDeque;
+
+        let mut inner = InnerState::default();
+        let run = held_run(
+            true,
+            Some(1_700_000_000_000_000_000),
+            ExecutionStatus::Queued,
+        );
+        let run_id = run.run_id;
+        inner.runs.insert(run_id, run);
+        inner
+            .held_runs
+            .insert(run_id, vec![test_queued_job(run_id, "held-job")]);
+
+        let done_id = RunId::new();
+        let key = ("owner/repo".to_owned(), "deploy".to_owned());
+        inner.concurrency_groups.insert(
+            key.clone(),
+            ConcurrencyGroup {
+                display_name: "deploy".to_owned(),
+                running: Some(Holder::Run(done_id)),
+                pending: VecDeque::from([Holder::Run(run_id)]),
+            },
+        );
+
+        promote_next_from_group(&mut inner, &key, Holder::Run(done_id));
+
+        // The run won the concurrency slot...
+        assert!(
+            matches!(
+                inner.concurrency_groups[&key].running,
+                Some(Holder::Run(id)) if id == run_id
+            ),
+            "promoted run keeps its concurrency slot"
+        );
+        // ...but its jobs must not dispatch before approval.
+        assert!(
+            inner.queue.iter().all(|j| j.run_id != run_id),
+            "fork-held jobs must not reach the ready queue"
+        );
+        assert_eq!(
+            inner
+                .pending_jobs
+                .iter()
+                .filter(|j| j.run_id == run_id)
+                .count(),
+            1,
+            "fork-held jobs route back to pending_jobs"
+        );
+        assert_eq!(
+            inner.runs[&run_id].jobs[&JobId("held-job".to_owned())],
+            ExecutionStatus::Pending,
+            "fork-held jobs wait visibly in Pending"
+        );
+    }
+
+    /// A terminal run promoted by a stale concurrency release must not have
+    /// its jobs resurrected: they are dropped instead of re-queued.
+    #[test]
+    fn concurrency_promotion_drops_terminal_run_jobs() {
+        use crate::concurrency::{ConcurrencyGroup, Holder};
+        use crate::runtime_scheduling::promote_next_from_group;
+        use std::collections::VecDeque;
+
+        let mut inner = InnerState::default();
+        let run = held_run(false, None, ExecutionStatus::Failure);
+        let run_id = run.run_id;
+        inner.runs.insert(run_id, run);
+        inner
+            .held_runs
+            .insert(run_id, vec![test_queued_job(run_id, "held-job")]);
+
+        let done_id = RunId::new();
+        let key = ("owner/repo".to_owned(), "deploy".to_owned());
+        inner.concurrency_groups.insert(
+            key.clone(),
+            ConcurrencyGroup {
+                display_name: "deploy".to_owned(),
+                running: Some(Holder::Run(done_id)),
+                pending: VecDeque::from([Holder::Run(run_id)]),
+            },
+        );
+
+        promote_next_from_group(&mut inner, &key, Holder::Run(done_id));
+
+        assert!(
+            inner.queue.iter().all(|j| j.run_id != run_id),
+            "terminal run jobs must not reach the ready queue"
+        );
+        assert!(
+            inner.pending_jobs.iter().all(|j| j.run_id != run_id),
+            "terminal run jobs must not reach pending_jobs"
+        );
+        assert!(
+            !inner.held_runs.contains_key(&run_id),
+            "terminal run jobs must leave held_runs"
+        );
     }
 }
