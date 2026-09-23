@@ -10,9 +10,12 @@ use super::{
 ///
 /// The parser is recursive descent and the evaluator recurses over the same
 /// AST, so unbounded nesting (e.g. megabytes of `(((…` or `!!!…`) overflows
-/// the thread stack, which aborts the process instead of unwinding. Real
-/// workflow expressions are shallow; nothing legitimate nests near this.
-pub(crate) const MAX_EXPRESSION_DEPTH: usize = 256;
+/// the thread stack, which aborts the process instead of unwinding. The
+/// ceiling must hold on a default 2 MiB thread in a debug build, where one
+/// nesting level costs ~10 KiB on aarch64 Linux: 256 needed 2-3 MiB and
+/// aborted there before the guard fired. The official runner caps expression
+/// trees at depth 50, so nothing a real workflow can express comes near this.
+pub(crate) const MAX_EXPRESSION_DEPTH: usize = 128;
 
 pub(crate) struct Parser {
     tokens: Vec<Token>,
