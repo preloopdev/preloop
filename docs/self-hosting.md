@@ -507,7 +507,10 @@ runner:
   `preloop approve <run-id> <job-id> [--note ...]`. Preloop has no user
   identities — the approver is whoever holds the operator credential — so
   for a single-operator server this is a deliberate confirmation step, not
-  a second human. A job not approved within 24 hours of entering the gate
+  a second human. Because one token holder could satisfy any quorum alone
+  by calling the approval endpoint repeatedly, `required_reviewers` is
+  capped at 1; values above 1 are rejected at config load (fail closed).
+  A job not approved within 24 hours of entering the gate
   fails closed.
 
 Removing an environment's rules releases its armed gates. Gate denials and

@@ -378,6 +378,12 @@ pub struct EnvironmentRules {
     /// `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system token) or
     /// `preloop approve`. Zero means no approval gate. A job not approved
     /// within 24 hours of entering the gate fails closed.
+    ///
+    /// Preloop has no user identities: every approval is authenticated with
+    /// the single operator system token, so an approval is a deliberate
+    /// operator confirmation, not a distinct human reviewer. Values above 1
+    /// would imply a separation-of-duties guarantee that cannot exist, so
+    /// config loading rejects them (fail closed).
     #[serde(default)]
     pub required_reviewers: u32,
 }
@@ -1150,6 +1156,8 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
     };
     let mut config: ConfigFile =
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    validate_environment_rules(&config)
+        .with_context(|| format!("validating config {}", path.display()))?;
     resolve_credential_references(&mut config, &OsCredentialStore)?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
@@ -1158,6 +1166,28 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
             .with_context(|| format!("unsealing secrets in config {}", path.display()))?;
     }
     Ok(config)
+}
+
+/// Reject environment protection rules that promise more than the
+/// single-operator trust model can deliver.
+///
+/// Approvals are authenticated only with the shared system token, so
+/// `required_reviewers > 1` cannot mean distinct reviewers: one token holder
+/// could satisfy the quorum alone by calling the approval endpoint
+/// repeatedly. Fail the config load closed rather than run with a
+/// misleading gate.
+fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
+    for (repo, envs) in &config.environment_rules {
+        for (env, rules) in envs {
+            anyhow::ensure!(
+                rules.required_reviewers <= 1,
+                "environment_rules[{repo}][{env}]: required_reviewers = {} is not supported; \
+                 preloop has no user identities, so at most 1 operator approval can be required",
+                rules.required_reviewers
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Atomically write the config file with mode 0600.
@@ -1316,6 +1346,44 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "not [ valid toml ==").unwrap();
         assert!(load_config_from(&path).is_err());
+    }
+
+    #[test]
+    fn required_reviewers_above_one_is_rejected() {
+        // One system token can approve repeatedly, so a quorum above 1 would
+        // imply distinct reviewers that cannot exist. Fail closed at load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[environment_rules.\"owner/repo\".prod]\nrequired_reviewers = 2\n",
+        )
+        .unwrap();
+        let err = load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("required_reviewers"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn required_reviewers_zero_or_one_is_accepted() {
+        for reviewers in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[environment_rules.\"owner/repo\".prod]\nrequired_reviewers = {reviewers}\n"
+                ),
+            )
+            .unwrap();
+            let config = load_config_from(&path).unwrap();
+            assert_eq!(
+                config.environment_rules["owner/repo"]["prod"].required_reviewers,
+                reviewers
+            );
+        }
     }
 
     use crate::credential_store::{

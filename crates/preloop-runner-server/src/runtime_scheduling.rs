@@ -4280,7 +4280,7 @@ mod environment_gate_tests {
         let mut job = gate_job("prod");
         job.environment = None;
         let rules = rules_for(crate::config::EnvironmentRules {
-            required_reviewers: 2,
+            required_reviewers: 1,
             ..Default::default()
         });
         let outcome =
@@ -4392,10 +4392,12 @@ mod environment_gate_tests {
     }
 
     #[test]
-    fn approvals_hold_until_quorum() {
+    fn approval_releases_on_single_operator_confirmation() {
+        // Config validation caps required_reviewers at 1 (no user identities
+        // exist), so one operator approval must release the gate.
         let mut job = gate_job("prod");
         let rules = rules_for(crate::config::EnvironmentRules {
-            required_reviewers: 2,
+            required_reviewers: 1,
             ..Default::default()
         });
         let outcome =
@@ -4407,7 +4409,7 @@ mod environment_gate_tests {
                 .and_then(|gate| gate.approval_requested_at_unix_nanos)
                 == Some(NOW)
         );
-        // One approval is not enough.
+        // The single operator confirmation releases the gate.
         job.environment_gate
             .as_mut()
             .unwrap()
@@ -4415,15 +4417,6 @@ mod environment_gate_tests {
             .push(NOW + 1);
         let outcome =
             check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW + 2);
-        assert_eq!(outcome, EnvironmentGateOutcome::Wait);
-        // Quorum reached.
-        job.environment_gate
-            .as_mut()
-            .unwrap()
-            .approvals_unix_nanos
-            .push(NOW + 3);
-        let outcome =
-            check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW + 4);
         assert_eq!(outcome, EnvironmentGateOutcome::Proceed);
     }
 
@@ -4489,7 +4482,7 @@ mod environment_gate_tests {
 [environment_rules."owner/repo".prod]
 deployment_branches = ["main"]
 wait_timer_minutes = 10
-required_reviewers = 2
+required_reviewers = 1
 [environment_rules."owner/repo".staging]
 "#,
         )
@@ -4497,7 +4490,7 @@ required_reviewers = 2
         let prod = &config.environment_rules["owner/repo"]["prod"];
         assert_eq!(prod.deployment_branches, vec!["main"]);
         assert_eq!(prod.wait_timer_minutes, 10);
-        assert_eq!(prod.required_reviewers, 2);
+        assert_eq!(prod.required_reviewers, 1);
         let staging = &config.environment_rules["owner/repo"]["staging"];
         assert_eq!(*staging, crate::config::EnvironmentRules::default());
     }
