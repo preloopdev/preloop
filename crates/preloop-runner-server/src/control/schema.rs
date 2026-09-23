@@ -545,7 +545,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 -- ── Runs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS runs (
-    run_id              TEXT PRIMARY KEY NOT NULL,
+    run_id              TEXT PRIMARY KEY,
     namespace           TEXT NOT NULL DEFAULT 'default',
     status              TEXT NOT NULL,
     run_number          BIGINT NOT NULL,
@@ -635,7 +635,7 @@ CREATE TABLE IF NOT EXISTS oidc_job_contexts (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS job_steps (
-    agent_job_id        TEXT PRIMARY KEY NOT NULL,
+    agent_job_id        TEXT PRIMARY KEY,
     steps_blob          BYTEA NOT NULL,
     revision            BIGINT NOT NULL DEFAULT 0
 );
@@ -655,7 +655,7 @@ CREATE TABLE IF NOT EXISTS runners (
     registered_at_us    BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runner_sessions (
-    session_id          TEXT PRIMARY KEY NOT NULL,
+    session_id          TEXT PRIMARY KEY,
     -- NULL for compatibility sessions (e.g. the implicit `default` session)
     -- that have no registered runner. No FK: the binding is a claimed id
     -- recorded at session-create time; the runner may register later or
@@ -714,7 +714,7 @@ CREATE TABLE IF NOT EXISTS jobset_ready (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS run_concurrency (
-    run_id              TEXT PRIMARY KEY NOT NULL,
+    run_id              TEXT PRIMARY KEY,
     concurrency_blob    BYTEA NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -743,15 +743,15 @@ CREATE TABLE IF NOT EXISTS cancellation_queue (
 
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
-    name                TEXT PRIMARY KEY NOT NULL,
+    name                TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS workflow_run_counters (
-    key                 TEXT PRIMARY KEY NOT NULL,
+    key                 TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meta (
-    key                 TEXT PRIMARY KEY NOT NULL,
+    key                 TEXT PRIMARY KEY,
     value               BYTEA NOT NULL
 );
 

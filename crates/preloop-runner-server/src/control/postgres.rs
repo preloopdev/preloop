@@ -22,7 +22,7 @@ use super::backend::*;
 use super::commands;
 use super::sched;
 use super::schema::{POSTGRES_DDL, POSTGRES_SCHEMA_VERSION};
-use super::txstate::TxState;
+use super::txstate::{TxScope, TxState};
 use super::types::*;
 use crate::concurrency;
 use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
@@ -43,10 +43,19 @@ pub(crate) struct PostgresBackend {
     /// Read connections handed out by [`PostgresBackend::read`].
     readers_tx: tokio::sync::mpsc::Sender<Client>,
     readers_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Client>>,
-    pool_assignments_enabled: bool,
-    require_job_assignments: bool,
-    runner_liveness_timeout: std::time::Duration,
+    /// AEAD envelope sealing every `*_blob` column — identical to the SQLite
+    /// backend so a read replica or `SELECT` yields ciphertext, not secrets.
+    cipher: store::Envelope,
+    pool_assignments_enabled: std::sync::atomic::AtomicBool,
+    require_job_assignments: std::sync::atomic::AtomicBool,
+    runner_liveness_timeout: std::sync::atomic::AtomicU64,
 }
+
+/// Advisory-lock key serializing control-plane writers across every process
+/// sharing the database. Any `i64` works; it only has to be identical for all
+/// engines and distinct from application-level advisory locks. `xact` scope
+/// means the lock is released automatically on `COMMIT`/`ROLLBACK`.
+const POSTGRES_WRITER_LOCK_KEY: i64 = 0x0070_7265_6c6f_6f70; // "preloop"
 
 impl PostgresBackend {
     /// Connect, migrate to the current schema version, and return the
@@ -54,11 +63,43 @@ impl PostgresBackend {
     /// when the URL's `sslmode` asks for it (see `store_pg::tls_connector`).
     pub(crate) async fn connect(
         url: &str,
+        cipher: store::Envelope,
         pool_assignments_enabled: bool,
         require_job_assignments: bool,
         runner_liveness_timeout: std::time::Duration,
     ) -> Result<Self, ControlError> {
         let client = connect_one(url).await?;
+        // Ensure the bookkeeping schema/table exist before probing the
+        // version (a fresh database has neither).
+        client
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS control; \
+                 CREATE TABLE IF NOT EXISTS control.schema_migrations ( \
+                     version BIGINT PRIMARY KEY, \
+                     applied_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+                 )",
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        // Apply pending migrations (see `schema::POSTGRES_MIGRATIONS`) before
+        // the idempotent DDL. `schema_migrations` doubles as the version
+        // pointer (Postgres has no `PRAGMA user_version`).
+        let max_version: Option<i64> = client
+            .query_opt("SELECT MAX(version) FROM control.schema_migrations", &[])
+            .await
+            .map_err(ControlError::backend)?
+            .and_then(|row| row.get(0));
+        if let Some(version) = max_version {
+            for (migration, sql) in super::schema::POSTGRES_MIGRATIONS {
+                if *migration <= version {
+                    continue;
+                }
+                client
+                    .batch_execute(sql)
+                    .await
+                    .map_err(ControlError::backend)?;
+            }
+        }
         client
             .batch_execute(POSTGRES_DDL)
             .await
@@ -85,10 +126,50 @@ impl PostgresBackend {
             client: tokio::sync::Mutex::new(client),
             readers_tx,
             readers_rx: tokio::sync::Mutex::new(readers_rx),
-            pool_assignments_enabled,
-            require_job_assignments,
-            runner_liveness_timeout,
+            cipher,
+            pool_assignments_enabled: std::sync::atomic::AtomicBool::new(pool_assignments_enabled),
+            require_job_assignments: std::sync::atomic::AtomicBool::new(require_job_assignments),
+            runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
+                runner_liveness_timeout.as_nanos() as u64,
+            ),
         })
+    }
+
+    /// The live scheduling config as a `with_config` argument tuple.
+    pub(crate) fn config(&self) -> (bool, bool, std::time::Duration) {
+        (
+            self.pool_assignments_enabled
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.require_job_assignments
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::time::Duration::from_nanos(
+                self.runner_liveness_timeout
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
+        )
+    }
+
+    /// Update the scheduling config after connect. Bootstrap applies the
+    /// real server config here once it is known — the values passed to
+    /// `connect` are only the recovered defaults.
+    pub(crate) fn set_config(
+        &self,
+        pool_assignments_enabled: bool,
+        require_job_assignments: bool,
+        runner_liveness_timeout: std::time::Duration,
+    ) {
+        self.pool_assignments_enabled.store(
+            pool_assignments_enabled,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.require_job_assignments.store(
+            require_job_assignments,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.runner_liveness_timeout.store(
+            runner_liveness_timeout.as_nanos() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Run one command as a transaction: `BEGIN`, load the working set,
@@ -98,15 +179,37 @@ impl PostgresBackend {
         &self,
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
+        self.transact_scoped(&TxScope::full(), f).await
+    }
+
+    /// `transact` under a scope — loads only `scope`, writes back only the
+    /// loaded rows. See [`TxScope`] for the always-global concurrency rule.
+    pub(crate) async fn transact_scoped<T>(
+        &self,
+        scope: &TxScope,
+        f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
         let mut client = self.client.lock().await;
         let txn = client.transaction().await.map_err(ControlError::backend)?;
-        let mut tx = load_txstate(&txn).await?.with_config(
-            self.pool_assignments_enabled,
-            self.require_job_assignments,
-            self.runner_liveness_timeout,
-        );
+        // Serialize writers across processes: the `client` mutex orders
+        // writers inside this process, but a second engine sharing the
+        // database takes no part in it. `pg_advisory_xact_lock` is the
+        // cross-process writer lock — it blocks until every other holder
+        // commits or rolls back, then is released automatically at the end
+        // of this transaction. Without it two processes `load_txstate` the
+        // same working set under READ COMMITTED and last-write-wins on
+        // `write_txstate` (lost updates). Reads stay concurrent on the
+        // reader pool; only the write command serializes, matching the
+        // single-writer command contract.
+        txn.batch_execute(&format!(
+            "SELECT pg_advisory_xact_lock({POSTGRES_WRITER_LOCK_KEY})"
+        ))
+        .await
+        .map_err(ControlError::backend)?;
+        let (tx, effective_scope) = load_txstate(&txn, scope, &self.cipher).await?;
+        let mut tx = tx.with_config(self.config());
         let result = f(&mut tx)?;
-        write_txstate(&txn, &tx).await?;
+        write_txstate(&txn, &tx, &effective_scope, &self.cipher).await?;
         txn.commit().await.map_err(ControlError::backend)?;
         Ok(result)
     }
@@ -118,6 +221,15 @@ impl PostgresBackend {
         &self,
         f: impl FnOnce(&TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
+        self.read_scoped(&TxScope::full(), f).await
+    }
+
+    /// `read` under a scope — loads only `scope` on the reader snapshot.
+    pub(crate) async fn read_scoped<T>(
+        &self,
+        scope: &TxScope,
+        f: impl FnOnce(&TxState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
         let mut client = self
             .readers_rx
             .lock()
@@ -125,26 +237,190 @@ impl PostgresBackend {
             .recv()
             .await
             .ok_or_else(|| ControlError::backend(anyhow::anyhow!("reader pool closed")))?;
-        let result = self.read_on(&mut client, f).await;
+        let result = self.read_on(&mut client, scope, f).await;
         let _ = self.readers_tx.send(client).await;
         result
+    }
+
+    /// Test-only: read one job's `(status, queue_kind, queue_position, seq)`
+    /// straight from the `jobs` table, bypassing `TxState`. Used by the
+    /// transition regression tests to assert exact FIFO/status invariants.
+    #[cfg(test)]
+    pub(crate) async fn job_row(&self, job_id: &str) -> Option<(String, String, Option<i64>, i64)> {
+        let client = self.client.lock().await;
+        client
+            .query_opt(
+                "SELECT status, queue_kind, queue_position, seq FROM jobs WHERE job_id=$1",
+                &[&job_id],
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+    }
+
+    /// Test-only: every ready job's `queue_position`, keyed by `job_id`.
+    /// Used by the FIFO regression test to assert a new job takes the global
+    /// MAX+1 and existing rows keep their exact positions.
+    #[cfg(test)]
+    pub(crate) async fn ready_positions(&self) -> std::collections::BTreeMap<String, i64> {
+        let client = self.client.lock().await;
+        client
+            .query(
+                "SELECT job_id, queue_position FROM jobs WHERE queue_kind='ready'",
+                &[],
+            )
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect()
     }
 
     /// The read body: one consistent snapshot on `client`, rolled back.
     async fn read_on<T>(
         &self,
         client: &mut Client,
+        scope: &TxScope,
         f: impl FnOnce(&TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
         let txn = client.transaction().await.map_err(ControlError::backend)?;
-        let tx = load_txstate(&txn).await?.with_config(
-            self.pool_assignments_enabled,
-            self.require_job_assignments,
-            self.runner_liveness_timeout,
-        );
+        let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher).await?;
+        let tx = tx.with_config(self.config());
         let result = f(&tx)?;
         txn.rollback().await.map_err(ControlError::backend)?;
         Ok(result)
+    }
+
+    /// Find the run a webhook delivery already produced, by its durable
+    /// `(delivery_id, workflow_path)` dedup key. O(1) via `runs_delivery` —
+    /// the submit path calls this before `transact_scoped` so the replay
+    /// check never scans the whole `runs` table.
+    pub(crate) async fn find_run_by_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunRecord>, ControlError> {
+        let client = self.client.lock().await;
+        let row = client
+            .query_opt(
+                "SELECT run_id, record_blob FROM runs \
+                 WHERE webhook_delivery_id = $1 AND workflow_path = $2",
+                &[&delivery_id, &workflow_path],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let run_id_s: String = row.get(0);
+        let record: Vec<u8> = row.get(1);
+        let mut run: RunRecord = blob(&self.cipher, &record)?;
+        run.jobs.clear();
+        let rows = client
+            .query(
+                "SELECT job_id, status FROM jobs WHERE run_id = $1",
+                &[&run_id_s],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        for row in rows {
+            let job_id_s: String = row.get(0);
+            let status_s: String = row.get(1);
+            run.jobs.insert(JobId(job_id_s), status_parse(&status_s));
+        }
+        Ok(Some(run))
+    }
+
+    /// Resolve a request's `(request_id, run_id)` from its `agent_job_id`.
+    /// O(1) via `job_requests_agent` — the broker complete path calls this
+    /// before `transact_scoped` so the working set stays narrow.
+    pub(crate) async fn find_request_by_agent_job_id(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<(i64, RunId)>, ControlError> {
+        let client = self.client.lock().await;
+        let agent_job_id_s = agent_job_id.to_string();
+        client
+            .query_opt(
+                "SELECT request_id, run_id FROM job_requests WHERE agent_job_id = $1",
+                &[&agent_job_id_s],
+            )
+            .await
+            .map_err(ControlError::backend)?
+            .map(|r| {
+                let request_id: i64 = r.get(0);
+                let run_id_s: String = r.get(1);
+                (request_id, parse_run_id(&run_id_s))
+            })
+            .map_or(Ok(None), |v| Ok(Some(v)))
+    }
+
+    /// The session that owns the request for `agent_job_id`. `complete_job`
+    /// resolves this before `transact_scoped` so `settle_request` can drop
+    /// the moot cancellation from the owner session's inflight messages.
+    pub(crate) async fn find_session_by_agent_job_id(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        let client = self.client.lock().await;
+        let agent_job_id_s = agent_job_id.to_string();
+        client
+            .query_opt(
+                "SELECT rs.session_id FROM runner_sessions rs \
+                 JOIN job_requests jr ON jr.request_id = rs.active_request_id \
+                 WHERE jr.agent_job_id = $1",
+                &[&agent_job_id_s],
+            )
+            .await
+            .map_err(ControlError::backend)?
+            .map(|r| r.get::<_, String>(0))
+            .map_or(Ok(None), |v| Ok(Some(v)))
+    }
+
+    /// Every session owning a request of `run_id`. `cancel_run`/`cancel_job`
+    /// resolve these before `transact_scoped` so `settle_request` can drop
+    /// moot cancellations from each owner session's inflight messages.
+    pub(crate) async fn find_sessions_by_run(
+        &self,
+        run_id: RunId,
+    ) -> Result<BTreeSet<String>, ControlError> {
+        let client = self.client.lock().await;
+        let run_id_s = run_id.0.to_string();
+        let rows = client
+            .query(
+                "SELECT DISTINCT rs.session_id FROM runner_sessions rs \
+                 JOIN job_requests jr ON jr.request_id = rs.active_request_id \
+                 WHERE jr.run_id = $1",
+                &[&run_id_s],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    /// `(run_id, owner_session)` for `request_id`. `acquire_context` resolves
+    /// this before `read_scoped` so the read stays narrow.
+    pub(crate) async fn find_request_context(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<(RunId, Option<String>)>, ControlError> {
+        let client = self.client.lock().await;
+        client
+            .query_opt(
+                "SELECT jr.run_id, rs.session_id FROM job_requests jr \
+                 LEFT JOIN runner_sessions rs ON rs.active_request_id = jr.request_id \
+                 WHERE jr.request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?
+            .map(|r| {
+                let run_id_s: String = r.get(0);
+                let session_id: Option<String> = r.get(1);
+                (parse_run_id(&run_id_s), session_id)
+            })
+            .map_or(Ok(None), |v| Ok(Some(v)))
     }
 }
 
@@ -224,12 +500,22 @@ fn status_parse(s: &str) -> ExecutionStatus {
     }
 }
 
-fn blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ControlError> {
-    serde_json::from_slice(bytes).map_err(ControlError::backend)
+/// Deserialize a sealed `*_blob` column (see the SQLite backend's `blob` —
+/// sealed on write, plaintext accepted once for pre-seal rows).
+fn blob<T: serde::de::DeserializeOwned>(
+    cipher: &store::Envelope,
+    bytes: &[u8],
+) -> Result<T, ControlError> {
+    match cipher.unseal(bytes) {
+        Ok(plain) => serde_json::from_slice(&plain).map_err(ControlError::backend),
+        Err(_) => serde_json::from_slice(bytes).map_err(ControlError::backend),
+    }
 }
 
-fn unblob<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, ControlError> {
-    serde_json::to_vec(v).map_err(ControlError::backend)
+/// Serialize + seal a `*_blob` column.
+fn unblob<T: serde::Serialize>(cipher: &store::Envelope, v: &T) -> Result<Vec<u8>, ControlError> {
+    let plain = serde_json::to_vec(v).map_err(ControlError::backend)?;
+    cipher.seal(&plain).map_err(ControlError::backend)
 }
 
 fn parse_run_id(s: &str) -> RunId {
@@ -240,48 +526,245 @@ fn parse_uuid(s: &str) -> uuid::Uuid {
     s.parse().unwrap_or_default()
 }
 
+/// Build a run-scope `WHERE` clause + bind param for `= ANY($1)` pushdown.
+/// `runs: None` → no filter (load all); `Some(set)` → `WHERE <col> = ANY($1)`
+/// with the run-id strings to bind. An empty set yields `WHERE false`.
+/// Mirrors sqlite's `scoped_select` so both backends read the same rows.
+fn run_scope_clause(
+    col: &str,
+    runs: Option<&std::collections::BTreeSet<RunId>>,
+) -> (String, Option<Vec<String>>) {
+    match runs {
+        None => (String::new(), None),
+        Some(set) if set.is_empty() => (" WHERE false".to_owned(), None),
+        Some(set) => (
+            format!(" WHERE {col} = ANY($1)"),
+            Some(set.iter().map(|id| id.0.to_string()).collect()),
+        ),
+    }
+}
+
+/// Bind the optional run-id array from `run_scope_clause` into a query param
+/// list. `None` (no filter) binds nothing.
+fn scope_params(ids: &Option<Vec<String>>) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+    ids.iter()
+        .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect()
+}
+
 type Tx<'a> = tokio_postgres::Transaction<'a>;
 
-async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
-    let mut tx = TxState::default();
+async fn load_txstate(
+    conn: &Tx<'_>,
+    scope: &TxScope,
+    cipher: &store::Envelope,
+) -> Result<(TxState, TxScope), ControlError> {
+    // Widen `scope.runs` with every run a concurrency holder references.
+    // `try_acquire_concurrency`/`release_concurrency_for_*` can cancel or
+    // promote a *different* run's holder; `cancel_run_inner`/`settle_request`
+    // must see that run's rows or the cancellation silently no-ops and the
+    // run's jobs stay queued. `concurrency_groups` is small (active gates
+    // only), so the extra scan is cheap; the full load below re-reads it.
+    let mut effective_scope = scope.clone();
+    if let Some(runs) = effective_scope.runs.as_mut() {
+        // Widen `runs` with every run a concurrency holder references.
+        // `try_acquire_concurrency`/`release_concurrency_for_*` can cancel or
+        // promote a *different* run's holder; `cancel_run_inner`/
+        // `settle_request` must see that run's rows or the cancellation
+        // silently no-ops and the run's jobs stay queued. `concurrency_groups`
+        // is small (active gates only), so the extra scan is cheap.
+        if scope.concurrency {
+            let rows = conn
+                .query(
+                    "SELECT running_holder, pending_holders FROM concurrency_groups",
+                    &[],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                let running: Option<Vec<u8>> = row.get(0);
+                let pending: Vec<u8> = row.get(1);
+                if let Some(b) = running {
+                    if let Ok(h) = blob::<concurrency::Holder>(cipher, &b) {
+                        runs.insert(h.run_id());
+                    }
+                }
+                let pending: VecDeque<concurrency::Holder> =
+                    blob(cipher, &pending).unwrap_or_default();
+                for h in pending {
+                    runs.insert(h.run_id());
+                }
+            }
+        }
+        // `runs_referenced`: widen `runs` with the runs of every row this
+        // transaction can mutate indirectly — the queued jobs the scope
+        // loads (a claim marks the run in-progress, a promotion summarizes
+        // it) and the scoped sessions' active requests (settle drops the
+        // request's run). `SELECT DISTINCT run_id` reads no `record_blob`,
+        // so this stays O(#queued + #sessions), not O(#runs).
+        if scope.runs_referenced {
+            let mut kinds: Vec<&'static str> = Vec::new();
+            if scope.ready_queue {
+                kinds.push("ready");
+            }
+            if scope.blocked_jobs {
+                kinds.push("blocked");
+            }
+            if scope.pending_expansions {
+                kinds.push("expand");
+            }
+            if !kinds.is_empty() {
+                let rows = conn
+                    .query(
+                        "SELECT DISTINCT run_id FROM jobs WHERE queue_kind = ANY($1)",
+                        &[&kinds],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                for row in rows {
+                    let run_id_s: String = row.get(0);
+                    runs.insert(parse_run_id(&run_id_s));
+                }
+            }
+            if let Some(sessions) = scope.sessions.as_ref() {
+                if !sessions.is_empty() {
+                    let session_ids: Vec<String> = sessions.iter().cloned().collect();
+                    let rows = conn
+                        .query(
+                            "SELECT DISTINCT jr.run_id FROM job_requests jr \
+                             JOIN runner_sessions rs \
+                             ON jr.request_id = rs.active_request_id \
+                             WHERE rs.session_id = ANY($1)",
+                            &[&session_ids],
+                        )
+                        .await
+                        .map_err(ControlError::backend)?;
+                    for row in rows {
+                        let run_id_s: String = row.get(0);
+                        runs.insert(parse_run_id(&run_id_s));
+                    }
+                }
+            }
+        }
+        // `runs_via_requests`: widen `runs` with the run_ids of the loaded
+        // `job_requests` (correlation lookup → request → run record). Only
+        // meaningful with `job_requests_all`. `SELECT DISTINCT` reads no blob.
+        if scope.runs_via_requests && scope.job_requests_all {
+            let rows = conn
+                .query("SELECT DISTINCT run_id FROM job_requests", &[])
+                .await
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                let run_id_s: String = row.get(0);
+                runs.insert(parse_run_id(&run_id_s));
+            }
+        }
+    }
+    let scope = &effective_scope;
 
-    // Runs.
-    for row in conn
-        .query("SELECT run_id, record_blob FROM runs", &[])
-        .await
-        .map_err(ControlError::backend)?
-    {
+    let mut tx = TxState {
+        ready_queue_loaded: scope.runs.is_none() || scope.ready_queue,
+        ..Default::default()
+    };
+
+    // Runs — scoped to `scope.runs` when set.
+    let run_ids: Vec<String> = scope
+        .runs
+        .as_ref()
+        .map(|s| s.iter().map(|id| id.0.to_string()).collect())
+        .unwrap_or_default();
+    let runs_rows = if let Some(runs) = scope.runs.as_ref() {
+        if runs.is_empty() {
+            Vec::new()
+        } else {
+            conn.query(
+                "SELECT run_id, record_blob FROM runs WHERE run_id = ANY($1)",
+                &[&run_ids],
+            )
+            .await
+            .map_err(ControlError::backend)?
+        }
+    } else {
+        conn.query("SELECT run_id, record_blob FROM runs", &[])
+            .await
+            .map_err(ControlError::backend)?
+    };
+    for row in runs_rows {
         let run_id_s: String = row.get(0);
         let record: Vec<u8> = row.get(1);
         let run_id = parse_run_id(&run_id_s);
-        let value: serde_json::Value = blob(&record)?;
-        let mut run = store::run_record_from_value(value).map_err(ControlError::backend)?;
+        let mut run: RunRecord = blob(cipher, &record)?;
         run.jobs.clear();
         tx.runs.insert(run_id, run);
         tx.loaded.runs.insert(run_id);
     }
 
-    // Jobs.
-    for row in conn
-        .query(
-            "SELECT run_id, job_id, status, queue_kind, queue_position, seq, \
-             reaper_first_seen_us, expand_generation, payload_blob \
-             FROM jobs ORDER BY seq",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
-    {
+    // Jobs — a row loads when its run is in scope OR it sits in a global
+    // queue kind the scope asked for (ready / blocked).
+    let mut kinds: Vec<&'static str> = Vec::new();
+    if scope.ready_queue {
+        kinds.push("ready");
+    }
+    if scope.blocked_jobs {
+        kinds.push("blocked");
+    }
+    if scope.pending_expansions {
+        kinds.push("expand");
+    }
+    let jobs_rows = {
+        let base = "SELECT run_id, job_id, status, queue_kind, queue_position, seq, \
+             reaper_first_seen_us, expand_generation, enqueued_at_us, payload_blob FROM jobs";
+        // `runs == None` means the run predicate is TRUE, which makes the
+        // whole OR true — emit no WHERE and load every job. Only when the
+        // scope names a run set do the queue-kind clauses matter.
+        let mut conds: Vec<String> = Vec::new();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        if let Some(runs) = scope.runs.as_ref() {
+            if runs.is_empty() {
+                conds.push("false".to_owned());
+            } else {
+                params.push(&run_ids);
+                conds.push(format!("run_id = ANY(${})", params.len()));
+            }
+            if !kinds.is_empty() {
+                params.push(&kinds);
+                conds.push(format!("queue_kind = ANY(${})", params.len()));
+            }
+        }
+        let sql = if conds.is_empty() {
+            format!("{base} ORDER BY seq")
+        } else {
+            format!("{base} WHERE {} ORDER BY seq", conds.join(" OR "))
+        };
+        conn.query(&sql, &params)
+            .await
+            .map_err(ControlError::backend)?
+    };
+    for row in jobs_rows {
         let run_id_s: String = row.get(0);
         let job_id_s: String = row.get(1);
         let status: String = row.get(2);
         let kind: String = row.get(3);
+        let pos: Option<i64> = row.get(4);
+        let job_seq: Option<i64> = row.get(5);
         let reaper_us: Option<i64> = row.get(6);
         let expand_generation: i64 = row.get(7);
-        let payload: Option<Vec<u8>> = row.get(8);
+        let enqueued_us: Option<i64> = row.get(8);
+        let payload: Option<Vec<u8>> = row.get(9);
         let run_id = parse_run_id(&run_id_s);
         let job_id = JobId(job_id_s);
         let status = status_parse(&status);
+        // Preserve the persisted row state for every loaded job — a job whose
+        // run isn't in `tx.runs` was widened in by a queue-kind clause and must
+        // be written back with these exact values.
+        tx.job_row_state.insert(
+            (run_id, job_id.clone()),
+            crate::control::txstate::JobRowState {
+                status,
+                queue_position: pos,
+                seq: job_seq.unwrap_or(0),
+            },
+        );
         if let Some(run) = tx.runs.get_mut(&run_id) {
             run.jobs.insert(job_id.clone(), status);
         }
@@ -297,7 +780,13 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
                 .insert((run_id, job_id.clone()), expand_generation);
         }
         if let Some(payload) = payload {
-            let job: QueuedJob = blob(&payload)?;
+            let mut job: QueuedJob = blob(cipher, &payload)?;
+            // `enqueued_at_us` is authoritative: the payload blob is only
+            // re-sealed on a slot change, so a rewritten enqueue time would
+            // otherwise be masked by the stale blob.
+            if let Some(us) = enqueued_us {
+                job.enqueued_at_unix_nanos = us * 1000;
+            }
             match kind {
                 QueueKind::Ready => tx.ready_index.push_back(job),
                 QueueKind::Pending => tx.pending_jobs.push_back(job),
@@ -319,7 +808,12 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
             }
         }
     }
-    tx.ready_count = tx.ready_index.len() as i64;
+    // Global ready-queue size — unscoped COUNT, not the loaded subset.
+    tx.ready_count = conn
+        .query_one("SELECT COUNT(*) FROM jobs WHERE queue_kind='ready'", &[])
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or(0);
     tx.next_queue_position = conn
         .query_one(
             "SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs WHERE queue_kind='ready'",
@@ -328,15 +822,45 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         .await
         .map(|r| r.get(0))
         .unwrap_or(1);
+    tx.next_seq = conn
+        .query_one("SELECT COALESCE(MAX(seq),0)+1 FROM jobs", &[])
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or(1);
+    // Global queue-front labels — unscoped, for pool next-image selection.
+    tx.next_queue_labels = conn
+        .query_opt(
+            "SELECT payload_blob FROM jobs WHERE queue_kind='ready' \
+             ORDER BY queue_position LIMIT 1",
+            &[],
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.get::<_, Option<Vec<u8>>>(0))
+        .and_then(|b| blob::<QueuedJob>(cipher, &b).ok())
+        .map(|j| j.runs_on)
+        .unwrap_or_default();
 
-    // Requests.
+    // Requests — run-scoped via `run_scope_clause`. `job_requests_all` loads
+    // the whole table without pulling `record_blob`s.
+    let (req_w, req_ids) = run_scope_clause(
+        "run_id",
+        if scope.job_requests_all {
+            None
+        } else {
+            scope.runs.as_ref()
+        },
+    );
     for row in conn
         .query(
-            "SELECT request_id, run_id, job_id, agent_job_id, plan_id, plan_type, \
-             timeline_id, result, locked_until, claimed_at_us, owner_runner_id, \
-             started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued, \
-             request_blob FROM job_requests",
-            &[],
+            &format!(
+                "SELECT request_id, run_id, job_id, agent_job_id, plan_id, plan_type, \
+                 timeline_id, result, locked_until, claimed_at_us, owner_runner_id, \
+                 started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued, \
+                 request_blob FROM job_requests{req_w}"
+            ),
+            &scope_params(&req_ids),
         )
         .await
         .map_err(ControlError::backend)?
@@ -357,9 +881,13 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         let timeout_triggered: i64 = row.get(13);
         let debug_token_issued: i64 = row.get(14);
         let request_blob: Option<Vec<u8>> = row.get(15);
+        let run_id = parse_run_id(&run_id_s);
+        if !scope.job_requests_all && !scope.includes_run(&run_id) {
+            continue;
+        }
         let record = TaskAgentJobRequestRecord {
             request_id,
-            run_id: parse_run_id(&run_id_s),
+            run_id,
             job_id: JobId(job_id_s),
             agent_job_id: parse_uuid(&agent_job_id_s),
             plan_id,
@@ -376,7 +904,7 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         };
         tx.loaded.requests.insert(request_id);
         if let Some(msg) = request_blob {
-            if let Ok(msg) = serde_json::from_slice(&msg) {
+            if let Ok(msg) = blob(cipher, &msg) {
                 tx.broker_messages.insert(request_id, msg);
             }
         }
@@ -384,67 +912,115 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
     }
 
     // Token requests, grants, OIDC, steps.
-    for row in conn
-        .query(
-            "SELECT request_id, request_blob FROM github_token_requests",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
     {
-        let request_id: i64 = row.get(0);
-        let req: Vec<u8> = row.get(1);
-        if let Ok(req) = serde_json::from_slice(&req) {
-            tx.github_token_requests.insert(request_id, req);
+        // `request_id` maps to a request — push the run scope through a
+        // subquery on `job_requests`.
+        let (sql, ids) = match scope.runs.as_ref() {
+            None => (
+                "SELECT request_id, request_blob FROM github_token_requests".to_owned(),
+                None,
+            ),
+            Some(set) if set.is_empty() => (
+                "SELECT request_id, request_blob FROM github_token_requests WHERE false".to_owned(),
+                None,
+            ),
+            Some(set) => (
+                "SELECT request_id, request_blob FROM github_token_requests \
+                 WHERE request_id IN (SELECT request_id FROM job_requests \
+                 WHERE run_id = ANY($1))"
+                    .to_owned(),
+                Some(set.iter().map(|id| id.0.to_string()).collect()),
+            ),
+        };
+        for row in conn
+            .query(&sql, &scope_params(&ids))
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let request_id: i64 = row.get(0);
+            let req: Vec<u8> = row.get(1);
+            if let Ok(req) = blob(cipher, &req) {
+                tx.github_token_requests.insert(request_id, req);
+            }
         }
     }
-    for row in conn
-        .query("SELECT run_id, job_id, granted FROM id_token_grants", &[])
-        .await
-        .map_err(ControlError::backend)?
     {
-        let run_id_s: String = row.get(0);
-        let job_id_s: String = row.get(1);
-        let granted: i64 = row.get(2);
-        tx.id_token_grants
-            .insert((parse_run_id(&run_id_s), JobId(job_id_s)), granted != 0);
-    }
-    for row in conn
-        .query(
-            "SELECT run_id, job_id, context_blob FROM oidc_job_contexts",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let job_id_s: String = row.get(1);
-        let ctx: Vec<u8> = row.get(2);
-        if let Ok(ctx) = serde_json::from_slice(&ctx) {
-            tx.oidc_job_contexts
-                .insert((parse_run_id(&run_id_s), JobId(job_id_s)), ctx);
+        let (w, ids) = run_scope_clause("run_id", scope.runs.as_ref());
+        for row in conn
+            .query(
+                &format!("SELECT run_id, job_id, granted FROM id_token_grants{w}"),
+                &scope_params(&ids),
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let run_id = parse_run_id(&run_id_s);
+            let job_id_s: String = row.get(1);
+            let granted: i64 = row.get(2);
+            tx.id_token_grants
+                .insert((run_id, JobId(job_id_s)), granted != 0);
         }
     }
-    for row in conn
-        .query(
-            "SELECT agent_job_id, steps_blob, revision FROM job_steps",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
     {
-        let agent_job_id_s: String = row.get(0);
-        let steps: Vec<u8> = row.get(1);
-        let revision: i64 = row.get(2);
-        let agent_job_id = parse_uuid(&agent_job_id_s);
-        if let Ok(steps) = serde_json::from_slice(&steps) {
-            tx.job_steps.insert(agent_job_id, steps);
-            tx.job_steps_revision.insert(agent_job_id, revision as u64);
+        let (w, ids) = run_scope_clause("run_id", scope.runs.as_ref());
+        for row in conn
+            .query(
+                &format!("SELECT run_id, job_id, context_blob FROM oidc_job_contexts{w}"),
+                &scope_params(&ids),
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let run_id = parse_run_id(&run_id_s);
+            let job_id_s: String = row.get(1);
+            let ctx: Vec<u8> = row.get(2);
+            if let Ok(ctx) = blob(cipher, &ctx) {
+                tx.oidc_job_contexts.insert((run_id, JobId(job_id_s)), ctx);
+            }
         }
-        tx.loaded.step_attempts.insert(agent_job_id);
+    }
+    {
+        // `agent_job_id` maps to a request — push the run scope through a
+        // subquery on `job_requests` so a narrow scope skips the table.
+        let (sql, ids) = match scope.runs.as_ref() {
+            None => (
+                "SELECT agent_job_id, steps_blob, revision FROM job_steps".to_owned(),
+                None,
+            ),
+            Some(set) if set.is_empty() => (
+                "SELECT agent_job_id, steps_blob, revision FROM job_steps WHERE false".to_owned(),
+                None,
+            ),
+            Some(set) => (
+                "SELECT agent_job_id, steps_blob, revision FROM job_steps \
+                 WHERE agent_job_id IN (SELECT agent_job_id FROM job_requests \
+                 WHERE run_id = ANY($1))"
+                    .to_owned(),
+                Some(set.iter().map(|id| id.0.to_string()).collect()),
+            ),
+        };
+        for row in conn
+            .query(&sql, &scope_params(&ids))
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let agent_job_id_s: String = row.get(0);
+            let steps: Vec<u8> = row.get(1);
+            let revision: i64 = row.get(2);
+            let agent_job_id = parse_uuid(&agent_job_id_s);
+            if let Ok(steps) = blob(cipher, &steps) {
+                tx.job_steps.insert(agent_job_id, steps);
+                tx.job_steps_revision.insert(agent_job_id, revision as u64);
+            }
+            tx.loaded.step_attempts.insert(agent_job_id);
+        }
     }
 
-    // Runners.
+    // Runners — always global. `claim_permitted` checks the runner holding a
+    // binding and `submit_run`/`unhostable_platform` need the full registry;
+    // the table is small, so it loads unconditionally.
     for row in conn
         .query(
             "SELECT runner_id, name, labels, ephemeral, public_key, rsa_public_key, \
@@ -499,24 +1075,31 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
     for row in conn
         .query(
             "SELECT session_id, runner_id, protocol, encryption_blob, \
-             active_request_id, last_seen_at_us FROM runner_sessions",
+             active_request_id, last_seen_at_us, verified FROM runner_sessions",
             &[],
         )
         .await
         .map_err(ControlError::backend)?
     {
         let session_id: String = row.get(0);
-        let runner_id: i64 = row.get(1);
+        // Session-scoped: only sessions this scope asked for.
+        if let Some(set) = scope.sessions.as_ref() {
+            if !set.contains(&session_id) {
+                continue;
+            }
+        }
+        let runner_id: Option<i64> = row.get(1);
         let protocol: String = row.get(2);
         let encryption_blob: Option<Vec<u8>> = row.get(3);
         let active_request_id: Option<i64> = row.get(4);
         let last_seen_at_us: Option<i64> = row.get(5);
-        match SessionProtocol::parse(&protocol) {
-            SessionProtocol::Broker => {
+        let verified: i64 = row.get(6);
+        match (SessionProtocol::parse(&protocol), runner_id) {
+            (SessionProtocol::Broker, Some(runner_id)) => {
                 tx.broker_session_runners
                     .insert(session_id.clone(), runner_id);
             }
-            SessionProtocol::Azdo => {
+            (SessionProtocol::Azdo, Some(runner_id)) => {
                 tx.sessions.insert(
                     session_id.clone(),
                     preloop_gha_protocol::RunnerSession {
@@ -526,15 +1109,25 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
                 );
                 tx.azdo_sessions.insert(session_id.clone());
             }
+            // Compatibility sessions carry no runner; they exist only to
+            // satisfy `broker_messages`/`active_request_id` foreign keys.
+            _ => {}
         }
-        if let Some(key) = encryption_blob {
-            tx.session_keys
-                .insert(session_id.clone(), SessionEncryption::from_key(key));
+        if verified != 0 {
+            tx.verified_sessions.insert(session_id.clone());
+        }
+        if let Some(key_blob) = encryption_blob {
+            let restored = cipher
+                .unseal(&key_blob)
+                .map(SessionEncryption::from_key)
+                .unwrap_or_else(|_| SessionEncryption::from_key(key_blob));
+            tx.session_keys.insert(session_id.clone(), restored);
         }
         if let Some(us) = last_seen_at_us {
             tx.session_last_seen
                 .insert(session_id.clone(), us_to_system(us));
         }
+
         if let Some(request_id) = active_request_id {
             tx.session_active_requests
                 .insert(session_id.clone(), request_id);
@@ -554,9 +1147,13 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         .map_err(ControlError::backend)?
     {
         let session_id: String = row.get(0);
+        // Only messages for sessions this scope loaded.
+        if !tx.loaded.sessions.contains(&session_id) {
+            continue;
+        }
         let message_id: i64 = row.get(1);
         let msg: Vec<u8> = row.get(2);
-        if let Ok(msg) = serde_json::from_slice(&msg) {
+        if let Ok(msg) = blob(cipher, &msg) {
             tx.inflight_messages
                 .entry(session_id)
                 .or_default()
@@ -564,175 +1161,210 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         }
     }
 
-    // Concurrency.
-    for row in conn
-        .query(
-            "SELECT repo, group_name, display_name, running_holder, pending_holders \
+    // Concurrency — always-global, loaded only when the scope asks for it.
+    if scope.concurrency {
+        for row in conn
+            .query(
+                "SELECT repo, group_name, display_name, running_holder, pending_holders \
              FROM concurrency_groups",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let repo: String = row.get(0);
-        let group_name: String = row.get(1);
-        let display_name: String = row.get(2);
-        let running: Option<Vec<u8>> = row.get(3);
-        let pending: Vec<u8> = row.get(4);
-        let running: Option<concurrency::Holder> =
-            running.and_then(|b| serde_json::from_slice(&b).ok());
-        let pending: VecDeque<concurrency::Holder> =
-            serde_json::from_slice(&pending).unwrap_or_default();
-        tx.concurrency_groups.insert(
-            (repo.clone(), group_name.clone()),
-            concurrency::ConcurrencyGroup {
-                display_name,
-                running,
-                pending,
-            },
-        );
-        tx.loaded.groups.insert((repo, group_name));
-    }
-    for row in conn
-        .query("SELECT run_id, repo, group_name FROM holder_keys", &[])
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let repo: String = row.get(1);
-        let group_name: String = row.get(2);
-        let run_id = parse_run_id(&run_id_s);
-        tx.holder_keys
-            .entry(run_id)
-            .or_default()
-            .push((repo, group_name));
-        tx.loaded.holder_key_runs.insert(run_id);
-    }
-    for row in conn
-        .query(
-            "SELECT run_id, job_ids, gates_blob, acquired_keys FROM jobset_admissions",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let job_ids_s: String = row.get(1);
-        let gates: Vec<u8> = row.get(2);
-        let acquired: Vec<u8> = row.get(3);
-        let run_id = parse_run_id(&run_id_s);
-        let job_ids: BTreeSet<JobId> = serde_json::from_str::<BTreeSet<String>>(&job_ids_s)
-            .unwrap_or_default()
-            .into_iter()
-            .map(JobId)
-            .collect();
-        let id = JobSetId { run_id, job_ids };
-        if let (Ok(gates), Ok(acquired_keys)) = (
-            serde_json::from_slice(&gates),
-            serde_json::from_slice(&acquired),
-        ) {
-            tx.jobset_admissions.insert(
-                id.clone(),
-                crate::state::JobSetAdmission {
-                    gates,
-                    acquired_keys,
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let repo: String = row.get(0);
+            let group_name: String = row.get(1);
+            let display_name: String = row.get(2);
+            let running: Option<Vec<u8>> = row.get(3);
+            let pending: Vec<u8> = row.get(4);
+            let running: Option<concurrency::Holder> = running.and_then(|b| blob(cipher, &b).ok());
+            let pending: VecDeque<concurrency::Holder> = blob(cipher, &pending).unwrap_or_default();
+            tx.concurrency_groups.insert(
+                (repo.clone(), group_name.clone()),
+                concurrency::ConcurrencyGroup {
+                    display_name,
+                    running,
+                    pending,
                 },
             );
-            tx.loaded.jobsets.insert(id);
+            tx.loaded.groups.insert((repo, group_name));
         }
-    }
-    for row in conn
-        .query("SELECT run_id, job_ids FROM jobset_ready", &[])
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let job_ids_s: String = row.get(1);
-        let run_id = parse_run_id(&run_id_s);
-        let job_ids: BTreeSet<JobId> = serde_json::from_str::<BTreeSet<String>>(&job_ids_s)
-            .unwrap_or_default()
-            .into_iter()
-            .map(JobId)
-            .collect();
-        tx.jobset_ready.insert(JobSetId { run_id, job_ids });
-    }
-    for row in conn
-        .query("SELECT run_id, concurrency_blob FROM run_concurrency", &[])
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let c: Vec<u8> = row.get(1);
-        if let Ok(c) = serde_json::from_slice(&c) {
-            tx.run_concurrency.insert(parse_run_id(&run_id_s), c);
+        for row in conn
+            .query("SELECT run_id, repo, group_name FROM holder_keys", &[])
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let repo: String = row.get(1);
+            let group_name: String = row.get(2);
+            let run_id = parse_run_id(&run_id_s);
+            tx.holder_keys
+                .entry(run_id)
+                .or_default()
+                .push((repo, group_name));
+            tx.loaded.holder_key_runs.insert(run_id);
+        }
+        for row in conn
+            .query(
+                "SELECT run_id, job_ids, gates_blob, acquired_keys FROM jobset_admissions",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let job_ids_s: String = row.get(1);
+            let gates: Vec<u8> = row.get(2);
+            let acquired: Vec<u8> = row.get(3);
+            let run_id = parse_run_id(&run_id_s);
+            let job_ids: BTreeSet<JobId> = serde_json::from_str::<BTreeSet<String>>(&job_ids_s)
+                .unwrap_or_default()
+                .into_iter()
+                .map(JobId)
+                .collect();
+            let id = JobSetId { run_id, job_ids };
+            if let (Ok(gates), Ok(acquired_keys)) = (blob(cipher, &gates), blob(cipher, &acquired))
+            {
+                tx.jobset_admissions.insert(
+                    id.clone(),
+                    crate::state::JobSetAdmission {
+                        gates,
+                        acquired_keys,
+                    },
+                );
+                tx.loaded.jobsets.insert(id);
+            }
+        }
+        for row in conn
+            .query("SELECT run_id, job_ids FROM jobset_ready", &[])
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let job_ids_s: String = row.get(1);
+            let run_id = parse_run_id(&run_id_s);
+            let job_ids: BTreeSet<JobId> = serde_json::from_str::<BTreeSet<String>>(&job_ids_s)
+                .unwrap_or_default()
+                .into_iter()
+                .map(JobId)
+                .collect();
+            tx.jobset_ready.insert(JobSetId { run_id, job_ids });
         }
     }
 
-    // Assignments, pool pending, cancellations.
-    for row in conn
-        .query(
-            "SELECT run_id, job_id, runner_id, at_us, first_at_us FROM job_assignments",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
+    // run_concurrency is run-scoped.
     {
-        let run_id_s: String = row.get(0);
-        let job_id_s: String = row.get(1);
-        let runner_id: Option<i64> = row.get(2);
-        let at_us: i64 = row.get(3);
-        let first_at_us: i64 = row.get(4);
-        let run_id = parse_run_id(&run_id_s);
-        let job_id = JobId(job_id_s);
-        tx.job_assignments.insert(
-            (run_id, job_id.clone()),
-            crate::models::AssignmentRecord {
-                runner_id,
-                at: us_to_system(at_us),
-                first_at: us_to_system(first_at_us),
-            },
-        );
-        tx.loaded.assignments.insert((run_id, job_id));
-    }
-    for row in conn
-        .query("SELECT run_id, job_id, at_us FROM pool_pending", &[])
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let job_id_s: String = row.get(1);
-        let at_us: i64 = row.get(2);
-        tx.pool_pending.insert(
-            (parse_run_id(&run_id_s), JobId(job_id_s)),
-            us_to_system(at_us),
-        );
-    }
-    for row in conn
-        .query(
-            "SELECT run_id, job_id, agent_job_id FROM cancellation_queue ORDER BY seq",
-            &[],
-        )
-        .await
-        .map_err(ControlError::backend)?
-    {
-        let run_id_s: String = row.get(0);
-        let job_id_s: String = row.get(1);
-        let agent_job_id_s: String = row.get(2);
-        let run_id = parse_run_id(&run_id_s);
-        let job_id = JobId(job_id_s);
-        let agent_job_id = parse_uuid(&agent_job_id_s);
-        tx.cancellation_queue
-            .push_back(crate::models::QueuedCancellation {
-                run_id,
-                job_id: job_id.clone(),
-                agent_job_id,
-            });
-        tx.loaded
-            .cancellations
-            .insert((run_id, job_id, agent_job_id));
+        let (w, ids) = run_scope_clause("run_id", scope.runs.as_ref());
+        for row in conn
+            .query(
+                &format!("SELECT run_id, concurrency_blob FROM run_concurrency{w}"),
+                &scope_params(&ids),
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let run_id = parse_run_id(&run_id_s);
+            let c: Vec<u8> = row.get(1);
+            if let Ok(c) = blob(cipher, &c) {
+                tx.run_concurrency.insert(run_id, c);
+            }
+        }
     }
 
-    // Counters.
+    // Assignments, pool pending, cancellations. `job_assignments`/`pool_pending`
+    // widen to every run when `ready_queue` (or `runs: None`); only a
+    // run-scoped command without the ready queue filters to its own runs.
+    {
+        let (w, ids) = if scope.ready_queue {
+            (String::new(), None)
+        } else {
+            run_scope_clause("run_id", scope.runs.as_ref())
+        };
+        for row in conn
+            .query(
+                &format!(
+                    "SELECT run_id, job_id, runner_id, at_us, first_at_us \
+                     FROM job_assignments{w}"
+                ),
+                &scope_params(&ids),
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let job_id_s: String = row.get(1);
+            let runner_id: Option<i64> = row.get(2);
+            let at_us: i64 = row.get(3);
+            let first_at_us: i64 = row.get(4);
+            let run_id = parse_run_id(&run_id_s);
+            let job_id = JobId(job_id_s);
+            tx.job_assignments.insert(
+                (run_id, job_id.clone()),
+                crate::models::AssignmentRecord {
+                    runner_id,
+                    at: us_to_system(at_us),
+                    first_at: us_to_system(first_at_us),
+                },
+            );
+            tx.loaded.assignments.insert((run_id, job_id));
+        }
+    }
+    {
+        let (w, ids) = if scope.ready_queue {
+            (String::new(), None)
+        } else {
+            run_scope_clause("run_id", scope.runs.as_ref())
+        };
+        for row in conn
+            .query(
+                &format!("SELECT run_id, job_id, at_us FROM pool_pending{w}"),
+                &scope_params(&ids),
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let run_id = parse_run_id(&run_id_s);
+            let job_id_s: String = row.get(1);
+            let at_us: i64 = row.get(2);
+            tx.pool_pending
+                .insert((run_id, JobId(job_id_s)), us_to_system(at_us));
+        }
+    }
+    {
+        let (w, ids) = run_scope_clause("run_id", scope.runs.as_ref());
+        for row in conn
+            .query(
+                &format!(
+                    "SELECT run_id, job_id, agent_job_id FROM cancellation_queue{w} \
+                     ORDER BY seq"
+                ),
+                &scope_params(&ids),
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            let run_id_s: String = row.get(0);
+            let job_id_s: String = row.get(1);
+            let agent_job_id_s: String = row.get(2);
+            let run_id = parse_run_id(&run_id_s);
+            let job_id = JobId(job_id_s);
+            let agent_job_id = parse_uuid(&agent_job_id_s);
+            tx.cancellation_queue
+                .push_back(crate::models::QueuedCancellation {
+                    run_id,
+                    job_id: job_id.clone(),
+                    agent_job_id,
+                });
+            tx.loaded
+                .cancellations
+                .insert((run_id, job_id, agent_job_id));
+        }
+    }
+
+    // Counters — global singletons and per-workflow run-number counters.
+    // Always loaded: the allocators must never observe 0, tables are tiny.
     for row in conn
         .query("SELECT name, value FROM counters", &[])
         .await
@@ -743,9 +1375,22 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         match name.as_str() {
             "next_message_id" => tx.next_message_id = value,
             "next_runner_id" => tx.next_runner_id = value,
+            "next_request_id" => tx.next_request_id = value,
             _ => {}
         }
         tx.loaded.counters.insert(name, value);
+    }
+    // `next_request_id` must never re-issue an existing `job_requests`
+    // primary key — including ids written before the counter row existed or
+    // by a peer that has not yet committed its counter bump. Seed from the
+    // table max so the first in-transaction allocation is `max + 1`.
+    {
+        let max_request: i64 = conn
+            .query_one("SELECT COALESCE(MAX(request_id), 0) FROM job_requests", &[])
+            .await
+            .map_err(ControlError::backend)?
+            .get(0);
+        tx.next_request_id = tx.next_request_id.max(max_request);
     }
     for row in conn
         .query("SELECT key, value FROM workflow_run_counters", &[])
@@ -757,14 +1402,95 @@ async fn load_txstate(conn: &Tx<'_>) -> Result<TxState, ControlError> {
         tx.workflow_run_counters.insert(key, value as u64);
     }
 
-    Ok(tx)
+    Ok((tx, effective_scope))
+}
+
+/// Delete rows keyed by a loaded-set: `full` clears the table, a narrow scope
+/// deletes only the rows it loaded so out-of-scope rows survive commit.
+async fn delete_scoped<I, T, F>(
+    conn: &Tx<'_>,
+    table: &str,
+    col: &str,
+    keys: &BTreeSet<I>,
+    f: F,
+    full: bool,
+) -> Result<(), ControlError>
+where
+    T: tokio_postgres::types::ToSql + Sync + Send,
+    F: Fn(&I) -> T,
+{
+    if full {
+        conn.execute(&format!("DELETE FROM {table}"), &[])
+            .await
+            .map_err(ControlError::backend)?;
+        return Ok(());
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let vals: Vec<T> = keys.iter().map(f).collect();
+    conn.execute(
+        &format!("DELETE FROM {table} WHERE {col} = ANY($1)"),
+        &[&vals],
+    )
+    .await
+    .map_err(ControlError::backend)?;
+    Ok(())
+}
+
+/// Delete run-scoped rows: `runs == None` clears the table, `Some(runs)`
+/// deletes only those runs' rows.
+async fn delete_scoped_runs(
+    conn: &Tx<'_>,
+    table: &str,
+    scope: &TxScope,
+) -> Result<(), ControlError> {
+    match scope.runs.as_ref() {
+        None => {
+            conn.execute(&format!("DELETE FROM {table}"), &[])
+                .await
+                .map_err(ControlError::backend)?;
+        }
+        Some(runs) if !runs.is_empty() => {
+            let vals: Vec<String> = runs.iter().map(|id| id.0.to_string()).collect();
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE run_id = ANY($1)"),
+                &[&vals],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+/// Delete rows for the job-assignment families (`job_assignments`,
+/// `pool_pending`). Their load widens to every run when `ready_queue` is set,
+/// so the delete must match: full when `ready_queue || runs.is_none()`.
+async fn delete_scoped_queue(
+    conn: &Tx<'_>,
+    table: &str,
+    scope: &TxScope,
+) -> Result<(), ControlError> {
+    if scope.ready_queue || scope.runs.is_none() {
+        conn.execute(&format!("DELETE FROM {table}"), &[])
+            .await
+            .map_err(ControlError::backend)?;
+        return Ok(());
+    }
+    delete_scoped_runs(conn, table, scope).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Write-back: TxState delta → rows
 // ─────────────────────────────────────────────────────────────────────────
-
-async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> {
+async fn write_txstate(
+    conn: &Tx<'_>,
+    tx: &TxState,
+    scope: &TxScope,
+    cipher: &store::Envelope,
+) -> Result<(), ControlError> {
     let now_us = system_to_us(std::time::SystemTime::now());
 
     // Runs.
@@ -772,7 +1498,7 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         let mut record = run.clone();
         record.jobs.clear();
         let value = store::run_record_value(&record).map_err(ControlError::backend)?;
-        let record_blob = serde_json::to_vec(&value).map_err(ControlError::backend)?;
+        let record_blob = unblob(cipher, &value)?;
         conn.execute(
             "INSERT INTO runs (run_id, status, run_number, run_attempt, run_name, event, \
              workflow_path, conclusion, webhook_delivery_id, record_blob, created_at_us, \
@@ -810,31 +1536,78 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
 
     // Jobs.
     let mut seen_jobs: BTreeSet<(RunId, JobId)> = BTreeSet::new();
-    let mut seq = 0i64;
-    let mut ready_position = 0i64;
+    // Fresh position/seq allocators for genuinely new jobs (those not in
+    // `job_row_state`); existing jobs keep their loaded values via write_job.
+    let mut next_pos = tx.next_queue_position;
+    let mut next_seq = tx.next_seq;
 
+    // Resolves `queue_position`/`seq` from `fresh` (newly enqueued/requeued
+    // via `tx.queue`), the persisted kind in `tx.loaded.jobs` vs the written
+    // kind (a transition clears position + takes a fresh FIFO seq), and
+    // `job_row_state` (only a job staying in the SAME slot keeps its loaded
+    // values, so a no-op scoped write is byte-identical).
     async fn write_job(
         conn: &Tx<'_>,
         tx: &TxState,
-        seq: i64,
+        next_seq: &mut i64,
+        next_pos: &mut i64,
+        fresh: bool,
         run_id: RunId,
         job_id: &JobId,
         kind: QueueKind,
-        position: Option<i64>,
         job: Option<&QueuedJob>,
+        cipher: &store::Envelope,
     ) -> Result<(), ControlError> {
-        let status = tx
-            .runs
-            .get(&run_id)
-            .and_then(|r| r.jobs.get(job_id).copied())
-            .unwrap_or(ExecutionStatus::Queued);
+        let key = (run_id, job_id.clone());
+        let preserved = tx.job_row_state.get(&key);
+        let same_slot = !fresh && tx.loaded.jobs.get(&key) == Some(&kind);
+        let (position, seq) = if same_slot {
+            match preserved {
+                Some(p) => (p.queue_position, p.seq),
+                None => (None, 0),
+            }
+        } else {
+            let s = *next_seq;
+            *next_seq += 1;
+            let p = if kind == QueueKind::Ready {
+                let v = *next_pos;
+                *next_pos += 1;
+                Some(v)
+            } else {
+                None
+            };
+            (p, s)
+        };
+        // Status precedence: explicit `job_status` override wins; then a
+        // widened job restores its persisted status verbatim (no coercion, so
+        // an untouched foreign `pending` row survives); finally an owned job
+        // reads `run.jobs` (canonical).
+        let widened = !tx.runs.contains_key(&run_id);
+        let status = if let Some(s) = tx.job_status.get(&key).copied() {
+            s
+        } else if widened {
+            preserved
+                .map(|p| p.status)
+                .unwrap_or(ExecutionStatus::Queued)
+        } else {
+            tx.runs
+                .get(&run_id)
+                .and_then(|r| r.jobs.get(job_id).copied())
+                .unwrap_or(ExecutionStatus::Queued)
+        };
         let (base_id, runs_on, runner_group, enqueued_us, payload) = match job {
             Some(j) => (
                 j.base_id.clone(),
                 serde_json::to_string(&j.runs_on).unwrap_or_default(),
                 j.runner_group.clone(),
                 Some(j.enqueued_at_unix_nanos / 1000),
-                Some(unblob(j)?),
+                // Unchanged slot → unchanged payload; `None` keeps the stored
+                // blob instead of re-sealing a fresh random IV every tx.
+                if same_slot {
+                    None
+                } else {
+                    Some(unblob(cipher, j)?)
+                },
             ),
             None => (String::new(), "[]".to_owned(), None, None, None),
         };
@@ -855,10 +1628,11 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
              ON CONFLICT(run_id,job_id) DO UPDATE SET status=excluded.status, \
              queue_kind=excluded.queue_kind, queue_position=excluded.queue_position, \
-             seq=excluded.seq, reaper_first_seen_us=excluded.reaper_first_seen_us, \
+             seq=excluded.seq, enqueued_at_us=excluded.enqueued_at_us, \
+             reaper_first_seen_us=excluded.reaper_first_seen_us, \
              claimed_by=excluded.claimed_by, claimed_at_us=excluded.claimed_at_us, \
              expand_generation=excluded.expand_generation, \
-             payload_blob=excluded.payload_blob",
+             payload_blob=COALESCE(excluded.payload_blob, jobs.payload_blob)",
             &[
                 &run_id.0.to_string(),
                 &job_id.0,
@@ -882,63 +1656,84 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         Ok(())
     }
 
-    for job in tx.ready_index.iter().chain(tx.queue.iter()) {
-        seq += 1;
-        ready_position += 1;
+    // `ready_index` = persisted ready jobs (same slot → keep pos/seq);
+    // `tx.queue` = newly enqueued + requeued (push_ready) → always fresh.
+    for job in &tx.ready_index {
         write_job(
             conn,
             tx,
-            seq,
+            &mut next_seq,
+            &mut next_pos,
+            false,
             job.run_id,
             &job.job_id,
             QueueKind::Ready,
-            Some(ready_position),
             Some(job),
+            cipher,
+        )
+        .await?;
+        seen_jobs.insert((job.run_id, job.job_id.clone()));
+    }
+    for job in &tx.queue {
+        write_job(
+            conn,
+            tx,
+            &mut next_seq,
+            &mut next_pos,
+            true,
+            job.run_id,
+            &job.job_id,
+            QueueKind::Ready,
+            Some(job),
+            cipher,
         )
         .await?;
         seen_jobs.insert((job.run_id, job.job_id.clone()));
     }
     for job in &tx.pending_jobs {
-        seq += 1;
         write_job(
             conn,
             tx,
-            seq,
+            &mut next_seq,
+            &mut next_pos,
+            false,
             job.run_id,
             &job.job_id,
             QueueKind::Pending,
-            None,
             Some(job),
+            cipher,
         )
         .await?;
         seen_jobs.insert((job.run_id, job.job_id.clone()));
     }
     for job in &tx.concurrency_blocked {
-        seq += 1;
         write_job(
             conn,
             tx,
-            seq,
+            &mut next_seq,
+            &mut next_pos,
+            false,
             job.run_id,
             &job.job_id,
             QueueKind::Blocked,
-            None,
             Some(job),
+            cipher,
         )
         .await?;
         seen_jobs.insert((job.run_id, job.job_id.clone()));
     }
     for job in &tx.pending_expansions {
-        seq += 1;
         write_job(
             conn,
             tx,
-            seq,
+            &mut next_seq,
+            &mut next_pos,
+            false,
             job.run_id,
             &job.job_id,
             QueueKind::Expand,
-            None,
             Some(job),
+            cipher,
         )
         .await?;
         seen_jobs.insert((job.run_id, job.job_id.clone()));
@@ -947,47 +1742,50 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         if seen_jobs.contains(&(*run_id, job_id.clone())) {
             continue;
         }
-        seq += 1;
         write_job(
             conn,
             tx,
-            seq,
+            &mut next_seq,
+            &mut next_pos,
+            false,
             *run_id,
             job_id,
             QueueKind::Expand,
-            None,
             tx.expanding_jobs.get(&(*run_id, job_id.clone())),
+            cipher,
         )
         .await?;
         seen_jobs.insert((*run_id, job_id.clone()));
     }
     for ((run_id, job_id), job) in &tx.claimed_jobs {
-        seq += 1;
         write_job(
             conn,
             tx,
-            seq,
+            &mut next_seq,
+            &mut next_pos,
+            false,
             *run_id,
             job_id,
             QueueKind::Claimed,
-            None,
             Some(job),
+            cipher,
         )
         .await?;
         seen_jobs.insert((*run_id, job_id.clone()));
     }
     for (run_id, jobs) in &tx.held_runs {
         for job in jobs {
-            seq += 1;
             write_job(
                 conn,
                 tx,
-                seq,
+                &mut next_seq,
+                &mut next_pos,
+                false,
                 *run_id,
                 &job.job_id,
                 QueueKind::Held,
-                None,
                 Some(job),
+                cipher,
             )
             .await?;
             seen_jobs.insert((*run_id, job.job_id.clone()));
@@ -996,8 +1794,19 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
     for (run_id, run) in &tx.runs {
         for job_id in run.jobs.keys() {
             if !seen_jobs.contains(&(*run_id, job_id.clone())) {
-                seq += 1;
-                write_job(conn, tx, seq, *run_id, job_id, QueueKind::None, None, None).await?;
+                write_job(
+                    conn,
+                    tx,
+                    &mut next_seq,
+                    &mut next_pos,
+                    false,
+                    *run_id,
+                    job_id,
+                    QueueKind::None,
+                    None,
+                    cipher,
+                )
+                .await?;
                 seen_jobs.insert((*run_id, job_id.clone()));
             }
         }
@@ -1015,7 +1824,11 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
 
     // Requests.
     for (request_id, r) in &tx.job_requests {
-        let request_blob = tx.broker_messages.get(request_id).map(unblob).transpose()?;
+        let request_blob = tx
+            .broker_messages
+            .get(request_id)
+            .map(|m| unblob(cipher, m))
+            .transpose()?;
         conn.execute(
             "INSERT INTO job_requests (request_id, run_id, job_id, agent_job_id, plan_id, \
              plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id, \
@@ -1061,20 +1874,26 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
             .map_err(ControlError::backend)?;
         }
     }
-    conn.execute("DELETE FROM github_token_requests", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    // Token requests — request-scoped: only requests this scope loaded.
+    delete_scoped(
+        conn,
+        "github_token_requests",
+        "request_id",
+        &tx.loaded.requests,
+        |id| *id,
+        scope.runs.is_none(),
+    )
+    .await?;
     for (request_id, req) in &tx.github_token_requests {
         conn.execute(
             "INSERT INTO github_token_requests (request_id, request_blob) VALUES ($1,$2)",
-            &[request_id, &unblob(req)?],
+            &[request_id, &unblob(cipher, req)?],
         )
         .await
         .map_err(ControlError::backend)?;
     }
-    conn.execute("DELETE FROM id_token_grants", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    // Grants + OIDC — run-scoped.
+    delete_scoped_runs(conn, "id_token_grants", scope).await?;
     for ((run_id, job_id), granted) in &tx.id_token_grants {
         conn.execute(
             "INSERT INTO id_token_grants (run_id, job_id, granted) VALUES ($1,$2,$3)",
@@ -1083,13 +1902,11 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         .await
         .map_err(ControlError::backend)?;
     }
-    conn.execute("DELETE FROM oidc_job_contexts", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    delete_scoped_runs(conn, "oidc_job_contexts", scope).await?;
     for ((run_id, job_id), ctx) in &tx.oidc_job_contexts {
         conn.execute(
             "INSERT INTO oidc_job_contexts (run_id, job_id, context_blob) VALUES ($1,$2,$3)",
-            &[&run_id.0.to_string(), &job_id.0, &unblob(ctx)?],
+            &[&run_id.0.to_string(), &job_id.0, &unblob(cipher, ctx)?],
         )
         .await
         .map_err(ControlError::backend)?;
@@ -1106,7 +1923,7 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
              revision=excluded.revision",
             &[
                 &agent_job_id.to_string(),
-                &unblob(steps)?,
+                &unblob(cipher, steps)?,
                 &(revision as i64),
             ],
         )
@@ -1172,27 +1989,43 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         }
     }
 
-    // Sessions.
-    conn.execute("DELETE FROM runner_sessions", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    // Sessions: rebuild from the unified maps, scoped to loaded sessions.
+    delete_scoped(
+        conn,
+        "runner_sessions",
+        "session_id",
+        &tx.loaded.sessions,
+        |s| s.clone(),
+        scope.sessions.is_none(),
+    )
+    .await?;
     async fn write_session(
         conn: &Tx<'_>,
         session_id: &str,
-        runner_id: i64,
+        runner_id: Option<i64>,
         protocol: SessionProtocol,
         tx: &TxState,
         now_us: i64,
+        cipher: &store::Envelope,
     ) -> Result<(), ControlError> {
-        let encryption = tx.session_keys.get(session_id).map(|e| e.key.clone());
+        // Seal the session AES key (see the SQLite backend's write_session).
+        let encryption = tx
+            .session_keys
+            .get(session_id)
+            .map(|e| cipher.seal(&e.key))
+            .transpose()
+            .map_err(ControlError::backend)?;
         let active_request_id = tx.session_active_requests.get(session_id).copied();
         let last_seen_us = tx
             .session_last_seen
             .get(session_id)
             .map(|t| system_to_us(*t));
+        let created_us = now_us;
+        let verified = tx.verified_sessions.contains(session_id) as i64;
         conn.execute(
             "INSERT INTO runner_sessions (session_id, runner_id, protocol, encryption_blob, \
-             active_request_id, last_seen_at_us, created_at_us) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+             active_request_id, last_seen_at_us, verified, created_at_us) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             &[
                 &session_id,
                 &runner_id,
@@ -1200,7 +2033,8 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
                 &encryption,
                 &active_request_id,
                 &last_seen_us,
-                &now_us,
+                &verified,
+                &created_us,
             ],
         )
         .await
@@ -1211,10 +2045,11 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         write_session(
             conn,
             session_id,
-            *runner_id,
+            Some(*runner_id),
             SessionProtocol::Broker,
             tx,
             now_us,
+            cipher,
         )
         .await?;
     }
@@ -1222,111 +2057,147 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         write_session(
             conn,
             session_id,
-            session.runner_id,
+            Some(session.runner_id),
             SessionProtocol::Azdo,
             tx,
             now_us,
+            cipher,
+        )
+        .await?;
+    }
+    // Compatibility sessions (e.g. the implicit `default` session) own no
+    // registered runner, so they are absent from `broker_session_runners` and
+    // `sessions`. They still need a `runner_sessions` row — with NULL
+    // `runner_id` — so that `broker_messages` and `active_request_id` foreign
+    // keys resolve and the active-request mapping survives the commit.
+    let compat_session_ids: std::collections::BTreeSet<&String> = tx
+        .session_active_requests
+        .keys()
+        .chain(tx.session_last_seen.keys())
+        .chain(tx.inflight_messages.keys())
+        .chain(tx.session_keys.keys())
+        .filter(|sid| {
+            !tx.broker_session_runners.contains_key(*sid) && !tx.sessions.contains_key(*sid)
+        })
+        .collect();
+    for session_id in compat_session_ids {
+        write_session(
+            conn,
+            session_id,
+            None,
+            SessionProtocol::Compat,
+            tx,
+            now_us,
+            cipher,
         )
         .await?;
     }
 
-    // Inflight messages.
-    conn.execute("DELETE FROM broker_messages", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    // Inflight messages — session-scoped.
+    delete_scoped(
+        conn,
+        "broker_messages",
+        "session_id",
+        &tx.loaded.sessions,
+        |s| s.clone(),
+        scope.sessions.is_none(),
+    )
+    .await?;
     for (session_id, messages) in &tx.inflight_messages {
         for (message_id, msg) in messages {
             conn.execute(
                 "INSERT INTO broker_messages (session_id, message_id, message_blob, \
                  created_at_us) VALUES ($1,$2,$3,$4)",
-                &[session_id, message_id, &unblob(msg)?, &now_us],
+                &[session_id, message_id, &unblob(cipher, msg)?, &now_us],
             )
             .await
             .map_err(ControlError::backend)?;
         }
     }
 
-    // Concurrency.
-    conn.execute("DELETE FROM concurrency_groups", &[])
-        .await
-        .map_err(ControlError::backend)?;
-    for ((repo, group_name), group) in &tx.concurrency_groups {
-        conn.execute(
-            "INSERT INTO concurrency_groups (repo, group_name, display_name, running_holder, \
-             pending_holders) VALUES ($1,$2,$3,$4,$5)",
-            &[
-                repo,
-                group_name,
-                &group.display_name,
-                &group.running.as_ref().map(unblob).transpose()?,
-                &unblob(&group.pending)?,
-            ],
-        )
-        .await
-        .map_err(ControlError::backend)?;
-    }
-    conn.execute("DELETE FROM holder_keys", &[])
-        .await
-        .map_err(ControlError::backend)?;
-    for (run_id, keys) in &tx.holder_keys {
-        for (repo, group_name) in keys {
+    // Concurrency — always-global, written only when the scope loaded it.
+    if scope.concurrency {
+        conn.execute("DELETE FROM concurrency_groups", &[])
+            .await
+            .map_err(ControlError::backend)?;
+        for ((repo, group_name), group) in &tx.concurrency_groups {
             conn.execute(
-                "INSERT INTO holder_keys (run_id, repo, group_name) VALUES ($1,$2,$3)",
-                &[&run_id.0.to_string(), repo, group_name],
+                "INSERT INTO concurrency_groups (repo, group_name, display_name, running_holder, \
+             pending_holders) VALUES ($1,$2,$3,$4,$5)",
+                &[
+                    repo,
+                    group_name,
+                    &group.display_name,
+                    &group
+                        .running
+                        .as_ref()
+                        .map(|h| unblob(cipher, h))
+                        .transpose()?,
+                    &unblob(cipher, &group.pending)?,
+                ],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        conn.execute("DELETE FROM holder_keys", &[])
+            .await
+            .map_err(ControlError::backend)?;
+        for (run_id, keys) in &tx.holder_keys {
+            for (repo, group_name) in keys {
+                conn.execute(
+                    "INSERT INTO holder_keys (run_id, repo, group_name) VALUES ($1,$2,$3)",
+                    &[&run_id.0.to_string(), repo, group_name],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            }
+        }
+        conn.execute("DELETE FROM jobset_admissions", &[])
+            .await
+            .map_err(ControlError::backend)?;
+        for (id, admission) in &tx.jobset_admissions {
+            let job_ids: Vec<String> = id.job_ids.iter().map(|j| j.0.clone()).collect();
+            conn.execute(
+                "INSERT INTO jobset_admissions (run_id, job_ids, gates_blob, acquired_keys) \
+             VALUES ($1,$2,$3,$4)",
+                &[
+                    &id.run_id.0.to_string(),
+                    &serde_json::to_string(&job_ids).unwrap_or_default(),
+                    &unblob(cipher, &admission.gates)?,
+                    &unblob(cipher, &admission.acquired_keys)?,
+                ],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        conn.execute("DELETE FROM jobset_ready", &[])
+            .await
+            .map_err(ControlError::backend)?;
+        for id in &tx.jobset_ready {
+            let job_ids: Vec<String> = id.job_ids.iter().map(|j| j.0.clone()).collect();
+            conn.execute(
+                "INSERT INTO jobset_ready (run_id, job_ids) VALUES ($1,$2)",
+                &[
+                    &id.run_id.0.to_string(),
+                    &serde_json::to_string(&job_ids).unwrap_or_default(),
+                ],
             )
             .await
             .map_err(ControlError::backend)?;
         }
     }
-    conn.execute("DELETE FROM jobset_admissions", &[])
-        .await
-        .map_err(ControlError::backend)?;
-    for (id, admission) in &tx.jobset_admissions {
-        let job_ids: Vec<String> = id.job_ids.iter().map(|j| j.0.clone()).collect();
-        conn.execute(
-            "INSERT INTO jobset_admissions (run_id, job_ids, gates_blob, acquired_keys) \
-             VALUES ($1,$2,$3,$4)",
-            &[
-                &id.run_id.0.to_string(),
-                &serde_json::to_string(&job_ids).unwrap_or_default(),
-                &unblob(&admission.gates)?,
-                &unblob(&admission.acquired_keys)?,
-            ],
-        )
-        .await
-        .map_err(ControlError::backend)?;
-    }
-    conn.execute("DELETE FROM jobset_ready", &[])
-        .await
-        .map_err(ControlError::backend)?;
-    for id in &tx.jobset_ready {
-        let job_ids: Vec<String> = id.job_ids.iter().map(|j| j.0.clone()).collect();
-        conn.execute(
-            "INSERT INTO jobset_ready (run_id, job_ids) VALUES ($1,$2)",
-            &[
-                &id.run_id.0.to_string(),
-                &serde_json::to_string(&job_ids).unwrap_or_default(),
-            ],
-        )
-        .await
-        .map_err(ControlError::backend)?;
-    }
-    conn.execute("DELETE FROM run_concurrency", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    delete_scoped_runs(conn, "run_concurrency", scope).await?;
     for (run_id, c) in &tx.run_concurrency {
         conn.execute(
             "INSERT INTO run_concurrency (run_id, concurrency_blob) VALUES ($1,$2)",
-            &[&run_id.0.to_string(), &unblob(c)?],
+            &[&run_id.0.to_string(), &unblob(cipher, c)?],
         )
         .await
         .map_err(ControlError::backend)?;
     }
 
-    // Assignments, pool pending, cancellations.
-    conn.execute("DELETE FROM job_assignments", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    // Assignments, pool pending, cancellations — run-scoped.
+    delete_scoped_queue(conn, "job_assignments", scope).await?;
     for ((run_id, job_id), record) in &tx.job_assignments {
         conn.execute(
             "INSERT INTO job_assignments (run_id, job_id, runner_id, at_us, first_at_us) \
@@ -1342,9 +2213,7 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         .await
         .map_err(ControlError::backend)?;
     }
-    conn.execute("DELETE FROM pool_pending", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    delete_scoped_queue(conn, "pool_pending", scope).await?;
     for ((run_id, job_id), at) in &tx.pool_pending {
         conn.execute(
             "INSERT INTO pool_pending (run_id, job_id, at_us) VALUES ($1,$2,$3)",
@@ -1353,9 +2222,7 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         .await
         .map_err(ControlError::backend)?;
     }
-    conn.execute("DELETE FROM cancellation_queue", &[])
-        .await
-        .map_err(ControlError::backend)?;
+    delete_scoped_runs(conn, "cancellation_queue", scope).await?;
     for c in &tx.cancellation_queue {
         conn.execute(
             "INSERT INTO cancellation_queue (run_id, job_id, agent_job_id) VALUES ($1,$2,$3)",
@@ -1369,10 +2236,11 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         .map_err(ControlError::backend)?;
     }
 
-    // Counters.
+    // Counters — always loaded, so always written.
     for (name, value) in [
         ("next_message_id", tx.next_message_id),
         ("next_runner_id", tx.next_runner_id),
+        ("next_request_id", tx.next_request_id),
     ] {
         conn.execute(
             "INSERT INTO counters (name, value) VALUES ($1,$2) \
@@ -1391,7 +2259,6 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
         .await
         .map_err(ControlError::backend)?;
     }
-
     Ok(())
 }
 
@@ -1402,17 +2269,113 @@ async fn write_txstate(conn: &Tx<'_>, tx: &TxState) -> Result<(), ControlError> 
 #[async_trait::async_trait]
 impl ControlBackend for PostgresBackend {
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError> {
-        self.transact(|tx| commands::submit_run_tx(tx, submit))
+        // Resolve the replay target before the transaction so the working
+        // set stays narrow: `submit_run_tx` dedups by scanning `tx.runs`,
+        // which only sees scoped runs — the existing run must be named in
+        // the scope or the check misses it and inserts a duplicate.
+        let mut run_ids = BTreeSet::from([submit.record.run_id]);
+        if let (Some(delivery_id), workflow_path) = (
+            submit.record.webhook_delivery_id.as_deref(),
+            submit.record.workflow_path_str.as_str(),
+        ) {
+            if let Some(existing) = self
+                .find_run_by_delivery(delivery_id, workflow_path)
+                .await?
+            {
+                run_ids.insert(existing.run_id);
+            }
+        }
+        // `sessions: None` — `on_job_enqueued` finds idle-runner candidates
+        // through `broker_session_runners`/`sessions`/`session_active_requests`,
+        // all session-scoped. `concurrency: true` widens `runs` with every
+        // holder's run (a `cancel_in_progress` submit cancels the running
+        // holder). `runs_referenced` is off: submit never promotes queued
+        // jobs, so ready/blocked runs stay foreign.
+        let scope = TxScope {
+            runs: Some(run_ids),
+            ready_queue: false,
+            blocked_jobs: false,
+            sessions: None,
+            concurrency: true,
+            runs_referenced: false,
+            job_requests_all: false,
+            pending_expansions: false,
+            runs_via_requests: false,
+        };
+        self.transact_scoped(&scope, |tx| commands::submit_run_tx(tx, submit))
             .await
     }
 
+    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
+        let workflow_path = workflow_path.to_owned();
+        // Only `workflow_run_counters` is touched — a full load would parse
+        // every `record_blob`/`payload_blob` per submission for one counter.
+        let scope = TxScope {
+            runs: Some(BTreeSet::new()),
+            ready_queue: false,
+            blocked_jobs: false,
+            sessions: Some(BTreeSet::new()),
+            concurrency: false,
+            runs_referenced: false,
+            job_requests_all: false,
+            pending_expansions: false,
+            runs_via_requests: false,
+        };
+        self.transact_scoped(&scope, move |tx| {
+            let counter = tx.workflow_run_counters.entry(workflow_path).or_insert(0);
+            *counter += 1;
+            Ok(*counter)
+        })
+        .await
+    }
+
     async fn poll_session(&self, poll: PollRequest) -> Result<PollOutcome, ControlError> {
-        self.transact(|tx| commands::poll_session_tx(tx, poll))
+        // `runs: Some(empty)` + `runs_referenced` — the claimed job's run is
+        // chosen inside the transaction (`choose_claim_position`), and the
+        // session's active request's run is needed for the cancellation
+        // check; neither is knowable beforehand, so the referenced set
+        // (ready/blocked jobs' runs + this session's request runs +
+        // concurrency holders) is widened in at load. `sessions: {session_id}`
+        // narrows the session families to this poller.
+        let scope = TxScope {
+            runs: Some(BTreeSet::new()),
+            ready_queue: true,
+            // `poll` claims ready work only — no blocked-job promotion, no
+            // concurrency-gate mutation. Loading those families is O(#blocked
+            // + #gates) `payload_blob`s for no benefit.
+            blocked_jobs: false,
+            sessions: Some(BTreeSet::from([poll.session_id.clone()])),
+            concurrency: false,
+            runs_referenced: true,
+            pending_expansions: false,
+            runs_via_requests: false,
+            job_requests_all: false,
+        };
+        self.transact_scoped(&scope, |tx| commands::poll_session_tx(tx, poll))
             .await
     }
 
     async fn acquire_context(&self, request_id: i64) -> Result<AcquireContext, ControlError> {
-        self.transact(|tx| {
+        // Read-only — the reader pool serves it concurrently with the
+        // writer instead of serializing on the advisory write lock. Scoped
+        // to the request's run + owner session so it never loads the whole
+        // working set.
+        let (run_id, session_id) = self
+            .find_request_context(request_id)
+            .await?
+            .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
+        let scope = TxScope {
+            runs: Some(BTreeSet::from([run_id])),
+            ready_queue: false,
+            blocked_jobs: false,
+            sessions: Some(session_id.into_iter().collect()),
+            pending_expansions: false,
+            runs_via_requests: false,
+            concurrency: false,
+            job_requests_all: false,
+            runs_referenced: false,
+        };
+        self.read_scoped(&scope, |tx| {
             let record = tx
                 .job_requests
                 .get(&request_id)
@@ -1447,7 +2410,31 @@ impl ControlBackend for PostgresBackend {
         &self,
         completion: JobCompletionInput,
     ) -> Result<CompleteOutcome, ControlError> {
-        self.transact(|tx| commands::complete_job_tx(tx, completion))
+        // `runs: {run_id}` + `runs_referenced` — the completion mutates its
+        // own run plus the queued jobs' runs it promotes (`promote_ready_jobs`
+        // summarizes them). `concurrency: true` widens `runs` with every
+        // holder's run (a released gate can cancel or promote a different
+        // run). `sessions: {owner}` — `settle_request` drops the moot
+        // cancellation from the owner session's inflight messages; the owner
+        // is resolved before the transaction.
+        let sessions = match completion.agent_job_id {
+            Some(id) => self.find_session_by_agent_job_id(id).await?,
+            None => None,
+        }
+        .into_iter()
+        .collect();
+        let scope = TxScope {
+            runs: Some(BTreeSet::from([completion.run_id])),
+            ready_queue: true,
+            pending_expansions: false,
+            runs_via_requests: false,
+            blocked_jobs: true,
+            sessions: Some(sessions),
+            job_requests_all: false,
+            concurrency: true,
+            runs_referenced: true,
+        };
+        self.transact_scoped(&scope, |tx| commands::complete_job_tx(tx, completion))
             .await
     }
 
@@ -1456,7 +2443,26 @@ impl ControlBackend for PostgresBackend {
         run_id: RunId,
         reason: Option<String>,
     ) -> Result<CancelOutcome, ControlError> {
-        self.transact(|tx| {
+        // `cancel_run_inner` touches the cancelled run plus the global
+        // queues/concurrency it releases; `concurrency: true` widens `runs`
+        // with every holder's run (a released gate promotes a different
+        // run), and `runs_referenced` adds the queued jobs' runs it
+        // promotes. `sessions: {owners}` — `settle_request` drops the moot
+        // cancellation from each owner session's inflight messages; owners
+        // are resolved before the transaction.
+        let sessions = self.find_sessions_by_run(run_id).await?;
+        let scope = TxScope {
+            pending_expansions: false,
+            runs_via_requests: false,
+            runs: Some(BTreeSet::from([run_id])),
+            ready_queue: true,
+            blocked_jobs: true,
+            job_requests_all: false,
+            sessions: Some(sessions),
+            concurrency: true,
+            runs_referenced: true,
+        };
+        self.transact_scoped(&scope, |tx| {
             let cancellations = sched::cancel_run_inner(tx, run_id, reason.as_deref());
             let run_status = tx.runs.get(&run_id).map(|r| r.status);
             Ok(CancelOutcome {
@@ -1476,7 +2482,19 @@ impl ControlBackend for PostgresBackend {
         job_id: &JobId,
     ) -> Result<CancelOutcome, ControlError> {
         let job_id = job_id.clone();
-        self.transact(|tx| {
+        let sessions = self.find_sessions_by_run(run_id).await?;
+        let scope = TxScope {
+            runs: Some(BTreeSet::from([run_id])),
+            ready_queue: true,
+            blocked_jobs: true,
+            sessions: Some(sessions),
+            concurrency: true,
+            runs_referenced: true,
+            job_requests_all: false,
+            pending_expansions: false,
+            runs_via_requests: false,
+        };
+        self.transact_scoped(&scope, |tx| {
             let cancellations = sched::cancel_job_inner(tx, run_id, &job_id);
             let run_status = tx.runs.get(&run_id).map(|r| r.status);
             Ok(CancelOutcome {
@@ -1548,7 +2566,21 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn claim_expansion(&self) -> Result<Option<ExpansionClaim>, ControlError> {
-        self.transact(|tx| {
+        // `runs: Some(empty)` + `pending_expansions` loads only the deferred
+        // nodes; `runs_referenced` widens `runs` to their runs so
+        // `plan_expansion` sees the claimed node's `RunRecord`.
+        let scope = TxScope {
+            runs: Some(BTreeSet::new()),
+            ready_queue: false,
+            blocked_jobs: false,
+            sessions: Some(BTreeSet::new()),
+            concurrency: true,
+            runs_referenced: true,
+            job_requests_all: false,
+            pending_expansions: true,
+            runs_via_requests: false,
+        };
+        self.transact_scoped(&scope, |tx| {
             let Some(job) = tx.pending_expansions.pop_front() else {
                 return Ok(None);
             };
@@ -1577,7 +2609,20 @@ impl ControlBackend for PostgresBackend {
         &self,
         claim: ExpansionApply,
     ) -> Result<crate::runtime_scheduling::SchedulingOutcome, ControlError> {
-        self.transact(|tx| {
+        // Scoped to the expanded node's run — `sched::apply_expansion`
+        // registers the built legs into that same run.
+        let scope = TxScope {
+            runs: Some(BTreeSet::from([claim.job.run_id])),
+            ready_queue: false,
+            blocked_jobs: false,
+            sessions: Some(BTreeSet::new()),
+            concurrency: true,
+            runs_referenced: false,
+            job_requests_all: false,
+            pending_expansions: false,
+            runs_via_requests: false,
+        };
+        self.transact_scoped(&scope, |tx| {
             let mut outcome = crate::runtime_scheduling::SchedulingOutcome::default();
             let current = tx
                 .expand_generations
@@ -1595,20 +2640,6 @@ impl ControlBackend for PostgresBackend {
             let promoted = sched::promote_ready_jobs(tx);
             outcome.merge(promoted);
             Ok(outcome)
-        })
-        .await
-    }
-
-    async fn sweep_expired(
-        &self,
-        now: std::time::SystemTime,
-    ) -> Result<SweepOutcome, ControlError> {
-        self.transact(|tx| {
-            let bindings = sched::sweep_stale_bindings(tx, now);
-            Ok(SweepOutcome {
-                bindings_swept: bindings,
-                ..Default::default()
-            })
         })
         .await
     }
@@ -1643,9 +2674,7 @@ impl ControlBackend for PostgresBackend {
                 .cloned()
                 .collect();
             for key in orphaned {
-                if let Some(job) = tx.claimed_jobs.remove(&key) {
-                    sched::clear_assignment(tx, key.0, &key.1);
-                    tx.push_ready(job);
+                if sched::requeue_claimed(tx, key.0, &key.1) {
                     outcome.recovered += 1;
                 } else {
                     outcome.failed += 1;
@@ -1705,9 +2734,12 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
+        // NOTE: must stay on `TxScope::full()` (via `read`) — `ready` is the
+        // global `ready_count` counter while the other five counts are
+        // loaded-subset lengths; a narrower scope would mix the two.
         self.read(|tx| {
             Ok(QueueStats {
-                ready: tx.ready_index.len() + tx.queue.len(),
+                ready: tx.ready_count.max(0) as usize,
                 pending: tx.pending_jobs.len(),
                 blocked: tx.concurrency_blocked.len(),
                 held: tx.held_runs.values().map(|v| v.len()).sum(),
