@@ -71,6 +71,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 sha1 = "0.10"
 hmac = "0.12"
 tempfile = "3.10"
+libc = "0.2"
 hex = "0.4"
 parking_lot = "0.12"
 thiserror = "1.0"

@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 /// Server configuration.
 #[derive(Clone)]
@@ -1590,6 +1591,11 @@ fn is_routine_unix_disconnect(error: &(dyn std::error::Error + 'static)) -> bool
 
 /// Start the server and block until shutdown.
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
+    // Mutual exclusion: a second `preloop serve` on the same state dir must
+    // fail fast, not overwrite the unix socket + PID file and orphan the
+    // path the guest bridges mount. The lock file is held for the process
+    // lifetime; the OS releases it on exit, so a crash leaves no stale lock.
+    let _serve_lock = acquire_serve_lock(&config.state_dir)?;
     let mut state = AppState::new_with_store(
         config.state_dir.clone(),
         crate::config::config_path(),
@@ -2048,6 +2054,45 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Exclusive `flock` on `<state_dir>/serve.lock` for the process lifetime.
+///
+/// A second `preloop serve` on the same state dir would overwrite the unix
+/// socket and PID file, then die — leaving the socket path pointing at a
+/// dead inode while the first engine keeps running on the old one. Guests
+/// mount the socket by path, so every bridge connection hits the dead
+/// socket and the runner goes deaf. The lock makes the second instance
+/// fail fast instead.
+///
+/// Returns the open file so the caller holds the lock; the OS releases it
+/// on process exit, so a crash leaves no stale lock behind.
+#[cfg(unix)]
+fn acquire_serve_lock(state_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = state_dir.join("serve.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .context(format!("opening serve lock {}", lock_path.display()))?;
+    // try_lock: fail fast rather than queue behind a live engine — a queued
+    // second serve would still overwrite the socket the moment the first
+    // exits, which is exactly the race this prevents.
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!(
+                "another preloop serve already holds {} — \
+                 refusing to start a second engine on the same state dir",
+                lock_path.display()
+            );
+        }
+        Err(error @ std::fs::TryLockError::Error(_)) => return Err(error.into()),
+    }
+    Ok(file)
 }
 
 async fn shutdown_signal(shutdown: CancellationToken) {
