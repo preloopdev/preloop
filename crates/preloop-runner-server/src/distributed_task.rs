@@ -18,53 +18,183 @@ pub async fn next_message(
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
 
-    loop {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(runner_id) = verified
-            && inner.runner_id_for_session(&session_id) != Some(runner_id)
-        {
-            return (StatusCode::FORBIDDEN, Json(None));
-        }
-        inner.mark_session_seen(&session_id);
-        if let Some(message) = inner
-            .inflight_messages
-            .get(&session_id)
-            .and_then(|messages| messages.values().next().cloned())
-        {
-            return (StatusCode::ACCEPTED, Json(Some(message)));
-        }
+    enum NextPoll {
+        Forbidden,
+        Deliver(azdo::TaskAgentMessage, StatusCode),
+        /// A terminal empty response (e.g. message build failed).
+        Empty(StatusCode),
+        Wait,
+        /// Claimed a job: message built, run marked InProgress, emit events.
+        Claimed {
+            message: azdo::TaskAgentMessage,
+            run_id: RunId,
+            job_id: JobId,
+        },
+    }
 
-        if let Some(request_id) = inner.session_active_requests.get(&session_id).copied() {
-            let request_finished = inner
-                .job_requests
-                .get(&request_id)
-                .is_none_or(|request| request.result.is_some());
-            if request_finished {
-                inner.session_active_requests.remove(&session_id);
-            } else {
-                let cancellation_pos = inner.job_requests.get(&request_id).and_then(|request| {
-                    inner.cancellation_queue.iter().position(|cancellation| {
-                        cancellation.run_id == request.run_id
-                            && cancellation.job_id == request.job_id
-                    })
-                });
-                if let Some(pos) = cancellation_pos {
-                    let cancellation = inner
-                        .cancellation_queue
-                        .remove(pos)
-                        .expect("cancellation position was found in the queue");
-                    let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
-                    match build_task_agent_message(
-                        &mut inner,
-                        &session_id,
-                        azdo::message_type::JOB_CANCELLED,
-                        body_json,
-                    ) {
-                        Ok(message) => return (StatusCode::OK, Json(Some(message))),
-                        Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+    loop {
+        let sid = session_id.clone();
+        let ident = identity.clone();
+        let shared_for_mint = shared.clone();
+        let step = shared
+            .state
+            .backend
+            .transact(move |tx| {
+                if let Some(runner_id) = verified {
+                    if tx.runner_id_for_session(&sid) != Some(runner_id) {
+                        return Ok(NextPoll::Forbidden);
                     }
                 }
-                drop(inner);
+                tx.mark_session_seen(&sid);
+                if let Some(message) = tx
+                    .inflight_messages
+                    .get(&sid)
+                    .and_then(|messages| messages.values().next().cloned())
+                {
+                    return Ok(NextPoll::Deliver(message, StatusCode::ACCEPTED));
+                }
+
+                if let Some(request_id) = tx.session_active_requests.get(&sid).copied() {
+                    let request_finished = tx
+                        .job_requests
+                        .get(&request_id)
+                        .is_none_or(|request| request.result.is_some());
+                    if request_finished {
+                        tx.session_active_requests.remove(&sid);
+                    } else {
+                        let cancellation_pos =
+                            tx.job_requests.get(&request_id).and_then(|request| {
+                                tx.cancellation_queue.iter().position(|cancellation| {
+                                    cancellation.run_id == request.run_id
+                                        && cancellation.job_id == request.job_id
+                                })
+                            });
+                        if let Some(pos) = cancellation_pos {
+                            let cancellation = tx
+                                .cancellation_queue
+                                .remove(pos)
+                                .expect("cancellation position was found in the queue");
+                            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
+                            return Ok(
+                                match build_task_agent_message(
+                                    tx,
+                                    &sid,
+                                    azdo::message_type::JOB_CANCELLED,
+                                    body_json,
+                                ) {
+                                    Ok(message) => NextPoll::Deliver(message, StatusCode::OK),
+                                    Err(_) => NextPoll::Empty(StatusCode::ACCEPTED),
+                                },
+                            );
+                        }
+                        return Ok(NextPoll::Wait);
+                    }
+                }
+
+                let runner = tx.runner_capabilities_for_session(&sid);
+                let verified_claim = effective_claim_runner(
+                    ident.as_ref().map(|axum::Extension(id)| id),
+                    tx.runner_id_for_session(&sid),
+                );
+                let claimed =
+                    crate::control::sched::choose_claim_position(tx, &runner, verified_claim)
+                        .and_then(|pos| crate::control::sched::apply_claim(tx, pos));
+                let Some(queued) = claimed else {
+                    return Ok(NextPoll::Wait);
+                };
+
+                let claimed_at = std::time::SystemTime::now();
+                if let Some(run) = tx.runs.get_mut(&queued.run_id) {
+                    run.status = ExecutionStatus::InProgress;
+                    run.jobs
+                        .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+                }
+
+                // F030: inject SystemVssConnection so the worker's AzDO
+                // reporting context has a server URL, access token, and
+                // ResultsServiceUrl — same as broker_acquire_job.
+                let mut msg = queued.message.clone();
+                for endpoint in &mut msg.resources.endpoints {
+                    if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                        endpoint.url = Some(runner_server_url());
+                        endpoint.authorization.parameters.insert(
+                            "AccessToken".to_owned(),
+                            // node-local crypto on SharedState — safe inside
+                            // the tx (does not touch `inner`).
+                            shared_for_mint
+                                .state
+                                .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                        );
+                        endpoint.data.insert(
+                            "ResultsServiceUrl".to_owned(),
+                            format!("{}/", runner_base_url()),
+                        );
+                        endpoint
+                            .data
+                            .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+                        endpoint.data.insert(
+                            "CacheServerUrl".to_owned(),
+                            format!("{}/", runner_base_url()),
+                        );
+                    }
+                }
+                let body_json = serde_json::to_string(&msg).map_err(|e| {
+                    crate::control::ControlError::Backend(anyhow::anyhow!(
+                        "serialize job message: {e}"
+                    ))
+                })?;
+                let request_id = queued.message.request_id;
+                let owner_runner_id = verified_claim.or_else(|| tx.runner_id_for_session(&sid));
+                tx.session_active_requests.insert(sid.clone(), request_id);
+                if let Some(request) = tx.job_requests.get_mut(&request_id) {
+                    request.owner_runner_id = owner_runner_id;
+                    request.claimed_at = Some(claimed_at);
+                    request.started_at = Some(claimed_at);
+                    request.last_renewed_at = Some(claimed_at);
+                }
+                let message = build_task_agent_message(
+                    tx,
+                    &sid,
+                    azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
+                    body_json,
+                )
+                .map_err(|_| {
+                    crate::control::ControlError::Backend(anyhow::anyhow!("build message failed"))
+                })?;
+                Ok(NextPoll::Claimed {
+                    message,
+                    run_id: queued.run_id,
+                    job_id: queued.job_id.clone(),
+                })
+            })
+            .await;
+
+        let step = match step {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::ACCEPTED, Json(None)),
+        };
+        match step {
+            NextPoll::Forbidden => return (StatusCode::FORBIDDEN, Json(None)),
+            NextPoll::Deliver(message, status) => return (status, Json(Some(message))),
+            NextPoll::Empty(status) => return (status, Json(None)),
+            NextPoll::Claimed {
+                message,
+                run_id,
+                job_id,
+            } => {
+                github::report_check_run_in_progress(&shared, run_id, &job_id).await;
+                shared
+                    .state
+                    .emit(NdjsonEvent::JobStatus {
+                        run_id,
+                        job_id,
+                        status: ExecutionStatus::InProgress,
+                        reason: None,
+                    })
+                    .await;
+                return (StatusCode::ACCEPTED, Json(Some(message)));
+            }
+            NextPoll::Wait => {
                 if wait_seconds == 0 {
                     return (StatusCode::OK, Json(None));
                 }
@@ -80,118 +210,6 @@ pub async fn next_message(
                 continue;
             }
         }
-
-        let runner = inner.runner_capabilities_for_session(&session_id);
-        let verified = effective_claim_runner(
-            identity.as_ref().map(|axum::Extension(id)| id),
-            inner.runner_id_for_session(&session_id),
-        );
-        let claimed = take_matching_job(&mut inner, &runner, verified);
-        shared
-            .state
-            .queue_depth
-            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-        let Some(queued) = claimed else {
-            drop(inner);
-            if wait_seconds == 0 {
-                return (StatusCode::OK, Json(None));
-            }
-            if tokio::time::timeout(
-                Duration::from_secs(wait_seconds),
-                shared.state.message_notify.notified(),
-            )
-            .await
-            .is_err()
-            {
-                return (StatusCode::OK, Json(None));
-            }
-            continue;
-        };
-
-        let claimed_at = std::time::SystemTime::now();
-        // Update run status
-        if let Some(run) = inner.runs.get_mut(&queued.run_id) {
-            run.status = ExecutionStatus::InProgress;
-            run.jobs
-                .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
-        }
-
-        // F030: inject SystemVssConnection so the worker's AzDO reporting context
-        // has a server URL, access token, and ResultsServiceUrl — same as broker_acquire_job.
-        let mut msg = queued.message.clone();
-        for endpoint in &mut msg.resources.endpoints {
-            if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                endpoint.url = Some(runner_server_url());
-                endpoint.authorization.parameters.insert(
-                    "AccessToken".to_owned(),
-                    shared
-                        .state
-                        .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
-                );
-                endpoint.data.insert(
-                    "ResultsServiceUrl".to_owned(),
-                    format!("{}/", runner_base_url()),
-                );
-                endpoint
-                    .data
-                    .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
-                endpoint.data.insert(
-                    "CacheServerUrl".to_owned(),
-                    format!("{}/", runner_base_url()),
-                );
-            }
-        }
-        debug!(
-            endpoint_count = msg.resources.endpoints.len(),
-            "F030: injected SystemVssConnection into AzDO job message"
-        );
-        let body_json = serde_json::to_string(&msg)
-            .map_err(|e| ApiError::bad_request(format!("failed to serialize job message: {e}")));
-        let body_json = match body_json {
-            Ok(b) => b,
-            Err(_) => return (StatusCode::ACCEPTED, Json(None)),
-        };
-        let request_id = queued.message.request_id;
-        let owner_runner_id = verified.or_else(|| inner.runner_id_for_session(&session_id));
-        inner
-            .session_active_requests
-            .insert(session_id.clone(), request_id);
-        if let Some(request) = inner.job_requests.get_mut(&request_id) {
-            request.owner_runner_id = owner_runner_id;
-            request.claimed_at = Some(claimed_at);
-            request.started_at = Some(claimed_at);
-            request.last_renewed_at = Some(claimed_at);
-        }
-        let message = build_task_agent_message(
-            &mut inner,
-            &session_id,
-            azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
-            body_json,
-        );
-
-        let message = match message {
-            Ok(m) => m,
-            Err(_) => return (StatusCode::ACCEPTED, Json(None)),
-        };
-
-        let run_id = queued.run_id;
-        let job_id = queued.job_id.clone();
-        drop(inner);
-
-        github::report_check_run_in_progress(&shared, run_id, &job_id).await;
-
-        shared
-            .state
-            .emit(NdjsonEvent::JobStatus {
-                run_id,
-                job_id,
-                status: ExecutionStatus::InProgress,
-                reason: None,
-            })
-            .await;
-
-        return (StatusCode::ACCEPTED, Json(Some(message)));
     }
 }
 
@@ -203,12 +221,12 @@ pub async fn delete_session_message(
 }
 
 pub fn build_task_agent_message(
-    inner: &mut InnerState,
+    tx: &mut crate::control::txstate::TxState,
     session_id: &str,
     message_type: &str,
     body_json: String,
 ) -> Result<azdo::TaskAgentMessage, ApiError> {
-    let session_key = inner
+    let session_key = tx
         .session_keys
         .get(session_id)
         .map(|s| s.key.clone())
@@ -221,16 +239,15 @@ pub fn build_task_agent_message(
         (body_json.into_bytes(), vec![0u8; 16])
     };
 
-    inner.next_message_id += 1;
-    let message_id = inner.next_message_id;
+    tx.next_message_id += 1;
+    let message_id = tx.next_message_id;
     let message = azdo::TaskAgentMessage {
         message_id,
         message_type: message_type.to_owned(),
         body: BASE64_STANDARD.encode(&encrypted_body),
         iv: Some(BASE64_STANDARD.encode(&iv)),
     };
-    inner
-        .inflight_messages
+    tx.inflight_messages
         .entry(session_id.to_owned())
         .or_default()
         .insert(message_id, message.clone());
@@ -238,21 +255,20 @@ pub fn build_task_agent_message(
 }
 
 pub fn build_broker_plaintext_message(
-    inner: &mut InnerState,
+    tx: &mut crate::control::txstate::TxState,
     session_id: &str,
     message_type: &str,
     body_json: String,
 ) -> azdo::TaskAgentMessage {
-    inner.next_message_id += 1;
-    let message_id = inner.next_message_id;
+    tx.next_message_id += 1;
+    let message_id = tx.next_message_id;
     let message = azdo::TaskAgentMessage {
         message_id,
         message_type: message_type.to_owned(),
         body: body_json,
         iv: None,
     };
-    inner
-        .inflight_messages
+    tx.inflight_messages
         .entry(session_id.to_owned())
         .or_default()
         .insert(message_id, message.clone());
@@ -267,26 +283,38 @@ pub async fn delete_pool_message(
 ) -> StatusCode {
     let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
     if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        let inner = shared.state.inner.lock().await;
-        if inner.runner_id_for_session(session_id) != Some(runner_id) {
+        let sid = session_id.to_owned();
+        let owns = shared
+            .state
+            .backend
+            .read(move |tx| Ok(tx.runner_id_for_session(&sid) == Some(runner_id)))
+            .await
+            .unwrap_or(false);
+        if !owns {
             return StatusCode::FORBIDDEN;
         }
     }
     ack_message(shared, session_id, message_id).await
 }
-
 pub async fn ack_message(
     shared: Arc<SharedState>,
     session_id: &str,
     message_id: i64,
 ) -> StatusCode {
-    let mut inner = shared.state.inner.lock().await;
-    if let Some(messages) = inner.inflight_messages.get_mut(session_id) {
-        messages.remove(&message_id);
-        if messages.is_empty() {
-            inner.inflight_messages.remove(session_id);
-        }
-    }
+    let sid = session_id.to_owned();
+    let _ = shared
+        .state
+        .backend
+        .transact(move |tx| {
+            if let Some(messages) = tx.inflight_messages.get_mut(&sid) {
+                messages.remove(&message_id);
+                if messages.is_empty() {
+                    tx.inflight_messages.remove(&sid);
+                }
+            }
+            Ok(())
+        })
+        .await;
     StatusCode::NO_CONTENT
 }
 
@@ -331,31 +359,42 @@ pub async fn complete_job_compat_authenticated(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<RunRecord>, ApiError> {
     let target = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .job_requests
-            .values()
-            .filter(|request| request.run_id == path.0 && request.job_id.0 == path.1)
-            .max_by_key(|request| request.request_id)
-            .cloned()
+        let run_id = path.0;
+        let job_key = path.1.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| {
+                Ok(tx
+                    .job_requests
+                    .values()
+                    .filter(|request| request.run_id == run_id && request.job_id.0 == job_key)
+                    .max_by_key(|request| request.request_id)
+                    .cloned())
+            })
+            .await
+            .map_err(ApiError::from)?
     };
     crate::auth::authorize_reporting_request(&shared.state, &headers, target.as_ref())?;
     complete_job_compat(State(shared), Path(path), Json(body)).await
 }
 
-fn runner_owns_agent_request(inner: &InnerState, request_id: i64, runner_id: i64) -> bool {
-    if let Some(owner) = inner
+fn runner_owns_agent_request(
+    tx: &crate::control::txstate::TxState,
+    request_id: i64,
+    runner_id: i64,
+) -> bool {
+    if let Some(owner) = tx
         .job_requests
         .get(&request_id)
         .and_then(|request| request.owner_runner_id)
     {
         return owner == runner_id;
     }
-    inner
-        .session_active_requests
+    tx.session_active_requests
         .iter()
         .any(|(session_id, active_id)| {
-            *active_id == request_id && inner.runner_id_for_session(session_id) == Some(runner_id)
+            *active_id == request_id && tx.runner_id_for_session(session_id) == Some(runner_id)
         })
 }
 
@@ -371,19 +410,26 @@ pub async fn agent_request_get(
     Path((pool_id, request_id)): Path<(i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let request = inner
-        .job_requests
-        .get(&request_id)
-        .ok_or_else(|| ApiError::not_found("agent request not found"))?;
-    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id)
-        && !runner_owns_agent_request(&inner, request_id, runner_id)
-    {
-        return Err(ApiError::forbidden(
-            "agent request belongs to another runner",
-        ));
-    }
-    Ok(Json(agent_request_json(pool_id, request)))
+    let runner_id = identity.and_then(|axum::Extension(id)| id.runner_id);
+    let request = shared
+        .state
+        .backend
+        .read(move |tx| {
+            let request = tx.job_requests.get(&request_id).ok_or_else(|| {
+                crate::control::ControlError::NotFound("agent request not found".to_owned())
+            })?;
+            if let Some(runner_id) = runner_id {
+                if !runner_owns_agent_request(tx, request_id, runner_id) {
+                    return Err(crate::control::ControlError::Forbidden(
+                        "agent request belongs to another runner".to_owned(),
+                    ));
+                }
+            }
+            Ok(request.clone())
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(agent_request_json(pool_id, &request)))
 }
 
 /// POST /_apis/v1/AgentRequest/:pool_id/:request_id — best-effort request ack.
@@ -393,14 +439,21 @@ pub async fn agent_request_ack(
     identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        let inner = shared.state.inner.lock().await;
-        if inner.job_requests.contains_key(&request_id)
-            && !runner_owns_agent_request(&inner, request_id, runner_id)
-        {
-            return Err(ApiError::forbidden(
-                "agent request belongs to another runner",
-            ));
-        }
+        shared
+            .state
+            .backend
+            .read(move |tx| {
+                if tx.job_requests.contains_key(&request_id)
+                    && !runner_owns_agent_request(tx, request_id, runner_id)
+                {
+                    return Err(crate::control::ControlError::Forbidden(
+                        "agent request belongs to another runner".to_owned(),
+                    ));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(ApiError::from)?;
     }
     Ok(StatusCode::OK)
 }
@@ -456,44 +509,47 @@ pub async fn agent_request_patch(
         };
         // Look up (run_id, job_id) under the inner lock, then drop it before calling
         // complete_job_inner which acquires the lock itself.
-        let completion = {
-            let mut inner = shared.state.inner.lock().await;
-            if let Some(runner_id) = verified_runner_id
-                && inner.job_requests.contains_key(&request_id)
-                && !runner_owns_agent_request(&inner, request_id, runner_id)
-            {
-                return Err(ApiError::forbidden(
-                    "agent request belongs to another runner",
-                ));
-            }
-            let already_completed = inner
-                .job_requests
-                .get(&request_id)
-                .is_some_and(|request| request.result.is_some());
-            if already_completed {
-                info!(
-                    request_id,
-                    result = %result_hint,
-                    "agent request already completed; ignoring duplicate completion"
-                );
-                None
-            } else {
-                if let Some(request) = inner.job_requests.get_mut(&request_id) {
+        let completion = shared
+            .state
+            .backend
+            .transact(move |tx| {
+                if let Some(runner_id) = verified_runner_id {
+                    if tx.job_requests.contains_key(&request_id)
+                        && !runner_owns_agent_request(tx, request_id, runner_id)
+                    {
+                        return Err(crate::control::ControlError::Forbidden(
+                            "agent request belongs to another runner".to_owned(),
+                        ));
+                    }
+                }
+                let already_completed = tx
+                    .job_requests
+                    .get(&request_id)
+                    .is_some_and(|request| request.result.is_some());
+                if already_completed {
+                    info!(
+                        request_id,
+                        result = %result_hint,
+                        "agent request already completed; ignoring duplicate completion"
+                    );
+                    return Ok(None);
+                }
+                if let Some(request) = tx.job_requests.get_mut(&request_id) {
                     request.result = Some(new_status);
                     request.locked_until = agent_request_locked_until();
                 }
-                if let Some((run_id, job_id)) = inner.inflight_requests.remove(&request_id) {
+                if let Some((run_id, job_id)) = tx.inflight_requests.remove(&request_id) {
                     info!(
                         %run_id,
                         %job_id,
                         result = %result_hint,
                         "job completed via agent_request_patch"
                     );
-                    Some(JobCompletion {
+                    Ok(Some(JobCompletion {
                         run_id,
                         job_id,
                         // The patched request is the attempt that reported.
-                        agent_job_id: inner
+                        agent_job_id: tx
                             .job_requests
                             .get(&request_id)
                             .map(|record| record.agent_job_id),
@@ -501,16 +557,17 @@ pub async fn agent_request_patch(
                         outputs: Default::default(),
                         annotations: Vec::new(),
                         step_results: Vec::new(),
-                    })
+                    }))
                 } else {
                     info!(
                         request_id,
                         "no inflight job for request_id; ignoring result"
                     );
-                    None
+                    Ok(None)
                 }
-            }
-        };
+            })
+            .await
+            .map_err(ApiError::from)?;
         if let Some(c) = completion {
             let _ = complete_job_inner(shared.clone(), c).await;
         }
@@ -520,25 +577,33 @@ pub async fn agent_request_patch(
     }
     // Renewal — runner is still working; just extend the lock. Completed
     // requests are immutable, so a late duplicate cannot rewrite their timing.
-    {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(runner_id) = verified_runner_id
-            && inner.job_requests.contains_key(&request_id)
-            && !runner_owns_agent_request(&inner, request_id, runner_id)
-        {
-            return Err(ApiError::forbidden(
-                "agent request belongs to another runner",
-            ));
-        }
-        let request_active = inner
-            .job_requests
-            .get(&request_id)
-            .is_some_and(|request| request.result.is_none());
-        if request_active && let Some(request) = inner.job_requests.get_mut(&request_id) {
-            request.locked_until = agent_request_locked_until();
-            request.last_renewed_at = Some(std::time::SystemTime::now());
-        }
-    }
+    shared
+        .state
+        .backend
+        .transact(move |tx| {
+            if let Some(runner_id) = verified_runner_id {
+                if tx.job_requests.contains_key(&request_id)
+                    && !runner_owns_agent_request(tx, request_id, runner_id)
+                {
+                    return Err(crate::control::ControlError::Forbidden(
+                        "agent request belongs to another runner".to_owned(),
+                    ));
+                }
+            }
+            let request_active = tx
+                .job_requests
+                .get(&request_id)
+                .is_some_and(|request| request.result.is_none());
+            if request_active {
+                if let Some(request) = tx.job_requests.get_mut(&request_id) {
+                    request.locked_until = agent_request_locked_until();
+                    request.last_renewed_at = Some(std::time::SystemTime::now());
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(
         agent_request_response(&shared, pool_id, request_id).await,
     ))
@@ -549,12 +614,24 @@ pub async fn agent_request_response(
     pool_id: i64,
     request_id: i64,
 ) -> serde_json::Value {
-    let inner = shared.state.inner.lock().await;
-    inner
-        .job_requests
-        .get(&request_id)
-        .map(|request| agent_request_json(pool_id, request))
-        .unwrap_or_else(|| {
+    shared
+        .state
+        .backend
+        .read(move |tx| {
+            Ok(tx
+                .job_requests
+                .get(&request_id)
+                .map(|request| agent_request_json(pool_id, request))
+                .unwrap_or_else(|| {
+                    json!({
+                        "requestId": request_id,
+                        "poolId": pool_id,
+                        "lockedUntil": agent_request_locked_until(),
+                    })
+                }))
+        })
+        .await
+        .unwrap_or_else(|_| {
             json!({
                 "requestId": request_id,
                 "poolId": pool_id,
@@ -625,29 +702,28 @@ pub fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
 }
 
 pub fn resolve_callback_job(
-    inner: &InnerState,
+    tx: &crate::control::txstate::TxState,
     plan_id: &str,
     timeline_id: Option<uuid::Uuid>,
     agent_job_id: Option<uuid::Uuid>,
 ) -> Option<(i64, RunId, JobId)> {
-    let request_id = inner
+    let request_id = tx
         .plan_requests
         .get(plan_id)
         .copied()
-        .or_else(|| timeline_id.and_then(|id| inner.timeline_requests.get(&id).copied()))
-        .or_else(|| agent_job_id.and_then(|id| inner.agent_job_requests.get(&id).copied()))?;
-    let request = inner.job_requests.get(&request_id)?;
+        .or_else(|| timeline_id.and_then(|id| tx.timeline_requests.get(&id).copied()))
+        .or_else(|| agent_job_id.and_then(|id| tx.agent_job_requests.get(&id).copied()))?;
+    let request = tx.job_requests.get(&request_id)?;
     Some((request_id, request.run_id, request.job_id.clone()))
 }
 
-pub fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
-    let mut active = inner
+pub fn sole_active_unfinished_request(tx: &crate::control::txstate::TxState) -> Option<i64> {
+    let mut active = tx
         .session_active_requests
         .values()
         .copied()
         .filter(|request_id| {
-            inner
-                .job_requests
+            tx.job_requests
                 .get(request_id)
                 .is_some_and(|request| request.result.is_none())
         });
@@ -657,8 +733,11 @@ pub fn sole_active_unfinished_request(inner: &InnerState) -> Option<i64> {
     }
     None
 }
-pub fn job_request_tuple(inner: &InnerState, request_id: i64) -> Option<(i64, RunId, JobId)> {
-    let request = inner.job_requests.get(&request_id)?;
+pub fn job_request_tuple(
+    tx: &crate::control::txstate::TxState,
+    request_id: i64,
+) -> Option<(i64, RunId, JobId)> {
+    let request = tx.job_requests.get(&request_id)?;
     Some((request_id, request.run_id, request.job_id.clone()))
 }
 
@@ -724,252 +803,310 @@ pub async fn complete_job_inner(
             "job completion status must be terminal",
         ));
     }
-    let mut inner = shared.state.inner.lock().await;
-    let finalized_callers: Vec<JobId>;
-    // Set when this completion finalizes the whole run with a success
-    // conclusion — the auto-PR trigger fires exactly once per run because
-    // the block below runs only while `completed_at` is still `None`.
-    let mut newly_terminal_success = false;
-    inner
-        .claimed_jobs
-        .remove(&(completion.run_id, completion.job_id.clone()));
-    {
-        let run = inner
-            .runs
-            .get_mut(&completion.run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-        let prior = run
-            .jobs
-            .get(&completion.job_id)
-            .copied()
-            .ok_or_else(|| ApiError::bad_request("job does not belong to run"))?;
-        if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
-            return Ok(Json(run.clone()));
-        }
-        let tolerated = run
-            .job_continue_on_error
-            .get(&completion.job_id.to_string())
-            .copied()
-            .unwrap_or(false);
-        let reported_status = if tolerated && completion.status == ExecutionStatus::Failure {
-            ExecutionStatus::Success
-        } else {
-            completion.status
-        };
-        let effective = match (prior, reported_status) {
-            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
-            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
-            _ => reported_status,
-        };
-        run.jobs.insert(completion.job_id.clone(), effective);
-        let job_name = completion.job_id.0.clone();
-        // Masked up front: `mask_completion_annotations` reads the run's
-        // secrets, which cannot be borrowed while a job detail inside the same
-        // run is held mutably.
-        let annotations = mask_completion_annotations(run, &completion);
-        if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
-            detail.conclusion = format!("{:?}", effective).to_lowercase();
-            if !completion.annotations.is_empty() {
-                detail.annotations = annotations;
-            }
-        } else {
-            run.jobs_list.push(JobDetail {
-                job_id: job_name.clone(),
-                name: job_name,
-                conclusion: format!("{:?}", effective).to_lowercase(),
-                steps: Vec::new(),
-                annotations,
-            });
-        }
-        run.job_outputs.insert(
-            completion.job_id.clone(),
-            completion
-                .outputs
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        );
-        finalized_callers = propagate_reusable_outputs(run);
-        run.status = summarize_run(run.jobs.values().copied());
-        // A completed job proves that the run has started. Keep the first
-        // observed completion as a conservative fallback when the runner did
-        // not report an earlier start transition.
-        if run.started_at.is_none() {
-            run.started_at = Some(chrono::Utc::now());
-        }
-        if matches!(
-            run.status,
-            ExecutionStatus::Success
-                | ExecutionStatus::Failure
-                | ExecutionStatus::Cancelled
-                | ExecutionStatus::Skipped
-        ) && run.completed_at.is_none()
-        {
-            run.completed_at = Some(chrono::Utc::now());
-            run.conclusion = Some(status_string(run.status));
-            newly_terminal_success = run.status == ExecutionStatus::Success;
-        }
+    // Everything the post-commit side-effects need, produced inside one
+    // scheduling transaction.
+    struct CompletionTx {
+        early: Option<RunRecord>,
+        effective_status: ExecutionStatus,
+        cancelled_siblings: Vec<JobId>,
+        scheduling: runtime_scheduling::SchedulingOutcome,
+        queue_nonempty: bool,
+        newly_terminal_success: bool,
+        finalized_callers: Vec<JobId>,
+        live_log_key: String,
+        completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)>,
+        completion_revision: u64,
     }
-    // Close only after the run and job were validated and the completion was
-    // projected. Invalid callbacks must not terminate another job's feed.
-    //
-    // Same attempt selection as the manifest reconciliation below: a
-    // re-dispatched job has several matching requests, and closing the oldest
-    // one's feed leaves the attempt that actually finished streaming forever
-    // while a follower on the dead key waits for output that never comes.
-    let live_log_key = completion
-        .agent_job_id
-        .or_else(|| {
-            inner
-                .job_requests
-                .values()
-                .filter(|record| {
-                    record.run_id == completion.run_id && record.job_id == completion.job_id
-                })
-                .max_by_key(|record| record.request_id)
-                .map(|record| record.agent_job_id)
-        })
-        .map(|agent_job_id| agent_job_id.to_string())
-        .unwrap_or_else(|| completion.job_id.0.clone());
-    crate::live_logs::close_live_log(&mut inner, &live_log_key);
-    // Use the status actually stored (may differ from completion if terminal-locked).
-    let effective_status = inner
-        .runs
-        .get(&completion.run_id)
-        .and_then(|r| r.jobs.get(&completion.job_id).copied())
-        .unwrap_or(completion.status);
-    // Reconcile the attempt's step manifest against the completion report.
-    //
-    // The official runner carries the authoritative per-step conclusions in
-    // `CompleteJob.stepResults` (status=TimelineRecordState,
-    // conclusion=TaskResult) keyed by `external_id` — the same identity the
-    // manifest uses, so this no longer matches on display names. A crashed
-    // worker sends none, and any step left `in_progress` afterwards is
-    // reconciled to the job's effective status, the view GitHub presents for
-    // orphaned steps. A step still `pending` was never reached, which stays
-    // truthful rather than inheriting the job's failure.
-    //
-    // The attempt comes from the callback itself. Deriving it from
-    // `(run_id, job_id)` picked whichever request the map yielded first, and
-    // `job_requests` is keyed by monotonic request id — so a re-dispatched job
-    // reconciled the *newest* attempt's report into the *oldest* attempt's
-    // manifest, where its ids match nothing, and terminalized that older
-    // attempt's steps while the run view still projected the newer one as
-    // in-flight. When the caller could not resolve an attempt, the newest
-    // request is the only defensible guess.
-    let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
-    let mut completion_revision = 0_u64;
-    if let Some(agent_job_id) = completion.agent_job_id.or_else(|| {
-        inner
-            .job_requests
-            .values()
-            .filter(|record| {
-                record.run_id == completion.run_id && record.job_id == completion.job_id
-            })
-            .max_by_key(|record| record.request_id)
-            .map(|record| record.agent_job_id)
-    }) && let Some(manifest) = inner.job_steps.get_mut(&agent_job_id)
-    {
-        for wire in &completion.step_results {
-            let Some(external_id) = wire.external_id.as_deref() else {
-                continue;
-            };
-            let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
-                continue;
-            };
-            if let Some(conclusion) = completion_step_conclusion(wire) {
-                manifest[pos].conclusion = conclusion;
-            }
-            if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
-                manifest[pos].runner_number = Some(number);
-            }
-        }
-        let orphan_conclusion = status_string(effective_status);
-        for step in manifest.iter_mut() {
-            if step.conclusion == "in_progress" {
-                step.conclusion = orphan_conclusion.clone();
-                step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-            }
-        }
-        completed_attempt = Some((agent_job_id, manifest.clone()));
-        let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
-        *counter += 1;
-        completion_revision = *counter;
-    }
-    let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
-        apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
-    } else {
-        Vec::new()
+
+    let comp = completion.clone();
+    // `runs: {run_id}` + `runs_referenced` — the completion mutates its own
+    // run plus the queued jobs' runs it promotes (`promote_ready_jobs`
+    // summarizes them). `concurrency: true` widens `runs` with every holder's
+    // run (a released gate can cancel or promote a different run).
+    // `sessions: {owner}` — `settle_request` drops the moot cancellation from
+    // the owner session's inflight messages; the owner is resolved before
+    // the transaction.
+    let sessions = match comp.agent_job_id {
+        Some(id) => shared
+            .state
+            .backend
+            .find_session_by_agent_job_id(id)
+            .await
+            .map_err(ApiError::from)?
+            .into_iter()
+            .collect(),
+        // Test/internal completions carry no `agent_job_id`; resolve every
+        // session owning a request of this run so `settle_request` can still
+        // drop the moot cancellation from each owner session's inflight.
+        None => shared
+            .state
+            .backend
+            .find_sessions_by_run(comp.run_id)
+            .await
+            .map_err(ApiError::from)?,
     };
-    // A terminal job must not remain dispatchable, including completion via
-    // the native/internal API before a runner acquires it.
-    inner
-        .queue
-        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
-    inner
-        .pending_jobs
-        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
-    inner
-        .concurrency_blocked
-        .retain(|job| !(job.run_id == completion.run_id && job.job_id == completion.job_id));
-    if let Some(held) = inner.held_runs.get_mut(&completion.run_id) {
-        held.retain(|job| job.job_id != completion.job_id);
-        if held.is_empty() {
-            inner.held_runs.remove(&completion.run_id);
-        }
+    let scope = crate::control::txstate::TxScope {
+        runs: Some(std::collections::BTreeSet::from([comp.run_id])),
+        // `ready_queue`/`blocked_jobs` stay unloaded: `complete_job`
+        // promotes `pending_jobs`, and `needs:` never cross runs, so this
+        // run's own pending rows already load via the `runs` clause.
+        // Loading every queued/blocked `payload_blob` is O(#queued) per
+        // completion for no benefit. `queue_nonempty`/`next_runs_on` read
+        // the O(1) `ready_index`/`next_queue_labels` snapshots.
+        ready_queue: false,
+        blocked_jobs: false,
+        sessions: Some(sessions),
+        concurrency: true,
+        runs_referenced: true,
+        job_requests_all: false,
+        pending_expansions: false,
+        runs_via_requests: false,
+    };
+    let tx_out = shared
+        .state
+        .backend
+        .transact_scoped(&scope, move |tx| {
+            let mut newly_terminal_success = false;
+            tx.claimed_jobs.remove(&(comp.run_id, comp.job_id.clone()));
+            let finalized_callers: Vec<JobId>;
+            {
+                let run = tx.runs.get_mut(&comp.run_id).ok_or_else(|| {
+                    crate::control::ControlError::NotFound("run not found".to_owned())
+                })?;
+                let prior = run.jobs.get(&comp.job_id).copied().ok_or_else(|| {
+                    crate::control::ControlError::Backend(anyhow::anyhow!(
+                        "job does not belong to run"
+                    ))
+                })?;
+                if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
+                    return Ok(CompletionTx {
+                        early: Some(run.clone()),
+                        effective_status: prior,
+                        cancelled_siblings: Vec::new(),
+                        scheduling: runtime_scheduling::SchedulingOutcome::default(),
+                        queue_nonempty: false,
+                        newly_terminal_success: false,
+                        finalized_callers: Vec::new(),
+                        live_log_key: String::new(),
+                        completed_attempt: None,
+                        completion_revision: 0,
+                    });
+                }
+                let tolerated = run
+                    .job_continue_on_error
+                    .get(&comp.job_id.to_string())
+                    .copied()
+                    .unwrap_or(false);
+                let reported_status = if tolerated && comp.status == ExecutionStatus::Failure {
+                    ExecutionStatus::Success
+                } else {
+                    comp.status
+                };
+                let effective = match (prior, reported_status) {
+                    (ExecutionStatus::Cancelled, ExecutionStatus::Success)
+                    | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => {
+                        ExecutionStatus::Cancelled
+                    }
+                    _ => reported_status,
+                };
+                run.jobs.insert(comp.job_id.clone(), effective);
+                let job_name = comp.job_id.0.clone();
+                let annotations = mask_completion_annotations(run, &comp);
+                if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
+                    detail.conclusion = format!("{:?}", effective).to_lowercase();
+                    if !comp.annotations.is_empty() {
+                        detail.annotations = annotations;
+                    }
+                } else {
+                    run.jobs_list.push(JobDetail {
+                        job_id: job_name.clone(),
+                        name: job_name,
+                        conclusion: format!("{:?}", effective).to_lowercase(),
+                        steps: Vec::new(),
+                        annotations,
+                    });
+                }
+                run.job_outputs.insert(
+                    comp.job_id.clone(),
+                    comp.outputs
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+                finalized_callers = propagate_reusable_outputs(run);
+                run.status = summarize_run(run.jobs.values().copied());
+                if run.started_at.is_none() {
+                    run.started_at = Some(chrono::Utc::now());
+                }
+                if matches!(
+                    run.status,
+                    ExecutionStatus::Success
+                        | ExecutionStatus::Failure
+                        | ExecutionStatus::Cancelled
+                        | ExecutionStatus::Skipped
+                ) && run.completed_at.is_none()
+                {
+                    run.completed_at = Some(chrono::Utc::now());
+                    run.conclusion = Some(status_string(run.status));
+                    newly_terminal_success = run.status == ExecutionStatus::Success;
+                }
+            }
+            let live_log_key = comp
+                .agent_job_id
+                .or_else(|| {
+                    tx.job_requests
+                        .values()
+                        .filter(|record| {
+                            record.run_id == comp.run_id && record.job_id == comp.job_id
+                        })
+                        .max_by_key(|record| record.request_id)
+                        .map(|record| record.agent_job_id)
+                })
+                .map(|agent_job_id| agent_job_id.to_string())
+                .unwrap_or_else(|| comp.job_id.0.clone());
+            let effective_status = tx
+                .runs
+                .get(&comp.run_id)
+                .and_then(|r| r.jobs.get(&comp.job_id).copied())
+                .unwrap_or(comp.status);
+            let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
+            let mut completion_revision = 0_u64;
+            if let Some(agent_job_id) = comp.agent_job_id.or_else(|| {
+                tx.job_requests
+                    .values()
+                    .filter(|record| record.run_id == comp.run_id && record.job_id == comp.job_id)
+                    .max_by_key(|record| record.request_id)
+                    .map(|record| record.agent_job_id)
+            }) {
+                if let Some(manifest) = tx.job_steps.get_mut(&agent_job_id) {
+                    for wire in &comp.step_results {
+                        let Some(external_id) = wire.external_id.as_deref() else {
+                            continue;
+                        };
+                        let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
+                            continue;
+                        };
+                        if let Some(conclusion) = completion_step_conclusion(wire) {
+                            manifest[pos].conclusion = conclusion;
+                        }
+                        if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                            manifest[pos].runner_number = Some(number);
+                        }
+                    }
+                    let orphan_conclusion = status_string(effective_status);
+                    for step in manifest.iter_mut() {
+                        if step.conclusion == "in_progress" {
+                            step.conclusion = orphan_conclusion.clone();
+                            step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+                        }
+                    }
+                    completed_attempt = Some((agent_job_id, manifest.clone()));
+                    let counter = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
+                    *counter += 1;
+                    completion_revision = *counter;
+                }
+            }
+            let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
+                crate::control::sched::apply_matrix_fail_fast(tx, comp.run_id, &comp.job_id)
+            } else {
+                Vec::new()
+            };
+            tx.retain_ready(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+            tx.pending_jobs
+                .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+            tx.concurrency_blocked
+                .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+            if let Some(held) = tx.held_runs.get_mut(&comp.run_id) {
+                held.retain(|job| job.job_id != comp.job_id);
+                if held.is_empty() {
+                    tx.held_runs.remove(&comp.run_id);
+                }
+            }
+            crate::control::sched::release_concurrency_for_job(tx, comp.run_id, &comp.job_id);
+            for caller_id in &finalized_callers {
+                crate::control::sched::release_concurrency_for_job(tx, comp.run_id, caller_id);
+            }
+            let scheduling = crate::control::sched::promote_ready_jobs(tx);
+            let finished_request_ids: Vec<i64> = tx
+                .job_requests
+                .iter()
+                .filter(|(_, r)| r.run_id == comp.run_id && r.job_id == comp.job_id)
+                .map(|(id, _)| *id)
+                .collect();
+            for request_id in &finished_request_ids {
+                // Shared settlement also clears the session's moot
+                // `JobCancellation` inflight message so it is not redelivered
+                // on the post-completion busy poll.
+                crate::control::sched::settle_request(tx, *request_id, effective_status);
+            }
+            // `ready_count` is the O(1) pre-tx global count; `ready_index`
+            // holds this tx's promotions under the narrow scope.
+            let queue_nonempty = tx.ready_count > 0
+                || !tx.ready_index.is_empty()
+                || !tx.cancellation_queue.is_empty();
+            Ok(CompletionTx {
+                early: None,
+                effective_status,
+                cancelled_siblings,
+                scheduling,
+                queue_nonempty,
+                newly_terminal_success,
+                finalized_callers,
+                live_log_key,
+                completed_attempt,
+                completion_revision,
+            })
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    if let Some(run) = tx_out.early {
+        return Ok(Json(run));
     }
-    // Release concurrency for the completed job / run, which may promote held work.
-    release_concurrency_for_job(&mut inner, completion.run_id, &completion.job_id);
-    for caller_id in &finalized_callers {
-        release_concurrency_for_job(&mut inner, completion.run_id, caller_id);
+    let CompletionTx {
+        effective_status,
+        cancelled_siblings,
+        mut scheduling,
+        queue_nonempty,
+        newly_terminal_success,
+        finalized_callers: _,
+        live_log_key,
+        completed_attempt,
+        completion_revision,
+        ..
+    } = tx_out;
+
+    // Node-local bookkeeping that does not belong to the scheduling tx:
+    // close the live-log feed and drop the run's DAP port registration.
+    {
+        let mut inner = shared.state.inner.lock().await;
+        crate::live_logs::close_live_log(&mut inner, &live_log_key);
+        inner.dap_ports.remove(&completion.run_id);
     }
-    let mut scheduling = promote_ready_jobs(
-        &mut inner,
-        &shared.state.environment_rules,
-        &shared.state.pool_status.snapshot().labels,
-    );
-    // The on-demand runner supervisor wakes on this atomic, and a completion
-    // can promote fresh work into the queue (a `needs:` chain or a released
-    // concurrency successor). Without refreshing it here the pool stays
-    // asleep on the last claim-time value and the promoted job queues
-    // forever — the observed "run stuck at queued" stall. Mirrors the store
-    // done at submit and at claim.
+    // Refresh the on-demand pool wake atomic and the next-job labels from the
+    // committed scheduling state.
+    let (queue_len, next_labels) = shared
+        .state
+        .backend
+        .read_scoped(
+            // No queue families: `ready_count`/`next_queue_labels` are O(1)
+            // SQL snapshots — loading `ready_queue` would parse every queued
+            // `payload_blob` per completion.
+            &crate::control::txstate::TxScope::runs(Default::default()),
+            |tx| {
+                Ok((
+                    tx.ready_count.max(0) as usize,
+                    crate::control::sched::next_job_labels(tx),
+                ))
+            },
+        )
+        .await
+        .unwrap_or((0, Vec::new()));
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    // Mark agent request finished and free the broker session slot so the
-    // runner can immediately poll the next job (including concurrency successors).
-    let finished_request_ids: Vec<i64> = inner
-        .job_requests
-        .iter()
-        .filter(|(_, r)| r.run_id == completion.run_id && r.job_id == completion.job_id)
-        .map(|(id, _)| *id)
-        .collect();
-    for request_id in &finished_request_ids {
-        if let Some(req) = inner.job_requests.get_mut(request_id)
-            && req.result.is_none()
-        {
-            req.result = Some(effective_status);
-        }
-        inner
-            .session_active_requests
-            .retain(|_, &mut rid| rid != *request_id);
-        inner.inflight_requests.remove(request_id);
-        // The job is terminal, so its deferred App-token request must not
-        // outlive it: a re-claim re-mints from this record. Claimed-job
-        // completions funnel through here (broker `completejob`, the legacy
-        // `/_apis` finish endpoints, `agent_request_patch`, and the
-        // lease-expiry reaper), and the scheduler's node retirement covers
-        // cancelled, skipped, and expansion-failed nodes. Known gap: the
-        // starvation sweep and the cancel of a never-claimed queued job turn
-        // terminal without reaching either site; the record leaks but is
-        // unreachable — the job is out of every dispatchable collection.
-        inner.github_token_requests.remove(request_id);
-    }
-    inner.dap_ports.remove(&completion.run_id);
-    let queue_nonempty = !inner.queue.is_empty() || !inner.cancellation_queue.is_empty();
-    drop(inner);
+        .store(queue_len, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = next_labels;
     // Best-effort, outside the lock: the completion's own step conclusions
     // must survive a restart, and the run-event projection deliberately no
     // longer carries step rows.
@@ -1002,12 +1139,17 @@ pub async fn complete_job_inner(
     // pre-expansion snapshot would report a failed/empty expansion as still
     // in progress and skip terminal workspace cleanup.
     let record = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&completion.run_id)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found("run not found"))?
+        let run_id = completion.run_id;
+        shared
+            .state
+            .backend
+            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+                tx.runs.get(&run_id).cloned().ok_or_else(|| {
+                    crate::control::ControlError::NotFound("run not found".to_owned())
+                })
+            })
+            .await
+            .map_err(ApiError::from)?
     };
 
     // Webhook-driven auto-PR: a successful push run may open a PR per
@@ -1150,15 +1292,19 @@ pub async fn complete_job_inner(
         // Off the completion path on purpose: this is housekeeping, and the
         // runner is waiting on this response before its slot can turn over.
         let state_dir = shared.state.state_dir.clone();
-        let active_plans = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .job_requests
-                .values()
-                .filter(|request| request.result.is_none())
-                .map(|request| request.plan_id.clone())
-                .collect()
-        };
+        let active_plans = shared
+            .state
+            .backend
+            .read_scoped(&crate::control::txstate::TxScope::requests_only(), |tx| {
+                Ok(tx
+                    .job_requests
+                    .values()
+                    .filter(|r| r.result.is_none())
+                    .map(|r| r.plan_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>())
+            })
+            .await
+            .unwrap_or_default();
         tokio::spawn(async move { prune_replay_results(&state_dir, &active_plans).await });
     }
     Ok(Json(record))
@@ -1388,7 +1534,7 @@ jobs:
         .await;
 
         let legs: Vec<JobId> = {
-            let inner = state.inner.lock().await;
+            let inner = state.test_tx().await;
             let run = inner.runs.get(&RunId(run_id.parse().unwrap())).unwrap();
             run.jobs
                 .keys()
@@ -1423,9 +1569,9 @@ jobs:
             )
             .await;
         }
-        let run = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            run.runs[&RunId(run_id.parse().unwrap())].status,
+            inner.runs[&RunId(run_id.parse().unwrap())].status,
             ExecutionStatus::Success,
             "run must conclude once every deferred-matrix leg completes"
         );
@@ -1490,7 +1636,7 @@ jobs:
         .await;
 
         let legs: Vec<JobId> = {
-            let inner = state.inner.lock().await;
+            let inner = state.test_tx().await;
             let run = inner.runs.get(&RunId(run_id.parse().unwrap())).unwrap();
             run.jobs
                 .keys()
@@ -1519,9 +1665,9 @@ jobs:
             )
             .await;
         }
-        let run = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            run.runs[&RunId(run_id.parse().unwrap())].status,
+            inner.runs[&RunId(run_id.parse().unwrap())].status,
             ExecutionStatus::Success,
             "run must conclude once the callee-local matrix legs complete"
         );
