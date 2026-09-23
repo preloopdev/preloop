@@ -135,6 +135,11 @@ pub(crate) struct SubmitOutcome {
     /// A replayed webhook delivery found an existing run — the handler
     /// returns that acceptance instead of a new run.
     pub(crate) existing: Option<Box<RunRecord>>,
+    /// Ready-queue depth after the transition — the handler stores it in
+    /// the node-local `queue_depth` gauge that wakes the runner supervisor.
+    pub(crate) queue_depth: usize,
+    /// `runs-on` labels of the next ready job, for `next_job_runs_on`.
+    pub(crate) next_runs_on: Vec<String>,
 }
 
 /// What a session poll produced. The handler maps each variant onto the
@@ -254,6 +259,11 @@ pub(crate) enum SessionProtocol {
     Broker,
     /// AzDO distributedtask session (encrypted PipelineAgentJobRequest).
     Azdo,
+    /// Compatibility session with no registered runner (e.g. the implicit
+    /// `default` session used by unauthenticated/legacy polls). Persisted with
+    /// a NULL `runner_id` so `broker_messages`/`active_request_id` foreign keys
+    /// still resolve, while `runner_id_for_session` reports no runner.
+    Compat,
 }
 
 impl SessionProtocol {
@@ -261,11 +271,13 @@ impl SessionProtocol {
         match self {
             Self::Broker => "broker",
             Self::Azdo => "azdo",
+            Self::Compat => "compat",
         }
     }
     pub(crate) fn parse(s: &str) -> Self {
         match s {
             "azdo" => Self::Azdo,
+            "compat" => Self::Compat,
             _ => Self::Broker,
         }
     }
@@ -282,21 +294,6 @@ pub(crate) struct QueueStats {
     pub(crate) expanding: usize,
     /// `runs-on` labels of the ready-queue front.
     pub(crate) next_runs_on: Vec<String>,
-}
-
-/// A durable effect committed with a state transition (transactional
-/// outbox). Workers lease rows per sink and acknowledge by generation.
-#[derive(Debug, Clone)]
-pub(crate) struct Effect {
-    pub(crate) namespace: String,
-    pub(crate) aggregate: String,
-    pub(crate) state_version: i64,
-    pub(crate) kind: String,
-    pub(crate) ordinal: i64,
-    pub(crate) sink: String,
-    pub(crate) payload: serde_json::Value,
-    pub(crate) lease_generation: i64,
-    pub(crate) attempts: i64,
 }
 
 /// Errors every backend maps onto the same domain vocabulary. Handlers
@@ -350,7 +347,15 @@ impl From<ControlError> for ApiError {
             ControlError::Forbidden(message) => ApiError::forbidden(message),
             ControlError::BadRequest(message) => ApiError::bad_request(message),
             ControlError::Stale(message) => ApiError::conflict(message),
-            ControlError::Backend(error) => ApiError::internal(format!("control backend: {error}")),
+            ControlError::Backend(error) => {
+                // Driver detail (SQL text, constraint names, PG DETAIL echoing
+                // row values) is free schema/tenant reconnaissance for any
+                // caller that can reach a control-backed handler — including
+                // untrusted workflow code holding a runtime token. Log it
+                // server-side; return a fixed message to the client.
+                tracing::error!(?error, "control backend error");
+                ApiError::internal("control backend error")
+            }
         }
     }
 }
