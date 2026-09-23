@@ -2304,10 +2304,13 @@ const DEFAULT_USE_PACKED_GOLDEN: bool = true;
 const RUNNER_MEMORY_MIB: u32 = 4096;
 /// Persistent storage given to each runner VM, in GiB.
 ///
-/// The default is enough for the minimal golden. Full snapshots of the
-/// official GitHub-hosted image are much larger and should set
-/// `PRELOOP_RUNNER_STORAGE_GB` to 80 or more.
-const RUNNER_STORAGE_GIB: u32 = 20;
+/// The packed OCI golden (~9.6 GB compressed) does not fit uncompressed in a
+/// 20 GiB disk — the guest-side layer unpack dies with `tar: write error: No
+/// space left on device` (observed on a macOS pool at first boot). 80 GiB is
+/// the documented floor for full hosted-image snapshots and costs nothing
+/// while unused: the disk is sparse/overlay-backed, so the ceiling is
+/// reserved, not allocated.
+const RUNNER_STORAGE_GIB: u32 = 80;
 
 /// Memory ceiling for each runner VM, honouring `PRELOOP_RUNNER_MEMORY_MIB`.
 ///
@@ -2348,12 +2351,15 @@ fn runner_storage_gib() -> u32 {
 }
 /// Guest DNS resolver. The host's `/etc/resolv.conf` is commonly a loopback
 /// systemd-resolved stub, which is unreachable from a microVM; use the
-/// operator override when supplied and otherwise a public resolver.
+/// operator override when supplied and otherwise a public resolver. The
+/// default must answer from any network — an ISP-scoped resolver (e.g.
+/// Comcast's 75.75.75.75) silently times out for guests on every other
+/// carrier, which is how image pulls die with `lookup … i/o timeout`.
 fn runner_dns() -> String {
     std::env::var("PRELOOP_RUNNER_DNS")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "75.75.75.75".to_owned())
+        .unwrap_or_else(|| "8.8.8.8".to_owned())
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.

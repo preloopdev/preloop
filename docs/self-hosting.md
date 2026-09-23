@@ -183,7 +183,7 @@ an encrypted volume if source retention needs encryption at rest.
 | `PRELOOP_RUNNER_POOL_SIZE` | derived from host CPU/RAM | Warm machines; `0` forks on demand |
 | `PRELOOP_RUNNER_CPUS` | `4` | vCPUs allocated to each runner VM |
 | `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per VM. Raise it for LTO release builds — rustc is `SIGKILL`ed at 4 GiB on large workspaces |
-| `PRELOOP_RUNNER_STORAGE_GB` | `20` | Writable guest disk. Raise to `80` or more for full hosted-image snapshots and large golden packs |
+| `PRELOOP_RUNNER_STORAGE_GB` | `80` | Writable guest disk ceiling (sparse — not allocated until written). The packed OCI golden needs ~80 GiB uncompressed |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
 | `PRELOOP_RUNNER_USER` / `PRELOOP_RUNNER_UID` | `runner` / `1001` | Guest account steps run as, for GitHub-hosted parity. `root` restores root; empty disables switching |
 | `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
@@ -195,7 +195,7 @@ an encrypted volume if source retention needs encryption at rest.
 | `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
-| `PRELOOP_RUNNER_DNS` | host resolver | Force a resolver inside guests (e.g. `8.8.8.8`) when the host's is unreachable from the VM network |
+| `PRELOOP_RUNNER_DNS` | `8.8.8.8` | Resolver used inside guests; override when a different public resolver is preferred |
 | `PRELOOP_RUNNER_PACK_PROXY` / `_NO_PROXY` | — | Proxy and no-proxy values used while downloading and packing golden artifacts |
 | `PRELOOP_WORKSPACE` | — | Workspace context for daemon deployments; not a package or toolchain installation input |
 | `PRELOOP_REQUIRE_JOB_ASSIGNMENTS` | — | Only let a runner claim jobs explicitly assigned to it |
