@@ -265,25 +265,6 @@ fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
         .unwrap_or(true)
 }
 
-fn existing_webhook_run(
-    inner: &InnerState,
-    delivery_id: &str,
-    workflow_path: &str,
-) -> Option<RunAccepted> {
-    inner
-        .runs
-        .values()
-        .find(|run| {
-            run.webhook_delivery_id.as_deref() == Some(delivery_id)
-                && run.workflow_path_str == workflow_path
-        })
-        .map(|run| RunAccepted {
-            run_id: run.run_id,
-            run_number: run.run_number,
-            queued_jobs: run.jobs.len(),
-        })
-}
-
 /// Static-PAT permission enforcement (H3).
 ///
 /// When no GitHub App is configured, the operator's static PAT
@@ -628,11 +609,23 @@ pub async fn submit_run_inner_with_webhook_delivery(
     };
     let key = (delivery_id.to_owned(), workflow_path.to_owned());
     loop {
+        // A committed run for this delivery wins over any in-flight
+        // reservation — check the backend first.
+        if let Some(existing) = shared
+            .state
+            .backend
+            .find_run_by_delivery(delivery_id, workflow_path)
+            .await
+            .map_err(ApiError::from)?
+        {
+            return Ok(RunAccepted {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: existing.jobs.len(),
+            });
+        }
         let reservation_acquired = {
             let mut inner = shared.state.inner.lock().await;
-            if let Some(existing) = existing_webhook_run(&inner, delivery_id, workflow_path) {
-                return Ok(existing);
-            }
             inner.webhook_run_reservations.insert(key.clone())
         };
         if reservation_acquired {
@@ -716,10 +709,12 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         webhook_delivery_id.as_deref(),
         submission.workflow_path.as_deref(),
     ) {
-        let existing = {
-            let inner = shared.state.inner.lock().await;
-            existing_webhook_run(&inner, delivery_id, workflow_path)
-        };
+        let existing = shared
+            .state
+            .backend
+            .find_run_by_delivery(delivery_id, workflow_path)
+            .await
+            .map_err(ApiError::from)?;
         if let Some(existing) = existing {
             tracing::info!(
                 %delivery_id,
@@ -727,7 +722,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 run_id = %existing.run_id,
                 "reusing run for replayed webhook delivery"
             );
-            return Ok(existing);
+            return Ok(RunAccepted {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: existing.jobs.len(),
+            });
         }
     }
 
@@ -1457,27 +1456,43 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // Reserve the workflow run number only after rechecking the durable
     // delivery identity under the same state lock used for run insertion.
     // A competing replay therefore returns before advancing the counter.
-    let mut inner = shared.state.inner.lock().await;
-    if let Some(delivery_id) = webhook_delivery_id.as_deref()
-        && let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path)
-    {
-        tracing::info!(
-            %delivery_id,
-            %workflow_path,
-            run_id = %existing.run_id,
-            "reusing run after webhook reservation race"
-        );
-        drop(inner);
-        return Ok(existing);
+    // Recheck the durable delivery identity against the backend before
+    // reserving the run number — a competing replay that already committed
+    // returns here instead of advancing the counter. The reservation set
+    // (above) already serializes in-flight submits for this delivery, so the
+    // committed-run check and the counter increment need no shared lock.
+    if let Some(delivery_id) = webhook_delivery_id.as_deref() {
+        if let Some(existing) = shared
+            .state
+            .backend
+            .find_run_by_delivery(delivery_id, &workflow_path)
+            .await
+            .map_err(ApiError::from)?
+        {
+            tracing::info!(
+                %delivery_id,
+                %workflow_path,
+                run_id = %existing.run_id,
+                "reusing run after webhook reservation race"
+            );
+            return Ok(RunAccepted {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: existing.jobs.len(),
+            });
+        }
     }
-    let run_number = {
-        let counter = inner
-            .workflow_run_counters
-            .entry(workflow_path.clone())
-            .or_insert(0);
-        *counter += 1;
-        *counter
-    };
+    // Durable run-number allocation lives in the control backend so it is
+    // atomic with the committed state and survives restarts. It is its own
+    // transaction because the number is embedded in `github.run_number`
+    // before the job messages are built; a crash between here and
+    // `submit_run` burns a number, which is acceptable.
+    let run_number = shared
+        .state
+        .backend
+        .allocate_run_number(&workflow_path)
+        .await
+        .map_err(ApiError::from)?;
     if let Some(object) = github.as_object_mut() {
         object.insert(
             "run_number".to_owned(),
@@ -1485,11 +1500,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
     }
 
-    // Release the state lock while building messages, token material and OIDC
-    // contexts for all jobs in the matrix. Holding the global lock during
-    // serialization of a 100-job matrix blocks unrelated runners and polls;
-    // the lock is reacquired only for atomic insertion into `inner.runs`.
-    drop(inner);
+    // Messages, token material and OIDC contexts for the whole matrix are
+    // built without any lock — the durable insert happens in one
+    // `submit_run` transaction below.
     let base_url = runner_base_url();
     let normalized_github = preloop_gha_parser::job_builder::normalize_github_context(&github);
     let secrets_exposed: BTreeMap<String, String> =
@@ -1498,7 +1511,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     struct PrebuiltJob {
         job: preloop_gha_protocol::JobPlan,
         agent_msg: Option<preloop_gha_protocol::azdo::AgentJobRequestMessage>,
-        request_id: i64,
         condition_context: preloop_gha_expressions::Context,
         skipped: bool,
         caller: bool,
@@ -1564,7 +1576,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             prebuilt.push(PrebuiltJob {
                 job,
                 agent_msg: None,
-                request_id: 0,
                 condition_context,
                 skipped: true,
                 caller: false,
@@ -1599,7 +1610,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             caller: job.reusable_call.is_some(),
             job,
             agent_msg: Some(artifacts.agent_msg),
-            request_id: artifacts.request_id,
             condition_context,
             skipped: false,
             id_token_granted: artifacts.id_token_granted,
@@ -1610,764 +1620,193 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     }
 
     {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(delivery_id) = webhook_delivery_id.as_deref()
-            && let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path)
-        {
-            tracing::info!(
-                %delivery_id,
-                %workflow_path,
-                run_id = %existing.run_id,
-                "reusing run after webhook race during message building"
-            );
-            return Ok(existing);
+        // Recheck the durable delivery identity against the backend before
+        // the atomic insert — a replay that committed while we built
+        // messages returns here.
+        if let Some(delivery_id) = webhook_delivery_id.as_deref() {
+            if let Some(existing) = shared
+                .state
+                .backend
+                .find_run_by_delivery(delivery_id, &workflow_path)
+                .await
+                .map_err(ApiError::from)?
+            {
+                tracing::info!(
+                    %delivery_id,
+                    %workflow_path,
+                    run_id = %existing.run_id,
+                    "reusing run after webhook race during message building"
+                );
+                return Ok(RunAccepted {
+                    run_id: existing.run_id,
+                    run_number: existing.run_number,
+                    queued_jobs: existing.jobs.len(),
+                });
+            }
         }
+        // Build the run record and per-job submit inputs without any lock —
+        // the durable insert, concurrency gates, queue classification and
+        // correlation-record writes all happen inside one `submit_run`
+        // transaction on the control backend.
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
         let github = github;
-        let mut statuses = pre_statuses;
+        let statuses = pre_statuses;
         let caller_plans = pre_caller_plans;
         let job_names = pre_job_names;
-        let mut ready_jobs = 0usize;
         let job_base_ids = pre_job_base_ids;
         let job_needs = pre_job_needs;
         let job_fail_fast = pre_job_fail_fast;
         let job_continue_on_error = pre_job_continue_on_error;
-        let mut ready_by_base: BTreeMap<String, u64> = BTreeMap::new();
         let initially_skipped = pre_initially_skipped;
-        // Jobs concluded at submit because no runner can host their platform,
-        // paired with the explanation emitted to watchers below.
-        let mut unhostable_reasons: Vec<(JobId, String)> = Vec::new();
-        let mut built_jobs: Vec<QueuedJob> = Vec::new();
-        if empty_workflow_concurrency_group {
-            let queued_jobs = 0;
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    webhook_delivery_id: webhook_delivery_id.clone(),
-                    run_name,
-                    submission: Arc::new(submission),
-                    jobs: BTreeMap::new(),
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids: BTreeMap::new(),
-                    job_needs: BTreeMap::new(),
-                    caller_plans: BTreeMap::new(),
-                    job_names: BTreeMap::new(),
-                    github: serde_json::Value::Null,
-                    head_sha: String::new(),
-                    workflow_ref: String::new(),
-                    workspace_snapshot: None,
-                    job_fail_fast: BTreeMap::new(),
-                    job_continue_on_error: BTreeMap::new(),
-                    status: ExecutionStatus::Failure,
-                    job_check_run_ids: BTreeMap::new(),
-                    reports_check_runs: false,
-                    reusable_calls,
-                    jobs_list: Vec::new(),
-                    created_at,
-                    started_at: None,
-                    completed_at: Some(created_at),
-                    run_number,
-                    run_attempt: 1,
-                    workflow_path_str: workflow_path.clone(),
-                    event: event.clone(),
-                    conclusion: Some("failure".to_owned()),
-                    push_state: None,
-                    snapshot_timing: None,
-                    fork_approval_pending,
-                    fork_approval_requested_at_unix_nanos,
-                    fork_approved_at_unix_nanos: None,
-                    fork_approval_note: None,
-                },
-            );
-            drop(inner);
-            shared
-                .state
-                .emit(NdjsonEvent::RunAccepted {
-                    run_id,
-                    queued_jobs,
-                })
-                .await;
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id,
-                    status: ExecutionStatus::Failure,
-                    reason: Some("concurrency group name must not be empty".to_owned()),
-                })
-                .await;
-            return Ok(RunAccepted {
-                run_id,
-                run_number,
-                queued_jobs,
-            });
-        }
-        // ── Install pre-built jobs under the lock (map inserts only) ────
+        let snapshot_timing = workspace_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.snapshot_timing);
+
+        let record = RunRecord {
+            run_id,
+            webhook_delivery_id: webhook_delivery_id.clone(),
+            run_name: run_name.clone(),
+            submission: Arc::new(submission.clone()),
+            jobs: statuses,
+            job_outputs: BTreeMap::new(),
+            job_base_ids,
+            job_needs,
+            caller_plans,
+            job_names,
+            github: github.clone(),
+            head_sha: sha.clone(),
+            workflow_ref: workflow_ref.clone(),
+            workspace_snapshot: workspace_snapshot.clone(),
+            job_fail_fast,
+            job_continue_on_error,
+            status: ExecutionStatus::Queued,
+            job_check_run_ids: BTreeMap::new(),
+            reusable_calls,
+            jobs_list: Vec::new(),
+            created_at,
+            started_at: None,
+            completed_at: None,
+            run_number,
+            run_attempt: 1,
+            workflow_path_str: workflow_path.clone(),
+            event: event.clone(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing,
+        };
+
+        // Skipped jobs are already `Skipped` in `record.jobs` (from
+        // `pre_statuses`) and carry no request/message — they are not
+        // submitted as `SubmitJob`s. The handler emits their `JobStatus`
+        // events from `pre_initially_skipped` below.
+        let mut submit_jobs: Vec<crate::control::types::SubmitJob> =
+            Vec::with_capacity(prebuilt.len());
         for pb in prebuilt {
             if pb.skipped {
                 continue;
             }
-            let job = &pb.job;
-            let agent_msg = pb.agent_msg.expect("non-skipped job must have agent_msg");
-
-            if !pb.caller {
-                // Caller placeholders are scheduling-only: no runner ever
-                // acquires them, so no request correlation records exist.
-                let job_request = pb
-                    .job_request
-                    .expect("non-skipped job must have job_request");
-
-                inner
-                    .id_token_grants
-                    .insert((run_id, job.id.clone()), pb.id_token_granted);
-                inner
-                    .oidc_job_contexts
-                    .insert((run_id, job.id.clone()), pb.oidc_ctx);
-
-                inner
-                    .inflight_requests
-                    .insert(job_request.request_id, (run_id, job.id.clone()));
-                inner
-                    .plan_requests
-                    .insert(job_request.plan_id.clone(), pb.request_id);
-                inner
-                    .agent_job_requests
-                    .insert(job_request.agent_job_id, pb.request_id);
-                inner
-                    .timeline_requests
-                    .insert(job_request.timeline_id, pb.request_id);
-                // Seed the attempt's step manifest before the runner can
-                // report anything, so step identity and order come from the
-                // message we just built rather than from whatever order the
-                // runner's log blobs happen to land in.
-                //
-                // Not persisted here. Rows are written by a runner report, a
-                // job completion, or a full snapshot that happens to flush
-                // them; none of those has necessarily run when a dispatched
-                // attempt is interrupted, so its manifest is rebuilt at startup
-                // from the persisted request message — the same source it was
-                // built from — and a restart in that window keeps its declared
-                // steps.
-                inner.job_steps.insert(
-                    job_request.agent_job_id,
-                    StepRecord::manifest(&agent_msg.steps),
-                );
-                inner.job_requests.insert(pb.request_id, job_request);
-                if let Some(request) = pb.github_token_request {
-                    inner.github_token_requests.insert(pb.request_id, request);
-                    tracing::debug!(
-                        request_id = pb.request_id,
-                        job = %job.id,
-                        "prebuild: dispatch token request inserted"
-                    );
-                } else {
-                    // Normal whenever no GitHub App is configured; one line per
-                    // job would drown the log on a wide matrix.
-                    tracing::debug!(
-                        request_id = pb.request_id,
-                        job = %job.id,
-                        "prebuild: job has no dispatch token request"
-                    );
-                }
-            }
-            let created_at_unix_nanos = crate::models::now_unix_nanos();
+            let step_manifest = pb
+                .agent_msg
+                .as_ref()
+                .map(|msg| StepRecord::manifest(&msg.steps))
+                .unwrap_or_default();
+            let agent_msg = pb.agent_msg.clone().expect("non-skipped job has agent_msg");
             let queued_job = QueuedJob {
                 run_id,
-                job_id: job.id.clone(),
-                base_id: job.base_id.clone(),
-                created_at_unix_nanos,
-                dependencies_ready_at_unix_nanos: job
+                job_id: pb.job.id.clone(),
+                base_id: pb.job.base_id.clone(),
+                created_at_unix_nanos: crate::models::now_unix_nanos(),
+                dependencies_ready_at_unix_nanos: pb
+                    .job
                     .needs
                     .is_empty()
-                    .then_some(created_at_unix_nanos),
+                    .then_some(crate::models::now_unix_nanos()),
                 concurrency_wait_started_at_unix_nanos: None,
                 concurrency_acquired_at_unix_nanos: None,
-                // Stamped when the job actually enters the ready queue (the
-                // promotion sites in runtime_scheduling), never at build
-                // time: dependency/concurrency delay is not queue wait.
                 enqueued_at_unix_nanos: 0,
-                needs: job.needs.clone(),
-                if_condition: job.if_condition.clone(),
+                needs: pb.job.needs.clone(),
+                if_condition: pb.job.if_condition.clone(),
                 condition_context: pb.condition_context,
-                max_parallel: job.max_parallel,
-                runs_on: job.runs_on.clone(),
-                runner_group: job.runner_group.clone(),
-                environment: job.environment.clone(),
+                max_parallel: pb.job.max_parallel,
+                runs_on: pb.job.runs_on.clone(),
+                runner_group: pb.job.runner_group.clone(),
+                environment: pb.job.environment.clone(),
                 message: agent_msg,
                 concurrency: concurrency::concurrency_from_plan_fields(
-                    job.concurrency_group.as_deref(),
-                    job.concurrency_cancel_in_progress.as_deref(),
-                    job.concurrency_queue.as_deref(),
+                    pb.job.concurrency_group.as_deref(),
+                    pb.job.concurrency_cancel_in_progress.as_deref(),
+                    pb.job.concurrency_queue.as_deref(),
                 ),
-                matrix: job
+                matrix: pb
+                    .job
                     .matrix
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
-                deferred_matrix: job.deferred_matrix.clone(),
-                reusable_call: job.reusable_call.clone(),
-                environment_gate: None,
+                deferred_matrix: pb.job.deferred_matrix.clone(),
+                reusable_call: pb.job.reusable_call.clone(),
             };
-            built_jobs.push(queued_job);
-        }
-
-        let mut hold_entire_run = false;
-        // Workflow-level concurrency is isolated by the run's provenance.
-        // The display name remains the workflow's evaluated group; only the
-        // internal admission key gains the trust namespace.
-        //
-        // A submission with nothing runnable — every job gated off by its `if:`
-        // — takes no admission and never parks on a busy group. Taking one here
-        // would outlive the run: a workless run completes inside this function,
-        // never through the completion path that releases run-level holders,
-        // and the leaked `Holder::Run` then parks every later submission in
-        // that group forever. That is how a burst of `issue_comment` events
-        // whose job gate excluded them left a group permanently held and every
-        // later comment waiting behind it.
-        let has_runnable_jobs = statuses.values().any(|status| !status.is_terminal());
-        if has_runnable_jobs && let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
-            let tier = crate::events::trust_tier::tier_of(&submission);
-            let key = concurrency::concurrency_key_for_tier(&submission.repository, group, tier);
-            match try_acquire_concurrency(
-                &mut inner,
-                key,
-                group.clone(),
-                concurrency::Holder::Run(run_id),
-                *cancel,
-                *queue,
-            ) {
-                Ok(true) => {
-                    for job in &mut built_jobs {
-                        runtime_scheduling::stamp_concurrency_acquired(job);
-                    }
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "accept");
-                    inner.run_concurrency.insert(run_id, raw.clone());
-                }
-                Ok(false) => {
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "pending");
-                    hold_entire_run = true;
-                    for job in &mut built_jobs {
-                        runtime_scheduling::stamp_concurrency_wait_started(job);
-                    }
-                    inner.run_concurrency.insert(run_id, raw.clone());
-                }
-                Err(e) if e == "concurrency_queue_overflow" => {
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "reject");
-                    // Cancel this run immediately — all jobs Cancelled.
-                    for job in &built_jobs {
-                        statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
-                    }
-                    let queued_jobs = statuses
-                        .values()
-                        .filter(|status| !status.is_terminal())
-                        .count();
-                    inner.runs.insert(
-                        run_id,
-                        RunRecord {
-                            run_id,
-                            webhook_delivery_id: webhook_delivery_id.clone(),
-                            run_name,
-                            submission: Arc::new(submission),
-                            jobs: statuses,
-                            job_outputs: BTreeMap::new(),
-                            job_base_ids,
-                            job_needs,
-                            caller_plans: caller_plans.clone(),
-                            job_names: job_names.clone(),
-                            github: github.clone(),
-                            head_sha: sha.clone(),
-                            workflow_ref: workflow_ref.clone(),
-                            workspace_snapshot: workspace_snapshot.clone(),
-                            job_fail_fast,
-                            job_continue_on_error,
-                            status: ExecutionStatus::Cancelled,
-                            job_check_run_ids: BTreeMap::new(),
-                            reports_check_runs: false,
-                            reusable_calls,
-                            jobs_list: Vec::new(),
-                            created_at,
-                            started_at: None,
-                            completed_at: Some(created_at),
-                            run_number,
-                            run_attempt: 1,
-                            workflow_path_str: workflow_path.clone(),
-                            event: event.clone(),
-                            conclusion: Some("cancelled".to_owned()),
-                            push_state: None,
-                            snapshot_timing: None,
-                            fork_approval_pending,
-                            fork_approval_requested_at_unix_nanos,
-                            fork_approved_at_unix_nanos: None,
-                            fork_approval_note: None,
-                        },
-                    );
-                    // The run died on arrival: nothing will ever dispatch,
-                    // so the expandable nodes' minted request correlation has
-                    // to be settled here (MC-3), exactly like a cancellation.
-                    for job in &built_jobs {
-                        if job.deferred_matrix.is_some() || job.reusable_call.is_some() {
-                            runtime_scheduling::retire_node_requests(
-                                &mut inner,
-                                run_id,
-                                &job.job_id,
-                                runtime_scheduling::RequestRetirement::Settle(
-                                    ExecutionStatus::Cancelled,
-                                ),
-                            );
-                        }
-                    }
-                    drop(inner);
-                    shared
-                        .state
-                        .emit(NdjsonEvent::RunAccepted {
-                            run_id,
-                            queued_jobs,
-                        })
-                        .await;
-                    shared
-                        .state
-                        .emit(NdjsonEvent::RunStatus {
-                            run_id,
-                            status: ExecutionStatus::Cancelled,
-                            reason: concurrency::cancelled_reason(),
-                        })
-                        .await;
-                    return Ok(RunAccepted {
-                        run_id,
-                        run_number,
-                        queued_jobs,
-                    });
-                }
-                Err(e) => {
-                    shared
-                        .state
-                        .observability
-                        .metrics()
-                        .lifecycle
-                        .record_concurrency_decision("workflow", "reject");
-                    return Err(ApiError::bad_request(e));
-                }
-            }
-        }
-
-        if hold_entire_run {
-            for job in &built_jobs {
-                statuses.insert(job.job_id.clone(), ExecutionStatus::Pending);
-            }
-            inner.held_runs.insert(run_id, built_jobs);
-            let queued_jobs = statuses
-                .values()
-                .filter(|status| !status.is_terminal())
-                .count();
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    webhook_delivery_id: webhook_delivery_id.clone(),
-                    run_name,
-                    submission: Arc::new(submission),
-                    jobs: statuses,
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids,
-                    job_needs,
-                    caller_plans: caller_plans.clone(),
-                    job_names: job_names.clone(),
-                    github: github.clone(),
-                    head_sha: sha.clone(),
-                    workflow_ref: workflow_ref.clone(),
-                    workspace_snapshot: workspace_snapshot.clone(),
-                    job_fail_fast,
-                    job_continue_on_error,
-                    status: ExecutionStatus::Pending,
-                    job_check_run_ids: BTreeMap::new(),
-                    reports_check_runs: false,
-                    reusable_calls,
-                    jobs_list: Vec::new(),
-                    created_at,
-                    started_at: None,
-                    completed_at: None,
-                    run_number,
-                    run_attempt: 1,
-                    workflow_path_str: workflow_path.clone(),
-                    event: event.clone(),
-                    conclusion: None,
-                    push_state: None,
-                    snapshot_timing: None,
-                    fork_approval_pending,
-                    fork_approval_requested_at_unix_nanos,
-                    fork_approved_at_unix_nanos: None,
-                    fork_approval_note: None,
-                },
-            );
-            drop(inner);
-            shared
-                .state
-                .emit(NdjsonEvent::RunAccepted {
-                    run_id,
-                    queued_jobs,
-                })
-                .await;
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id,
-                    status: ExecutionStatus::Pending,
-                    reason: concurrency::pending_reason(),
-                })
-                .await;
-            return Ok(RunAccepted {
-                run_id,
-                run_number,
-                queued_jobs,
+            submit_jobs.push(crate::control::types::SubmitJob {
+                queued: queued_job,
+                request: pb.job_request,
+                token_request: pb.github_token_request,
+                id_token_granted: pb.id_token_granted,
+                oidc_context: Some(pb.oidc_ctx),
+                step_manifest,
+                initially_skipped: false,
             });
         }
-        // Install a provisional run before evaluating per-job and JobSet gates.
-        // Multiple holders from this same submission can cancel each other;
-        // cancellation helpers need the run to exist so they can persist the
-        // affected job conclusion instead of silently becoming no-ops.
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: webhook_delivery_id.clone(),
-                run_name: run_name.clone(),
-                submission: Arc::new(submission.clone()),
-                jobs: statuses.clone(),
-                job_outputs: BTreeMap::new(),
-                job_base_ids: job_base_ids.clone(),
-                job_needs: job_needs.clone(),
-                caller_plans: caller_plans.clone(),
-                job_names: job_names.clone(),
-                github: github.clone(),
-                head_sha: sha.clone(),
-                workflow_ref: workflow_ref.clone(),
-                workspace_snapshot: workspace_snapshot.clone(),
-                job_fail_fast: job_fail_fast.clone(),
-                job_continue_on_error: job_continue_on_error.clone(),
-                status: ExecutionStatus::Queued,
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls: reusable_calls.clone(),
-                jobs_list: Vec::new(),
-                created_at,
-                started_at: None,
-                completed_at: None,
-                run_number,
-                run_attempt: 1,
-                workflow_path_str: workflow_path.clone(),
-                event: event.clone(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing: workspace_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.snapshot_timing),
-                fork_approval_pending,
-                fork_approval_requested_at_unix_nanos,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
-            },
-        );
 
-        // Enqueue jobs (workflow concurrency free / acquired).
-        for mut queued_job in built_jobs {
-            let job_id = queued_job.job_id.clone();
-            let base_id = queued_job.base_id.clone();
-
-            // Deferred reusable-caller nodes are scheduling-only: they wait in
-            // pending_jobs until their `if:` gate passes, when the scheduler
-            // acquires caller/embedded JobSet concurrency gates and expands
-            // the callee subtree (mirroring GitHub, which evaluates caller
-            // concurrency when the caller job starts).
-            if queued_job.reusable_call.is_some() {
-                statuses.insert(job_id, ExecutionStatus::Pending);
-                inner.pending_jobs.push_back(queued_job);
-                continue;
-            }
-
-            // No runner host for this platform: conclude the job rather than
-            // queue one nothing can ever claim. Checked here, before the job
-            // reaches either the ready queue or `pending_jobs`, so a
-            // needs-gated job on an unhostable platform concludes too and its
-            // dependents see a terminal status.
-            //
-            // The conclusion is `Failure`, never `Skipped`. A skipped job
-            // leaves the run reading `skipped`, which says "nothing to do
-            // here" rather than "this deployment cannot run your workflow":
-            // the operator would be told nothing by a run that never executed
-            // a step. Failing is loud, and the annotation below puts the
-            // reason where the user reads it rather than only in the server
-            // log.
-            let platforms = runtime_scheduling::registered_runner_platforms(&inner);
-            if let Some(platform) =
-                runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
-            {
-                let reason = format!(
-                    "no {platform} runner is registered with this server, so `runs-on: {}` \
-                     cannot be scheduled",
-                    queued_job.runs_on.join(", ")
+        let workflow_concurrency =
+            workflow_concurrency_eval
+                .as_ref()
+                .map(
+                    |(group, cancel, queue, raw)| crate::control::types::WorkflowConcurrency {
+                        group: group.clone(),
+                        cancel_in_progress: *cancel,
+                        queue: *queue,
+                        raw: raw.clone(),
+                    },
                 );
-                tracing::warn!(
-                    job = %job_id.0,
-                    labels = ?queued_job.runs_on,
-                    platform,
-                    "no {platform} runner is registered; failing the job"
-                );
-                unhostable_reasons.push((job_id.clone(), reason));
-                statuses.insert(job_id, ExecutionStatus::Failure);
-                continue;
-            }
 
-            let needs_empty = queued_job.needs.is_empty();
-            if needs_empty && queued_job.runs_on.iter().any(|label| label.contains("${{")) {
-                // A job with no `needs` never passes through the promotion
-                // path, so `runs-on` labels left raw at build time (they read
-                // `needs.*`, which is empty for a needs-less job) are finished
-                // here against the complete context, before the pool check
-                // below validates the true labels. Needs-gated jobs keep
-                // their raw templates until promotion, when the needed jobs
-                // have completed.
-                let mut context = preloop_gha_expressions::Context::new();
-                for (key, value) in &queued_job.message.context_data {
-                    context.insert(key, value.to_json());
-                }
-                crate::runtime_scheduling::resolve_deferred_runs_on(&mut queued_job, &context);
-            }
+        let outcome = shared
+            .state
+            .backend
+            .submit_run(crate::control::types::SubmitRun {
+                namespace: submission.repository.clone(),
+                record,
+                jobs: submit_jobs,
+                workflow_concurrency,
+                empty_concurrency_group: empty_workflow_concurrency_group,
+                check_hostable: true,
+            })
+            .await
+            .map_err(ApiError::from)?;
 
-            // Full label validation against the co-hosted pool's advertised
-            // labels: when the pool has published them, a `runs-on` it can
-            // never satisfy fails at enqueue rather than starving in the
-            // queue. Skipped when the pool hasn't published (external-only
-            // deployments, or a pool that predates the field) — the
-            // starvation sweep remains the backstop there. Also skipped for
-            // jobs whose labels are still raw templates reading `needs.*`:
-            // their real labels only exist once the needed jobs complete, so
-            // there is nothing meaningful to validate yet.
-            let pool_labels = shared.state.pool_status.snapshot().labels;
-            let runs_on_deferred = queued_job
-                .runs_on
-                .iter()
-                .any(|label| preloop_gha_parser::eval::has_expressions(label));
-            if !runs_on_deferred
-                && !pool_labels.is_empty()
-                && !crate::runtime_scheduling::job_matches_runner(&queued_job.runs_on, &pool_labels)
-            {
-                let reason = format!(
-                    "the runner pool's advertised labels ({}) can never satisfy \
-                     `runs-on: {}`, so the job cannot be scheduled",
-                    pool_labels.join(", "),
-                    queued_job.runs_on.join(", ")
-                );
-                tracing::warn!(
-                    job = %job_id.0,
-                    labels = ?queued_job.runs_on,
-                    pool_labels = ?pool_labels,
-                    "runs-on unsatisfiable by runner pool; failing the job at enqueue"
-                );
-                unhostable_reasons.push((job_id.clone(), reason));
-                statuses.insert(job_id, ExecutionStatus::Failure);
-                continue;
-            }
-
-            let max_parallel = queued_job.max_parallel;
-            let under_mp = max_parallel
-                .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
-
-            // Fork-PR workflow policy: a run awaiting fork approval holds
-            // every job in pending_jobs until the operator approves the run.
-            // The needs-empty fast path must not bypass that hold by
-            // enqueueing straight to inner.queue (or parking in
-            // concurrency_blocked): the fork gate in promote_ready_jobs only
-            // inspects pending_jobs.
-            let fork_held = inner
-                .runs
-                .get(&run_id)
-                .is_some_and(|run| run.fork_approval_pending);
-            if needs_empty && under_mp && !fork_held {
-                // Job-level concurrency gate (needs/max_parallel already satisfied).
-                match try_enqueue_with_job_concurrency(
-                    &mut inner,
-                    &github,
-                    &submission,
-                    queued_job,
-                    &mut statuses,
-                ) {
-                    JobEnqueueOutcome::Ready => {
-                        shared
-                            .state
-                            .observability
-                            .metrics()
-                            .lifecycle
-                            .record_concurrency_decision("job", "accept");
-                        *ready_by_base.entry(base_id).or_default() += 1;
-                        ready_jobs += 1;
-                    }
-                    JobEnqueueOutcome::Parked => {
-                        shared
-                            .state
-                            .observability
-                            .metrics()
-                            .lifecycle
-                            .record_concurrency_decision("job", "pending");
-                        // parked pending
-                    }
-                    JobEnqueueOutcome::Rejected => {
-                        shared
-                            .state
-                            .observability
-                            .metrics()
-                            .lifecycle
-                            .record_concurrency_decision("job", "reject");
-                        // cancelled by queue overflow or eval failure already marked
-                    }
-                }
-            } else {
-                // Fork-held jobs wait visibly in Pending until the operator
-                // approves the run; everything else queues normally for the
-                // scheduler.
-                let status = if fork_held {
-                    ExecutionStatus::Pending
-                } else {
-                    ExecutionStatus::Queued
-                };
-                statuses.insert(job_id, status);
-                inner.pending_jobs.push_back(queued_job);
-            }
-        }
-
-        // Preserve terminal conclusions written through cancel_job_inner while
-        // gates were evaluated. Non-terminal scheduling state remains owned by
-        // the local status map and is installed below with the final record.
-        if let Some(provisional) = inner.runs.get(&run_id) {
-            for (job_id, status) in &provisional.jobs {
-                if status.is_terminal() {
-                    statuses.insert(job_id.clone(), *status);
-                }
-            }
-        }
-
-        // Only jobs with a runner left to wait for are queued. A job gated off
-        // by its `if:` is already terminal, and counting it told the submitter
-        // — and the `RunAccepted` event — that work was scheduled when none
-        // was.
-        let queued_jobs = statuses
-            .values()
-            .filter(|status| !status.is_terminal())
-            .count();
-        // C-05: derive the initial run status from job statuses so that eval
-        // failures (Failure) are reflected immediately rather than leaving the
-        // run permanently Queued. summarize_run returns InProgress for any mix
-        // of Queued/Pending jobs; map that to Queued since no job has started.
-        let initial_status = {
-            let s = summarize_run(statuses.values().copied());
-            if s == ExecutionStatus::InProgress {
-                ExecutionStatus::Queued
-            } else {
-                s
-            }
-        };
-        let snapshot_timing = workspace_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.snapshot_timing);
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: webhook_delivery_id.clone(),
-                run_name,
-                submission: Arc::new(submission),
-                jobs: statuses,
-                job_outputs: BTreeMap::new(),
-                job_base_ids,
-                job_needs,
-                caller_plans,
-                job_names,
-                github,
-                head_sha: sha,
-                workflow_ref,
-                workspace_snapshot,
-                job_fail_fast,
-                job_continue_on_error,
-                status: initial_status,
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls,
-                jobs_list: Vec::new(),
-                created_at,
-                started_at: None,
-                completed_at: None,
-                run_number,
-                run_attempt: 1,
-                workflow_path_str: workflow_path.clone(),
-                event: event.clone(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing,
-                fork_approval_pending,
-                fork_approval_requested_at_unix_nanos,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
-            },
-        );
-        // Deferred reusable-caller nodes whose needs are already satisfied
-        // (typically none) are reified by a first promote sweep: needs-free
-        // callers acquire their JobSet gates and materialize their callee
-        // subtree immediately.
-        promote_ready_jobs(
-            &mut inner,
-            &shared.state.environment_rules,
-            &shared.state.pool_status.snapshot().labels,
-        );
-        // A submission whose every job concluded before it reached the queue
-        // (all skipped by `if:`, or none hostable) never passes through the
-        // completion path, so nothing else would ever stamp `completed_at` and
-        // `conclusion`. Without this the run reports a terminal status while
-        // anything polling for completion waits forever.
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            runtime_scheduling::finalize_run_if_complete(run);
-        }
-        // The same run never reaches the completion path that releases
-        // run-level concurrency either: a holder taken for a run that concluded
-        // on arrival would park every later submission in its group.
-        if inner
-            .runs
-            .get(&run_id)
-            .is_some_and(|run| run.status.is_terminal())
-        {
-            runtime_scheduling::release_concurrency_for_run(&mut inner, run_id);
-        }
-        // The on-demand runner supervisor uses this atomic as its wake-up
-        // signal. Refresh it when submission makes work runnable; updating it
-        // only after a runner claims a job leaves a size-zero pool asleep
-        // forever on the first webhook-created run.
+        // Post-commit: refresh the node-local gauges that wake the runner
+        // supervisor, then fan out the events the outcome carries.
         shared
             .state
             .queue_depth
-            .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-        runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-        let cancel_count = inner.cancellation_queue.len();
-        drop(inner);
-        // The sweep above only recorded the intent to expand; the subtree build
-        // runs here with the lock released.
+            .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+        *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
+
+        if let Some(existing) = outcome.existing {
+            return Ok(RunAccepted {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: existing.jobs.len(),
+            });
+        }
+
+        // The expansion sweep runs with the lock released; it materializes
+        // deferred caller/matrix subtrees the submit only recorded.
         let expansion = drain_expansions(shared).await;
-        if ready_jobs > 0 || cancel_count > 0 || expansion.promoted > 0 {
+        if outcome.queued_jobs > 0 || expansion.promoted > 0 {
             shared.state.message_notify.notify_waiters();
         }
+
         for (event_run_id, job_id) in initially_skipped {
             shared
                 .state
@@ -2379,30 +1818,55 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 })
                 .await;
         }
-        // Surface why a job could never be scheduled. Without this the only
-        // record is a server-side log line the workflow author never sees.
-        for (job_id, reason) in unhostable_reasons {
+        for (job_id, status, reason) in &outcome.concluded {
             shared
                 .state
                 .emit(NdjsonEvent::JobStatus {
-                    run_id,
-                    job_id,
-                    status: ExecutionStatus::Failure,
-                    reason: Some(reason),
+                    run_id: outcome.run_id,
+                    job_id: job_id.clone(),
+                    status: *status,
+                    reason: reason.clone(),
                 })
                 .await;
         }
+
         shared
             .state
             .emit(NdjsonEvent::RunAccepted {
-                run_id,
-                queued_jobs,
+                run_id: outcome.run_id,
+                queued_jobs: outcome.queued_jobs,
             })
             .await;
+
+        if let Some(rejected) = outcome.rejected {
+            let reason = match rejected {
+                ExecutionStatus::Cancelled => crate::concurrency::cancelled_reason(),
+                ExecutionStatus::Pending => crate::concurrency::pending_reason(),
+                _ => Some("concurrency group name must not be empty".to_owned()),
+            };
+            shared
+                .state
+                .emit(NdjsonEvent::RunStatus {
+                    run_id: outcome.run_id,
+                    status: rejected,
+                    reason,
+                })
+                .await;
+        } else if outcome.held {
+            shared
+                .state
+                .emit(NdjsonEvent::RunStatus {
+                    run_id: outcome.run_id,
+                    status: ExecutionStatus::Pending,
+                    reason: crate::concurrency::pending_reason(),
+                })
+                .await;
+        }
+
         Ok(RunAccepted {
-            run_id,
-            run_number,
-            queued_jobs,
+            run_id: outcome.run_id,
+            run_number: outcome.run_number,
+            queued_jobs: outcome.queued_jobs,
         })
     }
 }
@@ -2459,77 +1923,75 @@ pub async fn submit_run(
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
         let run_id = accepted.run_id;
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.push_state = Some(PushState {
-                status: PushStatus::Pending,
-                error: None,
-                pr_number: None,
-                effective_sha: None,
-            });
-        }
-        drop(inner);
-
         if clean_push_checks {
-            // Report queued check runs for every job in a detached task, so
-            // submitting a run with --push does not stall the CLI client on
-            // sequential GitHub Check API calls. Jobs resolved terminal at
-            // submission get their completion reported immediately.
-            let (repository, sha, jobs) = {
-                let mut inner = shared.state.inner.lock().await;
-                // Stamped before filtering: an all-expandable push reports
-                // nothing at intake yet still needs the flag for its
-                // materialized legs.
-                if let Some(run) = inner.runs.get_mut(&run_id) {
-                    run.reports_check_runs = true;
-                }
-                let Some(run) = inner.runs.get(&run_id) else {
-                    return Ok(Json(accepted));
-                };
-                (
-                    run.submission.repository.clone(),
-                    run.submission.sha.clone(),
-                    // Expandable nodes (deferred matrices, reusable callers)
-                    // mint no check at intake; their materialized legs do.
-                    run.jobs
-                        .keys()
-                        .filter(|job_id| {
-                            !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
+            // Report queued check runs for every job, exactly like the
+            // webhook adapter does for delivered events, so GitHub shows the
+            // run from the moment it is accepted. Jobs resolved terminal at
+            // submission (skipped, unsatisfiable needs) get their completion
+            // immediately.
+            let snap = shared
+                .state
+                .backend
+                .read(move |tx| {
+                    Ok(tx.runs.get(&run_id).map(|run| {
+                        (
+                            run.submission.repository.clone(),
+                            run.submission.sha.clone(),
+                            run.jobs.keys().cloned().collect::<Vec<_>>(),
+                        )
+                    }))
+                })
+                .await
+                .map_err(ApiError::from)?;
+            let Some((repository, sha, jobs)) = snap else {
+                return Ok(Json(accepted));
             };
-            let reporter = Arc::clone(&shared);
-            tokio::spawn(async move {
-                for job_id in &jobs {
-                    if let Err(error) = crate::github::report_check_run_queued(
-                        &reporter,
-                        &repository,
-                        &sha,
-                        job_id,
-                        run_id,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
-                    }
-                    let status = {
-                        let inner = reporter.state.inner.lock().await;
-                        inner
+            for job_id in &jobs {
+                if let Err(error) = crate::github::report_check_run_queued(
+                    &shared,
+                    &repository,
+                    &sha,
+                    job_id,
+                    run_id,
+                )
+                .await
+                {
+                    tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                }
+                let jid = job_id.clone();
+                let status = shared
+                    .state
+                    .backend
+                    .read(move |tx| {
+                        Ok(tx
                             .runs
                             .get(&run_id)
-                            .and_then(|run| run.jobs.get(job_id).copied())
-                    };
-                    if let Some(status) = status.filter(|status| status.is_terminal()) {
-                        crate::github::report_check_run_completed(
-                            &reporter, run_id, job_id, status,
-                        )
+                            .and_then(|run| run.jobs.get(&jid).copied()))
+                    })
+                    .await
+                    .map_err(ApiError::from)?;
+                if let Some(status) = status.filter(|status| status.is_terminal()) {
+                    crate::github::report_check_run_completed(&shared, run_id, job_id, status)
                         .await;
-                    }
                 }
-            });
+            }
         }
+        shared
+            .state
+            .backend
+            .transact(move |tx| {
+                if let Some(run) = tx.runs.get_mut(&run_id) {
+                    run.push_state = Some(PushState {
+                        status: PushStatus::Pending,
+                        error: None,
+                        pr_number: None,
+                        effective_sha: None,
+                    });
+                }
+                Ok(())
+            })
+            .await
+            .map_err(ApiError::from)?;
     }
     Ok(Json(accepted))
 }
@@ -2599,7 +2061,6 @@ pub fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>)
 /// broker and results/timeline services use to track the delivered request.
 pub struct BuiltJobArtifacts {
     pub agent_msg: azdo::AgentJobRequestMessage,
-    pub request_id: i64,
     pub job_request: TaskAgentJobRequestRecord,
     pub id_token_granted: bool,
     pub oidc_ctx: OidcJobContext,
@@ -2790,7 +2251,6 @@ pub fn build_job_artifacts(
         preloop_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
             job,
             normalized_github,
-            &job.env,
             merged_secrets,
             &submission.vars,
         )
@@ -2815,11 +2275,13 @@ pub fn build_job_artifacts(
         );
     }
 
-    // Pre-allocate request ID atomically (no lock needed).
-    let request_id = shared
-        .state
-        .next_request_id
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The request id is the `job_requests` primary key; it is minted inside
+    // the writer transaction (`submit_run_tx`/`register_expanded_jobs`) under
+    // the cross-process writer lock, not here — a process-local atomic would
+    // let two engines sharing one database allocate the same id. Stamp the
+    // placeholder the transaction overwrites on both the message and the
+    // request record.
+    let request_id = 0;
     agent_msg.request_id = request_id;
 
     // Mint tokens outside the lock (HMAC computation).
@@ -3118,7 +2580,6 @@ pub fn build_job_artifacts(
 
     Ok(BuiltJobArtifacts {
         agent_msg,
-        request_id,
         job_request,
         id_token_granted,
         oidc_ctx,
@@ -3132,17 +2593,17 @@ pub fn build_job_artifacts(
 /// the highest one is the newest dispatch. `None` when the job was never
 /// dispatched (skipped or cancelled before a request was built).
 pub fn latest_attempt_steps(
-    inner: &crate::state::InnerState,
+    tx: &crate::control::txstate::TxState,
     run_id: RunId,
     job_id: &JobId,
 ) -> Option<Vec<StepRecord>> {
-    let agent_job_id = inner
+    let agent_job_id = tx
         .job_requests
         .values()
         .filter(|request| request.run_id == run_id && request.job_id == *job_id)
         .max_by_key(|request| request.request_id)
         .map(|request| request.agent_job_id)?;
-    let mut steps = inner.job_steps.get(&agent_job_id).cloned()?;
+    let mut steps = tx.job_steps.get(&agent_job_id).cloned()?;
     // The stored vector is seeded-then-appended, so it is not execution order.
     StepRecord::sort_execution_order(&mut steps);
     Some(steps)
@@ -3154,7 +2615,7 @@ pub fn latest_attempt_steps(
 /// attempt-scoped manifest rather than in the stored run, so a caller that
 /// clones `inner.runs` directly returns empty step arrays — which is exactly
 /// what the list endpoint did.
-pub fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunRecord {
+pub fn project_run(tx: &crate::control::txstate::TxState, mut run: RunRecord) -> RunRecord {
     let run_id = run.run_id;
 
     // GitHub's run record shows a gate-passed reusable caller only as its
@@ -3201,12 +2662,30 @@ pub fn project_run(inner: &crate::state::InnerState, mut run: RunRecord) -> RunR
             // Steps live in the attempt-scoped manifest, so the run record
             // shows the newest attempt: a retry supersedes what the previous
             // dispatch reported.
-            if let Some(manifest) = latest_attempt_steps(inner, run_id, job_id) {
+            if let Some(manifest) = latest_attempt_steps(tx, run_id, job_id) {
                 detail.steps = manifest;
             }
             detail
         })
         .collect();
+
+    // The stored status collapses `Queued`/`Pending`/`InProgress` into
+    // `InProgress` (summarize_run). The wire must distinguish a run still
+    // waiting for a runner (`queued`) from one held on a concurrency slot
+    // (`pending`) — neither has a started job. A run in `held_runs` is
+    // `pending`; a runnable run with no `InProgress` job is `queued`.
+    if run.status == ExecutionStatus::InProgress
+        && !run
+            .jobs
+            .values()
+            .any(|status| matches!(status, ExecutionStatus::InProgress))
+    {
+        run.status = if tx.held_runs.contains_key(&run_id) {
+            ExecutionStatus::Pending
+        } else {
+            ExecutionStatus::Queued
+        };
+    }
 
     run
 }
@@ -3215,13 +2694,21 @@ pub async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    Ok(Json(project_run(&inner, run)))
+    // Scoped to this run — `project_run` reads `held_runs`/`job_steps`/
+    // `job_requests`, all of which load under `runs: {run_id}`.
+    let scope = crate::control::txstate::TxScope::run(run_id);
+    shared
+        .state
+        .backend
+        .read_scoped(&scope, move |tx| {
+            let run = tx.runs.get(&run_id).cloned().ok_or_else(|| {
+                crate::control::ControlError::NotFound("run not found".to_owned())
+            })?;
+            Ok(project_run(tx, run))
+        })
+        .await
+        .map(Json)
+        .map_err(ApiError::from)
 }
 
 /// Browser-safe status page linked from GitHub Check Runs.
@@ -3233,10 +2720,13 @@ pub async fn get_public_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<axum::response::Html<String>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
+    let scope = crate::control::txstate::TxScope::run(run_id);
+    let run = shared
+        .state
+        .backend
+        .read_scoped(&scope, move |tx| Ok(tx.runs.get(&run_id).cloned()))
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
 
     let jobs = run
@@ -3303,54 +2793,59 @@ pub async fn list_runs(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<RunRecord>>, ApiError> {
-    let inner = shared.state.inner.lock().await;
     let limit = query.limit.unwrap_or(50).min(200);
-
-    let mut runs: Vec<RunRecord> = inner
-        .runs
-        .values()
-        .filter(|run| {
-            if let Some(workflow) = &query.workflow
-                && !run.workflow_path_str.contains(workflow)
-            {
-                return false;
-            }
-            if let Some(status) = &query.status {
-                let run_status = serde_json::to_value(run.status)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                if run_status != *status {
-                    return false;
-                }
-            }
-            if let Some(event) = &query.event
-                && run.event != *event
-            {
-                return false;
-            }
-            true
+    let runs = shared
+        .state
+        .backend
+        .read(move |tx| {
+            let mut runs: Vec<RunRecord> = tx
+                .runs
+                .values()
+                .filter(|run| {
+                    if let Some(workflow) = &query.workflow {
+                        if !run.workflow_path_str.contains(workflow) {
+                            return false;
+                        }
+                    }
+                    if let Some(status) = &query.status {
+                        let run_status = serde_json::to_value(run.status)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default();
+                        if run_status != *status {
+                            return false;
+                        }
+                    }
+                    if let Some(event) = &query.event {
+                        if run.event != *event {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            runs.sort_by(|a, b| {
+                a.status
+                    .is_terminal()
+                    .cmp(&b.status.is_terminal())
+                    .then_with(|| {
+                        let a_time = a.completed_at.or(a.started_at).unwrap_or(a.created_at);
+                        let b_time = b.completed_at.or(b.started_at).unwrap_or(b.created_at);
+                        b_time.cmp(&a_time)
+                    })
+            });
+            runs.truncate(limit);
+            // Same projection as the single-run endpoint: steps live in the
+            // attempt manifest, so cloning the stored run alone returns
+            // empty step arrays.
+            Ok(runs
+                .into_iter()
+                .map(|run| project_run(tx, run))
+                .collect::<Vec<_>>())
         })
-        .cloned()
-        .collect();
-    runs.sort_by(|a, b| {
-        a.status
-            .is_terminal()
-            .cmp(&b.status.is_terminal())
-            .then_with(|| {
-                let a_time = a.completed_at.or(a.started_at).unwrap_or(a.created_at);
-                let b_time = b.completed_at.or(b.started_at).unwrap_or(b.created_at);
-                b_time.cmp(&a_time)
-            })
-    });
-    runs.truncate(limit);
-    let runs = runs
-        .into_iter()
-        // Same projection as the single-run endpoint: steps live in the
-        // attempt manifest, so cloning the stored run alone returns empty
-        // step arrays.
-        .map(|run| project_run(&inner, run))
-        .collect();
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(runs))
 }
@@ -3604,47 +3099,69 @@ pub async fn get_run_logs(
     Path(run_id): Path<RunId>,
     Query(query): Query<RunLogsQuery>,
 ) -> Result<Response, ApiError> {
-    let (state_dir, sources) = {
-        let inner = shared.state.inner.lock().await;
-        if !inner.runs.contains_key(&run_id) {
-            return Err(ApiError::not_found("run not found"));
-        }
+    // Backend state: run existence, the run's job requests, and each request's
+    // step manifest. `inner.logs` (console blocks) is node-local and read
+    // separately below.
+    let job_filter = query.job.clone();
+    let step_requested = query.step.is_some();
+    let (requests, manifests) = shared
+        .state
+        .backend
+        .read(move |tx| {
+            if !tx.runs.contains_key(&run_id) {
+                return Err(crate::control::ControlError::NotFound(
+                    "run not found".to_owned(),
+                ));
+            }
+            let mut requests: Vec<TaskAgentJobRequestRecord> = tx
+                .job_requests
+                .values()
+                .filter(|request| request.run_id == run_id)
+                .cloned()
+                .collect();
+            requests.sort_by_key(|request| request.request_id);
 
-        let mut requests: Vec<&TaskAgentJobRequestRecord> = inner
-            .job_requests
-            .values()
-            .filter(|request| request.run_id == run_id)
-            .collect();
-        requests.sort_by_key(|request| request.request_id);
-
-        if let Some(job) = &query.job {
-            // Same matching rule as the live-log feed: workflow job key or
-            // agent job UUID, so one value works across both surfaces.
-            requests.retain(|request| {
-                request.job_id.0 == *job || request.agent_job_id.to_string() == *job
-            });
-            if requests.is_empty() {
-                return Err(ApiError::not_found(format!(
-                    "job `{job}` not found in this run"
+            if let Some(job) = &job_filter {
+                // Same matching rule as the live-log feed: workflow job key
+                // or agent job UUID, so one value works across both surfaces.
+                requests.retain(|request| {
+                    request.job_id.0 == *job || request.agent_job_id.to_string() == *job
+                });
+                if requests.is_empty() {
+                    return Err(crate::control::ControlError::NotFound(format!(
+                        "job `{job}` not found in this run"
+                    )));
+                }
+            } else if step_requested && requests.len() > 1 {
+                // Numbering restarts per job, so an unqualified step in a
+                // multi-job run names more than one thing.
+                let jobs: Vec<&str> = requests
+                    .iter()
+                    .map(|request| request.job_id.0.as_str())
+                    .collect();
+                return Err(crate::control::ControlError::BadRequest(format!(
+                    "`step` needs `job` when a run has {} jobs: {}",
+                    jobs.len(),
+                    jobs.join(", ")
                 )));
             }
-        } else if query.step.is_some() && requests.len() > 1 {
-            // Numbering restarts per job, so an unqualified step in a
-            // multi-job run names more than one thing.
-            let jobs: Vec<&str> = requests
-                .iter()
-                .map(|request| request.job_id.0.as_str())
-                .collect();
-            return Err(ApiError::bad_request(format!(
-                "`step` needs `job` when a run has {} jobs: {}",
-                jobs.len(),
-                jobs.join(", ")
-            )));
-        }
 
-        let sources = requests
-            .into_iter()
-            .map(|request| {
+            let manifests = requests
+                .iter()
+                .map(|request| tx.job_steps.get(&request.agent_job_id).cloned())
+                .collect::<Vec<_>>();
+            Ok((requests, manifests))
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    // Node-local console blocks, keyed `plan_id/log_id`.
+    let sources = {
+        let inner = shared.state.inner.lock().await;
+        requests
+            .iter()
+            .zip(manifests.iter())
+            .map(|(request, manifest)| {
                 let prefix = format!("{}/", request.plan_id);
                 let mut blocks: Vec<(&str, &[u8])> = inner
                     .logs
@@ -3662,18 +3179,12 @@ pub async fn get_run_logs(
                         (Err(_), Err(_)) => left.cmp(right),
                     }
                 });
-                // The attempt's own manifest, keyed by the agent job id that
-                // also names this request's results directory. The broker
-                // message is deliberately not consulted — it is broker
-                // delivery state that a restart or a retirement can drop,
-                // while the manifest is run state.
-                //
                 // Two views: declared steps in workflow order decide `--step`,
                 // because a synthetic "Set up job" record must not occupy a
                 // slot; every id in execution order decides the whole-job
                 // concatenation, where synthetic output belongs in place.
-                let manifest = inner.job_steps.get(&request.agent_job_id);
                 let workflow_step_ids = manifest
+                    .as_ref()
                     .map(|records| {
                         StepRecord::workflow_steps(records)
                             .into_iter()
@@ -3682,6 +3193,7 @@ pub async fn get_run_logs(
                     })
                     .filter(|ids| !ids.is_empty());
                 let execution_step_ids = manifest
+                    .as_ref()
                     .map(|records| {
                         let mut ordered = records.clone();
                         StepRecord::sort_execution_order(&mut ordered);
@@ -3700,9 +3212,9 @@ pub async fn get_run_logs(
                     execution_step_ids,
                 )
             })
-            .collect::<Vec<_>>();
-        (shared.state.state_dir.clone(), sources)
+            .collect::<Vec<_>>()
     };
+    let state_dir = shared.state.state_dir.clone();
 
     let mut merged = Vec::new();
     for (
@@ -3743,35 +3255,47 @@ pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    if !inner.runs.contains_key(&run_id) {
-        return Err(ApiError::not_found("run not found"));
-    }
-    let cancellation_count =
-        cancel_run_inner(&mut inner, run_id, None /* no concurrency reason */);
-    let cancelled_jobs = {
-        let run = inner
-            .runs
-            .get_mut(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-        runtime_scheduling::finalize_run_if_complete(run);
-        run.jobs
-            .iter()
-            .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
-            .map(|(job_id, _)| job_id.clone())
-            .collect::<Vec<_>>()
-    };
-    let record = inner
-        .runs
-        .get(&run_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let (cancellation_count, cancelled_jobs, record, queue_depth, next_runs_on) = shared
+        .state
+        .backend
+        .transact(move |tx| {
+            if !tx.runs.contains_key(&run_id) {
+                return Err(crate::control::ControlError::NotFound(
+                    "run not found".to_owned(),
+                ));
+            }
+            let cancellation_count = crate::control::sched::cancel_run_inner(tx, run_id, None);
+            let cancelled_jobs = tx
+                .runs
+                .get(&run_id)
+                .map(|run| {
+                    run.jobs
+                        .iter()
+                        .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
+                        .map(|(job_id, _)| job_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let record = tx.runs.get(&run_id).cloned().ok_or_else(|| {
+                crate::control::ControlError::NotFound("run not found".to_owned())
+            })?;
+            let queue_depth = tx.ready_index.len();
+            let next_runs_on = crate::control::sched::next_job_labels(tx);
+            Ok((
+                cancellation_count,
+                cancelled_jobs,
+                record,
+                queue_depth,
+                next_runs_on,
+            ))
+        })
+        .await
+        .map_err(ApiError::from)?;
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    drop(inner);
+        .store(queue_depth, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
     }
@@ -3931,25 +3455,32 @@ pub async fn rerun_run_inner(
     run_id: RunId,
     reused_check_run: Option<(JobId, u64)>,
 ) -> Result<RunAccepted, ApiError> {
-    let submission = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .map(|run| (*run.submission).clone())
-            .ok_or_else(|| ApiError::not_found("run not found"))?
-    };
+    let submission = shared
+        .state
+        .backend
+        .read(move |tx| Ok(tx.runs.get(&run_id).map(|run| (*run.submission).clone())))
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
     let accepted = submit_run_inner(shared, submission).await?;
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
-        {
-            let mut inner = shared.state.inner.lock().await;
-            if let Some(run) = inner.runs.get_mut(&accepted.run_id)
-                && run.jobs.contains_key(job_id)
-            {
-                run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
-            }
-        }
+        let new_run = accepted.run_id;
+        let jid = job_id.clone();
+        let check_run_id = *check_run_id;
+        shared
+            .state
+            .backend
+            .transact(move |tx| {
+                if let Some(run) = tx.runs.get_mut(&new_run) {
+                    if run.jobs.contains_key(&jid) {
+                        run.job_check_run_ids.insert(jid.clone(), check_run_id);
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(ApiError::from)?;
         // Same persistence obligation as `report_check_run_queued`: the
         // reused check id must survive a restart before the job's first
         // status event.
@@ -4078,32 +3609,37 @@ pub async fn run_events(
     // de-duplicate, and applying a status twice is idempotent.
     let receiver = shared.state.events.subscribe();
 
-    let (snapshot, settled) = {
-        let inner = shared.state.inner.lock().await;
-        let run = inner
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-        let mut out = event_to_ndjson(&NdjsonEvent::RunStatus {
+    // Backend: run status + job statuses. Node-local: the timeline-event
+    // buffer (`inner.timeline_events`). Read them under their own owners.
+    let run = shared
+        .state
+        .backend
+        .read(move |tx| Ok(tx.runs.get(&run_id).cloned()))
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let mut snapshot = event_to_ndjson(&NdjsonEvent::RunStatus {
+        run_id,
+        status: run.status,
+        reason: None,
+    })?;
+    for (job_id, status) in &run.jobs {
+        snapshot.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
             run_id,
-            status: run.status,
+            job_id: job_id.clone(),
+            status: *status,
             reason: None,
-        })?;
-        for (job_id, status) in &run.jobs {
-            out.push_str(&event_to_ndjson(&NdjsonEvent::JobStatus {
-                run_id,
-                job_id: job_id.clone(),
-                status: *status,
-                reason: None,
-            })?);
-        }
+        })?);
+    }
+    {
+        let inner = shared.state.inner.lock().await;
         if let Some(events) = inner.timeline_events.get(&run_id) {
             for event in events {
-                out.push_str(&event_to_ndjson(event)?);
+                snapshot.push_str(&event_to_ndjson(event)?);
             }
         }
-        (out, run.status.is_terminal())
-    };
+    }
+    let settled = run.status.is_terminal();
 
     let body = if settled {
         Body::from(snapshot)
@@ -4216,7 +3752,7 @@ mod tests {
         assert_eq!(first.run_number, 1);
         assert_eq!(second.run_number, 1);
 
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
         assert_eq!(
             inner
@@ -4523,6 +4059,8 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .output()
             .expect("git runs in tests");
@@ -4581,7 +4119,7 @@ mod tests {
         };
         let accepted = submit_run_inner(&shared, submission).await.unwrap();
 
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
         let snapshot = run
             .workspace_snapshot
