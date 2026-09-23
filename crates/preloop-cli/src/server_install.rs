@@ -1537,6 +1537,11 @@ fn render_launchd_plist(exe: &Path, home: &Path, env_lines: &[String]) -> Result
             xml_escape(value)
         ));
     }
+    // `ProcessType` is Interactive, not Background: launchd applies
+    // background QoS to the whole process tree, and every runner VM is a
+    // child of the engine. Under Background the VMs ran on throttled
+    // efficiency cores with throttled I/O — a guest shell loop measured ~20x
+    // slower than on the host — and CI jobs blew through their timeouts.
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1557,7 +1562,7 @@ fn render_launchd_plist(exe: &Path, home: &Path, env_lines: &[String]) -> Result
     <key>KeepAlive</key>
     <true/>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>{home}/server.log</string>
     <key>StandardErrorPath</key>
