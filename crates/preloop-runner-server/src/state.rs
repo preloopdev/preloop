@@ -273,6 +273,39 @@ impl AppState {
             shutdown: CancellationToken::new(),
         })
     }
+
+    /// Read the authoritative scheduling working set for assertions. Tests
+    /// previously locked `inner` and read its scheduling fields directly;
+    /// those fields now live on `TxState` behind the backend.
+    pub(crate) async fn test_tx(&self) -> crate::control::txstate::TxState {
+        self.backend
+            .read(|tx| Ok(tx.clone()))
+            .await
+            .expect("test_tx read failed")
+    }
+
+    /// Run a mutation against the authoritative `TxState` in a test.
+    pub(crate) async fn test_tx_mutate<R>(
+        &self,
+        f: impl FnOnce(&mut crate::control::txstate::TxState) -> R + Send,
+    ) -> R {
+        self.backend
+            .transact(|tx| Ok(f(tx)))
+            .await
+            .expect("test_tx_mutate failed")
+    }
+
+    /// Read under an explicit `TxScope` for tests that exercise narrow loads.
+    /// Returns the loaded working set so assertions can inspect it directly.
+    pub(crate) async fn test_tx_scoped(
+        &self,
+        scope: &crate::control::txstate::TxScope,
+    ) -> crate::control::txstate::TxState {
+        self.backend
+            .read_scoped(scope, |tx| Ok(tx.clone()))
+            .await
+            .expect("test_tx_scoped failed")
+    }
 }
 
 /// Who may register a runner with the control plane.
@@ -449,10 +482,6 @@ pub struct AppState {
     /// constant so tests can drive the retry path without sleeping through the
     /// real tiers.
     pub webhook_retry_backoff: Vec<std::time::Duration>,
-    /// Atomic counter for pre-allocating request IDs outside the dispatch
-    /// lock.  Monotonically increases; the inner counter is no longer the
-    /// source of truth once this is in use.
-    pub next_request_id: Arc<std::sync::atomic::AtomicI64>,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -943,9 +972,8 @@ impl AppState {
         };
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
-        store
-            .load_into(&mut recovered, &config.environment_rules)
-            .await?;
+        let mut recovered_tx = crate::control::txstate::TxState::default();
+        store.load_into(&mut recovered_tx, &mut recovered, &config.environment_rules).await?;
         // An attempt dispatched but not yet reported has no persisted step
         // rows: seeding happens in memory, and only a runner report writes
         // them. The request message it was built from *is* persisted, so
@@ -954,21 +982,21 @@ impl AppState {
         //
         // Two homes, depending on how far the job got: `broker_messages` once
         // a runner claimed it, and the queue row's own copy before that.
-        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered
+        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered_tx
             .job_requests
             .values()
-            .filter(|record| !recovered.job_steps.contains_key(&record.agent_job_id))
+            .filter(|record| !recovered_tx.job_steps.contains_key(&record.agent_job_id))
             .filter_map(|record| {
-                let steps = recovered
+                let steps = recovered_tx
                     .broker_messages
                     .get(&record.request_id)
                     .map(|message| message.steps.as_slice())
                     .or_else(|| {
-                        recovered
-                            .queue
+                        recovered_tx
+                            .ready_index
                             .iter()
-                            .chain(recovered.pending_jobs.iter())
-                            .chain(recovered.concurrency_blocked.iter())
+                            .chain(recovered_tx.pending_jobs.iter())
+                            .chain(recovered_tx.concurrency_blocked.iter())
                             // Keyed by request id, not by (run, job): a
                             // re-dispatch leaves several requests for one
                             // logical job, and matching the pair attaches the
@@ -988,20 +1016,13 @@ impl AppState {
                 "rebuilt step manifests from persisted job request messages"
             );
         }
-        recovered.job_steps.extend(rebuilt);
-        let next_request_id = recovered
-            .job_requests
-            .keys()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        recovered_tx.job_steps.extend(rebuilt);
         let inner = recovered;
         // Seed the terminal-transition marker from the restored run record so
         // a replayed terminal `JobStatus` after a restart cannot double-record
         // `preloop.job.completed` for a job that already completed.
         let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
-            inner
+            recovered_tx
                 .runs
                 .iter()
                 .flat_map(|(run_id, run)| {
@@ -1014,7 +1035,7 @@ impl AppState {
         ));
         // Capture queue length before moving `inner` into the Mutex so the
         // `queue_depth` atomic is set to the recovered ready-queue size.
-        let recovered_queue_len = inner.queue.len();
+        let recovered_queue_len = recovered_tx.ready_index.len();
         let local_workspace = std::env::var("PRELOOP_LOCAL_WORKSPACE")
             .ok()
             .map(PathBuf::from);
@@ -1164,12 +1185,22 @@ impl AppState {
             crate::control::Backend::open(
                 store_url,
                 &state_dir,
-                inner.pool_assignments_enabled,
-                inner.require_job_assignments,
+                crate::store::Envelope::new(&local_jwt_key),
+                recovered_tx.pool_assignments_enabled,
+                recovered_tx.require_job_assignments,
                 inner.runner_liveness_timeout,
             )
             .await?,
         );
+        // One-time legacy→control import: seed the control schema from the
+        // recovered `TxState` only when it is empty (a fresh control.db), then
+        // reconcile orphaned claims/sessions. Both run before the state is
+        // exposed so no dispatch sees un-reconciled or un-imported work.
+        // `import_from_tx_if_empty` is atomic + idempotent — a restart
+        // against a populated control.db skips the import and only
+        // reconciles.
+        backend.import_from_tx_if_empty(recovered_tx).await?;
+        crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             backend,
@@ -1181,7 +1212,6 @@ impl AppState {
             github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
-            next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),
@@ -1338,20 +1368,22 @@ impl AppState {
         // it: a slow or unavailable backend must not stall the control plane
         // (runner polling, heartbeats, other state mutations).
         if let Some(run_id) = run_id {
-            let projection = {
-                let mut inner = self.inner.lock().await;
-                // A terminal RunStatus means this run just completed — bound
-                // retained completed-run records before projecting so the
-                // heap cannot grow one RunRecord (~1 MiB) per run forever.
-                if event.terminal_run_status().is_some() {
-                    crate::memory_caps::trim_completed_runs(&mut inner);
+            let projection = self
+                .backend
+                .read(|tx| {
+                    Ok(crate::store::RunProjection::from_tx(
+                        tx,
+                        run_id,
+                        event.clone(),
+                    ))
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(projection) = projection {
+                if let Err(error) = self.store.store_run_event(projection).await {
+                    error!(?error, %run_id, "failed to persist control-plane run event");
                 }
-                crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
-            };
-            if let Some(projection) = projection
-                && let Err(error) = self.store.store_run_event(projection).await
-            {
-                error!(?error, %run_id, "failed to persist control-plane run event");
             }
         }
         if !has_run_projection && let Err(error) = self.store.append_event(&event).await {
@@ -1536,87 +1568,14 @@ pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<
     Ok(key)
 }
 
-impl InnerState {
-    /// Return the runner that owns a listener session.
-    pub fn runner_id_for_session(&self, session_id: &str) -> Option<i64> {
-        self.broker_session_runners
-            .get(session_id)
-            .copied()
-            .or_else(|| {
-                self.sessions
-                    .get(session_id)
-                    .map(|session| session.runner_id)
-            })
-    }
-
-    /// Look up dispatch metadata for the runner that owns a given session.
-    pub fn runner_capabilities_for_session(&self, session_id: &str) -> RunnerCapabilities {
-        self.runner_id_for_session(session_id)
-            .and_then(|runner_id| self.runners.get(&runner_id))
-            .map(|runner| RunnerCapabilities {
-                known: true,
-                labels: runner.labels.clone(),
-                runner_group_id: runner.runner_group_id,
-                runner_group_name: runner.runner_group_name.clone(),
-            })
-            .unwrap_or_default()
-    }
-
-    /// Record that a runner session just polled the control plane.
-    ///
-    /// The liveness sweep purges runners whose sessions have not polled
-    /// within [`InnerState::runner_liveness_timeout`]: a session that goes
-    /// silent is a deaf runner (its in-guest control bridge died), and its
-    /// unfinished job must be requeued to a fresh machine instead of sitting
-    /// in_progress until the job-lease reaper fails it 45 minutes later.
-    pub fn mark_session_seen(&mut self, session_id: &str) {
-        self.session_last_seen
-            .insert(session_id.to_owned(), std::time::Instant::now());
-    }
-}
-
 #[derive(Default)]
 pub struct InnerState {
     /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
     pub metadata_revision: std::sync::atomic::AtomicU64,
-    pub runs: BTreeMap<RunId, RunRecord>,
-    pub workflow_run_counters: BTreeMap<String, u64>,
     /// Webhook run submissions currently building outside the state lock.
     /// Entries prevent a replay from doing the same expensive work twice.
     pub webhook_run_reservations: BTreeSet<(String, String)>,
-    pub queue: VecDeque<QueuedJob>,
-    /// When each ready-queue job was first seen by the reaper, used to fail
-    /// jobs no runner can ever claim. Maintained by the reaper itself, so it
-    /// needs no enqueue-site coordination: entries are inserted on first
-    /// observation and dropped when the job leaves the queue.
-    pub queued_at: BTreeMap<(RunId, JobId), std::time::SystemTime>,
-    pub pending_jobs: VecDeque<QueuedJob>,
-    /// Reusable-caller and dynamic-matrix nodes whose gates are already held
-    /// and whose callee subtree still has to be built.
-    ///
-    /// Building a subtree parses workflow YAML, constructs one runner message
-    /// per inner job and mints a runtime token for each, so it scales with the
-    /// width of the callee matrix. Doing that while holding the global state
-    /// mutex stalls every other request, so promotion only records the intent
-    /// here; `drain_expansions` performs the work with the lock released and
-    /// applies the result under a fresh one.
-    pub pending_expansions: VecDeque<QueuedJob>,
-    /// Nodes currently being expanded with the lock released.
-    ///
-    /// The entry is the reservation: it stops a second sweep from expanding
-    /// the same node, and cancellation drops it so a build that finishes after
-    /// the run was cancelled is discarded instead of resurrecting jobs.
-    pub expanding: BTreeSet<(RunId, JobId)>,
-    /// Serializes GitHub check-run creation per run. Creation races — an
-    /// expansion mint, a claim-time in-progress report, and a completion
-    /// report for the same job can all decide to mint at once — and GitHub
-    /// allows duplicate check runs for the same name+SHA, which would leave
-    /// one stale `queued` check forever. Only minting takes this lock;
-    /// status PATCHes never do.
     pub check_run_mint_locks: BTreeMap<RunId, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    pub runner_registered_at: BTreeMap<i64, std::time::Instant>,
-    pub runners: BTreeMap<i64, RegisteredRunner>,
-    pub sessions: BTreeMap<String, RunnerSession>,
     /// When each runner session last polled. In-memory only: sessions are
     /// ephemeral and re-created by runners, so nothing is persisted here.
     /// Restored sessions from a restart have no entry and are left to the
@@ -1626,50 +1585,10 @@ pub struct InnerState {
     /// purges its runner. Env: `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS`
     /// (default 1800).
     pub runner_liveness_timeout: std::time::Duration,
-    pub session_keys: BTreeMap<String, SessionEncryption>,
     // test-only: retained for session encryption integration coverage.
     #[allow(dead_code)]
     pub agent_keypair: Option<AgentRsaKeypair>,
     pub runner_public_keys: BTreeMap<i64, String>,
-    pub runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
-    pub inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
-    pub broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
-    /// Short-lived GitHub App credentials still to mint at broker acquisition.
-    pub github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
-    pub runner_client_ids: BTreeMap<String, i64>,
-    pub cancellation_queue: VecDeque<QueuedCancellation>,
-    /// Job → runner pairings. While an entry is fresh, the job may only be
-    /// claimed by sessions presenting a verified listen-token identity for
-    /// that runner. Entries are consumed on successful claim and dropped on
-    /// runner deregistration, requeue, or run teardown.
-    pub job_assignments: BTreeMap<(RunId, JobId), AssignmentRecord>,
-    /// Pool-managed jobs that are queued but not yet paired with a registered
-    /// runner (a machine is being provisioned for them). While fresh, these
-    /// cannot be claimed at all — the wait protects against a rogue session
-    /// claiming the job before its machine registers.
-    pub pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
-    /// Runners that proved themselves with a provision token at registration,
-    /// keyed by runner id. Pool-managed jobs must pair with one of these
-    /// (or a machine the pool itself provisioned) rather than an external
-    /// runner that registered before the job was queued.
-    pub pool_proven_runners: BTreeSet<i64>,
-    /// Set when the embedded runner pool provisions machines for queued jobs
-    /// (the `preloop serve` flow). Enables assignment enforcement for newly
-    /// queued jobs.
-    pub pool_assignments_enabled: bool,
-    /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: when true, jobs may only be claimed
-    /// through an assignment; unassigned jobs are never delivered, even to
-    /// external runners. Default false keeps bring-your-own-runner installs
-    /// working unchanged.
-    pub require_job_assignments: bool,
-    /// Observable counter of stale job bindings released back to waitlist or expired.
-    pub released_bindings_count: u64,
-    /// Jobs popped from the queue by a dispatch claim, keyed for requeueing:
-    /// if the runner that claimed a job dies mid-execution (machine torn down,
-    /// identity purged), the stashed copy is what gets the same job back into
-    /// the queue intact instead of waiting for the lease reaper to fail it.
-    /// Entries drop on normal completion.
-    pub claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
     pub pending_caches: BTreeMap<i64, PendingCache>,
     pub artifacts: BTreeMap<String, ArtifactRecord>,
     pub logs: BTreeMap<String, Vec<u8>>,
@@ -1691,41 +1610,17 @@ pub struct InnerState {
     /// ends, instead of subscribing to a channel that will never speak again.
     /// Cleared if the same key ingests fresh lines (a retry reusing the job).
     pub live_log_closed: std::collections::BTreeSet<String>,
-    pub inflight_requests: BTreeMap<i64, (RunId, JobId)>,
-    pub job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
-    /// Step records per job attempt, keyed by `agent_job_id`.
-    ///
-    /// Authoritative for both the run record's step projection and `--step`
-    /// log selection. Keyed by attempt, not by job: a re-dispatch mints fresh
-    /// `TaskStep` ids, so a job-scoped map would overwrite the mapping the
-    /// previous attempt's `step-<id>.txt` blobs are still named after.
-    ///
-    /// Seeded from the job request message at dispatch (every declared step,
-    /// in workflow order); runner reports only reconcile into it.
-    pub job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
-    /// Monotonic revision per attempt, bumped whenever `job_steps` changes.
-    ///
-    /// Reconciliation snapshots a manifest under this lock and writes it after
-    /// releasing it, so two reports for one attempt can commit out of order.
-    /// The revision travels with the write and the upsert refuses to move a
-    /// row backwards, so an older snapshot cannot overwrite newer conclusions.
-    /// In memory only: the persisted column is what it guards.
-    pub job_steps_revision: BTreeMap<uuid::Uuid, u64>,
-    pub plan_requests: BTreeMap<String, i64>,
-    pub agent_job_requests: BTreeMap<uuid::Uuid, i64>,
-    pub timeline_requests: BTreeMap<uuid::Uuid, i64>,
-    pub session_active_requests: BTreeMap<String, i64>,
-    /// Modern broker session owner, derived from the runner-listen JWT.
-    pub broker_session_runners: BTreeMap<String, i64>,
-    pub next_runner_id: i64,
+    /// Resolved plan→run secret masker cache (node-local). `plan_secret_masker`
+    /// is the permanent entry once a plan maps to a concrete run;
+    /// `plan_secret_masker_pending` is the negative-cache union fallback with a
+    /// re-probe deadline so an unresolved plan doesn't re-scan every run's
+    /// secrets on each log chunk.
+    pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
+    pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
     pub next_cache_id: i64,
-    pub next_message_id: i64,
     pub next_log_id: usize,
     pub flows_file: Option<std::fs::File>,
     pub next_flow_index: usize,
-    /// Sessions created via the AzDO distributedtask path (full encrypted message format).
-    /// Sessions NOT in this set use the broker-ref (RunnerJobRequest) format.
-    pub azdo_sessions: std::collections::HashSet<String>,
     /// Cache v2 Twirp pending uploads: upload_token → (key, version).
     pub cache_v2_pending: BTreeMap<String, CacheV2Pending>,
     /// Cache v2 download tokens: dl_token → (key, version).
@@ -1758,30 +1653,11 @@ pub struct InnerState {
     pub artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// Monotonic artifact v2 ID counter.
     pub next_artifact_v2_id: u64,
-    /// Per-job resolved OIDC execution context.
-    pub oidc_job_contexts: BTreeMap<(RunId, JobId), OidcJobContext>,
     /// OIDC issuer URL used in the `iss` claim and discovery document.
     pub oidc_issuer: String,
     pub dap_ports: BTreeMap<RunId, DapPortRegistration>,
     /// OIDC signing keypair (RS256) for id-token minting.
     pub oidc_keypair: Option<oidc::OidcKeypair>,
-    /// Per-job `id-token: write` grant, keyed by (run_id, job_id).
-    pub id_token_grants: BTreeMap<(RunId, JobId), bool>,
-    /// Concurrency groups keyed by (lowercased repo, lowercased group name).
-    pub concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
-    /// Workflow-level pending runs: run_id → jobs held out of the ready queue.
-    pub held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
-    /// Job-level concurrency-blocked jobs (FIFO).
-    pub concurrency_blocked: VecDeque<QueuedJob>,
-    /// Multi-key admission state for reusable workflow invocations.
-    pub jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
-    /// JobSets whose gates were acquired and whose caller placeholder nodes
-    /// still await callee-subtree expansion by the scheduler.
-    pub jobset_ready: BTreeSet<JobSetId>,
-    /// Evaluated workflow-level concurrency raw config per run (for release/debug).
-    pub run_concurrency: BTreeMap<RunId, preloop_gha_parser::Concurrency>,
-    /// Which concurrency key a holder currently occupies (for release).
-    pub holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
     /// Live debug sessions holding paused jobs open.
     pub debug_sessions: crate::debug_sessions::DebugSessionRegistry,
 }
