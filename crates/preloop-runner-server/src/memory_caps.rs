@@ -66,10 +66,14 @@ pub const MAX_TIMELINE_KEYS: usize = 4096;
 /// per-run event buckets (each itself capped by [`MAX_TIMELINE_EVENTS`]).
 pub const MAX_TIMELINE_EVENT_KEYS: usize = 4096;
 
-/// F5 — per-block cap for staged blob blocks. upload-artifact v4 stages
-/// 8 MiB blocks (observed Content-Length 8388608 from actions/upload-artifact
-/// against the nushell build); larger blocks are rejected with 413.
-pub const MAX_BLOCK_BYTES: usize = 8 * 1024 * 1024;
+/// F5 — per-block cap for staged blob blocks. actions/upload-artifact v4
+/// stages 8 MiB blocks, but @actions/cache v6 stages 64 MiB blocks
+/// (`uploadChunkSize`; user-overridable up to 128 MiB via
+/// `CACHE_UPLOAD_CHUNK_SIZE`) for archives over its 128 MiB single-shot
+/// threshold — see issue #292. Staged blocks are streamed to disk with the
+/// cap enforced mid-stream, never buffered whole in memory, so the larger
+/// cap cannot exhaust server RAM; larger blocks are rejected with 413.
+pub const MAX_BLOCK_BYTES: usize = 128 * 1024 * 1024;
 
 /// F5 — cap on the number of block IDs in a blocklist commit request.
 pub const MAX_BLOCKLIST_BLOCKS: usize = 10_000;

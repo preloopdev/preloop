@@ -767,6 +767,124 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
 }
 
 #[tokio::test]
+async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
+    // Issue #292: @actions/cache v6 uploads archives larger than its
+    // 128 MiB maxSingleShotSize as staged block blobs with 64 MiB blocks
+    // (uploadChunkSize, concurrency 8). The server capped staged blocks at
+    // 8 MiB -- the artifact client's chunk size -- so 256 MB+ cache uploads
+    // died with 413 on the first block while 16/64 MB single-shot uploads
+    // succeeded. SDK-sized (64 MiB) blocks must stage, commit, and
+    // round-trip byte-for-byte.
+    //
+    // Two blocks (128 MiB total) rather than the SDK's typical four: the
+    // commit assembles staged + output side by side, and the test tempdir
+    // lives on /tmp (a 512M tmpfs here), so 256 MiB staged + 256 MiB
+    // assembled would exhaust it for reasons unrelated to the fix.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
+    // R1-10: blob PUTs with a job token require a live job record.
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    let auth_header = format!("Bearer {token}");
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+    let put_uri = format!("/twirp-blob/cache/{blob_jwt}");
+
+    // 128 MiB in 2 x 64 MiB blocks, the block size the Azure SDK uses for
+    // @actions/cache v6 (BlockBlobClient.uploadFile with uploadChunkSize).
+    const BLOCK: usize = 64 * 1024 * 1024;
+    let mut expected = Vec::with_capacity(2 * BLOCK);
+    let mut xml = String::from("<BlockList>");
+    for i in 0..2u8 {
+        let bid = format!("YmxvY2st{i}"); // base64url-safe block id
+        let chunk = vec![i; BLOCK];
+        expected.extend_from_slice(&chunk);
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("{put_uri}?comp=block&blockid={bid}"))
+                    .header(header::AUTHORIZATION, auth_header.clone())
+                    .header(header::CONTENT_LENGTH, BLOCK)
+                    .body(Body::from(chunk))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            staged.status(),
+            StatusCode::CREATED,
+            "64 MiB staged block {i} must be accepted (issue #292)"
+        );
+        xml.push_str(&format!("<Latest>{bid}</Latest>"));
+    }
+    xml.push_str("</BlockList>");
+
+    let commit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("{put_uri}?comp=blocklist"))
+                .header(header::AUTHORIZATION, auth_header.clone())
+                .body(Body::from(xml))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit.status(), StatusCode::CREATED);
+
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(put_uri)
+                .header(header::AUTHORIZATION, auth_header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let body = to_bytes(get.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn blob_block_upload_still_rejects_blocks_over_cap() {
+    // F5 is preserved: blocks larger than the per-block cap are rejected
+    // with 413 via the early Content-Length check.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let job_id = uuid::Uuid::new_v4();
+    let token = state.mint_runtime_token("plan-blob", &job_id);
+    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    let bearer = format!("Bearer {token}");
+    let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
+
+    // One byte over the per-block cap: rejected before reading the body.
+    let over_cap = memory_caps::MAX_BLOCK_BYTES + 1;
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "/twirp-blob/cache/{blob_jwt}?comp=block&blockid=b3ZlcnNpemVk"
+                ))
+                .header(header::AUTHORIZATION, bearer)
+                .header(header::CONTENT_LENGTH, over_cap)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn native_api_rejects_job_runtime_token() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
