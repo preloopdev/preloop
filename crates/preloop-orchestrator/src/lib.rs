@@ -4355,7 +4355,7 @@ async fn run_one_runner<P: VmProvider + 'static>(
         }
     }
     let run_task = tokio::spawn(async move {
-        let result = run_until_exit(&run_provider, &run_name, &run, busy_tx).await;
+        let result = run_until_exit(&run_provider, &run_name, &run, busy_tx, GUEST_LIVENESS).await;
         let _ = done_tx.send(result);
     });
 
@@ -4490,16 +4490,22 @@ async fn run_one_runner<P: VmProvider + 'static>(
 
     // The runner writes this marker only when the job it ran opted in via
     // `preserve_on_failure` and then genuinely failed, so preservation is
-    // decided per run rather than by engine-wide configuration.
+    // decided per run rather than by engine-wide configuration. The probe is
+    // bounded: a wedged guest never answers, and waiting on it would pin the
+    // slot exactly as an unbounded runner stream did.
     let preserved = match &config.debug_dir {
         Some(debug_dir)
-            if provider
-                .exec(
-                    name,
-                    &["test".into(), "-f".into(), GUEST_FAILURE_MARKER.into()],
+            if matches!(
+                tokio::time::timeout(
+                    GUEST_LIVENESS.timeout,
+                    provider.exec(
+                        name,
+                        &["test".into(), "-f".into(), GUEST_FAILURE_MARKER.into()],
+                    ),
                 )
-                .await
-                .is_ok() =>
+                .await,
+                Ok(Ok(_))
+            ) =>
         {
             Some(debug_dir.clone())
         }
@@ -4553,16 +4559,62 @@ async fn finish<P: VmProvider + 'static>(
     }
 }
 
+/// How the runner stream checks that its guest is still alive.
+#[derive(Clone, Copy, Debug)]
+struct GuestLiveness {
+    /// Pause between probes.
+    interval: std::time::Duration,
+    /// A probe that takes longer than this counts as failed.
+    timeout: std::time::Duration,
+    /// Consecutive failed probes that mark the guest as wedged.
+    failures: u32,
+}
+
+/// Three failed probes a minute apart: at least three minutes of silence,
+/// matching the server's 180-second hung-worker cutoff, so a busy guest that
+/// is merely slow to answer one probe is not torn down mid-job.
+const GUEST_LIVENESS: GuestLiveness = GuestLiveness {
+    interval: std::time::Duration::from_secs(60),
+    timeout: std::time::Duration::from_secs(30),
+    failures: 3,
+};
+
+/// Resolve once the guest has failed `liveness.failures` probes in a row.
+async fn guest_unresponsive<P: VmProvider + 'static>(
+    provider: &Arc<P>,
+    name: &MachineName,
+    liveness: GuestLiveness,
+) -> VmError {
+    let probe = ["true".to_owned()];
+    let mut failures = 0;
+    loop {
+        tokio::time::sleep(liveness.interval).await;
+        match tokio::time::timeout(liveness.timeout, provider.exec(name, &probe)).await {
+            Ok(Ok(_)) => failures = 0,
+            Ok(Err(_)) | Err(_) => failures += 1,
+        }
+        if failures >= liveness.failures {
+            return VmError::GuestUnresponsive {
+                machine: name.as_str().to_owned(),
+                probes: failures,
+            };
+        }
+    }
+}
+
 /// Run the guest runner to completion, signalling the first job it accepts.
 ///
 /// Streaming rather than buffering the guest's output is what makes the busy
 /// signal observable while the job is still running; it also drops SmolVM's
-/// 30-second buffered-exec read timeout.
+/// 30-second buffered-exec read timeout. A guest that wedges never closes the
+/// stream, so the stream races a liveness probe: without it one wedged VM
+/// pinned its pool slot for good.
 async fn run_until_exit<P: VmProvider + 'static>(
     provider: &Arc<P>,
     name: &MachineName,
     run: &[String],
     busy: tokio::sync::oneshot::Sender<()>,
+    liveness: GuestLiveness,
 ) -> Result<(), VmError> {
     let (chunks, mut receiver) = mpsc::channel(64);
     let machine = name.as_str().to_owned();
@@ -4619,7 +4671,14 @@ async fn run_until_exit<P: VmProvider + 'static>(
         }
     });
 
-    let code = provider.exec_stream(name, run, chunks).await?;
+    let code = tokio::select! {
+        code = provider.exec_stream(name, run, chunks) => code,
+        error = guest_unresponsive(provider, name, liveness) => {
+            warn!(machine = name.as_str(), %error, "runner guest is wedged; abandoning its stream");
+            watcher.abort();
+            return Err(error);
+        }
+    }?;
     let _ = watcher.await;
     if code == 0 {
         Ok(())
@@ -5618,6 +5677,9 @@ mod lifecycle_tests {
         /// Fail the next fork with a transient boot error, then succeed.
         /// Mirrors a restored clone that wedged before its agent answered.
         fail_fork_once: Mutex<bool>,
+        /// Model a guest whose agent stopped answering: the runner stream
+        /// never closes and liveness probes never return.
+        wedged_guest: bool,
         /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
@@ -5662,6 +5724,7 @@ mod lifecycle_tests {
                 fork_base_busy: false,
                 fail_fork_once_spent: Mutex::new(false),
                 fail_fork_once: Mutex::new(false),
+                wedged_guest: false,
                 live_forks: Mutex::new(true),
                 drain_live_forks_after: Mutex::new(0),
                 fail_start,
@@ -5712,6 +5775,12 @@ mod lifecycle_tests {
         /// Fail the next fork with a transient boot error, then succeed.
         fn failing_fork_once(mut self) -> Self {
             *self.fail_fork_once.get_mut() = true;
+            self
+        }
+
+        /// Model a guest whose agent stopped answering.
+        fn with_wedged_guest(mut self) -> Self {
+            self.wedged_guest = true;
             self
         }
 
@@ -6979,6 +7048,9 @@ chmod +x "$dest/bin/node"
                 .lock()
                 .await
                 .push(format!("exec:{}:{:?}", name.as_str(), argv));
+            if self.wedged_guest && argv == ["true"] {
+                std::future::pending::<()>().await;
+            }
             if argv.len() == 3
                 && argv[0] == "test"
                 && argv[1] == "-f"
@@ -7045,6 +7117,9 @@ chmod +x "$dest/bin/node"
                 .lock()
                 .await
                 .push(format!("run:{}", name.as_str()));
+            if self.wedged_guest {
+                std::future::pending::<()>().await;
+            }
             if self.announce_busy {
                 output
                     .send(OutputChunk::Stdout(
@@ -7313,6 +7388,31 @@ chmod +x "$dest/bin/node"
         assert!(
             !events.contains(&format!("start:{}", name.as_str())),
             "a recovered fork must not cold-boot the packed artifact: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wedged_runner_guest_releases_its_slot() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).with_wedged_guest());
+        let name = MachineName::new("lifecycle-test-0-6").unwrap();
+        let (busy, _busy_rx) = tokio::sync::oneshot::channel();
+        let liveness = GuestLiveness {
+            interval: std::time::Duration::from_millis(5),
+            timeout: std::time::Duration::from_millis(5),
+            failures: 3,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_until_exit(&provider, &name, &["run".to_owned()], busy, liveness),
+        )
+        .await
+        .expect("a wedged guest must not pin the runner stream");
+
+        assert!(
+            matches!(result, Err(VmError::GuestUnresponsive { probes: 3, .. })),
+            "{result:?}"
         );
     }
 

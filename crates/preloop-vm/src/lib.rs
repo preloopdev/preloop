@@ -252,6 +252,17 @@ pub enum VmError {
     /// Invalid SmolVM JSON output.
     #[error("invalid smolvm response: {0}")]
     Protocol(String),
+    /// The guest agent stopped answering while a command was streaming.
+    ///
+    /// A wedged guest never closes its exec stream, so without this the
+    /// caller would wait on it forever.
+    #[error("guest `{machine}` stopped answering after {probes} consecutive liveness probes")]
+    GuestUnresponsive {
+        /// Machine whose agent stopped answering.
+        machine: String,
+        /// Consecutive probes that failed or timed out.
+        probes: u32,
+    },
     /// The resolved SmolVM predates generic socket forwarding.
     ///
     /// `--mount-socket` (added upstream in the 2026-07 socket-forwarding
