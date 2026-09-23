@@ -4748,6 +4748,21 @@ fn record_slot_failure(config: &RunnerPoolConfig, reason: &str) {
     }
 }
 
+/// Extra fork attempts after a transient packed-golden fork failure, before
+/// falling back to a direct create from the packed artifact.
+const FORK_RETRY_ATTEMPTS: u32 = 2;
+
+/// Remove whatever a failed fork left behind so the name can be reused.
+async fn remove_failed_fork<P: VmProvider + 'static>(provider: &Arc<P>, name: &MachineName) {
+    if let Err(cleanup) = provider.delete(name).await {
+        debug!(
+            machine = name.as_str(),
+            %cleanup,
+            "failed fork left no removable clone"
+        );
+    }
+}
+
 /// Create, boot, and register one ephemeral runner; return its `run` argv.
 ///
 /// The caller owns cleanup: on any error the machine may already exist.
@@ -4900,25 +4915,46 @@ async fn provision_runner<P: VmProvider + 'static>(
                         }
                     }
                 } else {
-                    // A failed fork can leave a partial clone behind.
-                    // Best-effort cleanup makes the direct create safe; if
-                    // cleanup itself is still racing SmolVM state, create
-                    // returns the actionable error and the slot supervisor
-                    // retries normally.
-                    warn!(
-                        machine = name.as_str(),
-                        golden = golden.as_str(),
-                        %error,
-                        "packed golden fork failed; creating runner directly from packed artifact"
-                    );
-                    if let Err(cleanup) = provider.delete(name).await {
-                        debug!(
+                    // A restored clone can wedge transiently (agent readiness
+                    // or rejuvenation timeouts) while the golden stays frozen
+                    // with its retained checkpoint, so the fork itself is safe
+                    // to retry. A retry costs about a second; the direct
+                    // create cold-boots the packed image, which takes minutes
+                    // on macOS while the guest unpacks its layers.
+                    let mut last_error = error;
+                    let mut retried = None;
+                    for attempt in 1..=FORK_RETRY_ATTEMPTS {
+                        remove_failed_fork(provider, name).await;
+                        warn!(
                             machine = name.as_str(),
-                            %cleanup,
-                            "failed fork left no removable clone"
+                            golden = golden.as_str(),
+                            attempt,
+                            error = %last_error,
+                            "packed golden fork failed; retrying the fork"
                         );
+                        match provider.fork(golden, name).await {
+                            Ok(()) => {
+                                retried = Some(golden);
+                                break;
+                            }
+                            Err(error) => last_error = error,
+                        }
                     }
-                    None
+                    if retried.is_none() {
+                        // A failed fork can leave a partial clone behind.
+                        // Best-effort cleanup makes the direct create safe; if
+                        // cleanup itself is still racing SmolVM state, create
+                        // returns the actionable error and the slot supervisor
+                        // retries normally.
+                        warn!(
+                            machine = name.as_str(),
+                            golden = golden.as_str(),
+                            error = %last_error,
+                            "packed golden fork failed; creating runner directly from packed artifact"
+                        );
+                        remove_failed_fork(provider, name).await;
+                    }
+                    retried
                 }
             }
             Err(error) => return Err(error.into()),
@@ -5579,6 +5615,9 @@ mod lifecycle_tests {
         /// Fail the next fork with the "spent fork base" signature, then
         /// succeed. Mirrors a golden whose retained checkpoint vanished.
         fail_fork_once_spent: Mutex<bool>,
+        /// Fail the next fork with a transient boot error, then succeed.
+        /// Mirrors a restored clone that wedged before its agent answered.
+        fail_fork_once: Mutex<bool>,
         /// Report live clones to `rearm_fork_base`; true by default so a spent
         /// base with dependents is never re-armed in tests either.
         live_forks: Mutex<bool>,
@@ -5622,6 +5661,7 @@ mod lifecycle_tests {
                 fail_fork: false,
                 fork_base_busy: false,
                 fail_fork_once_spent: Mutex::new(false),
+                fail_fork_once: Mutex::new(false),
                 live_forks: Mutex::new(true),
                 drain_live_forks_after: Mutex::new(0),
                 fail_start,
@@ -5666,6 +5706,12 @@ mod lifecycle_tests {
         /// Fail the next fork with the spent-fork-base signature, then succeed.
         fn failing_fork_once_spent(mut self) -> Self {
             *self.fail_fork_once_spent.get_mut() = true;
+            self
+        }
+
+        /// Fail the next fork with a transient boot error, then succeed.
+        fn failing_fork_once(mut self) -> Self {
+            *self.fail_fork_once.get_mut() = true;
             self
         }
 
@@ -6840,6 +6886,15 @@ chmod +x "$dest/bin/node"
                     ));
                 }
             }
+            {
+                let mut transient = self.fail_fork_once.lock().await;
+                if *transient {
+                    *transient = false;
+                    return Err(test_error(
+                        "smolvm fork failed with exit code 1: clone agent readiness timed out",
+                    ));
+                }
+            }
             if self.fail_fork {
                 return Err(test_error("fork-failure"));
             }
@@ -7227,6 +7282,38 @@ chmod +x "$dest/bin/node"
             "fallback order must be fork, cleanup, create, start: {events:?}"
         );
         assert!(provider.has_machine(&name).await);
+    }
+
+    #[tokio::test]
+    async fn transient_packed_golden_fork_failure_retries_the_fork_before_direct_creation() {
+        let provider =
+            Arc::new(TestProvider::new(false, false, false, false, false).failing_fork_once());
+        let config = packed_fork_config();
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        let name = MachineName::new("lifecycle-test-0-5").unwrap();
+
+        provision_runner(
+            &provider,
+            &config,
+            &name,
+            Some(&golden),
+            &Arc::new(KeyPool::new()),
+            &test_runner_environment(config.base_image.clone(), Vec::new(), true),
+        )
+        .await
+        .expect("a transient fork failure recovers by forking again");
+
+        let events = provider.events().await;
+        let fork = format!("fork:{}:{}", golden.as_str(), name.as_str());
+        assert_eq!(
+            events.iter().filter(|event| *event == &fork).count(),
+            2,
+            "the failed fork is retried once: {events:?}"
+        );
+        assert!(
+            !events.contains(&format!("start:{}", name.as_str())),
+            "a recovered fork must not cold-boot the packed artifact: {events:?}"
+        );
     }
 
     /// Issue #295: once the packed golden is forkable, the pool must ask the
