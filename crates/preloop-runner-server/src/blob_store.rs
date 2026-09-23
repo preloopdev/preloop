@@ -211,8 +211,8 @@ pub async fn blob_put(
             }
         }
     }
-    // Early Content-Length check before buffering — avoids allocating 512 MiB
-    // for a block that will be rejected at 8 MiB.
+    // Early Content-Length check before buffering — avoids streaming a block
+    // that will be rejected at the per-block cap.
     if let Some(cl) = headers
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -237,17 +237,9 @@ pub async fn blob_put(
 
     match query.comp.as_deref() {
         Some("block") => {
-            // F5: buffer at most the per-block cap. The official runner stages
-            // 8 MiB blocks, so nothing legitimate is lost; `to_bytes` aborts
-            // (413) once a streamed block exceeds the cap, so an attacker never
-            // materializes more than 8 MiB here.
-            let body = match axum::body::to_bytes(body, MAX_BLOCK_BYTES).await {
-                Ok(b) => b,
-                Err(_) => {
-                    warn!(kind, token, "blob block exceeds the per-block cap");
-                    return StatusCode::PAYLOAD_TOO_LARGE;
-                }
-            };
+            // Validate the block id before touching the filesystem: only the
+            // base64url charset survives, so a staged block can never escape
+            // `blocks/`.
             let block_id = query.blockid.unwrap_or_default();
             let Some(safe_id) = blockid_to_filename(&block_id) else {
                 warn!(kind, "rejected blob block with unsafe blockid");
@@ -258,17 +250,32 @@ pub async fn blob_put(
                 warn!(kind, "failed to create blocks dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
-            match tokio::fs::write(blocks_dir.join(&safe_id), &body).await {
-                Ok(()) => {
-                    debug!(
-                        kind,
-                        block = safe_id,
-                        bytes = body.len(),
-                        "blob block staged"
-                    );
-                    StatusCode::CREATED
+            // F5: stream the block straight to a temp file, enforcing the
+            // per-block cap mid-stream — a staged block is never buffered
+            // whole in memory, so the cap (raised for the cache SDK's
+            // 64 MiB blocks, issue #292) cannot exhaust server RAM. Commit
+            // via atomic rename so a failed upload never leaves a partial
+            // block behind.
+            let tmp_path = blocks_dir.join(format!(".tmp.{}", uuid::Uuid::new_v4()));
+            match stream_body_to_file(body, &tmp_path, MAX_BLOCK_BYTES).await {
+                Ok(size) => match tokio::fs::rename(&tmp_path, blocks_dir.join(&safe_id)).await {
+                    Ok(()) => {
+                        debug!(kind, block = safe_id, bytes = size, "blob block staged");
+                        StatusCode::CREATED
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        warn!(kind, block = %safe_id, "failed to stage block: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                },
+                Err(AssemblyError::Budget) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(kind, token, "blob block exceeds the per-block cap");
+                    StatusCode::PAYLOAD_TOO_LARGE
                 }
-                Err(e) => {
+                Err(AssemblyError::Io(e)) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     warn!(kind, block = %safe_id, "failed to write block: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
