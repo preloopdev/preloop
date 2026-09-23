@@ -205,15 +205,25 @@ pub fn try_acquire_job_gate(
     }
 }
 
+/// Where a ready job landed after its job-level concurrency gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobEnqueueOutcome {
+    /// Pushed to the ready queue.
+    Ready,
+    /// Parked behind a concurrency group.
+    Parked,
+    /// Rejected by the gate; its terminal status is already recorded.
+    Rejected,
+}
+
 /// Enqueue a ready job, applying job-level concurrency if present.
-/// Returns Ok(true) if pushed to ready queue, Ok(false) if parked, Err if cancelled.
 pub fn try_enqueue_with_job_concurrency(
     inner: &mut InnerState,
     github: &serde_json::Value,
     submission: &WorkflowSubmission,
     mut queued_job: QueuedJob,
     statuses: &mut BTreeMap<JobId, ExecutionStatus>,
-) -> Result<bool, ()> {
+) -> JobEnqueueOutcome {
     match try_acquire_job_gate(inner, github, submission, &queued_job) {
         JobGateOutcome::Proceed => {
             if queued_job.concurrency.is_some() {
@@ -223,17 +233,17 @@ pub fn try_enqueue_with_job_concurrency(
             stamp_ready_enqueue(&mut queued_job);
             on_job_enqueued(inner, &queued_job);
             inner.queue.push_back(queued_job);
-            Ok(true)
+            JobEnqueueOutcome::Ready
         }
         JobGateOutcome::Parked => {
             stamp_concurrency_wait_started(&mut queued_job);
             statuses.insert(queued_job.job_id.clone(), ExecutionStatus::Pending);
             inner.concurrency_blocked.push_back(queued_job);
-            Ok(false)
+            JobEnqueueOutcome::Parked
         }
         JobGateOutcome::Failed(status) => {
             statuses.insert(queued_job.job_id.clone(), status);
-            Err(())
+            JobEnqueueOutcome::Rejected
         }
     }
 }

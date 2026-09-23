@@ -2146,7 +2146,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     queued_job,
                     &mut statuses,
                 ) {
-                    Ok(true) => {
+                    JobEnqueueOutcome::Ready => {
                         shared
                             .state
                             .observability
@@ -2156,7 +2156,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                         *ready_by_base.entry(base_id).or_default() += 1;
                         ready_jobs += 1;
                     }
-                    Ok(false) => {
+                    JobEnqueueOutcome::Parked => {
                         shared
                             .state
                             .observability
@@ -2165,7 +2165,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                             .record_concurrency_decision("job", "pending");
                         // parked pending
                     }
-                    Err(_) => {
+                    JobEnqueueOutcome::Rejected => {
                         shared
                             .state
                             .observability

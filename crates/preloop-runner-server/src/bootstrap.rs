@@ -2076,6 +2076,8 @@ fn acquire_serve_lock(state_dir: &std::path::Path) -> anyhow::Result<std::fs::Fi
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        // The lock file carries no content; opening it must never clobber it.
+        .truncate(false)
         .open(&lock_path)
         .context(format!("opening serve lock {}", lock_path.display()))?;
     // try_lock: fail fast rather than queue behind a live engine — a queued
