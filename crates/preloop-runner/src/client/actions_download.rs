@@ -47,7 +47,10 @@ pub enum ArchiveDigestPin {
     #[default]
     Unsupported,
     /// The server supports checksums but has no pin for this (owner, repo,
-    /// sha) yet: this download establishes it (trust on first use).
+    /// sha) yet: the engine has not fetched this version itself. The
+    /// runner uses any existing local cache as-is — no eviction, no
+    /// verification — and downloads normally on a cache miss; the engine
+    /// pins the version when it serves the bytes.
     Unpinned,
     /// The server has a pin for this (owner, repo, sha): the downloaded
     /// archive's SHA-256 must equal this hex digest or the download fails
@@ -61,23 +64,6 @@ pub struct ActionsResolveClient {
     /// Base URL from `system.github.launch_endpoint` variable.
     /// Golden 10: `https://launch.actions.githubusercontent.com`
     launch_base_url: Option<String>,
-}
-
-/// Parameters for a first-use archive checksum report. Bundled into one
-/// struct so the report call does not grow an argument per protocol field.
-pub struct ArchiveSha256Report<'a> {
-    /// Job bearer token (the same credential runnerresolve accepted).
-    pub token: &'a str,
-    pub orchestration_id: &'a str,
-    pub job_id: &'a str,
-    pub owner: &'a str,
-    pub repo: &'a str,
-    /// Resolved commit SHA. The server rejects anything that is not a
-    /// commit SHA; pins are never keyed by mutable ref.
-    pub sha: &'a str,
-    /// Lowercase hex SHA-256 of the downloaded tarball bytes, observed by
-    /// this runner.
-    pub archive_sha256: &'a str,
 }
 
 /// Returns true for a well-formed archive digest: 64 hex chars.
@@ -233,59 +219,6 @@ impl ActionsResolveClient {
         }
 
         Ok(result)
-    }
-
-    /// Report the observed SHA-256 of a freshly downloaded action archive
-    /// so the server can pin it for later downloads (trust on first use).
-    ///
-    /// Best-effort by design: a failed report only means this runner does
-    /// not establish the pin, so it warns but never fails the job. Callers
-    /// must only report digests of archives they just downloaded and
-    /// successfully extracted over TLS — never of pre-existing cache
-    /// directories of unknown provenance.
-    pub async fn report_archive_sha256(&self, report: ArchiveSha256Report<'_>) -> Result<()> {
-        let ArchiveSha256Report {
-            token,
-            orchestration_id,
-            job_id,
-            owner,
-            repo,
-            sha,
-            archive_sha256,
-        } = report;
-        let Some(ref base) = self.launch_base_url else {
-            anyhow::bail!("no launch endpoint configured for archive digest report");
-        };
-        if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
-            anyhow::bail!("refusing to report archive digest for unresolved ref");
-        }
-        if !valid_archive_sha256(archive_sha256) {
-            anyhow::bail!("refusing to report malformed archive_sha256");
-        }
-        let url = format!(
-            "{}/actions/build/{orchestration_id}/jobs/{job_id}/runnerresolve/actions/digests",
-            base.trim_end_matches('/')
-        );
-        let body = serde_json::json!({
-            "owner": owner,
-            "repo": repo,
-            "sha": sha,
-            "archive_sha256": archive_sha256,
-        });
-        let resp = self
-            .http
-            .client_for(&url)
-            .post(&url)
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("archive digest report POST")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("archive digest report returned HTTP {}", resp.status());
-        }
-        Ok(())
     }
 
     /// Download a tarball from a resolved URL (authenticated or anonymous).
@@ -486,109 +419,6 @@ mod tests {
             result["actions/bad@v4"].archive_sha256,
             ArchiveDigestPin::Unpinned,
             "malformed pin must not become a Pinned digest"
-        );
-    }
-
-    /// The archive digest report validates the SHA and the digest shape
-    /// client-side and fails on HTTP errors; the runner treats a failed
-    /// report as best-effort.
-    #[tokio::test]
-    async fn report_archive_sha256_validates_sha_and_surfaces_http_errors() {
-        let client = ActionsResolveClient::new(
-            HttpClient::new(None).unwrap(),
-            Some("http://127.0.0.1:1".into()),
-        );
-        let sha = "0123456789abcdef0123456789abcdef01234567";
-        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-        // Unresolved refs must never be reported: pins are keyed by commit.
-        let err = client
-            .report_archive_sha256(ArchiveSha256Report {
-                token: "token",
-                orchestration_id: "plan",
-                job_id: "job",
-                owner: "o",
-                repo: "r",
-                sha: "v4",
-                archive_sha256: digest,
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("unresolved ref"));
-
-        // Malformed digests must never be reported: the server would reject
-        // them, and they must not mint pins.
-        let err = client
-            .report_archive_sha256(ArchiveSha256Report {
-                token: "token",
-                orchestration_id: "plan",
-                job_id: "job",
-                owner: "o",
-                repo: "r",
-                sha,
-                archive_sha256: "xyz",
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("malformed archive_sha256"));
-
-        // Unreachable server surfaces as an error (caller logs a warning).
-        let err = client
-            .report_archive_sha256(ArchiveSha256Report {
-                token: "token",
-                orchestration_id: "plan",
-                job_id: "job",
-                owner: "o",
-                repo: "r",
-                sha,
-                archive_sha256: digest,
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("archive digest report POST"));
-    }
-
-    #[tokio::test]
-    async fn report_archive_sha256_posts_expected_body() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let seen_clone = seen.clone();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 8192];
-            let n = socket.read(&mut request).await.unwrap();
-            *seen_clone.lock().await = request[..n].to_vec();
-            let response = "HTTP/1.1 200 OK\r\ncontent-length: 16\r\nconnection: close\r\n\r\n{\"recorded\":true}";
-            socket.write_all(response.as_bytes()).await.unwrap();
-        });
-        let client = ActionsResolveClient::new(
-            HttpClient::new(None).unwrap(),
-            Some(format!("http://{address}")),
-        );
-        client
-            .report_archive_sha256(ArchiveSha256Report {
-                token: "job-token",
-                orchestration_id: "plan1",
-                job_id: "job1",
-                owner: "actions",
-                repo: "checkout",
-                sha: "0123456789abcdef0123456789abcdef01234567",
-                archive_sha256: "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface",
-            })
-            .await
-            .unwrap();
-        let raw = seen.lock().await;
-        let text = String::from_utf8_lossy(&raw);
-        assert!(text.contains("/runnerresolve/actions/digests"), "{text}");
-        assert!(text.contains("Bearer job-token"), "{text}");
-        assert!(
-            text.contains("\"archive_sha256\":\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\""),
-            "{text}"
-        );
-        assert!(
-            text.contains("\"sha\":\"0123456789abcdef0123456789abcdef01234567\""),
-            "{text}"
         );
     }
 }

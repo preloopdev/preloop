@@ -33,12 +33,15 @@ pub fn archive_sha256_hex(bytes: &[u8]) -> String {
 /// Path of the sidecar file recording which archive produced a cached
 /// action tree: `<actions_dir>/<owner>/<repo>/<sha>.sha256`, containing the
 /// lowercase hex SHA-256 of the tarball bytes that were extracted there.
+/// Digest-sidecar path: `<actions>/<owner>/<repo>/<sha>.sha256`, the
+/// lowercase hex SHA-256 of the tarball bytes a verified fresh download
+/// hashed before extraction.
 ///
 /// A cache entry's provenance is unknown (it may predate checksum support
-/// or have been written by hand), so a cached tree alone can neither match
-/// a known pin nor mint a first-use pin. The sidecar written by a verified
-/// fresh download lets a later cache hit prove it came from the pinned
-/// archive without re-downloading.
+/// or have been written by hand), so a cached tree alone can never match
+/// a known pin — it is evicted and re-downloaded. The sidecar written by
+/// a verified fresh download lets a later cache hit prove it came from
+/// the pinned archive without re-downloading.
 fn archive_digest_sidecar(actions_dir: &Path, owner: &str, repo: &str, dir_ref: &str) -> PathBuf {
     actions_dir
         .join(owner)
@@ -83,9 +86,11 @@ fn evict_action_cache(dest: &Path, sidecar: &Path) -> Result<()> {
 /// bytes is computed immediately after download and compared against a known
 /// pin *before* `extract_tarball` runs: a mismatch fails closed and no
 /// destination tree is created, so tampered bytes are never executed. On a
-/// successful fresh download the observed digest is returned so the caller
-/// can report it for first-use pinning (only after the archive also
-/// extracts successfully).
+/// successful fresh download the observed digest is returned, and a
+/// digest sidecar is written after successful extraction so later cache
+/// hits can be checked against it without re-downloading. Nothing is
+/// reported back to the server: pins are minted by the engine when it
+/// fetches the tarball itself, never by job VMs.
 ///
 /// These checks run before the cache lookup so a stale mutable-ref cache
 /// entry cannot bypass them, and before any network access.
@@ -146,14 +151,18 @@ pub async fn download_action(
                 evict_action_cache(&dest, &sidecar)?;
             }
             ArchiveDigestPin::Unpinned => {
-                // A cache entry of unknown provenance cannot establish the
-                // first-use pin: evict it so the pin comes from a fresh
-                // download whose bytes were just hashed over TLS.
+                // The engine has not pinned this version yet (it has not
+                // fetched it itself). The runner is not in a position to
+                // establish the pin — it verifies *against* pins, never
+                // mints them — so the existing cache is used as-is: no
+                // eviction, no verification. A poisoned or stale cache is
+                // the runner's own local trust decision, unchanged from
+                // pre-checksum behavior.
                 info!(
-                    "Action {owner}/{repo}@{git_ref} cached but unpinned: \
-                     re-downloading to establish the first-use archive pin"
+                    "Action {owner}/{repo}@{git_ref} already cached at {} (server has no pin yet)",
+                    dest.display()
                 );
-                evict_action_cache(&dest, &sidecar)?;
+                return Ok((dest, read_cached_archive_digest(&sidecar)));
             }
             ArchiveDigestPin::Unsupported => {
                 info!(
@@ -245,10 +254,9 @@ pub async fn download_action(
     }
 
     // Record which archive produced this tree so later cache hits can
-    // prove they came from the pinned bytes. Written only after the archive
-    // extracted and moved into place successfully — the observed digest
-    // returned below is likewise only eligible for first-use reporting
-    // after a successful extraction.
+    // prove they came from the pinned bytes. Written only after the
+    // archive extracted and moved into place successfully, so a sidecar
+    // always describes a complete, extracted tree.
     if let Some(observed) = &observed_digest {
         std::fs::write(&sidecar, observed)
             .with_context(|| format!("recording action archive digest {}", sidecar.display()))?;
@@ -1214,8 +1222,9 @@ mod tests {
         );
     }
 
-    /// An unpinned fresh download returns the observed archive digest so
-    /// the caller can report it for first-use pinning.
+    /// An unpinned fresh download returns the observed archive digest,
+    /// which is also written to the digest sidecar after extraction so a
+    /// later Pinned cache hit can verify against it.
     #[tokio::test]
     async fn download_action_unpinned_fresh_download_returns_observed_digest() {
         let tarball = test_action_tarball();
@@ -1373,42 +1382,41 @@ mod tests {
         assert_eq!(observed.as_deref(), Some(pin.as_str()));
     }
 
-    /// Migration: a cache entry predating checksum support cannot mint the
-    /// first-use pin, so it is re-downloaded once to establish it.
+    /// An unpinned cache hit is used as-is: the runner verifies against
+    /// pins but never mints them, so an existing cache is trusted exactly
+    /// as before checksum support — no eviction, no re-download.
     #[tokio::test]
-    async fn download_action_redownloads_unpinned_cache_for_first_use() {
-        let tarball = test_action_tarball();
-        let expected = super::archive_sha256_hex(&tarball);
-        let url = serve_test_tarball(tarball).await;
+    async fn download_action_unpinned_uses_existing_cache_without_download() {
         let temp = TempDir::new().unwrap();
         let actions_dir = temp.path().join("actions");
 
-        // Simulate a pre-feature cache entry with stale content.
+        // Simulate a pre-existing cache entry of unknown provenance.
         let dest = actions_dir.join("owner").join("repo").join(TEST_SHA);
         std::fs::create_dir_all(&dest).unwrap();
-        std::fs::write(dest.join("action.yml"), b"name: Stale\n").unwrap();
+        std::fs::write(dest.join("action.yml"), b"name: Existing\n").unwrap();
 
-        let (fresh_dest, observed) = download_action(
+        // The URL is unreachable: any network attempt would fail. Success
+        // proves the cache was used without downloading.
+        let (cached_dest, observed) = download_action(
             "owner",
             "repo",
             TEST_SHA,
             &actions_dir,
-            Some(&url),
+            Some("http://127.0.0.1:1/unreachable"),
             None,
             ArchiveDigestPin::Unpinned,
         )
         .await
         .unwrap();
-        assert_eq!(fresh_dest, dest);
+        assert_eq!(cached_dest, dest);
         assert_eq!(
             std::fs::read_to_string(dest.join("action.yml")).unwrap(),
-            "name: Checkout\n",
-            "stale cache must be replaced by a fresh download"
+            "name: Existing\n",
+            "unpinned cache must be used as-is, not evicted"
         );
         assert_eq!(
-            observed.as_deref(),
-            Some(expected.as_str()),
-            "fresh download must report the archive digest for first-use pinning"
+            observed, None,
+            "an unpinned cache entry of unknown provenance carries no digest"
         );
     }
 }

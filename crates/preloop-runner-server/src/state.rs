@@ -333,14 +333,15 @@ pub type ActionShaCache = std::sync::Mutex<
     std::collections::HashMap<(String, String, String), (Option<String>, std::time::Instant)>,
 >;
 
-/// Trust-on-first-use action archive-checksum pins: (`owner`, `repo`,
+/// Engine-authoritative action archive-checksum pins: (`owner`, `repo`,
 /// `sha`) (lowercased) → lowercase hex SHA-256 of the downloaded tarball
 /// bytes.
 ///
-/// The digest pins the exact archive bytes a runner downloaded for a commit,
-/// hashed before extraction, so a known pin is compared before any
-/// destination tree exists. First report wins; conflicting later reports
-/// keep the original pin and are logged as tampering signals.
+/// The digest pins the exact archive bytes the engine fetched for a
+/// commit, hashed while streaming the fetch and before any extraction, so
+/// a known pin is compared before any destination tree exists. Pins are
+/// minted only by the engine itself — never by job VMs — so workflow code
+/// cannot poison them.
 pub type ActionArchiveSha256Pins =
     std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
 
@@ -538,13 +539,13 @@ pub struct AppState {
     pub action_sha_cache: Arc<ActionShaCache>,
     /// Trust-on-first-use pins of action archive checksums
     /// (`owner`, `repo`, `sha`) → hex SHA-256 of the tarball bytes. The
-    /// runner reports the digest it observed for a fresh download; the
-    /// first report wins and later downloads must match it or fail closed
-    /// before extraction. Keys are lowercased (GitHub owner/repo are
-    /// case-insensitive). In-memory like `action_sha_cache`: an engine
-    /// restart starts pinning over, which is the documented TOFU
-    /// limitation — the first download after a restart is trusted, guarded
-    /// by TLS like any other download.
+    /// engine computes the digest while fetching the tarball from the
+    /// forge and pins it here; later downloads must match it or fail
+    /// closed before extraction. Keys are lowercased (GitHub owner/repo
+    /// are case-insensitive). In-memory like `action_sha_cache`: an engine
+    /// restart rebuilds pins from the on-disk digest sidecars on the next
+    /// cache hit, so the first download after a restart is trusted —
+    /// guarded by the engine's TLS fetch like any other download.
     pub action_archive_sha256_pins: Arc<ActionArchiveSha256Pins>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was

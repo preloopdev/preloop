@@ -163,9 +163,6 @@ pub(crate) async fn ensure_remote_action_staged(
         .get_variable("system.github.launch_endpoint")
         .map(str::to_owned);
     let mut resolved = None;
-    // (resolver client, credentials, plan id, job id) for the first-use
-    // archive checksum report after a fresh download.
-    let mut digest_reporter = None;
     if let Some(launch_url) = launch_url {
         let http = crate::client::http::HttpClient::new(None)?;
         let resolver =
@@ -198,12 +195,6 @@ pub(crate) async fn ensure_remote_action_staged(
             .await
             .with_context(|| format!("runnerresolve nested action {uses}"))?;
         resolved = batch.get(&key).cloned();
-        digest_reporter = Some((
-            resolver,
-            access_token,
-            plan_id.to_owned(),
-            job_id.to_owned(),
-        ));
     }
     let dir_ref = resolved
         .as_ref()
@@ -221,46 +212,16 @@ pub(crate) async fn ensure_remote_action_staged(
         .as_ref()
         .map(|meta| meta.archive_sha256.clone())
         .unwrap_or_default();
-    let (action_root, observed_digest) = crate::worker::actions::manager::download_action(
+    let (action_root, _) = crate::worker::actions::manager::download_action(
         owner,
         repo,
         dir_ref,
         &actions_dir,
         download_url,
         auth_token,
-        archive_pin.clone(),
+        archive_pin,
     )
     .await?;
-    // First-use pinning: report the observed archive SHA-256 of a fresh
-    // download so the server can pin it for later downloads. Best-effort:
-    // a failed report only means this runner does not establish the pin.
-    // Digests of cache hits are never reported — a cache entry of unknown
-    // provenance must not mint a pin (fresh downloads re-pin instead).
-    if let (Some((reporter, report_token, report_plan, report_job)), Some(observed)) =
-        (digest_reporter, observed_digest)
-    {
-        if matches!(
-            archive_pin,
-            crate::client::actions_download::ArchiveDigestPin::Unpinned
-        ) {
-            if let Err(error) = reporter
-                .report_archive_sha256(crate::client::actions_download::ArchiveSha256Report {
-                    token: &report_token,
-                    orchestration_id: &report_plan,
-                    job_id: &report_job,
-                    owner,
-                    repo,
-                    sha: dir_ref,
-                    archive_sha256: &observed,
-                })
-                .await
-            {
-                tracing::warn!(
-                    "action archive sha256 report failed for {owner}/{repo}@{dir_ref}: {error:#}"
-                );
-            }
-        }
-    }
     let action_dir = if subpath.is_empty() {
         action_root
     } else {

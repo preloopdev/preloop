@@ -160,42 +160,16 @@ pub(crate) async fn prepare_remote_actions(
             let auth_token = meta.and_then(|m| m.auth_token.as_deref());
             let archive_pin = meta.map(|m| m.archive_sha256.clone()).unwrap_or_default();
 
-            let (action_root, observed_digest) = super::actions::manager::download_action(
+            let (action_root, _) = super::actions::manager::download_action(
                 &parsed.owner,
                 &parsed.repo,
                 dir_ref,
                 &actions_dir,
                 download_url,
                 auth_token,
-                archive_pin.clone(),
+                archive_pin,
             )
             .await?;
-            // First-use pinning: report the observed archive SHA-256 of a
-            // fresh download so the server can pin it for later downloads.
-            // Best-effort: a failed report only means this runner does not
-            // establish the pin. Cache-hit digests are never reported — a
-            // cache entry of unknown provenance must not mint a pin.
-            if let (crate::client::actions_download::ArchiveDigestPin::Unpinned, Some(observed)) =
-                (&archive_pin, observed_digest)
-            {
-                if let Err(error) = resolver
-                    .report_archive_sha256(crate::client::actions_download::ArchiveSha256Report {
-                        token: &access_token,
-                        orchestration_id: plan_id,
-                        job_id,
-                        owner: &parsed.owner,
-                        repo: &parsed.repo,
-                        sha: dir_ref,
-                        archive_sha256: &observed,
-                    })
-                    .await
-                {
-                    warn!(
-                        "action archive sha256 report failed for {}/{}@{dir_ref}: {error:#}",
-                        parsed.owner, parsed.repo
-                    );
-                }
-            }
 
             let action_dir = if parsed.subpath.is_empty() {
                 action_root
