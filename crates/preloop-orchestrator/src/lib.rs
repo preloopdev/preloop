@@ -2404,26 +2404,92 @@ fn remove_golden_record(config: &RunnerPoolConfig, golden: &MachineName) {
     }
 }
 
-/// Whether `golden` is already booted as a fork base for `fingerprint`.
+/// Adoption outcome for an existing golden machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoldenAdopt {
+    /// Already booted as a fork base with a matching fingerprint; use as-is.
+    Reusable,
+    /// Stopped with a matching fingerprint; needs `start_forkable` to serve
+    /// forks again. This is the normal state after a graceful engine shutdown,
+    /// which stops (not deletes) goldens so the next start can adopt them.
+    Rearm,
+    /// No adoptable golden; bake or unpack a fresh one.
+    Rebuild,
+}
+
+/// How `golden` can serve as the fork base for `fingerprint`, if at all.
 ///
 /// Deliberately host-side: the golden is frozen as SmolVM's fork base, and
 /// probing it through the guest would touch the very snapshot every clone is
-/// taken from.
-async fn golden_is_reusable<P: VmProvider>(
+/// taken from. The golden registry is in-memory, so without adoption an
+/// engine restart rebakes a golden that is still sitting there fully baked —
+/// apt plus rustup, five to eleven minutes, before the first job can run.
+async fn golden_adopt_state<P: VmProvider>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
     golden: &MachineName,
     fingerprint: &str,
-) -> bool {
-    if !matches!(provider.status(golden).await, Ok(MachineState::Running)) {
-        return false;
+) -> GoldenAdopt {
+    let state = provider.status(golden).await;
+    if !matches!(state, Ok(MachineState::Running) | Ok(MachineState::Stopped)) {
+        return GoldenAdopt::Rebuild;
     }
     let Some(path) = golden_record_path(config, golden) else {
-        return false;
+        return GoldenAdopt::Rebuild;
     };
-    std::fs::read_to_string(path)
+    let matched = std::fs::read_to_string(path)
         .map(|recorded| recorded.trim() == fingerprint)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !matched {
+        return GoldenAdopt::Rebuild;
+    }
+    match state {
+        Ok(MachineState::Running) => GoldenAdopt::Reusable,
+        _ => GoldenAdopt::Rearm,
+    }
+}
+
+/// Adopt an existing golden instead of baking or unpacking a fresh one.
+/// Returns `true` when the golden is ready to serve forks.
+async fn adopt_golden<P: VmProvider>(
+    provider: &Arc<P>,
+    config: &RunnerPoolConfig,
+    golden: &MachineName,
+    fingerprint: &str,
+    kind: &str,
+) -> Result<bool, OrchestratorError> {
+    match golden_adopt_state(provider, config, golden, fingerprint).await {
+        GoldenAdopt::Reusable => {
+            info!(
+                machine = golden.as_str(),
+                fingerprint = %fingerprint,
+                "adopted the existing {kind} fork base"
+            );
+            Ok(true)
+        }
+        GoldenAdopt::Rearm => {
+            info!(
+                machine = golden.as_str(),
+                fingerprint = %fingerprint,
+                "re-arming stopped {kind} fork base left by the previous engine run"
+            );
+            if let Err(error) = provider.start_forkable(golden).await {
+                warn!(
+                    machine = golden.as_str(),
+                    %error,
+                    "golden re-arm failed; rebuilding"
+                );
+                return Ok(false);
+            }
+            info!(
+                machine = golden.as_str(),
+                fingerprint = %fingerprint,
+                "adopted the existing {kind} fork base"
+            );
+            Ok(true)
+        }
+        GoldenAdopt::Rebuild => Ok(false),
+    }
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
@@ -2437,16 +2503,11 @@ async fn prepare_golden_for_env<P: VmProvider + 'static>(
     golden: &MachineName,
     env_spec: &EnvironmentSpec,
 ) -> Result<(), OrchestratorError> {
-    // The golden registry is in-memory, so without this every engine restart
-    // rebakes a golden that is still sitting there fully baked and forkable —
+    // The golden registry is in-memory, so without adoption every engine
+    // restart rebakes a golden that is still sitting there fully baked —
     // apt plus rustup, five to eleven minutes, before the first job of that
     // environment can run, paid again on every deploy.
-    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
-        info!(
-            machine = golden.as_str(),
-            fingerprint = %env_spec.fingerprint,
-            "adopted the existing golden fork base"
-        );
+    if adopt_golden(provider, config, golden, &env_spec.fingerprint, "golden").await? {
         return Ok(());
     }
     // Any record must die before the machine does: a rebake interrupted
@@ -2551,16 +2612,19 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     golden: &MachineName,
 ) -> Result<(), OrchestratorError> {
     // Same adoption rule as the baked-golden path: an engine restart must not
-    // re-unpack a multi-GiB packed golden that is still sitting there forkable
-    // and fingerprint-matched. Without this every `serve` restart pays the
+    // re-unpack a multi-GiB packed golden that is still sitting there
+    // fingerprint-matched. Without this every `serve` restart pays the
     // full unpack (tens of GB of storage writes) before the first job.
     let env_spec = EnvironmentSpec::for_base(config.base_image.clone());
-    if golden_is_reusable(provider, config, golden, &env_spec.fingerprint).await {
-        info!(
-            machine = golden.as_str(),
-            fingerprint = %env_spec.fingerprint,
-            "adopted the existing packed golden fork base"
-        );
+    if adopt_golden(
+        provider,
+        config,
+        golden,
+        &env_spec.fingerprint,
+        "packed golden",
+    )
+    .await?
+    {
         return Ok(());
     }
     remove_golden_record(config, golden);
@@ -2812,10 +2876,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
 
         while slots.join_next().await.is_some() {}
-        // Clean up every environment-specific golden fork base.
+        // Stop, don't delete, every environment-specific golden fork base: the
+        // machine directory (fork snapshot) must survive so the next engine
+        // start can adopt it instead of rebaking. `remove_stale_machines`
+        // spares recorded goldens; the fingerprint record gates adoption.
         for golden in golden_registry.all_names().await {
             vm_telemetry_deregister(&self.config, &golden);
-            let _ = self.provider.delete(&golden).await;
+            if let Err(error) = self.provider.stop(&golden).await {
+                warn!(
+                    machine = golden.as_str(),
+                    %error,
+                    "failed to stop golden on shutdown; the next start will rebake it"
+                );
+            }
         }
         self.remove_stale_machines().await?;
         Ok(())
@@ -2963,9 +3036,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
 
         // Drain remaining runners on shutdown.
         while slots.join_next().await.is_some() {}
+        // Stop, don't delete, golden fork bases: the machine directory (fork
+        // snapshot) must survive so the next engine start can adopt the golden
+        // instead of rebaking it. `remove_stale_machines` spares recorded
+        // goldens; the fingerprint record gates adoption.
         for golden in golden_registry.all_names().await {
             vm_telemetry_deregister(&self.config, &golden);
-            let _ = self.provider.delete(&golden).await;
+            if let Err(error) = self.provider.stop(&golden).await {
+                warn!(
+                    machine = golden.as_str(),
+                    %error,
+                    "failed to stop golden on shutdown; the next start will rebake it"
+                );
+            }
         }
         self.remove_stale_machines().await?;
         Ok(())
@@ -3217,6 +3300,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 .as_str()
                 .starts_with(&format!("{}-", self.config.name_prefix))
             {
+                // A golden fork base recorded by a previous engine run is not
+                // stale: its machine directory plus the fingerprint record are
+                // exactly what the startup adoption path needs. Deleting it
+                // here forced a full rebake on every restart (#293); the
+                // prepare path rebuilds it anyway when the fingerprint no
+                // longer matches.
+                if golden_record_path(&self.config, &name).is_some_and(|path| path.is_file()) {
+                    continue;
+                }
                 notify_runner_gone(&self.config, &name).await;
                 vm_telemetry_deregister(&self.config, &name);
                 if let Err(error) = self.provider.delete(&name).await {
@@ -7350,20 +7442,25 @@ chmod +x "$dest/bin/node"
     }
 
     /// The golden registry dies with the process, so a restart would rebake a
-    /// golden that is still running and still correct. The host-side record is
+    /// golden that is still sitting there fully baked. The host-side record is
     /// what makes adoption safe: it must match the requested fingerprint, and
-    /// the machine must actually be up to serve as a fork base.
+    /// the machine must exist. A stopped golden — the state a graceful
+    /// shutdown leaves, since shutdown stops rather than deletes goldens — is
+    /// re-armed; a running one is used as-is (#293).
     #[tokio::test]
-    async fn golden_is_adopted_only_when_running_and_recorded() {
+    async fn golden_adopt_state_covers_restart_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_config(false);
         config.artifact_stem = temp.path().join("runner-image");
         let provider = Arc::new(TestProvider::new(false, false, false, false, false));
         let golden = MachineName::new("lifecycle-test-golden-abc123").unwrap();
 
-        // Recorded, but the machine was never started.
+        // Recorded, but the machine was never started: rebuild.
         write_golden_record(&config, &golden, "fp-1");
-        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Rebuild
+        );
 
         provider
             .create(&MachineSpec {
@@ -7383,12 +7480,44 @@ chmod +x "$dest/bin/node"
             .unwrap();
         provider.start(&golden).await.unwrap();
 
-        assert!(golden_is_reusable(&provider, &config, &golden, "fp-1").await);
-        // A base-image or toolchain bump changes the fingerprint: rebake.
-        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-2").await);
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Reusable
+        );
+        // A base-image or toolchain bump changes the fingerprint: rebuild.
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-2").await,
+            GoldenAdopt::Rebuild
+        );
+
+        // Graceful shutdown stops the golden instead of deleting it; the next
+        // start re-arms it as a fork base rather than rebaking.
+        provider.stop(&golden).await.unwrap();
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Rearm
+        );
+        assert!(adopt_golden(&provider, &config, &golden, "fp-1", "golden")
+            .await
+            .unwrap());
+        assert_eq!(
+            provider.status(&golden).await.unwrap(),
+            MachineState::Running
+        );
+        assert!(
+            provider
+                .events()
+                .await
+                .iter()
+                .any(|event| event == &format!("start:{}", golden.as_str())),
+            "re-arm must restart the stopped golden as forkable"
+        );
 
         remove_golden_record(&config, &golden);
-        assert!(!golden_is_reusable(&provider, &config, &golden, "fp-1").await);
+        assert_eq!(
+            golden_adopt_state(&provider, &config, &golden, "fp-1").await,
+            GoldenAdopt::Rebuild
+        );
     }
 
     #[tokio::test]
