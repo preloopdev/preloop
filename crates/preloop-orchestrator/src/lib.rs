@@ -2713,6 +2713,23 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
         let _ = provider.delete(golden).await;
         return Err(error.into());
     }
+    // Issue #295: smolvm's pack export leaves ~29 GB of intermediates
+    // (`storage.ext4`, `layers/*.tar`) beside the finished `storage.raw`,
+    // and every fork copies the golden's whole data directory. Prune them
+    // now that the disk is written. Best-effort: never fail the golden
+    // over disk hygiene.
+    match provider.prune_pack_intermediates(golden).await {
+        Ok(true) => info!(
+            machine = golden.as_str(),
+            "pruned pack/ build intermediates from packed golden"
+        ),
+        Ok(false) => {}
+        Err(error) => warn!(
+            machine = golden.as_str(),
+            %error,
+            "failed to prune pack/ build intermediates from packed golden"
+        ),
+    }
     write_golden_record(config, golden, &env_spec.fingerprint);
     info!(
         machine = golden.as_str(),
@@ -5580,6 +5597,8 @@ mod lifecycle_tests {
         /// Whether this provider claims runtime-preserving suspension. When
         /// set, the debug watcher may park the machine via `stop`.
         suspends: bool,
+        /// Names passed to `prune_pack_intermediates`, in call order.
+        prune_pack_calls: Mutex<Vec<String>>,
     }
 
     impl TestProvider {
@@ -5609,6 +5628,7 @@ mod lifecycle_tests {
                 pause_marker: std::sync::atomic::AtomicBool::new(false),
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
                 suspends: false,
+                prune_pack_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -6785,6 +6805,14 @@ chmod +x "$dest/bin/node"
             self.start(name).await
         }
 
+        async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
+            self.prune_pack_calls
+                .lock()
+                .await
+                .push(name.as_str().to_owned());
+            Ok(true)
+        }
+
         async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
             self.events
                 .lock()
@@ -7193,6 +7221,57 @@ chmod +x "$dest/bin/node"
             "fallback order must be fork, cleanup, create, start: {events:?}"
         );
         assert!(provider.has_machine(&name).await);
+    }
+
+    /// Issue #295: once the packed golden is forkable, the pool must ask the
+    /// provider to drop the pack/ build intermediates that sit beside the
+    /// finished disk. A failed prune is best-effort and must not fail the
+    /// golden — but the hook itself must fire exactly once per preparation.
+    #[tokio::test]
+    async fn packed_golden_prepare_prunes_pack_intermediates() {
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        // Keep the golden fingerprint record off /tmp: the test only needs a
+        // writable directory, not the hardcoded lifecycle paths.
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+
+        prepare_packed_golden(&provider, &config, &golden)
+            .await
+            .expect("packed golden preparation succeeds");
+
+        assert_eq!(
+            *provider.prune_pack_calls.lock().await,
+            vec![golden.as_str().to_owned()],
+            "prune hook fires exactly once for the golden"
+        );
+        let events = provider.events().await;
+        let forkable = format!("start:{}", golden.as_str());
+        assert!(
+            events.iter().any(|event| event == &forkable),
+            "golden was started forkable before the prune: {events:?}"
+        );
+    }
+
+    /// The prune hook must not fire when the golden never becomes forkable:
+    /// `prepare_packed_golden` returns before the hook on any earlier failure.
+    #[tokio::test]
+    async fn packed_golden_prepare_skips_prune_on_start_failure() {
+        let provider = Arc::new(TestProvider::new(true, false, false, false, false));
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let mut config = packed_fork_config();
+        config.artifact_stem = scratch.path().join("artifact");
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+
+        prepare_packed_golden(&provider, &config, &golden)
+            .await
+            .expect_err("start failure aborts golden preparation");
+
+        assert!(
+            provider.prune_pack_calls.lock().await.is_empty(),
+            "prune hook must not fire when the golden never started"
+        );
     }
 
     /// A spent fork base with no surviving clones is re-armed (stop, start

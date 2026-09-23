@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub mod agentenv;
 pub mod telemetry;
@@ -348,6 +348,17 @@ pub trait VmProvider: Send + Sync {
     async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError>;
     /// Fork a running forkable machine into a new clone with CoW memory and disks.
     async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError>;
+    /// Remove `pack/` build intermediates from a machine's data directory once
+    /// its finished disk exists (issue #295).
+    ///
+    /// smolvm's pack export leaves ~29 GB of intermediates (`storage.ext4`,
+    /// `layers/*.tar`) beside the finished `storage.raw`, and a fork copies
+    /// the golden's whole data directory — so every runner inherits a copy.
+    /// Providers without pack intermediates keep the default no-op.
+    async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
+        let _ = name;
+        Ok(false)
+    }
     /// Stop an existing machine.
     async fn stop(&self, name: &MachineName) -> Result<(), VmError>;
     /// Delete a machine and its mutable overlay.
@@ -869,6 +880,99 @@ impl SmolVmProvider {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
     }
+
+    /// Resolve a machine's on-disk data directory via `smolvm machine data-dir`.
+    ///
+    /// The directory is hash-derived, not name-derived, so it must be asked
+    /// of smolvm rather than reconstructed from the platform cache layout.
+    async fn machine_data_dir(&self, name: &MachineName) -> Result<PathBuf, VmError> {
+        let output = self
+            .concurrent(
+                "data-dir",
+                &[
+                    "machine".into(),
+                    "data-dir".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+            )
+            .await?;
+        let dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if dir.is_empty() {
+            return Err(VmError::Protocol(format!(
+                "smolvm machine data-dir for `{}` returned empty output",
+                name.as_str()
+            )));
+        }
+        Ok(PathBuf::from(dir))
+    }
+}
+
+/// Best-effort recursive byte sum of a directory tree (metadata only).
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Do not follow symlinks: count the link itself, never its target.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+/// Remove `<data_dir>/pack` build intermediates left by smolvm's pack export
+/// (issue #295: `storage.ext4` + `layers/*.tar`, ~29 GB beside the finished
+/// `storage.raw`, copied into every fork).
+///
+/// Only removes when the finished disk (`storage.raw`) exists beside it, and
+/// only when `pack` is a real directory strictly inside `data_dir` — a
+/// symlink (even one pointing inside) is never followed. Returns true when a
+/// pack directory was removed.
+fn prune_pack_dir(data_dir: &Path) -> Result<bool, VmError> {
+    if !data_dir.join("storage.raw").is_file() {
+        return Ok(false);
+    }
+    let pack = data_dir.join("pack");
+    // Refuse symlinks outright: the removal must never follow a link.
+    if std::fs::symlink_metadata(&pack)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let canonical_dir = data_dir
+        .canonicalize()
+        .map_err(|source| VmError::RuntimeIo { source })?;
+    let canonical_pack = match pack.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    if !canonical_pack.is_dir()
+        || canonical_pack == canonical_dir
+        || !canonical_pack.starts_with(&canonical_dir)
+    {
+        return Ok(false);
+    }
+    let bytes = dir_size_bytes(&canonical_pack);
+    std::fs::remove_dir_all(&canonical_pack).map_err(|source| VmError::RuntimeIo { source })?;
+    info!(
+        machine_dir = %canonical_dir.display(),
+        reclaimed_bytes = bytes,
+        "removed pack/ build intermediates beside finished disk"
+    );
+    Ok(true)
 }
 
 #[async_trait]
@@ -1064,8 +1168,27 @@ impl VmProvider for SmolVmProvider {
                 .lock()
                 .await
                 .insert(clone.as_str().to_owned(), golden.as_str().to_owned());
+            // Issue #295: smolvm's fork copies the golden's whole data dir,
+            // pack/ build intermediates included. Prune the clone's copy;
+            // never fail provisioning over best-effort disk hygiene.
+            if let Err(error) = self.prune_pack_intermediates(clone).await {
+                warn!(
+                    clone = clone.as_str(),
+                    %error,
+                    "failed to prune pack/ intermediates from forked machine"
+                );
+            }
         }
         result.map(|_| ())
+    }
+
+    async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
+        let data_dir = self.machine_data_dir(name).await?;
+        // Removing ~29 GB of intermediates is metadata-heavy; keep it off the
+        // async runtime.
+        tokio::task::spawn_blocking(move || prune_pack_dir(&data_dir))
+            .await
+            .map_err(|error| VmError::Protocol(format!("pack prune task failed: {error}")))?
     }
 
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
@@ -2257,6 +2380,81 @@ async fn stream_output(
 
 #[cfg(test)]
 mod tests {
+
+    /// Scratch machine data dir for the pack-prune tests: `<tmp>/pack-prune-<uuid>/`.
+    fn pack_prune_scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("preloop-pack-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn prune_pack_dir_removes_pack_beside_finished_disk() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("storage.raw"), b"disk").unwrap();
+        let pack = data_dir.join("pack");
+        std::fs::create_dir_all(pack.join("layers")).unwrap();
+        std::fs::write(pack.join("storage.ext4"), b"intermediate").unwrap();
+        std::fs::write(pack.join("layers").join("abc.tar"), b"layer").unwrap();
+
+        assert!(super::prune_pack_dir(&data_dir).expect("prune"));
+        assert!(!pack.exists(), "pack/ must be gone");
+        assert!(data_dir.join("storage.raw").is_file(), "disk must survive");
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_skips_when_disk_missing() {
+        let data_dir = pack_prune_scratch();
+        let pack = data_dir.join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("storage.ext4"), b"intermediate").unwrap();
+
+        assert!(!super::prune_pack_dir(&data_dir).expect("prune"));
+        assert!(
+            pack.is_dir(),
+            "pack/ must be left alone without storage.raw"
+        );
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_skips_when_no_pack() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("storage.raw"), b"disk").unwrap();
+
+        assert!(!super::prune_pack_dir(&data_dir).expect("prune"));
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_refuses_symlink_pack() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("storage.raw"), b"disk").unwrap();
+        let target = data_dir.join("real-target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep"), b"data").unwrap();
+        std::os::unix::fs::symlink(&target, data_dir.join("pack")).unwrap();
+
+        assert!(!super::prune_pack_dir(&data_dir).expect("prune"));
+        assert!(target.join("keep").is_file(), "symlink target must survive");
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_counts_bytes_without_following_links() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("a"), vec![7u8; 100]).unwrap();
+        let sub = data_dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("b"), vec![8u8; 50]).unwrap();
+        std::os::unix::fs::symlink(data_dir.join("a"), sub.join("link")).unwrap();
+        // 100 (a) + 50 (b) + the link's own bytes; the link target's 100
+        // bytes are not counted twice, i.e. the link is not followed.
+        let link_len = std::fs::symlink_metadata(sub.join("link")).unwrap().len();
+        assert_eq!(super::dir_size_bytes(&data_dir), 150 + link_len);
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
 
     #[test]
     fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
