@@ -34,118 +34,112 @@ pub async fn twirp_workflow_steps_update(
         .as_str()
         .unwrap_or("");
     crate::auth::require_results_job(&identity, plan_id, agent_job_id_str)?;
-    let mut inner = shared.state.inner.lock().await;
-
-    let (Some(plan_uuid), Some(job_uuid)) = (
-        uuid::Uuid::parse_str(plan_id).ok(),
-        uuid::Uuid::parse_str(agent_job_id_str).ok(),
-    ) else {
+    let steps_payload = payload["steps"].as_array().cloned();
+    let plan_uuid = uuid::Uuid::parse_str(plan_id).ok();
+    let job_uuid = uuid::Uuid::parse_str(agent_job_id_str).ok();
+    let (Some(plan_uuid), Some(job_uuid)) = (plan_uuid, job_uuid) else {
         return Ok(Json(json!({"ok": true})));
     };
-    let Some((_, run_id, job_id)) =
-        resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
-    else {
-        return Ok(Json(json!({"ok": true})));
-    };
-    let Some(steps) = payload["steps"].as_array().cloned() else {
+    let Some(steps) = steps_payload else {
         return Ok(Json(json!({"ok": true})));
     };
 
-    let job_status = inner
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.jobs.get(&job_id).copied());
-    let observed = chrono::Utc::now();
-    let records = inner.job_steps.entry(job_uuid).or_default();
-
-    for step in &steps {
-        let external_id = step["external_id"].as_str().unwrap_or("");
-        if external_id.is_empty() {
-            // With no identity there is nothing to reconcile against, and
-            // guessing by display name is exactly what merged two distinct
-            // same-named steps and lost one from the run.
-            tracing::warn!(
-                %run_id, job = %job_id.0,
-                "dropping step report with no external_id"
-            );
-            continue;
-        }
-
-        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
-        let status_num = step["status"].as_u64().unwrap_or(0);
-        let terminal = status_num == 6;
-        let conclusion = if terminal {
-            match conclusion_num {
-                2 => "success",
-                3 if job_status == Some(ExecutionStatus::Cancelled) => "cancelled",
-                3 => "failure",
-                7 => "skipped",
-                _ => "success",
-            }
-        } else {
-            "in_progress"
-        };
-        // The runner reports the rendered display name ("Run actions/checkout@v4"),
-        // the same string GitHub's UI shows, so it wins over the message's name:
-        // the server leaves that empty for steps without an explicit `name:`.
-        let reported_name = step["name"].as_str().filter(|name| !name.is_empty());
-        let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
-
-        match StepRecord::find_by_id(records, external_id) {
-            Some(pos) => {
-                let record = &mut records[pos];
-                record.conclusion = conclusion.to_owned();
-                record.runner_number = runner_number.or(record.runner_number);
-                if let Some(name) = reported_name {
-                    record.name = name.to_owned();
-                }
-                // First non-terminal sighting is the start signal.
-                if !terminal && record.started_at.is_none() {
-                    record.started_at = Some(observed);
-                }
-                if terminal && record.finished_at.is_none() {
-                    record.finished_at = Some(observed);
-                }
-            }
-            None => records.push(StepRecord {
-                id: external_id.to_owned(),
-                kind: StepKind::Synthetic,
-                workflow_index: None,
-                runner_number,
-                context_name: None,
-                name: reported_name.unwrap_or_default().to_owned(),
-                conclusion: conclusion.to_owned(),
-                // Do not invent `started_at == finished_at`, which forces
-                // duration 0 for a step that completed before any in-progress
-                // update was processed.
-                started_at: (!terminal).then_some(observed),
-                finished_at: terminal.then_some(observed),
-            }),
-        }
-    }
-
-    // Persist the attempt that changed, after releasing the lock: without this
-    // a restart before job completion loses every step conclusion the runner
-    // reported. Best-effort, like the rest of the store — in-memory state is
-    // authoritative and a failed write must not fail the runner's callback.
-    let records = records.clone();
-    // Bumped under the same lock that mutated the manifest, so the write
-    // carries a revision strictly newer than any snapshot taken before it.
-    let revision = {
-        let counter = inner.job_steps_revision.entry(job_uuid).or_insert(0);
-        *counter += 1;
-        *counter
-    };
-    drop(inner);
-    if let Err(error) = shared
+    // Resolve the callback identity and apply the step manifest update in one
+    // backend transaction — `job_steps`/`job_steps_revision` are durable
+    // TxState, so the commit persists them (no separate store write).
+    shared
         .state
-        .store
-        .store_job_steps(run_id, job_uuid, &records, revision)
-        .await
-    {
-        tracing::warn!(?error, %run_id, "failed to persist step records");
-    }
+        .backend
+        .transact(move |tx| {
+            let Some((_, run_id, job_id)) =
+                resolve_callback_job(tx, &plan_uuid.to_string(), None, Some(job_uuid))
+            else {
+                return Ok(());
+            };
 
+            let job_status = tx
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.jobs.get(&job_id).copied());
+            let observed = chrono::Utc::now();
+            let records = tx.job_steps.entry(job_uuid).or_default();
+
+            for step in &steps {
+                let external_id = step["external_id"].as_str().unwrap_or("");
+                if external_id.is_empty() {
+                    // With no identity there is nothing to reconcile against,
+                    // and guessing by display name is exactly what merged two
+                    // distinct same-named steps and lost one from the run.
+                    tracing::warn!(
+                        %run_id, job = %job_id.0,
+                        "dropping step report with no external_id"
+                    );
+                    continue;
+                }
+
+                let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
+                let status_num = step["status"].as_u64().unwrap_or(0);
+                let terminal = status_num == 6;
+                let conclusion = if terminal {
+                    match conclusion_num {
+                        2 => "success",
+                        3 if job_status == Some(ExecutionStatus::Cancelled) => "cancelled",
+                        3 => "failure",
+                        7 => "skipped",
+                        _ => "success",
+                    }
+                } else {
+                    "in_progress"
+                };
+                // The runner reports the rendered display name ("Run
+                // actions/checkout@v4"), the same string GitHub's UI shows, so
+                // it wins over the message's name: the server leaves that
+                // empty for steps without an explicit `name:`.
+                let reported_name = step["name"].as_str().filter(|name| !name.is_empty());
+                let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
+
+                match StepRecord::find_by_id(records, external_id) {
+                    Some(pos) => {
+                        let record = &mut records[pos];
+                        record.conclusion = conclusion.to_owned();
+                        record.runner_number = runner_number.or(record.runner_number);
+                        if let Some(name) = reported_name {
+                            record.name = name.to_owned();
+                        }
+                        // First non-terminal sighting is the start signal.
+                        if !terminal && record.started_at.is_none() {
+                            record.started_at = Some(observed);
+                        }
+                        if terminal && record.finished_at.is_none() {
+                            record.finished_at = Some(observed);
+                        }
+                    }
+                    None => records.push(StepRecord {
+                        id: external_id.to_owned(),
+                        kind: StepKind::Synthetic,
+                        workflow_index: None,
+                        runner_number,
+                        context_name: None,
+                        name: reported_name.unwrap_or_default().to_owned(),
+                        conclusion: conclusion.to_owned(),
+                        // Do not invent `started_at == finished_at`, which
+                        // forces duration 0 for a step that completed before
+                        // any in-progress update was processed.
+                        started_at: (!terminal).then_some(observed),
+                        finished_at: terminal.then_some(observed),
+                    }),
+                }
+            }
+
+            // Bumped under the same transaction that mutated the manifest, so
+            // the committed revision is strictly newer than any snapshot taken
+            // before it.
+            let counter = tx.job_steps_revision.entry(job_uuid).or_insert(0);
+            *counter += 1;
+            Ok(())
+        })
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -378,7 +372,11 @@ pub async fn twirp_create_step_summary_metadata(
             line_count: 0,
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
+    let meta = shared
+        .state
+        .backend
+        .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+        .await?;
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist step summary metadata");
     }
@@ -430,7 +428,11 @@ pub async fn twirp_create_step_logs_metadata(
             line_count: line_count_usize,
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
+    let meta = shared
+        .state
+        .backend
+        .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+        .await?;
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist step log metadata");
     }
@@ -480,7 +482,11 @@ pub async fn twirp_create_job_logs_metadata(
             line_count: line_count_usize,
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
+    let meta = shared
+        .state
+        .backend
+        .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+        .await?;
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist job log metadata");
     }
@@ -935,7 +941,11 @@ pub async fn twirp_cache_v2_create(
                     created_unix: now_unix(),
                 },
             );
-            let meta = crate::store::build_meta_snapshot(&inner);
+            let meta = shared
+                .state
+                .backend
+                .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+                .await?;
             if let Err(error) = shared.state.store.store_meta_only(&meta).await {
                 tracing::warn!(?error, "failed to persist cache v2 reservation");
             }
@@ -1085,7 +1095,11 @@ pub async fn twirp_cache_v2_finalize(
     {
         let mut inner = shared.state.inner.lock().await;
         inner.cache_v2_pending.remove(&token);
-        let meta = crate::store::build_meta_snapshot(&inner);
+        let meta = shared
+            .state
+            .backend
+            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+            .await?;
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist cache v2 finalization");
         }

@@ -236,7 +236,11 @@ pub async fn cache_reserve(
             created_unix: crate::memory_caps::now_unix(),
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
+    let meta = shared
+        .state
+        .backend
+        .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+        .await?;
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist cache reservation");
     }
@@ -351,7 +355,11 @@ pub async fn cache_commit(
     };
     let meta = {
         let inner = shared.state.inner.lock().await;
-        crate::store::build_meta_snapshot(&inner)
+        shared
+            .state
+            .backend
+            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+            .await?
     };
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist cache commit");
@@ -494,7 +502,11 @@ pub async fn put_artifact(
     };
     let mut inner = shared.state.inner.lock().await;
     inner.artifacts.insert(record.id.clone(), record.clone());
-    let meta = crate::store::build_meta_snapshot(&inner);
+    let meta = shared
+        .state
+        .backend
+        .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+        .await?;
     if let Err(error) = shared.state.store.store_meta_only(&meta).await {
         tracing::warn!(?error, "failed to persist artifact metadata");
     }

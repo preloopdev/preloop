@@ -58,11 +58,15 @@ pub fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
 /// uploads invisible to the consumer (found via scenario 206). Map the plan id
 /// to the recorded run id when it is known; fall back to the request value for
 /// unknown plans (control-plane callers, tests).
-pub fn canonical_artifact_scope(inner: &InnerState, plan_id: &str, fallback: &str) -> String {
-    if let Some(request_id) = inner.plan_requests.get(plan_id)
-        && let Some(record) = inner.job_requests.get(request_id)
-    {
-        return record.run_id.to_string();
+pub fn canonical_artifact_scope(
+    tx: &crate::control::txstate::TxState,
+    plan_id: &str,
+    fallback: &str,
+) -> String {
+    if let Some(request_id) = tx.plan_requests.get(plan_id) {
+        if let Some(record) = tx.job_requests.get(request_id) {
+            return record.run_id.to_string();
+        }
     }
     fallback.to_owned()
 }
@@ -88,23 +92,23 @@ pub fn canonical_artifact_scope(inner: &InnerState, plan_id: &str, fallback: &st
 /// jobs. `workflow_job_run_backend_id` is consequently *not* an authorization
 /// input here; it is recorded as attribution only.
 fn artifact_v2_canonical_run_scope(
-    inner: &InnerState,
+    tx: &crate::control::txstate::TxState,
     workflow_run_backend_id: &str,
     job: Option<uuid::Uuid>,
 ) -> Result<String, ApiError> {
     let canonical_run =
-        canonical_artifact_scope(inner, workflow_run_backend_id, workflow_run_backend_id);
+        canonical_artifact_scope(tx, workflow_run_backend_id, workflow_run_backend_id);
     let Some(job) = job else {
         return Ok(canonical_run);
     };
     let forbidden =
         || ApiError::forbidden("artifact access requires a token for that workflow run");
-    let request_id = inner
+    let request_id = tx
         .agent_job_requests
         .get(&job)
         .copied()
         .ok_or_else(forbidden)?;
-    let record = inner.job_requests.get(&request_id).ok_or_else(forbidden)?;
+    let record = tx.job_requests.get(&request_id).ok_or_else(forbidden)?;
     if record.run_id.to_string() != canonical_run {
         return Err(forbidden());
     }
@@ -156,8 +160,13 @@ pub async fn twirp_artifact_v2_create(
     };
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
-        let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+        let backend_id = request.workflow_run_backend_id.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
+            .await
+            .map_err(ApiError::from)??
     };
     validate_artifact_name(&request.name)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -234,7 +243,11 @@ pub async fn twirp_artifact_v2_create(
                 created_unix: now_unix(),
             },
         );
-        let meta = crate::store::build_meta_snapshot(&inner);
+        let meta = shared
+            .state
+            .backend
+            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+            .await?;
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 reservation");
         }
@@ -274,8 +287,13 @@ pub async fn twirp_artifact_v2_finalize(
     };
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
-        let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+        let backend_id = request.workflow_run_backend_id.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
+            .await
+            .map_err(ApiError::from)??
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let token = {
@@ -345,7 +363,11 @@ pub async fn twirp_artifact_v2_finalize(
         // F7: keep the registry bounded per run (500) and globally (10k);
         // oldest entries are evicted first.
         trim_artifact_registry(&mut inner);
-        let meta = crate::store::build_meta_snapshot(&inner);
+        let meta = shared
+            .state
+            .backend
+            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+            .await?;
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 finalization");
         }
@@ -368,9 +390,39 @@ pub async fn twirp_artifact_v2_list(
     Json(request): Json<ArtifactV2ListRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
-    let inner = shared.state.inner.lock().await;
-    let canonical_run =
-        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?;
+    // Node-local registry snapshot (entries + their raw backend ids), then a
+    // backend read to canonicalize the request scope and each entry's scope.
+    let entries: Vec<crate::models::ArtifactV2Entry> = {
+        let inner = shared.state.inner.lock().await;
+        inner.artifact_v2_registry.values().cloned().collect()
+    };
+    let backend_id = request.workflow_run_backend_id.clone();
+    let (canonical_run, entry_scopes) = {
+        let entries_for_scope = entries.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| {
+                let canonical_run = artifact_v2_canonical_run_scope(tx, &backend_id, job);
+                let entry_scopes = entries_for_scope
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.workflow_run_backend_id.clone(),
+                            canonical_artifact_scope(
+                                tx,
+                                &e.workflow_run_backend_id,
+                                &e.workflow_run_backend_id,
+                            ),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                Ok((canonical_run, entry_scopes))
+            })
+            .await
+            .map_err(ApiError::from)?
+    };
+    let canonical_run = canonical_run?;
 
     let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
         serde_json::Value::String(s) => Some(s),
@@ -390,15 +442,13 @@ pub async fn twirp_artifact_v2_list(
         _ => None,
     });
 
-    let artifacts: Vec<serde_json::Value> = inner
-        .artifact_v2_registry
-        .values()
+    let artifacts: Vec<serde_json::Value> = entries
+        .iter()
         .filter(|e| {
-            canonical_artifact_scope(
-                &inner,
-                &e.workflow_run_backend_id,
-                &e.workflow_run_backend_id,
-            ) == canonical_run
+            entry_scopes
+                .get(&e.workflow_run_backend_id)
+                .map(|scope| scope == &canonical_run)
+                .unwrap_or(false)
         })
         .filter(|e| name_filter.as_deref().map(|f| e.name == f).unwrap_or(true))
         .filter(|e| id_filter.map(|id| e.id == id).unwrap_or(true))
@@ -424,8 +474,13 @@ pub async fn twirp_artifact_v2_get_signed_url(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
     let canonical_run = {
-        let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+        let backend_id = request.workflow_run_backend_id.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
+            .await
+            .map_err(ApiError::from)??
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let blob_jti = {
@@ -469,8 +524,13 @@ pub async fn twirp_artifact_v2_delete(
     };
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let canonical_run = {
-        let inner = shared.state.inner.lock().await;
-        artifact_v2_canonical_run_scope(&inner, &request.workflow_run_backend_id, job)?
+        let backend_id = request.workflow_run_backend_id.clone();
+        shared
+            .state
+            .backend
+            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
+            .await
+            .map_err(ApiError::from)??
     };
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let removed = {
@@ -480,7 +540,11 @@ pub async fn twirp_artifact_v2_delete(
     if let Some(e) = removed {
         let meta = {
             let inner = shared.state.inner.lock().await;
-            crate::store::build_meta_snapshot(&inner)
+            shared
+                .state
+                .backend
+                .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
+                .await?
         };
         if let Err(error) = shared.state.store.store_meta_only(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 deletion");
