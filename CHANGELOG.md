@@ -358,6 +358,13 @@ Releases before v0.27.0 predate the changelog.
   left `in_progress` with nothing executing it raises a
   `run_in_progress_without_execution` condition instead of vanishing from the
   operator's view.
+- SQLite control databases now enforce `NOT NULL` on text primary keys, matching
+  PostgreSQL instead of accepting identity rows with `NULL` keys. The v8
+  migration rebuilds affected tables atomically and preserves existing rows.
+- Pre-baked golden downloads now check free space on the destination filesystem
+  before writing the multi-gigabyte payload. An undersized host gets an
+  actionable size error instead of downloading a partial image and falling
+  through to an even larger local bake.
 - `preloop run` declared its change set as known even when path derivation had
   not run, so an empty list read as "nothing changed" and every `paths:` filter
   rejected the run with a 400. The flag now mirrors whether derivation actually

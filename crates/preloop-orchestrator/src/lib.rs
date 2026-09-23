@@ -827,12 +827,7 @@ async fn download_prebaked_golden(
     payload: &Path,
     release_version: &str,
 ) -> Result<bool, OrchestratorError> {
-    download_prebaked_golden_with_space(
-        payload,
-        release_version,
-        filesystem_available_space,
-    )
-    .await
+    download_prebaked_golden_with_space(payload, release_version, filesystem_available_space).await
 }
 
 async fn download_prebaked_golden_with_space(
@@ -9090,10 +9085,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-                .await
-                .unwrap();
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
@@ -9127,10 +9121,7 @@ mod golden_download_tests {
             } => {
                 assert_eq!(path, directory.path());
                 assert_eq!(available_bytes, 1024);
-                assert_eq!(
-                    required_bytes,
-                    expected_bytes + GOLDEN_DOWNLOAD_HEADROOM
-                );
+                assert_eq!(required_bytes, expected_bytes + GOLDEN_DOWNLOAD_HEADROOM);
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -9157,10 +9148,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-                .await
-                .unwrap();
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // The caller reads `false` as "build the golden locally", so a partial
@@ -9349,10 +9339,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-                .await
-                .unwrap();
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
@@ -9375,10 +9364,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded =
-            download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
-                .await
-                .unwrap();
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // A corrupted artifact must never be published as the payload: the
