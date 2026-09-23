@@ -658,10 +658,14 @@ impl Serialize for SerializedActionReference<'_> {
         let is_self = reference.path.is_some();
         let is_container_registry =
             reference.reference_type.as_deref() == Some("containerRegistry");
+        let emits_repository_type = !is_self
+            && !is_container_registry
+            && (reference.reference_type.is_none()
+                || reference.reference_type.as_deref() == Some("repository"));
         let field_count = 1
             + usize::from(reference.name.is_some() || is_self)
             + usize::from(reference.version.is_some())
-            + usize::from(reference.reference_type.is_some())
+            + usize::from(emits_repository_type)
             + usize::from(is_self);
         let mut map = serializer.serialize_map(Some(field_count))?;
         map.serialize_entry(
@@ -684,7 +688,12 @@ impl Serialize for SerializedActionReference<'_> {
             if let Some(version) = &reference.version {
                 map.serialize_entry("ref", version)?;
             }
-            if reference.reference_type.is_none() {
+            // `repositoryType: "GitHub"` is the canonical host marker for a
+            // remote action. `reference_type` round-trips `type: "repository"`
+            // back as `Some("repository")`, so emit it for both `None` and
+            // `Some("repository")` — dropping it on the second write loses
+            // the field the official runner sends.
+            if emits_repository_type {
                 map.serialize_entry("repositoryType", "GitHub")?;
             }
         }
@@ -875,6 +884,7 @@ mod tests {
 
         let wire = serde_json::to_value(&step).unwrap();
         assert_eq!(wire["reference"]["ref"], "v4");
+        assert_eq!(wire["reference"]["repositoryType"], "GitHub");
         assert!(
             wire["reference"].get("version").is_none(),
             "wire format must use the canonical `ref` field"
@@ -889,8 +899,12 @@ mod tests {
             Some("v4")
         );
 
+        // `type: "repository"` deserializes into `reference_type`, so the
+        // second serialize must still emit `repositoryType` — dropping it
+        // loses the host marker the official runner sends.
         let reserialized = serde_json::to_value(&decoded).unwrap();
         assert_eq!(reserialized["reference"]["ref"], "v4");
+        assert_eq!(reserialized["reference"]["repositoryType"], "GitHub");
         assert!(reserialized["reference"].get("version").is_none());
     }
 
