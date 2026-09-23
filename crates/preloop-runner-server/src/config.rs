@@ -1176,7 +1176,15 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
 /// could satisfy the quorum alone by calling the approval endpoint
 /// repeatedly. Fail the config load closed rather than run with a
 /// misleading gate.
+///
+/// Wait timers are also range-checked: the gate converts minutes to i64
+/// nanoseconds, and a `u64` value above `i64::MAX` would cast to a negative
+/// delay (bypassing the wait). TOML integers top out at `i64::MAX`, so no
+/// config file can trigger this today, but the bound is enforced anyway so
+/// the cast site stays total.
 fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
+    /// Largest whole minutes representable as i64 nanoseconds.
+    const MAX_WAIT_TIMER_MINUTES: u64 = (i64::MAX as u64) / 60_000_000_000;
     for (repo, envs) in &config.environment_rules {
         for (env, rules) in envs {
             anyhow::ensure!(
@@ -1184,6 +1192,12 @@ fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
                 "environment_rules[{repo}][{env}]: required_reviewers = {} is not supported; \
                  preloop has no user identities, so at most 1 operator approval can be required",
                 rules.required_reviewers
+            );
+            anyhow::ensure!(
+                rules.wait_timer_minutes <= MAX_WAIT_TIMER_MINUTES,
+                "environment_rules[{repo}][{env}]: wait_timer_minutes = {} is too large; \
+                 the wait must fit in i64 nanoseconds (max {MAX_WAIT_TIMER_MINUTES} minutes)",
+                rules.wait_timer_minutes
             );
         }
     }
@@ -1384,6 +1398,52 @@ mod tests {
                 reviewers
             );
         }
+    }
+
+    #[test]
+    fn wait_timer_minutes_overflow_is_rejected() {
+        // The gate casts minutes to i64 nanoseconds; a u64 above i64::MAX
+        // would cast negative and bypass the wait. TOML integers top out at
+        // i64::MAX so no config file can hit this today, but the bound is
+        // enforced at load so the cast site stays total.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // i64::MAX minutes is TOML-representable but not as i64 nanoseconds.
+        std::fs::write(
+            &path,
+            "[environment_rules.\"owner/repo\".prod]\nwait_timer_minutes = 9223372036854775807\n",
+        )
+        .unwrap();
+        let err = load_config_from(&path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("wait_timer_minutes"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn wait_timer_minutes_boundary_is_accepted() {
+        // Largest whole minutes that fit in i64 nanoseconds: the cast in the
+        // gate is the identity and saturating_mul cannot saturate.
+        let max_minutes = (i64::MAX as u64) / 60_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[environment_rules.\"owner/repo\".prod]\nwait_timer_minutes = {max_minutes}\n"
+            ),
+        )
+        .unwrap();
+        let config = load_config_from(&path).unwrap();
+        assert_eq!(
+            config.environment_rules["owner/repo"]["prod"].wait_timer_minutes,
+            max_minutes
+        );
+        assert_eq!(
+            (max_minutes as i64).saturating_mul(60_000_000_000) / 60_000_000_000,
+            max_minutes as i64
+        );
     }
 
     use crate::credential_store::{

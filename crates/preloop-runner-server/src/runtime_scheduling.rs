@@ -82,6 +82,8 @@ pub fn check_environment_gates(
 
     // 2. Wait timer: arm once, then hold until the deadline passes.
     if gate.wait_until_unix_nanos.is_none() && rule.wait_timer_minutes > 0 {
+        // Safe: config load rejects wait_timer_minutes above the i64-nanos
+        // bound, so this cast is the identity and the mul cannot saturate.
         let wait_nanos = (rule.wait_timer_minutes as i64).saturating_mul(60_000_000_000);
         gate.wait_until_unix_nanos = Some(now_unix_nanos.saturating_add(wait_nanos));
         tracing::info!(
