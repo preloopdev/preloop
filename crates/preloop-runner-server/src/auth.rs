@@ -547,12 +547,11 @@ pub async fn registered_runner_id(shared: &Arc<SharedState>, token: &str) -> Opt
         let client_id = client_id?;
         shared
             .state
-            .inner
-            .lock()
+            .backend
+            .read(move |tx| Ok(tx.runner_client_ids.get(&client_id).copied()))
             .await
-            .runner_client_ids
-            .get(&client_id)
-            .copied()
+            .ok()
+            .flatten()
     };
     let runner_id = runner_id?;
     runner_registered(shared, runner_id)
@@ -580,11 +579,10 @@ pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
 async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
     shared
         .state
-        .inner
-        .lock()
+        .backend
+        .read(move |tx| Ok(tx.runners.contains_key(&runner_id)))
         .await
-        .runners
-        .contains_key(&runner_id)
+        .unwrap_or(false)
 }
 
 /// Signed replay blob upload tickets expire after one hour.
@@ -976,13 +974,18 @@ pub async fn job_repository_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let inner = state.inner.lock().await;
-    let repository = inner
-        .agent_job_requests
-        .get(&job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-        .and_then(|record| inner.runs.get(&record.run_id))
-        .map(|run| run.submission.repository.clone())
+    let repository = state
+        .backend
+        .read(move |tx| {
+            Ok(tx
+                .agent_job_requests
+                .get(&job_id)
+                .and_then(|request_id| tx.job_requests.get(request_id))
+                .and_then(|record| tx.runs.get(&record.run_id))
+                .map(|run| run.submission.repository.clone()))
+        })
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::forbidden("job runtime token is not bound to a live workflow run")
         })?;
