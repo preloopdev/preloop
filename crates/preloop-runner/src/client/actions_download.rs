@@ -27,30 +27,31 @@ pub struct ResolvedAction {
     pub resolved_sha: String,
     pub tar_url: String,
     pub auth_token: Option<String>,
-    /// Tree-digest pin state for this action version (see [`TreeDigestPin`]).
-    pub tree_digest: TreeDigestPin,
+    /// Archive checksum pin state for this action version (see
+    /// [`ArchiveDigestPin`]).
+    pub archive_sha256: ArchiveDigestPin,
 }
 
-/// Whether the server supports action tree-digest pinning, and the pin state
-/// for one resolved action.
+/// Whether the server supports action archive-checksum pinning, and the pin
+/// state for one resolved action.
 ///
-/// The digest is a canonical hash of the *extracted* action tree (not the
-/// tarball bytes): codeload tarballs are an opaque packaging of a commit, and
-/// pinning raw bytes would fail closed on any packaging change GitHub makes.
-/// The tree digest depends only on the commit's content, which the resolved
-/// SHA already identifies.
+/// The digest is the SHA-256 of the *downloaded tarball bytes*, hashed
+/// before extraction. Pinning the archive bytes (rather than the extracted
+/// tree) means a known pin is compared before `extract_tarball` ever runs,
+/// so tampered bytes fail closed without creating an executable tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum TreeDigestPin {
-    /// The server predates digest support (no `tree_digest` key in the
+pub enum ArchiveDigestPin {
+    /// The server predates checksum support (no `archive_sha256` key in the
     /// resolve response). The runner must behave exactly as before: no
     /// verification, no digest report, no cache eviction.
     #[default]
     Unsupported,
-    /// The server supports digests but has no pin for this (owner, repo,
+    /// The server supports checksums but has no pin for this (owner, repo,
     /// sha) yet: this download establishes it (trust on first use).
     Unpinned,
     /// The server has a pin for this (owner, repo, sha): the downloaded
-    /// tree must hash to exactly this digest or the download fails closed.
+    /// archive's SHA-256 must equal this hex digest or the download fails
+    /// closed before extraction.
     Pinned(String),
 }
 
@@ -62,9 +63,9 @@ pub struct ActionsResolveClient {
     launch_base_url: Option<String>,
 }
 
-/// Parameters for a first-use tree digest report. Bundled into one struct
-/// so the report call does not grow an argument per protocol field.
-pub struct TreeDigestReport<'a> {
+/// Parameters for a first-use archive checksum report. Bundled into one
+/// struct so the report call does not grow an argument per protocol field.
+pub struct ArchiveSha256Report<'a> {
     /// Job bearer token (the same credential runnerresolve accepted).
     pub token: &'a str,
     pub orchestration_id: &'a str,
@@ -74,8 +75,14 @@ pub struct TreeDigestReport<'a> {
     /// Resolved commit SHA. The server rejects anything that is not a
     /// commit SHA; pins are never keyed by mutable ref.
     pub sha: &'a str,
-    /// `tree-sha256-v1:<hex>` digest observed by this runner.
-    pub tree_digest: &'a str,
+    /// Lowercase hex SHA-256 of the downloaded tarball bytes, observed by
+    /// this runner.
+    pub archive_sha256: &'a str,
+}
+
+/// Returns true for a well-formed archive digest: 64 hex chars.
+fn valid_archive_sha256(digest: &str) -> bool {
+    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl ActionsResolveClient {
@@ -193,15 +200,20 @@ impl ActionsResolveClient {
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 // Key presence (not value) signals server support: older
-                // servers omit `tree_digest` entirely, in which case the
+                // servers omit `archive_sha256` entirely, in which case the
                 // runner keeps the legacy unverified behavior.
-                let tree_digest = match info.get("tree_digest") {
-                    None => TreeDigestPin::Unsupported,
-                    Some(serde_json::Value::Null) => TreeDigestPin::Unpinned,
-                    Some(serde_json::Value::String(digest)) if !digest.is_empty() => {
-                        TreeDigestPin::Pinned(digest.clone())
+                let archive_sha256 = match info.get("archive_sha256") {
+                    None => ArchiveDigestPin::Unsupported,
+                    Some(serde_json::Value::Null) => ArchiveDigestPin::Unpinned,
+                    Some(serde_json::Value::String(digest)) if valid_archive_sha256(digest) => {
+                        ArchiveDigestPin::Pinned(digest.to_ascii_lowercase())
                     }
-                    _ => TreeDigestPin::Unpinned,
+                    Some(other) => {
+                        tracing::warn!(
+                            "ignoring malformed archive_sha256 pin {other:?}; treating as unpinned"
+                        );
+                        ArchiveDigestPin::Unpinned
+                    }
                 };
 
                 if !tar_url.is_empty() {
@@ -213,7 +225,7 @@ impl ActionsResolveClient {
                             resolved_sha,
                             tar_url,
                             auth_token,
-                            tree_digest,
+                            archive_sha256,
                         },
                     );
                 }
@@ -223,28 +235,32 @@ impl ActionsResolveClient {
         Ok(result)
     }
 
-    /// Report the observed tree digest of a freshly downloaded action so the
-    /// server can pin it for later downloads (trust on first use).
+    /// Report the observed SHA-256 of a freshly downloaded action archive
+    /// so the server can pin it for later downloads (trust on first use).
     ///
-    /// Best-effort by design: a failed report only means this runner does not
-    /// establish the pin, so it warns but never fails the job. Callers must
-    /// only report digests of trees they just downloaded and verified over
-    /// TLS — never of pre-existing cache directories of unknown provenance.
-    pub async fn report_tree_digest(&self, report: TreeDigestReport<'_>) -> Result<()> {
-        let TreeDigestReport {
+    /// Best-effort by design: a failed report only means this runner does
+    /// not establish the pin, so it warns but never fails the job. Callers
+    /// must only report digests of archives they just downloaded and
+    /// successfully extracted over TLS — never of pre-existing cache
+    /// directories of unknown provenance.
+    pub async fn report_archive_sha256(&self, report: ArchiveSha256Report<'_>) -> Result<()> {
+        let ArchiveSha256Report {
             token,
             orchestration_id,
             job_id,
             owner,
             repo,
             sha,
-            tree_digest,
+            archive_sha256,
         } = report;
         let Some(ref base) = self.launch_base_url else {
-            anyhow::bail!("no launch endpoint configured for digest report");
+            anyhow::bail!("no launch endpoint configured for archive digest report");
         };
         if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
-            anyhow::bail!("refusing to report digest for unresolved ref");
+            anyhow::bail!("refusing to report archive digest for unresolved ref");
+        }
+        if !valid_archive_sha256(archive_sha256) {
+            anyhow::bail!("refusing to report malformed archive_sha256");
         }
         let url = format!(
             "{}/actions/build/{orchestration_id}/jobs/{job_id}/runnerresolve/actions/digests",
@@ -254,7 +270,7 @@ impl ActionsResolveClient {
             "owner": owner,
             "repo": repo,
             "sha": sha,
-            "tree_digest": tree_digest,
+            "archive_sha256": archive_sha256,
         });
         let resp = self
             .http
@@ -265,9 +281,9 @@ impl ActionsResolveClient {
             .json(&body)
             .send()
             .await
-            .context("digest report POST")?;
+            .context("archive digest report POST")?;
         if !resp.status().is_success() {
-            anyhow::bail!("digest report returned HTTP {}", resp.status());
+            anyhow::bail!("archive digest report returned HTTP {}", resp.status());
         }
         Ok(())
     }
@@ -405,11 +421,13 @@ mod tests {
         assert!(error.to_string().contains("HTTP 401 Unauthorized"));
     }
 
-    /// `tree_digest` key presence signals server support: a digest string
-    /// becomes a pin, explicit null means supported-but-unpinned, and a
-    /// missing key means a pre-digest server (legacy unverified behavior).
+    /// `archive_sha256` key presence signals server support: a well-formed
+    /// digest string becomes a pin, explicit null means supported but
+    /// unpinned, and a missing key means a pre-checksum server (legacy
+    /// unverified behavior). Malformed digests are treated as unpinned so a
+    /// bad pin can never fail closed or mint a bogus pin.
     #[tokio::test]
-    async fn resolve_batch_parses_tree_digest_pin_states() {
+    async fn resolve_batch_parses_archive_sha256_pin_states() {
         let body = serde_json::json!({
             "actions": {
                 "actions/checkout@v4": {
@@ -417,20 +435,27 @@ mod tests {
                     "version": "v4",
                     "resolved_sha": "abc123",
                     "tar_url": "https://example.invalid/checkout.tar.gz",
-                    "tree_digest": "tree-sha256-v1:deadbeef"
+                    "archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 },
                 "actions/setup-node@v4": {
                     "name": "actions/setup-node",
                     "version": "v4",
                     "resolved_sha": "def456",
                     "tar_url": "https://example.invalid/node.tar.gz",
-                    "tree_digest": null
+                    "archive_sha256": null
                 },
                 "actions/cache@v4": {
                     "name": "actions/cache",
                     "version": "v4",
                     "resolved_sha": "123abc",
                     "tar_url": "https://example.invalid/cache.tar.gz"
+                },
+                "actions/bad@v4": {
+                    "name": "actions/bad",
+                    "version": "v4",
+                    "resolved_sha": "456def",
+                    "tar_url": "https://example.invalid/bad.tar.gz",
+                    "archive_sha256": "not-hex"
                 }
             }
         })
@@ -444,61 +469,87 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            result["actions/checkout@v4"].tree_digest,
-            TreeDigestPin::Pinned("tree-sha256-v1:deadbeef".to_string())
+            result["actions/checkout@v4"].archive_sha256,
+            ArchiveDigestPin::Pinned(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+            )
         );
         assert_eq!(
-            result["actions/setup-node@v4"].tree_digest,
-            TreeDigestPin::Unpinned
+            result["actions/setup-node@v4"].archive_sha256,
+            ArchiveDigestPin::Unpinned
         );
         assert_eq!(
-            result["actions/cache@v4"].tree_digest,
-            TreeDigestPin::Unsupported
+            result["actions/cache@v4"].archive_sha256,
+            ArchiveDigestPin::Unsupported
+        );
+        assert_eq!(
+            result["actions/bad@v4"].archive_sha256,
+            ArchiveDigestPin::Unpinned,
+            "malformed pin must not become a Pinned digest"
         );
     }
 
-    /// The digest report validates the SHA client-side and fails on HTTP
-    /// errors; the runner treats a failed report as best-effort.
+    /// The archive digest report validates the SHA and the digest shape
+    /// client-side and fails on HTTP errors; the runner treats a failed
+    /// report as best-effort.
     #[tokio::test]
-    async fn report_tree_digest_validates_sha_and_surfaces_http_errors() {
+    async fn report_archive_sha256_validates_sha_and_surfaces_http_errors() {
         let client = ActionsResolveClient::new(
             HttpClient::new(None).unwrap(),
             Some("http://127.0.0.1:1".into()),
         );
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
         // Unresolved refs must never be reported: pins are keyed by commit.
         let err = client
-            .report_tree_digest(TreeDigestReport {
+            .report_archive_sha256(ArchiveSha256Report {
                 token: "token",
                 orchestration_id: "plan",
                 job_id: "job",
                 owner: "o",
                 repo: "r",
                 sha: "v4",
-                tree_digest: "tree-sha256-v1:abc",
+                archive_sha256: digest,
             })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unresolved ref"));
 
-        // Unreachable server surfaces as an error (caller logs a warning).
+        // Malformed digests must never be reported: the server would reject
+        // them, and they must not mint pins.
         let err = client
-            .report_tree_digest(TreeDigestReport {
+            .report_archive_sha256(ArchiveSha256Report {
                 token: "token",
                 orchestration_id: "plan",
                 job_id: "job",
                 owner: "o",
                 repo: "r",
-                sha: "0123456789abcdef0123456789abcdef01234567",
-                tree_digest: "tree-sha256-v1:abc",
+                sha,
+                archive_sha256: "xyz",
             })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("digest report POST"));
+        assert!(err.to_string().contains("malformed archive_sha256"));
+
+        // Unreachable server surfaces as an error (caller logs a warning).
+        let err = client
+            .report_archive_sha256(ArchiveSha256Report {
+                token: "token",
+                orchestration_id: "plan",
+                job_id: "job",
+                owner: "o",
+                repo: "r",
+                sha,
+                archive_sha256: digest,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("archive digest report POST"));
     }
 
     #[tokio::test]
-    async fn report_tree_digest_posts_expected_body() {
+    async fn report_archive_sha256_posts_expected_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
@@ -516,14 +567,14 @@ mod tests {
             Some(format!("http://{address}")),
         );
         client
-            .report_tree_digest(TreeDigestReport {
+            .report_archive_sha256(ArchiveSha256Report {
                 token: "job-token",
                 orchestration_id: "plan1",
                 job_id: "job1",
                 owner: "actions",
                 repo: "checkout",
                 sha: "0123456789abcdef0123456789abcdef01234567",
-                tree_digest: "tree-sha256-v1:feedface",
+                archive_sha256: "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface",
             })
             .await
             .unwrap();
@@ -532,7 +583,7 @@ mod tests {
         assert!(text.contains("/runnerresolve/actions/digests"), "{text}");
         assert!(text.contains("Bearer job-token"), "{text}");
         assert!(
-            text.contains("\"tree_digest\":\"tree-sha256-v1:feedface\""),
+            text.contains("\"archive_sha256\":\"feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface\""),
             "{text}"
         );
         assert!(

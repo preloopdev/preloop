@@ -135,7 +135,7 @@ pub fn build_app(
         )
         .route(
             "/actions/build/:orchestration_id/jobs/:job_id/runnerresolve/actions/digests",
-            post(record_action_tree_digest),
+            post(record_action_archive_sha256),
         )
         .route(
             "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",

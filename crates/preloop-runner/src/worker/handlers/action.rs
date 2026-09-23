@@ -163,8 +163,8 @@ pub(crate) async fn ensure_remote_action_staged(
         .get_variable("system.github.launch_endpoint")
         .map(str::to_owned);
     let mut resolved = None;
-    // (resolver client, bearer token, plan id, job id) for the first-use
-    // digest report after a fresh download.
+    // (resolver client, credentials, plan id, job id) for the first-use
+    // archive checksum report after a fresh download.
     let mut digest_reporter = None;
     if let Some(launch_url) = launch_url {
         let http = crate::client::http::HttpClient::new(None)?;
@@ -217,9 +217,9 @@ pub(crate) async fn ensure_remote_action_staged(
     let auth_token = resolved
         .as_ref()
         .and_then(|meta| meta.auth_token.as_deref());
-    let digest_pin = resolved
+    let archive_pin = resolved
         .as_ref()
-        .map(|meta| meta.tree_digest.clone())
+        .map(|meta| meta.archive_sha256.clone())
         .unwrap_or_default();
     let (action_root, observed_digest) = crate::worker::actions::manager::download_action(
         owner,
@@ -228,10 +228,10 @@ pub(crate) async fn ensure_remote_action_staged(
         &actions_dir,
         download_url,
         auth_token,
-        digest_pin.clone(),
+        archive_pin.clone(),
     )
     .await?;
-    // First-use pinning: report the observed tree digest of a fresh
+    // First-use pinning: report the observed archive SHA-256 of a fresh
     // download so the server can pin it for later downloads. Best-effort:
     // a failed report only means this runner does not establish the pin.
     // Digests of cache hits are never reported — a cache entry of unknown
@@ -240,23 +240,23 @@ pub(crate) async fn ensure_remote_action_staged(
         (digest_reporter, observed_digest)
     {
         if matches!(
-            digest_pin,
-            crate::client::actions_download::TreeDigestPin::Unpinned
+            archive_pin,
+            crate::client::actions_download::ArchiveDigestPin::Unpinned
         ) {
             if let Err(error) = reporter
-                .report_tree_digest(crate::client::actions_download::TreeDigestReport {
+                .report_archive_sha256(crate::client::actions_download::ArchiveSha256Report {
                     token: &report_token,
                     orchestration_id: &report_plan,
                     job_id: &report_job,
                     owner,
                     repo,
                     sha: dir_ref,
-                    tree_digest: &observed,
+                    archive_sha256: &observed,
                 })
                 .await
             {
                 tracing::warn!(
-                    "action tree digest report failed for {owner}/{repo}@{dir_ref}: {error:#}"
+                    "action archive sha256 report failed for {owner}/{repo}@{dir_ref}: {error:#}"
                 );
             }
         }
