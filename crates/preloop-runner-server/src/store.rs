@@ -42,8 +42,8 @@ pub trait Store: Send + Sync {
     /// Restore the persisted state into `inner` (startup path).
     async fn load_into(
         &self,
+        tx: &mut crate::control::txstate::TxState,
         inner: &mut InnerState,
-        environment_rules: &crate::config::EnvironmentRulesMap,
     ) -> anyhow::Result<()>;
     /// Full snapshot: rewrite every table from a captured [`StoreSnapshot`]
     /// in one transaction.
@@ -266,15 +266,11 @@ impl InstrumentedStore {
 impl Store for InstrumentedStore {
     async fn load_into(
         &self,
+        tx: &mut crate::control::txstate::TxState,
         inner: &mut InnerState,
-        environment_rules: &crate::config::EnvironmentRulesMap,
     ) -> anyhow::Result<()> {
         let start = Instant::now();
-        self.record(
-            "load_into",
-            start,
-            self.inner.load_into(inner, environment_rules).await,
-        )
+        self.record("load_into", start, self.inner.load_into(tx, inner).await)
     }
 
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
@@ -637,27 +633,30 @@ pub struct StoreSnapshot {
 }
 
 impl StoreSnapshot {
-    pub fn from_inner(inner: &InnerState) -> Self {
+    /// Authoritative snapshot: scheduling families from `tx`, node-local
+    /// metadata (revision, cache/log/artifact counters, pending uploads) from
+    /// `inner`. Replaces `from_inner` for the `TxState`-backed control plane.
+    pub fn from_tx(tx: &crate::control::txstate::TxState, inner: &InnerState) -> Self {
         StoreSnapshot {
-            runs: inner.runs.values().cloned().collect(),
-            jobs: queue_rows(inner)
+            runs: tx.runs.values().cloned().collect(),
+            jobs: queue_rows_tx(tx)
                 .into_iter()
                 .map(|(kind, job, position)| (kind, job.clone(), position))
                 .collect(),
-            runners: inner.runners.values().cloned().collect(),
-            rsa_public_keys: inner
+            runners: tx.runners.values().cloned().collect(),
+            rsa_public_keys: tx
                 .runner_rsa_public_keys
                 .iter()
                 .map(|(id, key)| (*id, key.clone()))
                 .collect(),
-            sessions: inner.sessions.values().cloned().collect(),
-            session_keys: inner
+            sessions: tx.sessions.values().cloned().collect(),
+            session_keys: tx
                 .session_keys
                 .iter()
                 .map(|(id, enc)| (id.clone(), enc.clone()))
                 .collect(),
-            requests: inner.job_requests.values().cloned().collect(),
-            inflight: inner
+            requests: tx.job_requests.values().cloned().collect(),
+            inflight: tx
                 .inflight_messages
                 .iter()
                 .flat_map(|(session, messages)| {
@@ -666,21 +665,21 @@ impl StoreSnapshot {
                         .map(move |(id, message)| (session.clone(), *id, message.clone()))
                 })
                 .collect(),
-            session_active_requests: inner
+            session_active_requests: tx
                 .session_active_requests
                 .iter()
                 .map(|(session, request)| (session.clone(), *request))
                 .collect(),
-            broker_request_messages: inner
+            broker_request_messages: tx
                 .broker_messages
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
                 .collect(),
-            job_steps: inner
+            job_steps: tx
                 .job_steps
                 .iter()
                 .map(|(agent_job_id, records)| {
-                    let revision = inner
+                    let revision = tx
                         .job_steps_revision
                         .get(agent_job_id)
                         .copied()
@@ -688,7 +687,7 @@ impl StoreSnapshot {
                     (*agent_job_id, records.clone(), revision)
                 })
                 .collect(),
-            meta: build_meta_snapshot(inner),
+            meta: build_meta_snapshot_tx(tx, inner),
         }
     }
 }
@@ -711,28 +710,34 @@ pub struct RunProjection {
 }
 
 impl RunProjection {
-    /// Returns `None` when the run is no longer present; the caller then skips
-    /// persistence but still broadcasts.
-    pub fn from_inner(inner: &InnerState, run_id: RunId, event: NdjsonEvent) -> Option<Self> {
-        let run = inner.runs.get(&run_id)?.clone();
+    /// [`from_inner`] over the authoritative [`TxState`]. The run row, queue
+    /// rows, job requests, session/inflight/broker messages all come from
+    /// `tx`; `inner` is unused because a projection carries no node-local
+    /// metadata (it is kept for signature symmetry with `from_inner`).
+    pub fn from_tx(
+        tx: &crate::control::txstate::TxState,
+        run_id: RunId,
+        event: NdjsonEvent,
+    ) -> Option<Self> {
+        let run = tx.runs.get(&run_id)?.clone();
         Some(RunProjection {
             run,
-            jobs: queue_rows_for_run(inner, run_id)
+            jobs: queue_rows_for_run_tx(tx, run_id)
                 .into_iter()
                 .map(|(kind, job, position)| (kind, job.clone(), position))
                 .collect(),
-            requests: inner
+            requests: tx
                 .job_requests
                 .values()
                 .filter(|record| record.run_id == run_id)
                 .cloned()
                 .collect(),
-            session_active_requests: inner
+            session_active_requests: tx
                 .session_active_requests
                 .iter()
                 .map(|(session, request)| (session.clone(), *request))
                 .collect(),
-            inflight: inner
+            inflight: tx
                 .inflight_messages
                 .iter()
                 .flat_map(|(session, messages)| {
@@ -741,7 +746,7 @@ impl RunProjection {
                         .map(move |(id, message)| (session.clone(), *id, message.clone()))
                 })
                 .collect(),
-            broker_request_messages: inner
+            broker_request_messages: tx
                 .broker_messages
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
@@ -1357,47 +1362,52 @@ pub fn restore_request_snapshot(
     })
 }
 
-/// Serialize the runtime metadata snapshot from in-memory state. Shared by
-/// every backend so one code path defines what survives a restart.
-pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
+/// [`build_meta_snapshot`] split across the authoritative [`TxState`] (`tx`)
+/// and node-local [`InnerState`] (`inner`). Scheduling/identity/concurrency
+/// families come from `tx`; the revision counter, cache/log/artifact counters,
+/// pending uploads and timeline/log metadata stay on `inner`.
+pub fn build_meta_snapshot_tx(
+    tx: &crate::control::txstate::TxState,
+    inner: &InnerState,
+) -> MetaSnapshot {
     MetaSnapshot {
         revision: inner
             .metadata_revision
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1,
-        workflow_run_counters: inner.workflow_run_counters.clone(),
-        next_runner_id: inner.next_runner_id,
+        workflow_run_counters: tx.workflow_run_counters.clone(),
+        next_runner_id: tx.next_runner_id,
         next_cache_id: inner.next_cache_id,
-        next_message_id: inner.next_message_id,
+        next_message_id: tx.next_message_id,
         next_log_id: inner.next_log_id,
         next_artifact_v2_id: inner.next_artifact_v2_id,
-        azdo_sessions: inner.azdo_sessions.clone(),
-        oidc_job_contexts: inner
+        azdo_sessions: tx.azdo_sessions.clone(),
+        oidc_job_contexts: tx
             .oidc_job_contexts
             .iter()
             .map(|((run_id, job_id), context)| (*run_id, job_id.clone(), context.clone()))
             .collect(),
-        id_token_grants: inner
+        id_token_grants: tx
             .id_token_grants
             .iter()
             .map(|((run_id, job_id), granted)| (*run_id, job_id.clone(), *granted))
             .collect(),
-        concurrency_groups: inner
+        concurrency_groups: tx
             .concurrency_groups
             .iter()
             .map(|(key, group)| (key.clone(), group.clone()))
             .collect(),
-        jobset_admissions: inner
+        jobset_admissions: tx
             .jobset_admissions
             .iter()
             .map(|(key, admission)| (key.clone(), admission.clone()))
             .collect(),
-        run_concurrency: inner
+        run_concurrency: tx
             .run_concurrency
             .iter()
             .map(|(run_id, config)| (*run_id, config.clone()))
             .collect(),
-        holder_keys: inner
+        holder_keys: tx
             .holder_keys
             .iter()
             .map(|(run_id, keys)| (*run_id, keys.clone()))
@@ -1455,19 +1465,19 @@ pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
             .iter()
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect(),
-        github_token_requests: inner
+        github_token_requests: tx
             .github_token_requests
             .iter()
             .map(|(request_id, req)| (*request_id, req.clone()))
             .collect(),
-        cancellation_queue: inner.cancellation_queue.clone(),
-        runner_client_ids: inner
+        cancellation_queue: tx.cancellation_queue.clone(),
+        runner_client_ids: tx
             .runner_client_ids
             .iter()
             .map(|(client_id, runner_id)| (client_id.clone(), *runner_id))
             .collect(),
-        pool_proven_runners: inner.pool_proven_runners.iter().copied().collect(),
-        job_assignments: inner
+        pool_proven_runners: tx.pool_proven_runners.iter().copied().collect(),
+        job_assignments: tx
             .job_assignments
             .iter()
             .map(|((run_id, job_id), record)| {
@@ -1480,7 +1490,7 @@ pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
                 )
             })
             .collect(),
-        pool_pending: inner
+        pool_pending: tx
             .pool_pending
             .iter()
             .map(|((run_id, job_id), at)| {
@@ -1490,151 +1500,41 @@ pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
     }
 }
 
-fn restored_holder_tier(
-    inner: &InnerState,
-    holder: &concurrency::Holder,
-) -> Option<crate::events::trust_tier::TrustTier> {
-    inner
-        .runs
-        .get(&holder.run_id())
-        .and_then(|run| crate::events::trust_tier::tier_of(&run.submission))
-}
-
-fn rekey_restored_concurrency_groups(
-    inner: &InnerState,
-    groups: Vec<((String, String), concurrency::ConcurrencyGroup)>,
-) -> BTreeMap<(String, String), concurrency::ConcurrencyGroup> {
-    let mut rekeyed = BTreeMap::new();
-    for ((repo, legacy_group), group) in groups {
-        let concurrency::ConcurrencyGroup {
-            display_name,
-            running,
-            pending,
-        } = group;
-        let mut add = |holder: concurrency::Holder, running: bool| {
-            let tier = restored_holder_tier(inner, &holder);
-            let key = concurrency::concurrency_key_for_tier(&repo, &display_name, tier);
-            let entry = rekeyed
-                .entry(key)
-                .or_insert_with(|| concurrency::ConcurrencyGroup {
-                    display_name: display_name.clone(),
-                    ..Default::default()
-                });
-            if running && entry.running.is_none() {
-                entry.running = Some(holder);
-            } else {
-                entry.pending.push_back(holder);
-            }
-        };
-
-        let was_empty = running.is_none() && pending.is_empty();
-        if let Some(holder) = running {
-            add(holder, true);
-        }
-        for holder in pending {
-            add(holder, false);
-        }
-        if was_empty {
-            rekeyed
-                .entry((repo, legacy_group))
-                .or_insert_with(|| concurrency::ConcurrencyGroup {
-                    display_name,
-                    ..Default::default()
-                });
-        }
-    }
-    rekeyed
-}
-
-fn rebuild_holder_keys(inner: &mut InnerState) {
-    inner.holder_keys.clear();
-    for (key, group) in &inner.concurrency_groups {
-        if let Some(holder) = &group.running {
-            inner
-                .holder_keys
-                .entry(holder.run_id())
-                .or_default()
-                .push(key.clone());
-        }
-        for holder in &group.pending {
-            inner
-                .holder_keys
-                .entry(holder.run_id())
-                .or_default()
-                .push(key.clone());
-        }
-    }
-}
-
-/// Apply a restored metadata snapshot onto in-memory state.
-pub fn apply_meta_snapshot(
+/// [`apply_meta_snapshot`] split across the authoritative [`TxState`] (`tx`)
+/// and node-local [`InnerState`] (`inner`). Scheduling/identity/concurrency
+/// families land on `tx`; counters, pending uploads, timeline/log metadata and
+/// the derived order/cap bookkeeping stay on `inner`. Concurrency-group
+/// reconcile + ready promotion are NOT run here — the control backend's
+/// `reconcile_on_boot` owns that for the `TxState` path.
+pub fn apply_meta_snapshot_tx(
+    tx: &mut crate::control::txstate::TxState,
     inner: &mut InnerState,
     meta: MetaSnapshot,
-    environment_rules: &crate::config::EnvironmentRulesMap,
 ) {
-    inner.workflow_run_counters = meta.workflow_run_counters;
-    inner.next_runner_id = meta.next_runner_id;
+    tx.workflow_run_counters = meta.workflow_run_counters;
+    tx.next_runner_id = meta.next_runner_id;
     inner.next_cache_id = meta.next_cache_id;
-    inner.next_message_id = meta.next_message_id;
+    tx.next_message_id = meta.next_message_id;
     inner
         .metadata_revision
         .store(meta.revision, std::sync::atomic::Ordering::Relaxed);
     inner.next_log_id = meta.next_log_id;
     inner.next_artifact_v2_id = meta.next_artifact_v2_id;
-    inner.azdo_sessions = meta.azdo_sessions;
-    inner.oidc_job_contexts = meta
+    tx.azdo_sessions = meta.azdo_sessions;
+    tx.oidc_job_contexts = meta
         .oidc_job_contexts
         .into_iter()
         .map(|(run_id, job_id, context)| ((run_id, job_id), context))
         .collect();
-    inner.id_token_grants = meta
+    tx.id_token_grants = meta
         .id_token_grants
         .into_iter()
         .map(|(run_id, job_id, granted)| ((run_id, job_id), granted))
         .collect();
-    inner.concurrency_groups = rekey_restored_concurrency_groups(inner, meta.concurrency_groups);
-    // Rekey JobSet admissions BEFORE reconcile/promote: a promoted JobSet gate
-    // inserts its key into acquired_keys and creates live group entries, so
-    // advancing admissions on stale keys would split the JobSet's identity
-    // across old and new namespaces (the JobSet ends up queued behind itself).
-    inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
-    for (id, admission) in &mut inner.jobset_admissions {
-        let tier = inner
-            .runs
-            .get(&id.run_id)
-            .and_then(|run| crate::events::trust_tier::tier_of(&run.submission));
-        // Persisted acquired keys are canonical keys, not display names:
-        // re-deriving them from (repo, group) would stack a second namespace
-        // on keys written by this build and break identity with the gate they
-        // belong to. Translate each through its gate's old→new key instead.
-        let mut key_map = std::collections::BTreeMap::new();
-        for gate in &mut admission.gates {
-            let old_key = gate.key.clone();
-            let repo = gate.key.0.clone();
-            gate.key = concurrency::concurrency_key_for_tier(&repo, &gate.display_name, tier);
-            key_map.insert(old_key, gate.key.clone());
-        }
-        let acquired = std::mem::take(&mut admission.acquired_keys);
-        admission.acquired_keys = acquired
-            .into_iter()
-            .map(|key| {
-                key_map
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| concurrency::concurrency_key_for_tier(&key.0, &key.1, tier))
-            })
-            .collect();
-    }
-    // A restored group may name a holder whose run is already terminal (the
-    // snapshot predates the completion) or missing entirely; leaving it in
-    // place parks every later submission in that group forever. Reconcile
-    // before anything dispatches, and re-promote whatever the freed slots
-    // unblock.
-    crate::runtime_scheduling::reconcile_concurrency_groups(inner);
-    crate::runtime_scheduling::promote_ready_jobs(inner, environment_rules, &[]);
-    inner.run_concurrency = meta.run_concurrency.into_iter().collect();
-    inner.holder_keys = meta.holder_keys.into_iter().collect();
-    rebuild_holder_keys(inner);
+    tx.concurrency_groups = meta.concurrency_groups.into_iter().collect();
+    tx.jobset_admissions = meta.jobset_admissions.into_iter().collect();
+    tx.run_concurrency = meta.run_concurrency.into_iter().collect();
+    tx.holder_keys = meta.holder_keys.into_iter().collect();
     inner.artifacts = meta.artifacts.into_iter().collect();
     inner.log_metadata = meta.log_metadata.into_iter().collect();
     inner.timeline_events = meta.timeline_events.into_iter().collect();
@@ -1659,11 +1559,8 @@ pub fn apply_meta_snapshot(
     inner.artifact_v2_registry = migrated_registry;
     // Rebuild in-memory order queues for FIFO eviction and apply caps so a
     // restart doesn't reload unbounded history that was pending before the
-    // caps shipped.
+    // caps shipped. (node-local — unchanged from `apply_meta_snapshot`.)
     {
-        // Trim per-key overlong logs that were persisted before the 16 MiB
-        // cap FIRST, then seed `log_bytes_total` from the trimmed sizes so
-        // `trim_plan_logs` sees the correct total (its fast path keys on it).
         for buf in inner.logs.values_mut() {
             let excess = buf
                 .len()
@@ -1690,7 +1587,6 @@ pub fn apply_meta_snapshot(
     for key in inner.timeline_records.keys() {
         inner.timeline_records_order.push_back(key.clone());
     }
-    // Enforce global caps after restore.
     {
         let keys: Vec<String> = inner.timeline_records.keys().cloned().collect();
         for key in keys {
@@ -1713,13 +1609,11 @@ pub fn apply_meta_snapshot(
     }
     crate::memory_caps::trim_artifact_registry(inner);
     crate::memory_caps::trim_cache_dl_tokens(inner);
-    // Cache dl tokens order deque was not persisted — nothing to rebuild, but
-    // ensure restored map doesn't already exceed the cap.
-    inner.github_token_requests = meta.github_token_requests.into_iter().collect();
-    inner.cancellation_queue = meta.cancellation_queue;
-    inner.runner_client_ids = meta.runner_client_ids.into_iter().collect();
-    inner.pool_proven_runners = meta.pool_proven_runners.into_iter().collect();
-    inner.job_assignments = meta
+    tx.github_token_requests = meta.github_token_requests.into_iter().collect();
+    tx.cancellation_queue = meta.cancellation_queue;
+    tx.runner_client_ids = meta.runner_client_ids.into_iter().collect();
+    tx.pool_proven_runners = meta.pool_proven_runners.into_iter().collect();
+    tx.job_assignments = meta
         .job_assignments
         .into_iter()
         .filter_map(|(run_id, job_id, runner_id, at_us, first_at_us)| {
@@ -1735,7 +1629,7 @@ pub fn apply_meta_snapshot(
             })
         })
         .collect();
-    inner.pool_pending = meta
+    tx.pool_pending = meta
         .pool_pending
         .into_iter()
         .filter_map(|(run_id, job_id, at_us)| {
@@ -2018,8 +1912,8 @@ impl SqliteStore {
 
     pub fn load_into(
         &self,
+        tx: &mut crate::control::txstate::TxState,
         inner: &mut InnerState,
-        environment_rules: &crate::config::EnvironmentRulesMap,
     ) -> anyhow::Result<()> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         // Restore every run still in flight plus the newest completed runs up
@@ -2048,7 +1942,7 @@ impl SqliteStore {
         for blob in runs {
             let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;
-            inner.runs.insert(run_id, run);
+            tx.runs.insert(run_id, run);
         }
 
         let mut job_stmt = connection.prepare(
@@ -2082,15 +1976,18 @@ impl SqliteStore {
             }
             let job: QueuedJob = serde_json::from_slice(&self.cipher.unseal(&row.payload)?)?;
             match row.queue_kind.as_str() {
-                "ready" => inner.queue.push_back(job),
-                "pending" => inner.pending_jobs.push_back(job),
-                "blocked" => inner.concurrency_blocked.push_back(job),
-                "held" => inner.held_runs.entry(row.run_id).or_default().push(job),
+                "ready" => tx.ready_index.push_back(job),
+                "pending" => tx.pending_jobs.push_back(job),
+                "blocked" => tx.concurrency_blocked.push_back(job),
+                "held" => tx.held_runs.entry(row.run_id).or_default().push(job),
                 _ => unreachable!("schema constrains queue_kind"),
             }
         }
+        // `ready_index` is the persisted ready queue; `ready_count` mirrors its
+        // length so claim accounting resumes correctly after a restart.
+        tx.ready_count = tx.ready_index.len() as i64;
 
-        let restored_at = Instant::now();
+        let restored_at = std::time::SystemTime::now();
         let mut runner_stmt = connection.prepare(
             "SELECT runner_id, name, ephemeral, runner_group_id, runner_group_name,
                     public_key, rsa_public_key
@@ -2114,8 +2011,8 @@ impl SqliteStore {
                     .as_ref()
                     .map(|key| (runner.id, key.clone())),
             );
-            inner.runner_registered_at.insert(runner.id, restored_at);
-            inner.runners.insert(runner.id, runner);
+            tx.runner_registered_at.insert(runner.id, restored_at);
+            tx.runners.insert(runner.id, runner);
         }
         // Restore typed RSA public keys so post-restart sessions can be
         // FIPS-encrypted. Without this, every session is created
@@ -2129,7 +2026,7 @@ impl SqliteStore {
         })? {
             let (runner_id, rsa_xml) = row?;
             if let Ok(parsed) = AgentRsaPublicKey::parse(&rsa_xml) {
-                inner.runner_rsa_public_keys.insert(runner_id, parsed);
+                tx.runner_rsa_public_keys.insert(runner_id, parsed);
             }
         }
         let mut label_stmt =
@@ -2138,7 +2035,7 @@ impl SqliteStore {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })? {
             let (runner_id, label) = label?;
-            if let Some(runner) = inner.runners.get_mut(&runner_id) {
+            if let Some(runner) = tx.runners.get_mut(&runner_id) {
                 runner.labels.push(label);
             }
         }
@@ -2161,7 +2058,7 @@ impl SqliteStore {
             let (session_id, key_blob, iv, tag) = row?;
             match restore_session_key(&self.cipher, &key_blob, &iv, &tag) {
                 Ok(enc) => {
-                    inner.session_keys.insert(session_id.clone(), enc);
+                    tx.session_keys.insert(session_id.clone(), enc);
                 }
                 Err(error) => {
                     tracing::warn!(%session_id, %error, "failed to restore session_key on load");
@@ -2184,16 +2081,24 @@ impl SqliteStore {
             })
         })? {
             let session = session?;
-            inner
-                .broker_session_runners
+            tx.broker_session_runners
                 .insert(session.session_id.0.to_string(), session.runner_id);
-            inner
-                .sessions
+            tx.sessions
                 .insert(session.session_id.0.to_string(), session);
+        }
+        // Restore `session_active_requests` so a restarted broker session
+        // knows which request it had claimed but not acked.
+        let mut sar_stmt = connection
+            .prepare("SELECT session_id, active_request_id FROM session_active_requests")?;
+        for row in sar_stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (session_id, request_id) = row?;
+            tx.session_active_requests.insert(session_id, request_id);
         }
         // Restore per-session broker message queues (dequeued but not yet
         // delivered to the runner) from the `broker_messages` table that
-        // `store_inner` writes. `inner.broker_messages` (keyed by request_id)
+        // `store_inner` writes. `tx.broker_messages` (keyed by request_id)
         // is a separate map and comes back with the meta snapshot below.
         let inflight_rows: Vec<(String, i64, String)> = {
             let mut stmt = connection.prepare(
@@ -2217,8 +2122,7 @@ impl SqliteStore {
                 &associated_data,
             ) {
                 Ok(message) => {
-                    inner
-                        .inflight_messages
+                    tx.inflight_messages
                         .entry(session_id)
                         .or_default()
                         .insert(message_id, message);
@@ -2234,7 +2138,7 @@ impl SqliteStore {
             }
         }
         // Restore per-request job messages (request_id → message) from their
-        // own table; `inner.broker_messages` is keyed by request_id and the
+        // own table; `tx.broker_messages` is keyed by request_id and the
         // broker re-delivers from it after a restart.
         let job_request_rows: Vec<(i64, String)> = {
             let mut stmt = connection.prepare(
@@ -2253,7 +2157,7 @@ impl SqliteStore {
                 &associated_data,
             ) {
                 Ok(message) => {
-                    inner.broker_messages.insert(request_id, message);
+                    tx.broker_messages.insert(request_id, message);
                 }
                 Err(error) => {
                     tracing::warn!(request_id, %error, "dropping undecodable job request message");
@@ -2271,29 +2175,13 @@ impl SqliteStore {
         })? {
             let (request_id, blob) = row?;
             let record = restore_request_snapshot(&self.cipher, &blob)?;
-            // `inner.runs` restores only in-flight runs plus the newest
-            // `MAX_COMPLETED_RUNS_RETAINED` completed ones; `job_requests`
-            // has `FOREIGN KEY (run_id) REFERENCES runs`, so restoring a
-            // request for an evicted run makes the next `store_inner`
-            // snapshot violate the constraint and every persist fails.
-            // Skip requests whose run is not in memory — the durable row
-            // stays, and a live run's requests are always present.
-            if !inner.runs.contains_key(&record.run_id) {
-                continue;
-            }
-            inner
-                .inflight_requests
+            tx.inflight_requests
                 .insert(request_id, (record.run_id, record.job_id.clone()));
-            inner
-                .plan_requests
-                .insert(record.plan_id.clone(), request_id);
-            inner
-                .agent_job_requests
+            tx.plan_requests.insert(record.plan_id.clone(), request_id);
+            tx.agent_job_requests
                 .insert(record.agent_job_id, request_id);
-            inner
-                .timeline_requests
-                .insert(record.timeline_id, request_id);
-            inner.job_requests.insert(request_id, record);
+            tx.timeline_requests.insert(record.timeline_id, request_id);
+            tx.job_requests.insert(request_id, record);
         }
         // Restore `session_active_requests` so a restarted broker session
         // knows which request it had claimed but not acked.
@@ -2322,7 +2210,7 @@ impl SqliteStore {
             .optional()?
         {
             let meta: MetaSnapshot = serde_json::from_slice(&self.cipher.unseal(&blob)?)?;
-            apply_meta_snapshot(inner, meta, environment_rules);
+            apply_meta_snapshot_tx(tx, inner, meta);
         }
         let mut counters = connection.prepare(
             "SELECT workflow_path, next_run_number
@@ -2334,8 +2222,7 @@ impl SqliteStore {
         })?;
         for row in rows {
             let (workflow_path, next_run_number) = row?;
-            inner
-                .workflow_run_counters
+            tx.workflow_run_counters
                 .insert(workflow_path, next_run_number.saturating_sub(1));
         }
         // Step manifests, ordered so a workflow step's `--step` position is
@@ -2406,10 +2293,9 @@ impl SqliteStore {
             // counter has to resume above it. Left at zero, the first writes
             // after a restart carry revisions the rows already exceed and are
             // silently discarded.
-            let seen = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            let seen = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
             *seen = (*seen).max(revision.max(0) as u64);
-            inner
-                .job_steps
+            tx.job_steps
                 .entry(agent_job_id)
                 .or_default()
                 .push(crate::models::StepRecord {
@@ -3794,10 +3680,10 @@ fn parse_redelivery_row(
 impl Store for SqliteStore {
     async fn load_into(
         &self,
+        tx: &mut crate::control::txstate::TxState,
         inner: &mut InnerState,
-        environment_rules: &crate::config::EnvironmentRulesMap,
     ) -> anyhow::Result<()> {
-        SqliteStore::load_into(self, inner, environment_rules)
+        SqliteStore::load_into(self, tx, inner)
     }
 
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
@@ -4123,7 +4009,7 @@ impl Store for SqliteStore {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SessionKeyPayload(Vec<u8>);
+pub struct SessionKeyPayload(pub Vec<u8>);
 
 const MIGRATIONS: &[(u32, &str, &str)] = &[
     (
@@ -4502,36 +4388,62 @@ fn system_time_from_us(value: i64) -> SystemTime {
 /// left behind by another run's write still orders correctly relative to
 /// later writes: popping the front shifts everyone down uniformly and
 /// pushing to the back always yields a larger index than anything present.
-pub fn queue_rows(inner: &InnerState) -> Vec<(&'static str, &QueuedJob, i64)> {
+///
+/// [`queue_rows`] over the authoritative [`TxState`]. `ready_index` is the
+/// persisted ready queue; `queue` is the per-transaction enqueue buffer.
+/// A job enqueued this transaction that is already persisted in `ready_index`
+/// (requeue of a claimed job) must not appear twice — the persisted copy is
+/// dropped and the fresh enqueue lands at the tail with a new position.
+pub fn queue_rows_tx(
+    tx: &crate::control::txstate::TxState,
+) -> Vec<(&'static str, &QueuedJob, i64)> {
+    let enqueued: std::collections::BTreeSet<(RunId, &JobId)> = tx
+        .queue
+        .iter()
+        .map(|job| (job.run_id, &job.job_id))
+        .collect();
     let mut rows = Vec::new();
     for (kind, jobs) in [
-        ("ready", &inner.queue),
-        ("pending", &inner.pending_jobs),
-        ("blocked", &inner.concurrency_blocked),
+        ("ready", &tx.ready_index),
+        ("pending", &tx.pending_jobs),
+        ("blocked", &tx.concurrency_blocked),
     ] {
         rows.extend(
             jobs.iter()
+                .filter(|job| !enqueued.contains(&(job.run_id, &job.job_id)))
                 .enumerate()
                 .map(|(index, job)| (kind, job, index as i64)),
         );
     }
     rows.extend(
-        inner
-            .held_runs
+        tx.held_runs
             .values()
             .flatten()
             .enumerate()
             .map(|(index, job)| ("held", job, index as i64)),
     );
+    // Fresh enqueues append at the tail of the ready kind.
+    let tail = rows
+        .iter()
+        .filter(|(kind, _, _)| *kind == "ready")
+        .map(|(_, _, pos)| *pos)
+        .max()
+        .unwrap_or(-1);
+    rows.extend(
+        tx.queue
+            .iter()
+            .enumerate()
+            .map(|(index, job)| ("ready", job, tail + 1 + index as i64)),
+    );
     rows
 }
 
-/// [`queue_rows`] restricted to one run, keeping the global positions.
-pub fn queue_rows_for_run(
-    inner: &InnerState,
+/// [`queue_rows_tx`] restricted to one run, keeping the global positions.
+pub fn queue_rows_for_run_tx(
+    tx: &crate::control::txstate::TxState,
     run_id: RunId,
 ) -> Vec<(&'static str, &QueuedJob, i64)> {
-    let mut rows = queue_rows(inner);
+    let mut rows = queue_rows_tx(tx);
     rows.retain(|(_, job, _)| job.run_id == run_id);
     rows
 }

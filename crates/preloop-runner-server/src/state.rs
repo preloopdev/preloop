@@ -973,7 +973,7 @@ impl AppState {
         let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
         let mut recovered = inner;
         let mut recovered_tx = crate::control::txstate::TxState::default();
-        store.load_into(&mut recovered_tx, &mut recovered, &config.environment_rules).await?;
+        store.load_into(&mut recovered_tx, &mut recovered).await?;
         // An attempt dispatched but not yet reported has no persisted step
         // rows: seeding happens in memory, and only a runner report writes
         // them. The request message it was built from *is* persisted, so
