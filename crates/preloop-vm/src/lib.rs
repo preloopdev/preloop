@@ -1102,8 +1102,12 @@ impl VmProvider for SmolVmProvider {
         Ok(())
     }
 
+    /// Starting an already-defined machine constructs no base image, so it
+    /// runs alongside forks. Holding the write lock here stalled the whole
+    /// pool: a direct-created runner's cold boot (minutes on macOS while the
+    /// guest unpacks its layers) blocked every fork until it finished.
     async fn start(&self, name: &MachineName) -> Result<(), VmError> {
-        self.exclusive(
+        self.concurrent(
             "start",
             &[
                 "machine".into(),
