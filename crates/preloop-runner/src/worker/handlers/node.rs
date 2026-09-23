@@ -1,7 +1,7 @@
 //! Node.js action handler.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 use super::factory::ActionManifest;
@@ -192,6 +192,39 @@ fn resolve_node_version(
     NodeSelection { version, warnings }
 }
 
+/// Resolve a Node action's `runs.main` entry point under `action_dir` and
+/// contain the canonical result in the action's repository root.
+///
+/// Real actions keep entry points outside their own subdir: actions/cache's
+/// `restore` sub-action runs `../dist/restore-only/index.js`, gradle's
+/// setup-gradle runs `../dist/...`, codeql's init runs `../lib/...` (all
+/// resolve inside the repo; see issue #291). The official runner performs no
+/// such check; bounding by repo root instead of the action subdir keeps the
+/// sandbox while matching legitimate layouts. A result outside the repo root
+/// is rejected.
+fn resolve_contained_entry_point(action_dir: &Path, main: &str) -> Result<PathBuf> {
+    let entry_point = action_dir.join(main);
+    if !entry_point.exists() {
+        anyhow::bail!("action entry point not found: {}", entry_point.display());
+    }
+
+    let containment_root = super::composite::actions_tarball_root(action_dir)
+        .unwrap_or_else(|| action_dir.to_path_buf());
+    if let (Ok(canonical_dir), Ok(canonical_entry)) =
+        (containment_root.canonicalize(), entry_point.canonicalize())
+    {
+        if !canonical_entry.starts_with(&canonical_dir) {
+            anyhow::bail!(
+                "action entry point {} escapes action directory {}",
+                entry_point.display(),
+                containment_root.display()
+            );
+        }
+        return Ok(canonical_entry);
+    }
+    Ok(entry_point)
+}
+
 /// Run a Node.js action.
 pub async fn run_node_action(
     manifest: &ActionManifest,
@@ -208,30 +241,7 @@ pub async fn run_node_action(
         .or(manifest.runs_main.as_deref())
         .context("node action missing runs.main")?;
 
-    let entry_point = action_dir.join(main);
-    if !entry_point.exists() {
-        anyhow::bail!("action entry point not found: {}", entry_point.display());
-    }
-
-    // Contain the canonical entry point in the action's repository root.
-    // Real actions keep entry points outside their own subdir: gradle's
-    // setup-gradle runs `../dist/...`, codeql's init runs `../lib/...`
-    // (both resolve inside the repo). The official runner performs no such
-    // check; bounding by repo root instead of the action subdir keeps the
-    // sandbox while matching legitimate layouts.
-    let containment_root = super::composite::actions_tarball_root(action_dir)
-        .unwrap_or_else(|| action_dir.to_path_buf());
-    if let (Ok(canonical_dir), Ok(canonical_entry)) =
-        (containment_root.canonicalize(), entry_point.canonicalize())
-    {
-        if !canonical_entry.starts_with(&canonical_dir) {
-            anyhow::bail!(
-                "action entry point {} escapes action directory {}",
-                entry_point.display(),
-                containment_root.display()
-            );
-        }
-    }
+    let entry_point = resolve_contained_entry_point(action_dir, main)?;
 
     // Resolve node binary and apply the runner's Node 20 migration policy.
     let runs_using = manifest.runs_using.as_str();
@@ -731,6 +741,72 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("missing runs.main"));
+    }
+
+    /// Issue #291: actions/cache v6 ships split sub-actions (`restore`, `save`)
+    /// whose `runs.main` is `../dist/<name>/index.js` — above their own
+    /// subdir but inside the repository. The entry point must be accepted
+    /// when it resolves inside the repo root.
+    #[test]
+    fn subaction_shared_dist_entry_point_accepted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Mirror the on-disk layout: _actions/actions/cache/<sha>/restore
+        let repo_root = temp
+            .path()
+            .join("_actions")
+            .join("actions")
+            .join("cache")
+            .join("55cc8345863c7cc4c66a329aec7e433d2d1c52a9");
+        let subaction_dir = repo_root.join("restore");
+        let dist_file = repo_root.join("dist").join("restore-only").join("index.js");
+        std::fs::create_dir_all(&subaction_dir).unwrap();
+        std::fs::create_dir_all(dist_file.parent().unwrap()).unwrap();
+        std::fs::write(&dist_file, "console.log('restore');").unwrap();
+
+        let resolved =
+            resolve_contained_entry_point(&subaction_dir, "../dist/restore-only/index.js").unwrap();
+        assert_eq!(resolved, dist_file.canonicalize().unwrap());
+    }
+
+    /// The repo-root containment still rejects true escapes: an entry point
+    /// resolving outside the repository root must fail closed.
+    #[test]
+    fn entry_point_escaping_repo_root_rejected() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp
+            .path()
+            .join("_actions")
+            .join("actions")
+            .join("cache")
+            .join("55cc8345863c7cc4c66a329aec7e433d2d1c52a9");
+        let subaction_dir = repo_root.join("restore");
+        std::fs::create_dir_all(&subaction_dir).unwrap();
+        // Payload lives outside the repo root entirely: five levels up from
+        // `restore/` reaches the temp dir itself.
+        let evil = temp.path().join("evil.js");
+        std::fs::write(&evil, "console.log('evil');").unwrap();
+
+        let err =
+            resolve_contained_entry_point(&subaction_dir, "../../../../../evil.js").unwrap_err();
+        assert!(
+            err.to_string().contains("escapes action directory"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Without an `_actions/` marker in the path (e.g. local actions), the
+    /// containment root falls back to the action directory itself, and a
+    /// plain in-directory entry point is accepted.
+    #[test]
+    fn entry_point_without_actions_marker_contained_in_action_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let action_dir = temp.path().join("my-action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        let index = action_dir.join("index.js");
+        std::fs::write(&index, "console.log('hi');").unwrap();
+
+        let resolved = resolve_contained_entry_point(&action_dir, "index.js").unwrap();
+        assert_eq!(resolved, index.canonicalize().unwrap());
     }
 
     #[cfg(unix)]

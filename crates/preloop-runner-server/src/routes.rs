@@ -134,6 +134,10 @@ pub fn build_app(
             post(runnerresolve_actions),
         )
         .route(
+            "/actions/build/:orchestration_id/jobs/:job_id/runnerresolve/actions/digests",
+            post(record_action_tree_digest),
+        )
+        .route(
             "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
             patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )

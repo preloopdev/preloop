@@ -24,6 +24,99 @@ pub async fn runnerresolve_actions(
     Json(json!({ "actions": actions }))
 }
 
+/// Digest prefix minted by the runner's canonical tree digest
+/// (`tree-sha256-v1:<64 hex chars>`). The server never invents digests —
+/// it only pins what runners report — so the prefix is validated, not
+/// generated, here. Kept in sync with the runner's `TREE_DIGEST_PREFIX`.
+pub const TREE_DIGEST_PREFIX: &str = "tree-sha256-v1:";
+
+/// Validate a reported tree digest's shape. The server pins digests, never
+/// computes them, so shape validation is the only local check available.
+fn valid_tree_digest(digest: &str) -> bool {
+    match digest.strip_prefix(TREE_DIGEST_PREFIX) {
+        Some(hex) => hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// POST runner → server trust-on-first-use digest report.
+///
+/// Body: `{ "owner", "repo", "sha", "tree_digest" }`. The first report for
+/// an (owner, repo, sha) wins; a conflicting later report keeps the
+/// original pin and is logged — a digest that changes for the same commit
+/// SHA is exactly the tampering signal this exists to catch.
+///
+/// The route sits behind the same `require_protocol_bearer` layer as
+/// runnerresolve, so only a runner holding a live job token can file
+/// reports, and pins are keyed by resolved commit SHA, never by mutable
+/// ref. A malicious workflow inside a job cannot forge another action's
+/// pin: it would need that action's (owner, repo, sha), and a conflicting
+/// report never overwrites the honest pin anyway.
+pub async fn record_action_tree_digest(
+    State(shared): State<Arc<SharedState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = body.get("owner").and_then(|v| v.as_str()).unwrap_or("");
+    let repo = body.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+    let sha = body.get("sha").and_then(|v| v.as_str()).unwrap_or("");
+    let tree_digest = body
+        .get("tree_digest")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if owner.is_empty()
+        || repo.is_empty()
+        || owner.contains(['/', '\\'])
+        || repo.contains(['/', '\\'])
+        || owner.contains("..")
+        || repo.contains("..")
+    {
+        return Err(ApiError::bad_request("invalid owner or repo"));
+    }
+    if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(sha) {
+        return Err(ApiError::bad_request("sha must be a resolved commit SHA"));
+    }
+    if !valid_tree_digest(tree_digest) {
+        return Err(ApiError::bad_request("malformed tree_digest"));
+    }
+    let key = (
+        owner.to_lowercase(),
+        repo.to_lowercase(),
+        sha.to_lowercase(),
+    );
+    let mut pins = shared
+        .state
+        .action_tree_digest_pins
+        .lock()
+        .map_err(|_| ApiError::internal("digest pin table poisoned"))?;
+    // Bound the table: without a cap a long-lived server accumulates an
+    // entry per action version ever used. When full the report is dropped
+    // (fail open on the cap, never on verification — pins already held
+    // keep enforcing).
+    const MAX_DIGEST_PINS: usize = 50_000;
+    let recorded = match pins.get(&key) {
+        Some(existing) => {
+            if existing != tree_digest {
+                tracing::warn!(
+                    owner = %owner, repo = %repo, sha = %sha,
+                    pinned = %existing, reported = %tree_digest,
+                    "conflicting action tree digest report: keeping the original pin"
+                );
+            }
+            false
+        }
+        None => {
+            if pins.len() >= MAX_DIGEST_PINS {
+                tracing::warn!("action tree digest pin table full; dropping report");
+                false
+            } else {
+                pins.insert(key, tree_digest.to_owned());
+                true
+            }
+        }
+    };
+    Ok(Json(json!({ "recorded": recorded })))
+}
+
 /// How long a minted archive ticket stays valid. Actions are fetched during
 /// job setup, so this only has to outlive a queue wait, not a whole run.
 pub const ACTION_TICKET_TTL_SECS: u64 = 6 * 60 * 60;
@@ -528,6 +621,31 @@ async fn resolve_action_download(
     Some((key, name, git_ref, pinned, tar_url))
 }
 
+/// Look up the trust-on-first-use tree digest pin for a resolved action.
+/// Returns `Some(digest)` when pinned, `None` when the server supports
+/// digests but has no pin for this (owner, repo, sha) yet. The caller
+/// serializes `None` as an explicit JSON null so runners can distinguish
+/// "supported but unpinned" from a pre-digest server that omits the key.
+pub fn tree_digest_pin_for(
+    state: &AppState,
+    name: &str,
+    resolved_sha_opt: Option<&str>,
+) -> Option<String> {
+    let sha = resolved_sha_opt?;
+    let (owner, repo) = name.split_once('/')?;
+    let key = (
+        owner.to_lowercase(),
+        repo.to_lowercase(),
+        sha.to_lowercase(),
+    );
+    state
+        .action_tree_digest_pins
+        .lock()
+        .ok()?
+        .get(&key)
+        .cloned()
+}
+
 pub async fn runnerresolve_action(
     state: &AppState,
     action: &str,
@@ -539,11 +657,19 @@ pub async fn runnerresolve_action(
     // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
     // explicit on the wire, and the runner refuses the download instead of fetching
     // the mutable ref.
+    //
+    // `tree_digest` carries the trust-on-first-use pin for this exact
+    // (owner, repo, sha), if one was reported. A present null means the
+    // server supports digests but has no pin yet (the runner will report
+    // the fresh download's digest); the key is always present so runners
+    // can distinguish "supported" from a pre-digest server.
+    let tree_digest_pin = tree_digest_pin_for(state, &name, resolved_sha_opt.as_deref());
     let mut entry = json!({
         "name": name,
         "version": git_ref,
         "tar_url": tar_url,
         "authentication": null,
+        "tree_digest": tree_digest_pin,
     });
     if let Some(resolved_sha) = resolved_sha_opt {
         entry["resolved_sha"] = json!(resolved_sha);
@@ -576,4 +702,134 @@ pub async fn action_download_info_entry(
             package_details: None,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::Json;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const DIGEST_A: &str =
+        "tree-sha256-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST_B: &str =
+        "tree-sha256-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn test_state() -> AppState {
+        let temp = tempfile::tempdir().unwrap();
+        AppState::new(temp.path().to_path_buf()).await.unwrap()
+    }
+
+    fn report(owner: &str, repo: &str, sha: &str, digest: &str) -> serde_json::Value {
+        json!({
+            "owner": owner,
+            "repo": repo,
+            "sha": sha,
+            "tree_digest": digest,
+        })
+    }
+
+    /// First report wins: the pin is stored and `tree_digest_pin_for`
+    /// returns it, so runnerresolve will hand it to the runner.
+    #[tokio::test]
+    async fn first_digest_report_establishes_pin() {
+        let state = test_state().await;
+        let shared = state.shared();
+
+        let Json(body) = record_action_tree_digest(
+            State(shared.clone()),
+            Json(report("actions", "checkout", SHA, DIGEST_A)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["recorded"], true);
+
+        assert_eq!(
+            tree_digest_pin_for(&state, "actions/checkout", Some(SHA)),
+            Some(DIGEST_A.to_string())
+        );
+        // Unknown actions stay unpinned (runner will report on first use).
+        assert_eq!(
+            tree_digest_pin_for(&state, "actions/setup-node", Some(SHA)),
+            None
+        );
+    }
+
+    /// A conflicting later report keeps the original pin — a digest that
+    /// changes for the same commit SHA is the tampering signal, not new
+    /// information.
+    #[tokio::test]
+    async fn conflicting_digest_report_keeps_original_pin() {
+        let state = test_state().await;
+        let shared = state.shared();
+
+        let Json(first) = record_action_tree_digest(
+            State(shared.clone()),
+            Json(report("actions", "checkout", SHA, DIGEST_A)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["recorded"], true);
+
+        let Json(second) = record_action_tree_digest(
+            State(shared.clone()),
+            Json(report("actions", "checkout", SHA, DIGEST_B)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["recorded"], false);
+
+        assert_eq!(
+            tree_digest_pin_for(&state, "actions/checkout", Some(SHA)),
+            Some(DIGEST_A.to_string())
+        );
+    }
+
+    /// Pins are keyed by resolved commit SHA case-insensitively, never by
+    /// mutable ref.
+    #[tokio::test]
+    async fn digest_pins_are_case_insensitive_and_sha_keyed() {
+        let state = test_state().await;
+        let shared = state.shared();
+
+        let Json(body) = record_action_tree_digest(
+            State(shared.clone()),
+            Json(report("Actions", "Checkout", &SHA.to_uppercase(), DIGEST_A)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["recorded"], true);
+
+        assert_eq!(
+            tree_digest_pin_for(&state, "actions/checkout", Some(SHA)),
+            Some(DIGEST_A.to_string())
+        );
+        // No pin without a resolved SHA.
+        assert_eq!(tree_digest_pin_for(&state, "actions/checkout", None), None);
+    }
+
+    /// Malformed reports are rejected with 400 and store nothing.
+    #[tokio::test]
+    async fn malformed_digest_reports_are_rejected() {
+        let state = test_state().await;
+        let shared = state.shared();
+
+        for body in [
+            report("ac/tions", "checkout", SHA, DIGEST_A), // path separator
+            report("..", "checkout", SHA, DIGEST_A),       // traversal
+            report("actions", "checkout", "v4", DIGEST_A), // mutable ref, not SHA
+            report("actions", "checkout", SHA, "sha256:abc"), // wrong scheme
+            report("actions", "checkout", SHA, "tree-sha256-v1:xyz"), // bad hex
+        ] {
+            let err = record_action_tree_digest(State(shared.clone()), Json(body))
+                .await
+                .expect_err("malformed report must be rejected");
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{}", err.message());
+        }
+        assert!(
+            tree_digest_pin_for(&state, "actions/checkout", Some(SHA)).is_none(),
+            "rejected reports must not mint pins"
+        );
+    }
 }

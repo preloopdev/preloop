@@ -333,6 +333,17 @@ pub type ActionShaCache = std::sync::Mutex<
     std::collections::HashMap<(String, String, String), (Option<String>, std::time::Instant)>,
 >;
 
+/// Trust-on-first-use action tree-digest pins: (`owner`, `repo`, `sha`)
+/// (lowercased) → canonical tree digest (`tree-sha256-v1:<hex>`).
+///
+/// The digest identifies the *content* of the extracted action tree, not the
+/// tarball bytes: it is stable for a commit regardless of how GitHub
+/// packages the tarball, and any served-bytes difference that changes what
+/// runs is detected. First report wins; conflicting later reports keep the
+/// original pin and are logged as tampering signals.
+pub type ActionTreeDigestPins =
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), String>>;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -525,6 +536,15 @@ pub struct AppState {
     /// and bounds GitHub API pressure; entries expire after
     /// [`ACTION_SHA_CACHE_TTL`].
     pub action_sha_cache: Arc<ActionShaCache>,
+    /// Trust-on-first-use pins of action tree digests
+    /// (`owner`, `repo`, `sha`) → digest. The runner reports the digest it
+    /// observed for a fresh download; the first report wins and later
+    /// downloads must match it or fail closed. Keys are lowercased
+    /// (GitHub owner/repo are case-insensitive). In-memory like
+    /// `action_sha_cache`: an engine restart starts pinning over, which is
+    /// the documented TOFU limitation — the first download after a restart
+    /// is trusted, guarded by TLS like any other download.
+    pub action_tree_digest_pins: Arc<ActionTreeDigestPins>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1154,6 +1174,9 @@ impl AppState {
             github_urls,
             pr_config,
             action_sha_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            action_tree_digest_pins: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             config_path,
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
             fork_policy: config.fork_policy.clone(),

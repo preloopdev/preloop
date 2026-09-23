@@ -12,8 +12,117 @@
 //! reintroduce the TOCTOU that SHA pinning removes.
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tracing::info;
+
+use crate::client::actions_download::TreeDigestPin;
+
+/// Digest algorithm/version tag prefixing every tree digest this runner
+/// produces. Bumped if the canonical encoding ever changes; the server
+/// treats differently-prefixed pins as distinct values, so an encoding
+/// change fails closed rather than silently comparing across encodings.
+pub const TREE_DIGEST_PREFIX: &str = "tree-sha256-v1:";
+
+/// Compute the canonical digest of an extracted action tree.
+///
+/// The digest covers exactly what will be executed: for every entry under
+/// `root`, in byte-sorted relative-path order, it hashes the entry kind,
+/// the relative path, and — for files — the permission bits (masked to
+/// `0o777`, as extraction enforces) and content bytes; for symlinks — the
+/// link target. Directory permission bits are intentionally excluded: parent
+/// directories are created umask-dependently at extraction time, and their
+/// modes do not affect what executes.
+///
+/// This is deliberately a *tree* digest rather than a hash of the tarball
+/// bytes: codeload tarballs are an opaque packaging of a commit, and a
+/// packaging change on GitHub's side must never invalidate pins or, worse,
+/// fail closed on every action download. The tree depends only on the
+/// commit's content, which the resolved SHA already identifies — so any
+/// difference in served bytes that changes what runs is detected, while
+/// byte-level packaging churn is not.
+pub fn canonical_tree_digest(root: &Path) -> Result<String> {
+    let mut entries: Vec<(Vec<u8>, u8, u32, Vec<u8>)> = Vec::new();
+    collect_tree_entries(root, root, &mut entries)?;
+    // Byte-sorted relative paths make the encoding order canonical.
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    for (rel_path, kind, mode, payload) in &entries {
+        hasher.update([*kind]);
+        hasher.update([0]);
+        hasher.update(format!("{mode:o}").as_bytes());
+        hasher.update([0]);
+        hasher.update(rel_path);
+        hasher.update([0]);
+        hasher.update(payload);
+        hasher.update([0]);
+    }
+    Ok(format!("{TREE_DIGEST_PREFIX}{:x}", hasher.finalize()))
+}
+
+/// Recursively collect `(relative path, kind, mode, payload)` tuples.
+/// Kinds: `b'd'` directory (mode always 0 — see above), `b'f'` file
+/// (content payload), `b'l'` symlink (link-target payload). Symlinks are
+/// never followed.
+fn collect_tree_entries(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(Vec<u8>, u8, u32, Vec<u8>)>,
+) -> Result<()> {
+    // `symlink_metadata` so a symlink-to-dir is recorded as a link, not
+    // traversed: traversal would both follow untrusted links and make the
+    // digest depend on link targets' contents twice.
+    let metadata = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("reading metadata for {}", dir.display()))?;
+    #[cfg(unix)]
+    let file_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777
+    };
+    #[cfg(not(unix))]
+    let file_mode = 0;
+
+    let rel = dir
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/").into_bytes())
+        .unwrap_or_default();
+    if dir != root {
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(dir)
+                .with_context(|| format!("reading link {}", dir.display()))?;
+            out.push((
+                rel,
+                b'l',
+                0,
+                target.to_string_lossy().replace('\\', "/").into_bytes(),
+            ));
+            return Ok(());
+        } else if metadata.file_type().is_dir() {
+            // Directory modes are umask-dependent at extraction time and do
+            // not affect what executes: excluded from the digest.
+            out.push((rel, b'd', 0, Vec::new()));
+        } else if metadata.file_type().is_file() {
+            let content =
+                std::fs::read(dir).with_context(|| format!("reading file {}", dir.display()))?;
+            out.push((rel, b'f', file_mode, content));
+        } else {
+            anyhow::bail!("unsupported entry type in action tree: {}", dir.display());
+        }
+    }
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        let mut children: Vec<PathBuf> = std::fs::read_dir(dir)
+            .with_context(|| format!("listing {}", dir.display()))?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<_>>()
+            .with_context(|| format!("listing {}", dir.display()))?;
+        children.sort();
+        for child in children {
+            collect_tree_entries(root, &child, out)?;
+        }
+    }
+    Ok(())
+}
 
 /// Download and extract a remote action to the _actions directory.
 ///
@@ -27,6 +136,12 @@ use tracing::info;
 /// TOCTOU that SHA pinning exists to remove (the ref can move between
 /// resolution and download).
 ///
+/// `digest_pin` carries the server's tree-digest pin for this action
+/// version ([`TreeDigestPin`]). The digest is verified against the
+/// extracted tree before the action is accepted: a mismatch fails closed
+/// and the download is discarded, never executed. On success the observed
+/// digest is returned so the caller can report it for first-use pinning.
+///
 /// These checks run before the cache lookup so a stale mutable-ref cache
 /// entry cannot bypass them, and before any network access.
 pub async fn download_action(
@@ -36,7 +151,8 @@ pub async fn download_action(
     actions_dir: &Path,
     download_url: Option<&str>,
     auth_token: Option<&str>,
-) -> Result<PathBuf> {
+    digest_pin: TreeDigestPin,
+) -> Result<(PathBuf, Option<String>)> {
     // M2: only pinned commit SHAs may be downloaded; anything else means
     // server-side resolution failed. The all-zero sentinel is a valid SHA
     // shape but names no commit, so it is rejected like any unpinned ref.
@@ -57,12 +173,56 @@ pub async fn download_action(
     let dir_ref = git_ref; // caller should pass resolved_sha here when available
     let dest = actions_dir.join(owner).join(repo).join(dir_ref);
 
+    // Whether this run verifies digests at all. An older server that
+    // predates digest support keeps the exact legacy behavior: no
+    // verification, no report, no cache eviction.
+    let verifying = !matches!(digest_pin, TreeDigestPin::Unsupported);
+
     if dest.exists() {
-        info!(
-            "Action {owner}/{repo}@{git_ref} already cached at {}",
-            dest.display()
-        );
-        return Ok(dest);
+        match &digest_pin {
+            TreeDigestPin::Pinned(expected) => {
+                let observed = canonical_tree_digest(&dest)?;
+                if &observed != expected {
+                    // A poisoned or stale cache entry (e.g. downloaded
+                    // before digest support existed) must not be executed:
+                    // evict it and fall through to a fresh verified
+                    // download below. If eviction itself fails, fail
+                    // closed rather than running the suspect tree.
+                    tracing::warn!(
+                        "action tree digest mismatch for cached {owner}/{repo}@{git_ref}: \
+                         evicting cache and re-downloading"
+                    );
+                    std::fs::remove_dir_all(&dest).with_context(|| {
+                        format!("evicting digest-mismatched action cache {}", dest.display())
+                    })?;
+                } else {
+                    info!(
+                        "Action {owner}/{repo}@{git_ref} already cached at {} (digest verified)",
+                        dest.display()
+                    );
+                    return Ok((dest, Some(observed)));
+                }
+            }
+            TreeDigestPin::Unpinned => {
+                // A cache entry of unknown provenance cannot establish the
+                // first-use pin: evict it so the pin comes from a fresh
+                // download whose bytes were just verified over TLS.
+                info!(
+                    "Action {owner}/{repo}@{git_ref} cached but unpinned: \
+                     re-downloading to establish the first-use digest pin"
+                );
+                std::fs::remove_dir_all(&dest).with_context(|| {
+                    format!("evicting unpinned action cache {}", dest.display())
+                })?;
+            }
+            TreeDigestPin::Unsupported => {
+                info!(
+                    "Action {owner}/{repo}@{git_ref} already cached at {}",
+                    dest.display()
+                );
+                return Ok((dest, None));
+            }
+        }
     }
 
     // M2: no api.github.com fallback. `url` is the server-supplied
@@ -110,6 +270,27 @@ pub async fn download_action(
 
     extract_tarball(&bytes, staging.path())?;
 
+    // Verify the extracted tree before it is moved into place: a mismatch
+    // fails closed and the staging directory is discarded, so tampered
+    // bytes are never executed. The digest covers the post-extraction tree
+    // (what will actually run), not the tarball bytes.
+    let observed_digest = if verifying {
+        let observed = canonical_tree_digest(staging.path())?;
+        if let TreeDigestPin::Pinned(expected) = &digest_pin {
+            if &observed != expected {
+                anyhow::bail!(
+                    "action tree digest mismatch for {owner}/{repo}@{git_ref}: \
+                     expected {expected}, observed {observed}; refusing to run a \
+                     tarball whose content differs from the pinned digest"
+                );
+            }
+            info!("Action {owner}/{repo}@{git_ref} tree digest verified: {observed}");
+        }
+        Some(observed)
+    } else {
+        None
+    };
+
     let staging_path = staging.keep();
     if !dest.exists() {
         if let Err(err) = std::fs::rename(&staging_path, &dest) {
@@ -124,7 +305,7 @@ pub async fn download_action(
     }
 
     info!("Extracted action to {}", dest.display());
-    Ok(dest)
+    Ok((dest, observed_digest))
 }
 
 /// Check whether a relative symlink target, resolved against the symlink's parent directory,
@@ -682,6 +863,7 @@ mod tests {
             &actions_dir,
             Some("http://127.0.0.1:1/tarball"),
             None,
+            TreeDigestPin::Unsupported,
         )
         .await;
 
@@ -719,6 +901,7 @@ mod tests {
             &actions_dir,
             Some(&url),
             None,
+            TreeDigestPin::Unsupported,
         )
         .await;
 
@@ -749,31 +932,37 @@ mod tests {
         let actions_dir = temp.path().join("actions");
 
         let url = format!("http://{addr}/tarball");
-        let res = download_action(
+        let (res, observed) = download_action(
             "owner",
             "repo",
             "0123456789abcdef0123456789abcdef01234567",
             &actions_dir,
             Some(&url),
             None,
+            TreeDigestPin::Unsupported,
         )
         .await
         .unwrap();
 
         assert!(res.exists());
+        assert!(
+            observed.is_none(),
+            "an unsupported pin must not compute a digest"
+        );
         assert_eq!(
             std::fs::read_to_string(res.join("action.yml")).unwrap(),
             "name: Checkout\n"
         );
 
         // Second call hits the cache without reaching the server
-        let cached_res = download_action(
+        let (cached_res, _) = download_action(
             "owner",
             "repo",
             "0123456789abcdef0123456789abcdef01234567",
             &actions_dir,
             Some("http://127.0.0.1:1/unreachable"),
             None,
+            TreeDigestPin::Unsupported,
         )
         .await
         .unwrap();
@@ -789,7 +978,16 @@ mod tests {
         let actions_dir = temp.path().join("actions");
         let sha = "0123456789abcdef0123456789abcdef01234567";
 
-        let result = download_action("owner", "repo", sha, &actions_dir, None, None).await;
+        let result = download_action(
+            "owner",
+            "repo",
+            sha,
+            &actions_dir,
+            None,
+            None,
+            TreeDigestPin::Unsupported,
+        )
+        .await;
         let error = result.expect_err("missing resolved URL must fail closed");
         assert!(
             error.to_string().contains("no SHA-pinned download URL"),
@@ -818,6 +1016,7 @@ mod tests {
                 &actions_dir,
                 Some("http://127.0.0.1:1/unreachable"),
                 None,
+                TreeDigestPin::Unsupported,
             )
             .await;
             let error = result.expect_err("mutable ref must fail closed");
@@ -846,6 +1045,7 @@ mod tests {
             &actions_dir,
             Some("http://127.0.0.1:1/unreachable"),
             None,
+            TreeDigestPin::Unsupported,
         )
         .await;
         assert!(
@@ -903,6 +1103,242 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest.join("bin/tool")).unwrap(),
             "tool_content"
+        );
+    }
+
+    /// Serve `tar_bytes` on a loopback axum server; returns the tarball URL.
+    async fn serve_test_tarball(tar_bytes: Vec<u8>) -> String {
+        use axum::{routing::get, Router};
+        let app = Router::new().route("/tarball", get(|| async move { tar_bytes }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/tarball")
+    }
+
+    const TEST_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn test_action_tarball() -> Vec<u8> {
+        create_test_tarball(&[
+            ("action-root/action.yml", b"name: Checkout\n"),
+            ("action-root/dist/index.js", b"console.log('hi');\n"),
+        ])
+    }
+
+    #[test]
+    fn canonical_tree_digest_is_deterministic_and_content_sensitive() {
+        let temp = TempDir::new().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir.join("dist")).unwrap();
+            std::fs::write(dir.join("action.yml"), b"name: X\n").unwrap();
+            std::fs::write(dir.join("dist/index.js"), b"console.log('hi');\n").unwrap();
+        }
+        let da = canonical_tree_digest(&a).unwrap();
+        let db = canonical_tree_digest(&b).unwrap();
+        assert_eq!(da, db, "identical trees must hash identically");
+        assert!(
+            da.starts_with(super::TREE_DIGEST_PREFIX),
+            "digest must carry the algorithm prefix: {da}"
+        );
+
+        // Any content change flips the digest.
+        std::fs::write(b.join("dist/index.js"), b"console.log('evil');\n").unwrap();
+        assert_ne!(canonical_tree_digest(&b).unwrap(), da);
+
+        // Adding a file flips the digest.
+        std::fs::write(b.join("dist/index.js"), b"console.log('hi');\n").unwrap();
+        std::fs::write(b.join("extra.txt"), b"x").unwrap();
+        assert_ne!(canonical_tree_digest(&b).unwrap(), da);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_tree_digest_covers_symlink_targets() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("real.js"), b"data").unwrap();
+            symlink("real.js", dir.join("link.js")).unwrap();
+        }
+        assert_eq!(
+            canonical_tree_digest(&a).unwrap(),
+            canonical_tree_digest(&b).unwrap()
+        );
+        std::fs::remove_file(b.join("link.js")).unwrap();
+        symlink("other.js", b.join("link.js")).unwrap();
+        std::fs::write(b.join("other.js"), b"data").unwrap();
+        assert_ne!(
+            canonical_tree_digest(&a).unwrap(),
+            canonical_tree_digest(&b).unwrap(),
+            "retargeted symlink must change the digest"
+        );
+    }
+
+    /// A fresh download whose tree does not match the pinned digest fails
+    /// closed: the destination is never created and nothing is executed.
+    #[tokio::test]
+    async fn download_action_fails_closed_on_digest_mismatch() {
+        let url = serve_test_tarball(test_action_tarball()).await;
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        let wrong_pin = format!(
+            "{}0000000000000000000000000000000000000000000000000000000000000000",
+            super::TREE_DIGEST_PREFIX
+        );
+        let error = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            TreeDigestPin::Pinned(wrong_pin),
+        )
+        .await
+        .expect_err("digest mismatch must fail closed");
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !actions_dir
+                .join("owner")
+                .join("repo")
+                .join(TEST_SHA)
+                .exists(),
+            "mismatched download must leave no destination behind"
+        );
+    }
+
+    /// A fresh download matching the pinned digest is accepted, and the
+    /// observed digest is returned for first-use reporting.
+    #[tokio::test]
+    async fn download_action_accepts_matching_pin_and_reports_digest() {
+        let url = serve_test_tarball(test_action_tarball()).await;
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        // First download establishes the digest (unpinned = trust on first
+        // use); a second fresh download verifies against it.
+        let (first_dest, observed) = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            TreeDigestPin::Unpinned,
+        )
+        .await
+        .unwrap();
+        let observed = observed.expect("fresh download must report a digest");
+        assert!(first_dest.exists());
+
+        let fresh_dir = temp.path().join("actions2");
+        let (second_dest, observed2) = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &fresh_dir,
+            Some(&url),
+            None,
+            TreeDigestPin::Pinned(observed.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(second_dest.exists());
+        assert_eq!(observed2.as_deref(), Some(observed.as_str()));
+    }
+
+    /// A poisoned cache entry (digest differs from the pin) is evicted and
+    /// replaced by a fresh verified download — never executed.
+    #[tokio::test]
+    async fn download_action_evicts_cache_on_pin_mismatch() {
+        let url = serve_test_tarball(test_action_tarball()).await;
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        // Establish the honest pin with a fresh download.
+        let (_, observed) = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            TreeDigestPin::Unpinned,
+        )
+        .await
+        .unwrap();
+        let pin = observed.unwrap();
+
+        // Poison the cache entry.
+        let dest = actions_dir.join("owner").join("repo").join(TEST_SHA);
+        std::fs::write(dest.join("dist/index.js"), b"console.log('pwned');\n").unwrap();
+        assert_ne!(canonical_tree_digest(&dest).unwrap(), pin);
+
+        // The poisoned entry must be evicted and replaced by a fresh
+        // verified download.
+        let (fresh_dest, observed2) = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            TreeDigestPin::Pinned(pin.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh_dest, dest);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("dist/index.js")).unwrap(),
+            "console.log('hi');\n"
+        );
+        assert_eq!(observed2.as_deref(), Some(pin.as_str()));
+    }
+
+    /// Migration: a cache entry predating digest support cannot mint the
+    /// first-use pin, so it is re-downloaded once to establish it.
+    #[tokio::test]
+    async fn download_action_redownloads_unpinned_cache_for_first_use() {
+        let url = serve_test_tarball(test_action_tarball()).await;
+        let temp = TempDir::new().unwrap();
+        let actions_dir = temp.path().join("actions");
+
+        // Simulate a pre-feature cache entry with stale content.
+        let dest = actions_dir.join("owner").join("repo").join(TEST_SHA);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("action.yml"), b"name: Stale\n").unwrap();
+
+        let (fresh_dest, observed) = download_action(
+            "owner",
+            "repo",
+            TEST_SHA,
+            &actions_dir,
+            Some(&url),
+            None,
+            TreeDigestPin::Unpinned,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh_dest, dest);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("action.yml")).unwrap(),
+            "name: Checkout\n",
+            "stale cache must be replaced by a fresh download"
+        );
+        assert!(
+            observed.is_some(),
+            "fresh download must report a digest for first-use pinning"
         );
     }
 }
