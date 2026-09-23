@@ -12088,7 +12088,7 @@ async fn debug_session_suspends_job_timeout() {
     let lease = request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/lease"),
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
         json!({
             "controller": "test-agent",
             "capabilities": ["job.retry_from"]
@@ -12098,13 +12098,13 @@ async fn debug_session_suspends_job_timeout() {
     assert_eq!(lease["controller"], "test-agent");
     assert_eq!(
         lease["capabilities"],
-        json!(["step.retry", "job.retry_from", "job.abort"])
+        json!(["step.retry", "job.retry_from", "job.continue", "job.abort"])
     );
 
     let events = request_json(
         &app,
         Method::GET,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/events?after=0"),
+        &format!("/api/v1/debug/sessions/{session_id}/events?after=0"),
         Value::Null,
     )
     .await;
@@ -12115,7 +12115,7 @@ async fn debug_session_suspends_job_timeout() {
     let operation = request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/operations"),
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
         json!({
             "request_id": "agent-retry-1",
             "expected_version": 1,
@@ -12134,7 +12134,7 @@ async fn debug_session_suspends_job_timeout() {
     let audit = request_json(
         &app,
         Method::GET,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/audit"),
+        &format!("/api/v1/debug/sessions/{session_id}/audit"),
         Value::Null,
     )
     .await;
@@ -12309,12 +12309,25 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
     .await;
     let session_id = opened["session_id"].as_str().unwrap().to_owned();
 
-    // A controller queues a verdict for the paused worker.
+    // A controller leases the session and queues a continue operation for the
+    // paused worker.
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "cli" }),
+    )
+    .await;
     request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
-        json!({ "verdict": "continue", "controller": "cli" }),
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "test-continue-1",
+            "expected_version": lease["session_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "continue" }
+        }),
     )
     .await;
 
@@ -20430,11 +20443,23 @@ async fn retry_verdict_carries_a_fresh_snapshot_token() {
     .await;
     let session_id = opened["session_id"].as_str().unwrap().to_owned();
 
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "test" }),
+    )
+    .await;
     request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
-        json!({ "verdict": "retry", "controller": "test" }),
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "test-retry-1",
+            "expected_version": lease["session_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "retry" }
+        }),
     )
     .await;
 
@@ -21806,7 +21831,7 @@ async fn control_socket_surface_denies_native_and_test_apis() {
         "/api/v1/runs",
         "/api/v1/debug/sessions",
         "/api/v1/debug/sessions/dbg-controller-only",
-        "/api/v1/agent/debug/sessions/dbg-controller-only/events",
+        "/api/v1/debug/sessions/dbg-controller-only/events",
         "/internal/test/jobs/complete",
     ] {
         let response = socket_app
@@ -21827,23 +21852,25 @@ async fn control_socket_surface_denies_native_and_test_apis() {
             "socket must not expose {denied}"
         );
     }
-    let controller_verdict = socket_app
+    let controller_operation = socket_app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/debug/sessions/dbg-controller-only/verdict")
+                .uri("/api/v1/debug/sessions/dbg-controller-only/operations")
                 .header(header::AUTHORIZATION, "Bearer preloop-system-token")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"verdict":"abort"}"#))
+                .body(Body::from(
+                    r#"{"request_id":"t","expected_version":1,"lease_id":"l","operation":{"operation":"abort"}}"#,
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(
-        controller_verdict.status(),
+        controller_operation.status(),
         StatusCode::NOT_FOUND,
-        "the controller verdict API must stay off the guest socket"
+        "the controller operations API must stay off the guest socket"
     );
 
     // The v3 registration-token endpoints mint runner-management JWTs

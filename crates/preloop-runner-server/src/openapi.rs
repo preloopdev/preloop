@@ -166,12 +166,11 @@ pub struct RunResponse {
         open_debug_session,
         get_debug_session,
         poll_debug_verdict,
-        post_debug_verdict,
+        post_debug_operation,
         close_debug_session,
         acquire_debug_lease,
         release_debug_lease,
         debug_events,
-        debug_operation,
         debug_audit,
         cache_get,
         cache_post,
@@ -568,17 +567,18 @@ fn get_debug_session() {}
 )]
 fn poll_debug_verdict() {}
 
-/// Post a verdict to a debug session (controller-facing).
+/// Issue a debug operation (controller-facing).
 ///
-/// Possible verdicts: `retry`, `retry_from`, `abort`.
+/// The single mutation surface for a paused session. Requires an active
+/// controller lease. Operations: `retry`, `retry_from`, `continue`, `abort`.
 #[utoipa::path(
-    post, path = "/api/v1/debug/sessions/{session_id}/verdict", tag = "Debug Sessions",
+    post, path = "/api/v1/debug/sessions/{session_id}/operations", tag = "Debug Sessions",
     params(("session_id" = String, Path, description = "Session identifier")),
     request_body = JsonValue,
-    responses((status = 200, description = "Verdict accepted", body = JsonValue)),
+    responses((status = 200, description = "Operation result", body = JsonValue)),
     security(("native_bearer" = []))
 )]
-fn post_debug_verdict() {}
+fn post_debug_operation() {}
 
 /// Close a debug session (worker-facing).
 #[utoipa::path(
@@ -588,14 +588,13 @@ fn post_debug_verdict() {}
     security(("debug_worker_bearer" = []))
 )]
 fn close_debug_session() {}
-
-// ── Agent Debug ─────────────────────────────────────────────────────────────
+// ── Debug session controller surface ────────────────────────────────────────
 
 /// Acquire a controller lease on a debug session.
 ///
 /// At most one controller may hold a lease at a time.
 #[utoipa::path(
-    post, path = "/api/v1/agent/debug/sessions/{session_id}/lease", tag = "Agent Debug",
+    post, path = "/api/v1/debug/sessions/{session_id}/lease", tag = "Debug Sessions",
     params(("session_id" = String, Path, description = "Session identifier")),
     responses(
         (status = 200, description = "Lease acquired", body = JsonValue),
@@ -607,7 +606,7 @@ fn acquire_debug_lease() {}
 
 /// Release the controller lease.
 #[utoipa::path(
-    delete, path = "/api/v1/agent/debug/sessions/{session_id}/lease", tag = "Agent Debug",
+    delete, path = "/api/v1/debug/sessions/{session_id}/lease", tag = "Debug Sessions",
     params(("session_id" = String, Path, description = "Session identifier")),
     responses((status = 204, description = "Lease released")),
     security(("native_bearer" = []))
@@ -618,28 +617,16 @@ fn release_debug_lease() {}
 ///
 /// Returns events after the given `after` event id (query param).
 #[utoipa::path(
-    get, path = "/api/v1/agent/debug/sessions/{session_id}/events", tag = "Agent Debug",
+    get, path = "/api/v1/debug/sessions/{session_id}/events", tag = "Debug Sessions",
     params(("session_id" = String, Path, description = "Session identifier")),
     responses((status = 200, description = "Structured events", body = [JsonValue])),
     security(("native_bearer" = []))
 )]
 fn debug_events() {}
 
-/// Issue a debug operation (retry, retry_from, abort, etc.).
-///
-/// Requires an active controller lease.
-#[utoipa::path(
-    post, path = "/api/v1/agent/debug/sessions/{session_id}/operations", tag = "Agent Debug",
-    params(("session_id" = String, Path, description = "Session identifier")),
-    request_body = JsonValue,
-    responses((status = 200, description = "Operation result", body = JsonValue)),
-    security(("native_bearer" = []))
-)]
-fn debug_operation() {}
-
 /// Read the retained audit trail.
 #[utoipa::path(
-    get, path = "/api/v1/agent/debug/sessions/{session_id}/audit", tag = "Agent Debug",
+    get, path = "/api/v1/debug/sessions/{session_id}/audit", tag = "Debug Sessions",
     params(("session_id" = String, Path, description = "Session identifier")),
     responses((status = 200, description = "Audit entries", body = [JsonValue])),
     security(("native_bearer" = []))

@@ -780,40 +780,34 @@ pub fn build_app(
                 require_native_bearer,
             )),
         )
+        // Unified controller surface: every controller (human CLI, agent, or
+        // DAP) drives a paused session through the same lease-gated,
+        // idempotent, version-checked operations.
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
-            post(crate::debug_sessions::post_verdict).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_native_bearer,
-            )),
-        )
-        // Structured agent debugging surface. It is deliberately separate
-        // from the human CLI verbs, but both mutate the same session state.
-        .route(
-            "/api/v1/agent/debug/sessions/:session_id/lease",
-            post(crate::debug_sessions::agent_acquire_lease)
-                .delete(crate::debug_sessions::agent_release_lease)
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/lease"),
+            post(crate::debug_sessions::acquire_lease)
+                .delete(crate::debug_sessions::release_lease)
                 .route_layer(middleware::from_fn_with_state(
                     shared.clone(),
                     require_native_bearer,
                 )),
         )
         .route(
-            "/api/v1/agent/debug/sessions/:session_id/events",
-            get(crate::debug_sessions::agent_events).route_layer(middleware::from_fn_with_state(
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/events"),
+            get(crate::debug_sessions::session_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/agent/debug/sessions/:session_id/operations",
-            post(crate::debug_sessions::agent_operation).route_layer(
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/operations"),
+            post(crate::debug_sessions::session_operation).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_native_bearer),
             ),
         )
         .route(
-            "/api/v1/agent/debug/sessions/:session_id/audit",
-            get(crate::debug_sessions::agent_audit).route_layer(middleware::from_fn_with_state(
+            &format!("{DEBUG_SESSIONS_PATH}/:session_id/audit"),
+            get(crate::debug_sessions::session_audit).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),

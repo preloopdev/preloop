@@ -336,28 +336,6 @@ pub struct WorkerTokenResponse {
     pub token: String,
 }
 
-/// Controller → server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerdictRequest {
-    /// What the worker should do next.
-    pub verdict: Verdict,
-    /// How much of the failed attempt's debris to undo first. Only meaningful
-    /// with [`Verdict::Retry`].
-    #[serde(default)]
-    pub revert: RevertPolicy,
-    /// Who issued it, for the audit trail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controller: Option<String>,
-    /// Source revision the controller synced before deciding. Recorded on the
-    /// next attempt so the journal shows what each attempt ran against.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_revision: Option<String>,
-    /// When set, re-execute from this zero-based step index instead of only
-    /// the failed step. `Some(0)` means restart from the first user step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_from_step: Option<usize>,
-}
-
 /// Server → worker when the long poll resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerdictResponse {
@@ -394,7 +372,7 @@ pub struct VerdictResponse {
 /// an unbounded terminal transcript. The agent can request more evidence using
 /// the operation surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentEvent {
+pub struct SessionEvent {
     /// Monotonic sequence within one debug session.
     pub event_id: u64,
     /// Stable discriminator such as `step_failed` or `retry_requested`.
@@ -425,7 +403,7 @@ pub struct AgentEvent {
 
 /// Request to acquire the single mutating agent lease for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentLeaseRequest {
+pub struct SessionLeaseRequest {
     /// Stable caller identity, shown in the audit trail.
     pub controller: String,
     /// Capabilities requested by the caller. The server grants only supported
@@ -436,7 +414,7 @@ pub struct AgentLeaseRequest {
 
 /// Lease granted to an agent controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentLeaseResponse {
+pub struct SessionLeaseResponse {
     /// Opaque lease credential required on mutating operations.
     pub lease_id: String,
     /// Controller identity recorded in the audit trail.
@@ -449,22 +427,30 @@ pub struct AgentLeaseResponse {
 
 /// Events after an optional sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentEventsResponse {
+pub struct SessionEventsResponse {
     /// Events after the requested sequence number.
-    pub events: Vec<AgentEvent>,
+    pub events: Vec<SessionEvent>,
     /// Highest event id returned, for reconnecting consumers.
     pub next_event_id: u64,
 }
 
-/// Typed operation submitted by an agent.
+/// Typed operation submitted by a controller (human CLI, agent, or DAP).
+///
+/// This is the single mutation surface for a paused debug session — the
+/// former `verdict` endpoint is folded into these operations so every
+/// controller shares one lease-gated, idempotent, version-checked path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
-pub enum AgentOperation {
+pub enum SessionOperation {
     /// Retry only the failed step.
     Retry {
         /// Workspace cleanup policy before retry.
         #[serde(default)]
         revert: RevertPolicy,
+        /// Source revision the controller synced before deciding. Recorded on
+        /// the next attempt so the journal shows what it ran against.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_revision: Option<String>,
     },
     /// Retry from an earlier step. Index is zero-based on the wire.
     RetryFrom {
@@ -473,14 +459,19 @@ pub enum AgentOperation {
         /// Workspace cleanup policy before retry.
         #[serde(default)]
         revert: RevertPolicy,
+        /// Source revision the controller synced before deciding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_revision: Option<String>,
     },
+    /// Accept the failure and run the remaining steps (was `Verdict::Continue`).
+    Continue,
     /// Abort the job and run normal cleanup.
     Abort,
 }
 
 /// Agent operation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentOperationRequest {
+pub struct SessionOperationRequest {
     /// Client-generated idempotency key.
     pub request_id: String,
     /// Optimistic-concurrency version. Required for new mutations.
@@ -488,12 +479,12 @@ pub struct AgentOperationRequest {
     /// Lease credential returned by the acquire endpoint.
     pub lease_id: String,
     /// Operation to execute.
-    pub operation: AgentOperation,
+    pub operation: SessionOperation,
 }
 
 /// Result of a typed agent operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentOperationResponse {
+pub struct SessionOperationResponse {
     /// Idempotency key echoed from the request.
     pub request_id: String,
     /// Session version before the operation.
@@ -508,7 +499,7 @@ pub struct AgentOperationResponse {
 
 /// One audited agent mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentAuditEntry {
+pub struct SessionAuditEntry {
     /// Idempotency key of the mutation.
     pub request_id: String,
     /// Agent controller identity.
@@ -646,8 +637,14 @@ mod tests {
     fn revert_defaults_to_doing_nothing() {
         // Absent means "retry in place". A missing field must never be read as
         // permission to discard a step's output.
-        let parsed: VerdictRequest = serde_json::from_str(r#"{"verdict":"retry"}"#).unwrap();
-        assert_eq!(parsed.revert, RevertPolicy::None);
+        let parsed: SessionOperation = serde_json::from_str(r#"{"operation":"retry"}"#).unwrap();
+        assert_eq!(
+            parsed,
+            SessionOperation::Retry {
+                revert: RevertPolicy::None,
+                source_revision: None
+            }
+        );
         assert_eq!(RevertPolicy::default(), RevertPolicy::None);
     }
 
@@ -711,19 +708,20 @@ mod tests {
 
     #[test]
     fn agent_retry_operation_has_a_stable_wire_shape() {
-        let request = AgentOperationRequest {
+        let request = SessionOperationRequest {
             request_id: "retry-1".into(),
             expected_version: 4,
             lease_id: "lease_1".into(),
-            operation: AgentOperation::RetryFrom {
+            operation: SessionOperation::RetryFrom {
                 step_index: 0,
                 revert: RevertPolicy::None,
+                source_revision: None,
             },
         };
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["operation"]["operation"], "retry_from");
         assert_eq!(encoded["operation"]["step_index"], 0);
-        let decoded: AgentOperationRequest = serde_json::from_value(encoded).unwrap();
+        let decoded: SessionOperationRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, request);
     }
 }

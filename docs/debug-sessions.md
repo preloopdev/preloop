@@ -575,18 +575,17 @@ Preloop verbs are `:`-prefixed so they never collide with shell commands.
 
 ---
 
-## 13. Agent API
+## 13. Controller API
 
-Agents will use this at least as much as humans, and they operate on **both
-sides of the VM boundary** — environment fixes land in the VM, source fixes land
-in a repair workspace on the host. The API is typed operations with
-deterministic results, not a PTY.
+Every controller — the human CLI, an agent, or a DAP client — drives a paused
+session through **one** unified surface under
+`/api/v1/debug/sessions/:session_id`. 
 
-The core control surface is implemented under
-`/api/v1/agent/debug/sessions/:session_id`: acquire/release a single controller
-lease, poll resumable structured events, issue versioned retry/retry-from/abort
-operations, and read the retained audit trail. The human CLI and this agent
-surface both drive the same debug-session state machine.
+The surface: acquire/release a single controller lease, poll resumable
+structured events, issue versioned `retry`/`retry_from`/`continue`/`abort`
+operations, and read the retained audit trail. All controllers drive the same
+debug-session state machine through the same lease-gated, idempotent,
+version-checked operations.
 
 **Events** carry structured diagnostics and a log reference, not a wall of
 terminal output and not the full environment:
@@ -651,7 +650,7 @@ per job as `sub: preloop-debug-worker-{agent_job_id}` with a matching
 - a session may only be polled or closed by the job that owns it;
 - a mismatch is reported as `404`, not `403`, so session ids are not probeable.
 
-This is load-bearing, not defence in depth. Collecting a verdict *consumes* it:
+Collecting a verdict *consumes* it:
 an unauthorized poll would not merely read another job's session, it would
 drain the verdict its worker is waiting for, and that worker would then sit out
 the liveness window and be swept — a hang with no attributable cause. A runner
@@ -691,9 +690,9 @@ nothing to a step that later replays it:
   before any step runs, so a step that finds `ACTIONS_RUNTIME_TOKEN` in its
   environment finds the exchange already consumed.
 
-Controller-facing routes (`GET /api/v1/debug/sessions`, `POST …/verdict`) and
-the whole `/api/v1/agent/debug/…` surface use native authentication, which is
-the operator's credential.
+Controller-facing routes (`GET /api/v1/debug/sessions`, `POST …/operations`,
+`POST`/`DELETE …/lease`, `GET …/events`, `GET …/audit`) use native
+authentication, which is the operator's credential.
 
 **Untrusted fields.** Everything in `OpenSessionRequest` is worker-supplied.
 `workspace` reaches a controller's shell as a `cd` target, so it is validated at

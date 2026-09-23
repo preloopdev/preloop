@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use preloop_gha_protocol::debug_session::{
-    ChangeCategory, DebugSession, RevertPolicy, StepSummary, Verdict, VerdictRequest,
+    ChangeCategory, DebugSession, RevertPolicy, SessionLeaseRequest, SessionLeaseResponse,
+    SessionOperation, SessionOperationRequest, SessionOperationResponse, StepSummary, Verdict,
     WorkspaceChange,
 };
 
@@ -605,6 +606,42 @@ impl Api {
         Ok(response.error_for_status()?.json().await?)
     }
 
+    /// Acquire the single controller lease for a session.
+    async fn acquire_lease(&self, session_id: &str) -> Result<SessionLeaseResponse> {
+        let body = SessionLeaseRequest {
+            controller: "preloop-cli".to_owned(),
+            capabilities: Vec::new(),
+        };
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/v1/debug/sessions/{session_id}/lease"),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("acquiring session lease")?
+            .error_for_status()
+            .context("acquiring session lease")?;
+        Ok(response.json().await?)
+    }
+
+    /// Release the controller lease (best-effort).
+    async fn release_lease(&self, session_id: &str, lease_id: &str) {
+        let _ = self
+            .request(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/debug/sessions/{session_id}/lease"),
+            )
+            .json(&serde_json::json!({ "lease_id": lease_id }))
+            .send()
+            .await;
+    }
+
+    /// Drive a paused session through the unified operations surface.
+    ///
+    /// Acquires the controller lease, issues the operation, then releases the
+    /// lease. `verdict` maps onto the equivalent `SessionOperation`.
     async fn verdict(
         &self,
         session_id: &str,
@@ -613,24 +650,48 @@ impl Api {
         source_revision: Option<String>,
         retry_from_step: Option<usize>,
     ) -> Result<DebugSession> {
-        let body = VerdictRequest {
-            verdict,
-            revert,
-            controller: Some("preloop-cli".to_owned()),
-            source_revision,
-            retry_from_step,
+        let lease = self.acquire_lease(session_id).await?;
+        let operation = match (verdict, retry_from_step) {
+            (Verdict::Retry, Some(step_index)) => SessionOperation::RetryFrom {
+                step_index,
+                revert,
+                source_revision,
+            },
+            (Verdict::Retry, None) => SessionOperation::Retry {
+                revert,
+                source_revision,
+            },
+            (Verdict::Continue, _) => SessionOperation::Continue,
+            (Verdict::Abort, _) => SessionOperation::Abort,
         };
-        let response = self
+        let body = SessionOperationRequest {
+            request_id: format!(
+                "cli-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ),
+            expected_version: lease.session_version,
+            lease_id: lease.lease_id.clone(),
+            operation,
+        };
+        let result = self
             .request(
                 reqwest::Method::POST,
-                &format!("/api/v1/debug/sessions/{session_id}/verdict"),
+                &format!("/api/v1/debug/sessions/{session_id}/operations"),
             )
             .json(&body)
             .send()
             .await
-            .context("issuing verdict")?
-            .error_for_status()?;
-        Ok(response.json().await?)
+            .context("issuing session operation")?;
+        let status = result.status();
+        let parsed = result.json::<SessionOperationResponse>().await;
+        self.release_lease(session_id, &lease.lease_id).await;
+        if !status.is_success() {
+            anyhow::bail!("session operation failed: {status}");
+        }
+        Ok(parsed?.session)
     }
 }
 
