@@ -177,14 +177,122 @@ impl CredentialStore for OsCredentialStore {
     /// `keyring`'s platform store is initialized once, lazily, on the first
     /// `Entry::new`. `store_status` reports that one-time result without
     /// touching a credential.
+    ///
+    /// macOS: `store_status` succeeds whenever the Security framework is
+    /// present — including SSH sessions and LaunchDaemons where the login
+    /// keychain is locked and `SecKeychainAddGenericPassword` blocks forever
+    /// in `mach_msg` waiting on `securityd` (observed: `preloop serve` hung
+    /// before binding its listener when run over SSH on a Mac Studio). Probe
+    /// the login keychain's lock state with `security show-keychain-info`;
+    /// "User interaction is not allowed" means writes would hang, so report
+    /// the store unavailable and let callers fall back to inline/file
+    /// credentials.
     fn available(&self) -> Result<()> {
         match keyring::Entry::store_status() {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(error) => {
                 anyhow::bail!("no operating-system credential store available: {error}")
             }
         }
+        #[cfg(target_os = "macos")]
+        macos_keychain_writable()?;
+        Ok(())
     }
+}
+
+/// Whether the login keychain accepts writes without user interaction.
+///
+/// `security show-keychain-info` fails with `User interaction is not allowed`
+/// (errSecInteractionNotAllowed) when the keychain is locked — but in a
+/// session that cannot reach `securityd` at all (SSH, LaunchDaemon before
+/// Aqua login) the command itself blocks in `mach_msg` forever, the same
+/// hang this probe exists to prevent. The probe therefore runs with a hard
+/// deadline: a timeout means the store is unreachable, not writable.
+///
+/// `show-keychain-info` alone is not enough: it can succeed while a real
+/// `SecKeychainAddGenericPassword` write still blocks forever (observed:
+/// `preloop serve` under launchd on a Mac Studio — probe passed, the token
+/// migration write then hung the whole runtime in mach_msg). The probe
+/// therefore performs an actual write+delete of a throwaway item, which
+/// exercises the same `SecItemAdd` path `keyring` uses, under the same
+/// deadline.
+///
+/// A nonzero exit for any other reason is also treated as unavailable: the
+/// probe is cheap and the fallback (inline/file credentials) is always safe.
+#[cfg(target_os = "macos")]
+fn macos_keychain_writable() -> Result<()> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Throwaway item used to prove `SecItemAdd` completes in this session.
+    /// Distinct service/account so it can never collide with a real entry.
+    const PROBE_SERVICE: &str = "dev.preloop.writability-probe";
+    const PROBE_ACCOUNT: &str = "probe";
+
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let keychain = Path::new(&home)
+        .join("Library")
+        .join("Keychains")
+        .join("login.keychain-db");
+
+    // One probe command: write a throwaway item, then delete it. Both go
+    // through the same SecItemAdd/SecItemDelete path a real credential write
+    // takes, so a locked keychain hangs or fails here exactly as it would on
+    // the engine-token migration.
+    let mut child = std::process::Command::new("security")
+        .arg("add-generic-password")
+        .arg("-s")
+        .arg(PROBE_SERVICE)
+        .arg("-a")
+        .arg(PROBE_ACCOUNT)
+        .arg("-w")
+        .arg("probe")
+        .arg(&keychain)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("probing login keychain writability")?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait().context("waiting on keychain probe")? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "login keychain write probe timed out after {}s (keychain locked or \
+                     securityd unreachable); using inline/file credentials",
+                    PROBE_TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    // Best-effort cleanup of the probe item regardless of outcome; a leftover
+    // is harmless (distinct service name, no secret value).
+    let _ = std::process::Command::new("security")
+        .arg("delete-generic-password")
+        .arg("-s")
+        .arg(PROBE_SERVICE)
+        .arg("-a")
+        .arg(PROBE_ACCOUNT)
+        .arg(&keychain)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        anyhow::bail!(
+            "login keychain is not writable in this session ({}); \
+             using inline/file credentials",
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 /// Resolve the storage directory used for the engine administrator token.
 ///
@@ -387,6 +495,7 @@ pub fn resolve_engine_token_with_store(
     write_engine_token_file(&token_path, &token)?;
     Ok(token)
 }
+
 
 fn load_engine_token_with_store(
     storage_dir: &Path,
