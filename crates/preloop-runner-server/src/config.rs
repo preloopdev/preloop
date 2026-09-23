@@ -363,6 +363,65 @@ impl Default for CheckoutCacheConfig {
     }
 }
 
+/// Permission level for the token permissions ceiling. Strict: an unknown
+/// level string fails config parsing rather than silently weakening policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionLevel {
+    None,
+    #[default]
+    Read,
+    Write,
+    Admin,
+}
+
+impl PermissionLevel {
+    /// Authority rank: none < read < write < admin. Matches the ranking used
+    /// when clamping minted tokens to the App installation's grants.
+    pub fn rank(self) -> u8 {
+        match self {
+            PermissionLevel::None => 0,
+            PermissionLevel::Read => 1,
+            PermissionLevel::Write => 2,
+            PermissionLevel::Admin => 3,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionLevel::None => "none",
+            PermissionLevel::Read => "read",
+            PermissionLevel::Write => "write",
+            PermissionLevel::Admin => "admin",
+        }
+    }
+}
+
+/// Operator ceiling on `GITHUB_TOKEN` permissions (`[token_permissions_ceiling]`),
+/// mirroring GitHub's workflow-permissions defaults as a hard cap: a workflow
+/// may declare less than the ceiling, never more. The effective permission
+/// per scope is the minimum of the workflow-declared set, this ceiling, the
+/// fork-restricted profile (which stays the floor for fork PR jobs), and the
+/// GitHub App installation's grants.
+///
+/// Absent by default: no ceiling is applied and today's behavior is unchanged.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TokenPermissionsCeiling {
+    /// Cap applied to scopes not explicitly listed. Default `read`.
+    #[serde(default)]
+    pub r#default: PermissionLevel,
+    /// Per-scope caps, e.g. `contents = "read"`. Remaining keys are scope
+    /// names; unknown keys become scope caps (caps only ever reduce).
+    #[serde(flatten)]
+    pub scopes: BTreeMap<String, PermissionLevel>,
+    /// Mirror of GitHub's "Allow GitHub Actions to create and approve pull
+    /// requests" toggle. When false (default), `pull-requests` is capped at
+    /// `read` no matter what the ceiling table says, so the minted token
+    /// cannot create or approve pull requests.
+    #[serde(default)]
+    pub allow_create_approve_pr: bool,
+}
+
 /// The engine configuration file.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ConfigFile {
@@ -396,6 +455,11 @@ pub struct ConfigFile {
     /// currently gates existence.
     #[serde(default)]
     pub environments: BTreeMap<String, BTreeSet<String>>,
+    /// Token permissions ceiling (`[token_permissions_ceiling]`), mirroring
+    /// GitHub's workflow-permissions defaults as a hard operator cap.
+    /// `None` (absent table) = no ceiling; today's behavior is unchanged.
+    #[serde(default)]
+    pub token_permissions_ceiling: Option<TokenPermissionsCeiling>,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -622,12 +686,20 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, token_permissions_ceiling: {} }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
             self.env_secrets.len(),
-            self.environments.len()
+            self.environments.len(),
+            self.token_permissions_ceiling.as_ref().map_or(
+                "none".to_owned(),
+                |ceiling| format!(
+                    "default={} ({} scoped)",
+                    ceiling.r#default.as_str(),
+                    ceiling.scopes.len()
+                )
+            )
         )
     }
 }
@@ -1151,6 +1223,7 @@ mod tests {
                 )]),
             )]),
             environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
+            token_permissions_ceiling: None,
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }

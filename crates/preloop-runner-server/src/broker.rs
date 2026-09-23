@@ -1497,18 +1497,47 @@ pub async fn mint_dispatch_github_token(
             }
         });
     };
+    // Operator ceiling on GITHUB_TOKEN permissions: the permission map
+    // requested from GitHub is the minimum of the workflow-declared set
+    // (already downgraded to the fork-restricted profile for untrusted jobs)
+    // and the ceiling. The App installation's grants clamp it further at
+    // mint time. The PAT fallback below is the operator's own credential
+    // and ignores `permissions:` by design, so the ceiling does not apply
+    // to it.
+    let ceiling = crate::token_ceiling::apply_ceiling(
+        shared.state.token_permissions_ceiling.as_ref(),
+        &request.permissions,
+    );
+    for detail in &ceiling.clamped {
+        warn!(
+            repository = %request.repository,
+            scope = %detail.scope,
+            requested = %detail.requested,
+            granted = %detail.granted,
+            "token permissions ceiling clamped GITHUB_TOKEN scope"
+        );
+    }
+    let ceiling_clamped = !ceiling.clamped.is_empty();
     let minted = match crate::github_app::get_or_mint_token_declared(
         &app,
         &request.repository,
-        &request.permissions,
+        &ceiling.permissions,
         request.declared,
     )
     .await
     {
-        Ok((token, effective_permissions)) => Some(MintedGitHubToken {
-            token,
-            effective_permissions,
-        }),
+        Ok((token, narrowed)) => {
+            // The token carries the clamped set when the ceiling reduced the
+            // request (or when the installation narrowed it): restate it so
+            // the wire `system.github.token.permissions` variable reports
+            // what the token actually carries.
+            let effective_permissions =
+                narrowed.or_else(|| ceiling_clamped.then(|| ceiling.permissions.clone()));
+            Some(MintedGitHubToken {
+                token,
+                effective_permissions,
+            })
+        }
         Err(error) => {
             // An untrusted fork job must never fall back to the PAT: the
             // PAT is repository-unscoped and ignores `permissions:`, so

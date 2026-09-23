@@ -425,6 +425,51 @@ jobs are lost, not resumed — restart during a quiet period and re-run after.
 
 ---
 
+## 8. GitHub admin controls (codified policy)
+
+GitHub's admin surface — execution protections, token permission defaults,
+environment protection rules, fork PR policies — lives in repo/org settings,
+deliberately outside workflow files: whoever writes a workflow must not be
+able to weaken the policy that constrains it. Preloop mirrors that split by
+putting the equivalent controls in the operator's server config
+(`$PRELOOP_CONFIG`, default `~/.preloop/config.toml`), never in workflow
+repos. All of the tables below are optional and empty by default; an empty
+table preserves today's behavior exactly. Policy is read at startup — edit
+the file and restart the server to apply changes.
+
+### 8.2 Token permissions ceiling
+
+A hard operator cap on `GITHUB_TOKEN` permissions, mirroring GitHub's
+workflow-permissions defaults. A workflow may declare less than the ceiling,
+never more. Effective permissions per scope are the minimum of the
+workflow-declared set, this ceiling, the fork-restricted profile (which stays
+the floor for fork PR jobs), and the GitHub App installation's grants.
+
+```toml
+[token_permissions_ceiling]
+default = "read"        # cap for scopes not listed below (default "read")
+contents = "read"       # per-scope caps
+pull-requests = "write"
+allow_create_approve_pr = false  # default false, like GitHub's toggle
+```
+
+Semantics:
+
+- Omit the table entirely for today's behavior (no ceiling). Writing the
+  table activates it; `default` caps every scope not explicitly listed.
+- Levels are `none` < `read` < `write` < `admin`. Unknown level strings fail
+  config parsing (fail closed); an unknown *requested* level clamps down to
+  the cap instead of slipping past it.
+- `allow_create_approve_pr = false` caps `pull-requests` at `read` no matter
+  what the table says, so the minted token cannot create or approve pull
+  requests — the scope-model approximation of GitHub's toggle.
+- The ceiling is applied to the permission map requested from GitHub *before*
+  the installation token is minted, and the clamped set is what the wire
+  `system.github.token.permissions` variable reports. Every clamp is logged
+  at warn with scope, requested, and granted levels.
+- The PAT fallback is the operator's own credential and ignores
+  `permissions:` by design; the ceiling does not apply to it.
+
 ## See also
 
 - [`setup.md`](setup.md) — GitHub App and credential setup
