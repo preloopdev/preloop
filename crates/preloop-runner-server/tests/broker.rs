@@ -1165,6 +1165,141 @@ jobs:
     );
 }
 
+/// A fork-PR run under `require_approval` must hold even needs-empty jobs in
+/// `Pending`: the submit-time fast path used to enqueue them straight to the
+/// ready queue, letting a runner claim them before the operator approved.
+#[tokio::test]
+async fn fork_pr_needs_empty_job_held_until_approval() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+
+    let ws_dir = temp.path().join("workspace");
+    tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
+        .await
+        .unwrap();
+    // Single job with no `needs:` — the exact shape that took the fast path.
+    let workflow_content = r#"
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+"#;
+    tokio::fs::write(ws_dir.join(".github/workflows/build.yml"), workflow_content)
+        .await
+        .unwrap();
+
+    let head_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
+    // The adapter also emits a pull_request_target event (base trust tier);
+    // it needs a base SHA or it aborts the batch before our pull_request
+    // event is processed.
+    let base_sha = head_sha.clone();
+
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.webhook_secret = Some("super-secret".to_owned());
+    state.local_workspace = Some(ws_dir.clone());
+    state.fork_policy.require_approval = true;
+    let system_token = state.system_token.clone();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let payload = serde_json::json!({
+        "action": "opened",
+        "number": 7,
+        "pull_request": {
+            "head": {
+                "ref": "feature",
+                "sha": head_sha,
+                "repo": { "fork": true }
+            },
+            "base": { "ref": "main", "sha": base_sha },
+        },
+        "repository": {
+            "full_name": "owner/repo",
+            "default_branch": "main"
+        }
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"super-secret").unwrap();
+    mac.update(&payload_bytes);
+    let signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/github/webhooks")
+                .header("x-github-event", "pull_request")
+                .header("x-hub-signature-256", format!("sha256={signature}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    crate::github::drain_webhook_queue(&shared).await.unwrap();
+
+    let run_id = {
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.runs.len(), 1, "fork PR must create a run");
+        let (run_id, run) = inner.runs.iter().next().unwrap();
+        assert!(
+            run.fork_approval_pending,
+            "fork PR run must wait for approval"
+        );
+        // The needs-empty job must be held in Pending, not dispatched.
+        assert_eq!(run.jobs.len(), 1);
+        let status = run.jobs.values().next().unwrap();
+        assert_eq!(
+            *status,
+            ExecutionStatus::Pending,
+            "needs-empty fork job must hold in Pending"
+        );
+        assert!(
+            inner.queue.iter().all(|j| j.run_id != *run_id),
+            "needs-empty fork job must not reach the ready queue"
+        );
+        assert!(
+            inner.pending_jobs.iter().any(|j| j.run_id == *run_id),
+            "needs-empty fork job must wait in pending_jobs"
+        );
+        *run_id
+    };
+
+    // Approving releases the hold; an empty JSON body must be accepted.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/runs/{run_id}/approve-fork"))
+                .header("authorization", format!("Bearer {system_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let inner = state.inner.lock().await;
+    assert!(
+        !inner.runs[&run_id].fork_approval_pending,
+        "approval must clear the hold"
+    );
+}
+
 #[tokio::test]
 async fn github_app_manifest_registration_flow() {
     let temp = tempfile::tempdir().unwrap();

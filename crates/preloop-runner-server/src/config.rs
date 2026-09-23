@@ -462,6 +462,47 @@ pub struct TokenPermissionsCeiling {
     pub allow_create_approve_pr: bool,
 }
 
+/// Fork pull-request workflow policy, mirroring GitHub's "Fork pull request
+/// workflows" admin settings. Rules live in the operator's server config —
+/// never in workflow repos — so a fork author cannot weaken the policy that
+/// constrains their own workflows.
+///
+/// Deliberately narrow: GitHub's "send write tokens" and "send secrets"
+/// toggles are not knobs here — preloop never sends secrets or write tokens
+/// to fork-PR workflows (the [`TrustTier::UntrustedForkPullRequest`] tier
+/// hardcodes the safe answer), so there is nothing to configure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForkPolicyConfig {
+    /// Whether workflows may run at all for fork pull-request events
+    /// (`pull_request` / `pull_request_review` from a fork). `false` skips
+    /// the event in the webhook intake path before any workflow is matched.
+    /// Default `true` preserves today's behavior.
+    #[serde(default = "default_true")]
+    pub run_fork_workflows: bool,
+    /// Whether fork-PR workflow runs wait for explicit operator approval
+    /// before any job may start. The run is created and held at scheduler
+    /// admission; approve it with
+    /// `POST /api/v1/runs/:run_id/approve-fork` (system Bearer <redacted>) or
+    /// `preloop approve-fork`. A run not approved within 24 hours fails
+    /// closed. Default `false` preserves today's behavior.
+    #[serde(default)]
+    pub require_approval: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ForkPolicyConfig {
+    fn default() -> Self {
+        Self {
+            run_fork_workflows: true,
+            require_approval: false,
+        }
+    }
+}
+
 /// The engine configuration file.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ConfigFile {
@@ -509,6 +550,12 @@ pub struct ConfigFile {
     /// preserves today's behavior.
     #[serde(default)]
     pub environment_rules: EnvironmentRulesMap,
+    /// Fork pull-request workflow policy (`[fork_policy]`), mirroring
+    /// GitHub's "Fork pull request workflows" admin settings. Empty by
+    /// default: fork-PR workflows run as today until the operator writes
+    /// policy.
+    #[serde(default)]
+    pub fork_policy: ForkPolicyConfig,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -735,7 +782,7 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {} }}",
+            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?} }}",
             self.github,
             self.secrets.len(),
             self.repo_secrets.len(),
@@ -749,7 +796,8 @@ impl std::fmt::Debug for ConfigFile {
                     ceiling.r#default.as_str(),
                     ceiling.scopes.len()
                 )
-            )
+            ),
+            self.fork_policy
         )
     }
 }
@@ -1313,6 +1361,7 @@ mod tests {
             environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
             token_permissions_ceiling: None,
             environment_rules: BTreeMap::new(),
+            fork_policy: ForkPolicyConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
         }

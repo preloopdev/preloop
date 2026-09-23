@@ -765,70 +765,98 @@ pub fn promote_next_from_group(
     match next {
         concurrency::Holder::Run(run_id) => {
             if let Some(jobs) = inner.held_runs.remove(&run_id) {
-                for mut job in jobs {
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
-                    }
-                    // Re-check needs/max_parallel before queueing.
-                    let needs_ok = inner.runs.get(&run_id).is_some_and(|run| {
-                        job.needs
-                            .iter()
-                            .all(|n| scheduling::need_satisfied(&run.jobs, n))
-                    });
-                    if needs_ok && under_max_parallel(inner, &job) {
-                        // MC-S3: jobs held behind a workflow-level gate were
-                        // parked before the per-job gate evaluation ran at
-                        // submit, so their job-level gates were never checked.
-                        // Evaluate and acquire now; park in
-                        // `concurrency_blocked` when busy.
-                        let gate = inner
-                            .runs
-                            .get(&run_id)
-                            .map(|run| (run.github.clone(), run.submission.clone()));
-                        let gate_outcome = if let Some((github, submission)) = gate {
-                            try_acquire_job_gate(inner, &github, &submission, &job)
-                        } else {
-                            JobGateOutcome::Proceed
-                        };
-                        match gate_outcome {
-                            JobGateOutcome::Proceed => {
-                                stamp_concurrency_acquired(&mut job);
-                                if let Some(run) = inner.runs.get_mut(&run_id) {
-                                    hydrate_needs_context(&mut job, run);
-                                }
-                                stamp_ready_enqueue(&mut job);
-                                on_job_enqueued(inner, &job);
-                                inner.queue.push_back(job);
-                            }
-                            JobGateOutcome::Parked => {
-                                if let Some(run) = inner.runs.get_mut(&run_id) {
-                                    run.jobs
-                                        .insert(job.job_id.clone(), ExecutionStatus::Pending);
-                                }
-                                stamp_concurrency_wait_started(&mut job);
-                                inner.concurrency_blocked.push_back(job);
-                            }
-                            JobGateOutcome::Failed(status) => {
-                                if let Some(run) = inner.runs.get_mut(&run_id) {
-                                    run.jobs.insert(job.job_id.clone(), status);
-                                    run.status = summarize_run(run.jobs.values().copied());
-                                    finalize_run_if_complete(run);
-                                }
-                            }
-                        }
-                    } else {
+                // Fork-PR workflow policy: a run awaiting fork approval must
+                // not dispatch when its concurrency turn arrives. Route its
+                // jobs back to pending_jobs, where the fork gate in
+                // promote_ready_jobs holds them until the operator approves.
+                // A terminal run's jobs are dropped outright: resurrecting
+                // them would re-dispatch a concluded run.
+                let fork_held = inner
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| run.fork_approval_pending);
+                let terminal = inner
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| run.status.is_terminal());
+                if terminal {
+                    // Drop the jobs: the run already concluded.
+                } else if fork_held {
+                    for job in jobs {
                         if let Some(run) = inner.runs.get_mut(&run_id) {
-                            // keep Queued status in pending_jobs path
-                            run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                            run.jobs
+                                .insert(job.job_id.clone(), ExecutionStatus::Pending);
                         }
+                        // The run keeps its concurrency slot: it won its
+                        // turn, it just may not start jobs until approved.
                         inner.pending_jobs.push_back(job);
                     }
-                }
-                if let Some(run) = inner.runs.get_mut(&run_id) {
-                    if run.status == ExecutionStatus::Pending {
-                        run.status = ExecutionStatus::Queued;
+                } else {
+                    for mut job in jobs {
+                        if let Some(run) = inner.runs.get_mut(&run_id) {
+                            run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                        }
+                        // Re-check needs/max_parallel before queueing.
+                        let needs_ok = inner.runs.get(&run_id).is_some_and(|run| {
+                            job.needs
+                                .iter()
+                                .all(|n| scheduling::need_satisfied(&run.jobs, n))
+                        });
+                        if needs_ok && under_max_parallel(inner, &job) {
+                            // MC-S3: jobs held behind a workflow-level gate were
+                            // parked before the per-job gate evaluation ran at
+                            // submit, so their job-level gates were never checked.
+                            // Evaluate and acquire now; park in
+                            // `concurrency_blocked` when busy.
+                            let gate = inner
+                                .runs
+                                .get(&run_id)
+                                .map(|run| (run.github.clone(), run.submission.clone()));
+                            let gate_outcome = if let Some((github, submission)) = gate {
+                                try_acquire_job_gate(inner, &github, &submission, &job)
+                            } else {
+                                JobGateOutcome::Proceed
+                            };
+                            match gate_outcome {
+                                JobGateOutcome::Proceed => {
+                                    stamp_concurrency_acquired(&mut job);
+                                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                                        hydrate_needs_context(&mut job, run);
+                                    }
+                                    stamp_ready_enqueue(&mut job);
+                                    on_job_enqueued(inner, &job);
+                                    inner.queue.push_back(job);
+                                }
+                                JobGateOutcome::Parked => {
+                                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                                        run.jobs
+                                            .insert(job.job_id.clone(), ExecutionStatus::Pending);
+                                    }
+                                    stamp_concurrency_wait_started(&mut job);
+                                    inner.concurrency_blocked.push_back(job);
+                                }
+                                JobGateOutcome::Failed(status) => {
+                                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                                        run.jobs.insert(job.job_id.clone(), status);
+                                        run.status = summarize_run(run.jobs.values().copied());
+                                        finalize_run_if_complete(run);
+                                    }
+                                }
+                            }
+                        } else {
+                            if let Some(run) = inner.runs.get_mut(&run_id) {
+                                // keep Queued status in pending_jobs path
+                                run.jobs.insert(job.job_id.clone(), ExecutionStatus::Queued);
+                            }
+                            inner.pending_jobs.push_back(job);
+                        }
                     }
-                }
+                    if let Some(run) = inner.runs.get_mut(&run_id) {
+                        if run.status == ExecutionStatus::Pending {
+                            run.status = ExecutionStatus::Queued;
+                        }
+                    }
+                } // end else: normal dispatch path
             }
         }
         concurrency::Holder::Job { run_id, job_id } => {
@@ -1126,6 +1154,20 @@ pub fn promote_ready_jobs(
         let mut settled = false;
 
         while let Some(mut job) = inner.pending_jobs.pop_front() {
+            // Fork-PR workflow policy: a run awaiting fork approval holds
+            // every job here until the operator approves the run
+            // (`POST /api/v1/runs/:run_id/approve-fork`). The job keeps its
+            // `Pending` status and is re-considered on the next sweep.
+            // Approval-window expiry is handled by the reaper sweep, which
+            // fails the run closed after 24 hours.
+            if inner
+                .runs
+                .get(&job.run_id)
+                .is_some_and(|run| run.fork_approval_pending)
+            {
+                remaining.push_back(job);
+                continue;
+            }
             let decision = inner
                 .runs
                 .get(&job.run_id)
@@ -3703,6 +3745,10 @@ mod assignment_tests {
                 conclusion: None,
                 push_state: None,
                 snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
                 status: ExecutionStatus::Queued,
             },
         );

@@ -207,6 +207,46 @@ build, checksum, publishing, and runtime configuration flow, see
 Keep repository-specific software in workflow setup actions, install steps,
 or a job `container:`.
 
+### GitHub admin controls
+
+On GitHub, an organization's admins set workflow policy from the Actions
+settings page: which events may trigger workflows, what the `GITHUB_TOKEN` may
+do, which environments need approvals, and how fork pull-request workflows are
+treated. On a self-hosted Preloop server there is no settings page and no
+organization layer — the operator **is** the admin, and these policies live in
+the server config file (`PRELOOP_CONFIG`, default `$PRELOOP_HOME/config.toml`).
+They are deliberately server-side, never repository-controlled: anyone who can
+merge a workflow change could otherwise relax the policy the change is subject
+to.
+
+```toml
+[fork_policy]
+# Fork pull-request workflows are the classic untrusted-code vector: the
+# workflow file comes from the fork, so it runs before any merge review.
+run_fork_workflows = true   # false = drop fork-PR events before any workflow is fetched or matched
+require_approval = false    # true = run is created but all jobs hold until the operator approves it
+```
+
+- `run_fork_workflows` defaults to `true` (existing behavior); setting it to
+  `false` is a kill switch. Dropped events are logged and never create runs.
+- `require_approval` defaults to `false`. When `true`, a fork-PR run is created
+  and queued normally, but every job holds in `Pending` until the operator
+  releases it with `preloop approve-fork <run-id> [--note ...]` or
+  `POST /api/v1/runs/:run_id/approve-fork` (system bearer). A run not approved
+  within 24 hours fails closed. Timers hold jobs visibly in `Pending` and stay
+  cancellable.
+- Only the fork pull-request trust tier (`pull_request` from a fork) is
+  affected. `pull_request_target` always runs with base-repository trust and
+  is never treated as a fork-PR workflow by this policy, regardless of the
+  event that triggered it.
+- Secrets and write tokens for fork-PR workflows stay hardcoded off by the
+  trust tier — there is no knob for them. The policy only decides whether the
+  workflow runs at all, and whether a human says go first.
+- Preloop has no user identities: an approval means whoever holds the system
+  token approved. For a single operator this is a deliberate confirmation step,
+  not a second person — it stops fork code from executing without an explicit
+  go-ahead.
+
 ---
 ## 5. Exposure options
 

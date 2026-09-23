@@ -104,6 +104,15 @@ enum Command {
     Rerun {
         run_id: RunId,
     },
+    /// Approve a run held by the fork-PR workflow policy
+    /// (`[fork_policy] require_approval = true`).
+    ApproveFork {
+        /// Run id.
+        run_id: RunId,
+        /// Optional note recorded with the approval.
+        #[arg(long)]
+        note: Option<String>,
+    },
     Events {
         /// Run id.
         run_id: RunId,
@@ -258,6 +267,21 @@ async fn main() -> anyhow::Result<()> {
                     .bearer_auth(native_api_token)
                     .send()
                     .await?,
+            )
+            .await?;
+        }
+        Command::ApproveFork { run_id, note } => {
+            let native_api_token = resolve_native_api_token(&cli.server)?;
+            let body = serde_json::json!({ "note": note });
+            print_response(
+                http.post(
+                    cli.server
+                        .join(&format!("/api/v1/runs/{run_id}/approve-fork"))?,
+                )
+                .bearer_auth(native_api_token)
+                .json(&body)
+                .send()
+                .await?,
             )
             .await?;
         }

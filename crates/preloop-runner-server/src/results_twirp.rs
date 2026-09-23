@@ -1471,6 +1471,10 @@ mod cache_pb_tests {
                 conclusion: None,
                 push_state: None,
                 snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
             },
         );
     }
@@ -1568,6 +1572,10 @@ mod cache_pb_tests {
                 conclusion: None,
                 push_state: None,
                 snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
             },
         );
     }
