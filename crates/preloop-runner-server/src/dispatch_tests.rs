@@ -110,6 +110,8 @@ fn git_ok(ws: &std::path::Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(ws)
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .args(args)
         .output()
         .unwrap();
@@ -184,9 +186,8 @@ async fn get_json(app: &Router, uri: &str, bearer: Option<&str>) -> (StatusCode,
 
 /// The runs currently recorded, newest last.
 async fn recorded_runs(state: &AppState) -> Vec<(String, crate::models::RunRecord)> {
-    let inner = state.inner.lock().await;
-    inner
-        .runs
+    let tx = state.test_tx().await;
+    tx.runs
         .iter()
         .map(|(id, run)| (id.to_string(), run.clone()))
         .collect()

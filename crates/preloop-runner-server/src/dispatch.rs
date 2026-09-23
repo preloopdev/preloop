@@ -279,23 +279,44 @@ pub async fn list_actions_runs(
 ) -> Result<Json<Value>, ApiError> {
     authorize_read(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
-    let inner = shared.state.inner.lock().await;
-    let mut runs: Vec<&crate::models::RunRecord> = inner
-        .runs
-        .values()
-        .filter(|run| run.submission.repository.eq_ignore_ascii_case(&repository))
-        .collect();
+    let mut runs: Vec<crate::models::RunRecord> = shared
+        .state
+        .backend
+        .read(move |tx| {
+            Ok(tx
+                .runs
+                .values()
+                .filter(|run| run.submission.repository.eq_ignore_ascii_case(&repository))
+                .cloned()
+                .collect())
+        })
+        .await
+        .map_err(ApiError::from)?;
     // github.com lists the newest runs first.
     runs.sort_by_key(|right| std::cmp::Reverse(right.created_at));
     let workflow_runs: Vec<Value> = runs
         .iter()
         .map(|run| {
+            // The stored status collapses `Queued`/`Pending`/`InProgress` into
+            // `InProgress`; recover the wire status the same way `project_run`
+            // does — a held run is `pending`, a runnable run with no started
+            // job is `queued`.
+            let effective = if run.status == preloop_gha_protocol::ExecutionStatus::InProgress
+                && !run
+                    .jobs
+                    .values()
+                    .any(|s| matches!(s, preloop_gha_protocol::ExecutionStatus::InProgress))
+            {
+                preloop_gha_protocol::ExecutionStatus::Queued
+            } else {
+                run.status
+            };
             json!({
                 "id": stable_id(&run.run_id.to_string()),
                 "run_id": run.run_id.to_string(),
                 "name": run.run_name,
                 "event": run.event,
-                "status": github_run_status(run.status),
+                "status": github_run_status(effective),
                 "conclusion": run.conclusion,
                 "head_sha": run.head_sha,
                 "created_at": run.created_at.to_rfc3339(),
@@ -540,25 +561,17 @@ async fn submit_and_report(
 ) -> Result<RunAccepted, ApiError> {
     let accepted = crate::submit_run_inner(shared, submission).await?;
     let run_id = accepted.run_id;
-    let jobs = {
-        let mut inner = shared.state.inner.lock().await;
-        // Stamped before filtering: an all-expandable run reports nothing at
-        // intake yet still needs the flag for its materialized legs.
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.reports_check_runs = true;
-        }
-        inner.runs.get(&run_id).map(|run| {
-            // Expandable nodes (deferred matrices, reusable callers) mint no
-            // check at intake — their materialized legs get their own.
-            run.jobs
-                .keys()
-                .filter(|job_id| {
-                    !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+    let jobs = shared
+        .state
+        .backend
+        .read(move |tx| {
+            Ok(tx
+                .runs
+                .get(&run_id)
+                .map(|run| run.jobs.keys().cloned().collect::<Vec<_>>()))
         })
-    };
+        .await
+        .map_err(ApiError::from)?;
     if let Some(jobs) = jobs {
         for job_id in jobs {
             if let Err(error) =
@@ -567,13 +580,18 @@ async fn submit_and_report(
             {
                 warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-            let status = {
-                let inner = shared.state.inner.lock().await;
-                inner
-                    .runs
-                    .get(&run_id)
-                    .and_then(|run| run.jobs.get(&job_id).copied())
-            };
+            let jid = job_id.clone();
+            let status = shared
+                .state
+                .backend
+                .read(move |tx| {
+                    Ok(tx
+                        .runs
+                        .get(&run_id)
+                        .and_then(|run| run.jobs.get(&jid).copied()))
+                })
+                .await
+                .map_err(ApiError::from)?;
             if let Some(status) = status.filter(|status| status.is_terminal()) {
                 crate::github::report_check_run_completed(shared, run_id, &job_id, status).await;
             }
