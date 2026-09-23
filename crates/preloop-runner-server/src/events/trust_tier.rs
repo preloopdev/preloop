@@ -169,23 +169,38 @@ pub async fn fork_restricted_from_token(
         | Err(crate::auth::ResultsIdentityError::MalformedJobSubject) => return Some(true),
     };
     let job = identity.job_id;
-    let inner = state.inner.lock().await;
-    // Every hop of the correlation must survive. When the job is retired or
-    // purged mid-flight the worker still holds a valid JWT, and the missing
-    // record must widen the denial, not the access.
-    let Some(request_id) = inner.agent_job_requests.get(&job).copied() else {
-        return Some(true);
-    };
-    let Some(record) = inner.job_requests.get(&request_id) else {
-        return Some(true);
-    };
-    let Some(run) = inner.runs.get(&record.run_id) else {
-        return Some(true);
-    };
-    // A submission without a tier field is a native (trusted) submission and
-    // stays allowed; `tier_of`'s parse-failure-is-trusted convention matches
-    // the secret policy.
-    Some(tier_of(&run.submission).is_some_and(|tier| tier.is_fork_restricted()))
+    // Backend: agent_job → request → run → submission tier. `job_requests`
+    // and `runs` are TxState; scope to the run-scoped families only (the
+    // request maps derive from `job_requests`, so `runs: None` loads them).
+    state
+        .backend
+        .read_scoped(
+            &crate::control::txstate::TxScope::request_correlation(),
+            move |tx| {
+                // Every hop of the correlation must survive. When the job is
+                // retired or purged mid-flight the worker still holds a valid
+                // JWT, and the missing record must widen the denial, not the
+                // access.
+                let Some(request_id) = tx.agent_job_requests.get(&job).copied() else {
+                    return Ok(Some(true));
+                };
+                let Some(record) = tx.job_requests.get(&request_id) else {
+                    return Ok(Some(true));
+                };
+                let Some(run) = tx.runs.get(&record.run_id) else {
+                    return Ok(Some(true));
+                };
+                // A submission without a tier field is a native (trusted)
+                // submission and stays allowed; `tier_of`'s
+                // parse-failure-is-trusted convention matches the secret
+                // policy.
+                Ok(Some(
+                    tier_of(&run.submission).is_some_and(|tier| tier.is_fork_restricted()),
+                ))
+            },
+        )
+        .await
+        .unwrap_or(Some(true))
 }
 
 /// Reject a cache write when the calling job is a fork-restricted run.

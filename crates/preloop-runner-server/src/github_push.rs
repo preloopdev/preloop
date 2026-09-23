@@ -95,25 +95,36 @@ pub async fn already_published(
     sha: &str,
     workflow_path: &str,
 ) -> Option<RunId> {
-    let inner = shared.state.inner.lock().await;
-    inner
-        .runs
-        .values()
-        .find(|run| {
-            run.push_state.is_some()
-                // `conclusion` is what the push path itself treats as
-                // terminal, so the two must agree or a published run would
-                // still be re-run by its own echo.
-                && run.conclusion.is_some()
-                && run.submission.repository == repository
-                && (run.submission.sha == sha
-                    || run.push_state
-                        .as_ref()
-                        .and_then(|state| state.effective_sha.as_deref())
-                        == Some(sha))
-                && run.submission.workflow_path.as_deref() == Some(workflow_path)
+    let repository = repository.to_owned();
+    let sha = sha.to_owned();
+    let workflow_path = workflow_path.to_owned();
+    shared
+        .state
+        .backend
+        .read(move |tx| {
+            Ok(tx
+                .runs
+                .values()
+                .find(|run| {
+                    run.push_state.is_some()
+                        // `conclusion` is what the push path itself treats as
+                        // terminal, so the two must agree or a published run
+                        // would still be re-run by its own echo.
+                        && run.conclusion.is_some()
+                        && run.submission.repository == repository
+                        && (run.submission.sha == sha
+                            || run
+                                .push_state
+                                .as_ref()
+                                .and_then(|state| state.effective_sha.as_deref())
+                                == Some(sha.as_str()))
+                        && run.submission.workflow_path.as_deref()
+                            == Some(workflow_path.as_str())
+                })
+                .map(|run| run.run_id))
         })
-        .map(|run| run.run_id)
+        .await
+        .unwrap_or(None)
 }
 
 pub async fn push_run_to_github(
@@ -123,28 +134,30 @@ pub async fn push_run_to_github(
 ) -> Result<SyncResponse, ApiError> {
     // Snapshot everything the sync needs under one lock, then work outside
     // it: the GitHub calls are slow and must not hold the state mutex.
+    let run = shared
+        .state
+        .backend
+        .read(move |tx| Ok(tx.runs.get(&run_id).cloned()))
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
     let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs, dirty) = {
-        let inner = shared.state.inner.lock().await;
-        let run = inner
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-
-        if let Some(state) = &run.push_state
-            && state.status == PushStatus::Synced
-        {
-            // Already published; replay is a no-op.
-            return Ok(SyncResponse {
-                status: "pushed",
-                pr_number: state.pr_number,
-                pr_url: state.pr_number.map(|number| {
-                    pr_web_url(
-                        &crate::github::github_api_base(),
-                        &run.submission.repository,
-                        number,
-                    )
-                }),
-            });
+        let run = &run;
+        if let Some(state) = &run.push_state {
+            if state.status == PushStatus::Synced {
+                // Already published; replay is a no-op.
+                return Ok(SyncResponse {
+                    status: "pushed",
+                    pr_number: state.pr_number,
+                    pr_url: state.pr_number.map(|number| {
+                        pr_web_url(
+                            &crate::github::github_api_base(),
+                            &run.submission.repository,
+                            number,
+                        )
+                    }),
+                });
+            }
         }
 
         let Some(push) = &run.submission.push else {
@@ -199,15 +212,21 @@ pub async fn push_run_to_github(
     };
 
     async fn mark_blocked(shared: &Arc<SharedState>, run_id: RunId, error: String) {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.push_state = Some(PushState {
-                status: PushStatus::Blocked,
-                error: Some(error),
-                pr_number: None,
-                effective_sha: None,
-            });
-        }
+        let _ = shared
+            .state
+            .backend
+            .transact(move |tx| {
+                if let Some(run) = tx.runs.get_mut(&run_id) {
+                    run.push_state = Some(PushState {
+                        status: PushStatus::Blocked,
+                        error: Some(error),
+                        pr_number: None,
+                        effective_sha: None,
+                    });
+                }
+                Ok(())
+            })
+            .await;
     }
 
     let (owner, _) = repository
@@ -291,13 +310,18 @@ pub async fn push_run_to_github(
 
     // 2. Default base branch for PR creation: explicit base_ref wins,
     //    otherwise the repository's default branch.
-    let base = match &{
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .and_then(|run| run.submission.base_ref.clone())
-    } {
+    let base = match &shared
+        .state
+        .backend
+        .read(move |tx| {
+            Ok(tx
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.submission.base_ref.clone()))
+        })
+        .await
+        .map_err(ApiError::from)?
+    {
         Some(base) => base
             .strip_prefix("refs/heads/")
             .map(str::to_owned)
@@ -400,21 +424,18 @@ pub async fn push_run_to_github(
     //    loop may have been skipped or failed). Jobs with an existing check
     //    run were already updated through the normal lifecycle.
     for job_id in jobs.keys() {
-        // Expandable placeholders mint no check; materialized legs do.
-        let expandable = {
-            let inner = shared.state.inner.lock().await;
-            crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-        };
-        if expandable {
-            continue;
-        }
-        let has_check_run = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .is_some_and(|run| run.job_check_run_ids.contains_key(job_id))
-        };
+        let jid = job_id.clone();
+        let has_check_run = shared
+            .state
+            .backend
+            .read(move |tx| {
+                Ok(tx
+                    .runs
+                    .get(&run_id)
+                    .is_some_and(|run| run.job_check_run_ids.contains_key(&jid)))
+            })
+            .await
+            .unwrap_or(false);
         if !has_check_run {
             if let Err(error) = crate::github::report_check_run_queued(
                 shared,
@@ -434,18 +455,24 @@ pub async fn push_run_to_github(
         }
     }
 
-    let mut inner = shared.state.inner.lock().await;
-    if let Some(run) = inner.runs.get_mut(&run_id) {
-        run.push_state = Some(PushState {
-            status: PushStatus::Synced,
-            error: None,
-            pr_number,
-            // The commit the push webhook echo will carry; `already_published`
-            // matches it so a dirty-tree push does not re-run CI.
-            effective_sha: Some(effective_sha),
-        });
-    }
-    drop(inner);
+    let _ = shared
+        .state
+        .backend
+        .transact(move |tx| {
+            if let Some(run) = tx.runs.get_mut(&run_id) {
+                run.push_state = Some(PushState {
+                    status: PushStatus::Synced,
+                    error: None,
+                    pr_number,
+                    // The commit the push webhook echo will carry;
+                    // `already_published` matches it so a dirty-tree push
+                    // does not re-run CI.
+                    effective_sha: Some(effective_sha),
+                });
+            }
+            Ok(())
+        })
+        .await;
 
     Ok(SyncResponse {
         status: "pushed",

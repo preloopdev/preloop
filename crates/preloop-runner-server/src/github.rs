@@ -261,23 +261,17 @@ pub async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) -> anyhow::Result<Option<u64>> {
-    let (existing_check_run_id, mint_lock) = {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.reports_check_runs = true;
-        }
-        (
-            inner
+    let existing_check_run_id = shared
+        .state
+        .backend
+        .read(move |tx| {
+            Ok(tx
                 .runs
                 .get(&run_id)
-                .and_then(|run| run.job_check_run_ids.get(job_id).copied()),
-            inner
-                .check_run_mint_locks
-                .entry(run_id)
-                .or_default()
-                .clone(),
-        )
-    };
+                .and_then(|run| run.job_check_run_ids.get(job_id).copied()))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let token = resolve_check_run_token(shared, repo).await;
 
     if let Some(check_run_id) = existing_check_run_id {
@@ -292,12 +286,20 @@ pub async fn report_check_run_queued(
                     %error,
                     "persisted GitHub check run is stale; reconciling it"
                 );
-                let mut inner = shared.state.inner.lock().await;
-                if let Some(run) = inner.runs.get_mut(&run_id)
-                    && run.job_check_run_ids.get(job_id) == Some(&check_run_id)
-                {
-                    run.job_check_run_ids.remove(job_id);
-                }
+                let jid = job_id.clone();
+                shared
+                    .state
+                    .backend
+                    .transact(move |tx| {
+                        if let Some(run) = tx.runs.get_mut(&run_id) {
+                            if run.job_check_run_ids.get(&jid) == Some(&check_run_id) {
+                                run.job_check_run_ids.remove(&jid);
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             }
         }
     }
@@ -396,15 +398,19 @@ async fn mint_check_run(
     let check_run_id = if let Some(token) = token {
         let details_url = run_details_url(run_id);
 
-        let job_name = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.job_names.get(job_id))
-                .cloned()
-                .unwrap_or_else(|| job_id.0.clone())
-        };
+        let job_name = shared
+            .state
+            .backend
+            .read(move |tx| {
+                Ok(tx
+                    .runs
+                    .get(&run_id)
+                    .and_then(|run| run.job_names.get(job_id))
+                    .cloned()
+                    .unwrap_or_else(|| job_id.0.clone()))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let mut body = serde_json::json!({
             "name": job_name,
             "head_sha": sha,
@@ -462,14 +468,19 @@ async fn mint_check_run(
         rand::random::<u32>() as u64
     };
 
-    let mapping_changed = {
-        let mut inner = shared.state.inner.lock().await;
-        inner.runs.get_mut(&run_id).map(|run| {
-            run.job_check_run_ids
-                .insert(job_id.clone(), check_run_id)
-                .is_none_or(|previous| previous != check_run_id)
+    let jid = job_id.clone();
+    let mapping_changed = shared
+        .state
+        .backend
+        .transact(move |tx| {
+            Ok(tx.runs.get_mut(&run_id).map(|run| {
+                run.job_check_run_ids
+                    .insert(jid.clone(), check_run_id)
+                    .is_none_or(|previous| previous != check_run_id)
+            }))
         })
-    };
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     if mapping_changed == Some(true) {
         // The mapping is meaningful while the run lives, and the next status
         // event may be hours away. Persist it before returning to the caller.
@@ -620,29 +631,26 @@ pub async fn report_check_runs_for_run(
     reused_check_run: Option<(JobId, u64)>,
 ) {
     let (repository, sha, jobs) = {
-        let mut inner = shared.state.inner.lock().await;
-        // The rerun reports checks even when every job is an expandable
-        // placeholder — those mint nothing here, but their materialized legs
-        // report later and need the flag.
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.reports_check_runs = true;
-        } else {
-            return;
+        let outcome = shared
+            .state
+            .backend
+            .read(move |tx| {
+                Ok(tx.runs.get(&run_id).map(|run| {
+                    (
+                        run.submission.repository.clone(),
+                        run.submission.sha.clone(),
+                        run.jobs.keys().cloned().collect::<Vec<_>>(),
+                    )
+                }))
+            })
+            .await
+            .map_err(crate::ApiError::from)
+            .ok()
+            .flatten();
+        match outcome {
+            Some(outcome) => outcome,
+            None => return,
         }
-        let run = inner.runs.get(&run_id).unwrap();
-        (
-            run.submission.repository.clone(),
-            run.submission.sha.clone(),
-            // Expandable nodes are placeholders: no check run. Materialized
-            // legs mint their own when the rerun re-expands them.
-            run.jobs
-                .keys()
-                .filter(|job_id| {
-                    !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
     };
 
     for job_id in jobs {
@@ -671,11 +679,19 @@ pub async fn report_check_runs_for_run(
         }
 
         let status = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.jobs.get(&job_id).copied())
+            let jid = job_id.clone();
+            shared
+                .state
+                .backend
+                .read(move |tx| {
+                    Ok(tx
+                        .runs
+                        .get(&run_id)
+                        .and_then(|run| run.jobs.get(&jid).copied()))
+                })
+                .await
+                .ok()
+                .flatten()
         };
         if let Some(status) = status.filter(|status| status.is_terminal()) {
             report_check_run_completed(shared, run_id, &job_id, status).await;
@@ -689,25 +705,34 @@ pub async fn report_check_run_in_progress(
     run_id: RunId,
     job_id: &JobId,
 ) {
-    let (repo, job_name) = {
-        let inner = shared.state.inner.lock().await;
-        let run = match inner.runs.get(&run_id) {
-            Some(r) => r,
+    let (repo, check_run_id, job_name) = {
+        let outcome = shared
+            .state
+            .backend
+            .read(move |tx| {
+                Ok(tx.runs.get(&run_id).and_then(|run| {
+                    run.job_check_run_ids
+                        .get(job_id)
+                        .copied()
+                        .map(|check_run_id| {
+                            (
+                                run.submission.repository.clone(),
+                                check_run_id,
+                                run.job_names
+                                    .get(job_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| job_id.0.clone()),
+                            )
+                        })
+                }))
+            })
+            .await
+            .ok()
+            .flatten();
+        match outcome {
+            Some(outcome) => outcome,
             None => return,
-        };
-        let repo = run.submission.repository.clone();
-        let job_name = run
-            .job_names
-            .get(job_id)
-            .cloned()
-            .unwrap_or_else(|| job_id.0.clone());
-        (repo, job_name)
-    };
-
-    // Jobs materialized after intake (runtime matrix fan-out, reusable callee
-    // jobs) have no check run yet; mint one instead of dropping the report.
-    let Some(check_run_id) = ensure_check_run_mapped(shared, run_id, job_id).await else {
-        return;
+        }
     };
 
     let token = resolve_check_run_token(shared, &repo).await;
@@ -815,37 +840,68 @@ pub async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    let (repo, job_name, steps, started_at, completed_at, annotations, global_issues) = {
-        let inner = shared.state.inner.lock().await;
-        let run = match inner.runs.get(&run_id) {
-            Some(run) => run,
+    // Backend: run + projected job detail. Node-local: `timeline_events` for
+    // annotations. Read each under its own owner.
+    let (repo, check_run_id, job_name, steps, started_at, completed_at, detail) = {
+        let scope = crate::control::txstate::TxScope::run(run_id);
+        let outcome = shared
+            .state
+            .backend
+            .read_scoped(&scope, move |tx| {
+                let build = |tx: &crate::control::txstate::TxState| {
+                    let run = tx.runs.get(&run_id)?;
+                    let repo = run.submission.repository.clone();
+                    let check_run_id = run.job_check_run_ids.get(job_id).copied()?;
+                    let projected = crate::runs::project_run(tx, run.clone());
+                    let detail = projected
+                        .jobs_list
+                        .iter()
+                        .find(|detail| detail.job_id == job_id.0)
+                        .cloned();
+                    let job_name = detail
+                        .as_ref()
+                        .map(|detail| detail.name.clone())
+                        .or_else(|| run.job_names.get(job_id).cloned())
+                        .unwrap_or_else(|| job_id.0.clone());
+                    let steps = detail
+                        .as_ref()
+                        .map(|detail| detail.steps.clone())
+                        .unwrap_or_default();
+                    let started_at = steps
+                        .iter()
+                        .filter_map(|step| step.started_at)
+                        .min()
+                        .or(run.started_at);
+                    let completed_at = steps
+                        .iter()
+                        .filter_map(|step| step.finished_at)
+                        .max()
+                        .or(run.completed_at)
+                        .unwrap_or_else(chrono::Utc::now);
+                    Some((
+                        repo,
+                        check_run_id,
+                        job_name,
+                        steps,
+                        started_at,
+                        completed_at,
+                        detail,
+                    ))
+                };
+                Ok(build(tx))
+            })
+            .await
+            .map_err(crate::ApiError::from)
+            .ok()
+            .flatten();
+        match outcome {
+            Some(outcome) => outcome,
             None => return,
-        };
-        let repo = run.submission.repository.clone();
-        let projected = crate::runs::project_run(&inner, run.clone());
-        let detail = projected
-            .jobs_list
-            .iter()
-            .find(|detail| detail.job_id == job_id.0);
-        let job_name = detail
-            .map(|detail| detail.name.clone())
-            .or_else(|| run.job_names.get(job_id).cloned())
-            .unwrap_or_else(|| job_id.0.clone());
-        let steps = detail
-            .map(|detail| detail.steps.clone())
-            .unwrap_or_default();
-        let started_at = steps
-            .iter()
-            .filter_map(|step| step.started_at)
-            .min()
-            .or(run.started_at);
-        let completed_at = steps
-            .iter()
-            .filter_map(|step| step.finished_at)
-            .max()
-            .or(run.completed_at)
-            .unwrap_or_else(chrono::Utc::now);
+        }
+    };
 
+    let (annotations, global_issues) = {
+        let inner = shared.state.inner.lock().await;
         let mut annotations = Vec::new();
         let mut global_issues = Vec::new();
         if let Some(events) = inner.timeline_events.get(&run_id) {
@@ -884,7 +940,7 @@ pub async fn report_check_run_completed(
                 }
             }
         }
-        if let Some(detail) = detail {
+        if let Some(detail) = &detail {
             for annotation in &detail.annotations {
                 let message = annotation
                     .get("message")
@@ -894,15 +950,7 @@ pub async fn report_check_run_completed(
                 global_issues.push(format!("- {}", markdown_cell(&message)));
             }
         }
-        (
-            repo,
-            job_name,
-            steps,
-            started_at,
-            completed_at,
-            annotations,
-            global_issues,
-        )
+        (annotations, global_issues)
     };
 
     // Jobs materialized after intake (runtime matrix fan-out, reusable callee
@@ -1653,44 +1701,45 @@ async fn process_check_run_rerequest(
         });
 
     let target = {
-        let inner = shared.state.inner.lock().await;
-        let mut candidates = Vec::new();
-        if let Some(run_id) = details_run_id {
-            candidates.push(run_id);
-        }
-        candidates.extend(
-            inner
-                .runs
-                .keys()
-                .filter(|run_id| Some(**run_id) != details_run_id),
-        );
+        let repository = repository.to_owned();
+        shared
+            .state
+            .backend
+            .read(move |tx| {
+                let mut candidates = Vec::new();
+                if let Some(run_id) = details_run_id {
+                    candidates.push(run_id);
+                }
+                candidates.extend(
+                    tx.runs
+                        .keys()
+                        .filter(|run_id| Some(**run_id) != details_run_id)
+                        .copied(),
+                );
 
-        candidates.into_iter().find_map(|run_id| {
-            let run = inner.runs.get(&run_id)?;
-            if run.submission.repository != repository
-                || head_sha.is_some_and(|sha| run.head_sha != sha)
-                || !run.status.is_terminal()
-            {
-                return None;
-            }
+                Ok(candidates.into_iter().find_map(|run_id| {
+                    let run = tx.runs.get(&run_id)?;
+                    if run.submission.repository != repository
+                        || head_sha.is_some_and(|sha| run.head_sha != sha)
+                        || !run.status.is_terminal()
+                    {
+                        return None;
+                    }
 
-            let job_id = run
-                .job_check_run_ids
-                .iter()
-                .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))
-                .or_else(|| {
-                    job_name
-                        .map(|name| JobId(name.to_owned()))
-                        .filter(|job_id| run.jobs.contains_key(job_id))
-                })?;
-            Some((
-                run_id,
-                job_id,
-                run.submission.event.clone(),
-                run.submission.actor.clone(),
-                run.submission.workflow_file.clone(),
-            ))
-        })
+                    let job_id = run
+                        .job_check_run_ids
+                        .iter()
+                        .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))
+                        .or_else(|| {
+                            job_name
+                                .map(|name| JobId(name.to_owned()))
+                                .filter(|job_id| run.jobs.contains_key(job_id))
+                        })?;
+                    Some((run_id, job_id))
+                }))
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
 
     let Some((run_id, job_id, event, actor, workflow_file)) = target else {
@@ -2854,32 +2903,18 @@ async fn process_delivery_payload_with_lease(
                         .status_check_sha
                         .clone()
                         .unwrap_or_else(|| resolved_sha.clone());
-                    // Expandable nodes (deferred matrices, reusable callers)
-                    // are placeholders: GitHub never shows a check for them,
-                    // and materialized jobs mint their own when they enter
-                    // the run. Skipping them here also keeps a dissolved
-                    // placeholder from stranding a `queued` check.
-                    let jobs = {
-                        let mut inner = shared.state.inner.lock().await;
-                        // Stamped even when every job is expandable — the
-                        // filtered list may be empty, so nothing downstream
-                        // ever calls report_check_run_queued, but legs still
-                        // materialize later and must report.
-                        if let Some(run) = inner.runs.get_mut(&run_id) {
-                            run.reports_check_runs = true;
-                        }
-                        inner.runs.get(&run_id).map(|r| {
-                            r.jobs
-                                .keys()
-                                .filter(|job_id| {
-                                    !crate::runtime_scheduling::is_expandable_node(
-                                        &inner, run_id, job_id,
-                                    )
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>()
+                    let jobs = shared
+                        .state
+                        .backend
+                        .read(move |tx| {
+                            Ok(tx
+                                .runs
+                                .get(&run_id)
+                                .map(|r| r.jobs.keys().cloned().collect::<Vec<_>>()))
                         })
-                    };
+                        .await
+                        .ok()
+                        .flatten();
                     if let Some(jobs) = jobs {
                         for job_id in jobs {
                             tokio::select! {
@@ -2897,15 +2932,23 @@ async fn process_delivery_payload_with_lease(
                                         ));
                                     }
                                 }
-                            }
+                            };
                             let status = tokio::select! {
                                 _ = lease_lost.cancelled() => return WebhookOutcome::Success,
                                 status = async {
-                                    let inner = shared.state.inner.lock().await;
-                                    inner
-                                        .runs
-                                        .get(&run_id)
-                                        .and_then(|r| r.jobs.get(&job_id).copied())
+                                    let jid = job_id.clone();
+                                    shared
+                                        .state
+                                        .backend
+                                        .read(move |tx| {
+                                            Ok(tx
+                                                .runs
+                                                .get(&run_id)
+                                                .and_then(|r| r.jobs.get(&jid).copied()))
+                                        })
+                                        .await
+                                        .ok()
+                                        .flatten()
                                 } => status,
                             };
                             if let Some(status) = status.filter(|s| s.is_terminal()) {
@@ -3170,6 +3213,11 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(workspace)
+            // Test fixtures must not depend on the developer's signing
+            // setup — a broken or locked signing agent (e.g. 1Password)
+            // would otherwise fail every commit fixture.
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .output()
             .unwrap();
@@ -3436,7 +3484,7 @@ mod tests {
             );
             assert_eq!(record.attempts, 1);
             assert!(record.last_error.is_some());
-            let inner = fixture.state.inner.lock().await;
+            let inner = fixture.state.test_tx().await;
             assert!(
                 inner.runs.is_empty(),
                 "a failed delivery must not create a run"
@@ -3456,7 +3504,7 @@ mod tests {
             .unwrap()
             .expect("delivery row must exist");
         assert_eq!(record.state, WebhookDeliveryStatus::Done);
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -3619,7 +3667,7 @@ mod tests {
         );
         assert_eq!(record.attempts, 1);
         assert!(record.last_error.is_some());
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(
             inner.runs.is_empty(),
             "a failed delivery must not create a run"
@@ -3710,7 +3758,7 @@ mod tests {
                 .is_some_and(|error| error.contains("a-malformed.yml")),
             "permanent delivery error must identify malformed workflow"
         );
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -3869,7 +3917,7 @@ mod tests {
             WebhookDeliveryStatus::Done,
             "a delivery that triggered no workflow is still completed successfully"
         );
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(inner.runs.is_empty());
     }
 
@@ -3908,7 +3956,7 @@ mod tests {
             WebhookDeliveryStatus::Done,
             "skipped github-owned workflow completes delivery"
         );
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(inner.runs.is_empty());
 
         unsafe { std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV) };
@@ -3957,7 +4005,7 @@ mod tests {
         assert_eq!(rec.state, WebhookDeliveryStatus::Received);
 
         fixture.drain().await;
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -3987,7 +4035,7 @@ mod tests {
         let outcome = process_delivery_payload(&shared, &claimed[0]).await;
         assert!(matches!(outcome, WebhookOutcome::Success));
         let (original_run_id, original_check_run_ids) = {
-            let inner = fixture.state.inner.lock().await;
+            let inner = fixture.state.test_tx().await;
             assert_eq!(inner.runs.len(), 1);
             let run = inner.runs.values().next().unwrap();
             assert_eq!(run.webhook_delivery_id.as_deref(), Some("delivery-replay"));
@@ -4013,7 +4061,7 @@ mod tests {
         );
         fixture.drain().await;
 
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,

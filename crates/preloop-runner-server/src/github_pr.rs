@@ -36,42 +36,49 @@ pub async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
 async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow::Result<bool> {
     // Snapshot the fields we need under the lock, then drop it before any
     // network I/O.
-    let (repository, git_ref, payload) = {
-        let inner = shared.state.inner.lock().await;
-        let run = inner
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| anyhow::anyhow!("run {run_id} not found"))?;
-        if run.conclusion.as_deref() != Some("success") {
-            return Ok(false);
-        }
-        if run.event != "push" {
-            return Ok(false);
-        }
-        // Only webhook-delivered runs carry a trust tier (the dispatcher
-        // stamps it). A native `/api/v1/runs` caller setting `event = "push"`
-        // is a local submission, not a GitHub push, and must not trigger
-        // auto-PR.
-        if crate::events::trust_tier::tier_of(&run.submission).is_none() {
-            return Ok(false);
-        }
-        // Push-back runs are client-managed: `github_push.rs` owns their PR.
-        if run.submission.push.is_some() {
-            return Ok(false);
-        }
-        // A local-only submission (no real `owner/repo` slug) can never have
-        // a PR opened for it.
-        let Some((owner, repo)) = run.submission.repository.split_once('/') else {
-            return Ok(false);
-        };
-        if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-            return Ok(false);
-        }
-        (
-            run.submission.repository.clone(),
-            run.submission.git_ref.clone(),
-            run.submission.payload.clone(),
-        )
+    let snap = shared
+        .state
+        .backend
+        .read(move |tx| {
+            let run = match tx.runs.get(&run_id) {
+                Some(run) => run.clone(),
+                None => return Ok(None),
+            };
+            if run.conclusion.as_deref() != Some("success") {
+                return Ok(None);
+            }
+            if run.event != "push" {
+                return Ok(None);
+            }
+            // Only webhook-delivered runs carry a trust tier (the dispatcher
+            // stamps it). A native `/api/v1/runs` caller setting `event =
+            // "push"` is a local submission, not a GitHub push, and must not
+            // trigger auto-PR.
+            if crate::events::trust_tier::tier_of(&run.submission).is_none() {
+                return Ok(None);
+            }
+            // Push-back runs are client-managed: `github_push.rs` owns their PR.
+            if run.submission.push.is_some() {
+                return Ok(None);
+            }
+            // A local-only submission (no real `owner/repo` slug) can never
+            // have a PR opened for it.
+            let Some((owner, repo)) = run.submission.repository.split_once('/') else {
+                return Ok(None);
+            };
+            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+                return Ok(None);
+            }
+            Ok(Some((
+                run.submission.repository.clone(),
+                run.submission.git_ref.clone(),
+                run.submission.payload.clone(),
+            )))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let Some((repository, git_ref, payload)) = snap else {
+        return Ok(false);
     };
 
     let Some(branch) = git_ref.strip_prefix("refs/heads/") else {
@@ -449,14 +456,15 @@ mod tests {
                 let run_id = crate::RunId(
                     uuid::Uuid::parse_str(accepted["run_id"].as_str().unwrap()).unwrap(),
                 );
-                {
-                    let mut inner = state.inner.lock().await;
-                    let run = inner.runs.get_mut(&run_id).expect("run recorded");
-                    run.conclusion = Some("success".to_owned());
-                    // The webhook dispatcher stamps the trust tier; native
-                    // submissions carry none and are never auto-PR'd.
-                    Arc::make_mut(&mut run.submission).trust_tier = Some("internal".to_owned());
-                }
+                state
+                    .test_tx_mutate(|inner| {
+                        let run = inner.runs.get_mut(&run_id).expect("run recorded");
+                        run.conclusion = Some("success".to_owned());
+                        // The webhook dispatcher stamps the trust tier; native
+                        // submissions carry none and are never auto-PR'd.
+                        Arc::make_mut(&mut run.submission).trust_tier = Some("internal".to_owned());
+                    })
+                    .await;
                 run_id
             }
         };
@@ -550,11 +558,12 @@ mod tests {
                 .unwrap();
         let run_id =
             crate::RunId(uuid::Uuid::parse_str(accepted["run_id"].as_str().unwrap()).unwrap());
-        {
-            let mut inner = state.inner.lock().await;
-            let run = inner.runs.get_mut(&run_id).expect("run recorded");
-            run.conclusion = Some("success".to_owned());
-        }
+        state
+            .test_tx_mutate(|inner| {
+                let run = inner.runs.get_mut(&run_id).expect("run recorded");
+                run.conclusion = Some("success".to_owned());
+            })
+            .await;
         let shared = Arc::new(crate::SharedState {
             state: state.clone(),
             shutdown: CancellationToken::new(),
@@ -587,6 +596,8 @@ mod tests {
         let git = |args: &[&str]| {
             let output = Command::new("git")
                 .current_dir(&ws)
+                .arg("-c")
+                .arg("commit.gpgsign=false")
                 .args(args)
                 .output()
                 .unwrap();
@@ -649,7 +660,7 @@ mod tests {
 
         // The server must have recorded the snapshot's tree — the exact tree
         // CI tested — even though the submission carried no push_tree.
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&run_id).expect("run recorded");
         let push_tree = run
             .submission
