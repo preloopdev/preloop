@@ -602,8 +602,8 @@ impl Store for PgStore {
 
     async fn load_into(
         &self,
+        tx: &mut crate::control::txstate::TxState,
         inner: &mut InnerState,
-        environment_rules: &crate::config::EnvironmentRulesMap,
     ) -> anyhow::Result<()> {
         let client = self.connection.lock().await;
         // Same bound as the SQLite backend: every in-flight run plus the
@@ -628,7 +628,7 @@ impl Store for PgStore {
             let blob: Vec<u8> = row.get(0);
             let run = restore_run_record(&self.cipher, &blob)?;
             let run_id = run.run_id;
-            inner.runs.insert(run_id, run);
+            tx.runs.insert(run_id, run);
         }
 
         let rows = client
@@ -648,15 +648,18 @@ impl Store for PgStore {
             };
             let job: QueuedJob = serde_json::from_slice(&self.cipher.unseal(&job_row.payload)?)?;
             match job_row.queue_kind.as_str() {
-                "ready" => inner.queue.push_back(job),
-                "pending" => inner.pending_jobs.push_back(job),
-                "blocked" => inner.concurrency_blocked.push_back(job),
-                "held" => inner.held_runs.entry(job_row.run_id).or_default().push(job),
+                "ready" => tx.ready_index.push_back(job),
+                "pending" => tx.pending_jobs.push_back(job),
+                "blocked" => tx.concurrency_blocked.push_back(job),
+                "held" => tx.held_runs.entry(job_row.run_id).or_default().push(job),
                 _ => unreachable!("schema constrains queue_kind"),
             }
         }
+        // `ready_index` is the persisted ready queue; `ready_count` mirrors its
+        // length so claim accounting resumes correctly after a restart.
+        tx.ready_count = tx.ready_index.len() as i64;
 
-        let restored_at = std::time::Instant::now();
+        let restored_at = std::time::SystemTime::now();
         let rows = client
             .query(
                 "SELECT runner_id, name, ephemeral, runner_group_id, runner_group_name,
@@ -681,8 +684,8 @@ impl Store for PgStore {
                     .as_ref()
                     .map(|key| (runner.id, key.clone())),
             );
-            inner.runner_registered_at.insert(runner.id, restored_at);
-            inner.runners.insert(runner.id, runner);
+            tx.runner_registered_at.insert(runner.id, restored_at);
+            tx.runners.insert(runner.id, runner);
         }
         // Restore typed RSA public keys so post-restart sessions can be
         // FIPS-encrypted. Without this, every session is created
@@ -698,7 +701,7 @@ impl Store for PgStore {
             let runner_id: i64 = row.get(0);
             let rsa_xml: String = row.get(1);
             if let Ok(parsed) = AgentRsaPublicKey::parse(&rsa_xml) {
-                inner.runner_rsa_public_keys.insert(runner_id, parsed);
+                tx.runner_rsa_public_keys.insert(runner_id, parsed);
             }
         }
         let rows = client
@@ -710,7 +713,7 @@ impl Store for PgStore {
         for row in rows {
             let runner_id: i64 = row.get(0);
             let label: String = row.get(1);
-            if let Some(runner) = inner.runners.get_mut(&runner_id) {
+            if let Some(runner) = tx.runners.get_mut(&runner_id) {
                 runner.labels.push(label);
             }
         }
@@ -732,7 +735,7 @@ impl Store for PgStore {
             let tag: Vec<u8> = row.get(3);
             match restore_session_key(&self.cipher, &key_blob, &iv, &tag) {
                 Ok(enc) => {
-                    inner.session_keys.insert(session_id.clone(), enc);
+                    tx.session_keys.insert(session_id.clone(), enc);
                 }
                 Err(error) => {
                     tracing::warn!(%session_id, %error, "failed to restore session_key on load");
@@ -750,11 +753,9 @@ impl Store for PgStore {
                 session_id: SessionId(row.get::<_, String>(0).parse()?),
                 runner_id: row.get(1),
             };
-            inner
-                .broker_session_runners
+            tx.broker_session_runners
                 .insert(session.session_id.0.to_string(), session.runner_id);
-            inner
-                .sessions
+            tx.sessions
                 .insert(session.session_id.0.to_string(), session);
         }
         // Restore `session_active_requests` so a restarted broker session
@@ -768,11 +769,11 @@ impl Store for PgStore {
         for row in rows {
             let session_id: String = row.get(0);
             let request_id: i64 = row.get(1);
-            inner.session_active_requests.insert(session_id, request_id);
+            tx.session_active_requests.insert(session_id, request_id);
         }
         // Restore per-session broker message queues (dequeued but not yet
         // delivered to the runner) from the `broker_messages` table that
-        // `store_inner` / `store_run_event` write. `inner.broker_messages`
+        // `store_inner` / `store_run_event` write. `tx.broker_messages`
         // (keyed by request_id) is a separate map restored from its own table
         // below.
         let rows = client
@@ -793,8 +794,7 @@ impl Store for PgStore {
                 &associated_data,
             ) {
                 Ok(message) => {
-                    inner
-                        .inflight_messages
+                    tx.inflight_messages
                         .entry(session_id)
                         .or_default()
                         .insert(message_id, message);
@@ -812,7 +812,7 @@ impl Store for PgStore {
             }
         }
         // Restore per-request job messages (request_id → message); the broker
-        // re-delivers from `inner.broker_messages` after a restart.
+        // re-delivers from `tx.broker_messages` after a restart.
         let rows = client
             .query(
                 "SELECT request_id, payload_json FROM job_request_messages
@@ -830,7 +830,7 @@ impl Store for PgStore {
                 &associated_data,
             ) {
                 Ok(message) => {
-                    inner.broker_messages.insert(request_id, message);
+                    tx.broker_messages.insert(request_id, message);
                 }
                 Err(error) => {
                     tracing::warn!(request_id, %error, "dropping undecodable job request message");
@@ -881,10 +881,9 @@ impl Store for PgStore {
             };
             // See the SQLite twin: the counter must resume above the
             // persisted revision or the guard discards post-restart writes.
-            let seen = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+            let seen = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
             *seen = (*seen).max(revision.max(0) as u64);
-            inner
-                .job_steps
+            tx.job_steps
                 .entry(agent_job_id)
                 .or_default()
                 .push(crate::models::StepRecord {
@@ -909,19 +908,13 @@ impl Store for PgStore {
             let request_id: i64 = row.get(0);
             let blob: Vec<u8> = row.get(1);
             let record = restore_request_snapshot(&self.cipher, &blob)?;
-            inner
-                .inflight_requests
+            tx.inflight_requests
                 .insert(request_id, (record.run_id, record.job_id.clone()));
-            inner
-                .plan_requests
-                .insert(record.plan_id.clone(), request_id);
-            inner
-                .agent_job_requests
+            tx.plan_requests.insert(record.plan_id.clone(), request_id);
+            tx.agent_job_requests
                 .insert(record.agent_job_id, request_id);
-            inner
-                .timeline_requests
-                .insert(record.timeline_id, request_id);
-            inner.job_requests.insert(request_id, record);
+            tx.timeline_requests.insert(record.timeline_id, request_id);
+            tx.job_requests.insert(request_id, record);
         }
 
         if let Some(row) = client
@@ -933,7 +926,7 @@ impl Store for PgStore {
         {
             let blob: Vec<u8> = row.get(0);
             let meta: MetaSnapshot = serde_json::from_slice(&self.cipher.unseal(&blob)?)?;
-            apply_meta_snapshot(inner, meta, environment_rules);
+            apply_meta_snapshot_tx(tx, inner, meta);
         }
         let rows = client
             .query(
@@ -946,8 +939,7 @@ impl Store for PgStore {
         for row in rows {
             let workflow_path: String = row.get(0);
             let next_run_number: i64 = row.get(1);
-            inner
-                .workflow_run_counters
+            tx.workflow_run_counters
                 .insert(workflow_path, next_run_number.saturating_sub(1) as u64);
         }
         // Log bytes live in their own table; rebuild the in-memory buffers
