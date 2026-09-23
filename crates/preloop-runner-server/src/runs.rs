@@ -3563,15 +3563,6 @@ pub async fn cancel_run(
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
     }
-    for job_id in cancelled_jobs {
-        crate::github::report_check_run_completed(
-            &shared,
-            run_id,
-            &job_id,
-            ExecutionStatus::Cancelled,
-        )
-        .await;
-    }
     shared
         .state
         .emit(NdjsonEvent::RunStatus {
@@ -3580,6 +3571,23 @@ pub async fn cancel_run(
             reason: None,
         })
         .await;
+    // The cancellation is already committed in memory and persisted above.
+    // Reporting it to GitHub is one PATCH per job, which can take seconds
+    // each behind a busy engine. Awaiting it here let a client that timed out
+    // drop the handler midway: the run stayed cancelled while the remaining
+    // check runs were never updated and sat `queued` on GitHub forever.
+    let reporter = Arc::clone(&shared);
+    tokio::spawn(async move {
+        for job_id in cancelled_jobs {
+            crate::github::report_check_run_completed(
+                &reporter,
+                run_id,
+                &job_id,
+                ExecutionStatus::Cancelled,
+            )
+            .await;
+        }
+    });
     Ok(Json(record))
 }
 

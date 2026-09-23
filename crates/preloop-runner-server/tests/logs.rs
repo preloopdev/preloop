@@ -2510,6 +2510,19 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         cancelled["completed_at"].is_string(),
         "cancelled run must carry terminal completion metadata"
     );
+    // Cancel commits in memory and reports to GitHub in the background, so
+    // the completion lands shortly after the response rather than before it.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !check_completions
+            .lock()
+            .iter()
+            .any(|(id, body)| *id == CHECK_RUN_ID && body["status"] == "completed")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancel must complete the GitHub check run");
     let completions = check_completions.lock();
     let mine: Vec<&serde_json::Value> = completions
         .iter()
@@ -2593,6 +2606,17 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
     )
     .await;
 
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !patches
+            .lock()
+            .last()
+            .is_some_and(|body| body["status"] == "completed")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancel must finish uploading every annotation batch");
     let patches = patches.lock();
     assert_eq!(patches.len(), 3);
     let batch_sizes: Vec<usize> = patches
