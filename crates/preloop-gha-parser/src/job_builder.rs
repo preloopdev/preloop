@@ -1725,6 +1725,108 @@ jobs:
     }
 
     #[test]
+    fn job_env_secret_expression_carries_real_value() {
+        // Regression test for the issue where `${{ secrets.NAME }}` in
+        // job-level `env:` resolved to the log placeholder `***` instead of
+        // the secret value, so the step environment literally held `***`.
+        let yaml = r#"
+on: workflow_dispatch
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    env:
+      X: ${{ secrets.PROBE_SECRET }}
+    steps:
+      - run: echo "length=${#X}"
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+
+        let mut secrets = BTreeMap::new();
+        secrets.insert(
+            "PROBE_SECRET".to_owned(),
+            "dummy-value-of-twenty-six".to_owned(),
+        );
+        let github = serde_json::json!({"event_name": "workflow_dispatch"});
+        let msg = build_agent_job_message(
+            &plans[0],
+            &github,
+            &BTreeMap::new(),
+            &secrets,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let x = msg.variables.get("X").expect("job env variable X");
+        assert_eq!(x.value.as_deref(), Some("dummy-value-of-twenty-six"));
+
+        // The wire field the runner materializes into the step environment
+        // must carry the real value too, not the placeholder.
+        let wire_values: Vec<String> = msg
+            .environment_variables
+            .iter()
+            .filter_map(|token| {
+                token
+                    .get("map")?
+                    .as_array()?
+                    .first()?
+                    .get("Value")?
+                    .get("lit")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            wire_values.contains(&"dummy-value-of-twenty-six".to_owned()),
+            "environment_variables wire values: {wire_values:?}"
+        );
+        assert!(
+            !wire_values.iter().any(|v| v == "***"),
+            "placeholder leaked into environment_variables: {wire_values:?}"
+        );
+    }
+
+    #[test]
+    fn mapped_reusable_secrets_resolve_to_real_values() {
+        // A called workflow's `secrets: { NAME: ${{ secrets.NAME }} }` mapping
+        // must resolve to the real value, not the log placeholder.
+        let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
+"#;
+        let workflow = parse_workflow(yaml).unwrap();
+        let plans = crate::expand_jobs(&workflow).unwrap();
+        let mut plan = plans[0].clone();
+        // Simulate a called workflow job receiving a mapped secret.
+        plan.workflow_file = Some(".github/workflows/called.yml".to_owned());
+        plan.secrets_map.insert(
+            "PROBE_SECRET".to_owned(),
+            "${{ secrets.PROBE_SECRET }}".to_owned(),
+        );
+
+        let mut secrets = BTreeMap::new();
+        secrets.insert(
+            "PROBE_SECRET".to_owned(),
+            "dummy-value-of-twenty-six".to_owned(),
+        );
+        let github = serde_json::json!({"event_name": "push"});
+        let msg =
+            build_agent_job_message(&plan, &github, &BTreeMap::new(), &secrets, &BTreeMap::new())
+                .unwrap();
+
+        let secret = msg
+            .variables
+            .get("PROBE_SECRET")
+            .expect("mapped secret variable");
+        assert_eq!(secret.value.as_deref(), Some("dummy-value-of-twenty-six"));
+        assert_eq!(secret.is_secret, Some(true));
+    }
+
+    #[test]
     fn secrets_become_variables_and_mask_hints() {
         let yaml = r#"
 on: push
