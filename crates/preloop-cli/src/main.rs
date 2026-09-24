@@ -4468,12 +4468,6 @@ fn print_live_log_frame_bytes(frame: &[u8]) -> anyhow::Result<bool> {
     Ok(!wrapper.value.is_empty())
 }
 
-/// Print one SSE frame for callers/tests that already have valid UTF-8 text.
-#[cfg(test)]
-fn print_live_log_frame(frame: &str) {
-    let _ = print_live_log_frame_bytes(frame.as_bytes());
-}
-
 async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
@@ -5512,10 +5506,11 @@ mod tests {
 
     #[test]
     fn live_log_frame_tolerates_keepalive_and_garbage() {
-        // Keep-alive comments and unparseable payloads must not abort a follow.
-        print_live_log_frame(":");
-        print_live_log_frame("event: live-log\ndata: not-json");
-        print_live_log_frame("");
+        // Keep-alive comments and unparseable payloads must not abort a
+        // follow: the parser reports them as "no console lines", not errors.
+        assert!(!print_live_log_frame_bytes(b":").unwrap());
+        assert!(!print_live_log_frame_bytes(b"event: live-log\ndata: not-json").unwrap());
+        assert!(!print_live_log_frame_bytes(b"").unwrap());
     }
 
     #[test]

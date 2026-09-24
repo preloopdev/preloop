@@ -33,6 +33,7 @@ use axum::http::{header, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
+use preloop_gha_protocol::crypto::sha256_hex;
 use tracing::warn;
 
 use crate::events::trust_tier::TrustTier;
@@ -675,18 +676,6 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         .zip(right.iter())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
-}
-
-/// Hex SHA-256 of `value`.
-fn sha256_hex(value: &str) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(value.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 /// Short-TTL cache of validated installation tokens, keyed by token hash.

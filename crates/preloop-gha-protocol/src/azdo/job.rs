@@ -1,4 +1,5 @@
 use super::{MaskHint, PipelineContextData, TaskResources, TimelineReference, VariableValue};
+use crate::expr_scan::find_expression_end;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -806,37 +807,6 @@ pub fn append_format_literal(target: &mut String, literal: &str) {
             _ => target.push(character),
         }
     }
-}
-
-/// Find the position of `}}` that closes a `${{ ... }}` expression,
-/// skipping over `}}` that appears inside string literals (single-quoted).
-pub(crate) fn find_expression_end(s: &str) -> Option<usize> {
-    let mut in_string = false;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if in_string {
-            if bytes[i] == b'\'' {
-                // Check for escaped quote ''
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                } else {
-                    in_string = false;
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        } else if bytes[i] == b'\'' {
-            in_string = true;
-            i += 1;
-        } else if i + 1 < bytes.len() && bytes[i] == b'}' && bytes[i + 1] == b'}' {
-            return Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    None
 }
 
 /// Reference to an action or task.

@@ -12,7 +12,6 @@
 //! reintroduce the TOCTOU that SHA pinning removes.
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -26,9 +25,7 @@ use crate::client::actions_download::ArchiveDigestPin;
 /// are whatever the server-pinned URL served over TLS, so the digest also
 /// pins the packaging — a re-packaged tarball of the same commit is a
 /// different archive and will not match an old pin.
-pub fn archive_sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
+pub use preloop_gha_protocol::crypto::sha256_hex as archive_sha256_hex;
 
 /// Path of the sidecar file recording which archive produced a cached
 /// action tree: `<actions_dir>/<owner>/<repo>/<sha>.sha256`, containing the

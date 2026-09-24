@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use preloop_gha_protocol::crypto::sha256_hex;
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -387,18 +388,6 @@ impl MintLedger {
             .cloned()
             .filter(|entry| entry.expires_at > SystemTime::now())
     }
-}
-
-/// Hex SHA-256 of `value` — the key form the mint ledger stores tokens under.
-fn sha256_hex(value: &str) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(value.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[cfg(any(test, feature = "test-support"))]
