@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use preloop_orchestrator::{
-    artifact_payload, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE, RUNNER_BUSY_LINE,
+    artifact_payload, node_externals, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE,
+    RUNNER_BUSY_LINE,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
@@ -348,6 +349,8 @@ impl Fixture {
         fs::create_dir(&root).expect("unique test fixture directory");
         let bundle = root.join("runner-bundle");
         fs::create_dir(&bundle).unwrap();
+        let externals_dir = root.join("host-externals");
+        stage_fake_node_externals(&externals_dir.join("externals"));
         let artifact_stem = root.join("runner-image");
         if payload_exists {
             fs::write(
@@ -374,7 +377,7 @@ impl Fixture {
             artifact_stem,
             release_version: "9.9.9".to_owned(),
             runner_bundle: bundle,
-            externals_dir: PathBuf::from("/tmp/test-externals"),
+            externals_dir,
             runner_binary_name: "preloop-runner".to_owned(),
             server_url: "https://preloop.example".to_owned(),
             control_origin: None,
@@ -416,6 +419,33 @@ impl Drop for Fixture {
     }
 }
 
+/// Stand in for the host's Node externals with a tiny, already-valid tree.
+///
+/// The pool validates `externals/<runtime>` by manifest plus `bin/node
+/// --version` and downloads ~360 MB from nodejs.org when that fails, then
+/// copies it into every fixture's bundle. A shared real path made each test
+/// download on a fresh CI machine, and parallel test processes raced on it; a
+/// loser's pool errored out and its test hung waiting for a runner.
+fn stage_fake_node_externals(externals: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for (runtime, version) in node_externals::expected_runtimes() {
+        let plain = version.trim_start_matches('v');
+        let dir = externals.join(runtime);
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        let node = dir.join("bin/node");
+        fs::write(&node, format!("#!/bin/sh\necho v{plain}\n")).unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest = node_externals::NodeManifest::new(
+            runtime,
+            plain,
+            &node_externals::current_platform(),
+            "fixture",
+            "fixture",
+        );
+        node_externals::write_manifest(&dir, &manifest).unwrap();
+    }
+}
+
 async fn run_until_cancelled(
     pool: RunnerPool<RecordingVmProvider>,
     provider: &RecordingVmProvider,
@@ -423,10 +453,13 @@ async fn run_until_cancelled(
     run_calls: usize,
 ) {
     let task_shutdown = shutdown.clone();
-    let task = tokio::spawn(async move { pool.run(task_shutdown).await });
-    provider
-        .wait_until(|state| state.run_calls >= run_calls)
-        .await;
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+    // A pool that exits before reaching the runner must fail the test, not
+    // leave it waiting for a run call that can no longer happen.
+    tokio::select! {
+        () = provider.wait_until(|state| state.run_calls >= run_calls) => {}
+        result = &mut task => panic!("pool exited before {run_calls} runner call(s): {result:?}"),
+    }
     shutdown.cancel();
     task.await.unwrap().unwrap();
 }
@@ -669,7 +702,7 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
             VolumeMount {
                 // Node externals are mounted host-side, never baked into the
                 // machine image or downloaded per runner.
-                host: PathBuf::from("/tmp/test-externals/externals"),
+                host: fixture.root.join("host-externals").join("externals"),
                 guest: PathBuf::from("/home/runner/externals"),
                 read_only: true,
             },
