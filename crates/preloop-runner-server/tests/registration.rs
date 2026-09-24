@@ -2135,6 +2135,340 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
 }
 
 #[tokio::test]
+async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // Subscribe before the sweep so the emitted events are observable.
+    let mut events = state.events.subscribe();
+
+    // Backdate the first-seen mark past the grace window and reap: the job
+    // starves and the run concludes.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.queued_at.insert(
+            (run_id, JobId("build".to_owned())),
+            SystemTime::now() - Duration::from_secs(300),
+        );
+    }
+    reap_once(&shared).await;
+
+    // Drain the broadcast channel. The sweep must publish the terminal
+    // RunStatus for the concluded run: the event stream only closes a
+    // watcher connection on a terminal RunStatus, so without it `preloop
+    // run` keeps waiting on a run the engine has already failed.
+    let mut saw_terminal_run_status = false;
+    let mut saw_job_failure = false;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            NdjsonEvent::RunStatus {
+                run_id: id, status, ..
+            } if id == run_id => {
+                if status.is_terminal() {
+                    saw_terminal_run_status = true;
+                }
+            }
+            NdjsonEvent::JobStatus {
+                run_id: id, status, ..
+            } if id == run_id && status == ExecutionStatus::Failure => {
+                saw_job_failure = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_job_failure,
+        "the sweep must emit the per-job failure event"
+    );
+    assert!(
+        saw_terminal_run_status,
+        "the sweep must publish a terminal RunStatus so `preloop run` returns \
+         once the engine has failed the run"
+    );
+}
+
+#[tokio::test]
+async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    // Two independent jobs in one run.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  one:\n    runs-on: self-hosted\n    steps:\n      - run: echo one\n  two:\n    runs-on: self-hosted\n    steps:\n      - run: echo two\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let mut events = state.events.subscribe();
+
+    // Only the first job is old enough to starve; the second must survive.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.queued_at.insert(
+            (run_id, JobId("one".to_owned())),
+            SystemTime::now() - Duration::from_secs(300),
+        );
+    }
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .jobs
+                .get(&JobId("one".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "the overdue job must fail"
+        );
+        assert_eq!(
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .jobs
+                .get(&JobId("two".to_owned())),
+            Some(&ExecutionStatus::Queued),
+            "the surviving job must stay queued"
+        );
+        assert!(
+            inner.queue.iter().any(|job| job.job_id.0 == "two"),
+            "the surviving job must stay on the ready queue"
+        );
+    }
+
+    // The published run status must be non-terminal: a terminal RunStatus
+    // would close the watcher's event stream while the run is still live.
+    let mut saw_non_terminal_run_status = false;
+    let mut saw_terminal_run_status = false;
+    while let Ok(event) = events.try_recv() {
+        if let NdjsonEvent::RunStatus {
+            run_id: id, status, ..
+        } = event
+        {
+            if id == run_id {
+                if status.is_terminal() {
+                    saw_terminal_run_status = true;
+                } else {
+                    saw_non_terminal_run_status = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_non_terminal_run_status,
+        "the sweep must publish the run's updated (non-terminal) status"
+    );
+    assert!(
+        !saw_terminal_run_status,
+        "the sweep must not publish a terminal RunStatus while a job is still queued"
+    );
+}
+
+#[tokio::test]
+async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    // Two independent jobs in one run; both will starve on the same sweep.
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  one:\n    runs-on: self-hosted\n    steps:\n      - run: echo one\n  two:\n    runs-on: self-hosted\n    steps:\n      - run: echo two\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let mut events = state.events.subscribe();
+
+    // Both jobs old enough to starve: the sweep fails them together and the
+    // run concludes.
+    {
+        let mut inner = state.inner.lock().await;
+        for job in ["one", "two"] {
+            inner.queued_at.insert(
+                (run_id, JobId(job.to_owned())),
+                SystemTime::now() - Duration::from_secs(300),
+            );
+        }
+    }
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&run_id).unwrap();
+        assert!(
+            run.status.is_terminal(),
+            "the run must conclude once every job starved"
+        );
+    }
+
+    // The published RunStatus must carry the run's conclusion, not the
+    // intermediate status from the first failed job: the event stream only
+    // closes a watcher on the final terminal status.
+    let mut saw_terminal_run_status = false;
+    let mut saw_non_terminal_run_status = false;
+    while let Ok(event) = events.try_recv() {
+        if let NdjsonEvent::RunStatus {
+            run_id: id, status, ..
+        } = event
+        {
+            if id == run_id {
+                if status.is_terminal() {
+                    saw_terminal_run_status = true;
+                } else {
+                    saw_non_terminal_run_status = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_terminal_run_status,
+        "the sweep must publish the run's concluding (terminal) status when \
+         every job starves, so `preloop run` returns"
+    );
+    assert!(
+        !saw_non_terminal_run_status,
+        "the sweep must not publish a stale intermediate status for a concluded run"
+    );
+}
+
+#[tokio::test]
+async fn queued_job_does_not_starve_while_a_runner_is_being_provisioned() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // The on-demand pool publishes an in-flight provision while it builds a
+    // runner; the sweep must not count that provisioning time against the
+    // starvation limit.
+    state.pool_status.set_provisioning(1);
+
+    // Age the job past the 120s short grace but well under the absolute
+    // backstop: with provisioning in flight it must not starve.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.queued_at.insert(
+            (run_id, JobId("build".to_owned())),
+            SystemTime::now() - Duration::from_secs(300),
+        );
+    }
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.queue.len(),
+            1,
+            "a job whose runner is being provisioned must not starve past the short grace"
+        );
+        assert_eq!(
+            inner.runs.get(&run_id).unwrap().status,
+            ExecutionStatus::Queued,
+            "the run must still be live while provisioning is in flight"
+        );
+    }
+}
+
+#[tokio::test]
+async fn starvation_clock_ignores_provisioning_time_across_a_retry_gap() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = submit_simple_run(&app).await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    // The job has been queued for 200s — past the 120s short grace — and a
+    // provision is in flight for it.
+    let enqueued_nanos = SystemTime::now() - Duration::from_secs(200);
+    let enqueued_nanos = enqueued_nanos
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    state.pool_status.set_provisioning(1);
+    {
+        let mut inner = state.inner.lock().await;
+        for job in inner.queue.iter_mut() {
+            job.enqueued_at_unix_nanos = enqueued_nanos;
+        }
+    }
+    // While provisioning is in flight the sweep holds the job and re-stamps
+    // its observation clock instead of letting the 200s of provisioning
+    // time count against the short grace.
+    reap_once(&shared).await;
+
+    // The provision fails; the pool backs off before retrying. During the
+    // gap no provision is in flight, but the job must still not starve:
+    // its clock was reset when provisioning was last observed, not when
+    // the job was first queued.
+    state.pool_status.set_provisioning(0);
+    reap_once(&shared).await;
+
+    {
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner.queue.len(),
+            1,
+            "a job must not starve in a provisioning retry gap for time spent provisioning"
+        );
+        assert_eq!(
+            inner.runs.get(&run_id).unwrap().status,
+            ExecutionStatus::Queued,
+            "the run must still be live while the pool retries its provision"
+        );
+    }
+}
+
+#[tokio::test]
 async fn job_timeout_enforcement_cancels_job() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
