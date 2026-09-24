@@ -1048,6 +1048,130 @@ jobs:
     assert_eq!(jobs[0].runs_on, vec!["self-hosted", "X64"]);
 }
 
+/// A whole `runs-on` expression that yields a list must be unpacked into
+/// individual labels. Rendering the JSON text as one label (`["ubuntu-latest"]`)
+/// queues a label no runner advertises, so the job starves.
+#[test]
+fn runs_on_expression_yielding_list_unpacks_into_labels() {
+    let workflow = parse_workflow(
+        r#"
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ${{ fromJSON('["ubuntu-latest"]') }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
+}
+
+/// Multi-element lists unpack element by element, like GitHub's own
+/// `runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}` routing.
+#[test]
+fn runs_on_expression_yielding_multi_label_list_unpacks_each_label() {
+    let workflow = parse_workflow(
+        r#"
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ${{ fromJSON('["self-hosted", "linux"]') }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
+}
+
+/// The issue's real-world shape: an unset variable falls back to a JSON list,
+/// and the fallback list unpacks into labels the runners advertise.
+#[test]
+fn runs_on_expression_with_vars_fallback_unpacks_list() {
+    let workflow = parse_workflow(
+        r#"
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER || '["ubuntu-latest"]') }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
+}
+
+/// A list-yielding expression inside the list form unpacks in place, leaving
+/// the literal labels around it alone.
+#[test]
+fn runs_on_expression_list_unpacks_inside_a_label_list() {
+    let workflow = parse_workflow(
+        r#"
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: [self-hosted, "${{ fromJSON('[\"linux\"]') }}"]
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
+}
+
+/// A whole expression yielding a single value keeps the old string rendering —
+/// only lists unpack.
+#[test]
+fn runs_on_whole_expression_yielding_single_value_stays_single_label() {
+    let workflow = parse_workflow(
+        r#"
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ${{ fromJSON('"ubuntu-latest"') }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["ubuntu-latest"]);
+}
+
+/// An expression mixed with other text is not a whole expression, so it keeps
+/// the old string rendering.
+#[test]
+fn runs_on_expression_mixed_with_text_keeps_string_rendering() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: label-${{ matrix.os }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["label-ubuntu-latest"]);
+}
+
 #[test]
 fn parses_local_action_metadata() {
     let action = parse_action_metadata(

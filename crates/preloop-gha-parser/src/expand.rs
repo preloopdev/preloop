@@ -135,14 +135,34 @@ fn resolved_runs_on(
     let context = expression_context(matrix, inputs, None);
     labels
         .into_iter()
-        .map(|label| {
-            if !label.contains("${{") {
-                return label;
-            }
-            crate::eval::resolve_string(&label, &context).unwrap_or(label)
-        })
+        .flat_map(|label| resolve_runs_on_label(label, &context))
         .filter(|label| !label.trim().is_empty())
         .collect()
+}
+
+/// Resolve one `runs-on` label for a concrete matrix combination.
+///
+/// When the whole label is a single `${{ }}` expression that yields a list —
+/// `runs-on: ${{ fromJSON(vars.SELF_HOSTED_RUNNER || '["ubuntu-latest"]') }}` —
+/// the list is unpacked into individual labels, matching GitHub. Rendering the
+/// list as its JSON text instead would queue one label no runner advertises,
+/// and the job would starve. Anything else (no expression, an expression mixed
+/// with other text, or a whole expression yielding a single value) keeps the
+/// previous string-rendering behavior.
+fn resolve_runs_on_label(label: String, context: &Context) -> Vec<String> {
+    if let Some(Ok(Value::Array(items))) = crate::eval::whole_expression_value(&label, context) {
+        return items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(text) => text,
+                other => crate::eval::stringify_value(&other),
+            })
+            .collect();
+    }
+    if label.contains("${{") {
+        return vec![crate::eval::resolve_string(&label, context).unwrap_or(label)];
+    }
+    vec![label]
 }
 
 fn resolved_continue_on_error(
