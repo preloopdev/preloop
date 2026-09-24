@@ -3391,6 +3391,17 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             }
             _ => {}
         }
+        // The registry sweep above cannot see a machine whose registry row is
+        // gone but whose data dir survived (smolvm's delete drops the row
+        // first; a failed remove_dir_all or a crashed engine strands the
+        // files). Reconcile the filesystem against the registry.
+        match self.provider.sweep_orphaned_data_dirs().await {
+            Ok(swept) if swept > 0 => {
+                info!(swept, "removed orphaned machine data directories")
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "orphaned data-dir sweep failed"),
+        }
         Ok(())
     }
 
