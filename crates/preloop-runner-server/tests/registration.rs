@@ -2095,7 +2095,7 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
     state.pool_preparing = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
         true,
     )));
-    state.started_at = std::time::Instant::now() - Duration::from_secs(1900);
+    state.started_at = std::time::Instant::now() - Duration::from_secs(3700);
     let shared = Arc::new(SharedState {
         state: state.clone(),
         shutdown,
@@ -2107,7 +2107,7 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
     // Age the job's ready-enqueue past the absolute ceiling.
     {
         let mut inner = state.inner.lock().await;
-        let cutoff = (SystemTime::now() - Duration::from_secs(1900))
+        let cutoff = (SystemTime::now() - Duration::from_secs(3700))
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
