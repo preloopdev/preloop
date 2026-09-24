@@ -809,7 +809,12 @@ fn expand_jobs_with_reusables_internal(
                 }
             }
 
-            let mut resolved_inputs = BTreeMap::new();
+            // Validate and coerce the caller's `with:` values once. Expressions
+            // stay raw here: they are evaluated per matrix cell below, in the
+            // caller context, so `${{ inputs.dry_run }}` reads the caller's
+            // inputs instead of arriving unevaluated (or evaluated in the
+            // callee) downstream.
+            let mut coerced_inputs: BTreeMap<String, (InputType, Value)> = BTreeMap::new();
             for (name, def) in &trigger.inputs {
                 let caller_val = job
                     .with
@@ -835,7 +840,7 @@ fn expand_jobs_with_reusables_internal(
                         }
                     }
                 };
-                resolved_inputs.insert(name.clone(), coerced_val);
+                coerced_inputs.insert(name.clone(), (def.input_type, coerced_val));
             }
 
             // Validate secrets
@@ -890,16 +895,65 @@ fn expand_jobs_with_reusables_internal(
                 .map(|(k, v)| (k.clone(), v.value.clone()))
                 .collect();
 
+            let coerced_values: BTreeMap<String, Value> = coerced_inputs
+                .iter()
+                .map(|(name, (_, value))| (name.clone(), value.clone()))
+                .collect();
             let (matrices, deferred_matrix) = expand_matrix(
                 job_id,
                 job.strategy.matrix.as_ref(),
-                Some(&resolved_inputs),
+                Some(&coerced_values),
                 event_name,
             )?
             .into_cells();
             let matrix_count = matrices.len();
             for (matrix_index, matrix) in matrices.into_iter().enumerate() {
                 let expanded_job_id = matrix_expand::expanded_job_id(job_id, &matrix);
+                // Evaluate the caller's `with:` expressions in the caller
+                // context (this matrix cell plus the caller's inputs), the
+                // way the needs-deferred path already does at runtime.
+                // Literals pass through untouched. An expression that reads
+                // a context unavailable at parse time (`needs.*`,
+                // `github.workspace`) is left raw rather than resolved to
+                // an empty string. A caller whose matrix is deferred keeps
+                // every value raw: the runtime fan-out evaluates them per
+                // cell once the matrix exists.
+                let resolved_inputs: BTreeMap<String, Value> = if deferred_matrix.is_none() {
+                    let cell_context = expression_context(&matrix, inputs, event_name);
+                    let mut evaluated = BTreeMap::new();
+                    for (name, (input_type, coerced)) in &coerced_inputs {
+                        let value = match coerced {
+                            Value::String(raw)
+                                if raw.contains("${{")
+                                    && !crate::eval::resolves_after_job_build(raw) =>
+                            {
+                                let resolved = crate::eval::resolve_string(raw, &cell_context)
+                                    .map_err(|error| {
+                                        ParserError::InvalidExpression(format!(
+                                            "job `{job_id}` input `{name}` failed to evaluate: {error}"
+                                        ))
+                                    })?;
+                                // Re-coerce so an expression behaves like the
+                                // literal it produced: `${{ inputs.flag }}`
+                                // for a boolean input arrives as a real
+                                // boolean, not the string "true". When the
+                                // inputs are not all known (a plan preview
+                                // with no dispatch inputs, for example) the
+                                // evaluated text may not fit the declared
+                                // type; keep the raw expression then rather
+                                // than newly failing a workflow that parsed
+                                // before.
+                                coerce_value(&Value::String(resolved), *input_type, name)
+                                    .unwrap_or_else(|_| coerced.clone())
+                            }
+                            other => other.clone(),
+                        };
+                        evaluated.insert(name.clone(), value);
+                    }
+                    evaluated
+                } else {
+                    coerced_values.clone()
+                };
                 reusable_calls.insert(
                     expanded_job_id.clone(),
                     ReusableCallMetadata {
