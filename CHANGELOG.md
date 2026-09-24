@@ -12,19 +12,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
-- **Forks pass `--freeze-source` instead of an env pin**: the
+- **Forks pass `--freeze-source` instead of an env pin** (`53a93db9`): the
   `SMOLVM_BRANCH_CONTINUE=0` pin shipped in 0.33.5 was a no-op — upstream
   PR #1376 delivered the mechanism as `machine fork --freeze-source`, not an
   environment variable. `SmolVmProvider::fork` now passes the flag on every
   fork, so goldens actually stay frozen as reusable branch bases on Linux
   and macOS.
-- **Rotated the pinned release-signing key**: the private key matching the
+- **Rotated the pinned release-signing key** (`f64293de`): the private key matching the
   public key pinned in 0.33.5 was unrecoverable, so
   `PRELOOP_RELEASE_SIGNING_KEY` could never be set and the release
   workflow's signing step hard-failed. A fresh RSA-3072 keypair replaces the
   pin; the private key is stored as the repo secret. Safe to rotate because
   the pin first shipped in 0.33.5 — no released updater ever verified a
   signature against the old key.
+- **Windows runner build repaired** (`90f1c1ad`): two Windows-only compile
+  errors — a moved `upstream_addr` in `control_bridge.rs` and the unix-only
+  `cap_std::fs::Dir::symlink` in `manager.rs` — failed the
+  x86_64-pc-windows-msvc leg of release-runner, which gates the runner
+  container image publish.
 
 ## [0.33.5] - 2026-09-24
 
@@ -66,6 +71,48 @@ Releases before v0.27.0 predate the changelog.
 - **Reusable Workflow Expression Context**: Reusable workflow `with:` expressions now evaluate strictly in the caller context.
 - **Secret Value Resolution**: Job environments now receive real secret values rather than log placeholders.
 - **Runs-On List Expressions**: Dynamic `runs-on` expressions returning lists are correctly unpacked into runner labels.
+
+### Merged pull requests
+
+- #321 — Fix runs-on expressions reading needs outputs being evaluated too early
+- #320 — Starvation sweep ignores pool provisioning time and publishes the starvation limit
+- #319 — Reusable caller `with:` expressions evaluate in the caller context
+- #318 — Keep dispatch inputs in jobs with a needs-deferred matrix
+- #317 — Regression test for action post-step execution
+- #316 — Detach check-run reporting from complete_job and submit_run
+- #315 — Unpack runs-on expressions that yield a list into labels
+- #314 — Job environment receives real secret values instead of the log placeholder
+- #313 — Drop pack/ intermediates after golden finalize (fixes #295)
+- #312 — Fail closed when no runner bundle carries node externals
+- #311 — Action tarball checksum verification + #291 regression test
+- #310 — Adopt packed golden across engine restarts (fixes #293)
+- #309 — Accept @actions/cache v6's 64 MiB staged blocks (fixes #292)
+- #308 — Codify fork PR workflow policy
+- #307 — Environment protection rules
+- #306 — Codified GITHUB_TOKEN permissions ceiling
+- #305 — Codified workflow execution protections
+- #304 — Compare withheld-PAT token by job identity, not bytes
+- #303 — Align toJSON/join output formatting with the official runner
+- #302 — Require HTTPS for PAT scope introspection
+- #301 — On-demand LFS fetch for local snapshots + stable repo identity
+- #299 — Align string comparison and case-insensitivity with the official runner
+- #298 — Close remaining masking races
+- #297 — Sign blob tokens as JWTs, enforce owner liveness on bearer writes
+- #296 — r1_12 rematerialization test matches record/head split
+- #283 — Remove aarch64 golden bake jobs
+- #282 — Bump guest disk template to 200G for golden pack
+- #280 — Bump guest storage to 200G for golden pack
+- #279 — Target dispatches and provision Jammy runners
+- #278 — Free host disk for golden pack, isolate retry staging
+- #277 — Tolerate indented smolvm pin and fail loudly when unresolved
+- #273 — Scope caches by repo and ref, cap upload memory
+- #272 — Confine hashFiles, bound runner memory, cap bridge connections, mask multiline secrets
+- #271 — Encrypt secrets and tokens at rest, retroactive log masking
+- #270 — Scope PAT tokens, verify updater assets, pin action refs, bind webhook signer
+- #269 — Authenticate blob endpoints, validate OAuth assertions, bind result writes
+- #268 — Bind live-log ingest and reads to job identity
+- #267 — Lazy per-run LFS blob cache for checkout cache
+- #265 — Opt-in checkout object cache (run-scoped, repository)
 
 ## [0.33.2] - 2026-09-17
 
