@@ -1332,6 +1332,45 @@ async fn post_step_executes_for_node_action_with_post_entrypoint() {
     let dir = TempDir::new().unwrap();
     let workspace = dir.path().join("work").join("repo");
     std::fs::create_dir_all(&workspace).unwrap();
+    // Stage the host's Node binary into the runner root's bundled externals
+    // so the test does not depend on the system Node matching `using: node24`.
+    // If no Node binary is present on the host (e.g. minimal test environments),
+    // write a mock executable that satisfies the marker file contract.
+    let externals_bin = dir.path().join("externals").join("node24").join("bin");
+    std::fs::create_dir_all(&externals_bin).unwrap();
+    let staged = if let Some(host_node) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|p| {
+            let candidate = p.join(if cfg!(windows) { "node.exe" } else { "node" });
+            candidate.is_file().then_some(candidate)
+        })
+    }) {
+        #[cfg(unix)]
+        let ok = std::os::unix::fs::symlink(&host_node, externals_bin.join("node")).is_ok();
+        #[cfg(windows)]
+        let ok = std::fs::copy(&host_node, externals_bin.join("node.exe")).is_ok();
+        ok
+    } else {
+        false
+    };
+    if !staged {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mock = externals_bin.join("node");
+            std::fs::write(
+                &mock,
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do\n\
+                   case \"$a\" in\n\
+                     *main.js) [ -n \"$MARKER_MAIN\" ] && echo main-ran > \"$MARKER_MAIN\"; [ -n \"$MARKER_REMOTE_MAIN\" ] && echo main-ran > \"$MARKER_REMOTE_MAIN\" ;;\n\
+                     *post.js) [ -n \"$MARKER_POST\" ] && echo post-ran > \"$MARKER_POST\"; [ -n \"$MARKER_REMOTE_POST\" ] && echo post-ran > \"$MARKER_REMOTE_POST\" ;;\n\
+                   esac\n\
+                 done\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&mock, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
 
     // Local action with main + post entry points.
     let local_action = workspace.join("my-action");
