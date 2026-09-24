@@ -251,7 +251,10 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // restarts. While a co-hosted pool is still preparing its machine image
     // (artifact download or build, golden prep) or booting a runner it cannot
     // register a runner no matter how long the job waits, so keep the job
-    // protected during that warm. The protection is bounded by
+    // protected during that warm and do not count the warm against the short
+    // grace: each protected tick re-stamps the observation clock, so the
+    // grace window measures only time waited with no provision in flight.
+    // The protection is bounded by
     // MAX_QUEUED_GRACE (see below), measured from ready-enqueue, so continuous
     // provisioning cannot protect an unschedulable job forever.
     const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
@@ -348,10 +351,16 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             } else {
                 now
             };
+            // Provisioning time does not count against the short grace: stamp
+            // the observation clock at the latest tick the pool was still
+            // working, so the 120s window measures only time the job waited
+            // with no provision in flight. A failed provision followed by a
+            // retry gap must not fail the job for the earlier attempt's
+            // minutes.
             if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE
                 && now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE
             {
-                inner.queued_at.remove(&key);
+                inner.queued_at.insert(key.clone(), now);
                 continue;
             }
             // The pool is warming or booting a runner that may serve this
@@ -361,7 +370,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             // waited that long it starves even while the pool is still
             // preparing, so sustained provisioning cannot mask it forever.
             if !enqueue_age_expired {
-                inner.queued_at.remove(&key);
+                inner.queued_at.insert(key.clone(), now);
                 continue;
             }
             MAX_QUEUED_GRACE
@@ -525,7 +534,17 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
 
     // Apply starvation failures: remove each job from the ready queue and
     // mark it terminal in its run, so dependents unblock and a run with no
-    // surviving jobs concludes. The reason is emitted after the lock.
+    // surviving jobs concludes. The reason is emitted after the lock, along
+    // with a per-run status update (see below): without a `RunStatus` on the
+    // event stream the run looks unfinished to stream watchers forever even
+    // though the record already concluded.
+    //
+    // The per-run status is snapshotted after every starved job is applied:
+    // several starved jobs can belong to one run, and the status computed
+    // after the first failure is not the run's conclusion. Publishing that
+    // intermediate status would keep stream watchers waiting on a run the
+    // engine has already failed.
+    let mut starved_run_ids: Vec<RunId> = Vec::new();
     for (run_id, job_id, _reason) in &starved {
         inner
             .queue
@@ -535,7 +554,14 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             run.status = crate::runtime_scheduling::summarize_run(run.jobs.values().copied());
             crate::runtime_scheduling::finalize_run_if_complete(run);
         }
+        if !starved_run_ids.contains(run_id) {
+            starved_run_ids.push(*run_id);
+        }
     }
+    let starved_runs: Vec<(RunId, ExecutionStatus)> = starved_run_ids
+        .iter()
+        .filter_map(|run_id| inner.runs.get(run_id).map(|run| (*run_id, run.status)))
+        .collect();
 
     // Record queue-wait for every starved job so the histogram covers all
     // terminal outcomes, not just `claimed`. `unschedulable` = the pool's
@@ -686,6 +712,24 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             ExecutionStatus::Failure,
         )
         .await;
+    }
+
+    // Publish each affected run's updated status. A run the sweep just
+    // concluded (or whose last queued job failed) reaches its terminal state
+    // here; the event stream only closes a client connection on a terminal
+    // `RunStatus`, so without this `preloop run` keeps waiting on a run the
+    // engine has already failed instead of returning. A non-terminal status
+    // (one starved job of several) is safe to publish too: it neither closes
+    // the stream nor moves the watcher's conclusion.
+    for (run_id, status) in &starved_runs {
+        shared
+            .state
+            .emit(NdjsonEvent::RunStatus {
+                run_id: *run_id,
+                status: *status,
+                reason: None,
+            })
+            .await;
     }
 
     // Process completions for disconnected runners
