@@ -817,6 +817,122 @@ jobs:
     assert_eq!(dynamic_plans[1].id.0, "downstream (macos-latest)");
 }
 
+/// The `inputs` context is identical in every job of a workflow_dispatch run
+/// on GitHub — including a job whose matrix is deferred until `needs` outputs
+/// exist. The fan-out cells used to be rebuilt at runtime with an empty
+/// `inputs` map even though the expansion context carried the dispatch
+/// values, so `${{ inputs.dry_run }}` rendered empty inside the matrix job
+/// while the plain jobs saw `true`, and `!inputs.dry_run` gates fired in the
+/// matrix job alone.
+#[test]
+fn deferred_matrix_cells_keep_dispatch_inputs() {
+    let yaml = r#"
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run: { type: boolean, default: false }
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      products: ${{ steps.p.outputs.products }}
+    steps:
+      - id: p
+        run: echo "plan inputs.dry_run=[${{ inputs.dry_run }}]"
+  gen:
+    needs: plan
+    strategy:
+      matrix:
+        product: ${{ fromJSON(needs.plan.outputs.products) }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "gen inputs.dry_run=[${{ inputs.dry_run }}]"
+      - if: ${{ !inputs.dry_run }}
+        run: echo "GATED STEP RAN"
+  deploy:
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "deploy inputs.dry_run=[${{ inputs.dry_run }}]"
+"#;
+    let workflow = parse_workflow(yaml).unwrap();
+    let mut dispatch_inputs = BTreeMap::new();
+    dispatch_inputs.insert("dry_run".to_owned(), json!(true));
+    let expanded = expand_jobs_with_reusables_and_shas_and_inputs(
+        &workflow,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Some(&dispatch_inputs),
+    )
+    .unwrap();
+    assert_eq!(expanded.jobs.len(), 3);
+
+    // The parse-time plans all carry the dispatch inputs.
+    for plan in &expanded.jobs {
+        assert_eq!(
+            plan.inputs.get("dry_run"),
+            Some(&json!(true)),
+            "job `{}` should carry the dispatch input",
+            plan.id.0
+        );
+    }
+
+    // The `gen` job defers its matrix on `needs.plan.outputs`.
+    let gen = expanded
+        .jobs
+        .iter()
+        .find(|plan| plan.base_id == "gen")
+        .unwrap();
+    assert!(
+        gen.deferred_matrix.is_some(),
+        "a needs-dependent matrix must defer, not expand to zero cells"
+    );
+
+    // Simulate the server's runtime fan-out once `plan` completes.
+    let mut needs_outputs = BTreeMap::new();
+    let mut plan_outputs = BTreeMap::new();
+    plan_outputs.insert("products".to_owned(), json!(r#"["one"]"#));
+    needs_outputs.insert("plan".to_owned(), plan_outputs);
+
+    let cells = expand_deferred_matrix_job(
+        &workflow,
+        "gen",
+        gen.deferred_matrix.as_deref().unwrap(),
+        &needs_outputs,
+        Some(&dispatch_inputs),
+    )
+    .unwrap();
+    assert_eq!(cells.len(), 1);
+    let cell = &cells[0];
+    assert_eq!(cell.id.0, "gen (one)");
+    assert_eq!(
+        cell.inputs.get("dry_run"),
+        Some(&json!(true)),
+        "a deferred matrix fan-out cell must carry the dispatch inputs"
+    );
+
+    // The job message builder reads the `inputs` context from the plan, so
+    // evaluate exactly as it does: `inputs.dry_run` must be true and the
+    // `!inputs.dry_run` gate must stay shut.
+    let ctx = crate::eval::build_context(
+        &json!({}),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &cell.matrix,
+        &json!({}),
+        &BTreeMap::new(),
+        &cell.inputs,
+    );
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("inputs.dry_run", &ctx).unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        preloop_gha_expressions::eval_expression("!inputs.dry_run", &ctx).unwrap(),
+        json!(false)
+    );
+}
+
 #[test]
 fn expands_needs_expression_inside_matrix_axis() {
     let yaml = r#"

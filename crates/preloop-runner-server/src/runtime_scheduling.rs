@@ -2409,6 +2409,15 @@ struct MatrixExpansionInputs {
     /// reusable callee, so the build phase parses the callee YAML rather than
     /// the root workflow.
     workflow_file: Option<String>,
+    /// The deferred node's own `inputs` context. For a top-level node this is
+    /// the run's dispatch inputs (stamped on the plan at submit time); for a
+    /// node inside a reusable workflow it is the caller's `with` values that
+    /// the callee subtree was expanded with. The fan-out cells must see these
+    /// scoped inputs, not the root dispatch inputs: GitHub scopes `inputs` to
+    /// the workflow that declares the job, so a callee cell reading
+    /// `inputs.dry_run` gets the caller's `with` value even on a
+    /// push-triggered run whose dispatch map is empty.
+    scoped_inputs: BTreeMap<String, serde_json::Value>,
 }
 
 enum ExpansionPlan {
@@ -2467,10 +2476,17 @@ fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> 
     // A deferred matrix inside a reusable workflow carries its home workflow
     // on the plan (`register_expanded_jobs` stores it alongside the node), so
     // the build phase can parse the callee YAML instead of the root workflow.
-    let workflow_file = run
-        .caller_plans
-        .get(&job.job_id)
-        .and_then(|plan| plan.workflow_file.clone());
+    let stored_plan = run.caller_plans.get(&job.job_id);
+    let workflow_file = stored_plan.and_then(|plan| plan.workflow_file.clone());
+    // The fan-out cells inherit the deferred node's own `inputs` context:
+    // the root run's dispatch inputs for a top-level node (stamped on the
+    // plan at submit time), or the caller's `with` values for a node inside a
+    // reusable workflow. Nodes that were never stored (a top-level node from
+    // the initial submit, which only stores reusable callers) fall back to
+    // the dispatch inputs the submit path stamped on every plan.
+    let scoped_inputs = stored_plan
+        .map(|plan| plan.inputs.clone())
+        .unwrap_or_else(|| run.submission.dispatch_inputs.clone());
     Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
         ctx,
         node_id: job.job_id.clone(),
@@ -2480,6 +2496,7 @@ fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> 
         // rather than in the build phase, which no longer sees the run record.
         needs_outputs: collect_needs_outputs(run, job),
         workflow_file,
+        scoped_inputs,
     })))
 }
 
@@ -2748,6 +2765,7 @@ fn build_matrix_expansion(
         expression,
         needs_outputs,
         workflow_file,
+        scoped_inputs,
     } = inputs;
     let run_id = ctx.run_id;
     // A deferred matrix that lives inside a reusable workflow must be expanded
@@ -2769,7 +2787,13 @@ fn build_matrix_expansion(
         &base_id,
         &expression,
         &needs_outputs,
-        Some(&ctx.submission.inputs),
+        // Fan out with the deferred node's own scoped inputs: the root run's
+        // dispatch inputs for a top-level node, or the caller's `with` values
+        // for a node inside a reusable workflow. The legacy
+        // `submission.inputs` field is empty for workflow_dispatch runs, so
+        // using it here would fan out cells with an empty `inputs` context
+        // while plain jobs see the values.
+        Some(&scoped_inputs),
     )
     .map_err(|error| {
         tracing::warn!(%run_id, job = %node_id, %error, "dynamic matrix expansion failed");
@@ -2778,7 +2802,6 @@ fn build_matrix_expansion(
 
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
-    let submission_inputs = ctx.submission.inputs.clone();
     // No `secrets` in the job-level condition context: GitHub does not expose
     // the `secrets` context to a job `if:`, precisely so a workflow cannot
     // branch on a secret's value. The reusable-expansion path already passes
@@ -2796,7 +2819,9 @@ fn build_matrix_expansion(
                 .collect(),
             &serde_json::json!({}),
             &BTreeMap::new(),
-            &submission_inputs,
+            // The fan-out plans carry the node's scoped inputs on the plan
+            // itself, so the cell `if:` sees the same `inputs` the steps will.
+            &plan.inputs,
         )
     })?;
     Ok(BuiltExpansion::Matrix { jobs })
@@ -3792,6 +3817,149 @@ mod assignment_tests {
         assert!(
             !inner.holder_keys.contains_key(&zombie),
             "holder-key tracking for the dead run must be pruned"
+        );
+    }
+
+    /// Build a deferred matrix node plan with controlled `inputs`, standing
+    /// in for the node the expansion pass stored in `run.caller_plans`.
+    fn stored_deferred_plan(
+        id: &str,
+        inputs: BTreeMap<String, serde_json::Value>,
+    ) -> preloop_gha_protocol::JobPlan {
+        let workflow = preloop_gha_parser::parse_workflow(
+            "on: push\njobs:\n  gen:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        target: [a]\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("the test workflow must parse");
+        let expanded =
+            preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
+                &workflow,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                None,
+                Some("push"),
+            )
+            .expect("the test workflow must expand");
+        let mut plan = expanded
+            .jobs
+            .into_iter()
+            .find(|job| job.base_id == "gen")
+            .expect("the gen job must expand");
+        plan.id = JobId(id.to_owned());
+        plan.inputs = inputs;
+        plan
+    }
+
+    /// Minimal run state holding one deferred matrix node, optionally with
+    /// its stored plan (as `register_expanded_jobs` keeps deferred nodes).
+    fn deferred_expansion_state(
+        dispatch_inputs: BTreeMap<String, serde_json::Value>,
+        stored_plan: Option<preloop_gha_protocol::JobPlan>,
+        job_id: &str,
+    ) -> (InnerState, QueuedJob) {
+        let run_id = RunId::new();
+        let mut caller_plans = BTreeMap::new();
+        if let Some(plan) = stored_plan {
+            caller_plans.insert(JobId(job_id.to_owned()), plan);
+        }
+        let mut inner = InnerState {
+            pool_assignments_enabled: false,
+            ..Default::default()
+        };
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: std::sync::Arc::new(preloop_gha_protocol::WorkflowSubmission {
+                    dispatch_inputs,
+                    ..Default::default()
+                }),
+                jobs: BTreeMap::new(),
+                job_outputs: BTreeMap::new(),
+                job_base_ids: BTreeMap::new(),
+                job_needs: BTreeMap::new(),
+                caller_plans,
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        let mut job = test_queued_job(job_id);
+        job.run_id = run_id;
+        job.deferred_matrix = Some("${{ fromJSON(needs.plan.outputs.targets) }}".to_owned());
+        (inner, job)
+    }
+
+    fn matrix_scoped_inputs(
+        inner: &InnerState,
+        job: &QueuedJob,
+    ) -> BTreeMap<String, serde_json::Value> {
+        match plan_expansion(inner, job).expect("the deferred node must plan an expansion") {
+            ExpansionPlan::Matrix(inputs) => inputs.scoped_inputs,
+            ExpansionPlan::Reusable(_) => panic!("expected a matrix expansion plan"),
+        }
+    }
+
+    /// A deferred matrix node fans out with its own scoped `inputs`: the
+    /// root run's dispatch inputs for a top-level node, or the caller's
+    /// `with` values for a node inside a reusable workflow. A callee cell
+    /// must not see the root dispatch inputs, which are empty on a
+    /// push-triggered run while the caller passed real values.
+    #[test]
+    fn matrix_expansion_uses_deferred_node_scoped_inputs() {
+        // A top-level node has no stored plan; the fan-out falls back to the
+        // dispatch inputs the submit path stamped on every plan.
+        let dispatch = BTreeMap::from([("dry_run".to_owned(), serde_json::json!(true))]);
+        let (inner, job) = deferred_expansion_state(dispatch.clone(), None, "gen");
+        assert_eq!(
+            matrix_scoped_inputs(&inner, &job),
+            dispatch,
+            "a top-level deferred node must fan out with the dispatch inputs"
+        );
+
+        // A node inside a reusable workflow carries the caller's `with`
+        // values on its stored plan; the empty dispatch map of a
+        // push-triggered run must not erase them.
+        let with_values = BTreeMap::from([("mode".to_owned(), serde_json::json!("plan"))]);
+        let plan = stored_deferred_plan("call/gen", with_values.clone());
+        let (inner, job) = deferred_expansion_state(BTreeMap::new(), Some(plan), "call/gen");
+        assert_eq!(
+            matrix_scoped_inputs(&inner, &job),
+            with_values,
+            "a callee node must fan out with the caller's with values"
+        );
+
+        // When the run also has dispatch inputs, the node's own scoped
+        // inputs still win over the root map.
+        let plan = stored_deferred_plan("call/gen", with_values.clone());
+        let (inner, job) = deferred_expansion_state(dispatch, Some(plan), "call/gen");
+        assert_eq!(
+            matrix_scoped_inputs(&inner, &job),
+            with_values,
+            "the callee-scoped inputs must win over the root dispatch inputs"
         );
     }
 
