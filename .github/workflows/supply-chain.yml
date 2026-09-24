@@ -37,9 +37,15 @@ jobs:
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha }}"
-          # Ensure base is fetched for diff (fail closed on network/fetch error)
-          git fetch --no-tags --depth=1 origin "$base"
-          diff_files="$(git diff --name-only "$base" HEAD)"
+          pr_head="${{ github.event.pull_request.head.sha }}"
+          # Ensure base and PR head are fetched for diff (fail closed on
+          # network/fetch error)
+          git fetch --no-tags origin "$base" "$pr_head"
+          # Diff the merge base against the PR head, not the merge-checkout
+          # HEAD: HEAD is a synthetic merge commit, and identical changes on
+          # both sides would cancel out of the diff and hide a policy touch.
+          merge_base="$(git merge-base "$base" "$pr_head")"
+          diff_files="$(git diff --name-only "$merge_base" "$pr_head")"
 
           policy_files="$(echo "$diff_files" | grep -E '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' || true)"
           non_policy_files="$(echo "$diff_files" | grep -vE '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' | grep -v '^$' || true)"
