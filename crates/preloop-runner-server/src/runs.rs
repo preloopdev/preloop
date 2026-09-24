@@ -2417,12 +2417,22 @@ pub async fn submit_run(
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
         let run_id = accepted.run_id;
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.push_state = Some(PushState {
+                status: PushStatus::Pending,
+                error: None,
+                pr_number: None,
+                effective_sha: None,
+            });
+        }
+        drop(inner);
+
         if clean_push_checks {
-            // Report queued check runs for every job, exactly like the
-            // webhook adapter does for delivered events, so GitHub shows the
-            // run from the moment it is accepted. Jobs resolved terminal at
-            // submission (skipped, unsatisfiable needs) get their completion
-            // immediately.
+            // Report queued check runs for every job in a detached task, so
+            // submitting a run with --push does not stall the CLI client on
+            // sequential GitHub Check API calls. Jobs resolved terminal at
+            // submission get their completion reported immediately.
             let (repository, sha, jobs) = {
                 let inner = shared.state.inner.lock().await;
                 let Some(run) = inner.runs.get(&run_id) else {
@@ -2434,38 +2444,34 @@ pub async fn submit_run(
                     run.jobs.keys().cloned().collect::<Vec<_>>(),
                 )
             };
-            for job_id in &jobs {
-                if let Err(error) = crate::github::report_check_run_queued(
-                    &shared,
-                    &repository,
-                    &sha,
-                    job_id,
-                    run_id,
-                )
-                .await
-                {
-                    tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
-                }
-                let status = {
-                    let inner = shared.state.inner.lock().await;
-                    inner
-                        .runs
-                        .get(&run_id)
-                        .and_then(|run| run.jobs.get(job_id).copied())
-                };
-                if let Some(status) = status.filter(|status| status.is_terminal()) {
-                    crate::github::report_check_run_completed(&shared, run_id, job_id, status)
+            let reporter = Arc::clone(&shared);
+            tokio::spawn(async move {
+                for job_id in &jobs {
+                    if let Err(error) = crate::github::report_check_run_queued(
+                        &reporter,
+                        &repository,
+                        &sha,
+                        job_id,
+                        run_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                    }
+                    let status = {
+                        let inner = reporter.state.inner.lock().await;
+                        inner
+                            .runs
+                            .get(&run_id)
+                            .and_then(|run| run.jobs.get(job_id).copied())
+                    };
+                    if let Some(status) = status.filter(|status| status.is_terminal()) {
+                        crate::github::report_check_run_completed(
+                            &reporter, run_id, job_id, status,
+                        )
                         .await;
+                    }
                 }
-            }
-        }
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.push_state = Some(PushState {
-                status: PushStatus::Pending,
-                error: None,
-                pr_number: None,
-                effective_sha: None,
             });
         }
     }

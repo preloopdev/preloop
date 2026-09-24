@@ -1033,13 +1033,34 @@ pub async fn complete_job_inner(
         });
     }
 
-    github::report_check_run_completed(
-        &shared,
+    // Off the completion path on purpose: reporting check runs to GitHub is one
+    // or more network PATCH requests per job. Awaiting it here stalls the
+    // runner's HTTP finish request and delays pool slot turnover.
+    let mut check_reports = Vec::new();
+    check_reports.push((
         completion.run_id,
-        &completion.job_id,
+        completion.job_id.clone(),
         effective_status,
-    )
-    .await;
+    ));
+    for job_id in &cancelled_siblings {
+        check_reports.push((
+            completion.run_id,
+            job_id.clone(),
+            ExecutionStatus::Cancelled,
+        ));
+    }
+    for (run_id, job_id) in &scheduling.skipped {
+        check_reports.push((*run_id, job_id.clone(), ExecutionStatus::Skipped));
+    }
+    for (run_id, job_id) in &scheduling.failed {
+        check_reports.push((*run_id, job_id.clone(), ExecutionStatus::Failure));
+    }
+    let report_shared = Arc::clone(&shared);
+    tokio::spawn(async move {
+        for (run_id, job_id, status) in check_reports {
+            github::report_check_run_completed(&report_shared, run_id, &job_id, status).await;
+        }
+    });
 
     if scheduling.promoted > 0 || !cancelled_siblings.is_empty() || queue_nonempty {
         shared.state.message_notify.notify_waiters();
@@ -1055,13 +1076,6 @@ pub async fn complete_job_inner(
         })
         .await;
     for job_id in cancelled_siblings {
-        github::report_check_run_completed(
-            &shared,
-            completion.run_id,
-            &job_id,
-            ExecutionStatus::Cancelled,
-        )
-        .await;
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
@@ -1073,8 +1087,6 @@ pub async fn complete_job_inner(
             .await;
     }
     for (run_id, job_id) in scheduling.skipped {
-        github::report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Skipped)
-            .await;
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
@@ -1086,8 +1098,6 @@ pub async fn complete_job_inner(
             .await;
     }
     for (run_id, job_id) in scheduling.failed {
-        github::report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Failure)
-            .await;
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
