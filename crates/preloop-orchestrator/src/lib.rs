@@ -2481,14 +2481,14 @@ async fn adopt_golden<P: VmProvider>(
     fingerprint: &str,
     kind: &str,
 ) -> Result<bool, OrchestratorError> {
-    match golden_adopt_state(provider, config, golden, fingerprint).await {
+    let adopted = match golden_adopt_state(provider, config, golden, fingerprint).await {
         GoldenAdopt::Reusable => {
             info!(
                 machine = golden.as_str(),
                 fingerprint = %fingerprint,
                 "adopted the existing {kind} fork base"
             );
-            Ok(true)
+            true
         }
         GoldenAdopt::Rearm => {
             info!(
@@ -2509,10 +2509,28 @@ async fn adopt_golden<P: VmProvider>(
                 fingerprint = %fingerprint,
                 "adopted the existing {kind} fork base"
             );
-            Ok(true)
+            true
         }
-        GoldenAdopt::Rebuild => Ok(false),
+        GoldenAdopt::Rebuild => false,
+    };
+    if adopted {
+        // Issue #295's prune only ran on the fresh-bake path, so a golden
+        // adopted across restarts keeps its pack/ intermediates forever —
+        // and every fork copies them. Best-effort, same as the bake path.
+        match provider.prune_pack_intermediates(golden).await {
+            Ok(true) => info!(
+                machine = golden.as_str(),
+                "pruned pack/ build intermediates from adopted golden"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                machine = golden.as_str(),
+                %error,
+                "failed to prune pack/ build intermediates from adopted golden"
+            ),
+        }
     }
+    Ok(adopted)
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
@@ -2778,6 +2796,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         {
             self.prepare_artifact(true).await?;
         }
+        self.sweep_stale_artifacts().await;
         self.remove_stale_machines().await?;
 
         let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
@@ -3373,6 +3392,66 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Collect golden-artifact garbage the success paths leave behind.
+    ///
+    /// Two leaks live beside `artifact_stem` in `vms/`:
+    ///
+    /// - `.tmp-golden-*` staging files: the pack and download paths remove
+    ///   them on failures they observe, but a crash between `pack()` and the
+    ///   final `rename()` leaves a multi-GB file nothing ever revisits.
+    /// - `<stem>-<fingerprint>` payloads from earlier environment
+    ///   fingerprints: `artifact_payload()` rotates the filename on every
+    ///   bake-content change and `rebuild_artifact` deletes only the current
+    ///   one, so each rebake strands the previous packed golden.
+    ///
+    /// The current payload and the `goldens/` fingerprint directory are
+    /// always kept. Runs at pool startup, before `remove_stale_machines`.
+    async fn sweep_stale_artifacts(&self) {
+        let Some(directory) = self.config.artifact_stem.parent() else {
+            return;
+        };
+        let stem_name = self
+            .config
+            .artifact_stem
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let current_payload = self.config.artifact_payload();
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        let mut swept = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale_tmp = name.starts_with(".tmp-golden-");
+            // A stale payload is `<stem>-<64-hex>`: the fingerprint suffix
+            // shape keeps the sweep from touching unrelated files that happen
+            // to share the stem prefix.
+            let stale_payload = stem_name.as_deref().is_some_and(|stem| {
+                name.strip_prefix(stem).is_some_and(|suffix| {
+                    suffix.len() == 65
+                        && suffix.starts_with('-')
+                        && suffix[1..].chars().all(|c| c.is_ascii_hexdigit())
+                })
+            }) && path != current_payload;
+            if !stale_tmp && !stale_payload {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => swept += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to remove stale golden artifact"
+                ),
+            }
+        }
+        if swept > 0 {
+            info!(swept, directory = %directory.display(), "swept stale golden artifacts");
+        }
     }
 }
 
@@ -7902,6 +7981,85 @@ chmod +x "$dest/bin/node"
             golden_adopt_state(&provider, &config, &golden, "fp-1").await,
             GoldenAdopt::Rebuild
         );
+    }
+
+    /// An adopted golden never went through `prepare_packed_golden`, so the
+    /// #295 pack/ prune must fire on the adopt path too — otherwise a golden
+    /// carried across restarts keeps its intermediates forever and every
+    /// fork copies them.
+    #[tokio::test]
+    async fn adopted_golden_prunes_pack_intermediates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = packed_fork_config();
+        config.artifact_stem = temp.path().join("runner-image");
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        write_golden_record(&config, &golden, "fp-1");
+        provider
+            .create(&MachineSpec {
+                name: golden.clone(),
+                image: config.base_image.clone(),
+                cpus: config.cpus,
+                memory_mib: config.memory_mib,
+                storage_gib: config.storage_gib,
+                overlay_gib: None,
+                network: NetworkPolicy::PublicOnly,
+                volumes: Vec::new(),
+                sockets: Vec::new(),
+                dns: None,
+                rosetta: false,
+            })
+            .await
+            .unwrap();
+        provider.start(&golden).await.unwrap();
+
+        assert!(adopt_golden(&provider, &config, &golden, "fp-1", "golden")
+            .await
+            .unwrap());
+        assert_eq!(
+            *provider.prune_pack_calls.lock().await,
+            vec![golden.as_str().to_owned()],
+            "adopt path must prune pack intermediates"
+        );
+    }
+
+    /// `.tmp-golden-*` staging files and payloads from older environment
+    /// fingerprints are unreachable once written; the startup sweep reclaims
+    /// them while sparing the current payload and the goldens/ records.
+    #[tokio::test]
+    async fn sweep_stale_artifacts_removes_orphans_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-image-aarch64");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(
+            Arc::new(TestProvider::new(false, false, false, false, false)),
+            config.clone(),
+        )
+        .expect("pool config validates");
+
+        let current = config.artifact_payload();
+        std::fs::write(&current, b"current").unwrap();
+        let stale_payload = vms.join(format!("preloop-image-aarch64-{:064x}", 0xdeadbeef_u64));
+        std::fs::write(&stale_payload, b"stale").unwrap();
+        let tmp = vms.join(".tmp-golden-1234");
+        std::fs::write(&tmp, b"partial").unwrap();
+        // Same stem prefix but not a fingerprint suffix: must survive.
+        let unrelated = vms.join("preloop-image-aarch64-notes.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let goldens = vms.join("goldens");
+        std::fs::create_dir_all(&goldens).unwrap();
+
+        pool.sweep_stale_artifacts().await;
+
+        assert!(current.is_file(), "current payload survives");
+        assert!(!stale_payload.exists(), "stale payload is swept");
+        assert!(!tmp.exists(), "tmp-golden staging file is swept");
+        assert!(unrelated.is_file(), "unrelated file survives");
+        assert!(goldens.is_dir(), "goldens/ record dir survives");
     }
 
     #[tokio::test]
