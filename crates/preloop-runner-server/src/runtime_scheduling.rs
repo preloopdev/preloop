@@ -1155,6 +1155,7 @@ pub enum DependencyDecision {
 pub fn promote_ready_jobs(
     inner: &mut InnerState,
     environment_rules: &crate::config::EnvironmentRulesMap,
+    pool_labels: &[String],
 ) -> SchedulingOutcome {
     let mut outcome = SchedulingOutcome::default();
     loop {
@@ -1301,6 +1302,38 @@ pub fn promote_ready_jobs(
                                 labels = ?job.runs_on,
                                 platform,
                                 "no {platform} runner is registered; failing the job"
+                            );
+                            if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                run.jobs
+                                    .insert(job.job_id.clone(), ExecutionStatus::Failure);
+                                run.status = summarize_run(run.jobs.values().copied());
+                                finalize_run_if_complete(run);
+                            }
+                            outcome.failed.push((job.run_id, job.job_id));
+                            settled = true;
+                            continue;
+                        }
+                        // Advertised-pool validation, mirroring the submit-time
+                        // check that raw templates skip: the labels only became
+                        // concrete now, so this is their first validation.
+                        // When the pool has published its labels and they can
+                        // never satisfy the resolved `runs-on`, the job fails
+                        // here instead of starving in the queue. Skipped while
+                        // the labels are still raw templates (unresolvable) or
+                        // the pool hasn't published — the starvation sweep
+                        // remains the backstop there.
+                        let resolved_concrete =
+                            !job.runs_on.iter().any(|label| label.contains("${{"));
+                        if resolved_concrete
+                            && !pool_labels.is_empty()
+                            && !job_matches_runner(&job.runs_on, pool_labels)
+                        {
+                            tracing::warn!(
+                                run_id = %job.run_id.0,
+                                job = %job.job_id.0,
+                                labels = ?job.runs_on,
+                                pool_labels = ?pool_labels,
+                                "runs-on unsatisfiable by runner pool; failing the job"
                             );
                             if let Some(run) = inner.runs.get_mut(&job.run_id) {
                                 run.jobs
@@ -3529,7 +3562,11 @@ pub async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
         }
         let ready = apply_expansion(&mut inner, job, built, &mut outcome);
         inner.pending_jobs.extend(ready);
-        let promoted = promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+        let promoted = promote_ready_jobs(
+            &mut inner,
+            &shared.state.environment_rules,
+            &shared.state.pool_status.snapshot().labels,
+        );
         outcome.merge(promoted);
         shared
             .state
@@ -3904,7 +3941,7 @@ mod assignment_tests {
         inner.pending_jobs.push_back(release);
 
         let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
-        let outcome = promote_ready_jobs(&mut inner, &rules);
+        let outcome = promote_ready_jobs(&mut inner, &rules, &[]);
 
         assert_eq!(outcome.promoted, 1);
         let queued = inner.queue.front().expect("promoted job must be queued");
@@ -3979,7 +4016,7 @@ mod assignment_tests {
         inner.pending_jobs.push_back(release);
 
         let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
-        let outcome = promote_ready_jobs(&mut inner, &rules);
+        let outcome = promote_ready_jobs(&mut inner, &rules, &[]);
 
         assert_eq!(outcome.promoted, 1);
         let queued = inner.queue.front().expect("promoted job must be queued");
@@ -4063,12 +4100,98 @@ mod assignment_tests {
         inner.pending_jobs.push_back(release);
 
         let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
-        let outcome = promote_ready_jobs(&mut inner, &rules);
+        let outcome = promote_ready_jobs(&mut inner, &rules, &[]);
 
         assert_eq!(outcome.promoted, 0);
         assert!(
             outcome.failed.contains(&(run_id, release_id.clone())),
             "unhostable deferred label must fail the job"
+        );
+        assert!(inner.queue.is_empty(), "failed job must not be queued");
+        let run = inner.runs.get(&run_id).expect("run must exist");
+        assert_eq!(
+            run.jobs.get(&release_id),
+            Some(&ExecutionStatus::Failure),
+            "dependents must see a terminal status"
+        );
+    }
+
+    /// A deferred label that resolves to a concrete label the runner pool
+    /// never advertised fails at promotion, mirroring the submit-time
+    /// pool-label check that raw templates skip. Without it the job would
+    /// sit in the queue behind runners that can never claim it.
+    #[test]
+    fn promote_fails_deferred_runs_on_pool_cannot_satisfy() {
+        let run_id = RunId::new();
+        let plan_id = JobId("plan".to_owned());
+        let release_id = JobId("release".to_owned());
+
+        let mut release = test_queued_job("release");
+        release.run_id = run_id;
+        release.needs = vec![plan_id.clone()];
+        release.runs_on = vec!["${{ needs.plan.outputs.runner }}".to_owned()];
+
+        let mut inner = InnerState {
+            ..Default::default()
+        };
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
+                jobs: BTreeMap::from([
+                    (plan_id.clone(), ExecutionStatus::Success),
+                    (release_id.clone(), ExecutionStatus::Queued),
+                ]),
+                job_outputs: BTreeMap::from([(
+                    plan_id.clone(),
+                    BTreeMap::from([("runner".to_owned(), serde_json::json!("gpu-large"))]),
+                )]),
+                job_base_ids: BTreeMap::from([
+                    (plan_id.clone(), "plan".to_owned()),
+                    (release_id.clone(), "release".to_owned()),
+                ]),
+                job_needs: BTreeMap::from([(release_id.clone(), vec![plan_id.clone()])]),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        inner.pending_jobs.push_back(release);
+
+        let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
+        let pool_labels = vec!["ubuntu-latest".to_owned()];
+        let outcome = promote_ready_jobs(&mut inner, &rules, &pool_labels);
+
+        assert_eq!(outcome.promoted, 0);
+        assert!(
+            outcome.failed.contains(&(run_id, release_id.clone())),
+            "deferred label the pool cannot satisfy must fail the job"
         );
         assert!(inner.queue.is_empty(), "failed job must not be queued");
         let run = inner.runs.get(&run_id).expect("run must exist");

@@ -2296,7 +2296,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // (typically none) are reified by a first promote sweep: needs-free
         // callers acquire their JobSet gates and materialize their callee
         // subtree immediately.
-        promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+        promote_ready_jobs(
+            &mut inner,
+            &shared.state.environment_rules,
+            &shared.state.pool_status.snapshot().labels,
+        );
         // A submission whose every job concluded before it reached the queue
         // (all skipped by `if:`, or none hostable) never passes through the
         // completion path, so nothing else would ever stamp `completed_at` and
@@ -3705,6 +3709,7 @@ pub async fn approve_job(
             crate::runtime_scheduling::promote_ready_jobs(
                 &mut inner,
                 &shared.state.environment_rules,
+                &shared.state.pool_status.snapshot().labels,
             );
             crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
             if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -3728,8 +3733,11 @@ pub async fn approve_job(
         note = body.note.as_deref().unwrap_or_default(),
         "environment approval recorded"
     );
-    let outcome =
-        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    let outcome = crate::runtime_scheduling::promote_ready_jobs(
+        &mut inner,
+        &shared.state.environment_rules,
+        &shared.state.pool_status.snapshot().labels,
+    );
     shared
         .state
         .queue_depth
@@ -3859,8 +3867,11 @@ pub async fn approve_fork(
         note = body.note.as_deref().unwrap_or_default(),
         "fork-PR approval recorded; run released"
     );
-    let outcome =
-        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    let outcome = crate::runtime_scheduling::promote_ready_jobs(
+        &mut inner,
+        &shared.state.environment_rules,
+        &shared.state.pool_status.snapshot().labels,
+    );
     shared
         .state
         .queue_depth
