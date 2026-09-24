@@ -2309,9 +2309,29 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     //    starts in `pending`.
     let accepted = submit_push_run(&app, SHA, TREE).await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let parsed_run_id: RunId = run_id.parse().unwrap();
+    // Check-run creation on submit is detached from the HTTP response, so
+    // wait for the background reporting task to populate the check run id.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let ready = {
+                let inner = state.inner.lock().await;
+                inner
+                    .runs
+                    .get(&parsed_run_id)
+                    .is_some_and(|r| !r.job_check_run_ids.is_empty())
+            };
+            if ready {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued check run at submit");
     {
         let inner = state.inner.lock().await;
-        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
+        let run = inner.runs.get(&parsed_run_id).unwrap();
         assert_eq!(run.job_check_run_ids.len(), 1, "queued check run at submit");
         assert_eq!(
             *run.job_check_run_ids.values().next().unwrap(),
