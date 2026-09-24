@@ -113,26 +113,6 @@ pub fn has_expressions(input: &str) -> bool {
     input.contains("${{")
 }
 
-/// Evaluate `input` as one whole `${{ expr }}` expression and return the raw
-/// value, or `None` when the input is not exactly one expression (no
-/// expression at all, or an expression mixed with other text).
-///
-/// `runs-on` needs the raw value (not its string rendering) so a whole
-/// expression that yields a list can be unpacked into individual labels.
-pub(crate) fn whole_expression_value(
-    input: &str,
-    context: &Context,
-) -> Option<Result<Value, String>> {
-    let rest = input.trim().strip_prefix("${{")?;
-    let end = find_expression_end(rest)?;
-    if !rest[end + 2..].trim().is_empty() {
-        // Text after the expression means this is not a whole expression.
-        return None;
-    }
-    let expr = rest[..end].trim();
-    Some(eval_expression(expr, context).map_err(|e| format!("{e}")))
-}
-
 /// Resolve a map of string values, evaluating all `${{ }}` expressions.
 pub fn resolve_map(
     map: &BTreeMap<String, String>,
@@ -740,8 +720,40 @@ pub fn build_context(
 /// property to "". Resolving early therefore replaces a real value with an
 /// empty string, with nothing to catch it — which is exactly why this
 /// predicate exists instead of a `let _ = resolve(...)` at each call site.
+///
+/// The `needs` check inspects the *parsed* expression rather than searching
+/// for a literal `needs.` / `needs[` substring: the expression lexer skips
+/// whitespace, so `needs ['plan']` parses exactly like `needs['plan']`, and a
+/// substring search would miss the spaced form, let the label evaluate to ""
+/// at build time, and leave an empty `runs-on` that matches any runner.
 pub fn resolves_after_job_build(value: &str) -> bool {
-    value.contains("github.workspace") || value.contains("needs.") || value.contains("needs[")
+    if value.contains("github.workspace") {
+        return true;
+    }
+    let mut rest = value;
+    while let Some(start) = rest.find("${{") {
+        let after = &rest[start + 3..];
+        let Some(end) = find_expression_end(after) else {
+            break;
+        };
+        let body = &after[..end];
+        match preloop_gha_expressions::collect_expression_references(body) {
+            Ok(references) => {
+                if references.contexts.contains("needs") {
+                    return true;
+                }
+            }
+            Err(_) => {
+                // Unparseable span: stay conservative. If it mentions `needs`
+                // at all, defer rather than risk evaluating it to "" early.
+                if body.to_ascii_lowercase().contains("needs") {
+                    return true;
+                }
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -764,6 +776,50 @@ mod tests {
         ctx.insert("env", Value::Object(env));
         ctx.insert("matrix", json!({"os": "ubuntu-latest", "node": "18"}));
         ctx
+    }
+
+    #[test]
+    fn deferred_predicate_detects_needs_in_all_accessor_forms() {
+        // The lexer skips whitespace, so the spaced bracket form parses
+        // exactly like the tight form; the predicate must catch both.
+        for value in [
+            "${{ needs.plan.outputs.runner }}",
+            "${{ needs['plan'].outputs.runner }}",
+            "${{ needs ['plan'].outputs.runner }}",
+            "${{ needs .plan.outputs.runner }}",
+            "${{ NEEDS.plan.outputs.runner }}",
+            "prefix-${{ needs.plan.outputs.suffix }}",
+            "${{ matrix.os }}-${{ needs.plan.outputs.suffix }}",
+        ] {
+            assert!(
+                resolves_after_job_build(value),
+                "expected deferral for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_predicate_ignores_unrelated_contexts() {
+        for value in [
+            "ubuntu-latest",
+            "${{ matrix.os }}",
+            "${{ github.event_name }}",
+            "${{ format('{0}', needsX) }}",
+        ] {
+            assert!(
+                !resolves_after_job_build(value),
+                "expected no deferral for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_predicate_keeps_github_workspace_and_parse_failures_conservative() {
+        assert!(resolves_after_job_build("${{ github.workspace }}/bin"));
+        assert!(resolves_after_job_build("plain github.workspace text"));
+        // Unparseable span mentioning needs still defers rather than
+        // evaluating to "" at build time.
+        assert!(resolves_after_job_build("${{ needs..broken }}"));
     }
 
     #[test]

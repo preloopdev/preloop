@@ -1109,6 +1109,123 @@ jobs:
     assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
 }
 
+/// A build-time expression that yields zero labels (an empty array, or an
+/// array of only empty strings) keeps its raw labels: an empty label list
+/// matches every runner, so dropping them would make the job schedulable on
+/// an arbitrary machine. The raw expression matches no runner, and the job
+/// starves instead.
+#[test]
+fn empty_array_runs_on_keeps_raw_labels() {
+    for expression in ["${{ fromJSON('[]') }}", "${{ fromJSON('[\"\"]') }}"] {
+        let workflow = parse_workflow(&format!(
+            r#"
+on: push
+jobs:
+  job:
+    runs-on: {expression}
+    steps:
+      - run: echo hi
+"#,
+        ))
+        .unwrap();
+        let jobs = expand_jobs(&workflow).unwrap();
+
+        assert_eq!(
+            jobs[0].runs_on,
+            vec![expression.to_owned()],
+            "expression {expression:?} must stay unschedulable"
+        );
+    }
+}
+
+/// A `needs` reference with whitespace before the bracket still ships raw: the
+/// expression lexer ignores the space, so without parsed detection the label
+/// would evaluate to "" at build time and leave an empty, match-any
+/// `runs-on`.
+#[test]
+fn spaced_bracket_needs_runs_on_stays_raw() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ubuntu-latest
+    steps:
+      - run: echo ok
+  release:
+    needs: plan
+    runs-on: ${{ needs ['plan'].outputs.runner }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    let release = jobs.iter().find(|job| job.base_id == "release").unwrap();
+    assert_eq!(
+        release.runs_on,
+        vec!["${{ needs ['plan'].outputs.runner }}"]
+    );
+}
+
+/// `runs-on: ${{ matrix.os }}` is the most common shape in real workflows
+/// (tokio, caddy, uv). An unresolved label is one no runner can advertise, so
+/// the cell queues forever and the cause looks like a scheduling bug.
+#[test]
+fn matrix_runs_on_resolves_per_combination() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    let labels: Vec<Vec<String>> = jobs.iter().map(|job| job.runs_on.clone()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            vec!["ubuntu-latest".to_owned()],
+            vec!["ubuntu-22.04".to_owned()]
+        ]
+    );
+}
+
+/// The list form carries expressions too, and a literal label beside an
+/// expression must survive untouched.
+#[test]
+fn matrix_runs_on_resolves_inside_a_label_list() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  cell:
+    strategy:
+      matrix:
+        include:
+          - arch: X64
+    runs-on: [self-hosted, "${{ matrix.arch }}"]
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "X64"]);
+}
+
 /// A `runs-on` expression reading `needs.*` must not be evaluated at expansion
 /// time: the needed job has not run yet, so the resolver would coalesce the
 /// missing output to "" and the job could never match a runner (it starves).
@@ -1179,61 +1296,6 @@ jobs:
         cell.runs_on,
         vec!["${{ matrix.os }}-${{ needs.plan.outputs.suffix }}"]
     );
-}
-
-/// `runs-on: ${{ matrix.os }}` is the most common shape in real workflows
-/// (tokio, caddy, uv). An unresolved label is one no runner can advertise, so
-/// the cell queues forever and the cause looks like a scheduling bug.
-#[test]
-fn matrix_runs_on_resolves_per_combination() {
-    let workflow = parse_workflow(
-        r#"
-on: push
-jobs:
-  cell:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, ubuntu-22.04]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - run: echo hi
-"#,
-    )
-    .unwrap();
-    let jobs = expand_jobs(&workflow).unwrap();
-
-    let labels: Vec<Vec<String>> = jobs.iter().map(|job| job.runs_on.clone()).collect();
-    assert_eq!(
-        labels,
-        vec![
-            vec!["ubuntu-latest".to_owned()],
-            vec!["ubuntu-22.04".to_owned()]
-        ]
-    );
-}
-
-/// The list form carries expressions too, and a literal label beside an
-/// expression must survive untouched.
-#[test]
-fn matrix_runs_on_resolves_inside_a_label_list() {
-    let workflow = parse_workflow(
-        r#"
-on: push
-jobs:
-  cell:
-    strategy:
-      matrix:
-        include:
-          - arch: X64
-    runs-on: [self-hosted, "${{ matrix.arch }}"]
-    steps:
-      - run: echo hi
-"#,
-    )
-    .unwrap();
-    let jobs = expand_jobs(&workflow).unwrap();
-
-    assert_eq!(jobs[0].runs_on, vec!["self-hosted", "X64"]);
 }
 
 /// A whole `runs-on` expression that yields a list must be unpacked into

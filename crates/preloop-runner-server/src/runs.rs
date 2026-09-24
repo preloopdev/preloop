@@ -2110,7 +2110,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
 
             let needs_empty = queued_job.needs.is_empty();
-            if needs_empty {
+            if needs_empty && queued_job.runs_on.iter().any(|label| label.contains("${{")) {
                 // A job with no `needs` never passes through the promotion
                 // path, so `runs-on` labels left raw at build time (they read
                 // `needs.*`, which is empty for a needs-less job) are finished

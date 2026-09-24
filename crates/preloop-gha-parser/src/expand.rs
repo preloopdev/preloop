@@ -144,16 +144,26 @@ fn resolved_runs_on(
     inputs: Option<&BTreeMap<String, Value>>,
 ) -> Vec<String> {
     let context = expression_context(matrix, inputs, None);
-    labels
-        .into_iter()
+    let resolved: Vec<String> = labels
+        .iter()
         .flat_map(|label| {
-            if crate::eval::resolves_after_job_build(&label) {
-                return vec![label];
+            if crate::eval::resolves_after_job_build(label) {
+                return vec![label.clone()];
             }
-            crate::eval::resolve_runs_on_label(&label, &context)
+            crate::eval::resolve_runs_on_label(label, &context)
         })
         .filter(|label| !label.trim().is_empty())
-        .collect()
+        .collect();
+    if resolved.is_empty() && !labels.is_empty() {
+        // An empty label list matches every runner (`job_matches_runner([], ..)`
+        // is true), so a build-time expression that produced zero labels —
+        // e.g. `${{ fromJSON('[]') }}` or an array of only empty strings —
+        // would become schedulable on an arbitrary runner. Keep the raw labels
+        // instead: they match no runner, so the job starves and is failed by
+        // the starvation sweep rather than running on the wrong machine.
+        return labels;
+    }
+    resolved
 }
 
 fn resolved_continue_on_error(
