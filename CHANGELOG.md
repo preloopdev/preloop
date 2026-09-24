@@ -8,7 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.33.6] - 2026-09-24
+
+### Fixed
+
+- **Forks pass `--freeze-source` instead of an env pin**: the
+  `SMOLVM_BRANCH_CONTINUE=0` pin shipped in 0.33.5 was a no-op — upstream
+  PR #1376 delivered the mechanism as `machine fork --freeze-source`, not an
+  environment variable. `SmolVmProvider::fork` now passes the flag on every
+  fork, so goldens actually stay frozen as reusable branch bases on Linux
+  and macOS.
+- **Rotated the pinned release-signing key**: the private key matching the
+  public key pinned in 0.33.5 was unrecoverable, so
+  `PRELOOP_RELEASE_SIGNING_KEY` could never be set and the release
+  workflow's signing step hard-failed. A fresh RSA-3072 keypair replaces the
+  pin; the private key is stored as the repo secret. Safe to rotate because
+  the pin first shipped in 0.33.5 — no released updater ever verified a
+  signature against the old key.
+
 ## [0.33.5] - 2026-09-24
+
 
 ### Added
 - **SmolVM 1.18.1 runtime floor and golden pin**: `smolvm_min_version` and
