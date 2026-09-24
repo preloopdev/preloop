@@ -3258,3 +3258,177 @@ jobs:
     assert!(jobs.iter().any(|j| j.name == "Build ubuntu-latest / test"));
     assert!(jobs.iter().any(|j| j.name == "Build macos-latest / test"));
 }
+
+/// Issue #286: a `with:` expression on a reusable workflow caller must be
+/// evaluated in the caller's context (its inputs and matrix), the way
+/// literals already flow through. Before the fix the raw `${{ }}` text
+/// survived expansion and the server then replaced the whole input map
+/// with the dispatch inputs, so the callee saw an empty value.
+#[test]
+fn reusable_with_expression_evaluated_in_caller_context() {
+    fn expand_caller(
+        caller_yaml: &str,
+        dispatch_inputs: &BTreeMap<String, serde_json::Value>,
+    ) -> ExpandedWorkflows {
+        let callee_yaml = r#"
+on:
+  workflow_call:
+    inputs:
+      mode: { type: string, required: true }
+      flag: { type: boolean, required: false, default: false }
+jobs:
+  callee:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "callee inputs.mode=[${{ inputs.mode }}]"
+"#;
+        let caller = parse_workflow(caller_yaml).unwrap();
+        let mut reusables = BTreeMap::new();
+        reusables.insert(
+            ".github/workflows/callee.yml".to_owned(),
+            callee_yaml.to_owned(),
+        );
+        let expanded = expand_jobs_with_reusables_and_shas_and_inputs(
+            &caller,
+            &reusables,
+            &BTreeMap::new(),
+            Some(dispatch_inputs),
+        )
+        .unwrap();
+        let called = parse_workflow(callee_yaml).unwrap();
+        let caller_plan = expanded
+            .jobs
+            .iter()
+            .find(|j| j.reusable_call.is_some())
+            .unwrap()
+            .clone();
+        expand_reusable_call(&called, &caller_plan, &reusables, &BTreeMap::new()).unwrap()
+    }
+
+    let caller_yaml = r#"
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run: { type: boolean, default: false }
+jobs:
+  infra:
+    uses: ./.github/workflows/callee.yml
+    with:
+      mode: ${{ inputs.dry_run && 'plan' || 'apply' }}
+      flag: ${{ inputs.dry_run }}
+"#;
+
+    // dry_run: true -> the caller passes "plan", not the raw expression.
+    let mut dispatch = BTreeMap::new();
+    dispatch.insert("dry_run".to_owned(), serde_json::json!(true));
+    let subtree = expand_caller(caller_yaml, &dispatch);
+    let inner = subtree
+        .jobs
+        .iter()
+        .find(|j| j.base_id.ends_with("/callee"))
+        .unwrap();
+    assert_eq!(
+        inner.inputs.get("mode"),
+        Some(&serde_json::json!("plan")),
+        "expression in with: must be evaluated against the caller inputs"
+    );
+    // The boolean expression re-coerces to a real boolean, like a literal.
+    assert_eq!(inner.inputs.get("flag"), Some(&serde_json::json!(true)));
+
+    // dry_run: false (explicit) -> "apply".
+    let mut dispatch = BTreeMap::new();
+    dispatch.insert("dry_run".to_owned(), serde_json::json!(false));
+    let subtree = expand_caller(caller_yaml, &dispatch);
+    let inner = subtree
+        .jobs
+        .iter()
+        .find(|j| j.base_id.ends_with("/callee"))
+        .unwrap();
+    assert_eq!(inner.inputs.get("mode"), Some(&serde_json::json!("apply")));
+    assert_eq!(inner.inputs.get("flag"), Some(&serde_json::json!(false)));
+
+    // With no inputs known at all (a plan preview, for example), evaluation
+    // is best-effort: `mode` still resolves through the falsy branch, while
+    // `flag` keeps its raw expression instead of failing the parse.
+    let subtree = expand_caller(caller_yaml, &BTreeMap::new());
+    let inner = subtree
+        .jobs
+        .iter()
+        .find(|j| j.base_id.ends_with("/callee"))
+        .unwrap();
+    assert_eq!(inner.inputs.get("mode"), Some(&serde_json::json!("apply")));
+    assert_eq!(
+        inner.inputs.get("flag").and_then(|v| v.as_str()),
+        Some("${{ inputs.dry_run }}")
+    );
+
+    // A literal with: value still passes through untouched.
+    let literal_yaml = caller_yaml.replace(
+        "mode: ${{ inputs.dry_run && 'plan' || 'apply' }}",
+        "mode: always-plan",
+    );
+    let subtree = expand_caller(&literal_yaml, &BTreeMap::new());
+    let inner = subtree
+        .jobs
+        .iter()
+        .find(|j| j.base_id.ends_with("/callee"))
+        .unwrap();
+    assert_eq!(
+        inner.inputs.get("mode"),
+        Some(&serde_json::json!("always-plan"))
+    );
+}
+
+/// Issue #286: a static-matrix caller evaluates `with:` per matrix cell.
+#[test]
+fn reusable_with_expression_resolved_per_matrix_cell() {
+    let caller_yaml = r#"
+on: { workflow_dispatch: {} }
+jobs:
+  infra:
+    strategy:
+      matrix:
+        region: [us, eu]
+    uses: ./.github/workflows/callee.yml
+    with:
+      mode: ${{ matrix.region }}
+"#;
+    let callee_yaml = r#"
+on:
+  workflow_call:
+    inputs:
+      mode: { type: string, required: true }
+jobs:
+  callee:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ inputs.mode }}"
+"#;
+    let caller = parse_workflow(caller_yaml).unwrap();
+    let mut reusables = BTreeMap::new();
+    reusables.insert(
+        ".github/workflows/callee.yml".to_owned(),
+        callee_yaml.to_owned(),
+    );
+    let expanded = expand_jobs_with_reusables_and_shas_and_inputs(
+        &caller,
+        &reusables,
+        &BTreeMap::new(),
+        Some(&BTreeMap::new()),
+    )
+    .unwrap();
+    let mut modes: Vec<String> = expanded
+        .jobs
+        .iter()
+        .filter(|j| j.reusable_call.is_some())
+        .map(|j| {
+            j.inputs
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    modes.sort();
+    assert_eq!(modes, vec!["eu".to_owned(), "us".to_owned()]);
+}

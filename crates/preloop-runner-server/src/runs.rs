@@ -951,7 +951,21 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let reusable_calls = expanded.reusable_calls;
     if !submission.dispatch_inputs.is_empty() {
         for job in &mut jobs {
-            job.inputs = submission.dispatch_inputs.clone();
+            if job.reusable_call.is_some() {
+                // A reusable caller's `inputs` are the evaluated `with:`
+                // values destined for the callee; overwriting them with the
+                // dispatch inputs drops every input the call passes, so the
+                // callee sees empty values. The caller's own gates still
+                // need the dispatch inputs in context, so merge them
+                // underneath instead of replacing.
+                for (name, value) in &submission.dispatch_inputs {
+                    job.inputs
+                        .entry(name.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            } else {
+                job.inputs = submission.dispatch_inputs.clone();
+            }
         }
     }
 

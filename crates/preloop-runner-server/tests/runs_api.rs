@@ -3475,3 +3475,54 @@ async fn runner_protocol_errors_use_official_envelopes_without_changing_native_a
     assert_eq!(body["error"], "run not found");
     assert!(body.get("typeName").is_none());
 }
+
+/// Issue #286: dispatch inputs must not erase a reusable caller's evaluated
+/// `with:` values. The submit path used to overwrite the caller
+/// placeholder's whole input map with the dispatch inputs, so the callee
+/// saw an empty `mode` instead of the evaluated "plan".
+#[tokio::test]
+async fn dispatch_inputs_do_not_erase_reusable_caller_with_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let caller_yaml = "on:\n  workflow_dispatch:\n    inputs:\n      dry_run: { type: boolean, default: false }\njobs:\n  infra:\n    uses: ./.github/workflows/callee.yml\n    with:\n      mode: ${{ inputs.dry_run && 'plan' || 'apply' }}\n";
+    let callee_yaml = "on:\n  workflow_call:\n    inputs:\n      mode: { type: string, required: true }\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{ inputs.mode }}\"\n";
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": caller_yaml,
+            "event": "workflow_dispatch",
+            "payload": {"inputs": {"dry_run": true}},
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/main",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+    assert_eq!(accepted["queued_jobs"], 1);
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let inner = state.inner.lock().await;
+    let run = inner.runs.get(&run_id).expect("the run must be recorded");
+    let caller_plan = run
+        .caller_plans
+        .values()
+        .find(|plan| plan.reusable_call.is_some())
+        .expect("the caller placeholder must be recorded");
+    // The expression was evaluated in the caller context at parse time...
+    assert_eq!(
+        caller_plan.inputs.get("mode").and_then(|v| v.as_str()),
+        Some("plan"),
+        "the callee input must keep its evaluated value, not be erased"
+    );
+    // ...and the dispatch inputs stay available to the caller's own gates.
+    assert_eq!(
+        caller_plan.inputs.get("dry_run"),
+        Some(&json!(true)),
+        "dispatch inputs must still reach the caller's own if:/name: context"
+    );
+}
