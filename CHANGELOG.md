@@ -13,15 +13,14 @@ Releases before v0.27.0 predate the changelog.
 ### Added
 - **SmolVM 1.18.1 runtime floor and golden pin**: `smolvm_min_version` and
   `smolvm_golden_version` both move to v1.18.1, the first upstream release
-  carrying `SMOLVM_BRANCH_CONTINUE` (smol-machines/smolvm#1376) — the
+  carrying `machine fork --freeze-source` (smol-machines/smolvm#1376) — the
   upstreamed form of the retained fork patch. `preloop update
   --ensure-runtime` now upgrades any engine below it.
-- **Frozen fork bases on every platform**: `SmolVmProvider` pins
-  `SMOLVM_BRANCH_CONTINUE=0` on all lifecycle invocations, disabling live
-  forking on Linux/x86_64 and macOS alike. Live forking resumed the golden
-  onto new CoW layers per fork, accumulating qcow2 backing layers until
-  `MAX_FORK_LINEAGE_DEPTH` (32) wedged the pool; the frozen base serves
-  arbitrary fanout from one retained checkpoint.
+- **Frozen fork bases on every platform**: `SmolVmProvider::fork` passes
+  `--freeze-source`, disabling live forking on Linux/x86_64 and macOS alike.
+  Live forking resumed the golden onto new CoW layers per fork, accumulating
+  qcow2 backing layers until `MAX_FORK_LINEAGE_DEPTH` (32) wedged the pool;
+  the frozen base serves arbitrary fanout from one retained checkpoint.
 
 - **Guest Liveness Watchdog**: Runner execution streams (`run_until_exit`) now race a guest liveness watchdog (`true` probe every 60s with 30s timeout). After 3 consecutive failed probes, the stream is aborted with `VmError::GuestUnresponsive`, preventing wedged runner VMs from holding pool slots indefinitely.
 - **Transitory Fork Retries**: The orchestrator now retries transient packed-golden fork failures (`FORK_RETRY_ATTEMPTS = 2`) before falling back to cold image instantiation, shielding pool replenishment from transient hypervisor or agent initialization jitter.

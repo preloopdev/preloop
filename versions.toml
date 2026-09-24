@@ -1,12 +1,12 @@
 runner_version = "2.336.0"
 
 # SmolVM runtime floor: v1.18.1 is the first release that carries
-# SMOLVM_BRANCH_CONTINUE (upstream PR #1376), the env knob preloop-vm pins to
-# `0` so `machine fork` keeps the golden frozen as a reusable branch base
-# instead of live-forking it onto new CoW layers. Live forking accumulates
-# qcow2 backing layers until MAX_FORK_LINEAGE_DEPTH (32) wedges the pool, and
-# on macOS it re-checkpoints the source on every fork — the failure mode the
-# retained fork patch fixed before upstream carried the knob. The floor also
+# `machine fork --freeze-source` (upstream PR #1376), which preloop-vm passes
+# on every fork so the golden stays frozen as a reusable branch base instead
+# of live-forking onto new CoW layers. Live forking accumulates qcow2 backing
+# layers until MAX_FORK_LINEAGE_DEPTH (32) wedges the pool, and on macOS it
+# re-checkpoints the source on every fork — the failure mode the retained
+# fork patch fixed before upstream carried the flag. The floor also
 # still covers packed-machine UID/GID metadata restoration (v1.8.1) for an
 # UNPRIVILEGED smolvm; run as root, the per-VM uid drop presents packed layers
 # through a count-1 idmapped mount and every non-zero uid surfaces as the

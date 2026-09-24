@@ -76,9 +76,10 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 ///
 /// The configured floor is the first release that satisfies all runtime
 /// invariants: packed-machine ownership preservation (v1.8.1) and
-/// `SMOLVM_BRANCH_CONTINUE` (v1.18.1), which preloop-vm pins to `0` so golden
-/// forks keep a frozen reusable branch base instead of live-forking the
-/// source. Newer stable releases satisfy it without another code change.
+/// `machine fork --freeze-source` (v1.18.1), which preloop-vm passes on every
+/// fork so goldens keep a frozen reusable branch base instead of
+/// live-forking the source. Newer stable releases satisfy it without another
+/// code change.
 static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
     Version::parse(SMOLVM_MIN_VERSION)
         .expect("smolvm_min_version in versions.toml must be a semver version")
