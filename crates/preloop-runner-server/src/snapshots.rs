@@ -2672,6 +2672,106 @@ pub async fn discard_workspace_snapshot(state_dir: &FsPath, run_id: RunId) {
     }
 }
 
+/// Reap workspace snapshots whose deletion timer died with the last engine.
+///
+/// [`discard_workspace_snapshot`] is scheduled by an in-process
+/// `tokio::spawn(sleep(retention))` at run completion; a restart inside the
+/// retention window orphans the repository permanently because nothing else
+/// ever looks at `state/snapshots/`. Called once at startup after the store
+/// has restored runs:
+///
+/// - live (non-terminal) runs keep their snapshot — jobs may still check out;
+/// - terminal runs inside the retention window get their discard timer
+///   re-armed for the remaining time;
+/// - terminal runs past retention, and directories whose run no longer
+///   exists in memory, are deleted now;
+/// - an unparseable or very young entry is left alone: a snapshot being
+///   written right now must not be swept out from under its run.
+pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
+    let retention = std::time::Duration::from_secs(shared.state.snapshot_retention_seconds);
+    let runs: std::collections::BTreeMap<
+        RunId,
+        (ExecutionStatus, Option<chrono::DateTime<chrono::Utc>>),
+    > = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runs
+            .iter()
+            .map(|(id, run)| (*id, (run.status, run.completed_at)))
+            .collect()
+    };
+    let snapshots_dir = shared.state.state_dir.join("snapshots");
+    let mut entries = match tokio::fs::read_dir(&snapshots_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(
+                path = %snapshots_dir.display(),
+                %error,
+                "Failed to list workspace snapshots for startup sweep"
+            );
+            return;
+        }
+    };
+    let mut swept = 0usize;
+    let mut rearmed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(run_id) = name.parse::<RunId>() else {
+            continue;
+        };
+        match runs.get(&run_id) {
+            Some((status, _)) if !status.is_terminal() => {}
+            Some((_, completed_at)) => {
+                let age = match completed_at {
+                    Some(at) => Some(
+                        chrono::Utc::now()
+                            .signed_duration_since(*at)
+                            .to_std()
+                            .unwrap_or_default(),
+                    ),
+                    None => entry_age(&path).await,
+                };
+                match age {
+                    Some(age) if age >= retention => {
+                        discard_workspace_snapshot(&shared.state.state_dir, run_id).await;
+                        swept += 1;
+                    }
+                    Some(age) => {
+                        // The completion-time discard died with the last
+                        // process; re-arm it for the remaining window so the
+                        // snapshot still expires on schedule.
+                        let state_dir = shared.state.state_dir.clone();
+                        let remaining = retention - age;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(remaining).await;
+                            discard_workspace_snapshot(&state_dir, run_id).await;
+                        });
+                        rearmed += 1;
+                    }
+                    None => {}
+                }
+            }
+            // No run record survived the restart — the snapshot can never be
+            // referenced again. Keep only entries young enough to plausibly
+            // still be mid-write.
+            None => match entry_age(&path).await {
+                Some(age) if age >= retention => {
+                    discard_workspace_snapshot(&shared.state.state_dir, run_id).await;
+                    swept += 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    if swept > 0 || rearmed > 0 {
+        info!(swept, rearmed, "Swept orphaned workspace snapshots");
+    }
+}
+
 /// Marker file recording when a run-scoped cache became releasable.
 const RELEASED_MARKER: &str = "preloop-released-at";
 
@@ -4958,6 +5058,142 @@ mod remote_checkout_cache_tests {
         .unwrap();
         assert_eq!(response["objects"][0]["error"]["code"], 404);
         assert_eq!(forge.batch_hits.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_sweep_tests {
+    use super::*;
+
+    fn run_record(
+        status: ExecutionStatus,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> RunRecord {
+        RunRecord {
+            run_id: RunId::new(),
+            webhook_delivery_id: None,
+            run_name: None,
+            submission: Arc::new(WorkflowSubmission::default()),
+            jobs: BTreeMap::new(),
+            status,
+            job_outputs: BTreeMap::new(),
+            job_base_ids: BTreeMap::new(),
+            job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
+            job_check_run_ids: BTreeMap::new(),
+            reusable_calls: BTreeMap::new(),
+            jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at,
+            run_number: 1,
+            run_attempt: 1,
+            workflow_path_str: ".github/workflows/ci.yml".to_owned(),
+            event: "push".to_owned(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing: None,
+            fork_approval_pending: false,
+            fork_approval_requested_at_unix_nanos: None,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
+        }
+    }
+
+    async fn fixture(retention_seconds: u64) -> (tempfile::TempDir, Arc<SharedState>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+        state.snapshot_retention_seconds = retention_seconds;
+        let shared = Arc::new(SharedState {
+            state,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        (temp, shared)
+    }
+
+    fn snapshot_dir(shared: &SharedState, run_id: RunId) -> PathBuf {
+        let dir = shared
+            .state
+            .state_dir
+            .join("snapshots")
+            .join(run_id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A restart inside the retention window used to orphan the snapshot
+    /// forever: the discard timer is in-process. The startup sweep must
+    /// collect terminal runs past retention and snapshots whose run record
+    /// never restored, while sparing live runs.
+    #[tokio::test]
+    async fn sweep_collects_orphans_and_spares_live_runs() {
+        let (_temp, shared) = fixture(60).await;
+
+        let live = RunId::new();
+        let terminal_old = RunId::new();
+        let terminal_fresh = RunId::new();
+        let unknown = RunId::new();
+        {
+            let mut inner = shared.state.inner.lock().await;
+            let mut live_run = run_record(ExecutionStatus::InProgress, None);
+            live_run.run_id = live;
+            inner.runs.insert(live, live_run);
+            let mut old = run_record(
+                ExecutionStatus::Success,
+                Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            );
+            old.run_id = terminal_old;
+            inner.runs.insert(terminal_old, old);
+            let mut fresh = run_record(ExecutionStatus::Success, Some(chrono::Utc::now()));
+            fresh.run_id = terminal_fresh;
+            inner.runs.insert(terminal_fresh, fresh);
+        }
+        let live_dir = snapshot_dir(&shared, live);
+        let old_dir = snapshot_dir(&shared, terminal_old);
+        let fresh_dir = snapshot_dir(&shared, terminal_fresh);
+        // Age the unknown snapshot past retention so the sweep can take it:
+        // a young unreferenced entry might still be mid-write.
+        let unknown_dir = snapshot_dir(&shared, unknown);
+        let old_mtime =
+            filetime::FileTime::from_unix_time(chrono::Utc::now().timestamp() - 3600, 0);
+        filetime::set_file_mtime(&unknown_dir, old_mtime).unwrap();
+
+        sweep_workspace_snapshots(&shared).await;
+
+        assert!(live_dir.is_dir(), "live run keeps its snapshot");
+        assert!(!old_dir.exists(), "terminal run past retention is swept");
+        assert!(fresh_dir.is_dir(), "terminal run inside retention is kept");
+        assert!(!unknown_dir.exists(), "orphaned snapshot is swept");
+    }
+
+    /// A terminal run inside its window gets the discard timer re-armed, so
+    /// the snapshot still expires without waiting for another restart.
+    #[tokio::test]
+    async fn sweep_rearms_fresh_terminal_snapshot() {
+        let (_temp, shared) = fixture(1).await;
+
+        let run_id = RunId::new();
+        {
+            let mut inner = shared.state.inner.lock().await;
+            let mut run = run_record(ExecutionStatus::Success, Some(chrono::Utc::now()));
+            run.run_id = run_id;
+            inner.runs.insert(run_id, run);
+        }
+        let dir = snapshot_dir(&shared, run_id);
+
+        sweep_workspace_snapshots(&shared).await;
+        assert!(dir.is_dir(), "inside retention at sweep time");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        tokio::task::yield_now().await;
+        assert!(!dir.exists(), "re-armed timer discards the snapshot");
     }
 }
 
