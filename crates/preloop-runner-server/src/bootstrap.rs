@@ -751,6 +751,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             crate::runtime_scheduling::promote_ready_jobs(
                 &mut inner,
                 &shared.state.environment_rules,
+                &shared.state.pool_status.snapshot().labels,
             );
             shared
                 .state

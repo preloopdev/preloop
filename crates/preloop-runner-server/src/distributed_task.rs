@@ -928,7 +928,11 @@ pub async fn complete_job_inner(
     for caller_id in &finalized_callers {
         release_concurrency_for_job(&mut inner, completion.run_id, caller_id);
     }
-    let mut scheduling = promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    let mut scheduling = promote_ready_jobs(
+        &mut inner,
+        &shared.state.environment_rules,
+        &shared.state.pool_status.snapshot().labels,
+    );
     // The on-demand runner supervisor wakes on this atomic, and a completion
     // can promote fresh work into the queue (a `needs:` chain or a released
     // concurrency successor). Without refreshing it here the pool stays

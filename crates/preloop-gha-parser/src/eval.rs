@@ -40,6 +40,48 @@ pub fn resolve_string(input: &str, context: &Context) -> Result<String, String> 
     Ok(result)
 }
 
+/// If the whole string is exactly one `${{ }}` expression, return its body.
+fn whole_expression(input: &str) -> Option<&str> {
+    let rest = input.trim().strip_prefix("${{")?;
+    let end = find_expression_end(rest)?;
+    if rest[end + 2..].trim().is_empty() {
+        Some(rest[..end].trim())
+    } else {
+        None
+    }
+}
+
+/// Resolve one `runs-on` label entry into the labels it contributes.
+///
+/// Most entries contribute exactly one label. A label that is a single
+/// `${{ }}` expression evaluating to an array contributes one label per
+/// element: GitHub's `runs-on` accepts a string or an array of strings, and
+/// an expression result keeps its type instead of being stringified — so
+/// `runs-on: ${{ fromJSON('[\"ubuntu-latest\"]') }}` means the label
+/// `ubuntu-latest`, not the literal string `["ubuntu-latest"]`, which no
+/// runner could ever advertise.
+///
+/// Empty elements are preserved as empty labels rather than dropped: an empty
+/// label matches no runner, so the job starves exactly the way the official
+/// service leaves a job whose label evaluated to nothing. (The build-time
+/// pass keeps its own drop-empty filter on top of this function; that is the
+/// pre-existing behaviour for labels resolved against a complete context.)
+///
+/// A label that fails to evaluate is returned raw, mirroring the
+/// `resolve_string` fallback: an unevaluated label matches nothing, which is
+/// the same failure mode the server has always had for broken expressions.
+pub fn resolve_runs_on_label(label: &str, context: &Context) -> Vec<String> {
+    if !label.contains("${{") {
+        return vec![label.to_owned()];
+    }
+    if let Some(expression) = whole_expression(label) {
+        if let Ok(Value::Array(items)) = eval_expression(expression, context) {
+            return items.iter().map(stringify_value).collect();
+        }
+    }
+    vec![resolve_string(label, context).unwrap_or_else(|_| label.to_owned())]
+}
+
 pub(crate) fn find_expression_end(input: &str) -> Option<usize> {
     // Mirror the single-quoted string rules of `preloop-gha-expressions`'s lexer:
     // only `'` opens/closes a string, doubled `''` is an escaped quote, and
@@ -69,26 +111,6 @@ pub(crate) fn find_expression_end(input: &str) -> Option<usize> {
 /// Check if a string contains any `${{ }}` expressions.
 pub fn has_expressions(input: &str) -> bool {
     input.contains("${{")
-}
-
-/// Evaluate `input` as one whole `${{ expr }}` expression and return the raw
-/// value, or `None` when the input is not exactly one expression (no
-/// expression at all, or an expression mixed with other text).
-///
-/// `runs-on` needs the raw value (not its string rendering) so a whole
-/// expression that yields a list can be unpacked into individual labels.
-pub(crate) fn whole_expression_value(
-    input: &str,
-    context: &Context,
-) -> Option<Result<Value, String>> {
-    let rest = input.trim().strip_prefix("${{")?;
-    let end = find_expression_end(rest)?;
-    if !rest[end + 2..].trim().is_empty() {
-        // Text after the expression means this is not a whole expression.
-        return None;
-    }
-    let expr = rest[..end].trim();
-    Some(eval_expression(expr, context).map_err(|e| format!("{e}")))
 }
 
 /// Resolve a map of string values, evaluating all `${{ }}` expressions.
@@ -698,8 +720,40 @@ pub fn build_context(
 /// property to "". Resolving early therefore replaces a real value with an
 /// empty string, with nothing to catch it — which is exactly why this
 /// predicate exists instead of a `let _ = resolve(...)` at each call site.
+///
+/// The `needs` check inspects the *parsed* expression rather than searching
+/// for a literal `needs.` / `needs[` substring: the expression lexer skips
+/// whitespace, so `needs ['plan']` parses exactly like `needs['plan']`, and a
+/// substring search would miss the spaced form, let the label evaluate to ""
+/// at build time, and leave an empty `runs-on` that matches any runner.
 pub fn resolves_after_job_build(value: &str) -> bool {
-    value.contains("github.workspace") || value.contains("needs.") || value.contains("needs[")
+    if value.contains("github.workspace") {
+        return true;
+    }
+    let mut rest = value;
+    while let Some(start) = rest.find("${{") {
+        let after = &rest[start + 3..];
+        let Some(end) = find_expression_end(after) else {
+            break;
+        };
+        let body = &after[..end];
+        match preloop_gha_expressions::collect_expression_references(body) {
+            Ok(references) => {
+                if references.contexts.contains("needs") {
+                    return true;
+                }
+            }
+            Err(_) => {
+                // Unparseable span: stay conservative. If it mentions `needs`
+                // at all, defer rather than risk evaluating it to "" early.
+                if body.to_ascii_lowercase().contains("needs") {
+                    return true;
+                }
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -722,6 +776,50 @@ mod tests {
         ctx.insert("env", Value::Object(env));
         ctx.insert("matrix", json!({"os": "ubuntu-latest", "node": "18"}));
         ctx
+    }
+
+    #[test]
+    fn deferred_predicate_detects_needs_in_all_accessor_forms() {
+        // The lexer skips whitespace, so the spaced bracket form parses
+        // exactly like the tight form; the predicate must catch both.
+        for value in [
+            "${{ needs.plan.outputs.runner }}",
+            "${{ needs['plan'].outputs.runner }}",
+            "${{ needs ['plan'].outputs.runner }}",
+            "${{ needs .plan.outputs.runner }}",
+            "${{ NEEDS.plan.outputs.runner }}",
+            "prefix-${{ needs.plan.outputs.suffix }}",
+            "${{ matrix.os }}-${{ needs.plan.outputs.suffix }}",
+        ] {
+            assert!(
+                resolves_after_job_build(value),
+                "expected deferral for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_predicate_ignores_unrelated_contexts() {
+        for value in [
+            "ubuntu-latest",
+            "${{ matrix.os }}",
+            "${{ github.event_name }}",
+            "${{ format('{0}', needsX) }}",
+        ] {
+            assert!(
+                !resolves_after_job_build(value),
+                "expected no deferral for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_predicate_keeps_github_workspace_and_parse_failures_conservative() {
+        assert!(resolves_after_job_build("${{ github.workspace }}/bin"));
+        assert!(resolves_after_job_build("plain github.workspace text"));
+        // Unparseable span mentioning needs still defers rather than
+        // evaluating to "" at build time.
+        assert!(resolves_after_job_build("${{ needs..broken }}"));
     }
 
     #[test]
@@ -830,6 +928,62 @@ mod tests {
     fn unclosed_expression_returns_error() {
         let ctx = make_context();
         assert!(resolve_string("${{ github.event_name", &ctx).is_err());
+    }
+
+    #[test]
+    fn runs_on_label_array_expression_flattens_to_labels() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("${{ fromJSON('[\"a\", \"b\"]') }}", &ctx),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_array_expression_keeps_empty_elements() {
+        // An empty element is an unmatchable label, not an absent one: the
+        // job must starve rather than silently match every runner, so the
+        // empty string is preserved here. (The build-time pass drops empties
+        // with its own filter; the deferred server path keeps them.)
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("${{ fromJSON('[\"a\", \"\"]') }}", &ctx),
+            vec!["a".to_owned(), String::new()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_scalar_expression_stays_one_label() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("${{ matrix.os }}", &ctx),
+            vec!["ubuntu-latest".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_mixed_text_interpolates() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("prefix-${{ matrix.os }}", &ctx),
+            vec!["prefix-ubuntu-latest".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_literal_passes_through() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("self-hosted", &ctx),
+            vec!["self-hosted".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_broken_expression_stays_raw() {
+        let ctx = make_context();
+        let label = "${{ bogusFunction( }}";
+        assert_eq!(resolve_runs_on_label(label, &ctx), vec![label.to_owned()]);
     }
 
     #[test]

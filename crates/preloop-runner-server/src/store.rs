@@ -1505,7 +1505,7 @@ pub fn apply_meta_snapshot(
     // before anything dispatches, and re-promote whatever the freed slots
     // unblock.
     crate::runtime_scheduling::reconcile_concurrency_groups(inner);
-    crate::runtime_scheduling::promote_ready_jobs(inner, environment_rules);
+    crate::runtime_scheduling::promote_ready_jobs(inner, environment_rules, &[]);
     inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
     inner.run_concurrency = meta.run_concurrency.into_iter().collect();
     inner.holder_keys = meta.holder_keys.into_iter().collect();

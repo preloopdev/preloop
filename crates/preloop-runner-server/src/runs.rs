@@ -2061,7 +2061,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
 
         // Enqueue jobs (workflow concurrency free / acquired).
-        for queued_job in built_jobs {
+        for mut queued_job in built_jobs {
             let job_id = queued_job.job_id.clone();
             let base_id = queued_job.base_id.clone();
 
@@ -2109,14 +2109,38 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 continue;
             }
 
+            let needs_empty = queued_job.needs.is_empty();
+            if needs_empty && queued_job.runs_on.iter().any(|label| label.contains("${{")) {
+                // A job with no `needs` never passes through the promotion
+                // path, so `runs-on` labels left raw at build time (they read
+                // `needs.*`, which is empty for a needs-less job) are finished
+                // here against the complete context, before the pool check
+                // below validates the true labels. Needs-gated jobs keep
+                // their raw templates until promotion, when the needed jobs
+                // have completed.
+                let mut context = preloop_gha_expressions::Context::new();
+                for (key, value) in &queued_job.message.context_data {
+                    context.insert(key, value.to_json());
+                }
+                crate::runtime_scheduling::resolve_deferred_runs_on(&mut queued_job, &context);
+            }
+
             // Full label validation against the co-hosted pool's advertised
             // labels: when the pool has published them, a `runs-on` it can
             // never satisfy fails at enqueue rather than starving in the
             // queue. Skipped when the pool hasn't published (external-only
             // deployments, or a pool that predates the field) — the
-            // starvation sweep remains the backstop there.
+            // starvation sweep remains the backstop there. Also skipped for
+            // jobs whose labels are still raw templates reading `needs.*`:
+            // their real labels only exist once the needed jobs complete, so
+            // there is nothing meaningful to validate yet.
             let pool_labels = shared.state.pool_status.snapshot().labels;
-            if !pool_labels.is_empty()
+            let runs_on_deferred = queued_job
+                .runs_on
+                .iter()
+                .any(|label| preloop_gha_parser::eval::has_expressions(label));
+            if !runs_on_deferred
+                && !pool_labels.is_empty()
                 && !crate::runtime_scheduling::job_matches_runner(&queued_job.runs_on, &pool_labels)
             {
                 let reason = format!(
@@ -2136,7 +2160,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 continue;
             }
 
-            let needs_empty = queued_job.needs.is_empty();
             let max_parallel = queued_job.max_parallel;
             let under_mp = max_parallel
                 .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);
@@ -2273,7 +2296,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // (typically none) are reified by a first promote sweep: needs-free
         // callers acquire their JobSet gates and materialize their callee
         // subtree immediately.
-        promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+        promote_ready_jobs(
+            &mut inner,
+            &shared.state.environment_rules,
+            &shared.state.pool_status.snapshot().labels,
+        );
         // A submission whose every job concluded before it reached the queue
         // (all skipped by `if:`, or none hostable) never passes through the
         // completion path, so nothing else would ever stamp `completed_at` and
@@ -3682,6 +3709,7 @@ pub async fn approve_job(
             crate::runtime_scheduling::promote_ready_jobs(
                 &mut inner,
                 &shared.state.environment_rules,
+                &shared.state.pool_status.snapshot().labels,
             );
             crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
             if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -3705,8 +3733,11 @@ pub async fn approve_job(
         note = body.note.as_deref().unwrap_or_default(),
         "environment approval recorded"
     );
-    let outcome =
-        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    let outcome = crate::runtime_scheduling::promote_ready_jobs(
+        &mut inner,
+        &shared.state.environment_rules,
+        &shared.state.pool_status.snapshot().labels,
+    );
     shared
         .state
         .queue_depth
@@ -3836,8 +3867,11 @@ pub async fn approve_fork(
         note = body.note.as_deref().unwrap_or_default(),
         "fork-PR approval recorded; run released"
     );
-    let outcome =
-        crate::runtime_scheduling::promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+    let outcome = crate::runtime_scheduling::promote_ready_jobs(
+        &mut inner,
+        &shared.state.environment_rules,
+        &shared.state.pool_status.snapshot().labels,
+    );
     shared
         .state
         .queue_depth

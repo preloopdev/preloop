@@ -1155,6 +1155,7 @@ pub enum DependencyDecision {
 pub fn promote_ready_jobs(
     inner: &mut InnerState,
     environment_rules: &crate::config::EnvironmentRulesMap,
+    pool_labels: &[String],
 ) -> SchedulingOutcome {
     let mut outcome = SchedulingOutcome::default();
     loop {
@@ -1277,8 +1278,73 @@ pub fn promote_ready_jobs(
                             .unwrap_or(0)
                             < job.max_parallel.unwrap_or(u64::MAX) =>
                 {
+                    let had_deferred_runs_on =
+                        job.runs_on.iter().any(|label| label.contains("${{"));
                     if let Some(run) = inner.runs.get(&job.run_id) {
                         hydrate_needs_context(&mut job, run);
+                    }
+                    // A deferred `runs-on` that resolved to a platform no
+                    // registered runner can host (e.g. a `needs` output
+                    // yielding `windows-latest`) concludes here, mirroring
+                    // the submit-time check that raw templates skip: the
+                    // labels only became known now, so this is their first
+                    // validation. Only jobs that actually had deferred labels
+                    // are checked — literal labels were already validated at
+                    // submit. Queueing such a job would leave it stuck behind
+                    // a host that may never appear, and its dependents would
+                    // never see a terminal status.
+                    if had_deferred_runs_on {
+                        let platforms = registered_runner_platforms(inner);
+                        if let Some(platform) = unhostable_platform(&job.runs_on, platforms) {
+                            tracing::warn!(
+                                run_id = %job.run_id.0,
+                                job = %job.job_id.0,
+                                labels = ?job.runs_on,
+                                platform,
+                                "no {platform} runner is registered; failing the job"
+                            );
+                            if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                run.jobs
+                                    .insert(job.job_id.clone(), ExecutionStatus::Failure);
+                                run.status = summarize_run(run.jobs.values().copied());
+                                finalize_run_if_complete(run);
+                            }
+                            outcome.failed.push((job.run_id, job.job_id));
+                            settled = true;
+                            continue;
+                        }
+                        // Advertised-pool validation, mirroring the submit-time
+                        // check that raw templates skip: the labels only became
+                        // concrete now, so this is their first validation.
+                        // When the pool has published its labels and they can
+                        // never satisfy the resolved `runs-on`, the job fails
+                        // here instead of starving in the queue. Skipped while
+                        // the labels are still raw templates (unresolvable) or
+                        // the pool hasn't published — the starvation sweep
+                        // remains the backstop there.
+                        let resolved_concrete =
+                            !job.runs_on.iter().any(|label| label.contains("${{"));
+                        if resolved_concrete
+                            && !pool_labels.is_empty()
+                            && !job_matches_runner(&job.runs_on, pool_labels)
+                        {
+                            tracing::warn!(
+                                run_id = %job.run_id.0,
+                                job = %job.job_id.0,
+                                labels = ?job.runs_on,
+                                pool_labels = ?pool_labels,
+                                "runs-on unsatisfiable by runner pool; failing the job"
+                            );
+                            if let Some(run) = inner.runs.get_mut(&job.run_id) {
+                                run.jobs
+                                    .insert(job.job_id.clone(), ExecutionStatus::Failure);
+                                run.status = summarize_run(run.jobs.values().copied());
+                                finalize_run_if_complete(run);
+                            }
+                            outcome.failed.push((job.run_id, job.job_id));
+                            settled = true;
+                            continue;
+                        }
                     }
                     // Environment protection rules (operator policy): branch
                     // policy, wait timer, required reviewers. Evaluated
@@ -2245,32 +2311,48 @@ pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
         .context_data
         .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
 
+    // `runs-on` labels reading `needs.*` were deliberately left as raw
+    // templates at build time (see `resolved_runs_on` in the parser): the
+    // needed jobs had not run yet, so evaluating them then would have resolved
+    // to "" and the job could never match a runner. Now that the needs are
+    // complete, finish them against the completed context.
+    let runs_on_deferred = job.runs_on.iter().any(|label| label.contains("${{"));
+
     // The environment name is the one field the runner never evaluates: it
     // ships as a plain string, so a name reading `needs.*` was deliberately
     // left as a template by the job builder and is finished here, now that the
     // context is complete. Everything else needing `needs` travels as a
     // template token and is evaluated in-VM against the map installed above.
-    let Some(environment) = job.environment.as_ref() else {
-        return;
-    };
-    let Some(name) = (match environment {
-        serde_json::Value::String(name) => Some(name.as_str()),
-        serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
-        _ => None,
-    }) else {
-        return;
-    };
-    if !preloop_gha_parser::eval::resolves_after_job_build(name) {
-        // Already resolved at build time against a complete context.
+    let deferred_environment_name: Option<String> = job
+        .environment
+        .as_ref()
+        .and_then(|environment| match environment {
+            serde_json::Value::String(name) => Some(name.as_str()),
+            serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
+            _ => None,
+        })
+        .filter(|name| preloop_gha_parser::eval::resolves_after_job_build(name))
+        .map(str::to_owned);
+
+    if !runs_on_deferred && deferred_environment_name.is_none() {
         return;
     }
-    let Some(actions_environment) = job.message.actions_environment.as_mut() else {
-        return;
-    };
+
     let mut context = preloop_gha_expressions::Context::new();
     for (key, value) in &job.message.context_data {
         context.insert(key, value.to_json());
     }
+
+    if runs_on_deferred {
+        resolve_deferred_runs_on(job, &context);
+    }
+
+    let Some(name) = deferred_environment_name.as_deref() else {
+        return;
+    };
+    let Some(actions_environment) = job.message.actions_environment.as_mut() else {
+        return;
+    };
     match preloop_gha_parser::eval::resolve_string(name, &context) {
         Ok(resolved) => actions_environment.name = resolved,
         Err(error) => {
@@ -2286,6 +2368,53 @@ pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
         }
     }
 }
+
+/// Finish `runs-on` labels that were left as raw `${{ }}` templates at build
+/// time because they read `needs.*` (see `resolved_runs_on` in
+/// preloop-gha-parser). Called from [`hydrate_needs_context`], i.e. exactly
+/// when the needed jobs have completed and their outputs are in the context,
+/// and from the submit path for needs-less jobs, which never pass through
+/// promotion and whose `needs` context is already complete (empty).
+///
+/// A label that is a single expression evaluating to an array contributes one
+/// label per element, mirroring GitHub's `runs-on` accepting a string or an
+/// array of strings. A label that evaluates to an empty string is kept as an
+/// empty label — it matches no runner, so a job whose label genuinely comes
+/// back empty (a `needs` output that was never set) starves exactly the way
+/// the official service leaves a job with an unmatchable label. Dropping it
+/// instead would leave `runs_on` empty, and an empty label list matches every
+/// runner: the job would silently run on an arbitrary machine. A label that
+/// fails to evaluate keeps its raw template (and is logged) rather than
+/// failing the job: an unevaluated label matches nothing, which is the same
+/// outcome the build-time fallback has always had.
+pub fn resolve_deferred_runs_on(job: &mut QueuedJob, context: &preloop_gha_expressions::Context) {
+    if !job.runs_on.iter().any(|label| label.contains("${{")) {
+        return;
+    }
+    let resolved: Vec<String> = job
+        .runs_on
+        .iter()
+        .flat_map(|label| preloop_gha_parser::eval::resolve_runs_on_label(label, context))
+        .collect();
+    if resolved.iter().any(|label| label.contains("${{")) {
+        tracing::warn!(
+            run_id = %job.run_id.0,
+            job = %job.job_id.0,
+            labels = ?resolved,
+            "runs-on expression could not be resolved after needs completed; the job may never match a runner"
+        );
+    }
+    job.runs_on = if resolved.is_empty() {
+        // Degenerate: every template contributed zero labels (an expression
+        // evaluating to an empty array). Keep the raw templates so the job
+        // stays unschedulable — an empty label list would match every runner.
+        // The warning above fires for these, since they still contain `${{`.
+        job.runs_on.clone()
+    } else {
+        resolved
+    };
+}
+
 pub fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value {
     let values = needs
         .iter()
@@ -3433,7 +3562,11 @@ pub async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
         }
         let ready = apply_expansion(&mut inner, job, built, &mut outcome);
         inner.pending_jobs.extend(ready);
-        let promoted = promote_ready_jobs(&mut inner, &shared.state.environment_rules);
+        let promoted = promote_ready_jobs(
+            &mut inner,
+            &shared.state.environment_rules,
+            &shared.state.pool_status.snapshot().labels,
+        );
         outcome.merge(promoted);
         shared
             .state
@@ -3736,6 +3869,337 @@ mod assignment_tests {
             job.concurrency_acquired_at_unix_nanos
         );
         assert_eq!(restored.enqueued_at_unix_nanos, job.enqueued_at_unix_nanos);
+    }
+
+    /// A job whose `runs-on` reads `needs.*` is queued with the raw template
+    /// and the label must be finished once the needed job completes. The
+    /// server used to evaluate it at submission time, when the output did not
+    /// exist yet, so the label resolved to "" and the job starved every time.
+    #[test]
+    fn promote_resolves_needs_runs_on_after_needs_complete() {
+        let run_id = RunId::new();
+        let plan_id = JobId("plan".to_owned());
+        let release_id = JobId("release".to_owned());
+
+        let mut release = test_queued_job("release");
+        release.run_id = run_id;
+        release.needs = vec![plan_id.clone()];
+        release.runs_on =
+            vec!["${{ fromJSON(format('[\"{0}\"]', needs.plan.outputs.runner)) }}".to_owned()];
+
+        let mut inner = InnerState {
+            ..Default::default()
+        };
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
+                jobs: BTreeMap::from([
+                    (plan_id.clone(), ExecutionStatus::Success),
+                    (release_id.clone(), ExecutionStatus::Queued),
+                ]),
+                job_outputs: BTreeMap::from([(
+                    plan_id.clone(),
+                    BTreeMap::from([("runner".to_owned(), serde_json::json!("ubuntu-latest"))]),
+                )]),
+                job_base_ids: BTreeMap::from([
+                    (plan_id.clone(), "plan".to_owned()),
+                    (release_id.clone(), "release".to_owned()),
+                ]),
+                job_needs: BTreeMap::from([(release_id.clone(), vec![plan_id.clone()])]),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        inner.pending_jobs.push_back(release);
+
+        let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
+        let outcome = promote_ready_jobs(&mut inner, &rules, &[]);
+
+        assert_eq!(outcome.promoted, 1);
+        let queued = inner.queue.front().expect("promoted job must be queued");
+        assert_eq!(queued.runs_on, vec!["ubuntu-latest".to_owned()]);
+    }
+
+    /// A deferred label whose output is genuinely missing resolves to an empty
+    /// label, which is kept: an empty label matches no runner, so the job
+    /// starves the way the official service leaves a job with an unmatchable
+    /// label. Dropping it would leave `runs_on` empty, and an empty label
+    /// list matches every runner — the job must not silently run on an
+    /// arbitrary machine.
+    #[test]
+    fn promote_keeps_needs_runs_on_label_that_resolves_empty() {
+        let run_id = RunId::new();
+        let plan_id = JobId("plan".to_owned());
+        let release_id = JobId("release".to_owned());
+
+        let mut release = test_queued_job("release");
+        release.run_id = run_id;
+        release.needs = vec![plan_id.clone()];
+        release.runs_on = vec!["${{ needs.plan.outputs.runner }}".to_owned()];
+
+        let mut inner = InnerState {
+            ..Default::default()
+        };
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
+                jobs: BTreeMap::from([
+                    (plan_id.clone(), ExecutionStatus::Success),
+                    (release_id.clone(), ExecutionStatus::Queued),
+                ]),
+                job_outputs: BTreeMap::new(),
+                job_base_ids: BTreeMap::from([
+                    (plan_id.clone(), "plan".to_owned()),
+                    (release_id.clone(), "release".to_owned()),
+                ]),
+                job_needs: BTreeMap::from([(release_id.clone(), vec![plan_id.clone()])]),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        inner.pending_jobs.push_back(release);
+
+        let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
+        let outcome = promote_ready_jobs(&mut inner, &rules, &[]);
+
+        assert_eq!(outcome.promoted, 1);
+        let queued = inner.queue.front().expect("promoted job must be queued");
+        assert_eq!(queued.runs_on, vec![String::new()]);
+        // The empty label must not match an arbitrary runner: the job stays
+        // queued (starves) instead of running on a machine it never asked for.
+        assert!(!job_matches_runner(
+            &queued.runs_on,
+            &["ubuntu-latest".to_owned()]
+        ));
+    }
+
+    /// A deferred label that resolves to a platform no registered runner can
+    /// host fails at promotion, mirroring the submit-time check that raw
+    /// templates skip: the labels only became known now, so this is their
+    /// first validation. Without it the job would queue behind a host that
+    /// may never appear, and its dependents would never see a terminal
+    /// status.
+    #[test]
+    fn promote_fails_deferred_runs_on_resolving_to_unhostable_platform() {
+        let run_id = RunId::new();
+        let plan_id = JobId("plan".to_owned());
+        let release_id = JobId("release".to_owned());
+
+        let mut release = test_queued_job("release");
+        release.run_id = run_id;
+        release.needs = vec![plan_id.clone()];
+        release.runs_on = vec!["${{ needs.plan.outputs.runner }}".to_owned()];
+
+        let mut inner = InnerState {
+            ..Default::default()
+        };
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
+                jobs: BTreeMap::from([
+                    (plan_id.clone(), ExecutionStatus::Success),
+                    (release_id.clone(), ExecutionStatus::Queued),
+                ]),
+                job_outputs: BTreeMap::from([(
+                    plan_id.clone(),
+                    BTreeMap::from([("runner".to_owned(), serde_json::json!("windows-latest"))]),
+                )]),
+                job_base_ids: BTreeMap::from([
+                    (plan_id.clone(), "plan".to_owned()),
+                    (release_id.clone(), "release".to_owned()),
+                ]),
+                job_needs: BTreeMap::from([(release_id.clone(), vec![plan_id.clone()])]),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        inner.pending_jobs.push_back(release);
+
+        let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
+        let outcome = promote_ready_jobs(&mut inner, &rules, &[]);
+
+        assert_eq!(outcome.promoted, 0);
+        assert!(
+            outcome.failed.contains(&(run_id, release_id.clone())),
+            "unhostable deferred label must fail the job"
+        );
+        assert!(inner.queue.is_empty(), "failed job must not be queued");
+        let run = inner.runs.get(&run_id).expect("run must exist");
+        assert_eq!(
+            run.jobs.get(&release_id),
+            Some(&ExecutionStatus::Failure),
+            "dependents must see a terminal status"
+        );
+    }
+
+    /// A deferred label that resolves to a concrete label the runner pool
+    /// never advertised fails at promotion, mirroring the submit-time
+    /// pool-label check that raw templates skip. Without it the job would
+    /// sit in the queue behind runners that can never claim it.
+    #[test]
+    fn promote_fails_deferred_runs_on_pool_cannot_satisfy() {
+        let run_id = RunId::new();
+        let plan_id = JobId("plan".to_owned());
+        let release_id = JobId("release".to_owned());
+
+        let mut release = test_queued_job("release");
+        release.run_id = run_id;
+        release.needs = vec![plan_id.clone()];
+        release.runs_on = vec!["${{ needs.plan.outputs.runner }}".to_owned()];
+
+        let mut inner = InnerState {
+            ..Default::default()
+        };
+        inner.runs.insert(
+            run_id,
+            RunRecord {
+                run_id,
+                webhook_delivery_id: None,
+                run_name: None,
+                submission: Arc::new(preloop_gha_protocol::WorkflowSubmission::default()),
+                jobs: BTreeMap::from([
+                    (plan_id.clone(), ExecutionStatus::Success),
+                    (release_id.clone(), ExecutionStatus::Queued),
+                ]),
+                job_outputs: BTreeMap::from([(
+                    plan_id.clone(),
+                    BTreeMap::from([("runner".to_owned(), serde_json::json!("gpu-large"))]),
+                )]),
+                job_base_ids: BTreeMap::from([
+                    (plan_id.clone(), "plan".to_owned()),
+                    (release_id.clone(), "release".to_owned()),
+                ]),
+                job_needs: BTreeMap::from([(release_id.clone(), vec![plan_id.clone()])]),
+                caller_plans: BTreeMap::new(),
+                job_names: BTreeMap::new(),
+                github: serde_json::Value::Null,
+                head_sha: String::new(),
+                workflow_ref: String::new(),
+                workspace_snapshot: None,
+                job_fail_fast: BTreeMap::new(),
+                job_continue_on_error: BTreeMap::new(),
+                job_check_run_ids: BTreeMap::new(),
+                reusable_calls: BTreeMap::new(),
+                jobs_list: Vec::new(),
+                created_at: chrono::Utc::now(),
+                started_at: None,
+                completed_at: None,
+                run_number: 1,
+                run_attempt: 1,
+                workflow_path_str: String::new(),
+                event: "push".to_owned(),
+                conclusion: None,
+                push_state: None,
+                snapshot_timing: None,
+                fork_approval_pending: false,
+                fork_approval_requested_at_unix_nanos: None,
+                fork_approved_at_unix_nanos: None,
+                fork_approval_note: None,
+                status: ExecutionStatus::Queued,
+            },
+        );
+        inner.pending_jobs.push_back(release);
+
+        let rules: crate::config::EnvironmentRulesMap = BTreeMap::new();
+        let pool_labels = vec!["ubuntu-latest".to_owned()];
+        let outcome = promote_ready_jobs(&mut inner, &rules, &pool_labels);
+
+        assert_eq!(outcome.promoted, 0);
+        assert!(
+            outcome.failed.contains(&(run_id, release_id.clone())),
+            "deferred label the pool cannot satisfy must fail the job"
+        );
+        assert!(inner.queue.is_empty(), "failed job must not be queued");
+        let run = inner.runs.get(&run_id).expect("run must exist");
+        assert_eq!(
+            run.jobs.get(&release_id),
+            Some(&ExecutionStatus::Failure),
+            "dependents must see a terminal status"
+        );
     }
 
     /// A restored concurrency group whose holder's run is terminal (or
