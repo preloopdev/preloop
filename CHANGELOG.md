@@ -945,8 +945,6 @@ Releases before v0.27.0 predate the changelog.
 
 - smolvm installs are pinned to 1.7.4, the last macOS release exposing the virtio-net symbol; virtio-net remains the default net backend
 
-### Fixed
-
 - Pool: on-demand slot failure backoff now escalates across reap cycles instead of resetting every cycle
 - `preloop update`: install a smolvm with `--mount-socket` support, warn when PATH shadows the install, and preserve symlinks when copying the agent rootfs
 - `preloop serve`: report the GitHub App stored in `config.toml` when env vars are absent
@@ -997,8 +995,6 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.5...HEAD
-[0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5
 [0.33.2]: https://github.com/preloopdev/preloop/compare/v0.33.1...v0.33.2
 [0.33.1]: https://github.com/preloopdev/preloop/compare/v0.33.0...v0.33.1
 [0.32.7]: https://github.com/preloopdev/preloop/compare/v0.32.5...v0.32.7
@@ -1011,3 +1007,6 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.6...HEAD
+[0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
+[0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5
