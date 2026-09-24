@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use crate::models::{EnvValue, JobContinueOnError, ParserError, RunsOn, Workflow};
 use indexmap::IndexMap;
 use preloop_gha_expressions::{eval_expression, Context};
+use preloop_gha_protocol::expr_scan::find_expression_end;
 use serde_json::{Map, Value};
 
 /// Resolve all `${{ }}` expressions in a string using the given context.
@@ -80,32 +81,6 @@ pub fn resolve_runs_on_label(label: &str, context: &Context) -> Vec<String> {
         }
     }
     vec![resolve_string(label, context).unwrap_or_else(|_| label.to_owned())]
-}
-
-pub(crate) fn find_expression_end(input: &str) -> Option<usize> {
-    // Mirror the single-quoted string rules of `preloop-gha-expressions`'s lexer:
-    // only `'` opens/closes a string, doubled `''` is an escaped quote, and
-    // backslash is treated as an ordinary character (no C-style escapes).
-    let mut chars = input.char_indices().peekable();
-    let mut in_string = false;
-    while let Some((index, ch)) = chars.next() {
-        if in_string {
-            if ch == '\'' {
-                if matches!(chars.peek(), Some(&(_, '\''))) {
-                    chars.next();
-                    continue;
-                }
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '\'' => in_string = true,
-            '}' if input[index..].starts_with("}}") => return Some(index),
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Check if a string contains any `${{ }}` expressions.
@@ -847,27 +822,6 @@ mod tests {
             resolve_string("ref=${{ github.ref }}", &ctx).unwrap(),
             "ref=refs/heads/main"
         );
-    }
-
-    #[test]
-    fn expression_end_ignores_braces_inside_string_literals() {
-        let source = r#" format('value }} still inside') }}"#;
-        assert_eq!(find_expression_end(source), Some(source.len() - 2));
-    }
-
-    #[test]
-    fn expression_end_treats_backslash_as_literal_in_single_quotes() {
-        // Backslash is NOT an escape in the lexer's single-quoted strings.
-        // The first `'` closes the string, then `}}` should terminate.
-        let source = r"'C:\' }}";
-        assert_eq!(find_expression_end(source), Some(source.len() - 2));
-    }
-
-    #[test]
-    fn expression_end_handles_doubled_quote_escape() {
-        // `''` inside a single-quoted string is an escaped quote, not a close.
-        let source = r"'it''s fine' }}";
-        assert_eq!(find_expression_end(source), Some(source.len() - 2));
     }
 
     #[test]

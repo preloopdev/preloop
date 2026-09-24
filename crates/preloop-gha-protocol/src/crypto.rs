@@ -450,6 +450,14 @@ impl AgentRsaKeypair {
     }
 }
 
+/// Lowercase hex SHA-256 of `bytes` — the one copy. Previously duplicated in
+/// `dispatch_auth`, `github_app`, both `node_externals` mirrors, and the
+/// runner's action manager.
+pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use sha2::Digest;
+    format!("{:x}", Sha256::digest(bytes.as_ref()))
+}
+
 /// Sign a JWT with PS256 (RSA-PSS SHA-256) — the algorithm the official runner uses.
 ///
 /// Produces: base64url(header).base64url(claims).base64url(signature)

@@ -869,16 +869,6 @@ fn template_string_token_handles_braces_inside_string_literals() {
 }
 
 #[test]
-fn find_expression_end_skips_braces_in_strings() {
-    // }} inside a string should be skipped
-    assert_eq!(find_expression_end(" fromJSON('{}}')'a' }}"), Some(20));
-    // Plain expression
-    assert_eq!(find_expression_end(" x }}"), Some(3));
-    // No closing
-    assert_eq!(find_expression_end(" x "), None);
-}
-
-#[test]
 fn pipeline_context_data_variants() {
     let json = r#""hello""#;
     let data: PipelineContextData = serde_json::from_str(json).unwrap();

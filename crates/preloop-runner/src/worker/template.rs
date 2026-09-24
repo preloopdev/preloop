@@ -4,6 +4,7 @@
 //! env, displayName, run script) using the runner-side expression engine.
 
 use anyhow::Result;
+use preloop_gha_protocol::expr_scan::find_expression_end;
 use tracing::debug;
 
 /// Evaluate all `${{ }}` expressions in a string.
@@ -119,51 +120,6 @@ pub fn evaluate_condition(condition: &str, ctx: &preloop_gha_expressions::Contex
         && trimmed.to_lowercase() != "false"
         && trimmed != "null"
         && !trimmed.is_empty())
-}
-
-/// Find the closing `}}` of a `${{ ... }}` expression, respecting string literals.
-///
-/// GitHub's control plane wraps multi-line `run:` scripts containing expressions
-/// into `format('...{0}...', expr1, expr2)` calls. The format template string
-/// may contain `}}` as literal brace escapes (e.g. bash `${{ }}` or `{ }` blocks).
-/// We track single-quote depth so `}}` inside `'...'` literals is not treated
-/// as the expression closer.
-fn find_expression_end(s: &str) -> Option<usize> {
-    let mut in_single_quote = false;
-    let mut paren_depth: usize = 0;
-    // char_indices() yields (byte_offset, char) — we return byte offsets so
-    // that the caller can safely slice `s[..end]` even when `s` contains
-    // multi-byte characters (e.g. em dash U+2014 inside a format() literal).
-    let mut iter = s.char_indices().peekable();
-    while let Some((byte_pos, ch)) = iter.next() {
-        match ch {
-            '\'' if !in_single_quote => {
-                in_single_quote = true;
-            }
-            '\'' if in_single_quote => {
-                // Check for escaped quote ('') inside string literal
-                if iter.peek().map(|&(_, c)| c) == Some('\'') {
-                    iter.next(); // skip escaped quote
-                } else {
-                    in_single_quote = false;
-                }
-            }
-            '(' if !in_single_quote => {
-                paren_depth += 1;
-            }
-            ')' if !in_single_quote && paren_depth > 0 => {
-                paren_depth -= 1;
-            }
-            '}' if !in_single_quote && paren_depth == 0
-                // Check for }}
-                && iter.peek().map(|&(_, c)| c) == Some('}') =>
-            {
-                return Some(byte_pos);
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Convert a serde_json::Value to its display string (matching GitHub Actions semantics).

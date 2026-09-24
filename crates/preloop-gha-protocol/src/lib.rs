@@ -25,6 +25,9 @@ pub mod debug_session;
 /// control plane, the runner, and the CLI.
 pub mod git_ref;
 
+/// `${{ }}` boundary scanning shared by the parser, azdo layer, and runner.
+pub mod expr_scan;
+
 /// Protocol version exposed by this crate's runner-compatible DTOs.
 pub const PROTOCOL_VERSION: &str = "2026-06-25.preloop.v1";
 
