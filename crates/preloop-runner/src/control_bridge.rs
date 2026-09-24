@@ -117,7 +117,7 @@ pub async fn spawn_from_env() -> Option<ControlBridge> {
     let origin = std::env::var(CONTROL_ORIGIN_ENV).ok()?;
     let socket = std::env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
     let upstream_addr = std::env::var(CONTROL_UPSTREAM_ENV).ok();
-    let upstream = match (socket, upstream_addr) {
+    let upstream = match (socket, upstream_addr.as_deref()) {
         #[cfg(unix)]
         (Some(socket), _) => Upstream::Socket(socket),
         #[cfg(not(unix))]
@@ -134,7 +134,7 @@ pub async fn spawn_from_env() -> Option<ControlBridge> {
             }
         }
         (None, Some(addr)) => {
-            let addr = upstream_tcp_address(&addr)?;
+            let addr = upstream_tcp_address(addr)?;
             Upstream::Tcp(addr)
         }
         (None, None) => return None,

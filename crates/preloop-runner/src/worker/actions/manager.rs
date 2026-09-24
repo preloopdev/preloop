@@ -463,7 +463,17 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
                         link_target.display()
                     );
                 }
+                #[cfg(unix)]
                 dest_dir.symlink(&link_target, &stripped)?;
+                #[cfg(windows)]
+                {
+                    // cap_std splits symlink creation by target type on
+                    // Windows; the archived target may not exist yet, so try
+                    // file first and fall back to dir.
+                    if dest_dir.symlink_file(&link_target, &stripped).is_err() {
+                        dest_dir.symlink_dir(&link_target, &stripped)?;
+                    }
+                }
             }
         } else {
             anyhow::bail!(

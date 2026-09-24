@@ -1175,7 +1175,12 @@ pub fn kill_orphan_processes(tracking_id: &str) {
 ///
 /// On Linux reads `/proc/<pid>/environ` (NUL-delimited).
 /// On macOS uses `ps -Ewwx -o pid=,command=` which prints the env inline.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_variables)
+)]
 fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
+    #[allow(unused_mut)]
     let mut pids = Vec::new();
     #[cfg(target_os = "linux")]
     {
