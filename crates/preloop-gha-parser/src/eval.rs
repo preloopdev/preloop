@@ -643,9 +643,17 @@ pub fn build_context(
     // [`resolves_after_job_build`] rather than resolving blindly.
     ctx.insert("needs", Value::Object(Map::new()));
 
+    // Secrets resolve to their real values here. This context backs
+    // server-side expression evaluation whose results are shipped to the
+    // runner inside the job message (job-level `env:`, reusable-workflow
+    // `secrets:` mappings, step `shell`/`working-directory`). Substituting
+    // the log placeholder here made every `${{ secrets.NAME }}` land in the
+    // job environment as the literal `***`. Log masking stays value-based on
+    // the runner side (mask hints carry the real values), so the placeholder
+    // must never appear in an evaluated value.
     let secrets_value: Map<String, Value> = secrets
-        .keys()
-        .map(|k| (k.clone(), Value::String("***".to_owned())))
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect();
     ctx.insert("secrets", Value::Object(secrets_value));
 
@@ -757,6 +765,34 @@ mod tests {
     fn resolve_env_value() {
         let ctx = make_context();
         assert_eq!(resolve_string("${{ env.MY_VAR }}", &ctx).unwrap(), "hello");
+    }
+
+    #[test]
+    fn build_context_resolves_secrets_to_real_values() {
+        // `build_context` backs server-side expression evaluation whose
+        // results are shipped to the runner inside the job message (job-level
+        // `env:`, reusable-workflow `secrets:` mappings). Substituting the
+        // log placeholder here made every `${{ secrets.NAME }}` land in the
+        // job environment as the literal `***`. Log masking stays
+        // value-based on the runner side, so the placeholder must never
+        // appear in evaluated values.
+        let secrets = BTreeMap::from([(
+            "PROBE_SECRET".to_owned(),
+            "dummy-value-of-twenty-six".to_owned(),
+        )]);
+        let ctx = build_context(
+            &json!({}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &IndexMap::new(),
+            &json!({}),
+            &secrets,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            resolve_string("${{ secrets.PROBE_SECRET }}", &ctx).unwrap(),
+            "dummy-value-of-twenty-six"
+        );
     }
 
     #[test]
