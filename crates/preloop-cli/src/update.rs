@@ -75,8 +75,10 @@ fn is_https_downgrade(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
 /// `build.rs`; keep the two in sync).
 ///
 /// The configured floor is the first release that satisfies all runtime
-/// invariants, including packed-machine ownership preservation; newer stable
-/// releases satisfy it without another code change.
+/// invariants: packed-machine ownership preservation (v1.8.1) and
+/// `SMOLVM_BRANCH_CONTINUE` (v1.18.1), which preloop-vm pins to `0` so golden
+/// forks keep a frozen reusable branch base instead of live-forking the
+/// source. Newer stable releases satisfy it without another code change.
 static SMOLVM_MIN_COMPATIBLE_VERSION: LazyLock<Version> = LazyLock::new(|| {
     Version::parse(SMOLVM_MIN_VERSION)
         .expect("smolvm_min_version in versions.toml must be a semver version")
@@ -1557,12 +1559,12 @@ mod tests {
         // versions that must pass or fail against it.
         let _minimum = Version::parse(SMOLVM_MIN_VERSION).unwrap();
         for (version, flag, expected) in [
-            ("1.8.1", "--mount-socket <HOST:GUEST>", true),
-            ("1.8.2", "--mount-socket <HOST:GUEST>", true),
-            ("1.8.0", "--mount-socket <HOST:GUEST>", false),
-            ("1.7.5", "--mount-socket <HOST:GUEST>", false),
-            ("1.7.6", "--mount-socket <HOST:GUEST>", false),
-            ("1.8.1", "--docker-socket", false),
+            ("1.18.1", "--mount-socket <HOST:GUEST>", true),
+            ("1.18.2", "--mount-socket <HOST:GUEST>", true),
+            ("1.18.0", "--mount-socket <HOST:GUEST>", false),
+            ("1.8.1", "--mount-socket <HOST:GUEST>", false),
+            ("1.16.1", "--mount-socket <HOST:GUEST>", false),
+            ("1.18.1", "--docker-socket", false),
         ] {
             let executable = directory
                 .path()

@@ -618,10 +618,20 @@ impl SmolVmProvider {
     /// the sandbox reaches any command that can spawn or restart SmolVM's
     /// `_boot-vm` subprocess — create, start, start_forkable, fork, exec,
     /// pack — not just machine creation.
+    ///
+    /// `SMOLVM_BRANCH_CONTINUE=0` is pinned unconditionally (SmolVM ≥1.18.1,
+    /// upstream PR #1376): the pool model requires the golden to stay frozen
+    /// as a reusable branch base. Live forking — the upstream default on
+    /// Linux and macOS — resumes the source on new CoW layers per fork,
+    /// accumulating qcow2 backing layers until MAX_FORK_LINEAGE_DEPTH (32)
+    /// wedges the pool, and on macOS re-checkpoints the source on every fork.
+    /// An operator override would reintroduce both failure modes, so unlike
+    /// the sandbox knobs no pre-set value is honored.
     fn sandboxed_command(&self) -> Result<Command, VmError> {
         let mut command = self.command();
         apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
         apply_sandbox_env(&mut command, self.env_lookup)?;
+        command.env("SMOLVM_BRANCH_CONTINUE", "0");
         Ok(command)
     }
 
@@ -1148,13 +1158,15 @@ impl VmProvider for SmolVmProvider {
 
     /// Fork one clone from a golden, one fork per golden at a time.
     ///
-    /// SmolVM holds exactly one RAM checkpoint per golden: the first fork
+    /// `SMOLVM_BRANCH_CONTINUE=0` (pinned in [`Self::sandboxed_command`])
+    /// keeps the golden frozen as a reusable branch base: the first fork
     /// freezes the base and publishes a retained checkpoint, and later forks
-    /// restore from that checkpoint instead of re-freezing. Two forks racing
-    /// the same golden break the invariant — the loser issues a second FORK
-    /// against an already-paused VM, and that failure's rollback resumes the
-    /// base and deletes the retained checkpoint. Every later fork then fails
-    /// with `golden '<name>' is already paused; a valid retained checkpoint is
+    /// restore from that checkpoint instead of re-freezing or resuming the
+    /// source onto new CoW layers. Two forks racing the same golden break the
+    /// invariant — the loser issues a second FORK against an already-paused
+    /// VM, and that failure's rollback resumes the base and deletes the
+    /// retained checkpoint. Every later fork then fails with
+    /// `golden '<name>' is already paused; a valid retained checkpoint is
     /// required`, so the pool cannot produce another runner until the golden is
     /// rebuilt from scratch: queued jobs stall indefinitely, in exchange for
     /// the few hundred milliseconds a concurrent refill saves. SmolVM's own

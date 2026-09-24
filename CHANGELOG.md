@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.33.5] - 2026-09-24
+
+### Added
+- **SmolVM 1.18.1 runtime floor and golden pin**: `smolvm_min_version` and
+  `smolvm_golden_version` both move to v1.18.1, the first upstream release
+  carrying `SMOLVM_BRANCH_CONTINUE` (smol-machines/smolvm#1376) — the
+  upstreamed form of the retained fork patch. `preloop update
+  --ensure-runtime` now upgrades any engine below it.
+- **Frozen fork bases on every platform**: `SmolVmProvider` pins
+  `SMOLVM_BRANCH_CONTINUE=0` on all lifecycle invocations, disabling live
+  forking on Linux/x86_64 and macOS alike. Live forking resumed the golden
+  onto new CoW layers per fork, accumulating qcow2 backing layers until
+  `MAX_FORK_LINEAGE_DEPTH` (32) wedged the pool; the frozen base serves
+  arbitrary fanout from one retained checkpoint.
+
+- **Guest Liveness Watchdog**: Runner execution streams (`run_until_exit`) now race a guest liveness watchdog (`true` probe every 60s with 30s timeout). After 3 consecutive failed probes, the stream is aborted with `VmError::GuestUnresponsive`, preventing wedged runner VMs from holding pool slots indefinitely.
+- **Transitory Fork Retries**: The orchestrator now retries transient packed-golden fork failures (`FORK_RETRY_ATTEMPTS = 2`) before falling back to cold image instantiation, shielding pool replenishment from transient hypervisor or agent initialization jitter.
+- **State Directory Exclusive Lock**: `preloop serve` acquires an exclusive `flock` on `serve.lock` at startup, failing fast if another engine is already running against the same state directory.
+- **Fail-Fast for Unsatisfiable Labels**: The scheduler validates job labels against available runner pools and fails fast when a job asks for labels no runner can satisfy.
+- **Workflow Execution Protections & Fork Policies**: Administrative controls to enforce security ceilings, fork PR approval gates, and environment protection rules.
+
+### Changed
+
+- **Concurrent VM Startup**: `SmolVmProvider::start` now runs under the shared/concurrent lifecycle lock (`RwLock::read`) rather than exclusive write lock. Starting an already-created VM builds no base image, eliminating pool-wide starvation where one cold-boot blocked all fork operations.
+- **Detached GitHub Check-Run Reporting**: Check-run PATCH updates during `cancel_run`, `complete_job_inner`, and `submit_run` (`--push`) are now offloaded to detached background tasks. Local state transitions, SQLite persistence, and HTTP responses return immediately, preventing client timeouts from stranding check runs in `queued`.
+- **macOS Launchd Interactive QoS**: The macOS engine plist template now specifies `ProcessType = Interactive` instead of `Background`. This prevents XNU from throttling engine and VM threads to efficiency cores and low-priority I/O queues (~68× CPU and ~50× I/O throughput improvement).
+- **Expression Depth Ceiling**: `MAX_EXPRESSION_DEPTH` in `preloop-gha-expressions` was lowered from 256 to 128, preventing recursive-descent stack overflow in unoptimized debug builds on default 2 MiB thread stacks while remaining well above the official GitHub Actions AST depth limit of 50.
+- **Starvation Ceiling Extended**: Extended the queued-job starvation backstop from 30 minutes to 1 hour (`MAX_QUEUED_GRACE = 3600s`).
+- **Server Clippy Cleanups**: Refactored `try_enqueue_with_job_concurrency` to return a strongly-typed `JobEnqueueOutcome` enum instead of `Result<bool, ()>`, and explicitly marked the serve lock file as non-truncating (`truncate(false)`).
+
+### Fixed
+
+- **Action Post-Step Execution Test**: Fixed a version mismatch failure in `steps_runner_tests` by staging the host's Node binary into mock runner externals (with fallback), removing an environmental dependency on system Node 24.
+- **Supply-Chain Audit Policy Diff**: Updated `supply-chain.yml` to compare base and HEAD trees directly (`git diff $base HEAD`) rather than symmetric difference (`$base...HEAD`), avoiding `fatal: no merge base` on shallow PR fetches.
+- **Starvation Grace Test**: Adjusted the starved-job test assertion in `registration.rs` to age past the updated 3600s ceiling.
+- **Hermetic Lifecycle Test Fixtures**: Isolated `externals_dir` per test fixture in `runner_pool_lifecycle.rs` with pre-staged mock runtimes, eliminating cross-process network download races and timeouts on fresh CI nodes.
+- **Cargo.lock Integrity**: Resolved a missing `libc` dependency in `Cargo.lock` that previously caused `--locked` build failures across CI shards.
+- **Reusable Workflow Expression Context**: Reusable workflow `with:` expressions now evaluate strictly in the caller context.
+- **Secret Value Resolution**: Job environments now receive real secret values rather than log placeholders.
+- **Runs-On List Expressions**: Dynamic `runs-on` expressions returning lists are correctly unpacked into runner labels.
+
 ## [0.33.2] - 2026-09-17
 
 ### Fixed
@@ -891,7 +932,10 @@ live-logs (8), and golden (8).
 Bootstrap the cargo-dist release pipeline for `preloop-cli` (binary
 installers for macOS and Linux).
 
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.32.7...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.5...HEAD
+[0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5
+[0.33.2]: https://github.com/preloopdev/preloop/compare/v0.33.1...v0.33.2
+[0.33.1]: https://github.com/preloopdev/preloop/compare/v0.33.0...v0.33.1
 [0.32.7]: https://github.com/preloopdev/preloop/compare/v0.32.5...v0.32.7
 [0.32.5]: https://github.com/preloopdev/preloop/compare/v0.32.0...v0.32.5
 [0.30.3]: https://github.com/preloopdev/preloop/compare/v0.30.2...v0.30.3
