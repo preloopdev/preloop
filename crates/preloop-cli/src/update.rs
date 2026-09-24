@@ -29,7 +29,7 @@ include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 /// detached signature is missing or invalid — a SHA-256 checksum alone
 /// cannot authenticate the release because it is published on the same
 /// channel as the asset it describes.
-const RELEASE_SIGNING_PUBLIC_KEY_DER_B64: &str = "MIIBigKCAYEA3Fz8tdm/XggeYlZbs9DRXPDzlgrcLpHKEKUJvkxnj1J6GOgz4qho1PEZ0nzEOxxESl2FZDQLD/UdcQpw+pae0Jhumm3mOSG9mJaGF1ZGVjSU8oHOU0Y887wu7FIqBMLa1/O9SmVe4xCzhvaHJKczrdXzCJcOji98nhx0omwUdIRClaZ4P/iK+/oG0d7+K+efexhfRdncXD5+iu/D60RjDG96KLs4wOfY9ciudBnpYYOe57a9YQEsZ8gKWm5bB4Bcz1k0sCfoeHDO0KAMySn1TbFmPM9aEPQ7M+rd7jhPb06QVvq6ROIlMhi1AJ0v2eYqkIYwJjPrAt2rVEqJaKdxqzUOyxRdj6gaGkYocatrPbmRwu4t/+KanPOMtY/EyJ9XzHLQ3yFWsnxNmqRwSFrf3RWGnzrLsVVktXxgwcp/IBad440sQOqV9vx/wYzy4MkSuMBfLFdm2qV9zSYMwlRVqIKZ1shi2aABlQpyRz4xFtLXjMLoTryAcLZkxvfvUmNbAgMBAAE=";
+const RELEASE_SIGNING_PUBLIC_KEY_DER_B64: &str = "MIIBigKCAYEAsSCF1NnqbOcV3itWi6rr4q62cE904AsWiUPu4lNR9Bpubpr0a9ucx1sQJE1ySpNxB7WLw3Vpm0vSOQWOg/s79EyJJ/Rv/8i4WK2KgOKCJ+8+pJeGW5hu6BCC8qeEmuMXAgTm7UE49q1/YtCtJqYESI9rbcSbho822UG7IiyfP+EDV1uqxuudQzjOdw0CQjnYx/bpeUEIymnunDtfyz1xWBV6lLXZNXSPgXlKiThCSoEkZwyGmvc+KkwZDe22VC9zdMcLfnk1os4kbvNw5ZFc+UF8XWVTSLYpG6EOwRb9p5W9vnJQCWHsi7J4B06dRd/tyj7LxFJamqnsZO9IClQezgE+fw74vjhMX0rURw9eoPTJaiUsMTEIpiS3ua0jXfHlsKbq2z8v59XHQIUxrD4a9gIkY8IarYA9uHnACzHd9nrywKK1OKoSjbFemavYFMpAnyTuYKStjcT+Tck7Exy1rS9P+f2srJ6MKXAfddUneoDD+lORWLW8FRABCxNS9qp1AgMBAAE=";
 
 /// M1: the updater replaces the running binary — it must never fetch
 /// release metadata or assets over plaintext HTTP, where a network
@@ -1347,7 +1347,7 @@ mod tests {
     fn pinned_key_verifies_release_pipeline_signature() {
         let asset = b"preloop-m1-release-signature-test-asset-v1";
         let signature = base64::engine::general_purpose::STANDARD.decode(
-            "iLUt5DpGI/QwD5xlhIUwOguf0Uq8zbnRj3CjpICQxWENE/ckUNZKLaJ4Mz3Fo4pGkInqImHkaLEBBjsn3wZVC2/WlLKKhkv7zuBE6JHE79RovSVB7EYph5GMUNkI+WDm5HiGoNhWSGegRHo89BKkhBnDJ1TLK9DhIkrcZNAqbrLofpHZxyrfKAW7I8Onfl76GGxjCHEovY3yG4KDOFoAK3WpFNkQRPhauAclMSrBTvLIWz4sdDfYV8Quf2rrEDapUZJrlGr/7WdkogoNWxVt+m2KcE6xi8l7LiK9sjRQzEH9Pgt08vGNsn46MtM0R1P52dZdi+L0EuRxa8Qkfrr3eO8/FrcuIgDcukOynNvSOI4ywWWxPyw1+0lILtjou0yX0jRVoXRLAKkmWcJYRFn+RcmOLO94N7jm+mByjARa6f32DVbjN6W1SEPC5r8EDyvye8IT0XH1etQMnzh3QS48e6tnERjIFGyK/ZlzNiW6QqRVUEYYJ7NQ37lGXqTynyGL",
+            "IKLG7oEyIsCk0VgIbCItKyH2r0g4lIuRlKfn1LsqFbWkUVLjVqYVnkKcerQ+HUrjwKRmbyF4nuiAHQ8C8EkECKu0Nia7OlUClNVqLquqjZmCMd/pLw0BbibxNTf5CdQB4cDL+gsvt3maJEGC64MRxP5jhCwvJGwhlnootoMijd0pi3dY+gppxQ1eHS/pm+AH2oIH/6w3tb+GINfZhe9VEyy6fVVMH5xd41jtLwzNumBVUBQUDG5o5v3yVMYDSC48/XX6/XddieXrX32ieUJfzKL7s9U/FUfq0J7bbJAjzKLMGBj7NRXPVOVUeWKTl/AEID8wWdOvextZVLCuNEwdDGC8uekidevhGj3LkDr/TpeWMY3EMTcyjOOKarnmMfOr1wfa0TJ2uxdiR04syQn9FppZEzEe02jeqRRknU9khZJFKYzX8Qfws3Yx0IgiqkJBzf1MgwZGb2+un9xLGGF8rErgPen8SSZ+rmE4E2l+AfZYHUL3WOIxM8f9UDRCXpXu",
         ).unwrap();
         assert!(verify_detached_signature(asset, &signature).is_ok());
     }
@@ -1357,7 +1357,7 @@ mod tests {
     fn tampered_asset_or_signature_fails_closed() {
         let asset = b"preloop-m1-release-signature-test-asset-v1";
         let mut signature = base64::engine::general_purpose::STANDARD.decode(
-            "iLUt5DpGI/QwD5xlhIUwOguf0Uq8zbnRj3CjpICQxWENE/ckUNZKLaJ4Mz3Fo4pGkInqImHkaLEBBjsn3wZVC2/WlLKKhkv7zuBE6JHE79RovSVB7EYph5GMUNkI+WDm5HiGoNhWSGegRHo89BKkhBnDJ1TLK9DhIkrcZNAqbrLofpHZxyrfKAW7I8Onfl76GGxjCHEovY3yG4KDOFoAK3WpFNkQRPhauAclMSrBTvLIWz4sdDfYV8Quf2rrEDapUZJrlGr/7WdkogoNWxVt+m2KcE6xi8l7LiK9sjRQzEH9Pgt08vGNsn46MtM0R1P52dZdi+L0EuRxa8Qkfrr3eO8/FrcuIgDcukOynNvSOI4ywWWxPyw1+0lILtjou0yX0jRVoXRLAKkmWcJYRFn+RcmOLO94N7jm+mByjARa6f32DVbjN6W1SEPC5r8EDyvye8IT0XH1etQMnzh3QS48e6tnERjIFGyK/ZlzNiW6QqRVUEYYJ7NQ37lGXqTynyGL",
+            "IKLG7oEyIsCk0VgIbCItKyH2r0g4lIuRlKfn1LsqFbWkUVLjVqYVnkKcerQ+HUrjwKRmbyF4nuiAHQ8C8EkECKu0Nia7OlUClNVqLquqjZmCMd/pLw0BbibxNTf5CdQB4cDL+gsvt3maJEGC64MRxP5jhCwvJGwhlnootoMijd0pi3dY+gppxQ1eHS/pm+AH2oIH/6w3tb+GINfZhe9VEyy6fVVMH5xd41jtLwzNumBVUBQUDG5o5v3yVMYDSC48/XX6/XddieXrX32ieUJfzKL7s9U/FUfq0J7bbJAjzKLMGBj7NRXPVOVUeWKTl/AEID8wWdOvextZVLCuNEwdDGC8uekidevhGj3LkDr/TpeWMY3EMTcyjOOKarnmMfOr1wfa0TJ2uxdiR04syQn9FppZEzEe02jeqRRknU9khZJFKYzX8Qfws3Yx0IgiqkJBzf1MgwZGb2+un9xLGGF8rErgPen8SSZ+rmE4E2l+AfZYHUL3WOIxM8f9UDRCXpXu",
         ).unwrap();
         // Tampered asset bytes: signature no longer matches.
         let mut tampered_asset = asset.to_vec();
