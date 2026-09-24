@@ -1323,3 +1323,145 @@ async fn run_steps_display_name_from_format_token_script() {
         step_update.name
     );
 }
+
+/// Issue #290: a Node action that declares `runs.post` must have its post
+/// entry point executed after the main steps, even when the post step is
+/// generated via the wire-format `build_step_list` path.
+#[tokio::test]
+async fn post_step_executes_for_node_action_with_post_entrypoint() {
+    let dir = TempDir::new().unwrap();
+    let workspace = dir.path().join("work").join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    // Local action with main + post entry points.
+    let local_action = workspace.join("my-action");
+    std::fs::create_dir_all(&local_action).unwrap();
+    std::fs::write(
+        local_action.join("action.yml"),
+        "name: my-action\ndescription: test\nruns:\n  using: node24\n  main: main.js\n  post: post.js\n",
+    )
+    .unwrap();
+    std::fs::write(
+        local_action.join("main.js"),
+        "require('fs').writeFileSync(process.env['MARKER_MAIN'], 'main-ran');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        local_action.join("post.js"),
+        "require('fs').writeFileSync(process.env['MARKER_POST'], 'post-ran');\n",
+    )
+    .unwrap();
+
+    // Remote action (staged under _actions) with main + post entry points.
+    let remote_action = dir
+        .path()
+        .join("work")
+        .join("_actions")
+        .join("example")
+        .join("remote-action")
+        .join("abc123");
+    std::fs::create_dir_all(&remote_action).unwrap();
+    std::fs::write(
+        remote_action.join("action.yml"),
+        "name: remote-action\ndescription: test\nruns:\n  using: node24\n  main: main.js\n  post: post.js\n",
+    )
+    .unwrap();
+    std::fs::write(
+        remote_action.join("main.js"),
+        "require('fs').writeFileSync(process.env['MARKER_REMOTE_MAIN'], 'main-ran');\n",
+    )
+    .unwrap();
+    std::fs::write(
+        remote_action.join("post.js"),
+        "require('fs').writeFileSync(process.env['MARKER_REMOTE_POST'], 'post-ran');\n",
+    )
+    .unwrap();
+
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.workspace = Some(workspace.to_str().unwrap().to_string());
+    for (key, file) in [
+        ("MARKER_MAIN", "main.marker"),
+        ("MARKER_POST", "post.marker"),
+        ("MARKER_REMOTE_MAIN", "remote-main.marker"),
+        ("MARKER_REMOTE_POST", "remote-post.marker"),
+    ] {
+        job.env.insert(
+            key.to_string(),
+            dir.path().join(file).to_str().unwrap().to_string(),
+        );
+    }
+
+    let mut local_step = test_step("local-action", None);
+    local_step.step_type = StepType::Action {
+        uses: "./my-action".to_string(),
+        with: serde_json::json!({}),
+    };
+    let mut remote_step = test_step("remote-action", None);
+    remote_step.step_type = StepType::Action {
+        uses: "example/remote-action@abc123".to_string(),
+        with: serde_json::json!({}),
+    };
+
+    let mut action_paths = std::collections::HashMap::new();
+    action_paths.insert(
+        "example/remote-action@abc123".to_string(),
+        remote_action.to_str().unwrap().to_string(),
+    );
+
+    let ordered = crate::worker::job_extension::build_step_list_with_lifecycle(
+        vec![local_step, remote_step],
+        workspace.to_str().unwrap(),
+        &action_paths,
+    );
+    // Two main steps plus two generated post steps.
+    assert_eq!(ordered.len(), 4);
+    assert!(ordered[2].display_name.starts_with("Post "));
+    assert!(ordered[3].display_name.starts_with("Post "));
+
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let result = run_steps(
+        &ordered,
+        &mut job,
+        workspace.to_str().unwrap(),
+        cancel_rx,
+        queue.clone(),
+        None,
+        None,
+        &[],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, "Succeeded");
+    for file in [
+        "main.marker",
+        "post.marker",
+        "remote-main.marker",
+        "remote-post.marker",
+    ] {
+        assert!(
+            dir.path().join(file).exists(),
+            "expected {file} to be written (post steps must run)"
+        );
+    }
+    // The queued updates must include the generated Post steps so they are
+    // visible in the job log.
+    let updates = queue.lock().await;
+    let post_updates = updates
+        .all_queued_updates()
+        .iter()
+        .filter(|u| u.name.starts_with("Post "))
+        .count();
+    assert!(
+        post_updates >= 2,
+        "expected Post steps in queue updates, got {post_updates}"
+    );
+}
