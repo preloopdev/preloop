@@ -100,6 +100,29 @@ Reproduce: `scripts/bench-runner-compare.sh` (set `BENCH_RUNS=N`; needs
 `~/.cache/actions-runner/current`). Interactive chart:
 `benchmarks/runner-compare.html`.
 
+## Just the runner
+
+If you only want `preloop-runner` — the drop-in Rust replacement for
+`actions/runner` — every release publishes standalone binaries for Linux
+(x86_64/aarch64), macOS (x86_64/arm64), and Windows (x86_64):
+
+```sh
+curl -fsSLO https://github.com/preloopdev/preloop/releases/latest/download/preloop-runner-<triple>
+chmod +x preloop-runner-<triple>
+./preloop-runner-<triple> configure --url https://github.com/owner/repo --token <registration-token>
+./preloop-runner-<triple> run
+```
+
+Or the container image:
+
+```sh
+docker run ghcr.io/preloopdev/preloop-runner:latest \
+  configure --url https://github.com/owner/repo --token <registration-token>
+```
+
+Each binary ships with a CycloneDX SBOM (`preloop-runner-<triple>.cdx.json`)
+and a sha256 checksum.
+
 
 ## Documentation on where to go to find info.
 
