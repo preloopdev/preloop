@@ -40,6 +40,48 @@ pub fn resolve_string(input: &str, context: &Context) -> Result<String, String> 
     Ok(result)
 }
 
+/// If the whole string is exactly one `${{ }}` expression, return its body.
+fn whole_expression(input: &str) -> Option<&str> {
+    let rest = input.trim().strip_prefix("${{")?;
+    let end = find_expression_end(rest)?;
+    if rest[end + 2..].trim().is_empty() {
+        Some(rest[..end].trim())
+    } else {
+        None
+    }
+}
+
+/// Resolve one `runs-on` label entry into the labels it contributes.
+///
+/// Most entries contribute exactly one label. A label that is a single
+/// `${{ }}` expression evaluating to an array contributes one label per
+/// element: GitHub's `runs-on` accepts a string or an array of strings, and
+/// an expression result keeps its type instead of being stringified — so
+/// `runs-on: ${{ fromJSON('[\"ubuntu-latest\"]') }}` means the label
+/// `ubuntu-latest`, not the literal string `["ubuntu-latest"]`, which no
+/// runner could ever advertise.
+///
+/// Empty elements are preserved as empty labels rather than dropped: an empty
+/// label matches no runner, so the job starves exactly the way the official
+/// service leaves a job whose label evaluated to nothing. (The build-time
+/// pass keeps its own drop-empty filter on top of this function; that is the
+/// pre-existing behaviour for labels resolved against a complete context.)
+///
+/// A label that fails to evaluate is returned raw, mirroring the
+/// `resolve_string` fallback: an unevaluated label matches nothing, which is
+/// the same failure mode the server has always had for broken expressions.
+pub fn resolve_runs_on_label(label: &str, context: &Context) -> Vec<String> {
+    if !label.contains("${{") {
+        return vec![label.to_owned()];
+    }
+    if let Some(expression) = whole_expression(label) {
+        if let Ok(Value::Array(items)) = eval_expression(expression, context) {
+            return items.iter().map(stringify_value).collect();
+        }
+    }
+    vec![resolve_string(label, context).unwrap_or_else(|_| label.to_owned())]
+}
+
 pub(crate) fn find_expression_end(input: &str) -> Option<usize> {
     // Mirror the single-quoted string rules of `preloop-gha-expressions`'s lexer:
     // only `'` opens/closes a string, doubled `''` is an escaped quote, and
@@ -830,6 +872,62 @@ mod tests {
     fn unclosed_expression_returns_error() {
         let ctx = make_context();
         assert!(resolve_string("${{ github.event_name", &ctx).is_err());
+    }
+
+    #[test]
+    fn runs_on_label_array_expression_flattens_to_labels() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("${{ fromJSON('[\"a\", \"b\"]') }}", &ctx),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_array_expression_keeps_empty_elements() {
+        // An empty element is an unmatchable label, not an absent one: the
+        // job must starve rather than silently match every runner, so the
+        // empty string is preserved here. (The build-time pass drops empties
+        // with its own filter; the deferred server path keeps them.)
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("${{ fromJSON('[\"a\", \"\"]') }}", &ctx),
+            vec!["a".to_owned(), String::new()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_scalar_expression_stays_one_label() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("${{ matrix.os }}", &ctx),
+            vec!["ubuntu-latest".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_mixed_text_interpolates() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("prefix-${{ matrix.os }}", &ctx),
+            vec!["prefix-ubuntu-latest".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_literal_passes_through() {
+        let ctx = make_context();
+        assert_eq!(
+            resolve_runs_on_label("self-hosted", &ctx),
+            vec!["self-hosted".to_owned()]
+        );
+    }
+
+    #[test]
+    fn runs_on_label_broken_expression_stays_raw() {
+        let ctx = make_context();
+        let label = "${{ bogusFunction( }}";
+        assert_eq!(resolve_runs_on_label(label, &ctx), vec![label.to_owned()]);
     }
 
     #[test]

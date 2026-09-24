@@ -2061,7 +2061,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         );
 
         // Enqueue jobs (workflow concurrency free / acquired).
-        for queued_job in built_jobs {
+        for mut queued_job in built_jobs {
             let job_id = queued_job.job_id.clone();
             let base_id = queued_job.base_id.clone();
 
@@ -2109,14 +2109,38 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 continue;
             }
 
+            let needs_empty = queued_job.needs.is_empty();
+            if needs_empty {
+                // A job with no `needs` never passes through the promotion
+                // path, so `runs-on` labels left raw at build time (they read
+                // `needs.*`, which is empty for a needs-less job) are finished
+                // here against the complete context, before the pool check
+                // below validates the true labels. Needs-gated jobs keep
+                // their raw templates until promotion, when the needed jobs
+                // have completed.
+                let mut context = preloop_gha_expressions::Context::new();
+                for (key, value) in &queued_job.message.context_data {
+                    context.insert(key, value.to_json());
+                }
+                crate::runtime_scheduling::resolve_deferred_runs_on(&mut queued_job, &context);
+            }
+
             // Full label validation against the co-hosted pool's advertised
             // labels: when the pool has published them, a `runs-on` it can
             // never satisfy fails at enqueue rather than starving in the
             // queue. Skipped when the pool hasn't published (external-only
             // deployments, or a pool that predates the field) — the
-            // starvation sweep remains the backstop there.
+            // starvation sweep remains the backstop there. Also skipped for
+            // jobs whose labels are still raw templates reading `needs.*`:
+            // their real labels only exist once the needed jobs complete, so
+            // there is nothing meaningful to validate yet.
             let pool_labels = shared.state.pool_status.snapshot().labels;
-            if !pool_labels.is_empty()
+            let runs_on_deferred = queued_job
+                .runs_on
+                .iter()
+                .any(|label| preloop_gha_parser::eval::has_expressions(label));
+            if !runs_on_deferred
+                && !pool_labels.is_empty()
                 && !crate::runtime_scheduling::job_matches_runner(&queued_job.runs_on, &pool_labels)
             {
                 let reason = format!(
@@ -2136,7 +2160,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 continue;
             }
 
-            let needs_empty = queued_job.needs.is_empty();
             let max_parallel = queued_job.max_parallel;
             let under_mp = max_parallel
                 .is_none_or(|max| ready_by_base.get(&base_id).copied().unwrap_or(0) < max);

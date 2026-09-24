@@ -1109,6 +1109,78 @@ jobs:
     assert_eq!(jobs[0].runs_on, vec!["self-hosted", "linux"]);
 }
 
+/// A `runs-on` expression reading `needs.*` must not be evaluated at expansion
+/// time: the needed job has not run yet, so the resolver would coalesce the
+/// missing output to "" and the job could never match a runner (it starves).
+/// The raw template ships through and the server finishes it once the needed
+/// jobs have completed.
+#[test]
+fn needs_output_runs_on_stays_raw_until_needs_complete() {
+    let workflow = parse_workflow(
+        r#"
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.p.outputs.runner }}
+    steps:
+      - id: p
+        run: echo 'runner=ubuntu-latest' >> "$GITHUB_OUTPUT"
+  release:
+    needs: plan
+    runs-on: ${{ fromJSON(format('["{0}"]', needs.plan.outputs.runner)) }}
+    steps:
+      - run: echo ok
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    let plan = jobs.iter().find(|job| job.base_id == "plan").unwrap();
+    assert_eq!(plan.runs_on, vec!["ubuntu-latest"]);
+    let release = jobs.iter().find(|job| job.base_id == "release").unwrap();
+    assert_eq!(
+        release.runs_on,
+        vec!["${{ fromJSON(format('[\"{0}\"]', needs.plan.outputs.runner)) }}"]
+    );
+}
+
+/// A label mixing a matrix reference with a `needs` reference also ships raw:
+/// resolving it at expansion time would destroy the `needs` half, and at
+/// promotion time the context carries both halves.
+#[test]
+fn mixed_matrix_and_needs_runs_on_stays_raw() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      suffix: x64
+    steps:
+      - run: echo ok
+  cell:
+    needs: plan
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: "${{ matrix.os }}-${{ needs.plan.outputs.suffix }}"
+    steps:
+      - run: echo hi
+"#,
+    )
+    .unwrap();
+    let jobs = expand_jobs(&workflow).unwrap();
+
+    let cell = jobs.iter().find(|job| job.base_id == "cell").unwrap();
+    assert_eq!(
+        cell.runs_on,
+        vec!["${{ matrix.os }}-${{ needs.plan.outputs.suffix }}"]
+    );
+}
+
 /// `runs-on: ${{ matrix.os }}` is the most common shape in real workflows
 /// (tokio, caddy, uv). An unresolved label is one no runner can advertise, so
 /// the cell queues forever and the cause looks like a scheduling bug.
