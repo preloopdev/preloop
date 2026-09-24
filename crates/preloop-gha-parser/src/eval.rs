@@ -71,6 +71,26 @@ pub fn has_expressions(input: &str) -> bool {
     input.contains("${{")
 }
 
+/// Evaluate `input` as one whole `${{ expr }}` expression and return the raw
+/// value, or `None` when the input is not exactly one expression (no
+/// expression at all, or an expression mixed with other text).
+///
+/// `runs-on` needs the raw value (not its string rendering) so a whole
+/// expression that yields a list can be unpacked into individual labels.
+pub(crate) fn whole_expression_value(
+    input: &str,
+    context: &Context,
+) -> Option<Result<Value, String>> {
+    let rest = input.trim().strip_prefix("${{")?;
+    let end = find_expression_end(rest)?;
+    if !rest[end + 2..].trim().is_empty() {
+        // Text after the expression means this is not a whole expression.
+        return None;
+    }
+    let expr = rest[..end].trim();
+    Some(eval_expression(expr, context).map_err(|e| format!("{e}")))
+}
+
 /// Resolve a map of string values, evaluating all `${{ }}` expressions.
 pub fn resolve_map(
     map: &BTreeMap<String, String>,
@@ -114,7 +134,7 @@ pub fn resolve_json(value: &Value, context: &Context) -> Result<Value, String> {
 /// GitHub Actions renders whole-number values as integers — `1.0` → `"1"`.
 /// serde_yaml 0.9 may produce `f64(1.0)` for a YAML integer `1`; normalise
 /// before embedding in a step command string.
-fn stringify_value(value: &Value) -> String {
+pub(crate) fn stringify_value(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
