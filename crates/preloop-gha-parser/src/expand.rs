@@ -666,7 +666,13 @@ fn job_plan_from_job(
         secrets_inherit: false,
         container: job.container.clone(),
         services: non_empty_services(job.services.clone()),
-        inputs: BTreeMap::new(),
+        // The runtime fan-out builds plans for deferred matrix cells after the
+        // submit-time stamping, so the inputs the expansion context carried
+        // must live on the plan: the job message builder and `if:` evaluation
+        // read the `inputs` context from the plan, and a fan-out cell would
+        // otherwise be born with an empty one while plain jobs see the
+        // dispatch values.
+        inputs: inputs.cloned().unwrap_or_default(),
         workflow_file: None,
         workflow_ref: None,
         workflow_sha: None,
