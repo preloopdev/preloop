@@ -45,6 +45,21 @@ To continue with the setup, see GitHub App and PAT credentials, secrets, config 
 Run it as a server, service install, every runtime knob, and how to expose it (tailnet only, Tailscale Funnel, Cloudflare Tunnel, or your own
 domain): [docs/self-hosting.md](docs/self-hosting.md)
 
+### Just the runner
+
+`preloop-runner` is a drop-in Rust replacement for `actions/runner` — it
+registers against GitHub (or a preloop server) the same way, at 36× smaller
+install and 19× lower peak memory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+preloop-runner configure --url https://github.com/owner/repo --token <registration-token>
+preloop-runner run
+```
+
+Or the container image: `docker run ghcr.io/preloopdev/preloop-runner:latest
+configure --url … --token …`. Details: [docs/setup.md](docs/setup.md#just-the-runner).
+
 ## What makes it different vs others.
 
 - We use the real runner protocol, not a behavior approximation: the official runner binary works against it unchanged.

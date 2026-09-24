@@ -62,6 +62,12 @@ just dogfood    # E2E with real runner
 - **Composability is the goal.** Any runner should work with any server. Never introduce protocol divergences.
 - **Local CI is mandatory.** After every large chunk of work or task, run `just test-ci` to validate the changes and dogfood the workflow.
 - **Drop-in workflows.** Users should be able to run their workflows in local CI unmodified.
+- **Supply-chain policy isolation.** A PR must not mix policy files
+  (`Cargo.lock`, `deny.toml`, `.cargo/audit.toml`, `supply-chain/`,
+  `.github/workflows/supply-chain.yml`) with non-policy changes — the
+  supply-chain audit job fails the PR. Adding a dependency (even a
+  dev-dependency) touches `Cargo.lock`; split it into a dedicated PR or
+  vendor the need away.
 
 ## Debugging Dogfood (mandatory)
 
