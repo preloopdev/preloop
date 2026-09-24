@@ -9,6 +9,7 @@
 #
 # Options: --version <tag>  install a specific release (default: latest)
 #          --prefix <dir>   install under <dir>/bin (default: ~/.local)
+#          --runner         install only preloop-runner (no control plane or smolvm)
 
 set -e
 
@@ -16,6 +17,7 @@ PREFIX="${PREFIX:-$HOME/.local}"
 VERSION="${VERSION:-latest}"
 REPO="preloopdev/preloop"
 BIN_DIR="$PREFIX/bin"
+RUNNER_ONLY=0
 
 say() { printf '\033[1;32m[preloop]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[preloop] error:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -24,12 +26,27 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
         --prefix) PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
-        -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -12; exit 0 ;;
+        --runner|--runner-only) RUNNER_ONLY=1; shift ;;
+        -h|--help)
+            cat <<'EOF'
+preloop installer
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+
+Options:
+  --runner         install only preloop-runner (no control plane or smolvm)
+  --version <tag>  install a specific release (default: latest)
+  --prefix <dir>   install under <dir>/bin (default: ~/.local)
+  -h, --help       show this help message
+EOF
+            exit 0
+            ;;
         *) die "unknown option: $1" ;;
     esac
 done
 BIN_DIR="$PREFIX/bin"
-
 # --- platform ---------------------------------------------------------------
 
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -247,7 +264,101 @@ install_from_release() {
     return 0
 }
 
-if install_from_release; then
+install_runner_from_release() {
+    local tag="$VERSION"
+    local json
+    if [ "$tag" = "latest" ]; then
+        json="$(release_json latest)" || return 1
+    else
+        json="$(release_json "tags/$tag")" || return 1
+    fi
+    tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    [ -n "$tag" ] || return 1
+
+    local triple="$(full_triple)"
+    local runner_asset="preloop-runner-${triple}"
+    local runner_url
+    runner_url="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$runner_asset\)\".*/\1/p" | head -1)"
+
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    if [ -n "$runner_url" ]; then
+        say "downloading $runner_asset ($tag)..."
+        local runner_file="$tmp/$runner_asset"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$runner_url" -o "$runner_file" 2>/dev/null || runner_file=""
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$runner_url" -O "$runner_file" 2>/dev/null || runner_file=""
+        fi
+        if [ -n "${runner_file:-}" ] && [ -s "$runner_file" ]; then
+            local runner_expected runner_actual
+            runner_expected="$(curl -fsSL "${runner_url}.sha256" 2>/dev/null | awk '{print $1}')"
+            if [ -n "$runner_expected" ]; then
+                if command -v sha256sum >/dev/null 2>&1; then
+                    runner_actual="$(sha256sum "$runner_file" | awk '{print $1}')"
+                else
+                    runner_actual="$(shasum -a 256 "$runner_file" | awk '{print $1}')"
+                fi
+                [ "$runner_actual" = "$runner_expected" ] || die "checksum mismatch for $runner_asset"
+                say "sha256 verified"
+            fi
+            mkdir -p "$BIN_DIR"
+            install -m 0755 "$runner_file" "$BIN_DIR/preloop-runner"
+            say "installed $BIN_DIR/preloop-runner"
+            return 0
+        fi
+    fi
+
+    # Fallback: check if the platform tarball contains preloop-runner
+    local short="preloop-cli-${os}-${arch}.tar.gz"
+    local full="preloop-cli-${triple}.tar.gz"
+    local archive_url
+    archive_url="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$short\)\".*/\1/p" | head -1)"
+    if [ -z "$archive_url" ]; then
+        archive_url="$(printf '%s' "$json" | sed -n "s/.*\"browser_download_url\":[[:space:]]*\"\([^\"]*\/$full\)\".*/\1/p" | head -1)"
+    fi
+    if [ -n "$archive_url" ]; then
+        say "downloading $archive_url ($tag)..."
+        local archive="$tmp/archive.tar.gz"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$archive_url" -o "$archive" 2>/dev/null || archive=""
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$archive_url" -O "$archive" 2>/dev/null || archive=""
+        fi
+        if [ -n "${archive:-}" ] && [ -s "$archive" ]; then
+            mkdir -p "$tmp/extract"
+            tar -xzf "$archive" -C "$tmp/extract" --strip-components=1 2>/dev/null || true
+            if [ -f "$tmp/extract/preloop-runner" ]; then
+                mkdir -p "$BIN_DIR"
+                install -m 0755 "$tmp/extract/preloop-runner" "$BIN_DIR/preloop-runner"
+                say "installed $BIN_DIR/preloop-runner"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+if [ "$RUNNER_ONLY" = 1 ]; then
+    if install_runner_from_release; then
+        case ":$PATH:" in
+            *":$BIN_DIR:"*) ;;
+            *) say "add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+        esac
+        cat <<EOF
+
+[preloop] next steps:
+    preloop-runner configure --url https://github.com/OWNER/REPO --token <TOKEN>
+    preloop-runner run
+
+[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md#just-the-runner
+EOF
+        exit 0
+    fi
+elif install_from_release; then
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *) say "add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
@@ -274,6 +385,40 @@ command -v cargo >/dev/null 2>&1 || {
     command -v rustup >/dev/null 2>&1 || die "rustup/cargo is required — install from https://rustup.rs"
     die "cargo not found — run: rustup toolchain install stable && rustup default stable"
 }
+
+if [ "$RUNNER_ONLY" = 1 ]; then
+    PRELOOP_SRC="${PRELOOP_SRC:-$HOME/.preloop-src}"
+    REPO_URL="${PRELOOP_REPO:-https://github.com/preloopdev/preloop.git}"
+    mkdir -p "$PRELOOP_SRC"
+    if [ -d "$PRELOOP_SRC/.git" ]; then
+        say "refreshing $PRELOOP_SRC"
+        git -C "$PRELOOP_SRC" fetch --quiet --depth=1 origin main
+        git -C "$PRELOOP_SRC" checkout --quiet FETCH_HEAD
+    else
+        say "cloning $REPO_URL into $PRELOOP_SRC"
+        git clone --quiet --depth=1 "$REPO_URL" "$PRELOOP_SRC"
+    fi
+    cd "$PRELOOP_SRC"
+    say "building preloop-runner (release)..."
+    cargo build --release -p preloop-runner 2>/dev/null \
+        || cargo build --release -p aksh-runner
+    mkdir -p "$BIN_DIR"
+    install -m 0755 "$PRELOOP_SRC/target/release/preloop-runner" "$BIN_DIR/preloop-runner"
+    say "installed $BIN_DIR/preloop-runner (source build)"
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) say "add $BIN_DIR to your PATH:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    esac
+    cat <<EOF
+
+[preloop] next steps:
+    preloop-runner configure --url https://github.com/OWNER/REPO --token <TOKEN>
+    preloop-runner run
+
+[preloop] full guide: https://github.com/preloopdev/preloop/blob/main/docs/setup.md#just-the-runner
+EOF
+    exit 0
+fi
 if command -v zig >/dev/null 2>&1; then
     command -v cargo-zigbuild >/dev/null 2>&1 || say "zig found; cargo-zigbuild missing — the Linux microVM runner will be skipped (run: cargo install cargo-zigbuild)"
     ZIGBUILD=1

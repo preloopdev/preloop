@@ -18,24 +18,138 @@ curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh 
   `.wslconfig` (`[wsl2] nestedVirtualization=true`) so `/dev/kvm` is exposed.
 - Without it, `preloop runner` still works (jobs run as WSL processes); only the VM pool needs KVM.
 
-## Just the runner
+## Just the runner (Standalone GitHub Actions Runner)
 
-If you only want `preloop-runner` — a drop-in Rust replacement for
-`actions/runner` that registers against GitHub (or a preloop server) the same
-way — every release publishes standalone binaries:
+If you only want `preloop-runner` — a drop-in Rust replacement for the official
+`actions/runner` (`config.sh` / `run.sh`) that speaks the same wire protocol
+and registers directly against GitHub (or a preloop server) without the
+control plane or microVM infrastructure — follow this guide.
+
+It behaves **exactly like the official runner**:
+- Registers with repository or organization runner pools
+- Listens for jobs via GitHub's broker service
+- Executes jobs, streams step logs, and reports timelines directly to GitHub
+- Requires no control plane, no `smolvm`, and no background services
+
+### 1. Installation
+
+Install with one command:
 
 ```sh
-# linux x86_64 / aarch64, macOS x86_64 / arm64, windows x86_64
-curl -fsSLO https://github.com/preloopdev/preloop/releases/latest/download/preloop-runner-<triple>
-chmod +x preloop-runner-<triple>
-./preloop-runner-<triple> configure --url https://github.com/owner/repo --token <registration-token>
-./preloop-runner-<triple> run
+curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
 ```
 
-Or the container image: `docker run ghcr.io/preloopdev/preloop-runner:latest
-configure --url … --token …`. Each binary ships with a CycloneDX SBOM
-(`preloop-runner-<triple>.cdx.json`) and a sha256 checksum.
+This detects your platform, downloads `preloop-runner`, verifies the sha256 checksum,
+and installs it into `~/.local/bin/preloop-runner` (or pass `--prefix <dir>`):
 
+- **Linux**: `x86_64` or `aarch64`
+- **macOS**: Apple Silicon (`aarch64`) or Intel (`x86_64`)
+- **Windows**: `x86_64` (standalone `.exe` via release downloads)
+
+Alternatively, download standalone platform binaries (`preloop-runner-<triple>`) and
+CycloneDX SBOMs (`preloop-runner-<triple>.cdx.json`) from the
+[latest release](https://github.com/preloopdev/preloop/releases/latest).
+The container image is available at `ghcr.io/preloopdev/preloop-runner:latest`.
+
+### 2. Obtain a Registration Token from GitHub
+
+Get a runner registration token from your GitHub repository or organization:
+
+- **Repository**: `Settings` → `Actions` → `Runners` → `New self-hosted runner`
+- **Organization**: `Settings` → `Actions` → `Runners` → `New runner`
+- **GitHub CLI**:
+  ```sh
+  gh api --method POST /repos/OWNER/REPO/actions/runners/registration-token --jq .token
+  ```
+
+### 3. Configure the Runner
+
+Run `configure` with your GitHub URL and registration token. Flags mirror
+the official `config.sh`:
+
+```sh
+preloop-runner configure \
+  --url https://github.com/OWNER/REPO \
+  --token <REGISTRATION_TOKEN> \
+  --name my-runner \
+  --labels self-hosted,linux,x64 \
+  --unattended \
+  --replace
+```
+
+| Flag | Meaning | Official runner equivalent |
+|---|---|---|
+| `--url` | GitHub repository or organization URL | `--url` |
+| `--token` | Registration token from GitHub | `--token` |
+| `--name` | Runner name in GitHub UI (defaults to hostname) | `--name` |
+| `--labels` | Comma-separated labels for workflow matching | `--labels` |
+| `--work` | Work directory (defaults to `_work`) | `--work` |
+| `--runner-group` | Runner group for organization runners | `--runnergroup` |
+| `--unattended` | Run non-interactively | `--unattended` |
+| `--replace` | Replace an existing runner with the same name | `--replace` |
+| `--ephemeral` | Unregister runner after completing one job | `--ephemeral` |
+| `--no-externals` | Skip downloading Node 20/24 (if pre-installed) | — |
+
+During `configure`, `preloop-runner`:
+1. Authenticates against GitHub's runner API.
+2. Generates an RSA keypair for message encryption.
+3. Downloads Node 20 and Node 24 runtimes to `externals/` for JavaScript actions.
+4. Persists runner settings to `.runner` and credentials to `.credentials`.
+
+### 4. Start the Runner
+
+#### Foreground Mode
+```sh
+preloop-runner run
+```
+The listener connects to GitHub (`broker.actions.githubusercontent.com`), polls
+for matching jobs, and executes them. Press `Ctrl-C` for a graceful shutdown.
+
+#### Ephemeral / Single-Job Mode (CI, Containers, Ephemeral VMs)
+If you want the runner to process exactly one job, deregister, and exit:
+
+```sh
+preloop-runner configure --url https://github.com/OWNER/REPO --token <TOKEN> --ephemeral --unattended
+preloop-runner run --once
+```
+
+#### Running as a systemd Service (Linux)
+To run `preloop-runner` as a persistent background service on a Linux server:
+
+```ini
+# /etc/systemd/system/preloop-runner.service
+[Unit]
+Description=preloop GitHub Actions Runner
+After=network.target
+
+[Service]
+Type=simple
+User=runner
+WorkingDirectory=/home/runner/preloop-runner
+ExecStart=/usr/local/bin/preloop-runner run
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now preloop-runner
+```
+
+### 5. Deregistering the Runner
+
+To remove the runner from GitHub:
+
+```sh
+# Get a remove token from GitHub repo settings or:
+# gh api --method POST /repos/OWNER/REPO/actions/runners/remove-token --jq .token
+preloop-runner remove --token <REMOVE_TOKEN>
+```
 ## Quick start
 
 ```sh
