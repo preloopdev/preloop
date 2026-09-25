@@ -171,6 +171,10 @@ pub(crate) struct JobRowState {
     pub(crate) status: ExecutionStatus,
     pub(crate) queue_position: Option<i64>,
     pub(crate) seq: i64,
+    pub(crate) priority: i16,
+    pub(crate) run_order: i64,
+    pub(crate) job_order: i64,
+    pub(crate) not_before_us: Option<i64>,
 }
 
 /// Rows loaded into a [`TxState`], used to compute deletions at write-back:

@@ -17,6 +17,18 @@ use preloop_gha_protocol::{ExecutionStatus, JobId, RegisteredRunner, RunId};
 /// identical.
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// Compute a normalized, deterministic pool key from a job's runs-on labels and runner group.
+pub(crate) fn compute_pool_key(runs_on: &[String], runner_group: Option<&str>) -> String {
+    let mut labels: Vec<String> = runs_on.iter().map(|s| s.to_ascii_lowercase()).collect();
+    labels.sort();
+    let group = runner_group.unwrap_or("").to_ascii_lowercase();
+    if group.is_empty() {
+        labels.join(",")
+    } else {
+        format!("{group}:{}", labels.join(","))
+    }
+}
+
 /// Queue classification for a job row. `jobs.state` (the `ExecutionStatus`
 /// in the run record and the `jobs.status` column) is canonical workflow
 /// truth; `queue_kind` is the derived dispatch copy — never independently

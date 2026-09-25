@@ -1024,7 +1024,8 @@ fn load_txstate(
     {
         let mut sql = String::from(
             "SELECT run_id, job_id, status, queue_kind, queue_position, seq, \
-             reaper_first_seen_us, expand_generation, enqueued_at_us, payload_blob \
+             reaper_first_seen_us, expand_generation, enqueued_at_us, payload_blob, \
+             priority, run_order, job_order, not_before_us \
              FROM jobs",
         );
         let mut params: Vec<String> = Vec::new();
@@ -1075,6 +1076,10 @@ fn load_txstate(
                     r.get::<_, i64>(7)?,
                     r.get::<_, Option<i64>>(8)?,
                     r.get::<_, Option<Vec<u8>>>(9)?,
+                    r.get::<_, Option<i16>>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
+                    r.get::<_, Option<i64>>(12)?,
+                    r.get::<_, Option<i64>>(13)?,
                 ))
             })
             .map_err(ControlError::backend)?;
@@ -1090,6 +1095,10 @@ fn load_txstate(
                 expand_generation,
                 enqueued_us,
                 payload,
+                priority,
+                run_order,
+                job_order,
+                not_before_us,
             ) = row.map_err(ControlError::backend)?;
             let run_id = parse_run_id(&run_id_s);
             let job_id = JobId(job_id_s);
@@ -1103,6 +1112,10 @@ fn load_txstate(
                     status,
                     queue_position: pos,
                     seq: job_seq.unwrap_or(0),
+                    priority: priority.unwrap_or(0),
+                    run_order: run_order.unwrap_or(0),
+                    job_order: job_order.unwrap_or(0),
+                    not_before_us,
                 },
             );
             if let Some(run) = tx.runs.get_mut(&run_id) {
@@ -2060,19 +2073,36 @@ fn write_txstate(
                 .and_then(|r| r.jobs.get(job_id).copied())
                 .unwrap_or(ExecutionStatus::Queued)
         };
+        let pool_key = match job {
+            Some(j) => {
+                crate::control::types::compute_pool_key(&j.runs_on, j.runner_group.as_deref())
+            }
+            None => String::new(),
+        };
+        let run_order = preserved.map(|p| p.run_order).unwrap_or_else(|| {
+            tx.runs
+                .get(&run_id)
+                .map(|r| r.run_number as i64)
+                .unwrap_or(0)
+        });
+        let job_order = if same_slot {
+            preserved.map(|p| p.job_order).unwrap_or(0)
+        } else {
+            position.unwrap_or(0)
+        };
+        let priority = preserved.map(|p| p.priority).unwrap_or(0);
+        let not_before_us = preserved.and_then(|p| p.not_before_us);
+        let is_initial_insert = !tx.loaded.jobs.contains_key(&key);
         let (base_id, runs_on, runner_group, enqueued_us, payload) = match job {
             Some(j) => (
                 j.base_id.clone(),
                 serde_json::to_string(&j.runs_on).unwrap_or_default(),
                 j.runner_group.clone(),
                 Some(j.enqueued_at_unix_nanos / 1000),
-                // A job staying in its persisted slot carries an unchanged
-                // payload — re-sealing it every transaction is wasted AES +
-                // a fresh random IV per row. `None` keeps the stored blob.
-                if same_slot {
-                    None
-                } else {
+                if is_initial_insert {
                     Some(unblob(cipher, j)?)
+                } else {
+                    None
                 },
             ),
             None => (String::new(), "[]".to_owned(), None, None, None),
@@ -2090,15 +2120,19 @@ fn write_txstate(
         conn.execute(
             "INSERT INTO jobs (run_id, job_id, status, queue_kind, queue_position, seq, \
              base_id, runs_on, runner_group, enqueued_at_us, reaper_first_seen_us, \
-             claimed_by, claimed_at_us, expand_generation, payload_blob) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
+             claimed_by, claimed_at_us, expand_generation, payload_blob, \
+             namespace_id, pool_key, priority, run_order, job_order, not_before_us) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
              ON CONFLICT(run_id,job_id) DO UPDATE SET status=excluded.status, \
              queue_kind=excluded.queue_kind, queue_position=excluded.queue_position, \
              seq=excluded.seq, enqueued_at_us=excluded.enqueued_at_us, \
              reaper_first_seen_us=excluded.reaper_first_seen_us, \
              claimed_by=excluded.claimed_by, claimed_at_us=excluded.claimed_at_us, \
              expand_generation=excluded.expand_generation, \
-             payload_blob=COALESCE(excluded.payload_blob, jobs.payload_blob)",
+             payload_blob=COALESCE(excluded.payload_blob, jobs.payload_blob), \
+             namespace_id=excluded.namespace_id, pool_key=excluded.pool_key, \
+             priority=excluded.priority, run_order=excluded.run_order, \
+             job_order=excluded.job_order, not_before_us=excluded.not_before_us",
             params![
                 run_id.0.to_string(),
                 job_id.0,
@@ -2115,6 +2149,12 @@ fn write_txstate(
                 claimed.map(|c| system_to_us(c.at)),
                 expand_generation,
                 payload,
+                "default",
+                pool_key,
+                priority,
+                run_order,
+                job_order,
+                not_before_us,
             ],
         )
         .map_err(ControlError::backend)?;

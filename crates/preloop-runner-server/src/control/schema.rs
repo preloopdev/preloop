@@ -36,7 +36,8 @@
 /// - 8: SQLite text primary keys made explicitly `NOT NULL`.
 /// - 9: durable control events moved into the authoritative backend.
 /// - 10: live logs moved to file-backed segments; log_chunks and log_files dropped.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 10;
+/// - 11: jobs gains namespace_id, priority, run_order, job_order, pool_key, not_before_us.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 11;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -209,6 +210,56 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
         10,
         "DROP TABLE IF EXISTS log_chunks; DROP TABLE IF EXISTS log_files;",
     ),
+    // v11: jobs gains namespace_id, priority, run_order, job_order, pool_key, not_before_us.
+    (
+        11,
+        r#"
+        CREATE TABLE jobs_v11 (
+            run_id              TEXT NOT NULL,
+            job_id              TEXT NOT NULL,
+            status              TEXT NOT NULL,
+            queue_kind          TEXT NOT NULL DEFAULT 'none',
+            queue_position      INTEGER,
+            seq                 INTEGER,
+            base_id             TEXT NOT NULL DEFAULT '',
+            runs_on             TEXT NOT NULL DEFAULT '[]',
+            runner_group        TEXT,
+            enqueued_at_us      INTEGER,
+            reaper_first_seen_us INTEGER,
+            claimed_by          INTEGER,
+            claimed_at_us       INTEGER,
+            expand_generation   INTEGER NOT NULL DEFAULT 0,
+            payload_blob        BLOB,
+            namespace_id        TEXT NOT NULL DEFAULT 'default',
+            priority            INTEGER NOT NULL DEFAULT 0,
+            run_order           INTEGER NOT NULL DEFAULT 0,
+            job_order           INTEGER NOT NULL DEFAULT 0,
+            pool_key            TEXT NOT NULL DEFAULT '',
+            not_before_us       INTEGER,
+            PRIMARY KEY (run_id, job_id),
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+        INSERT INTO jobs_v11 (
+            run_id, job_id, status, queue_kind, queue_position, seq,
+            base_id, runs_on, runner_group, enqueued_at_us, reaper_first_seen_us,
+            claimed_by, claimed_at_us, expand_generation, payload_blob
+        )
+        SELECT
+            run_id, job_id, status, queue_kind, queue_position, seq,
+            base_id, runs_on, runner_group, enqueued_at_us, reaper_first_seen_us,
+            claimed_by, claimed_at_us, expand_generation, payload_blob
+        FROM jobs;
+        DROP TABLE jobs;
+        ALTER TABLE jobs_v11 RENAME TO jobs;
+        DROP INDEX IF EXISTS jobs_ready;
+        CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(pool_key, namespace_id, priority DESC,
+                                                      run_order, job_order, run_id, job_id)
+            WHERE queue_kind = 'ready';
+        CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
+            WHERE queue_kind = 'ready';
+        CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
+        "#,
+    ),
 ];
 
 /// The SQLite DDL, applied as one migration. `IF NOT EXISTS` makes it
@@ -268,11 +319,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     claimed_at_us       INTEGER,                    -- when the claim was taken
     expand_generation   INTEGER NOT NULL DEFAULT 0, -- expansion fencing
     payload_blob        BLOB,                       -- QueuedJob (sealed JSON)
+    namespace_id        TEXT NOT NULL DEFAULT 'default',
+    priority            INTEGER NOT NULL DEFAULT 0,
+    run_order           INTEGER NOT NULL DEFAULT 0,
+    job_order           INTEGER NOT NULL DEFAULT 0,
+    pool_key            TEXT NOT NULL DEFAULT '',
+    not_before_us       INTEGER,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
--- The ready queue: claim candidates in FIFO order.
-CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(queue_position)
+-- The ready queue: claim candidates in FIFO / policy order.
+CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(pool_key, namespace_id, priority DESC,
+                                              run_order, job_order, run_id, job_id)
+    WHERE queue_kind = 'ready';
+CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
     WHERE queue_kind = 'ready';
 -- Per-run scans (cancel, fail-fast, promote).
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
@@ -524,7 +584,8 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 7: `outbox` dropped — declared but never read or written.
 /// - 8: durable control events moved into the authoritative backend.
 /// - 9: live logs moved to file-backed segments; log_chunks and log_files dropped.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 9;
+/// - 10: jobs gains namespace_id, priority, run_order, job_order, pool_key, not_before_us.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 10;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -572,6 +633,22 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
     (
         9,
         "DROP TABLE IF EXISTS control.log_chunks; DROP TABLE IF EXISTS control.log_files;",
+    ),
+    // v10: jobs gains namespace_id, priority, run_order, job_order, pool_key, not_before_us.
+    (
+        10,
+        "ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS namespace_id TEXT NOT NULL DEFAULT 'default'; \
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS priority SMALLINT NOT NULL DEFAULT 0; \
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS run_order BIGINT NOT NULL DEFAULT 0; \
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS job_order BIGINT NOT NULL DEFAULT 0; \
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS pool_key TEXT NOT NULL DEFAULT ''; \
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS not_before_us BIGINT; \
+         DROP INDEX IF EXISTS control.jobs_ready; \
+         CREATE INDEX IF NOT EXISTS jobs_ready ON control.jobs(pool_key, namespace_id, priority DESC, \
+                                                               run_order, job_order, run_id, job_id) \
+             WHERE queue_kind = 'ready'; \
+         CREATE INDEX IF NOT EXISTS jobs_ready_pos ON control.jobs(queue_position) \
+             WHERE queue_kind = 'ready';",
     ),
 ];
 
@@ -635,10 +712,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     claimed_at_us       BIGINT,
     expand_generation   BIGINT NOT NULL DEFAULT 0,
     payload_blob        BYTEA,
+    namespace_id        TEXT NOT NULL DEFAULT 'default',
+    priority            SMALLINT NOT NULL DEFAULT 0,
+    run_order           BIGINT NOT NULL DEFAULT 0,
+    job_order           BIGINT NOT NULL DEFAULT 0,
+    pool_key            TEXT NOT NULL DEFAULT '',
+    not_before_us       BIGINT,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(queue_position)
+CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(pool_key, namespace_id, priority DESC,
+                                              run_order, job_order, run_id, job_id)
+    WHERE queue_kind = 'ready';
+CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
     WHERE queue_kind = 'ready';
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
 
