@@ -2860,4 +2860,54 @@ mod postgres {
             "widened blocked→ready promotion must derive queued via override"
         );
     }
+
+    #[tokio::test]
+    async fn concurrent_pollers_claim_different_jobs_via_skip_locked() {
+        use crate::control::types::PollOutcome;
+        let (_pg, backend) = backend().await;
+        let r1 = backend
+            .register_runner(super::register_runner("r1"))
+            .await
+            .unwrap();
+        let r2 = backend
+            .register_runner(super::register_runner("r2"))
+            .await
+            .unwrap();
+        let s1 = backend
+            .create_session(super::create_session(r1.runner.id))
+            .await
+            .unwrap();
+        let s2 = backend
+            .create_session(super::create_session(r2.runner.id))
+            .await
+            .unwrap();
+
+        let run_id = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![
+                    super::submit_job(run_id, "j1", 1),
+                    super::submit_job(run_id, "j2", 2),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let p1 = backend.poll_session(super::poll(&s1.session_id, r1.runner.id));
+        let p2 = backend.poll_session(super::poll(&s2.session_id, r2.runner.id));
+        let (out1, out2) = tokio::join!(p1, p2);
+
+        let PollOutcome::Claimed(c1) = out1.unwrap() else {
+            panic!("expected c1 claim");
+        };
+        let PollOutcome::Claimed(c2) = out2.unwrap() else {
+            panic!("expected c2 claim");
+        };
+
+        assert_ne!(
+            c1.queued.job_id, c2.queued.job_id,
+            "concurrent pollers must claim different jobs"
+        );
+    }
 }

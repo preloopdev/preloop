@@ -43,7 +43,8 @@ use tokio_postgres::{Client, NoTls};
 /// is the production upgrade; the channel pool here gives the same
 /// read/write separation without a new dependency.)
 pub(crate) struct PostgresBackend {
-    client: tokio::sync::Mutex<Client>,
+    writers_tx: tokio::sync::mpsc::Sender<Client>,
+    writers_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Client>>,
     /// Read connections handed out by [`PostgresBackend::read`].
     readers_tx: tokio::sync::mpsc::Sender<Client>,
     readers_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Client>>,
@@ -75,6 +76,18 @@ fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// engines and distinct from application-level advisory locks. `xact` scope
 /// means the lock is released automatically on `COMMIT`/`ROLLBACK`.
 const POSTGRES_WRITER_LOCK_KEY: i64 = 0x0070_7265_6c6f_6f70; // "preloop"
+
+fn run_lock_key(run_id: &RunId) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    run_id.hash(&mut hasher);
+    let h = hasher.finish() as i64;
+    if h == POSTGRES_WRITER_LOCK_KEY {
+        h.wrapping_add(1)
+    } else {
+        h
+    }
+}
 
 impl PostgresBackend {
     /// Connect, migrate to the current schema version, and return the
@@ -154,9 +167,21 @@ impl PostgresBackend {
                 .await
                 .map_err(ControlError::backend)?;
         }
+        // A pool of writer connections replacing the single Mutex<Client>.
+        let (writers_tx, writers_rx) = tokio::sync::mpsc::channel(4);
+        writers_tx
+            .send(client)
+            .await
+            .map_err(|_| ControlError::backend(anyhow::anyhow!("writer pool closed")))?;
+        for _ in 1..4 {
+            writers_tx
+                .send(connect_one(url).await?)
+                .await
+                .map_err(|_| ControlError::backend(anyhow::anyhow!("writer pool closed")))?;
+        }
         // A small pool of read connections. Read-only commands check one
         // out and run a `BEGIN` read transaction, so a read never queues
-        // behind the writer's mutex.
+        // behind writes.
         let (readers_tx, readers_rx) = tokio::sync::mpsc::channel(4);
         for _ in 0..4 {
             readers_tx
@@ -168,7 +193,8 @@ impl PostgresBackend {
             .await
             .map_err(ControlError::backend)?;
         Ok(Self {
-            client: tokio::sync::Mutex::new(client),
+            writers_tx,
+            writers_rx: tokio::sync::Mutex::new(writers_rx),
             readers_tx,
             readers_rx: tokio::sync::Mutex::new(readers_rx),
             cipher,
@@ -230,6 +256,19 @@ impl PostgresBackend {
 
     /// `transact` under a scope — loads only `scope`, writes back only the
     /// loaded rows. See [`TxScope`] for the always-global concurrency rule.
+    async fn checkout_writer(&self) -> Result<Client, ControlError> {
+        self.writers_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| ControlError::backend(anyhow::anyhow!("writer pool closed")))
+    }
+
+    async fn return_writer(&self, client: Client) {
+        let _ = self.writers_tx.send(client).await;
+    }
+
     pub(crate) async fn transact_scoped<T>(
         &self,
         scope: &TxScope,
@@ -240,27 +279,41 @@ impl PostgresBackend {
                 "history scope is read-only".into(),
             ));
         }
-        let mut client = self.client.lock().await;
+        let mut client = self.checkout_writer().await?;
+        let result = self.transact_on(&mut client, scope, f).await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn transact_on<T>(
+        &self,
+        client: &mut Client,
+        scope: &TxScope,
+        f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
         let txn = client.transaction().await.map_err(ControlError::backend)?;
-        // Serialize writers across processes: the `client` mutex orders
-        // writers inside this process, but a second engine sharing the
-        // database takes no part in it. `pg_advisory_xact_lock` is the
-        // cross-process writer lock — it blocks until every other holder
-        // commits or rolls back, then is released automatically at the end
-        // of this transaction. Without it two processes `load_txstate` the
-        // same working set under READ COMMITTED and last-write-wins on
-        // `write_txstate` (lost updates). Reads stay concurrent on the
-        // reader pool; only the write command serializes, matching the
-        // single-writer command contract.
-        txn.batch_execute(&format!(
-            "SELECT pg_advisory_xact_lock({POSTGRES_WRITER_LOCK_KEY})"
-        ))
-        .await
-        .map_err(ControlError::backend)?;
+        let is_run_scoped = scope.runs.as_ref().is_some_and(|runs| {
+            !runs.is_empty() && !scope.ready_queue && !scope.blocked_jobs && !scope.concurrency
+        });
+        if is_run_scoped {
+            let runs = scope.runs.as_ref().unwrap();
+            let mut sorted: Vec<&RunId> = runs.iter().collect();
+            sorted.sort();
+            for run_id in sorted {
+                let key = run_lock_key(run_id);
+                txn.batch_execute(&format!("SELECT pg_advisory_xact_lock({key})"))
+                    .await
+                    .map_err(ControlError::backend)?;
+            }
+        } else {
+            txn.batch_execute(&format!(
+                "SELECT pg_advisory_xact_lock({POSTGRES_WRITER_LOCK_KEY})"
+            ))
+            .await
+            .map_err(ControlError::backend)?;
+        }
         let (tx, effective_scope) = load_txstate(&txn, scope, &self.cipher).await?;
         let mut tx = tx.with_config(self.config());
-        // The command body is synchronous CPU over the working set; keep it
-        // off the executor thread so a heavy command cannot starve reads.
         let result = run_blocking(|| f(&mut tx))?;
         write_txstate(&txn, &tx, &effective_scope, &self.cipher).await?;
         txn.commit().await.map_err(ControlError::backend)?;
@@ -300,8 +353,8 @@ impl PostgresBackend {
     /// transition regression tests to assert exact FIFO/status invariants.
     #[cfg(test)]
     pub(crate) async fn job_row(&self, job_id: &str) -> Option<(String, String, Option<i64>, i64)> {
-        let client = self.client.lock().await;
-        client
+        let client = self.checkout_reader().await.ok()?;
+        let result = client
             .query_opt(
                 "SELECT status, queue_kind, queue_position, seq FROM jobs WHERE job_id=$1",
                 &[&job_id],
@@ -309,7 +362,9 @@ impl PostgresBackend {
             .await
             .ok()
             .flatten()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
+        self.return_reader(client).await;
+        result
     }
 
     /// Test-only: every ready job's `queue_position`, keyed by `job_id`.
@@ -317,8 +372,10 @@ impl PostgresBackend {
     /// MAX+1 and existing rows keep their exact positions.
     #[cfg(test)]
     pub(crate) async fn ready_positions(&self) -> std::collections::BTreeMap<String, i64> {
-        let client = self.client.lock().await;
-        client
+        let Ok(client) = self.checkout_reader().await else {
+            return Default::default();
+        };
+        let result = client
             .query(
                 "SELECT job_id, queue_position FROM jobs WHERE queue_kind='ready'",
                 &[],
@@ -327,7 +384,9 @@ impl PostgresBackend {
             .unwrap_or_default()
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
-            .collect()
+            .collect();
+        self.return_reader(client).await;
+        result
     }
 
     /// The read body: one consistent snapshot on `client`, rolled back.
@@ -590,8 +649,8 @@ impl PostgresBackend {
     ) -> Result<(), ControlError> {
         let run_id = event_run_id(event).map(|id| id.0.to_string());
         let event_blob = unblob(&self.cipher, event)?;
-        let client = self.client.lock().await;
-        client
+        let client = self.checkout_writer().await?;
+        let res = client
             .execute(
                 "INSERT INTO control_events(run_id, event_blob, created_at_us) \
                  VALUES ($1, $2, $3)",
@@ -602,7 +661,9 @@ impl PostgresBackend {
                 ],
             )
             .await
-            .map_err(ControlError::backend)?;
+            .map_err(ControlError::backend);
+        self.return_writer(client).await;
+        res?;
         Ok(())
     }
     async fn terminal_job_rows(&self) -> Result<BTreeSet<(RunId, JobId)>, ControlError> {
@@ -947,10 +1008,16 @@ async fn load_txstate(
                      CASE WHEN queue_kind='ready' THEN run_order ELSE 0 END, \
                      CASE WHEN queue_kind='ready' THEN job_order ELSE 0 END, \
                      seq, run_id, job_id";
-        let sql = if conds.is_empty() {
-            format!("{base}{order}")
+        let is_poll = scope.runs.as_ref().is_some_and(|r| r.is_empty()) && scope.ready_queue;
+        let lock_suffix = if is_poll {
+            " FOR UPDATE SKIP LOCKED LIMIT 16"
         } else {
-            format!("{base} WHERE {}{order}", conds.join(" OR "))
+            ""
+        };
+        let sql = if conds.is_empty() {
+            format!("{base}{order}{lock_suffix}")
+        } else {
+            format!("{base} WHERE {}{order}{lock_suffix}", conds.join(" OR "))
         };
         conn.query(&sql, &params)
             .await
@@ -966,7 +1033,7 @@ async fn load_txstate(
         let reaper_us: Option<i64> = row.get(6);
         let expand_generation: i64 = row.get(7);
         let enqueued_us: Option<i64> = row.get(8);
-        let payload: Option<Vec<u8>> = row.get(9);
+        let payload: Option<Vec<u8>> = row.get::<_, Option<Vec<u8>>>(9);
         let priority: Option<i16> = row.get(10);
         let run_order: Option<i64> = row.get(11);
         let job_order: Option<i64> = row.get(12);
@@ -3049,50 +3116,51 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError> {
-        let mut client = self.client.lock().await;
-        let tx = client.transaction().await.map_err(ControlError::backend)?;
-        let now: i64 = tx
-            .query_one(
-                "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT",
-                &[],
-            )
-            .await
-            .map_err(ControlError::backend)?
-            .get(0);
-        let cutoff = now - 60_000_000;
-        let limit = limit.min(64) as i64;
-        let rows = tx
-            .query(
-                "SELECT r.run_id FROM runs r
-             WHERE r.archived_at_us IS NULL
-               AND r.completed_at_us IS NOT NULL AND r.completed_at_us <= $1
-               AND r.status IN ('success','failure','skipped','cancelled')
-               AND NOT EXISTS (SELECT 1 FROM job_requests q
-                               WHERE q.run_id=r.run_id AND q.result IS NULL)
-               AND NOT EXISTS (SELECT 1 FROM job_requests q
-                               JOIN runner_sessions s ON s.active_request_id=q.request_id
-                               WHERE q.run_id=r.run_id)
-               AND NOT EXISTS (SELECT 1 FROM cancellation_queue c WHERE c.run_id=r.run_id)
-             ORDER BY r.completed_at_us, r.run_id LIMIT $2
-             FOR UPDATE OF r SKIP LOCKED",
-                &[&cutoff, &limit],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-        for row in &rows {
-            let run_id: String = row.get(0);
-            tx.execute(
-                "INSERT INTO job_history(namespace_id,run_id,run_attempt,run_created_at_us,
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let now: i64 = tx
+                .query_one(
+                    "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT",
+                    &[],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            let cutoff = now - 60_000_000;
+            let limit = limit.min(64) as i64;
+            let rows = tx
+                .query(
+                    "SELECT r.run_id FROM runs r
+                 WHERE r.archived_at_us IS NULL
+                   AND r.completed_at_us IS NOT NULL AND r.completed_at_us <= $1
+                   AND r.status IN ('success','failure','skipped','cancelled')
+                   AND NOT EXISTS (SELECT 1 FROM job_requests q
+                                   WHERE q.run_id=r.run_id AND q.result IS NULL)
+                   AND NOT EXISTS (SELECT 1 FROM job_requests q
+                                   JOIN runner_sessions s ON s.active_request_id=q.request_id
+                                   WHERE q.run_id=r.run_id)
+                   AND NOT EXISTS (SELECT 1 FROM cancellation_queue c WHERE c.run_id=r.run_id)
+                 ORDER BY r.completed_at_us, r.run_id LIMIT $2
+                 FOR UPDATE OF r SKIP LOCKED",
+                    &[&cutoff, &limit],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            for row in &rows {
+                let run_id: String = row.get(0);
+                tx.execute(
+                    "INSERT INTO job_history(namespace_id,run_id,run_attempt,run_created_at_us,
                     job_id,status,base_id,pool_key,priority,run_order,job_order)
                  SELECT r.namespace,r.run_id,r.run_attempt,r.created_at_us,
                         j.job_id,j.status,j.base_id,j.pool_key,j.priority,j.run_order,j.job_order
                  FROM jobs j JOIN runs r ON r.run_id=j.run_id WHERE r.run_id=$1",
-                &[&run_id],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-            tx.execute(
-                "INSERT INTO attempt_history(namespace_id,run_id,run_attempt,run_created_at_us,
+                    &[&run_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+                tx.execute(
+                    "INSERT INTO attempt_history(namespace_id,run_id,run_attempt,run_created_at_us,
                     request_id,job_id,agent_job_id,plan_id,timeline_id,result,owner_runner_id,
                     claimed_at_us,started_at_us,steps_blob)
                  SELECT r.namespace,r.run_id,r.run_attempt,r.created_at_us,
@@ -3101,41 +3169,45 @@ impl ControlBackend for PostgresBackend {
                  FROM job_requests q JOIN runs r ON r.run_id=q.run_id
                  LEFT JOIN job_steps s ON s.agent_job_id=q.agent_job_id
                  WHERE r.run_id=$1",
-                &[&run_id],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-            tx.execute(
-                "DELETE FROM job_steps WHERE agent_job_id IN
-                 (SELECT agent_job_id FROM job_requests WHERE run_id=$1)",
-                &[&run_id],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-            for table in [
-                "job_requests",
-                "id_token_grants",
-                "oidc_job_contexts",
-                "job_assignments",
-                "pool_pending",
-                "cancellation_queue",
-            ] {
-                tx.execute(&format!("DELETE FROM {table} WHERE run_id=$1"), &[&run_id])
-                    .await
-                    .map_err(ControlError::backend)?;
-            }
-            tx.execute("DELETE FROM jobs WHERE run_id=$1", &[&run_id])
+                    &[&run_id],
+                )
                 .await
                 .map_err(ControlError::backend)?;
-            tx.execute(
-                "UPDATE runs SET archived_at_us=$2 WHERE run_id=$1",
-                &[&run_id, &now],
-            )
-            .await
-            .map_err(ControlError::backend)?;
+                tx.execute(
+                    "DELETE FROM job_steps WHERE agent_job_id IN
+                 (SELECT agent_job_id FROM job_requests WHERE run_id=$1)",
+                    &[&run_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+                for table in [
+                    "job_requests",
+                    "id_token_grants",
+                    "oidc_job_contexts",
+                    "job_assignments",
+                    "pool_pending",
+                    "cancellation_queue",
+                ] {
+                    tx.execute(&format!("DELETE FROM {table} WHERE run_id=$1"), &[&run_id])
+                        .await
+                        .map_err(ControlError::backend)?;
+                }
+                tx.execute("DELETE FROM jobs WHERE run_id=$1", &[&run_id])
+                    .await
+                    .map_err(ControlError::backend)?;
+                tx.execute(
+                    "UPDATE runs SET archived_at_us=$2 WHERE run_id=$1",
+                    &[&run_id, &now],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            }
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(rows.len())
         }
-        tx.commit().await.map_err(ControlError::backend)?;
-        Ok(rows.len())
+        .await;
+        self.return_writer(client).await;
+        result
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
@@ -3163,33 +3235,39 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn create_log(&self, _plan_id: &str) -> Result<i64, ControlError> {
-        let mut client = self.client.lock().await;
-        let tx = client.transaction().await.map_err(ControlError::backend)?;
-        let row = tx
-            .query_one(
-                "INSERT INTO counters(name, value) VALUES ('next_log_id', 1) \
-                 ON CONFLICT(name) DO UPDATE SET value = counters.value + 1 \
-                 RETURNING value - 1",
-                &[],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-        tx.commit().await.map_err(ControlError::backend)?;
-        Ok(row.get(0))
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let row = tx
+                .query_one(
+                    "INSERT INTO counters(name, value) VALUES ('next_log_id', 1) \
+                     ON CONFLICT(name) DO UPDATE SET value = counters.value + 1 \
+                     RETURNING value - 1",
+                    &[],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(row.get(0))
+        }
+        .await;
+        self.return_writer(client).await;
+        result
     }
 
     async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
         let value = unblob(&self.cipher, meta)?;
-        let client = self.client.lock().await;
-        client
+        let client = self.checkout_writer().await?;
+        let result = client
             .execute(
                 "INSERT INTO meta(key, value) VALUES ('local_state', $1) \
                  ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
                 &[&value],
             )
             .await
-            .map_err(ControlError::backend)?;
-        Ok(())
+            .map_err(ControlError::backend);
+        self.return_writer(client).await;
+        result.map(|_| ())
     }
 
     async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
