@@ -677,12 +677,13 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         None => return false,
     };
 
+    // Claim the companion lock before creating the payload: a staging file
+    // without a fresh lock reads as orphaned to a concurrent sweep.
+    let _staging_guard = StagingLockGuard::claim(staging_lock_path(&tmp_payload));
     let mut file = match tokio::fs::File::create(&tmp_payload).await {
         Ok(file) => file,
         Err(_) => return false,
     };
-    #[cfg(unix)]
-    lock_staging_file(&file);
 
     // The body is copied chunk by chunk rather than through `bytes()`. A golden
     // carries the apt baseline, the Node externals and the VM's storage volume,
@@ -981,14 +982,15 @@ async fn stream_golden_response(
     expected_sha256: Option<String>,
     expected_total_bytes: Option<u64>,
 ) -> Result<u64, String> {
+    // Claim the companion lock before creating the payload: a staging file
+    // without a fresh lock reads as orphaned to a concurrent sweep.
+    let _staging_guard = StagingLockGuard::claim(staging_lock_path(tmp_payload));
     let mut file = match tokio::fs::File::create(tmp_payload).await {
         Ok(file) => file,
         Err(error) => {
             return Err(format!("could not create temporary OCI golden: {error}"));
         }
     };
-    #[cfg(unix)]
-    lock_staging_file(&file);
     let total_bytes = response.content_length().or(expected_total_bytes);
     let mut downloaded_bytes = 0_u64;
     let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
@@ -3337,16 +3339,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     payload.display()
                 ))
             })?;
-        let lock_path = PathBuf::from(format!("{}.lock", temporary.display()));
-        let lock_file = std::fs::File::create(&lock_path).ok();
-        #[cfg(unix)]
-        if let Some(f) = &lock_file {
-            lock_staging_file(f);
-        }
-        let pack_res = self.provider.pack(&name, &temporary).await;
-        if let Err(error) = pack_res {
+        // Claim the companion lock for the pack duration: the heartbeat
+        // keeps it fresh, and dropping the guard removes it. A staging file
+        // without a fresh lock reads as orphaned to a concurrent sweep.
+        let _staging_guard = StagingLockGuard::claim(staging_lock_path(&temporary));
+        if let Err(error) = self.provider.pack(&name, &temporary).await {
             let _ = std::fs::remove_file(&temporary);
-            let _ = std::fs::remove_file(&lock_path);
             return Err(error.into());
         }
         // smolvm pack writes two files: `<output>` (ELF executable stub) and
@@ -3356,7 +3354,6 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
         let rename_res = std::fs::rename(&sidecar, &payload);
         let _ = std::fs::remove_file(&temporary);
-        let _ = std::fs::remove_file(&lock_path);
         rename_res.inspect_err(|_| {
             let _ = std::fs::remove_file(&sidecar);
         })?;
@@ -3451,13 +3448,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let stale_tmp = if name.starts_with(".tmp-golden-") {
                 if name.ends_with(".lock") {
-                    !staging_file_has_active_writer(&path)
+                    // Companion lock whose staging file is gone (or whose
+                    // writer died): a fresh lock is transient, a stale one
+                    // is swept with its staging file.
+                    !staging_lock_is_fresh(&path)
                 } else {
-                    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-                    let lock_active =
-                        lock_path.is_file() && staging_file_has_active_writer(&lock_path);
-                    let file_active = staging_file_has_active_writer(&path);
-                    !lock_active && !file_active
+                    !staging_lock_is_fresh(&staging_lock_path(&path))
                 }
             } else {
                 false
@@ -3476,7 +3472,15 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                 continue;
             }
             match std::fs::remove_file(&path) {
-                Ok(()) => swept += 1,
+                Ok(()) => {
+                    swept += 1;
+                    // A swept staging file leaves its companion lock behind;
+                    // remove it in the same pass (a stale `.lock` entry is
+                    // also swept on its own iteration).
+                    if stale_tmp && !name.ends_with(".lock") {
+                        let _ = std::fs::remove_file(staging_lock_path(&path));
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => warn!(
                     path = %path.display(),
@@ -3490,50 +3494,70 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
     }
 }
-/// Acquire an advisory exclusive non-blocking lock on a staging file descriptor.
+/// Grace window for a staging-file companion lock: the writer refreshes the
+/// lock's mtime every heartbeat, so a lock older than this has no live writer
+/// (crash between `pack()`/`download()` and `rename()`).
+const STAGING_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+/// How often a live writer refreshes its staging lock.
+const STAGING_LOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Companion lock path for a `.tmp-golden-*` staging file.
+fn staging_lock_path(staging: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", staging.display()))
+}
+
+/// Whether a companion lock evidences a live writer.
 ///
-/// Holds `flock(LOCK_EX)` so concurrent pool instances or startup sweeps
-/// recognize the file as actively written and will not delete it.
-#[cfg(unix)]
-fn lock_staging_file<F: std::os::unix::io::AsRawFd>(file: &F) {
-    let fd = file.as_raw_fd();
-    unsafe {
-        libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB);
+/// A missing lock means no writer ever claimed the file (or it already
+/// finished); a lock younger than the grace window means a heartbeat is
+/// refreshing it. An unreadable mtime spares the file: deleting on unknown
+/// age risks removing a live bake after a clock adjustment.
+fn staging_lock_is_fresh(lock: &Path) -> bool {
+    let Ok(mtime) = std::fs::metadata(lock).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    match mtime.elapsed() {
+        Ok(age) => age < STAGING_LOCK_GRACE,
+        Err(_) => true,
     }
 }
 
-/// Check if a staging file currently has an active writer holding an advisory lock.
+/// Heartbeated claim on a staging file's companion lock.
 ///
-/// Returns `true` if another process holds an exclusive lock (or the file cannot
-/// be locked because it is in active use).
-fn staging_file_has_active_writer(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .or_else(|_| std::fs::OpenOptions::new().read(true).open(path))
-        else {
-            return false;
-        };
-        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if res != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || err.raw_os_error() == Some(libc::EAGAIN)
-            {
-                return true;
+/// Creating the guard writes the lock file; a background task refreshes its
+/// mtime until the guard drops, so a concurrent pool's startup sweep sees a
+/// fresh lock and spares the in-flight bake or download. Dropping aborts the
+/// heartbeat and removes the lock file.
+struct StagingLockGuard {
+    lock: PathBuf,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StagingLockGuard {
+    fn claim(lock: PathBuf) -> Self {
+        let _ = std::fs::File::create(&lock);
+        let heartbeat_lock = lock.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STAGING_LOCK_HEARTBEAT).await;
+                if std::fs::File::create(&heartbeat_lock).is_err() {
+                    break;
+                }
             }
-        } else {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        });
+        Self {
+            lock,
+            heartbeat: Some(heartbeat),
         }
-        false
     }
-    #[cfg(not(unix))]
-    {
-        false
+}
+
+impl Drop for StagingLockGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+        let _ = std::fs::remove_file(&self.lock);
     }
 }
 
@@ -8144,10 +8168,10 @@ chmod +x "$dest/bin/node"
         assert!(goldens.is_dir(), "goldens/ record dir survives");
     }
 
-    /// An active writer holding an advisory lock on a `.tmp-golden-*` staging
-    /// file (or its `.lock` companion) must survive the startup sweep so
-    /// concurrent pools sharing the artifact directory cannot delete each
-    /// other's in-flight bakes or downloads.
+    /// A `.tmp-golden-*` staging file with a fresh companion lock must survive
+    /// the startup sweep, so concurrent pools sharing the artifact directory
+    /// cannot delete each other's in-flight bakes or downloads. A stale lock
+    /// (crashed writer) and a lockless staging file are swept.
     #[tokio::test]
     async fn sweep_stale_artifacts_spares_active_writer_staging_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -8163,39 +8187,43 @@ chmod +x "$dest/bin/node"
         )
         .expect("pool config validates");
 
+        // Live writer: fresh companion lock.
         let active_tmp = vms.join(".tmp-golden-active");
-        let active_file = std::fs::File::create(&active_tmp).unwrap();
-        #[cfg(unix)]
-        lock_staging_file(&active_file);
+        std::fs::write(&active_tmp, b"download in flight").unwrap();
+        std::fs::write(staging_lock_path(&active_tmp), b"").unwrap();
 
-        let active_pack = vms.join(".tmp-golden-pack");
-        let active_lock = vms.join(".tmp-golden-pack.lock");
-        std::fs::write(&active_pack, b"pack in flight").unwrap();
-        let pack_lock_file = std::fs::File::create(&active_lock).unwrap();
-        #[cfg(unix)]
-        lock_staging_file(&pack_lock_file);
+        // Crashed writer: lock untouched for over an hour.
+        let crashed_tmp = vms.join(".tmp-golden-crashed");
+        std::fs::write(&crashed_tmp, b"orphan").unwrap();
+        let crashed_lock = staging_lock_path(&crashed_tmp);
+        std::fs::write(&crashed_lock, b"").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&crashed_lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
 
+        // No lock at all: orphaned staging file.
         let stale_tmp = vms.join(".tmp-golden-stale");
         std::fs::write(&stale_tmp, b"stale").unwrap();
 
         pool.sweep_stale_artifacts().await;
 
-        #[cfg(unix)]
-        {
-            assert!(
-                active_tmp.exists(),
-                "active staging file with held lock survives"
-            );
-            assert!(
-                active_pack.exists(),
-                "staging file with active companion lock survives"
-            );
-            assert!(active_lock.exists(), "active companion lock file survives");
-        }
-        assert!(!stale_tmp.exists(), "unlocked stale staging file is swept");
-
-        drop(active_file);
-        drop(pack_lock_file);
+        assert!(
+            active_tmp.is_file(),
+            "staging file with fresh lock survives"
+        );
+        assert!(
+            staging_lock_path(&active_tmp).is_file(),
+            "fresh companion lock survives"
+        );
+        assert!(
+            !crashed_tmp.exists(),
+            "staging file with stale lock is swept"
+        );
+        assert!(!crashed_lock.exists(), "stale companion lock is swept");
+        assert!(!stale_tmp.exists(), "lockless staging file is swept");
     }
 
     #[tokio::test]
