@@ -677,6 +677,9 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         None => return false,
     };
 
+    // Claim the companion lock before creating the payload: a staging file
+    // without a fresh lock reads as orphaned to a concurrent sweep.
+    let _staging_guard = StagingLockGuard::claim(staging_lock_path(&tmp_payload));
     let mut file = match tokio::fs::File::create(&tmp_payload).await {
         Ok(file) => file,
         Err(_) => return false,
@@ -979,6 +982,9 @@ async fn stream_golden_response(
     expected_sha256: Option<String>,
     expected_total_bytes: Option<u64>,
 ) -> Result<u64, String> {
+    // Claim the companion lock before creating the payload: a staging file
+    // without a fresh lock reads as orphaned to a concurrent sweep.
+    let _staging_guard = StagingLockGuard::claim(staging_lock_path(tmp_payload));
     let mut file = match tokio::fs::File::create(tmp_payload).await {
         Ok(file) => file,
         Err(error) => {
@@ -2481,14 +2487,14 @@ async fn adopt_golden<P: VmProvider>(
     fingerprint: &str,
     kind: &str,
 ) -> Result<bool, OrchestratorError> {
-    match golden_adopt_state(provider, config, golden, fingerprint).await {
+    let adopted = match golden_adopt_state(provider, config, golden, fingerprint).await {
         GoldenAdopt::Reusable => {
             info!(
                 machine = golden.as_str(),
                 fingerprint = %fingerprint,
                 "adopted the existing {kind} fork base"
             );
-            Ok(true)
+            true
         }
         GoldenAdopt::Rearm => {
             info!(
@@ -2509,10 +2515,28 @@ async fn adopt_golden<P: VmProvider>(
                 fingerprint = %fingerprint,
                 "adopted the existing {kind} fork base"
             );
-            Ok(true)
+            true
         }
-        GoldenAdopt::Rebuild => Ok(false),
+        GoldenAdopt::Rebuild => false,
+    };
+    if adopted {
+        // Issue #295's prune only ran on the fresh-bake path, so a golden
+        // adopted across restarts keeps its pack/ intermediates forever —
+        // and every fork copies them. Best-effort, same as the bake path.
+        match provider.prune_pack_intermediates(golden).await {
+            Ok(true) => info!(
+                machine = golden.as_str(),
+                "pruned pack/ build intermediates from adopted golden"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                machine = golden.as_str(),
+                %error,
+                "failed to prune pack/ build intermediates from adopted golden"
+            ),
+        }
     }
+    Ok(adopted)
 }
 
 /// Prepare a running forkable golden VM with the requested environment.
@@ -2778,6 +2802,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         {
             self.prepare_artifact(true).await?;
         }
+        self.sweep_stale_artifacts().await;
         self.remove_stale_machines().await?;
 
         let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
@@ -3314,6 +3339,10 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     payload.display()
                 ))
             })?;
+        // Claim the companion lock for the pack duration: the heartbeat
+        // keeps it fresh, and dropping the guard removes it. A staging file
+        // without a fresh lock reads as orphaned to a concurrent sweep.
+        let _staging_guard = StagingLockGuard::claim(staging_lock_path(&temporary));
         if let Err(error) = self.provider.pack(&name, &temporary).await {
             let _ = std::fs::remove_file(&temporary);
             return Err(error.into());
@@ -3323,11 +3352,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // artifact consumed by `machine create --from`; the stub is only a
         // launcher and is discarded.
         let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
-        std::fs::rename(&sidecar, &payload).inspect_err(|_| {
-            let _ = std::fs::remove_file(&temporary);
+        let rename_res = std::fs::rename(&sidecar, &payload);
+        let _ = std::fs::remove_file(&temporary);
+        rename_res.inspect_err(|_| {
             let _ = std::fs::remove_file(&sidecar);
         })?;
-        let _ = std::fs::remove_file(&temporary);
         self.provider.delete(&name).await?;
         if !payload.is_file() {
             return Err(OrchestratorError::Config(format!(
@@ -3372,7 +3401,163 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
             }
             _ => {}
         }
+        // The registry sweep above cannot see a machine whose registry row is
+        // gone but whose data dir survived (smolvm's delete drops the row
+        // first; a failed remove_dir_all or a crashed engine strands the
+        // files). Reconcile the filesystem against the registry.
+        match self.provider.sweep_orphaned_data_dirs().await {
+            Ok(swept) if swept > 0 => {
+                info!(swept, "removed orphaned machine data directories")
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "orphaned data-dir sweep failed"),
+        }
         Ok(())
+    }
+
+    /// Collect golden-artifact garbage the success paths leave behind.
+    ///
+    /// Two leaks live beside `artifact_stem` in `vms/`:
+    ///
+    /// - `.tmp-golden-*` staging files: the pack and download paths remove
+    ///   them on failures they observe, but a crash between `pack()` and the
+    ///   final `rename()` leaves a multi-GB file nothing ever revisits.
+    /// - `<stem>-<fingerprint>` payloads from earlier environment
+    ///   fingerprints: `artifact_payload()` rotates the filename on every
+    ///   bake-content change and `rebuild_artifact` deletes only the current
+    ///   one, so each rebake strands the previous packed golden.
+    ///
+    /// The current payload and the `goldens/` fingerprint directory are
+    /// always kept. Runs at pool startup, before `remove_stale_machines`.
+    async fn sweep_stale_artifacts(&self) {
+        let Some(directory) = self.config.artifact_stem.parent() else {
+            return;
+        };
+        let stem_name = self
+            .config
+            .artifact_stem
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let current_payload = self.config.artifact_payload();
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        let mut swept = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stale_tmp = if name.starts_with(".tmp-golden-") {
+                if name.ends_with(".lock") {
+                    // Companion lock whose staging file is gone (or whose
+                    // writer died): a fresh lock is transient, a stale one
+                    // is swept with its staging file.
+                    !staging_lock_is_fresh(&path)
+                } else {
+                    !staging_lock_is_fresh(&staging_lock_path(&path))
+                }
+            } else {
+                false
+            };
+            // A stale payload is `<stem>-<64-hex>`: the fingerprint suffix
+            // shape keeps the sweep from touching unrelated files that happen
+            // to share the stem prefix.
+            let stale_payload = stem_name.as_deref().is_some_and(|stem| {
+                name.strip_prefix(stem).is_some_and(|suffix| {
+                    suffix.len() == 65
+                        && suffix.starts_with('-')
+                        && suffix[1..].chars().all(|c| c.is_ascii_hexdigit())
+                })
+            }) && path != current_payload;
+            if !stale_tmp && !stale_payload {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    swept += 1;
+                    // A swept staging file leaves its companion lock behind;
+                    // remove it in the same pass (a stale `.lock` entry is
+                    // also swept on its own iteration).
+                    if stale_tmp && !name.ends_with(".lock") {
+                        let _ = std::fs::remove_file(staging_lock_path(&path));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to remove stale golden artifact"
+                ),
+            }
+        }
+        if swept > 0 {
+            info!(swept, directory = %directory.display(), "swept stale golden artifacts");
+        }
+    }
+}
+/// Grace window for a staging-file companion lock: the writer refreshes the
+/// lock's mtime every heartbeat, so a lock older than this has no live writer
+/// (crash between `pack()`/`download()` and `rename()`).
+const STAGING_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+/// How often a live writer refreshes its staging lock.
+const STAGING_LOCK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Companion lock path for a `.tmp-golden-*` staging file.
+fn staging_lock_path(staging: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", staging.display()))
+}
+
+/// Whether a companion lock evidences a live writer.
+///
+/// A missing lock means no writer ever claimed the file (or it already
+/// finished); a lock younger than the grace window means a heartbeat is
+/// refreshing it. An unreadable mtime spares the file: deleting on unknown
+/// age risks removing a live bake after a clock adjustment.
+fn staging_lock_is_fresh(lock: &Path) -> bool {
+    let Ok(mtime) = std::fs::metadata(lock).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    match mtime.elapsed() {
+        Ok(age) => age < STAGING_LOCK_GRACE,
+        Err(_) => true,
+    }
+}
+
+/// Heartbeated claim on a staging file's companion lock.
+///
+/// Creating the guard writes the lock file; a background task refreshes its
+/// mtime until the guard drops, so a concurrent pool's startup sweep sees a
+/// fresh lock and spares the in-flight bake or download. Dropping aborts the
+/// heartbeat and removes the lock file.
+struct StagingLockGuard {
+    lock: PathBuf,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StagingLockGuard {
+    fn claim(lock: PathBuf) -> Self {
+        let _ = std::fs::File::create(&lock);
+        let heartbeat_lock = lock.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(STAGING_LOCK_HEARTBEAT).await;
+                if std::fs::File::create(&heartbeat_lock).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            lock,
+            heartbeat: Some(heartbeat),
+        }
+    }
+}
+
+impl Drop for StagingLockGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            handle.abort();
+        }
+        let _ = std::fs::remove_file(&self.lock);
     }
 }
 
@@ -7902,6 +8087,143 @@ chmod +x "$dest/bin/node"
             golden_adopt_state(&provider, &config, &golden, "fp-1").await,
             GoldenAdopt::Rebuild
         );
+    }
+
+    /// An adopted golden never went through `prepare_packed_golden`, so the
+    /// #295 pack/ prune must fire on the adopt path too — otherwise a golden
+    /// carried across restarts keeps its intermediates forever and every
+    /// fork copies them.
+    #[tokio::test]
+    async fn adopted_golden_prunes_pack_intermediates() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = packed_fork_config();
+        config.artifact_stem = temp.path().join("runner-image");
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let golden = MachineName::new("lifecycle-test-golden").unwrap();
+        write_golden_record(&config, &golden, "fp-1");
+        provider
+            .create(&MachineSpec {
+                name: golden.clone(),
+                image: config.base_image.clone(),
+                cpus: config.cpus,
+                memory_mib: config.memory_mib,
+                storage_gib: config.storage_gib,
+                overlay_gib: None,
+                network: NetworkPolicy::PublicOnly,
+                volumes: Vec::new(),
+                sockets: Vec::new(),
+                dns: None,
+                rosetta: false,
+            })
+            .await
+            .unwrap();
+        provider.start(&golden).await.unwrap();
+
+        assert!(adopt_golden(&provider, &config, &golden, "fp-1", "golden")
+            .await
+            .unwrap());
+        assert_eq!(
+            *provider.prune_pack_calls.lock().await,
+            vec![golden.as_str().to_owned()],
+            "adopt path must prune pack intermediates"
+        );
+    }
+
+    /// `.tmp-golden-*` staging files and payloads from older environment
+    /// fingerprints are unreachable once written; the startup sweep reclaims
+    /// them while sparing the current payload and the goldens/ records.
+    #[tokio::test]
+    async fn sweep_stale_artifacts_removes_orphans_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-image-aarch64");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(
+            Arc::new(TestProvider::new(false, false, false, false, false)),
+            config.clone(),
+        )
+        .expect("pool config validates");
+
+        let current = config.artifact_payload();
+        std::fs::write(&current, b"current").unwrap();
+        let stale_payload = vms.join(format!("preloop-image-aarch64-{:064x}", 0xdeadbeef_u64));
+        std::fs::write(&stale_payload, b"stale").unwrap();
+        let tmp = vms.join(".tmp-golden-1234");
+        std::fs::write(&tmp, b"partial").unwrap();
+        // Same stem prefix but not a fingerprint suffix: must survive.
+        let unrelated = vms.join("preloop-image-aarch64-notes.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let goldens = vms.join("goldens");
+        std::fs::create_dir_all(&goldens).unwrap();
+
+        pool.sweep_stale_artifacts().await;
+
+        assert!(current.is_file(), "current payload survives");
+        assert!(!stale_payload.exists(), "stale payload is swept");
+        assert!(!tmp.exists(), "tmp-golden staging file is swept");
+        assert!(unrelated.is_file(), "unrelated file survives");
+        assert!(goldens.is_dir(), "goldens/ record dir survives");
+    }
+
+    /// A `.tmp-golden-*` staging file with a fresh companion lock must survive
+    /// the startup sweep, so concurrent pools sharing the artifact directory
+    /// cannot delete each other's in-flight bakes or downloads. A stale lock
+    /// (crashed writer) and a lockless staging file are swept.
+    #[tokio::test]
+    async fn sweep_stale_artifacts_spares_active_writer_staging_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-image-aarch64");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(
+            Arc::new(TestProvider::new(false, false, false, false, false)),
+            config.clone(),
+        )
+        .expect("pool config validates");
+
+        // Live writer: fresh companion lock.
+        let active_tmp = vms.join(".tmp-golden-active");
+        std::fs::write(&active_tmp, b"download in flight").unwrap();
+        std::fs::write(staging_lock_path(&active_tmp), b"").unwrap();
+
+        // Crashed writer: lock untouched for over an hour.
+        let crashed_tmp = vms.join(".tmp-golden-crashed");
+        std::fs::write(&crashed_tmp, b"orphan").unwrap();
+        let crashed_lock = staging_lock_path(&crashed_tmp);
+        std::fs::write(&crashed_lock, b"").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&crashed_lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        // No lock at all: orphaned staging file.
+        let stale_tmp = vms.join(".tmp-golden-stale");
+        std::fs::write(&stale_tmp, b"stale").unwrap();
+
+        pool.sweep_stale_artifacts().await;
+
+        assert!(
+            active_tmp.is_file(),
+            "staging file with fresh lock survives"
+        );
+        assert!(
+            staging_lock_path(&active_tmp).is_file(),
+            "fresh companion lock survives"
+        );
+        assert!(
+            !crashed_tmp.exists(),
+            "staging file with stale lock is swept"
+        );
+        assert!(!crashed_lock.exists(), "stale companion lock is swept");
+        assert!(!stale_tmp.exists(), "lockless staging file is swept");
     }
 
     #[tokio::test]

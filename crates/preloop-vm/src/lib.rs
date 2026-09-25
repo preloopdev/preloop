@@ -370,6 +370,18 @@ pub trait VmProvider: Send + Sync {
         let _ = name;
         Ok(false)
     }
+    /// Remove machine data directories the provider's registry no longer
+    /// knows about.
+    ///
+    /// smolvm's delete can drop the registry row while the data dir survives
+    /// (the "directory not empty" / "database is locked" races `delete`
+    /// retries bound but cannot eliminate), and a crashed engine leaves dirs
+    /// no `list()` can reach. Such orphans are invisible to every other
+    /// cleanup path and leak whole VM disks. Providers without
+    /// host-visible data dirs keep the default no-op.
+    async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        Ok(0)
+    }
     /// Stop an existing machine.
     async fn stop(&self, name: &MachineName) -> Result<(), VmError>;
     /// Delete a machine and its mutable overlay.
@@ -458,6 +470,9 @@ impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
     }
     async fn list(&self) -> Result<Vec<MachineName>, VmError> {
         (**self).list().await
+    }
+    async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        (**self).sweep_orphaned_data_dirs().await
     }
     async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
         (**self).exec(name, argv).await
@@ -1212,6 +1227,36 @@ impl VmProvider for SmolVmProvider {
             .map_err(|error| VmError::Protocol(format!("pack prune task failed: {error}")))?
     }
 
+    async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        let registered = self.list().await?;
+        let mut known_dirs = std::collections::BTreeSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for name in &registered {
+            let dir = self.machine_data_dir(name).await?;
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+            known_dirs.insert(dir);
+        }
+        // Conventional roots cover the empty-registry case: with no machines
+        // left, registered data dirs cannot reveal where orphans live.
+        // Only scan the root belonging to the active registry configuration.
+        if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
+            roots.insert(data_dir.join("vms"));
+        } else if let Some(home) = effective_preloop_home() {
+            #[cfg(target_os = "macos")]
+            roots.insert(home.join("smolvm-home/Library/Caches/smolvm/vms"));
+            #[cfg(not(target_os = "macos"))]
+            roots.insert(home.join("smolvm/vms"));
+        }
+        let roots: Vec<PathBuf> = roots.into_iter().collect();
+        tokio::task::spawn_blocking(move || {
+            sweep_orphaned_dirs(&roots, &known_dirs, ORPHAN_DIR_GRACE)
+        })
+        .await
+        .map_err(|error| VmError::Protocol(format!("orphan sweep task failed: {error}")))?
+    }
+
     async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
         self.recovery(
             "stop",
@@ -1246,6 +1291,7 @@ impl VmProvider for SmolVmProvider {
                 {
                     break Ok(());
                 }
+
                 // SmolVM 1.7.7 can race its final agent/log writes with the
                 // recursive data-directory removal. The same force-delete
                 // succeeds once those writers exit.
@@ -1564,6 +1610,54 @@ impl VmProvider for SmolVmProvider {
         .await?;
         Ok(true)
     }
+}
+
+/// Grace window covering the create-before-register gap: smolvm writes the
+/// data dir before the registry row commits, so a brand-new dir is not yet
+/// provably orphaned.
+const ORPHAN_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Delete children of `roots` that are not in `known_dirs` and are older than
+/// `grace`. Synchronous: the sweep runs inside `spawn_blocking` because a
+/// leaked VM dir can be gigabytes of metadata.
+fn sweep_orphaned_dirs(
+    roots: &[PathBuf],
+    known_dirs: &std::collections::BTreeSet<PathBuf>,
+    grace: std::time::Duration,
+) -> Result<usize, VmError> {
+    let mut swept = 0usize;
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if known_dirs.contains(&path) || !path.is_dir() {
+                continue;
+            }
+            let old_enough = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= grace);
+            if !old_enough {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    swept += 1;
+                    info!(path = %path.display(), "removed orphaned machine data dir");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to remove orphaned machine data dir"
+                ),
+            }
+        }
+    }
+    Ok(swept)
 }
 
 /// Clone machine names SmolVM names in its "stop or delete the clones first"
@@ -2437,6 +2531,54 @@ mod tests {
             "pack/ must be left alone without storage.raw"
         );
         std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// A data dir with no registry entry is unreachable garbage once the
+    /// create-before-register grace window passes; the sweep must take it
+    /// while sparing registered dirs and anything too young to be proven
+    /// orphaned.
+    #[test]
+    fn sweep_orphaned_dirs_removes_unregistered_only() {
+        let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
+        let known = root.join("registered");
+        let orphan = root.join("orphaned");
+        std::fs::create_dir_all(&known).unwrap();
+        std::fs::create_dir_all(&orphan).unwrap();
+        let known_dirs = std::collections::BTreeSet::from([known.clone()]);
+
+        // Zero grace: every unregistered dir is provably old enough.
+        let swept = super::sweep_orphaned_dirs(
+            std::slice::from_ref(&root),
+            &known_dirs,
+            std::time::Duration::ZERO,
+        )
+        .expect("sweep");
+
+        assert_eq!(swept, 1);
+        assert!(known.is_dir(), "registered dir survives");
+        assert!(!orphan.exists(), "orphaned dir is removed");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The grace window keeps a dir too young to be proven orphaned: smolvm
+    /// writes the data dir before the registry row commits, so a fresh dir
+    /// may belong to a create still in flight.
+    #[test]
+    fn sweep_orphaned_dirs_spares_young_dirs() {
+        let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
+        let young = root.join("young");
+        std::fs::create_dir_all(&young).unwrap();
+
+        let swept = super::sweep_orphaned_dirs(
+            std::slice::from_ref(&root),
+            &std::collections::BTreeSet::new(),
+            super::ORPHAN_DIR_GRACE,
+        )
+        .expect("sweep");
+
+        assert_eq!(swept, 0);
+        assert!(young.is_dir(), "young dir survives the grace window");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

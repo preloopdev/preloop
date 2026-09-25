@@ -1951,6 +1951,13 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         run_checkout_cache_pruner(cache_pruner_shared).await;
     });
 
+    // Snapshots orphaned by a restart inside their retention window are
+    // otherwise never collected: the discard timer is in-process.
+    let snapshot_sweep_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
+    });
+
     let webhook_worker_heartbeat = state.observability.heartbeat().clone();
     let webhook_worker_handle = webhook_worker_heartbeat.register(
         "webhook_queue_worker",
