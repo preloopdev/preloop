@@ -87,7 +87,7 @@ pub(crate) fn template_string_token(raw: &str, file_id: u32) -> Value {
     let location = || json!({"file": file_id, "line": 1, "col": 1});
     let trimmed = raw.trim();
     if let Some(expression_source) = trimmed.strip_prefix("${{") {
-        if let Some(end) = crate::eval::find_expression_end(expression_source) {
+        if let Some(end) = preloop_gha_protocol::expr_scan::find_expression_end(expression_source) {
             if end + 2 == expression_source.len() {
                 return json!({
                     "type": 3,
@@ -112,7 +112,8 @@ pub(crate) fn template_string_token(raw: &str, file_id: u32) -> Value {
     while let Some(start) = remaining.find("${{") {
         append_format_literal(&mut format_string, &remaining[..start]);
         let expression_source = &remaining[start + 3..];
-        let Some(end) = crate::eval::find_expression_end(expression_source) else {
+        let Some(end) = preloop_gha_protocol::expr_scan::find_expression_end(expression_source)
+        else {
             let mut token = location();
             token["type"] = json!(0);
             token["lit"] = json!(raw);

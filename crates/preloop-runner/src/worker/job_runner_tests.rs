@@ -73,37 +73,6 @@ fn any_step_failed_counts_continue_on_error_failures() {
 }
 
 #[tokio::test]
-async fn test_run_job_executes_successfully() {
-    let (_ws, workspace_dir) = contained_workspace();
-    let payload = serde_json::json!({
-        "jobId": "job-1",
-        "jobDisplayName": "Mock Job",
-        "steps": [
-            {
-                "id": "step-1",
-                "contextName": "step1",
-                "displayName": "Step One",
-                "run": "echo step-one-executed",
-                "shell": "bash"
-            }
-        ],
-        "fileTable": {
-            "workDirectory": workspace_dir
-        }
-    });
-
-    let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(
-        payload,
-        ProtocolPath::Broker,
-        cancel_rx,
-        LeaseTiming::default(),
-    )
-    .await;
-    assert!(res.is_ok(), "Expected run_job to succeed, got: {:?}", res);
-}
-
-#[tokio::test]
 async fn periodic_drain_flushes_queued_step_updates() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -201,127 +170,6 @@ fn results_url_prefers_system_vss_endpoint_data() {
     );
 }
 
-#[tokio::test]
-async fn test_run_job_propagates_step_failure() {
-    // When a step fails, run_job still returns Ok(()) because the failure
-    // is propagated in the completion report, not the function return.
-    // The worker process exits 0 and the server sees the Failed result.
-    let (_ws, workspace_dir) = contained_workspace();
-    let payload = serde_json::json!({
-        "jobId": "job-fail",
-        "jobDisplayName": "Failing Job",
-        "steps": [
-            {
-                "id": "step-1",
-                "contextName": "step1",
-                "displayName": "Failing Step",
-                "run": "exit 1",
-                "shell": "bash"
-            }
-        ],
-        "fileTable": {
-            "workDirectory": workspace_dir
-        }
-    });
-
-    let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(
-        payload,
-        ProtocolPath::Broker,
-        cancel_rx,
-        LeaseTiming::default(),
-    )
-    .await;
-    // run_job returns Ok even when steps fail — the failure result is
-    // reported to the server via report_completion, not the return value.
-    assert!(
-        res.is_ok(),
-        "Expected run_job to return Ok even with failing step, got: {:?}",
-        res
-    );
-}
-
-// --- JobRunnerL0 gap coverage ---
-
-#[tokio::test]
-async fn test_run_job_handles_cancelled() {
-    let (_ws, workspace_dir) = contained_workspace();
-    let payload = serde_json::json!({
-        "jobId": "job-cancel",
-        "jobDisplayName": "Cancel Job",
-        "steps": [
-            {
-                "id": "step-1",
-                "contextName": "step1",
-                "displayName": "Long Step",
-                "run": "sleep 30",
-                "shell": "bash"
-            }
-        ],
-        "fileTable": {
-            "workDirectory": workspace_dir
-        }
-    });
-
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = cancel_tx.send(true);
-    });
-
-    // run_job returns Ok — cancellation is reported via completion, not
-    // the function return value.
-    let res = run_job(
-        payload,
-        ProtocolPath::Broker,
-        cancel_rx,
-        LeaseTiming::default(),
-    )
-    .await;
-    assert!(
-        res.is_ok(),
-        "Expected run_job to handle cancel gracefully, got: {:?}",
-        res
-    );
-}
-
-#[tokio::test]
-async fn test_run_job_with_timeout() {
-    let (_ws, workspace_dir) = contained_workspace();
-    // jobTimeout of 0 means the timeout fires immediately (0 * 60 = 0s),
-    // triggering the cancel channel before the step can finish.
-    let payload = serde_json::json!({
-        "jobId": "job-timeout",
-        "jobDisplayName": "Timeout Job",
-        "plan": {"jobTimeoutInMinutes": 0},
-        "steps": [
-            {
-                "id": "step-1",
-                "contextName": "step1",
-                "displayName": "Long Step",
-                "run": "sleep 30",
-                "shell": "bash"
-            }
-        ],
-        "fileTable": {
-            "workDirectory": workspace_dir
-        }
-    });
-
-    let (_tx, cancel_rx) = watch::channel(false);
-    let res = run_job(
-        payload,
-        ProtocolPath::Broker,
-        cancel_rx,
-        LeaseTiming::default(),
-    )
-    .await;
-    assert!(
-        res.is_ok(),
-        "Expected run_job to handle timeout gracefully, got: {:?}",
-        res
-    );
-}
 #[test]
 fn action_resolution_key_excludes_subpath() {
     let parsed = parse_remote_uses("actions/cache/restore@v4").expect("valid action ref");
@@ -616,6 +464,83 @@ async fn first_renew_gate_404_abandons_without_running_steps() {
     assert!(
         !complete.2.contains("step-1"),
         "no user step may run before the first renewal: {}",
+        complete.2
+    );
+}
+
+/// A failing step must surface as `conclusion: failed` on the completejob
+/// wire body while `run_job` itself still returns Ok — the worker process
+/// exits 0 and the server reads the disposition from the report.
+#[tokio::test]
+async fn step_failure_reports_failed_conclusion_on_completejob() {
+    let (_ws, work_dir) = contained_workspace();
+    let (addr, requests) = serve_scripted_control(vec![]).await;
+    let payload = control_payload(
+        &addr,
+        &work_dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Failing Step",
+            "run": "exit 1",
+            "shell": "bash"
+        }]),
+    );
+    let (_tx, cancel_rx) = watch::channel(false);
+    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    assert!(res.is_ok(), "run_job failed: {res:?}");
+
+    let reqs = requests.lock().await.clone();
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    let body: serde_json::Value =
+        serde_json::from_str(&complete.2).expect("completejob body must be valid JSON");
+    assert_eq!(
+        body["conclusion"], "failed",
+        "job-level conclusion must be failed: {}",
+        complete.2
+    );
+}
+
+/// Cancellation mid-job must surface as `conclusion: canceled` on the wire —
+/// the worker exits 0 and the server learns the disposition from completejob.
+#[tokio::test]
+async fn cancelled_job_reports_canceled_conclusion_on_completejob() {
+    let (_ws, work_dir) = contained_workspace();
+    let (addr, requests) = serve_scripted_control(vec![]).await;
+    let marker = std::path::Path::new(&work_dir).join("started.marker");
+    let payload = control_payload(
+        &addr,
+        &work_dir,
+        serde_json::json!([{
+            "id": "step-1",
+            "contextName": "step1",
+            "displayName": "Long Step",
+            "run": "touch started.marker && sleep 30",
+            "shell": "bash"
+        }]),
+    );
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let marker_path = marker.clone();
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            if marker_path.exists() {
+                let _ = cancel_tx.send(true);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = cancel_tx.send(true);
+    });
+    let res = run_job(payload, ProtocolPath::Broker, cancel_rx, fast_timing()).await;
+    assert!(res.is_ok(), "run_job failed: {res:?}");
+
+    let reqs = requests.lock().await.clone();
+    let complete = recorded_completion(&reqs).expect("completejob was reported");
+    let body: serde_json::Value =
+        serde_json::from_str(&complete.2).expect("completejob body must be valid JSON");
+    assert_eq!(
+        body["conclusion"], "canceled",
+        "job-level conclusion must be canceled: {}",
         complete.2
     );
 }

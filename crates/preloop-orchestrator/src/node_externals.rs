@@ -10,7 +10,6 @@
 //! must be re-materialized (download into temp, verify checksums, atomic rename).
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Command;
 
@@ -103,12 +102,7 @@ pub fn pinned_key(runtime: &str, version: &str, platform: &str) -> String {
     format!("{runtime}_{ver}_{platform}")
 }
 
-/// Compute hex SHA256 of bytes.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
-}
+pub use preloop_gha_protocol::crypto::sha256_hex;
 
 /// Try to read the manifest at `dir/preloop-node.json`.
 pub fn read_manifest(dir: &Path) -> Option<NodeManifest> {
