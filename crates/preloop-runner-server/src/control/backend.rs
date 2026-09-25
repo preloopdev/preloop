@@ -16,9 +16,104 @@
 
 use super::sched::{BuiltExpansion, SchedulingOutcome};
 use super::types::*;
-use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
-use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
+use crate::models::{
+    JobDetail, QueuedJob, RunRecord, StepRecord, TaskAgentJobRequestRecord, WebhookDeliveryRecord,
+    WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats, WebhookRedeliveryRecord,
+    WebhookWatchdogCursor,
+};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
 use std::collections::BTreeMap;
+
+/// Indexed run-list query. Backends apply filtering, ordering and limiting in
+/// SQL; handlers never deserialize the complete control state to list runs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunListFilter {
+    pub(crate) workflow: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) event: Option<String>,
+    pub(crate) limit: usize,
+}
+
+/// Bounded live-log tail restored after restart.
+#[derive(Debug, Clone)]
+pub(crate) struct DurableLog {
+    pub(crate) key: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) byte_count: usize,
+    pub(crate) line_count: usize,
+}
+
+/// Extract the optional run identity carried by a durable event.
+pub(crate) fn event_run_id(event: &NdjsonEvent) -> Option<RunId> {
+    match event {
+        NdjsonEvent::RunAccepted { run_id, .. }
+        | NdjsonEvent::JobStatus { run_id, .. }
+        | NdjsonEvent::RunStatus { run_id, .. }
+        | NdjsonEvent::JobCompleted { run_id, .. }
+        | NdjsonEvent::CheckRunCreated { run_id } => Some(*run_id),
+        _ => None,
+    }
+}
+
+/// Project database rows into the public run shape without a `TxState` load.
+pub(crate) fn project_run_rows(
+    mut run: RunRecord,
+    jobs: Vec<(JobId, ExecutionStatus, String, Option<Vec<StepRecord>>)>,
+) -> RunRecord {
+    let expanded_callers: std::collections::BTreeSet<String> = run
+        .reusable_calls
+        .iter()
+        .filter(|(_, call)| !call.inner_job_ids.is_empty())
+        .map(|(caller_id, _)| caller_id.clone())
+        .collect();
+    let existing = std::mem::take(&mut run.jobs_list);
+    run.jobs.clear();
+    run.jobs_list.clear();
+    let mut held = false;
+    for (job_id, status, queue_kind, steps) in jobs {
+        if expanded_callers.contains(&job_id.0) {
+            continue;
+        }
+        held |= queue_kind == "held";
+        run.jobs.insert(job_id.clone(), status);
+        let name = run
+            .job_names
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_else(|| job_id.0.clone());
+        let mut detail = existing
+            .iter()
+            .find(|detail| detail.job_id == job_id.0)
+            .cloned()
+            .unwrap_or(JobDetail {
+                job_id: job_id.0.clone(),
+                name: name.clone(),
+                conclusion: crate::status_string(status),
+                steps: Vec::new(),
+                annotations: Vec::new(),
+            });
+        detail.job_id = job_id.0.clone();
+        detail.name = name;
+        detail.conclusion = crate::status_string(status);
+        if let Some(steps) = steps {
+            detail.steps = steps;
+        }
+        run.jobs_list.push(detail);
+    }
+    if run.status == ExecutionStatus::InProgress
+        && !run
+            .jobs
+            .values()
+            .any(|status| *status == ExecutionStatus::InProgress)
+    {
+        run.status = if held {
+            ExecutionStatus::Pending
+        } else {
+            ExecutionStatus::Queued
+        };
+    }
+    run
+}
 
 /// The control-plane authority. Object-safe so `AppState` holds
 /// `Arc<dyn ControlBackend>` and the backend is swappable by configuration.
@@ -138,11 +233,136 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// fan-out.
     async fn run_record(&self, run_id: RunId) -> Result<RunRecord, ControlError>;
 
+    /// Runs matching `filter`, ordered and limited by the database.
+    async fn list_runs(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError>;
+
+    /// Terminal logical jobs, used to seed exactly-once lifecycle metrics
+    /// after restart without loading complete run records.
+    async fn terminal_jobs(
+        &self,
+    ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError>;
+
+    /// Append one durable control event. This never reads or rewrites run
+    /// state: the command that produced the event already committed it.
+    async fn append_event(&self, event: &NdjsonEvent) -> Result<(), ControlError>;
+
     /// A request record by id, plan id, agent job id or timeline id.
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError>;
 
     /// Queue pressure snapshot for status/metrics.
     async fn queue_stats(&self) -> Result<QueueStats, ControlError>;
+
+    // ── Live log recovery ─────────────────────────────────────────────
+
+    /// Allocate a plan-local log id and create its empty durable row.
+    async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError>;
+
+    /// Append one masked live-log chunk and update its aggregate counters.
+    async fn append_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> Result<(), ControlError>;
+
+    /// Delete a live-log tail and all of its chunks.
+    async fn delete_log(&self, key: &str) -> Result<(), ControlError>;
+
+    /// Restore bounded live-log tails after restart.
+    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError>;
+
+    /// Persist node-local artifact/cache/timeline metadata as one sealed value.
+    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError>;
+
+    /// Restore node-local metadata after restart.
+    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError>;
+
+    // ── Webhook inbox and repair state ────────────────────────────────
+
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> Result<bool, ControlError>;
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> Result<Vec<WebhookDeliveryRecord>, ControlError>;
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> Result<bool, ControlError>;
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, ControlError>;
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay: Option<std::time::Duration>,
+    ) -> Result<bool, ControlError>;
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>, ControlError>;
+    async fn count_dead_letter_webhook_deliveries(&self) -> Result<u64, ControlError>;
+    async fn recover_webhook_deliveries(&self) -> Result<u64, ControlError>;
+    async fn prune_webhook_deliveries(
+        &self,
+        before_us: i64,
+        limit: usize,
+    ) -> Result<u64, ControlError>;
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> Result<bool, ControlError>;
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> Result<bool, ControlError>;
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> Result<Vec<WebhookDeliverySummary>, ControlError>;
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, ControlError>;
+    async fn webhook_queue_stats(&self) -> Result<WebhookQueueStats, ControlError>;
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> Result<Option<WebhookWatchdogCursor>, ControlError>;
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> Result<(), ControlError>;
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> Result<(), ControlError>;
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError>;
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError>;
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> Result<bool, ControlError>;
 
     /// Live runner → job assignments for status reporting.
     async fn live_assignments(
@@ -244,28 +464,20 @@ pub(crate) struct ReconcileOutcome {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The configured control backend: SQLite (default, single node) or
-/// Postgres (shared nodes). `AppState` holds `Arc<Backend>` — a concrete
+/// PostgreSQL (shared nodes). `AppState` holds `Arc<Backend>` — a concrete
 /// enum, not `Arc<dyn ControlBackend>`, so [`Backend::transact`] can stay
 /// generic (a generic method is not object-safe over `dyn`).
-///
-/// `transact` is the cutover escape hatch: any `inner.lock()` site that
-/// only touches scheduling fields becomes `backend.transact(|tx| …)` with
-/// the same body — the closure runs inside the transaction on the working
-/// set. Typed commands ([`ControlBackend`]) cover the shaped operations;
-/// `transact` covers everything else until a command earns its own name.
 pub(crate) enum Backend {
-    /// Single-node default: one writer on a `control.db` file.
+    /// Single-node default: one writer on `<state_dir>/preloop.db`.
     Sqlite(super::sqlite::SqliteBackend),
     /// Shared-node: a connection pool against the `control` schema.
     Postgres(super::postgres::PostgresBackend),
 }
 
 impl Backend {
-    /// Open the backend selected by `store_url`: `postgres://…` → Postgres,
-    /// anything else (`sqlite://<path>`, a bare path) → SQLite at
-    /// `<state_dir>/control.db`. The control database is deliberately a
-    /// separate file/schema from the legacy `preloop.db` store so the two
-    /// never share a table namespace.
+    /// Open the backend selected by `store_url`: `postgres://…` → PostgreSQL,
+    /// anything else (`sqlite://<path>`, a bare path) → SQLite. The default
+    /// authoritative database is `<state_dir>/preloop.db`.
     pub(crate) async fn open(
         store_url: Option<&str>,
         state_dir: &std::path::Path,
@@ -287,7 +499,7 @@ impl Backend {
             .await?;
             return Ok(Self::Postgres(backend));
         }
-        let path = state_dir.join("control.db");
+        let path = state_dir.join("preloop.db");
         let backend = super::sqlite::SqliteBackend::open(
             &path,
             cipher,
@@ -456,45 +668,6 @@ impl Backend {
             Self::Postgres(backend) => backend.config(),
         }
     }
-
-    /// One-time legacy→control import, atomic and idempotent.
-    ///
-    /// Inside a single full-scope writer transaction, seeds the control
-    /// schema from a recovered legacy `InnerState` **only if the schema is
-    /// empty**. The emptiness check runs inside the same transaction as the
-    /// write, so two engines racing a fresh database cannot both seed, and a
-    /// restart against a live `control.db` never re-imports stale `preloop.db`
-    /// state over committed work.
-    ///
-    /// Returns `true` when this call performed the import, `false` when the
-    /// schema already held rows (nothing written).
-    pub(crate) async fn import_from_tx_if_empty(
-        &self,
-        seed: super::txstate::TxState,
-    ) -> Result<bool, ControlError> {
-        self.transact_scoped(&super::txstate::TxScope::full(), move |tx| {
-            let empty = tx.runs.is_empty()
-                && tx.job_requests.is_empty()
-                && tx.runners.is_empty()
-                && tx.ready_index.is_empty()
-                && tx.sessions.is_empty();
-            if !empty {
-                return Ok(false);
-            }
-            *tx = seed;
-            // A restored concurrency group may name a holder whose run is
-            // already terminal (the snapshot predates the completion) or
-            // missing entirely; leaving it parks every later submission in
-            // that group forever. Reconcile before anything dispatches, then
-            // re-promote whatever the freed slots unblock. Runs on `tx` so it
-            // sees the fully-populated working set (jobset admissions, run
-            // concurrency, holder keys).
-            super::sched::reconcile_concurrency_groups(tx);
-            super::sched::promote_ready_jobs(tx);
-            Ok(true)
-        })
-        .await
-    }
 }
 
 #[async_trait::async_trait]
@@ -623,6 +796,281 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.run_record(run_id).await,
             Self::Postgres(b) => b.run_record(run_id).await,
+        }
+    }
+    async fn list_runs(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.list_runs(filter).await,
+            Self::Postgres(b) => b.list_runs(filter).await,
+        }
+    }
+    async fn terminal_jobs(
+        &self,
+    ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.terminal_jobs().await,
+            Self::Postgres(b) => b.terminal_jobs().await,
+        }
+    }
+    async fn append_event(&self, event: &NdjsonEvent) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.append_event(event).await,
+            Self::Postgres(b) => b.append_event(event).await,
+        }
+    }
+    async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.create_log(plan_id).await,
+            Self::Postgres(b) => b.create_log(plan_id).await,
+        }
+    }
+    async fn append_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.append_log_chunk(key, chunk_index, payload, byte_count, line_count)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.append_log_chunk(key, chunk_index, payload, byte_count, line_count)
+                    .await
+            }
+        }
+    }
+    async fn delete_log(&self, key: &str) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.delete_log(key).await,
+            Self::Postgres(b) => b.delete_log(key).await,
+        }
+    }
+    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.load_logs().await,
+            Self::Postgres(b) => b.load_logs().await,
+        }
+    }
+    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.store_meta(meta).await,
+            Self::Postgres(b) => b.store_meta(meta).await,
+        }
+    }
+    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.load_meta().await,
+            Self::Postgres(b) => b.load_meta().await,
+        }
+    }
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.enqueue_webhook_delivery(delivery).await,
+            Self::Postgres(b) => b.enqueue_webhook_delivery(delivery).await,
+        }
+    }
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> Result<Vec<WebhookDeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.claim_webhook_deliveries(limit, lease_duration_secs).await,
+            Self::Postgres(b) => b.claim_webhook_deliveries(limit, lease_duration_secs).await,
+        }
+    }
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.renew_webhook_delivery(delivery_id, lease_token, lease_duration_secs)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.renew_webhook_delivery(delivery_id, lease_token, lease_duration_secs)
+                    .await
+            }
+        }
+    }
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.complete_webhook_delivery(delivery_id, lease_token).await,
+            Self::Postgres(b) => b.complete_webhook_delivery(delivery_id, lease_token).await,
+        }
+    }
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay: Option<std::time::Duration>,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay)
+                    .await
+            }
+        }
+    }
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.get_webhook_delivery(delivery_id).await,
+            Self::Postgres(b) => b.get_webhook_delivery(delivery_id).await,
+        }
+    }
+    async fn count_dead_letter_webhook_deliveries(&self) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.count_dead_letter_webhook_deliveries().await,
+            Self::Postgres(b) => b.count_dead_letter_webhook_deliveries().await,
+        }
+    }
+    async fn recover_webhook_deliveries(&self) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.recover_webhook_deliveries().await,
+            Self::Postgres(b) => b.recover_webhook_deliveries().await,
+        }
+    }
+    async fn prune_webhook_deliveries(
+        &self,
+        before_us: i64,
+        limit: usize,
+    ) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.prune_webhook_deliveries(before_us, limit).await,
+            Self::Postgres(b) => b.prune_webhook_deliveries(before_us, limit).await,
+        }
+    }
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.park_webhook_delivery(delivery_id, lease_token, error, retry_delay_secs)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.park_webhook_delivery(delivery_id, lease_token, error, retry_delay_secs)
+                    .await
+            }
+        }
+    }
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.requeue_webhook_delivery(delivery_id).await,
+            Self::Postgres(b) => b.requeue_webhook_delivery(delivery_id).await,
+        }
+    }
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> Result<Vec<WebhookDeliverySummary>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.list_webhook_deliveries(state, limit).await,
+            Self::Postgres(b) => b.list_webhook_deliveries(state, limit).await,
+        }
+    }
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.webhook_deliveries_present(delivery_ids).await,
+            Self::Postgres(b) => b.webhook_deliveries_present(delivery_ids).await,
+        }
+    }
+    async fn webhook_queue_stats(&self) -> Result<WebhookQueueStats, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.webhook_queue_stats().await,
+            Self::Postgres(b) => b.webhook_queue_stats().await,
+        }
+    }
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> Result<Option<WebhookWatchdogCursor>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.load_webhook_watchdog_cursor(scope).await,
+            Self::Postgres(b) => b.load_webhook_watchdog_cursor(scope).await,
+        }
+    }
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.store_webhook_watchdog_cursor(cursor).await,
+            Self::Postgres(b) => b.store_webhook_watchdog_cursor(cursor).await,
+        }
+    }
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.upsert_webhook_redelivery(record).await,
+            Self::Postgres(b) => b.upsert_webhook_redelivery(record).await,
+        }
+    }
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.load_webhook_redelivery(delivery_guid).await,
+            Self::Postgres(b) => b.load_webhook_redelivery(delivery_guid).await,
+        }
+    }
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.open_webhook_redeliveries(limit).await,
+            Self::Postgres(b) => b.open_webhook_redeliveries(limit).await,
+        }
+    }
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.resolve_webhook_redelivery(delivery_guid, resolved_at_us)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.resolve_webhook_redelivery(delivery_guid, resolved_at_us)
+                    .await
+            }
         }
     }
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {

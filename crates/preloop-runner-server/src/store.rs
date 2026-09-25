@@ -50,8 +50,6 @@ pub trait Store: Send + Sync {
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()>;
     /// Persist only the runtime metadata snapshot (hot path).
     async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()>;
-    /// Persist one run's mutable projection plus a control event.
-    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()>;
     /// Persist one attempt's step records.
     ///
     /// Separate from [`Store::store_run_event`] on purpose. Steps change far
@@ -284,15 +282,6 @@ impl Store for InstrumentedStore {
             "store_meta_only",
             start,
             self.inner.store_meta_only(meta).await,
-        )
-    }
-
-    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
-        let start = Instant::now();
-        self.record(
-            "store_run_event",
-            start,
-            self.inner.store_run_event(projection).await,
         )
     }
 
@@ -692,70 +681,6 @@ impl StoreSnapshot {
     }
 }
 
-/// The per-run projection persisted on control events. Captured under the
-/// state lock, written after it is released. Includes the claim/message state
-/// so a job that was claimed (dequeued, message handed to a session) but not
-/// yet acked survives a restart in the same transaction that rewrites its
-/// run's queue rows.
-#[derive(Clone)]
-pub struct RunProjection {
-    pub run: RunRecord,
-    /// (queue_kind, job, global queue position within the kind).
-    pub jobs: Vec<(&'static str, QueuedJob, i64)>,
-    pub requests: Vec<TaskAgentJobRequestRecord>,
-    pub session_active_requests: Vec<(String, i64)>,
-    pub inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
-    pub broker_request_messages: Vec<(i64, azdo::AgentJobRequestMessage)>,
-    pub event: NdjsonEvent,
-}
-
-impl RunProjection {
-    /// [`from_inner`] over the authoritative [`TxState`]. The run row, queue
-    /// rows, job requests, session/inflight/broker messages all come from
-    /// `tx`; `inner` is unused because a projection carries no node-local
-    /// metadata (it is kept for signature symmetry with `from_inner`).
-    pub fn from_tx(
-        tx: &crate::control::txstate::TxState,
-        run_id: RunId,
-        event: NdjsonEvent,
-    ) -> Option<Self> {
-        let run = tx.runs.get(&run_id)?.clone();
-        Some(RunProjection {
-            run,
-            jobs: queue_rows_for_run_tx(tx, run_id)
-                .into_iter()
-                .map(|(kind, job, position)| (kind, job.clone(), position))
-                .collect(),
-            requests: tx
-                .job_requests
-                .values()
-                .filter(|record| record.run_id == run_id)
-                .cloned()
-                .collect(),
-            session_active_requests: tx
-                .session_active_requests
-                .iter()
-                .map(|(session, request)| (session.clone(), *request))
-                .collect(),
-            inflight: tx
-                .inflight_messages
-                .iter()
-                .flat_map(|(session, messages)| {
-                    messages
-                        .iter()
-                        .map(move |(id, message)| (session.clone(), *id, message.clone()))
-                })
-                .collect(),
-            broker_request_messages: tx
-                .broker_messages
-                .iter()
-                .map(|(id, message)| (*id, message.clone()))
-                .collect(),
-            event,
-        })
-    }
-}
-
 /// SQLite backend: `<state_dir>/preloop.db`, one connection behind a mutex.
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -838,9 +763,11 @@ pub async fn open_store(
             } else {
                 path
             };
-            Arc::new(SqliteStore::open(&path, cipher)?)
+            Arc::new(SqliteStore::open_existing(&path, cipher)?)
         }
-        StoreUrl::Postgres(url) => Arc::new(crate::store_pg::PgStore::open(&url, cipher).await?),
+        StoreUrl::Postgres(url) => {
+            Arc::new(crate::store_pg::PgStore::open_existing(&url, cipher).await?)
+        }
     };
     Ok(store)
 }
@@ -1364,6 +1291,18 @@ pub fn restore_request_snapshot(
 
 /// [`build_meta_snapshot`] split across the authoritative [`TxState`] (`tx`)
 /// and node-local [`InnerState`] (`inner`). Scheduling/identity/concurrency
+/// Capture node-local metadata without reading authoritative control state.
+pub(crate) fn build_local_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
+    build_meta_snapshot_tx(&crate::control::txstate::TxState::default(), inner)
+}
+
+/// Restore node-local metadata. Control fields present in the serialized
+/// shape are ignored; the authoritative backend owns them.
+pub(crate) fn apply_local_meta_snapshot(inner: &mut InnerState, meta: MetaSnapshot) {
+    let mut discarded_control = crate::control::txstate::TxState::default();
+    apply_meta_snapshot_tx(&mut discarded_control, inner, meta);
+}
+
 /// families come from `tx`; the revision counter, cache/log/artifact counters,
 /// pending uploads and timeline/log metadata stay on `inner`.
 pub fn build_meta_snapshot_tx(
@@ -1828,6 +1767,23 @@ impl SqliteStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Open the auxiliary adapters against an already-migrated authoritative
+    /// database. The control backend owns schema creation and versioning.
+    pub(crate) fn open_existing(path: &std::path::Path, cipher: Envelope) -> anyhow::Result<Self> {
+        let connection = Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL; \
+             PRAGMA synchronous = NORMAL; \
+             PRAGMA foreign_keys = ON; \
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(Self {
+            connection: Arc::new(StdMutex::new(connection)),
+            cipher,
+            checkpoint_counter: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Post-commit WAL maintenance. Forces a truncating checkpoint only every
@@ -2590,55 +2546,6 @@ impl SqliteStore {
         // MB) makes a later checkpoint sync stall the server for minutes.
         // Force a truncation periodically (autocheckpoint bounds the rest) so
         // the file is reclaimed without an fsync on every commit.
-        self.maybe_checkpoint_wal(&connection)?;
-        Ok(())
-    }
-
-    /// Persist only one run's mutable projection. This is the hot path used
-    /// after runner events; rebuilding every run on every status transition
-    /// turns a burst of independent submissions into quadratic work.
-    pub fn store_run_event(&self, projection: &RunProjection) -> anyhow::Result<()> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
-        let tx = connection.transaction()?;
-        let run_id = projection.run.run_id;
-        self.store_workflow_run_counter_tx(
-            &tx,
-            &projection.run.workflow_path_str,
-            projection.run.run_number.saturating_add(1),
-        )?;
-        self.store_run_tx(&tx, &projection.run)?;
-        tx.execute("DELETE FROM jobs WHERE run_id = ?1", [run_id.to_string()])?;
-        for (kind, job, position) in &projection.jobs {
-            self.insert_job(&tx, job, kind, *position)?;
-        }
-        tx.execute(
-            "DELETE FROM job_requests WHERE run_id = ?1",
-            [run_id.to_string()],
-        )?;
-        for record in &projection.requests {
-            self.insert_request_tx(&tx, record)?;
-        }
-        // Steps are not part of this projection: they change far more often
-        // than the rest of a run, and rewriting every attempt's rows on each
-        // transition is quadratic in matrix width against a single writer.
-        // `store_job_steps` persists the one attempt that changed instead.
-        //
-        // The claim state must land in the same transaction as the queue
-        // rewrite above: a job that was claimed (dequeued, message handed to a
-        // session) but not yet acked would otherwise have neither its queue
-        // row nor its claim after a restart.
-        self.write_claim_state_tx(
-            &tx,
-            &projection.session_active_requests,
-            &projection.inflight,
-            &projection.broker_request_messages,
-        )?;
-        self.insert_event_tx(&tx, &projection.event)?;
-        tx.commit()
-            .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
-        // Same rationale as the full-snapshot path: bound the WAL so a
-        // runner-event burst cannot stall a later commit behind a giant
-        // checkpoint sync — periodically, not on every event.
         self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
@@ -3700,13 +3607,6 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.store_meta_only(&meta))
             .await
             .map_err(|error| anyhow::anyhow!("store metadata task panicked: {error}"))?
-    }
-
-    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.store_run_event(&projection))
-            .await
-            .map_err(|error| anyhow::anyhow!("store run-event task panicked: {error}"))?
     }
 
     async fn store_job_steps(

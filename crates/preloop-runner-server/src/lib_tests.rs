@@ -130,8 +130,8 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
             // Log bytes now go through `log_chunks`; the per-file counter
             // is UPSERTed on the same path.
             state
-                .store
-                .store_log_chunk("plan-1/7", 0, b"durable log\n", 13, 1)
+                .backend
+                .append_log_chunk("plan-1/7", 0, b"durable log\n", 13, 1)
                 .await
                 .unwrap();
             inner.cache_v2_pending.insert(
@@ -143,10 +143,9 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                     created_unix: 0,
                 },
             );
-            let tx = state.test_tx().await;
             state
-                .store
-                .store_meta_only(&crate::store::build_meta_snapshot_tx(&tx, &inner))
+                .backend
+                .store_meta(&crate::store::build_local_meta_snapshot(&inner))
                 .await
                 .unwrap();
         }
@@ -271,13 +270,13 @@ async fn sqlite_recovery_restores_post_restart_state() {
 
         // Persist a log chunk (A: log_chunks hot path).
         state
-            .store
-            .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
+            .backend
+            .append_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
             .await
             .unwrap();
         state
-            .store
-            .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
+            .backend
+            .append_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
             .await
             .unwrap();
 
@@ -528,25 +527,15 @@ async fn postgres_recovery_restores_post_restart_state() {
         // Persist log chunks (hot path) and a full snapshot so every table
         // is written through the translated SQL before the restart.
         state
-            .store
-            .store_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
+            .backend
+            .append_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
             .await
             .unwrap();
         state
-            .store
-            .store_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
+            .backend
+            .append_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
             .await
             .unwrap();
-        {
-            let tx = state.test_tx().await;
-            let inner = state.inner.lock().await;
-            state
-                .store
-                .store_inner(&crate::store::StoreSnapshot::from_tx(&tx, &inner))
-                .await
-                .unwrap();
-        }
-
         (run_id, runner_id, session_id, public_xml, first_number)
     };
 
@@ -11821,12 +11810,6 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
                     .enqueued_at_unix_nanos = cutoff;
             })
             .await;
-        {
-            let tx = state.test_tx().await;
-            let inner = state.inner.lock().await;
-            let snapshot = crate::store::StoreSnapshot::from_tx(&tx, &inner);
-            state.store.store_inner(&snapshot).await.unwrap();
-        }
         run_id
     };
 
@@ -14051,7 +14034,7 @@ async fn github_webhook_dedup_survives_restart() {
         shutdown: CancellationToken::new(),
     });
     let claimed = restarted_state
-        .store
+        .backend
         .claim_webhook_deliveries(1, 60)
         .await
         .unwrap();
@@ -14116,7 +14099,7 @@ async fn github_webhook_run_reservation_survives_restart() {
     let original_run_id = accepted.run_id;
     let claimed = fixture
         .state
-        .store
+        .backend
         .claim_webhook_deliveries(1, 0)
         .await
         .unwrap();
@@ -14136,7 +14119,7 @@ async fn github_webhook_run_reservation_survives_restart() {
     restarted_state.local_workspace = Some(temp.path().join("ws"));
     assert_eq!(
         restarted_state
-            .store
+            .backend
             .recover_webhook_deliveries()
             .await
             .unwrap(),
@@ -24296,15 +24279,7 @@ async fn store_recovery_preserves_broker_and_inflight_messages() {
                     );
             })
             .await;
-        let tx = state.test_tx().await;
-        let inner = state.inner.lock().await;
-        state
-            .store
-            .store_inner(&crate::store::StoreSnapshot::from_tx(&tx, &inner))
-            .await
-            .unwrap();
     }
-
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let inner = recovered.test_tx().await;
     let session = inner
@@ -24358,10 +24333,9 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
             Some(payload.len()),
             "the upload is buffered in memory"
         );
-        let tx = state.test_tx().await;
         state
-            .store
-            .store_meta_only(&crate::store::build_meta_snapshot_tx(&tx, &inner))
+            .backend
+            .store_meta(&crate::store::build_local_meta_snapshot(&inner))
             .await
             .unwrap();
     }
@@ -24370,7 +24344,7 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
     let connection = rusqlite::Connection::open(&db).unwrap();
     let blob_len: i64 = connection
         .query_row(
-            "SELECT length(meta_blob) FROM runtime_snapshots WHERE snapshot_id = 1",
+            "SELECT length(value) FROM meta WHERE key = 'local_state'",
             [],
             |row| row.get(0),
         )
@@ -24787,15 +24761,7 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
                     .insert((run_id, JobId("build".to_owned())), now);
             })
             .await;
-        {
-            let tx = state.test_tx().await;
-            let inner = state.inner.lock().await;
-            state
-                .store
-                .store_inner(&crate::store::StoreSnapshot::from_tx(&tx, &inner))
-                .await
-                .unwrap();
-        }
+
         (run_id, now)
     };
 

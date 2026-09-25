@@ -2411,6 +2411,19 @@ async fn replay_flows_to_preloop_inner(
                     saw_auth = true;
                 }
                 let header_value = rewritten_header_value(name, value, &path, auth_token);
+                // The broker session header carries the session id verbatim;
+                // rewrite the official id to the local one so DELETE /session
+                // (and any session-scoped call) targets the live session.
+                let header_value = if name.eq_ignore_ascii_case("x-actions-session") {
+                    std::borrow::Cow::Owned(
+                        session_ids
+                            .get(header_value.as_ref())
+                            .cloned()
+                            .unwrap_or_else(|| header_value.into_owned()),
+                    )
+                } else {
+                    header_value
+                };
                 req = req.header(name, header_value.as_ref());
             }
         }
@@ -2447,7 +2460,7 @@ async fn replay_flows_to_preloop_inner(
                 captured["response_headers"] = json!(headers);
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
                     let mut runtime_token = None;
-                    if path.ends_with("/sessions")
+                    if (path.ends_with("/sessions") || path.ends_with("/runner/session"))
                         && let (Some(official_id), Some(local_id)) = (
                             flow.pointer("/response_body_json/sessionId")
                                 .and_then(Value::as_str),
@@ -3234,7 +3247,12 @@ fn normalize_request_path(_method: &str, path: &str) -> String {
         return normalize_replay_wait(format!("/runner/server{}", &path[pos..]));
     }
     if path.starts_with("/session") {
-        return "/runner/server/_apis/distributedtask/pools/1/sessions".to_string();
+        // The official runner speaks the broker session protocol: POST
+        // /session always mints a fresh session and DELETE /session drops the
+        // caller's (via X-Actions-Session). Map to the broker endpoints, not
+        // the disttask /sessions route — that one 409s on an already-live
+        // session, which breaks the runner's delete-then-recreate cycle.
+        return "/runner/session".to_string();
     }
     if path.starts_with("/message") {
         return normalize_replay_wait(path.replacen(
@@ -3369,7 +3387,12 @@ fn is_oidc_path(path: &str) -> bool {
 
 fn is_listener_path(method: &str, path: &str) -> bool {
     let endpoint = path.split('?').next().unwrap_or(path);
+    // The broker session endpoint (`/runner/session`) is listen-token scoped:
+    // POST mints a session, DELETE drops it. The disttask `/sessions` POST is
+    // the legacy equivalent.
     (endpoint.ends_with("/sessions") && method.eq_ignore_ascii_case("POST"))
+        || endpoint == "/runner/session"
+        || endpoint.starts_with("/runner/session/")
         || endpoint.contains("/sessions/")
         || endpoint.contains("/messages")
         || endpoint.contains("/v1/AgentRequest/")

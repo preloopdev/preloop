@@ -229,7 +229,7 @@ pub async fn create_log_org(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
         .await?;
-    Ok(create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await)
+    create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
 pub async fn append_log_org(

@@ -30,7 +30,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore};
+use crate::credential_store::CredentialRef;
 use crate::shared_http::CLIENT;
 /// Private-key environment variables, highest precedence first. The flag marks
 /// a variable that holds a path to a PEM file rather than the PEM itself.
@@ -530,7 +530,12 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
         Some(raw) => {
             let mut env_apps: Vec<crate::config::AppConfig> =
                 serde_json::from_str(&raw).with_context(|| "parsing PRELOOP_GITHUB_APPS_JSON")?;
-            let store = OsCredentialStore;
+            let cred_base = crate::config::config_path()
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let store = crate::credential_store::store_from_env(&cred_base);
+            let store = store.as_ref();
             for app in &mut env_apps {
                 if let Some(reference) = &app.pem_ref
                     && let Ok(reference_ref) = CredentialRef::new(reference)

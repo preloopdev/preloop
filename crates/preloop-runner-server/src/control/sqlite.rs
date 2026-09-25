@@ -27,7 +27,10 @@ use super::schema::{SQLITE_DDL, SQLITE_SCHEMA_VERSION};
 use super::txstate::{TxScope, TxState};
 use super::types::*;
 use crate::concurrency;
-use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
+use crate::models::{
+    QueuedJob, RunRecord, TaskAgentJobRequestRecord, WebhookDeliveryRecord, WebhookDeliveryStatus,
+    WebhookDeliverySummary, WebhookQueueStats, WebhookRedeliveryRecord, WebhookWatchdogCursor,
+};
 use crate::state::JobSetId;
 use crate::store;
 use parking_lot::Mutex;
@@ -58,9 +61,27 @@ pub(crate) struct SqliteBackend {
     /// legacy store applies to `preloop.db`, so a stolen `control.db` (or a
     /// read-only Postgres replica) yields ciphertext, not workflow secrets.
     cipher: store::Envelope,
+    /// Auxiliary SQL operations that have not yet been folded into this
+    /// module. They use a second connection to the same authoritative file;
+    /// there is no second database.
+    aux: Option<crate::store::SqliteStore>,
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
+}
+
+/// Run `f` without stalling the async executor. On a multi-thread runtime
+/// `block_in_place` hands the blocking section a spare worker so a long
+/// write transaction cannot starve concurrent reads; on a `current_thread`
+/// runtime (unit tests) there is no spare worker to give, so `f` runs
+/// inline — `block_in_place` would panic there.
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 impl SqliteBackend {
@@ -155,11 +176,14 @@ impl SqliteBackend {
                 let _ = std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o600));
             }
         }
+        let aux = crate::store::SqliteStore::open_existing(path, cipher.clone())
+            .map_err(ControlError::backend)?;
         Ok(Self {
             conn: Mutex::new(conn),
             readers: Mutex::new(readers),
             readers_idle: parking_lot::Condvar::new(),
             cipher,
+            aux: Some(aux),
             pool_assignments_enabled: std::sync::atomic::AtomicBool::new(pool_assignments_enabled),
             require_job_assignments: std::sync::atomic::AtomicBool::new(require_job_assignments),
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
@@ -189,6 +213,7 @@ impl SqliteBackend {
             readers: Mutex::new(Vec::new()),
             readers_idle: parking_lot::Condvar::new(),
             cipher,
+            aux: None,
             pool_assignments_enabled: std::sync::atomic::AtomicBool::new(false),
             require_job_assignments: std::sync::atomic::AtomicBool::new(false),
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
@@ -324,16 +349,21 @@ impl SqliteBackend {
         scope: &TxScope,
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
-        let mut conn = self.conn.lock();
-        let txn = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(ControlError::backend)?;
-        let (tx, effective_scope) = load_txstate(&txn, scope, &self.cipher)?;
-        let mut tx = tx.with_config(self.config());
-        let result = f(&mut tx)?;
-        write_txstate(&txn, &tx, &effective_scope, &self.cipher)?;
-        txn.commit().map_err(ControlError::backend)?;
-        Ok(result)
+        // The transaction is synchronous (rusqlite has no async driver), so
+        // it would otherwise run on the executor thread and stall every
+        // concurrent request for the duration of load→f→write-back→commit.
+        run_blocking(|| {
+            let mut conn = self.conn.lock();
+            let txn = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(ControlError::backend)?;
+            let (tx, effective_scope) = load_txstate(&txn, scope, &self.cipher)?;
+            let mut tx = tx.with_config(self.config());
+            let result = f(&mut tx)?;
+            write_txstate(&txn, &tx, &effective_scope, &self.cipher)?;
+            txn.commit().map_err(ControlError::backend)?;
+            Ok(result)
+        })
     }
 
     /// Run a read-only command on a `query_only` reader connection under
@@ -356,40 +386,70 @@ impl SqliteBackend {
         scope: &TxScope,
         f: impl FnOnce(&TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
-        // An empty pool (in-memory databases) can't lend a reader — fall
-        // back to the writer, which still gives a consistent snapshot.
-        if self.readers.lock().is_empty() {
-            let mut conn = self.conn.lock();
-            let txn = conn.transaction().map_err(ControlError::backend)?;
-            let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher)?;
-            let tx = tx.with_config(self.config());
-            let result = f(&tx)?;
-            txn.rollback().map_err(ControlError::backend)?;
-            return Ok(result);
-        }
-        // Check out a reader; block until one is free. A `query_only`
-        // connection can never write, so a reader is always safe to lend.
-        let mut conn = {
-            let mut pool = self.readers.lock();
-            loop {
-                if let Some(conn) = pool.pop() {
-                    break conn;
-                }
-                self.readers_idle.wait(&mut pool);
+        run_blocking(|| {
+            // An empty pool (in-memory databases) can't lend a reader — fall
+            // back to the writer, which still gives a consistent snapshot.
+            if self.readers.lock().is_empty() {
+                let mut conn = self.conn.lock();
+                let txn = conn.transaction().map_err(ControlError::backend)?;
+                let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher)?;
+                let tx = tx.with_config(self.config());
+                let result = f(&tx)?;
+                txn.rollback().map_err(ControlError::backend)?;
+                return Ok(result);
             }
-        };
-        // Return the reader to the pool on every exit path.
-        let result = (|| {
-            let txn = conn.transaction().map_err(ControlError::backend)?;
-            let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher)?;
-            let tx = tx.with_config(self.config());
-            let result = f(&tx)?;
-            txn.rollback().map_err(ControlError::backend)?;
-            Ok(result)
-        })();
-        self.readers.lock().push(conn);
-        self.readers_idle.notify_one();
-        result
+            // Check out a reader; block until one is free. A `query_only`
+            // connection can never write, so a reader is always safe to lend.
+            let mut conn = {
+                let mut pool = self.readers.lock();
+                loop {
+                    if let Some(conn) = pool.pop() {
+                        break conn;
+                    }
+                    self.readers_idle.wait(&mut pool);
+                }
+            };
+            // Return the reader to the pool on every exit path.
+            let result = (|| {
+                let txn = conn.transaction().map_err(ControlError::backend)?;
+                let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher)?;
+                let tx = tx.with_config(self.config());
+                let result = f(&tx)?;
+                txn.rollback().map_err(ControlError::backend)?;
+                Ok(result)
+            })();
+            self.readers.lock().push(conn);
+            self.readers_idle.notify_one();
+            result
+        })
+    }
+
+    /// Borrow a pooled reader (or the writer for an in-memory database) and
+    /// run `f` on it. Read-only point lookups go through here so they never
+    /// queue behind the single writer.
+    fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
+        run_blocking(|| {
+            if self.readers.lock().is_empty() {
+                let conn = self.conn.lock();
+                return f(&conn);
+            }
+            let conn = {
+                let mut pool = self.readers.lock();
+                loop {
+                    if let Some(conn) = pool.pop() {
+                        break conn;
+                    }
+                    self.readers_idle.wait(&mut pool);
+                }
+            };
+            let result = f(&conn);
+            self.readers.lock().push(conn);
+            self.readers_idle.notify_one();
+            result
+        })
     }
 
     /// Find the run a webhook delivery already produced, by its durable
@@ -401,34 +461,35 @@ impl SqliteBackend {
         delivery_id: &str,
         workflow_path: &str,
     ) -> Result<Option<RunRecord>, ControlError> {
-        let conn = self.conn.lock();
-        let row = conn
-            .query_row(
-                "SELECT run_id, record_blob FROM runs \
-                 WHERE webhook_delivery_id = ?1 AND workflow_path = ?2",
-                params![delivery_id, workflow_path],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()
-            .map_err(ControlError::backend)?;
-        let Some((run_id_s, record)) = row else {
-            return Ok(None);
-        };
-        let mut run: RunRecord = blob(&self.cipher, &record)?;
-        run.jobs.clear();
-        let mut stmt = conn
-            .prepare("SELECT job_id, status FROM jobs WHERE run_id = ?1")
-            .map_err(ControlError::backend)?;
-        let rows = stmt
-            .query_map(params![run_id_s], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(ControlError::backend)?;
-        for row in rows {
-            let (job_id_s, status_s) = row.map_err(ControlError::backend)?;
-            run.jobs.insert(JobId(job_id_s), status_parse(&status_s));
-        }
-        Ok(Some(run))
+        self.with_reader(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT run_id, record_blob FROM runs \
+                     WHERE webhook_delivery_id = ?1 AND workflow_path = ?2",
+                    params![delivery_id, workflow_path],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some((run_id_s, record)) = row else {
+                return Ok(None);
+            };
+            let mut run: RunRecord = blob(&self.cipher, &record)?;
+            run.jobs.clear();
+            let mut stmt = conn
+                .prepare("SELECT job_id, status FROM jobs WHERE run_id = ?1")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(params![run_id_s], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                let (job_id_s, status_s) = row.map_err(ControlError::backend)?;
+                run.jobs.insert(JobId(job_id_s), status_parse(&status_s));
+            }
+            Ok(Some(run))
+        })
     }
 
     /// Resolve a request's `(request_id, run_id)` from its `agent_job_id`.
@@ -438,14 +499,15 @@ impl SqliteBackend {
         &self,
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<(i64, RunId)>, ControlError> {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT request_id, run_id FROM job_requests WHERE agent_job_id = ?1",
-            params![agent_job_id.to_string()],
-            |r| Ok((r.get::<_, i64>(0)?, parse_run_id(&r.get::<_, String>(1)?))),
-        )
-        .optional()
-        .map_err(ControlError::backend)
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT request_id, run_id FROM job_requests WHERE agent_job_id = ?1",
+                params![agent_job_id.to_string()],
+                |r| Ok((r.get::<_, i64>(0)?, parse_run_id(&r.get::<_, String>(1)?))),
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
     }
 
     /// The session that owns the request for `agent_job_id`. `complete_job`
@@ -455,16 +517,17 @@ impl SqliteBackend {
         &self,
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<String>, ControlError> {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT rs.session_id FROM runner_sessions rs \
-             JOIN job_requests jr ON jr.request_id = rs.active_request_id \
-             WHERE jr.agent_job_id = ?1",
-            params![agent_job_id.to_string()],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(ControlError::backend)
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT rs.session_id FROM runner_sessions rs \
+                 JOIN job_requests jr ON jr.request_id = rs.active_request_id \
+                 WHERE jr.agent_job_id = ?1",
+                params![agent_job_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
     }
 
     /// Every session owning a request of `run_id`. `cancel_run`/`cancel_job`
@@ -474,45 +537,175 @@ impl SqliteBackend {
         &self,
         run_id: RunId,
     ) -> Result<BTreeSet<String>, ControlError> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT rs.session_id FROM runner_sessions rs \
-                 JOIN job_requests jr ON jr.request_id = rs.active_request_id \
-                 WHERE jr.run_id = ?1",
-            )
-            .map_err(ControlError::backend)?;
-        let rows = stmt
-            .query_map(params![run_id.0.to_string()], |r| r.get::<_, String>(0))
-            .map_err(ControlError::backend)?;
-        let mut sessions = BTreeSet::new();
-        for row in rows {
-            sessions.insert(row.map_err(ControlError::backend)?);
-        }
-        Ok(sessions)
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT rs.session_id FROM runner_sessions rs \
+                     JOIN job_requests jr ON jr.request_id = rs.active_request_id \
+                     WHERE jr.run_id = ?1",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(params![run_id.0.to_string()], |r| r.get::<_, String>(0))
+                .map_err(ControlError::backend)?;
+            let mut sessions = BTreeSet::new();
+            for row in rows {
+                sessions.insert(row.map_err(ControlError::backend)?);
+            }
+            Ok(sessions)
+        })
     }
 
     /// `(run_id, owner_session)` for `request_id`. `acquire_context` resolves
-    /// this before `read_scoped` so the read stays narrow.
     pub(crate) fn find_request_context(
         &self,
         request_id: i64,
     ) -> Result<Option<(RunId, Option<String>)>, ControlError> {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT jr.run_id, rs.session_id FROM job_requests jr \
-             LEFT JOIN runner_sessions rs ON rs.active_request_id = jr.request_id \
-             WHERE jr.request_id = ?1",
-            params![request_id],
-            |r| {
-                Ok((
-                    parse_run_id(&r.get::<_, String>(0)?),
-                    r.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(ControlError::backend)
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT jr.run_id, rs.session_id FROM job_requests jr \
+                 LEFT JOIN runner_sessions rs ON rs.active_request_id = jr.request_id \
+                 WHERE jr.request_id = ?1",
+                params![request_id],
+                |r| {
+                    Ok((
+                        parse_run_id(&r.get::<_, String>(0)?),
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+    /// Query run summaries without materializing `TxState`.
+    fn list_run_rows(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT selected.run_id, selected.record_blob, j.job_id, j.status, \
+                            j.queue_kind, js.steps_blob \
+                     FROM ( \
+                         SELECT run_id, record_blob, \
+                                CASE WHEN status IN ('success','failure','skipped','cancelled') \
+                                     THEN 1 ELSE 0 END AS terminal_rank, \
+                                COALESCE(completed_at_us, started_at_us, created_at_us) AS sort_at \
+                         FROM runs \
+                         WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
+                           AND (?2 IS NULL OR status = ?2) \
+                           AND (?3 IS NULL OR event = ?3) \
+                         ORDER BY terminal_rank, sort_at DESC \
+                         LIMIT ?4 \
+                     ) AS selected \
+                     LEFT JOIN jobs j ON j.run_id = selected.run_id \
+                     LEFT JOIN job_steps js ON js.agent_job_id = ( \
+                         SELECT jr.agent_job_id FROM job_requests jr \
+                         WHERE jr.run_id = j.run_id AND jr.job_id = j.job_id \
+                         ORDER BY jr.request_id DESC LIMIT 1 \
+                     ) \
+                     ORDER BY selected.terminal_rank, selected.sort_at DESC, j.job_id",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        filter.workflow.as_deref(),
+                        filter.status.as_deref(),
+                        filter.event.as_deref(),
+                        filter.limit.min(200) as i64,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(ControlError::backend)?;
+            let mut runs = Vec::new();
+            let mut current_id: Option<String> = None;
+            let mut current_run: Option<RunRecord> = None;
+            let mut current_jobs = Vec::new();
+            for row in rows {
+                let (run_id, record, job_id, status, queue_kind, steps) =
+                    row.map_err(ControlError::backend)?;
+                if current_id.as_deref() != Some(run_id.as_str()) {
+                    if let Some(run) = current_run.take() {
+                        runs.push(project_run_rows(run, std::mem::take(&mut current_jobs)));
+                    }
+                    current_id = Some(run_id);
+                    current_run = Some(blob(&self.cipher, &record)?);
+                }
+                if let (Some(job_id), Some(status), Some(queue_kind)) = (job_id, status, queue_kind)
+                {
+                    let steps = steps
+                        .map(|bytes| blob::<Vec<crate::models::StepRecord>>(&self.cipher, &bytes))
+                        .transpose()?;
+                    current_jobs.push((JobId(job_id), status_parse(&status), queue_kind, steps));
+                }
+            }
+            if let Some(run) = current_run {
+                runs.push(project_run_rows(run, current_jobs));
+            }
+            Ok(runs)
+        })
+    }
+
+    /// Append an event without reading or rewriting its run.
+    fn append_event_row(
+        &self,
+        event: &preloop_gha_protocol::NdjsonEvent,
+    ) -> Result<(), ControlError> {
+        let run_id = event_run_id(event).map(|id| id.0.to_string());
+        let event_blob = unblob(&self.cipher, event)?;
+        run_blocking(|| {
+            self.conn
+                .lock()
+                .execute(
+                    "INSERT INTO control_events(run_id, event_blob, created_at_us) \
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        run_id,
+                        event_blob,
+                        system_to_us(std::time::SystemTime::now())
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            Ok(())
+        })
+    }
+
+    fn auxiliary(&self) -> Result<&crate::store::SqliteStore, ControlError> {
+        self.aux
+            .as_ref()
+            .ok_or_else(|| ControlError::backend(anyhow::anyhow!("webhooks unavailable in-memory")))
+    }
+    fn terminal_job_rows(&self) -> Result<BTreeSet<(RunId, JobId)>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, job_id FROM jobs \
+                     WHERE status IN ('success','failure','skipped','cancelled')",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        parse_run_id(&row.get::<_, String>(0)?),
+                        JobId(row.get::<_, String>(1)?),
+                    ))
+                })
+                .map_err(ControlError::backend)?;
+            let mut terminal = BTreeSet::new();
+            for row in rows {
+                terminal.insert(row.map_err(ControlError::backend)?);
+            }
+            Ok(terminal)
+        })
     }
 }
 
@@ -520,18 +713,14 @@ impl SqliteBackend {
 // Load: rows → TxState
 // ─────────────────────────────────────────────────────────────────────────
 /// Deserialize a sealed `*_blob` column. Every blob the control backend
-/// writes is AEAD-sealed; a pre-seal plaintext row (a database written
-/// before the envelope was wired) is accepted once and re-sealed on the
-/// next write-back, so existing state upgrades in place.
+/// writes is AEAD-sealed; unsealed input is rejected outright — pre-seal
+/// databases are not supported and must be recreated.
 fn blob<T: serde::de::DeserializeOwned>(
     cipher: &store::Envelope,
     bytes: &[u8],
 ) -> Result<T, ControlError> {
-    match cipher.unseal(bytes) {
-        Ok(plain) => serde_json::from_slice(&plain).map_err(ControlError::backend),
-        // Plaintext fallback: only valid while pre-seal databases exist.
-        Err(_) => serde_json::from_slice(bytes).map_err(ControlError::backend),
-    }
+    let plain = cipher.unseal(bytes).map_err(ControlError::backend)?;
+    serde_json::from_slice(&plain).map_err(ControlError::backend)
 }
 
 /// Serialize + seal a `*_blob` column.
@@ -1360,13 +1549,12 @@ fn load_txstate(
                 tx.verified_sessions.insert(session_id.clone());
             }
             if let Some(key_blob) = encryption_blob {
-                // Sealed session keys unseal to raw key bytes; a raw
-                // 32-byte key (pre-seal row) is accepted once and re-sealed
-                // on the next write-back.
+                // Session keys are sealed on write; unsealed input is
+                // rejected outright — pre-seal databases are not supported.
                 let restored = cipher
                     .unseal(&key_blob)
                     .map(SessionEncryption::from_key)
-                    .unwrap_or_else(|_| SessionEncryption::from_key(key_blob));
+                    .map_err(ControlError::backend)?;
                 tx.session_keys.insert(session_id.clone(), restored);
             }
             if let Some(us) = last_seen_at_us {
@@ -2942,6 +3130,21 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn list_runs(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError> {
+        self.list_run_rows(filter)
+    }
+
+    async fn append_event(
+        &self,
+        event: &preloop_gha_protocol::NdjsonEvent,
+    ) -> Result<(), ControlError> {
+        self.append_event_row(event)
+    }
+
+    async fn terminal_jobs(&self) -> Result<BTreeSet<(RunId, JobId)>, ControlError> {
+        self.terminal_job_rows()
+    }
+
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
         self.transact(|tx| {
             let record = match &key {
@@ -2950,6 +3153,7 @@ impl ControlBackend for SqliteBackend {
                     .plan_requests
                     .get(plan)
                     .and_then(|id| tx.job_requests.get(id)),
+
                 RequestKey::AgentJobId(id) => tx
                     .agent_job_requests
                     .get(id)
@@ -2962,6 +3166,373 @@ impl ControlBackend for SqliteBackend {
             record
                 .cloned()
                 .ok_or_else(|| ControlError::NotFound("request".to_owned()))
+        })
+    }
+    async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
+        run_blocking(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let next_id: i64 = tx
+                .query_row(
+                    "INSERT INTO counters(name, value) VALUES ('next_log_id', 1) \
+                     ON CONFLICT(name) DO UPDATE SET value = counters.value + 1 \
+                     RETURNING value - 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ControlError::backend)?;
+            let key = format!("{plan_id}/{next_id}");
+            tx.execute(
+                "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
+                 VALUES (?1, 0, 0, ?2)",
+                params![key, system_to_us(std::time::SystemTime::now())],
+            )
+            .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)?;
+            Ok(next_id)
+        })
+    }
+
+    async fn append_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> Result<(), ControlError> {
+        run_blocking(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let now_us = system_to_us(std::time::SystemTime::now());
+            tx.execute(
+                "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(log_key) DO UPDATE SET \
+                   byte_count = excluded.byte_count, \
+                   line_count = excluded.line_count, \
+                   updated_at_us = excluded.updated_at_us",
+                params![key, byte_count, line_count, now_us],
+            )
+            .map_err(ControlError::backend)?;
+            tx.execute(
+                "INSERT INTO log_chunks(log_key, chunk_index, payload, written_at_us) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![key, chunk_index, payload, now_us],
+            )
+            .map_err(ControlError::backend)?;
+            let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
+            if cutoff > 0 {
+                tx.execute(
+                    "DELETE FROM log_chunks WHERE log_key = ?1 AND chunk_index <= ?2",
+                    params![key, cutoff],
+                )
+                .map_err(ControlError::backend)?;
+            }
+            tx.commit().map_err(ControlError::backend)
+        })
+    }
+
+    async fn delete_log(&self, key: &str) -> Result<(), ControlError> {
+        run_blocking(|| {
+            self.conn
+                .lock()
+                .execute("DELETE FROM log_files WHERE log_key = ?1", params![key])
+                .map_err(ControlError::backend)?;
+            Ok(())
+        })
+    }
+
+    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT f.log_key, f.byte_count, f.line_count, c.payload \
+                     FROM log_files f \
+                     LEFT JOIN log_chunks c ON c.log_key = f.log_key \
+                     ORDER BY f.updated_at_us, f.log_key, c.chunk_index",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                })
+                .map_err(ControlError::backend)?;
+            let mut logs: Vec<DurableLog> = Vec::new();
+            for row in rows {
+                let (key, byte_count, line_count, payload) = row.map_err(ControlError::backend)?;
+                if logs.last().is_none_or(|log| log.key != key) {
+                    logs.push(DurableLog {
+                        key,
+                        payload: Vec::new(),
+                        byte_count: byte_count.max(0) as usize,
+                        line_count: line_count.max(0) as usize,
+                    });
+                }
+                if let Some(payload) = payload {
+                    logs.last_mut()
+                        .expect("log row was inserted")
+                        .payload
+                        .extend_from_slice(&payload);
+                }
+            }
+            Ok(logs)
+        })
+    }
+
+    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
+        let value = unblob(&self.cipher, meta)?;
+        run_blocking(|| {
+            self.conn
+                .lock()
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('local_state', ?1) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![value],
+                )
+                .map_err(ControlError::backend)?;
+            Ok(())
+        })
+    }
+
+    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
+        self.with_reader(|conn| {
+            let value = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'local_state'",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            value.map(|value| blob(&self.cipher, &value)).transpose()
+        })
+    }
+
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .enqueue_webhook_delivery(delivery)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> Result<Vec<WebhookDeliveryRecord>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .claim_webhook_deliveries(limit, lease_duration_secs)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .renew_webhook_delivery(delivery_id, lease_token, lease_duration_secs)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .complete_webhook_delivery(delivery_id, lease_token)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay: Option<std::time::Duration>,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .get_webhook_delivery(delivery_id)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn count_dead_letter_webhook_deliveries(&self) -> Result<u64, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .count_dead_letter_webhook_deliveries()
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn recover_webhook_deliveries(&self) -> Result<u64, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .recover_webhook_deliveries()
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn prune_webhook_deliveries(
+        &self,
+        before_us: i64,
+        limit: usize,
+    ) -> Result<u64, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .prune_webhook_deliveries(before_us, limit)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .park_webhook_delivery(delivery_id, lease_token, error, retry_delay_secs)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .requeue_webhook_delivery(delivery_id)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> Result<Vec<WebhookDeliverySummary>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .list_webhook_deliveries(state, limit)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> Result<BTreeSet<String>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .webhook_deliveries_present(delivery_ids)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn webhook_queue_stats(&self) -> Result<WebhookQueueStats, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .webhook_queue_stats()
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> Result<Option<WebhookWatchdogCursor>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .load_webhook_watchdog_cursor(scope)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> Result<(), ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .store_webhook_watchdog_cursor(cursor)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> Result<(), ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .upsert_webhook_redelivery(record)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .load_webhook_redelivery(delivery_guid)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .open_webhook_redeliveries(limit)
+                .map_err(ControlError::backend)
+        })
+    }
+
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            self.auxiliary()?
+                .resolve_webhook_redelivery(delivery_guid, resolved_at_us)
+                .map_err(ControlError::backend)
         })
     }
 

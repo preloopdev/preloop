@@ -243,12 +243,8 @@ pub async fn twirp_artifact_v2_create(
                 created_unix: now_unix(),
             },
         );
-        let meta = shared
-            .state
-            .backend
-            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
-            .await?;
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        let meta = crate::store::build_local_meta_snapshot(&inner);
+        if let Err(error) = shared.state.backend.store_meta(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 reservation");
         }
     }
@@ -363,12 +359,8 @@ pub async fn twirp_artifact_v2_finalize(
         // F7: keep the registry bounded per run (500) and globally (10k);
         // oldest entries are evicted first.
         trim_artifact_registry(&mut inner);
-        let meta = shared
-            .state
-            .backend
-            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
-            .await?;
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        let meta = crate::store::build_local_meta_snapshot(&inner);
+        if let Err(error) = shared.state.backend.store_meta(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 finalization");
         }
     }
@@ -540,13 +532,9 @@ pub async fn twirp_artifact_v2_delete(
     if let Some(e) = removed {
         let meta = {
             let inner = shared.state.inner.lock().await;
-            shared
-                .state
-                .backend
-                .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
-                .await?
+            crate::store::build_local_meta_snapshot(&inner)
         };
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+        if let Err(error) = shared.state.backend.store_meta(&meta).await {
             tracing::warn!(?error, "failed to persist artifact v2 deletion");
         }
         let _ = save_artifact_v2_registry(&shared).await;

@@ -1638,16 +1638,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             .or_else(|| std::env::var(crate::store::STORE_URL_ENV).ok())
             .unwrap_or_default();
         let store_url = crate::store::parse_store_url(&effective_url);
-        // One decorator around the private `Store` trait — never per-backend
-        // duplication. The backend label is bounded to sqlite|postgres.
-        state.store = crate::store::InstrumentedStore::wrap(
-            state.store.clone(),
-            state.observability.clone(),
-            match &store_url {
-                Ok(crate::store::StoreUrl::Postgres(_)) => "postgres",
-                _ => "sqlite",
-            },
-        );
         match &store_url {
             Ok(crate::store::StoreUrl::Postgres(_)) => {
                 preloop_observability::status::StoreBackend::Postgres

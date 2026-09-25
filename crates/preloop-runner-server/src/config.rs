@@ -14,7 +14,7 @@
 //! with mode 0600 and secret values are never echoed back by
 //! `preloop secret list` or `preloop doctor`.
 
-use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
+use crate::credential_store::{CredentialRef, CredentialStore, SecretString};
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -1088,7 +1088,7 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
 /// it. A reachable backend that fails an individual read is still an error.
 pub fn resolve_credential_references(
     config: &mut ConfigFile,
-    store: &impl CredentialStore,
+    store: &dyn CredentialStore,
 ) -> anyhow::Result<()> {
     let references_present = config.github.app_pem_ref.is_some()
         || config.github.pat_ref.is_some()
@@ -1130,7 +1130,7 @@ pub fn resolve_credential_references(
 }
 
 fn read_credential(
-    store: &impl CredentialStore,
+    store: &dyn CredentialStore,
     reference: &str,
 ) -> anyhow::Result<Option<SecretString>> {
     let reference = CredentialRef::new(reference.to_owned())?;
@@ -1443,11 +1443,16 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         .with_context(|| format!("validating config {}", path.display()))?;
     validate_execution_protection(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
-    resolve_credential_references(&mut config, &OsCredentialStore)?;
+    let cred_base = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let store = crate::credential_store::store_from_env(&cred_base);
+    resolve_credential_references(&mut config, store.as_ref())?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
     if let Some(dir) = path.parent() {
-        unseal_config_secrets(&mut config, dir, &OsCredentialStore)
+        unseal_config_secrets(&mut config, dir, store.as_ref())
             .with_context(|| format!("unsealing secrets in config {}", path.display()))?;
     }
     Ok(config)

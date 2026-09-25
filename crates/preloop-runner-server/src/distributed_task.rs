@@ -1071,8 +1071,6 @@ pub async fn complete_job_inner(
         newly_terminal_success,
         finalized_callers: _,
         live_log_key,
-        completed_attempt,
-        completion_revision,
         ..
     } = tx_out;
 
@@ -1107,23 +1105,6 @@ pub async fn complete_job_inner(
         .queue_depth
         .store(queue_len, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = next_labels;
-    // Best-effort, outside the lock: the completion's own step conclusions
-    // must survive a restart, and the run-event projection deliberately no
-    // longer carries step rows.
-    if let Some((agent_job_id, records)) = completed_attempt
-        && let Err(error) = shared
-            .state
-            .store
-            .store_job_steps(
-                completion.run_id,
-                agent_job_id,
-                &records,
-                completion_revision,
-            )
-            .await
-    {
-        warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");
-    }
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now

@@ -4,10 +4,10 @@
 //! dialect; `postgres` translates the few constructs that differ (`?` → `$N`,
 //! `INSERT OR REPLACE` → `ON CONFLICT … DO UPDATE`, autoincrement →
 //! `BIGSERIAL`, `BEGIN IMMEDIATE` → `SELECT … FOR UPDATE`). The logical
-//! tables, columns and invariants are identical — the shared behavioral
+//! tables, columns and invariants are identical. The shared behavioral
 //! suite runs the same commands against both and expects the same results.
 //!
-//! Design rules (from `docs/internal/arch/02-control-model.md`):
+//! Design rules
 //! - `jobs.status` (the `ExecutionStatus` in the run record) is canonical
 //!   workflow truth; `queue_kind` is the derived dispatch copy — never
 //!   independently mutable.
@@ -33,10 +33,9 @@
 /// - 6: `jobs.claim_generation` dropped — job-claim fencing lives on
 ///   `job_requests.locked_until_us` + `owner_runner_id`, never this column.
 /// - 7: `outbox` dropped — declared but never read or written.
-/// - 8: SQLite text primary keys made explicitly `NOT NULL`; unlike
-///   PostgreSQL, SQLite rowid tables otherwise accept `NULL` in a
-///   non-integer primary key.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 8;
+/// - 8: SQLite text primary keys made explicitly `NOT NULL`.
+/// - 9: durable control events moved into the authoritative backend.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 9;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -444,6 +443,67 @@ CREATE TABLE IF NOT EXISTS cancellation_queue (
 -- (the generation is the fencing token). Held runs are queue_kind='held'
 -- jobs grouped by run_id. No separate tables needed.
 
+-- ── Durable events ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS control_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT,
+    event_blob          BLOB NOT NULL,
+    created_at_us       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_events_run ON control_events(run_id, id);
+
+-- ── Live log recovery buffer ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS log_files (
+    log_key             TEXT PRIMARY KEY NOT NULL,
+    byte_count          INTEGER NOT NULL DEFAULT 0,
+    line_count          INTEGER NOT NULL DEFAULT 0,
+    updated_at_us       INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS log_chunks (
+    log_key             TEXT NOT NULL,
+    chunk_index         INTEGER NOT NULL,
+    payload             BLOB NOT NULL,
+    written_at_us       INTEGER NOT NULL,
+    PRIMARY KEY (log_key, chunk_index),
+    FOREIGN KEY (log_key) REFERENCES log_files(log_key) ON DELETE CASCADE
+);
+
+-- ── Durable webhook inbox and repair state ───────────────────────────
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id         TEXT PRIMARY KEY NOT NULL,
+    event               TEXT NOT NULL,
+    payload_blob        BLOB NOT NULL,
+    received_at_us      INTEGER NOT NULL,
+    state               TEXT NOT NULL CHECK (state IN ('received','processing','done','failed')),
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    lease_until_us      INTEGER,
+    lease_token         TEXT,
+    last_error          TEXT
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_claim
+    ON webhook_deliveries(state, received_at_us);
+CREATE TABLE IF NOT EXISTS webhook_watchdog (
+    scope                       TEXT PRIMARY KEY NOT NULL,
+    cursor_delivered_at_us      INTEGER,
+    cursor_delivered_at_guid    TEXT,
+    scan_cursor                 TEXT,
+    last_poll_at_us             INTEGER,
+    last_success_at_us          INTEGER
+);
+CREATE TABLE IF NOT EXISTS webhook_redeliveries (
+    delivery_guid       TEXT PRIMARY KEY NOT NULL,
+    github_delivery_id  INTEGER NOT NULL,
+    app_id              TEXT NOT NULL,
+    reason              TEXT NOT NULL CHECK (reason IN ('remote_failure','phantom_ack')),
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    first_seen_at_us    INTEGER NOT NULL,
+    last_attempt_at_us  INTEGER,
+    resolved_at_us      INTEGER,
+    last_error          TEXT
+);
+CREATE INDEX IF NOT EXISTS webhook_redeliveries_open
+    ON webhook_redeliveries(resolved_at_us, first_seen_at_us);
+
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
     name                TEXT PRIMARY KEY NOT NULL,
@@ -472,10 +532,9 @@ CREATE TABLE IF NOT EXISTS meta (
 ///   dedup key is the pair, not the delivery alone.
 /// - 5: `runner_sessions.verified` marks sessions created under a verified
 ///   listen token; only they count toward the duplicate live-session conflict.
-/// - 6: `jobs.claim_generation` dropped — job-claim fencing lives on
-///   `job_requests.locked_until_us` + `owner_runner_id`, never this column.
 /// - 7: `outbox` dropped — declared but never read or written.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 7;
+/// - 8: durable control events moved into the authoritative backend.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 8;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -740,6 +799,67 @@ CREATE TABLE IF NOT EXISTS cancellation_queue (
     job_id              TEXT NOT NULL,
     agent_job_id        TEXT NOT NULL
 );
+
+-- ── Durable events ───────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS control_events (
+    id                  BIGSERIAL PRIMARY KEY,
+    run_id              TEXT,
+    event_blob          BYTEA NOT NULL,
+    created_at_us       BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_events_run ON control_events(run_id, id);
+
+-- ── Live log recovery buffer ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS log_files (
+    log_key             TEXT PRIMARY KEY,
+    byte_count          BIGINT NOT NULL DEFAULT 0,
+    line_count          BIGINT NOT NULL DEFAULT 0,
+    updated_at_us       BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS log_chunks (
+    log_key             TEXT NOT NULL,
+    chunk_index         BIGINT NOT NULL,
+    payload             BYTEA NOT NULL,
+    written_at_us       BIGINT NOT NULL,
+    PRIMARY KEY (log_key, chunk_index),
+    FOREIGN KEY (log_key) REFERENCES log_files(log_key) ON DELETE CASCADE
+);
+
+-- ── Durable webhook inbox and repair state ───────────────────────────
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id         TEXT PRIMARY KEY,
+    event               TEXT NOT NULL,
+    payload_blob        BYTEA NOT NULL,
+    received_at_us      BIGINT NOT NULL,
+    state               TEXT NOT NULL CHECK (state IN ('received','processing','done','failed')),
+    attempts            BIGINT NOT NULL DEFAULT 0,
+    lease_until_us      BIGINT,
+    lease_token         TEXT,
+    last_error          TEXT
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_claim
+    ON webhook_deliveries(state, received_at_us);
+CREATE TABLE IF NOT EXISTS webhook_watchdog (
+    scope                       TEXT PRIMARY KEY,
+    cursor_delivered_at_us      BIGINT,
+    cursor_delivered_at_guid    TEXT,
+    scan_cursor                 TEXT,
+    last_poll_at_us             BIGINT,
+    last_success_at_us          BIGINT
+);
+CREATE TABLE IF NOT EXISTS webhook_redeliveries (
+    delivery_guid       TEXT PRIMARY KEY,
+    github_delivery_id  BIGINT NOT NULL,
+    app_id              TEXT NOT NULL,
+    reason              TEXT NOT NULL CHECK (reason IN ('remote_failure','phantom_ack')),
+    attempts            BIGINT NOT NULL DEFAULT 0,
+    first_seen_at_us    BIGINT NOT NULL,
+    last_attempt_at_us  BIGINT,
+    resolved_at_us      BIGINT,
+    last_error          TEXT
+);
+CREATE INDEX IF NOT EXISTS webhook_redeliveries_open
+    ON webhook_redeliveries(resolved_at_us, first_seen_at_us);
 
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (

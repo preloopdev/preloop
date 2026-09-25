@@ -330,6 +330,14 @@ pub fn load_engine_token(storage_dir: &Path) -> Result<Option<String>> {
     load_engine_token_with_store(storage_dir, &OsCredentialStore)
 }
 
+/// Like [`load_engine_token`], but the backend is chosen by
+/// `PRELOOP_CREDENTIAL_STORE` (`file`/`memory`/`os`). Use this from binaries
+/// so a dev or headless process can avoid the OS keychain prompt entirely.
+pub fn load_engine_token_from_env(storage_dir: &Path) -> Result<Option<String>> {
+    let store = store_from_env(storage_dir);
+    load_engine_token_with_store(storage_dir, store.as_ref())
+}
+
 /// Resolve the engine token, generating and persisting one when absent.
 ///
 /// An explicitly supplied token is validated and returned without copying it
@@ -661,6 +669,101 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
+/// File-backed credential store: one `0600` file per credential under a
+/// private directory. Selected with `PRELOOP_CREDENTIAL_STORE=file` so a dev
+/// or headless server never touches the OS keychain with no per-binary access
+/// prompt, and credentials survive rebuilds and restarts.
+///
+/// Security note: this is the same trust level as the existing
+/// `engine.token` file fallback — a private file in the state dir, readable
+/// only by the owning user. It is *not* the OS keychain; use it where a
+/// keychain prompt is unacceptable (local iteration, containers, CI).
+#[derive(Clone)]
+pub struct FileCredentialStore {
+    dir: PathBuf,
+}
+
+impl FileCredentialStore {
+    /// Store rooted at `dir` (created `0700` on first write).
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    /// The default directory: `<state_dir>/credentials`.
+    pub fn default_dir(state_dir: &Path) -> PathBuf {
+        state_dir.join("credentials")
+    }
+
+    /// Map a credential reference to a safe filename. References are already
+    /// restricted to a flat printable identifier, but we hash anyway so a
+    /// host-provided reference can never escape the directory or collide
+    /// with the engine-token file.
+    fn path_for(&self, reference: &CredentialRef) -> PathBuf {
+        let digest = Sha256::digest(reference.as_str().as_bytes());
+        self.dir.join(format!("{digest:x}.cred"))
+    }
+}
+
+impl CredentialStore for FileCredentialStore {
+    fn get(&self, reference: &CredentialRef) -> Result<Option<SecretString>> {
+        let path = self.path_for(reference);
+        match std::fs::read_to_string(&path) {
+            Ok(value) => Ok(Some(SecretString::new(value))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context(format!("read credential file {}", path.display())),
+        }
+    }
+
+    fn set(&self, reference: &CredentialRef, value: &SecretString) -> Result<()> {
+        if value.expose().is_empty() {
+            anyhow::bail!("refusing to store an empty credential");
+        }
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("create credential dir {}", self.dir.display()))?;
+        set_private_directory_permissions(&self.dir)?;
+        let path = self.path_for(reference);
+        std::fs::write(&path, value.expose())
+            .with_context(|| format!("write credential file {}", path.display()))?;
+        set_private_file_permissions(&path)?;
+        Ok(())
+    }
+
+    fn delete(&self, reference: &CredentialRef) -> Result<()> {
+        let path = self.path_for(reference);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context(format!("delete credential file {}", path.display())),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "file credential store"
+    }
+}
+
+/// Select the credential store for this process.
+///
+/// `PRELOOP_CREDENTIAL_STORE`:
+/// - `os` (default) — the native keychain / secret-service / credential manager.
+/// - `file` — a private directory of `0600` files under `state_dir`; no OS
+///   prompt, survives rebuilds. Recommended for local dev and headless hosts.
+/// - `memory` — non-persistent; secrets vanish on restart (tests only).
+///
+/// Returns a boxed store so the server and CLI share one selection point.
+pub fn store_from_env(state_dir: &Path) -> Arc<dyn CredentialStore> {
+    match std::env::var("PRELOOP_CREDENTIAL_STORE")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "file" => Arc::new(FileCredentialStore::new(FileCredentialStore::default_dir(
+            state_dir,
+        ))),
+        "memory" => Arc::new(MemoryCredentialStore::default()),
+        _ => Arc::new(OsCredentialStore),
+    }
+}
+
 /// A backend that is reachable by nobody, standing in for a headless host.
 #[cfg(test)]
 #[derive(Clone, Copy, Default)]
@@ -955,5 +1058,65 @@ mod tests {
                 .is_none()
         );
         assert!(!dir.path().join(ENGINE_TOKEN_FILE).exists());
+    }
+
+    #[test]
+    fn file_store_round_trips_and_isolates_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(dir.path().join("credentials"));
+        let a = CredentialRef::new("app-pem-1").unwrap();
+        let b = CredentialRef::new("webhook-1").unwrap();
+
+        // Missing entry reads as None, not an error.
+        assert!(store.get(&a).unwrap().is_none());
+
+        store.set(&a, &SecretString::new("pem-a")).unwrap();
+        store.set(&b, &SecretString::new("secret-b")).unwrap();
+        assert_eq!(store.get(&a).unwrap().unwrap().expose(), "pem-a");
+        assert_eq!(store.get(&b).unwrap().unwrap().expose(), "secret-b");
+
+        // Overwrite wins; delete removes only that reference.
+        store.set(&a, &SecretString::new("pem-a2")).unwrap();
+        assert_eq!(store.get(&a).unwrap().unwrap().expose(), "pem-a2");
+        store.delete(&a).unwrap();
+        assert!(store.get(&a).unwrap().is_none());
+        assert_eq!(store.get(&b).unwrap().unwrap().expose(), "secret-b");
+        // Deleting a missing reference is a no-op.
+        store.delete(&a).unwrap();
+
+        // Files are private: dir 0700, each credential 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(store.dir.clone())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            let cred = store.path_for(&b);
+            assert_eq!(
+                std::fs::metadata(cred).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn file_store_refuses_empty_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cred_dir = dir.path().join("credentials");
+        let reference = CredentialRef::new("pat").unwrap();
+
+        let store = FileCredentialStore::new(&cred_dir);
+        assert!(store.set(&reference, &SecretString::new("")).is_err());
+
+        store.set(&reference, &SecretString::new("tok")).unwrap();
+        // A fresh store over the same directory reads the persisted value —
+        // this is the property that lets a rebuilt binary skip the keychain.
+        let reopened = FileCredentialStore::new(&cred_dir);
+        assert_eq!(reopened.get(&reference).unwrap().unwrap().expose(), "tok");
     }
 }

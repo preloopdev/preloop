@@ -250,6 +250,29 @@ impl PgStore {
         Ok(())
     }
 
+    /// Open auxiliary adapters against the authoritative `control` schema.
+    /// The control backend owns migrations and schema versioning.
+    pub(crate) async fn open_existing(url: &str, cipher: Envelope) -> anyhow::Result<Self> {
+        let connect_url = connect_url(url);
+        let client = match tls_connector(url)? {
+            Some(tls) => {
+                let (client, connection) = connect(&connect_url, tls).await?;
+                spawn_connection_task(connection);
+                client
+            }
+            None => {
+                let (client, connection) = connect(&connect_url, NoTls).await?;
+                spawn_connection_task(connection);
+                client
+            }
+        };
+        client.batch_execute("SET search_path TO control").await?;
+        Ok(Self {
+            connection: Arc::new(tokio::sync::Mutex::new(client)),
+            cipher,
+        })
+    }
+
     /// Apply pending migrations. `schema_migrations` doubles as the version
     /// pointer (SQLite uses `PRAGMA user_version`); steps are append-only and
     /// each runs in its own transaction.
@@ -1171,54 +1194,6 @@ impl Store for PgStore {
         tx.commit()
             .await
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
-        Ok(())
-    }
-
-    async fn store_run_event(&self, projection: RunProjection) -> anyhow::Result<()> {
-        let mut client = self.connection.lock().await;
-        let tx = client.transaction().await?;
-        let run_id = projection.run.run_id;
-        tx.execute(
-            "INSERT INTO workflow_run_counters(repository_key, workflow_path, next_run_number)
-             VALUES ('', $1, $2)
-             ON CONFLICT(repository_key, workflow_path) DO UPDATE SET
-               next_run_number = GREATEST(workflow_run_counters.next_run_number,
-                                          EXCLUDED.next_run_number)",
-            &[
-                &projection.run.workflow_path_str,
-                &(projection.run.run_number.saturating_add(1) as i64),
-            ],
-        )
-        .await?;
-        self.store_run_tx(&tx, &projection.run).await?;
-        tx.execute("DELETE FROM jobs WHERE run_id = $1", &[&run_id.to_string()])
-            .await?;
-        for (kind, job, position) in &projection.jobs {
-            self.insert_job(&tx, job, kind, *position).await?;
-        }
-        tx.execute(
-            "DELETE FROM job_requests WHERE run_id = $1",
-            &[&run_id.to_string()],
-        )
-        .await?;
-        for record in &projection.requests {
-            self.insert_request_tx(&tx, record).await?;
-        }
-        // Steps are persisted per attempt by `store_job_steps`, not here: see
-        // the SQLite twin for why a run-scoped rewrite is quadratic.
-        // Claim state must land in the same transaction as the queue rewrite
-        // (see the SQLite twin).
-        self.write_claim_state_tx(
-            &tx,
-            &projection.session_active_requests,
-            &projection.inflight,
-            &projection.broker_request_messages,
-        )
-        .await?;
-        self.insert_event_tx(&tx, &projection.event).await?;
-        tx.commit()
-            .await
-            .map_err(|error| anyhow::anyhow!("committing run event: {error}"))?;
         Ok(())
     }
 

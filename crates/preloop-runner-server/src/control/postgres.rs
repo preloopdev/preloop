@@ -1,14 +1,14 @@
 //! The Postgres `ControlBackend`: the shared-node authority.
 //!
 //! Same contract as [`crate::control::sqlite`]: every command is one
-//! transaction — `BEGIN`, [`load_txstate`] builds the working set, the
+//! transaction [`load_txstate`] builds the working set, the
 //! shared [`crate::control::commands`] logic runs on it, [`write_txstate`]
 //! persists the delta, `COMMIT`. The database is the serialization and
 //! fencing boundary; a pool of connections serves concurrent commands, so
 //! this backend scales past SQLite's single writer.
 //!
 //! The SQL is the Postgres dialect of [`crate::control::schema::POSTGRES_DDL`]
-//! — the same table families, `$N` placeholders, `BYTEA` blobs, `BIGSERIAL`
+//! `$N` placeholders, `BYTEA` blobs, `BIGSERIAL`
 //! sequences. Every table lives in the `control` schema (the analogue of the
 //! separate `control.db` file): `POSTGRES_DDL` sets `search_path TO control`
 //! on this connection, so the unqualified names below resolve to `control.*`
@@ -25,9 +25,13 @@ use super::schema::{POSTGRES_DDL, POSTGRES_SCHEMA_VERSION};
 use super::txstate::{TxScope, TxState};
 use super::types::*;
 use crate::concurrency;
-use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
+use crate::models::{
+    QueuedJob, RunRecord, TaskAgentJobRequestRecord, WebhookDeliveryRecord, WebhookDeliveryStatus,
+    WebhookDeliverySummary, WebhookQueueStats, WebhookRedeliveryRecord, WebhookWatchdogCursor,
+};
 use crate::state::JobSetId;
 use crate::store;
+use crate::store::Store as _;
 use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, SessionId};
 use std::collections::{BTreeSet, VecDeque};
@@ -46,9 +50,24 @@ pub(crate) struct PostgresBackend {
     /// AEAD envelope sealing every `*_blob` column — identical to the SQLite
     /// backend so a read replica or `SELECT` yields ciphertext, not secrets.
     cipher: store::Envelope,
+    /// Auxiliary SQL adapter over the same PostgreSQL `control` schema.
+    aux: crate::store_pg::PgStore,
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
+}
+
+/// Run `f` without stalling the async executor. On a multi-thread runtime
+/// `block_in_place` hands the blocking section a spare worker so a heavy
+/// command body cannot starve concurrent requests; on a `current_thread`
+/// runtime (unit tests) `f` runs inline — `block_in_place` would panic.
+fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// Advisory-lock key serializing control-plane writers across every process
@@ -122,11 +141,15 @@ impl PostgresBackend {
                 .await
                 .map_err(|_| ControlError::backend(anyhow::anyhow!("reader pool closed")))?;
         }
+        let aux = crate::store_pg::PgStore::open_existing(url, cipher.clone())
+            .await
+            .map_err(ControlError::backend)?;
         Ok(Self {
             client: tokio::sync::Mutex::new(client),
             readers_tx,
             readers_rx: tokio::sync::Mutex::new(readers_rx),
             cipher,
+            aux,
             pool_assignments_enabled: std::sync::atomic::AtomicBool::new(pool_assignments_enabled),
             require_job_assignments: std::sync::atomic::AtomicBool::new(require_job_assignments),
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
@@ -208,7 +231,9 @@ impl PostgresBackend {
         .map_err(ControlError::backend)?;
         let (tx, effective_scope) = load_txstate(&txn, scope, &self.cipher).await?;
         let mut tx = tx.with_config(self.config());
-        let result = f(&mut tx)?;
+        // The command body is synchronous CPU over the working set; keep it
+        // off the executor thread so a heavy command cannot starve reads.
+        let result = run_blocking(|| f(&mut tx))?;
         write_txstate(&txn, &tx, &effective_scope, &self.cipher).await?;
         txn.commit().await.map_err(ControlError::backend)?;
         Ok(result)
@@ -287,9 +312,26 @@ impl PostgresBackend {
         let txn = client.transaction().await.map_err(ControlError::backend)?;
         let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher).await?;
         let tx = tx.with_config(self.config());
-        let result = f(&tx)?;
+        let result = run_blocking(|| f(&tx))?;
         txn.rollback().await.map_err(ControlError::backend)?;
         Ok(result)
+    }
+
+    /// Check out a pooled reader connection. Pair with [`Self::return_reader`].
+    /// Read-only point lookups go through here so they never queue behind the
+    /// single writer.
+    async fn checkout_reader(&self) -> Result<Client, ControlError> {
+        self.readers_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| ControlError::backend(anyhow::anyhow!("reader pool closed")))
+    }
+
+    /// Return a reader checked out by [`Self::checkout_reader`].
+    async fn return_reader(&self, client: Client) {
+        let _ = self.readers_tx.send(client).await;
     }
 
     /// Find the run a webhook delivery already produced, by its durable
@@ -301,35 +343,40 @@ impl PostgresBackend {
         delivery_id: &str,
         workflow_path: &str,
     ) -> Result<Option<RunRecord>, ControlError> {
-        let client = self.client.lock().await;
-        let row = client
-            .query_opt(
-                "SELECT run_id, record_blob FROM runs \
-                 WHERE webhook_delivery_id = $1 AND workflow_path = $2",
-                &[&delivery_id, &workflow_path],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let run_id_s: String = row.get(0);
-        let record: Vec<u8> = row.get(1);
-        let mut run: RunRecord = blob(&self.cipher, &record)?;
-        run.jobs.clear();
-        let rows = client
-            .query(
-                "SELECT job_id, status FROM jobs WHERE run_id = $1",
-                &[&run_id_s],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-        for row in rows {
-            let job_id_s: String = row.get(0);
-            let status_s: String = row.get(1);
-            run.jobs.insert(JobId(job_id_s), status_parse(&status_s));
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let row = client
+                .query_opt(
+                    "SELECT run_id, record_blob FROM runs \
+                     WHERE webhook_delivery_id = $1 AND workflow_path = $2",
+                    &[&delivery_id, &workflow_path],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let run_id_s: String = row.get(0);
+            let record: Vec<u8> = row.get(1);
+            let mut run: RunRecord = blob(&self.cipher, &record)?;
+            run.jobs.clear();
+            let rows = client
+                .query(
+                    "SELECT job_id, status FROM jobs WHERE run_id = $1",
+                    &[&run_id_s],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                let job_id_s: String = row.get(0);
+                let status_s: String = row.get(1);
+                run.jobs.insert(JobId(job_id_s), status_parse(&status_s));
+            }
+            Ok(Some(run))
         }
-        Ok(Some(run))
+        .await;
+        self.return_reader(client).await;
+        result
     }
 
     /// Resolve a request's `(request_id, run_id)` from its `agent_job_id`.
@@ -339,23 +386,25 @@ impl PostgresBackend {
         &self,
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<(i64, RunId)>, ControlError> {
-        let client = self.client.lock().await;
+        let client = self.checkout_reader().await?;
         let agent_job_id_s = agent_job_id.to_string();
-        client
+        let result = client
             .query_opt(
                 "SELECT request_id, run_id FROM job_requests WHERE agent_job_id = $1",
                 &[&agent_job_id_s],
             )
             .await
-            .map_err(ControlError::backend)?
-            .map(|r| {
-                let request_id: i64 = r.get(0);
-                let run_id_s: String = r.get(1);
-                (request_id, parse_run_id(&run_id_s))
-            })
-            .map_or(Ok(None), |v| Ok(Some(v)))
+            .map_err(ControlError::backend)
+            .map(|opt| {
+                opt.map(|r| {
+                    let request_id: i64 = r.get(0);
+                    let run_id_s: String = r.get(1);
+                    (request_id, parse_run_id(&run_id_s))
+                })
+            });
+        self.return_reader(client).await;
+        result
     }
-
     /// The session that owns the request for `agent_job_id`. `complete_job`
     /// resolves this before `transact_scoped` so `settle_request` can drop
     /// the moot cancellation from the owner session's inflight messages.
@@ -363,9 +412,9 @@ impl PostgresBackend {
         &self,
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<String>, ControlError> {
-        let client = self.client.lock().await;
+        let client = self.checkout_reader().await?;
         let agent_job_id_s = agent_job_id.to_string();
-        client
+        let result = client
             .query_opt(
                 "SELECT rs.session_id FROM runner_sessions rs \
                  JOIN job_requests jr ON jr.request_id = rs.active_request_id \
@@ -373,21 +422,19 @@ impl PostgresBackend {
                 &[&agent_job_id_s],
             )
             .await
-            .map_err(ControlError::backend)?
-            .map(|r| r.get::<_, String>(0))
-            .map_or(Ok(None), |v| Ok(Some(v)))
+            .map_err(ControlError::backend)
+            .map(|opt| opt.map(|r| r.get::<_, String>(0)));
+        self.return_reader(client).await;
+        result
     }
-
-    /// Every session owning a request of `run_id`. `cancel_run`/`cancel_job`
-    /// resolve these before `transact_scoped` so `settle_request` can drop
     /// moot cancellations from each owner session's inflight messages.
     pub(crate) async fn find_sessions_by_run(
         &self,
         run_id: RunId,
     ) -> Result<BTreeSet<String>, ControlError> {
-        let client = self.client.lock().await;
+        let client = self.checkout_reader().await?;
         let run_id_s = run_id.0.to_string();
-        let rows = client
+        let result = client
             .query(
                 "SELECT DISTINCT rs.session_id FROM runner_sessions rs \
                  JOIN job_requests jr ON jr.request_id = rs.active_request_id \
@@ -395,8 +442,10 @@ impl PostgresBackend {
                 &[&run_id_s],
             )
             .await
-            .map_err(ControlError::backend)?;
-        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+            .map_err(ControlError::backend)
+            .map(|rows| rows.iter().map(|r| r.get::<_, String>(0)).collect());
+        self.return_reader(client).await;
+        result
     }
 
     /// `(run_id, owner_session)` for `request_id`. `acquire_context` resolves
@@ -405,8 +454,8 @@ impl PostgresBackend {
         &self,
         request_id: i64,
     ) -> Result<Option<(RunId, Option<String>)>, ControlError> {
-        let client = self.client.lock().await;
-        client
+        let client = self.checkout_reader().await?;
+        let result = client
             .query_opt(
                 "SELECT jr.run_id, rs.session_id FROM job_requests jr \
                  LEFT JOIN runner_sessions rs ON rs.active_request_id = jr.request_id \
@@ -414,13 +463,129 @@ impl PostgresBackend {
                 &[&request_id],
             )
             .await
-            .map_err(ControlError::backend)?
-            .map(|r| {
-                let run_id_s: String = r.get(0);
-                let session_id: Option<String> = r.get(1);
-                (parse_run_id(&run_id_s), session_id)
-            })
-            .map_or(Ok(None), |v| Ok(Some(v)))
+            .map_err(ControlError::backend)
+            .map(|opt| {
+                opt.map(|r| {
+                    let run_id_s: String = r.get(0);
+                    let session_id: Option<String> = r.get(1);
+                    (parse_run_id(&run_id_s), session_id)
+                })
+            });
+        self.return_reader(client).await;
+        result
+    }
+    /// Query run summaries without materializing `TxState`.
+    async fn list_run_rows(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let limit = filter.limit.min(200) as i64;
+        let result = async {
+            let rows = client
+                .query(
+                    "SELECT selected.run_id, selected.record_blob, j.job_id, j.status, \
+                            j.queue_kind, js.steps_blob \
+                     FROM ( \
+                         SELECT run_id, record_blob, \
+                                CASE WHEN status IN ('success','failure','skipped','cancelled') \
+                                     THEN 1 ELSE 0 END AS terminal_rank, \
+                                COALESCE(completed_at_us, started_at_us, created_at_us) AS sort_at \
+                         FROM runs \
+                         WHERE ($1::TEXT IS NULL OR POSITION($1 IN workflow_path) > 0) \
+                           AND ($2::TEXT IS NULL OR status = $2) \
+                           AND ($3::TEXT IS NULL OR event = $3) \
+                         ORDER BY terminal_rank, sort_at DESC \
+                         LIMIT $4 \
+                     ) AS selected \
+                     LEFT JOIN jobs j ON j.run_id = selected.run_id \
+                     LEFT JOIN job_steps js ON js.agent_job_id = ( \
+                         SELECT jr.agent_job_id FROM job_requests jr \
+                         WHERE jr.run_id = j.run_id AND jr.job_id = j.job_id \
+                         ORDER BY jr.request_id DESC LIMIT 1 \
+                     ) \
+                     ORDER BY selected.terminal_rank, selected.sort_at DESC, j.job_id",
+                    &[&filter.workflow, &filter.status, &filter.event, &limit],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let mut runs = Vec::new();
+            let mut current_id: Option<String> = None;
+            let mut current_run: Option<RunRecord> = None;
+            let mut current_jobs = Vec::new();
+            for row in rows {
+                let run_id: String = row.get(0);
+                if current_id.as_deref() != Some(run_id.as_str()) {
+                    if let Some(run) = current_run.take() {
+                        runs.push(project_run_rows(run, std::mem::take(&mut current_jobs)));
+                    }
+                    let record: Vec<u8> = row.get(1);
+                    current_id = Some(run_id);
+                    current_run = Some(blob(&self.cipher, &record)?);
+                }
+                let job_id: Option<String> = row.get(2);
+                let status: Option<String> = row.get(3);
+                let queue_kind: Option<String> = row.get(4);
+                let steps: Option<Vec<u8>> = row.get(5);
+                if let (Some(job_id), Some(status), Some(queue_kind)) = (job_id, status, queue_kind)
+                {
+                    let steps = steps
+                        .map(|bytes| blob::<Vec<crate::models::StepRecord>>(&self.cipher, &bytes))
+                        .transpose()?;
+                    current_jobs.push((JobId(job_id), status_parse(&status), queue_kind, steps));
+                }
+            }
+            if let Some(run) = current_run {
+                runs.push(project_run_rows(run, current_jobs));
+            }
+            Ok(runs)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    /// Append an event without reading or rewriting its run.
+    async fn append_event_row(
+        &self,
+        event: &preloop_gha_protocol::NdjsonEvent,
+    ) -> Result<(), ControlError> {
+        let run_id = event_run_id(event).map(|id| id.0.to_string());
+        let event_blob = unblob(&self.cipher, event)?;
+        let client = self.client.lock().await;
+        client
+            .execute(
+                "INSERT INTO control_events(run_id, event_blob, created_at_us) \
+                 VALUES ($1, $2, $3)",
+                &[
+                    &run_id,
+                    &event_blob,
+                    &system_to_us(std::time::SystemTime::now()),
+                ],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        Ok(())
+    }
+    async fn terminal_job_rows(&self) -> Result<BTreeSet<(RunId, JobId)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query(
+                "SELECT run_id, job_id FROM jobs \
+                 WHERE status IN ('success','failure','skipped','cancelled')",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            parse_run_id(&row.get::<_, String>(0)),
+                            JobId(row.get::<_, String>(1)),
+                        )
+                    })
+                    .collect()
+            });
+        self.return_reader(client).await;
+        result
     }
 }
 
@@ -500,16 +665,15 @@ fn status_parse(s: &str) -> ExecutionStatus {
     }
 }
 
-/// Deserialize a sealed `*_blob` column (see the SQLite backend's `blob` —
-/// sealed on write, plaintext accepted once for pre-seal rows).
+/// Deserialize a sealed `*_blob` column. Every blob the control backend
+/// writes is AEAD-sealed; unsealed input is rejected outright — pre-seal
+/// databases are not supported and must be recreated.
 fn blob<T: serde::de::DeserializeOwned>(
     cipher: &store::Envelope,
     bytes: &[u8],
 ) -> Result<T, ControlError> {
-    match cipher.unseal(bytes) {
-        Ok(plain) => serde_json::from_slice(&plain).map_err(ControlError::backend),
-        Err(_) => serde_json::from_slice(bytes).map_err(ControlError::backend),
-    }
+    let plain = cipher.unseal(bytes).map_err(ControlError::backend)?;
+    serde_json::from_slice(&plain).map_err(ControlError::backend)
 }
 
 /// Serialize + seal a `*_blob` column.
@@ -1117,10 +1281,12 @@ async fn load_txstate(
             tx.verified_sessions.insert(session_id.clone());
         }
         if let Some(key_blob) = encryption_blob {
+            // Session keys are sealed on write; unsealed input is
+            // rejected outright — pre-seal databases are not supported.
             let restored = cipher
                 .unseal(&key_blob)
                 .map(SessionEncryption::from_key)
-                .unwrap_or_else(|_| SessionEncryption::from_key(key_blob));
+                .map_err(ControlError::backend)?;
             tx.session_keys.insert(session_id.clone(), restored);
         }
         if let Some(us) = last_seen_at_us {
@@ -2709,6 +2875,21 @@ impl ControlBackend for PostgresBackend {
         .await
     }
 
+    async fn list_runs(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError> {
+        self.list_run_rows(filter).await
+    }
+
+    async fn append_event(
+        &self,
+        event: &preloop_gha_protocol::NdjsonEvent,
+    ) -> Result<(), ControlError> {
+        self.append_event_row(event).await
+    }
+
+    async fn terminal_jobs(&self) -> Result<BTreeSet<(RunId, JobId)>, ControlError> {
+        self.terminal_job_rows().await
+    }
+
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
         self.transact(|tx| {
             let record = match &key {
@@ -2731,6 +2912,347 @@ impl ControlBackend for PostgresBackend {
                 .ok_or_else(|| ControlError::NotFound("request".to_owned()))
         })
         .await
+    }
+
+    async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(ControlError::backend)?;
+        let row = tx
+            .query_one(
+                "INSERT INTO counters(name, value) VALUES ('next_log_id', 1) \
+                 ON CONFLICT(name) DO UPDATE SET value = counters.value + 1 \
+                 RETURNING value - 1",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        let next_id: i64 = row.get(0);
+        let key = format!("{plan_id}/{next_id}");
+        let now_us = system_to_us(std::time::SystemTime::now());
+        tx.execute(
+            "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
+             VALUES ($1, 0, 0, $2)",
+            &[&key, &now_us],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+        tx.commit().await.map_err(ControlError::backend)?;
+        Ok(next_id)
+    }
+
+    async fn append_log_chunk(
+        &self,
+        key: &str,
+        chunk_index: i64,
+        payload: &[u8],
+        byte_count: i64,
+        line_count: i64,
+    ) -> Result<(), ControlError> {
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(ControlError::backend)?;
+        let now_us = system_to_us(std::time::SystemTime::now());
+        tx.execute(
+            "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT(log_key) DO UPDATE SET \
+               byte_count = EXCLUDED.byte_count, \
+               line_count = EXCLUDED.line_count, \
+               updated_at_us = EXCLUDED.updated_at_us",
+            &[&key, &byte_count, &line_count, &now_us],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+        tx.execute(
+            "INSERT INTO log_chunks(log_key, chunk_index, payload, written_at_us) \
+             VALUES ($1, $2, $3, $4)",
+            &[&key, &chunk_index, &payload, &now_us],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+        let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
+        if cutoff > 0 {
+            tx.execute(
+                "DELETE FROM log_chunks WHERE log_key = $1 AND chunk_index <= $2",
+                &[&key, &cutoff],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        tx.commit().await.map_err(ControlError::backend)
+    }
+
+    async fn delete_log(&self, key: &str) -> Result<(), ControlError> {
+        let client = self.client.lock().await;
+        client
+            .execute("DELETE FROM log_files WHERE log_key = $1", &[&key])
+            .await
+            .map_err(ControlError::backend)?;
+        Ok(())
+    }
+
+    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query(
+                "SELECT f.log_key, f.byte_count, f.line_count, c.payload \
+                 FROM log_files f \
+                 LEFT JOIN log_chunks c ON c.log_key = f.log_key \
+                 ORDER BY f.updated_at_us, f.log_key, c.chunk_index",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|rows| {
+                let mut logs: Vec<DurableLog> = Vec::new();
+                for row in rows {
+                    let key: String = row.get(0);
+                    if logs.last().is_none_or(|log| log.key != key) {
+                        logs.push(DurableLog {
+                            key,
+                            payload: Vec::new(),
+                            byte_count: row.get::<_, i64>(1).max(0) as usize,
+                            line_count: row.get::<_, i64>(2).max(0) as usize,
+                        });
+                    }
+                    if let Some(payload) = row.get::<_, Option<Vec<u8>>>(3) {
+                        logs.last_mut()
+                            .expect("log row was inserted")
+                            .payload
+                            .extend_from_slice(&payload);
+                    }
+                }
+                logs
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
+        let value = unblob(&self.cipher, meta)?;
+        let client = self.client.lock().await;
+        client
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('local_state', $1) \
+                 ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                &[&value],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        Ok(())
+    }
+
+    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt("SELECT value FROM meta WHERE key = 'local_state'", &[])
+            .await
+            .map_err(ControlError::backend)?
+            .map(|row| blob(&self.cipher, &row.get::<_, Vec<u8>>(0)))
+            .transpose();
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn enqueue_webhook_delivery(
+        &self,
+        delivery: &WebhookDeliveryRecord,
+    ) -> Result<bool, ControlError> {
+        self.aux
+            .enqueue_webhook_delivery(delivery)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn claim_webhook_deliveries(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> Result<Vec<WebhookDeliveryRecord>, ControlError> {
+        self.aux
+            .claim_webhook_deliveries(limit, lease_duration_secs)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn renew_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        lease_duration_secs: u64,
+    ) -> Result<bool, ControlError> {
+        self.aux
+            .renew_webhook_delivery(delivery_id, lease_token, lease_duration_secs)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn complete_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+    ) -> Result<bool, ControlError> {
+        self.aux
+            .complete_webhook_delivery(delivery_id, lease_token)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn fail_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        permanent: bool,
+        retry_delay: Option<std::time::Duration>,
+    ) -> Result<bool, ControlError> {
+        self.aux
+            .fail_webhook_delivery(delivery_id, lease_token, error, permanent, retry_delay)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn get_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<WebhookDeliveryRecord>, ControlError> {
+        self.aux
+            .get_webhook_delivery(delivery_id)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn count_dead_letter_webhook_deliveries(&self) -> Result<u64, ControlError> {
+        self.aux
+            .count_dead_letter_webhook_deliveries()
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn recover_webhook_deliveries(&self) -> Result<u64, ControlError> {
+        self.aux
+            .recover_webhook_deliveries()
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn prune_webhook_deliveries(
+        &self,
+        before_us: i64,
+        limit: usize,
+    ) -> Result<u64, ControlError> {
+        self.aux
+            .prune_webhook_deliveries(before_us, limit)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn park_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        lease_token: &str,
+        error: &str,
+        retry_delay_secs: u64,
+    ) -> Result<bool, ControlError> {
+        self.aux
+            .park_webhook_delivery(delivery_id, lease_token, error, retry_delay_secs)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn requeue_webhook_delivery(&self, delivery_id: &str) -> Result<bool, ControlError> {
+        self.aux
+            .requeue_webhook_delivery(delivery_id)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn list_webhook_deliveries(
+        &self,
+        state: Option<WebhookDeliveryStatus>,
+        limit: usize,
+    ) -> Result<Vec<WebhookDeliverySummary>, ControlError> {
+        self.aux
+            .list_webhook_deliveries(state, limit)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn webhook_deliveries_present(
+        &self,
+        delivery_ids: &[String],
+    ) -> Result<BTreeSet<String>, ControlError> {
+        self.aux
+            .webhook_deliveries_present(delivery_ids)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn webhook_queue_stats(&self) -> Result<WebhookQueueStats, ControlError> {
+        self.aux
+            .webhook_queue_stats()
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn load_webhook_watchdog_cursor(
+        &self,
+        scope: &str,
+    ) -> Result<Option<WebhookWatchdogCursor>, ControlError> {
+        self.aux
+            .load_webhook_watchdog_cursor(scope)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn store_webhook_watchdog_cursor(
+        &self,
+        cursor: &WebhookWatchdogCursor,
+    ) -> Result<(), ControlError> {
+        self.aux
+            .store_webhook_watchdog_cursor(cursor)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn upsert_webhook_redelivery(
+        &self,
+        record: &WebhookRedeliveryRecord,
+    ) -> Result<(), ControlError> {
+        self.aux
+            .upsert_webhook_redelivery(record)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn load_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+    ) -> Result<Option<WebhookRedeliveryRecord>, ControlError> {
+        self.aux
+            .load_webhook_redelivery(delivery_guid)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn open_webhook_redeliveries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WebhookRedeliveryRecord>, ControlError> {
+        self.aux
+            .open_webhook_redeliveries(limit)
+            .await
+            .map_err(ControlError::backend)
+    }
+
+    async fn resolve_webhook_redelivery(
+        &self,
+        delivery_guid: &str,
+        resolved_at_us: i64,
+    ) -> Result<bool, ControlError> {
+        self.aux
+            .resolve_webhook_redelivery(delivery_guid, resolved_at_us)
+            .await
+            .map_err(ControlError::backend)
     }
 
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {

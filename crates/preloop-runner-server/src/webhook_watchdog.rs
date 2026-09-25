@@ -40,6 +40,7 @@ use crate::github_app::GitHubAppCredentials;
 use crate::models::{WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor};
 use crate::state::SharedState;
 use crate::webhook_status::now_us;
+use crate::ControlBackend;
 
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const MIN_INTERVAL_SECS: u64 = 10;
@@ -251,7 +252,7 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
     }
 
     // One store probe per pass decides whether repairs are safe at all.
-    let store_healthy = shared.state.store.webhook_queue_stats().await.is_ok();
+    let store_healthy = shared.state.backend.webhook_queue_stats().await.is_ok();
     if !store_healthy {
         tracing::warn!("local webhook store is unhealthy; watchdog will observe but not redeliver");
     }
@@ -270,7 +271,7 @@ pub async fn watchdog_poll_once(shared: &Arc<SharedState>) -> anyhow::Result<Wat
 
     let open_repairs = shared
         .state
-        .store
+        .backend
         .open_webhook_redeliveries(OPEN_REPAIR_SCAN_LIMIT)
         .await
         .map(|repairs| repairs.len() as u64)
@@ -305,7 +306,7 @@ async fn poll_app(
     let api_base = crate::github::github_api_base();
     let previous = shared
         .state
-        .store
+        .backend
         .load_webhook_watchdog_cursor(&app.app_id)
         .await?;
     let watermark = previous
@@ -356,7 +357,7 @@ async fn poll_app(
             let guids: Vec<String> = examined.iter().map(|item| item.guid.clone()).collect();
             let present = shared
                 .state
-                .store
+                .backend
                 .webhook_deliveries_present(&guids)
                 .await?;
             for item in &examined {
@@ -365,7 +366,7 @@ async fn poll_app(
                     // keeps the backlog gauge meaningful.
                     if let Err(error) = shared
                         .state
-                        .store
+                        .backend
                         .resolve_webhook_redelivery(&item.guid, now_us())
                         .await
                     {
@@ -433,7 +434,7 @@ async fn poll_app(
     };
     shared
         .state
-        .store
+        .backend
         .store_webhook_watchdog_cursor(&WebhookWatchdogCursor {
             scope: app.app_id.clone(),
             cursor_delivered_at_us: advanced,
@@ -459,7 +460,7 @@ async fn repair_delivery(
     let now = now_us();
     let existing = shared
         .state
-        .store
+        .backend
         .load_webhook_redelivery(&item.guid)
         .await?;
     let mut record = existing.unwrap_or(WebhookRedeliveryRecord {
@@ -489,7 +490,7 @@ async fn repair_delivery(
         ));
         shared
             .state
-            .store
+            .backend
             .upsert_webhook_redelivery(&record)
             .await?;
         return Ok(false);
@@ -548,7 +549,7 @@ async fn repair_delivery(
     };
     shared
         .state
-        .store
+        .backend
         .upsert_webhook_redelivery(&record)
         .await?;
     Ok(requested)
@@ -729,7 +730,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         let repair = shared
             .state
-            .store
+            .backend
             .load_webhook_redelivery("guid-fail")
             .await
             .unwrap()
@@ -759,7 +760,7 @@ mod tests {
         assert_eq!(
             shared
                 .state
-                .store
+                .backend
                 .load_webhook_redelivery("guid-phantom")
                 .await
                 .unwrap()
@@ -781,7 +782,7 @@ mod tests {
         let (_temp, shared) = shared_with_app(&api_base).await;
         shared
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&WebhookDeliveryRecord {
                 delivery_id: "guid-present".to_owned(),
                 event: "push".to_owned(),
@@ -821,7 +822,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 0);
         let cursor = shared
             .state
-            .store
+            .backend
             .load_webhook_watchdog_cursor("424")
             .await
             .unwrap()
@@ -850,7 +851,7 @@ mod tests {
         assert!(
             shared
                 .state
-                .store
+                .backend
                 .load_webhook_watchdog_cursor("424")
                 .await
                 .unwrap()

@@ -465,7 +465,6 @@ pub struct AppState {
     /// here, not in `inner`. `Arc<Backend>` (concrete enum) so
     /// `Backend::transact` stays generic.
     pub backend: Arc<crate::control::Backend>,
-    pub store: Arc<dyn Store>,
     pub events: broadcast::Sender<NdjsonEvent>,
     pub message_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
@@ -924,8 +923,14 @@ impl AppState {
             )?
         };
         #[cfg(not(any(test, feature = "test-support")))]
-        let system_token =
-            crate::credential_store::resolve_engine_token(&token_dir, configured_token)?;
+        let system_token = {
+            let store = crate::credential_store::store_from_env(&state_dir);
+            crate::credential_store::resolve_engine_token_with_store(
+                &token_dir,
+                configured_token,
+                store.as_ref(),
+            )?
+        };
         #[cfg(any(test, feature = "test-support"))]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(any(test, feature = "test-support")))]
@@ -970,72 +975,7 @@ impl AppState {
             ),
             ..Default::default()
         };
-        let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
-        let mut recovered = inner;
-        let mut recovered_tx = crate::control::txstate::TxState::default();
-        store.load_into(&mut recovered_tx, &mut recovered).await?;
-        // An attempt dispatched but not yet reported has no persisted step
-        // rows: seeding happens in memory, and only a runner report writes
-        // them. The request message it was built from *is* persisted, so
-        // rebuild from that rather than leaving the run with no declared steps
-        // and `--step` answering 409 for logs that are on disk.
-        //
-        // Two homes, depending on how far the job got: `broker_messages` once
-        // a runner claimed it, and the queue row's own copy before that.
-        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered_tx
-            .job_requests
-            .values()
-            .filter(|record| !recovered_tx.job_steps.contains_key(&record.agent_job_id))
-            .filter_map(|record| {
-                let steps = recovered_tx
-                    .broker_messages
-                    .get(&record.request_id)
-                    .map(|message| message.steps.as_slice())
-                    .or_else(|| {
-                        recovered_tx
-                            .ready_index
-                            .iter()
-                            .chain(recovered_tx.pending_jobs.iter())
-                            .chain(recovered_tx.concurrency_blocked.iter())
-                            // Keyed by request id, not by (run, job): a
-                            // re-dispatch leaves several requests for one
-                            // logical job, and matching the pair attaches the
-                            // newest queued message to an older attempt —
-                            // rebuilding it with the wrong `TaskStep` ids, so
-                            // its `step-<id>.txt` blobs stop resolving.
-                            .find(|job| job.message.request_id == record.request_id)
-                            .map(|job| job.message.steps.as_slice())
-                    })?;
-                let manifest = crate::models::StepRecord::manifest(steps);
-                (!manifest.is_empty()).then_some((record.agent_job_id, manifest))
-            })
-            .collect();
-        if !rebuilt.is_empty() {
-            tracing::info!(
-                attempts = rebuilt.len(),
-                "rebuilt step manifests from persisted job request messages"
-            );
-        }
-        recovered_tx.job_steps.extend(rebuilt);
-        let inner = recovered;
-        // Seed the terminal-transition marker from the restored run record so
-        // a replayed terminal `JobStatus` after a restart cannot double-record
-        // `preloop.job.completed` for a job that already completed.
-        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
-            recovered_tx
-                .runs
-                .iter()
-                .flat_map(|(run_id, run)| {
-                    run.jobs
-                        .iter()
-                        .filter(|(_, status)| status.is_terminal())
-                        .map(move |(job_id, _)| (*run_id, job_id.clone()))
-                })
-                .collect::<BTreeSet<(RunId, JobId)>>(),
-        ));
-        // Capture queue length before moving `inner` into the Mutex so the
-        // `queue_depth` atomic is set to the recovered ready-queue size.
-        let recovered_queue_len = recovered_tx.ready_index.len();
+        let mut inner = inner;
         let local_workspace = std::env::var("PRELOOP_LOCAL_WORKSPACE")
             .ok()
             .map(PathBuf::from);
@@ -1176,35 +1116,51 @@ impl AppState {
                 .map(str::to_owned)
                 .collect();
         }
-        // The database-authoritative control plane. Scheduling state lives
-        // here, not in `inner`; the backend is selected by the same
-        // `store_url` as the legacy store (postgres:// → Postgres, else
-        // SQLite at `<state_dir>/control.db`). Config flags come from the
-        // recovered `inner` before it moves into the Mutex.
+        // The sole database authority. SQLite uses `<state_dir>/preloop.db`;
+        // PostgreSQL uses the configured database's `control` schema.
         let backend = Arc::new(
             crate::control::Backend::open(
                 store_url,
                 &state_dir,
                 crate::store::Envelope::new(&local_jwt_key),
-                recovered_tx.pool_assignments_enabled,
-                recovered_tx.require_job_assignments,
+                false,
+                false,
                 inner.runner_liveness_timeout,
             )
             .await?,
         );
-        // One-time legacy→control import: seed the control schema from the
-        // recovered `TxState` only when it is empty (a fresh control.db), then
-        // reconcile orphaned claims/sessions. Both run before the state is
-        // exposed so no dispatch sees un-reconciled or un-imported work.
-        // `import_from_tx_if_empty` is atomic + idempotent — a restart
-        // against a populated control.db skips the import and only
-        // reconciles.
-        backend.import_from_tx_if_empty(recovered_tx).await?;
         crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
+        if let Some(meta) = crate::control::backend::ControlBackend::load_meta(&*backend).await? {
+            crate::store::apply_local_meta_snapshot(&mut inner, meta);
+        }
+        // Live-log tails are owned by the authoritative backend. Replace any
+        // transitional auxiliary-store copy instead of merging duplicate
+        // chunks.
+        inner.logs.clear();
+        inner.log_metadata.clear();
+        inner.log_order.clear();
+        inner.log_bytes_total = 0;
+        for log in crate::control::backend::ControlBackend::load_logs(&*backend).await? {
+            inner.log_bytes_total = inner.log_bytes_total.saturating_add(log.payload.len());
+            inner.log_order.push_back(log.key.clone());
+            inner.log_metadata.insert(
+                log.key.clone(),
+                crate::models::LogMetadata {
+                    byte_count: log.byte_count,
+                    line_count: log.line_count,
+                },
+            );
+            inner.logs.insert(log.key, log.payload);
+        }
+        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
+            crate::control::backend::ControlBackend::terminal_jobs(&*backend).await?,
+        ));
+        let recovered_queue_len = crate::control::backend::ControlBackend::queue_stats(&*backend)
+            .await?
+            .ready;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             backend,
-            store,
             events,
             message_notify: Arc::new(Notify::new()),
             webhook_queue_notify: Arc::new(Notify::new()),
@@ -1268,15 +1224,6 @@ impl AppState {
     }
 
     pub async fn emit(&self, event: NdjsonEvent) {
-        let run_id = match &event {
-            NdjsonEvent::RunAccepted { run_id, .. }
-            | NdjsonEvent::JobStatus { run_id, .. }
-            | NdjsonEvent::RunStatus { run_id, .. }
-            | NdjsonEvent::JobCompleted { run_id, .. }
-            | NdjsonEvent::CheckRunCreated { run_id } => Some(*run_id),
-            _ => None,
-        };
-        let has_run_projection = run_id.is_some();
         if let NdjsonEvent::RunAccepted { queued_jobs, .. } = &event {
             self.observability.export_log(
                 "INFO",
@@ -1364,30 +1311,11 @@ impl AppState {
             // call here would make the record look double-sourced.
             _ => {}
         }
-        // Capture the projection under the lock, then persist after releasing
-        // it: a slow or unavailable backend must not stall the control plane
-        // (runner polling, heartbeats, other state mutations).
-        if let Some(run_id) = run_id {
-            let projection = self
-                .backend
-                .read(|tx| {
-                    Ok(crate::store::RunProjection::from_tx(
-                        tx,
-                        run_id,
-                        event.clone(),
-                    ))
-                })
-                .await
-                .ok()
-                .flatten();
-            if let Some(projection) = projection {
-                if let Err(error) = self.store.store_run_event(projection).await {
-                    error!(?error, %run_id, "failed to persist control-plane run event");
-                }
-            }
-        }
-        if !has_run_projection && let Err(error) = self.store.append_event(&event).await {
-            error!(?error, "failed to append durable control-plane event");
+        // The transition that produced this event is already committed in the
+        // authoritative backend. Persist exactly the event; never reload or
+        // rewrite run state as an observer side effect.
+        if let Err(error) = self.backend.append_event(&event).await {
+            error!(?error, "failed to persist control-plane event");
         }
         // Always broadcast: in-memory state is the source of truth and
         // subscribers see live events. A store hiccup must never

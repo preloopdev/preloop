@@ -312,23 +312,12 @@ pub async fn patch_timeline_records(
             .get(&timeline_key)
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default();
-        let meta = match shared
-            .state
-            .backend
-            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
-            .await
-        {
-            Ok(meta) => meta,
-            Err(error) => {
-                warn!(?error, "failed to read tx for timeline snapshot");
-                return Json(json!({ "count": 0, "value": [] }));
-            }
-        };
+        let meta = crate::store::build_local_meta_snapshot(&inner);
         (vals, meta)
     };
     // Persist after the lock is released so a slow backend does not serialize
-    // the control plane behind the snapshot write.
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
+    // the control plane behind the metadata write.
+    if let Err(error) = shared.state.backend.store_meta(&meta).await {
         warn!(?error, "failed to persist timeline records");
     }
 
@@ -363,44 +352,32 @@ pub async fn create_log(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
-) -> Json<serde_json::Value> {
-    let (meta, evicted) = {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let next_id = shared
+        .state
+        .backend
+        .create_log(&plan_id)
+        .await
+        .map_err(ApiError::from)?;
+    log.id = next_id;
+    let key = format!("{plan_id}/{next_id}");
+    let evicted = {
         let mut inner = shared.state.inner.lock().await;
-        let next_id = inner.next_log_id;
-        inner.next_log_id = next_id.wrapping_add(1);
-        log.id = next_id as i64;
-        let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
         inner.log_metadata.entry(key.clone()).or_default();
-        if !inner.log_order.iter().any(|k| k == &key) {
-            inner.log_order.push_back(key.clone());
+        if !inner.log_order.iter().any(|existing| existing == &key) {
+            inner.log_order.push_back(key);
         }
-        let evicted = trim_plan_logs(&mut inner, &plan_id);
-        let meta = shared
-            .state
-            .backend
-            .read(|tx| Ok(crate::store::build_meta_snapshot_tx(tx, &inner)))
-            .await
-            .map_err(|error| {
-                warn!(?error, "failed to read tx for log snapshot");
-                error
-            })
-            .ok();
-        (meta, evicted)
+        trim_plan_logs(&mut inner, &plan_id)
     };
-    // Delete durably any logs the caps just evicted from memory, so the
-    // on-disk store never outgrows the in-memory retention (D2).
     for key in &evicted {
-        if let Err(error) = shared.state.store.delete_log(key).await {
-            warn!(?error, key, "failed to delete evicted log from store");
+        if let Err(error) = shared.state.backend.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log");
         }
     }
-    if let Some(meta) = &meta {
-        if let Err(error) = shared.state.store.store_meta_only(meta).await {
-            warn!(?error, "failed to persist created log");
-        }
-    }
-    Json(serde_json::to_value(&log).unwrap_or(json!({ "ok": true })))
+    Ok(Json(
+        serde_json::to_value(&log).unwrap_or(json!({ "ok": true })),
+    ))
 }
 
 /// POST append log — runner appends lines to a log file.
@@ -475,17 +452,15 @@ pub async fn append_log(
             evicted,
         )
     };
-    // Delete durably any logs the caps just evicted from memory (D2). The just
-    // appended key is never in this list — it is the newest.
     for key in &evicted {
-        if let Err(error) = shared.state.store.delete_log(key).await {
-            warn!(?error, key, "failed to delete evicted log from store");
+        if let Err(error) = shared.state.backend.delete_log(key).await {
+            warn!(?error, key, "failed to delete evicted log");
         }
     }
     if let Err(error) = shared
         .state
-        .store
-        .store_log_chunk(&key, chunk_index, &masked, byte_count, line_count)
+        .backend
+        .append_log_chunk(&key, chunk_index, &masked, byte_count, line_count)
         .await
     {
         warn!(?error, "failed to persist appended log chunk");
@@ -813,7 +788,7 @@ pub async fn create_log_plan(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     Json(log): Json<azdo::TaskLog>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     create_log(
         State(shared),
         Path((String::new(), String::new(), plan_id)),
@@ -969,7 +944,7 @@ pub async fn create_log_authenticated(
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
-    Ok(create_log(State(shared), Path(path), Json(log)).await)
+    create_log(State(shared), Path(path), Json(log)).await
 }
 
 pub async fn append_log_authenticated(
@@ -1049,7 +1024,7 @@ pub async fn create_log_plan_authenticated(
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
-    Ok(create_log_plan(State(shared), Path(plan_id), Json(log)).await)
+    create_log_plan(State(shared), Path(plan_id), Json(log)).await
 }
 
 pub async fn append_log_plan_authenticated(

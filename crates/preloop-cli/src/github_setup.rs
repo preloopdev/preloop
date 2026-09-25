@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use preloop_runner_server::config::{load_config, store_memory, write_config};
 use preloop_runner_server::credential_store::{
-    CredentialStore, OsCredentialStore, SecretString, github_reference, github_reference_with_host,
+    github_reference, github_reference_with_host, SecretString,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -255,7 +255,7 @@ async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
         // `setup_app` / `save_app_credentials` will bind the secret directly to
         // that target App. Otherwise, configure it here.
         if !(via == Via::App && args.app_id.is_some()) {
-            let store = OsCredentialStore;
+            let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
             let mut config = preloop_runner_server::config::load_config()?;
             let target_app_id = args.app_id.as_deref().or(config.github.app_id.as_deref());
             if let Some(app_id) = target_app_id {
@@ -407,7 +407,7 @@ fn save_app_credentials(
     pem: &str,
     webhook_secret: Option<String>,
 ) -> anyhow::Result<PathBuf> {
-    let store = OsCredentialStore;
+    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
     let store_available = store.available().is_ok();
     let mut config = load_config()?;
     let host = config.github.server_url.as_deref();
@@ -582,7 +582,7 @@ async fn enable_webhooks(
     );
     preloop_runner_server::github_app::set_app_webhook_config(app_id, pem, &hook_url, &secret)
         .await?;
-    let store = OsCredentialStore;
+    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
     let mut config = load_config()?;
     if store.available().is_ok() {
         let webhook_ref = github_reference_with_host(
@@ -713,7 +713,7 @@ async fn setup_pat(args: &GithubSetupArgs) -> anyhow::Result<()> {
         );
     }
 
-    let store = OsCredentialStore;
+    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
     let mut config = load_config()?;
     if store.available().is_ok() {
         let pat_ref = github_reference_with_host("pat", config.github.server_url.as_deref(), None)?;

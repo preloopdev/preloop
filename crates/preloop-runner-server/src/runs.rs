@@ -730,6 +730,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         }
     }
 
+    let t_parse = std::time::Instant::now();
     let workflow = parse_workflow(&submission.workflow_yaml)?;
     // GitHub rejects workflows whose `on.schedule` cron cannot parse (save
     // time); aksh rejects them at submit so a bad schedule is a hard error
@@ -745,6 +746,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         shared.state.static_github_pat().as_deref(),
     )
     .await?;
+    let remote_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
         if submission.dispatch_inputs.is_empty() {
@@ -808,6 +810,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         }
     }
+    let secrets_ms = t_parse.elapsed().as_secs_f64() * 1000.0 - remote_ms;
     let (branch, tag) = {
         let (default_branch, default_tag) = git_ref_context(&submission.git_ref);
         let filter_branch = submission.filter_branch.clone().or_else(|| {
@@ -937,6 +940,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let t_expand = std::time::Instant::now();
     let expanded = preloop_gha_parser::expand_jobs_with_reusables_and_shas_and_inputs_and_event(
         &workflow,
         &submission.reusable_workflows,
@@ -944,6 +948,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         (!dispatch_inputs_for_expand.is_empty()).then_some(&dispatch_inputs_for_expand),
         Some(submission.event.as_str()),
     )?;
+    let expand_ms = t_expand.elapsed().as_secs_f64() * 1000.0;
     let mut jobs = expanded.jobs;
     let reusable_calls = expanded.reusable_calls;
     if !submission.dispatch_inputs.is_empty() {
@@ -1530,6 +1535,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let mut pre_caller_plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan> = BTreeMap::new();
     let mut pre_job_names: BTreeMap<JobId, String> = BTreeMap::new();
 
+    let t_build = std::time::Instant::now();
     for job in jobs {
         pre_job_base_ids.insert(job.id.clone(), job.base_id.clone());
         pre_job_needs.insert(job.id.clone(), job.needs.clone());
@@ -1770,6 +1776,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     },
                 );
 
+        let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
+        let t_tx = std::time::Instant::now();
+
         let outcome = shared
             .state
             .backend
@@ -1783,6 +1792,8 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             })
             .await
             .map_err(ApiError::from)?;
+        let tx_ms = t_tx.elapsed().as_secs_f64() * 1000.0;
+        let t_tail = std::time::Instant::now();
 
         // Post-commit: refresh the node-local gauges that wake the runner
         // supervisor, then fan out the events the outcome carries.
@@ -1803,6 +1814,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // The expansion sweep runs with the lock released; it materializes
         // deferred caller/matrix subtrees the submit only recorded.
         let expansion = drain_expansions(shared).await;
+        let drain_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
         if outcome.queued_jobs > 0 || expansion.promoted > 0 {
             shared.state.message_notify.notify_waiters();
         }
@@ -1862,6 +1874,24 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 })
                 .await;
         }
+
+        let tail_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
+        let parse_ms = total_ms - expand_ms - build_ms - tx_ms - tail_ms;
+        tracing::debug!(
+            run_id = %outcome.run_id,
+            queued_jobs = outcome.queued_jobs,
+            parse_ms = format_args!("{parse_ms:.1}"),
+            remote_ms = format_args!("{remote_ms:.1}"),
+            secrets_ms = format_args!("{secrets_ms:.1}"),
+            expand_ms = format_args!("{expand_ms:.1}"),
+            drain_ms = format_args!("{drain_ms:.1}"),
+            build_ms = format_args!("{build_ms:.1}"),
+            tx_ms = format_args!("{tx_ms:.1}"),
+            tail_ms = format_args!("{tail_ms:.1}"),
+            total_ms = format_args!("{total_ms:.1}"),
+            "submit_run timing"
+        );
 
         Ok(RunAccepted {
             run_id: outcome.run_id,
@@ -2793,56 +2823,14 @@ pub async fn list_runs(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<ListRunsQuery>,
 ) -> Result<Json<Vec<RunRecord>>, ApiError> {
-    let limit = query.limit.unwrap_or(50).min(200);
     let runs = shared
         .state
         .backend
-        .read(move |tx| {
-            let mut runs: Vec<RunRecord> = tx
-                .runs
-                .values()
-                .filter(|run| {
-                    if let Some(workflow) = &query.workflow {
-                        if !run.workflow_path_str.contains(workflow) {
-                            return false;
-                        }
-                    }
-                    if let Some(status) = &query.status {
-                        let run_status = serde_json::to_value(run.status)
-                            .ok()
-                            .and_then(|v| v.as_str().map(str::to_owned))
-                            .unwrap_or_default();
-                        if run_status != *status {
-                            return false;
-                        }
-                    }
-                    if let Some(event) = &query.event {
-                        if run.event != *event {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .cloned()
-                .collect();
-            runs.sort_by(|a, b| {
-                a.status
-                    .is_terminal()
-                    .cmp(&b.status.is_terminal())
-                    .then_with(|| {
-                        let a_time = a.completed_at.or(a.started_at).unwrap_or(a.created_at);
-                        let b_time = b.completed_at.or(b.started_at).unwrap_or(b.created_at);
-                        b_time.cmp(&a_time)
-                    })
-            });
-            runs.truncate(limit);
-            // Same projection as the single-run endpoint: steps live in the
-            // attempt manifest, so cloning the stored run alone returns
-            // empty step arrays.
-            Ok(runs
-                .into_iter()
-                .map(|run| project_run(tx, run))
-                .collect::<Vec<_>>())
+        .list_runs(crate::control::backend::RunListFilter {
+            workflow: query.workflow,
+            status: query.status,
+            event: query.event,
+            limit: query.limit.unwrap_or(50).min(200),
         })
         .await
         .map_err(ApiError::from)?;

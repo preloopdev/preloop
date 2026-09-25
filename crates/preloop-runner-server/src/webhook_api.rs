@@ -26,6 +26,7 @@ use crate::ApiError;
 use crate::models::{WebhookDeliveryStatus, WebhookQueueStats};
 use crate::state::SharedState;
 use crate::webhook_status::{age_seconds, now_us};
+use crate::{ApiError, ControlBackend};
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 500;
@@ -78,13 +79,13 @@ pub async fn list_webhook_deliveries(
         .clamp(1, MAX_LIST_LIMIT);
     let deliveries = shared
         .state
-        .store
+        .backend
         .list_webhook_deliveries(state, limit)
         .await
         .map_err(|error| ApiError::internal(format!("listing webhook deliveries: {error}")))?;
     let stats = shared
         .state
-        .store
+        .backend
         .webhook_queue_stats()
         .await
         .map_err(|error| ApiError::internal(format!("reading webhook queue stats: {error}")))?;
@@ -121,7 +122,7 @@ pub async fn replay_webhook_delivery(
 ) -> Result<Json<Value>, ApiError> {
     let requeued = shared
         .state
-        .store
+        .backend
         .requeue_webhook_delivery(&delivery_id)
         .await
         .map_err(|error| ApiError::internal(format!("requeueing webhook delivery: {error}")))?;
@@ -135,7 +136,7 @@ pub async fn replay_webhook_delivery(
     }
     let existing = shared
         .state
-        .store
+        .backend
         .get_webhook_delivery(&delivery_id)
         .await
         .map_err(|error| ApiError::internal(format!("reading webhook delivery: {error}")))?;
@@ -156,7 +157,7 @@ pub async fn webhook_health(
     State(shared): State<Arc<SharedState>>,
 ) -> Result<Json<Value>, ApiError> {
     let now = now_us();
-    let queue = match shared.state.store.webhook_queue_stats().await {
+    let queue = match shared.state.backend.webhook_queue_stats().await {
         Ok(stats) => stats_json(&stats, now),
         Err(error) => {
             tracing::warn!(?error, "failed to read webhook queue health");
@@ -233,7 +234,7 @@ mod tests {
     async fn enqueue(shared: &Arc<SharedState>, id: &str) {
         shared
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&WebhookDeliveryRecord {
                 delivery_id: id.to_owned(),
                 event: "push".to_owned(),
@@ -260,7 +261,7 @@ mod tests {
         for _ in 0..8 {
             let claimed = shared
                 .state
-                .store
+                .backend
                 .claim_webhook_deliveries(1, 60)
                 .await
                 .unwrap();
@@ -273,7 +274,7 @@ mod tests {
             }
             shared
                 .state
-                .store
+                .backend
                 .park_webhook_delivery(
                     &claimed.delivery_id,
                     claimed.lease_token.as_deref().unwrap(),
@@ -288,7 +289,7 @@ mod tests {
         let delivery = delivery.expect("claimed the delivery under test");
         shared
             .state
-            .store
+            .backend
             .fail_webhook_delivery(
                 id,
                 delivery.lease_token.as_deref().unwrap(),
@@ -352,7 +353,7 @@ mod tests {
         assert_eq!(response.0["status"], "requeued");
         let claimed = shared
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();

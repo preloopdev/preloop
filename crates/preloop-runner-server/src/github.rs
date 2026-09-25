@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use crate::{
-    ExecutionStatus, SharedState, changed_paths_from_payload,
-    submit_run_inner_with_webhook_delivery,
+    changed_paths_from_payload, submit_run_inner_with_webhook_delivery, ControlBackend,
+    ExecutionStatus, SharedState,
 };
 use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
 
@@ -1449,7 +1449,7 @@ fn webhook_retry_backoff(ladder: &[Duration], attempts: u32) -> Duration {
 /// hands over what it read and the snapshot reads memory instead of taking the
 /// store's single connection for a query that usually reports "unchanged".
 pub async fn refresh_webhook_queue_stats(state: &crate::state::AppState) -> bool {
-    match state.store.webhook_queue_stats().await {
+    match state.backend.webhook_queue_stats().await {
         Ok(stats) => {
             state.webhook_status.set_queue_stats(stats);
             true
@@ -1481,7 +1481,7 @@ async fn enqueue_webhook_delivery_with_budget(
         let attempt_budget = remaining.min(Duration::from_secs(4));
         match tokio::time::timeout(
             attempt_budget,
-            shared.state.store.enqueue_webhook_delivery(delivery),
+            shared.state.backend.enqueue_webhook_delivery(delivery),
         )
         .await
         {
@@ -1890,7 +1890,7 @@ async fn run_webhook_lease_heartbeat(
                     renewal_timeout,
                     shared
                         .state
-                        .store
+                        .backend
                         .renew_webhook_delivery(
                             &delivery_id,
                             &lease_token,
@@ -1952,7 +1952,7 @@ pub async fn run_webhook_queue_worker(
     // again on every loop; a stuck queue worker must not look healthy.
     heartbeat.beat();
     // Crash recovery: on boot, reset processing rows whose lease has expired back to received.
-    if let Err(error) = shared.state.store.recover_webhook_deliveries().await {
+    if let Err(error) = shared.state.backend.recover_webhook_deliveries().await {
         warn!(
             ?error,
             "failed to recover stale webhook deliveries on startup"
@@ -1989,7 +1989,7 @@ pub async fn run_webhook_queue_worker(
                 .saturating_sub(WEBHOOK_DELIVERY_RETENTION_SECS.saturating_mul(1_000_000));
             match shared
                 .state
-                .store
+                .backend
                 .prune_webhook_deliveries(cutoff, WEBHOOK_PRUNE_BATCH_SIZE)
                 .await
             {
@@ -2044,7 +2044,7 @@ pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<us
         }
         let deliveries = shared
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(BATCH_SIZE, WEBHOOK_LEASE_DURATION_SECS)
             .await?;
         if deliveries.is_empty() {
@@ -2172,7 +2172,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
         WebhookOutcome::Success => {
             match shared
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery(&delivery.delivery_id, lease_token)
                 .await
             {
@@ -2201,7 +2201,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             );
             match shared
                 .state
-                .store
+                .backend
                 .park_webhook_delivery(&delivery.delivery_id, lease_token, &error, retry_after_secs)
                 .await
             {
@@ -2229,7 +2229,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             );
             match shared
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(
                     &delivery.delivery_id,
                     lease_token,
@@ -2299,7 +2299,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
                         );
                         if let Err(store_error) = shared
                             .state
-                            .store
+                            .backend
                             .fail_webhook_delivery(
                                 &delivery.delivery_id,
                                 lease_token,
@@ -2324,7 +2324,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             }
             match shared
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(&delivery.delivery_id, lease_token, &error, true, None)
                 .await
             {
@@ -2348,7 +2348,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             );
             match shared
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(&delivery.delivery_id, lease_token, &err, true, None)
                 .await
             {
@@ -3472,7 +3472,7 @@ mod tests {
         {
             let record = fixture
                 .state
-                .store
+                .backend
                 .get_webhook_delivery("delivery-fetch-fail")
                 .await
                 .unwrap()
@@ -3498,7 +3498,7 @@ mod tests {
         fixture.drain().await;
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-fetch-fail")
             .await
             .unwrap()
@@ -3543,7 +3543,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-outage-gate")
             .await
             .unwrap()
@@ -3574,7 +3574,7 @@ mod tests {
         std::fs::rename(&ws_dir, &hidden_ws).unwrap();
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&WebhookDeliveryRecord {
                 delivery_id: "delivery-outage-park".to_owned(),
                 event: "push".to_owned(),
@@ -3594,7 +3594,7 @@ mod tests {
         });
         let claimed = shared
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
             .await
             .unwrap();
@@ -3606,7 +3606,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-outage-park")
             .await
             .unwrap()
@@ -3655,7 +3655,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-no-sha")
             .await
             .unwrap()
@@ -3745,7 +3745,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-malformed")
             .await
             .unwrap()
@@ -3811,7 +3811,7 @@ mod tests {
         });
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -3907,7 +3907,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-no-match")
             .await
             .unwrap()
@@ -3946,7 +3946,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-github-owned")
             .await
             .unwrap()
@@ -3982,14 +3982,14 @@ mod tests {
         };
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&record)
             .await
             .unwrap();
 
         let recovered = fixture
             .state
-            .store
+            .backend
             .recover_webhook_deliveries()
             .await
             .unwrap();
@@ -3997,7 +3997,7 @@ mod tests {
 
         let rec = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-cancel")
             .await
             .unwrap()
@@ -4027,7 +4027,7 @@ mod tests {
         });
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -4045,20 +4045,18 @@ mod tests {
         // Simulate a worker crash after run creation but before marking the
         // delivery done. The replay must reuse that persisted run.
         let lease_token = claimed[0].lease_token.as_deref().unwrap();
-        assert!(
-            fixture
-                .state
-                .store
-                .fail_webhook_delivery(
-                    "delivery-replay",
-                    lease_token,
-                    "simulated crash",
-                    false,
-                    Some(Duration::ZERO),
-                )
-                .await
-                .unwrap()
-        );
+        assert!(fixture
+            .state
+            .backend
+            .fail_webhook_delivery(
+                "delivery-replay",
+                lease_token,
+                "simulated crash",
+                false,
+                Some(Duration::ZERO),
+            )
+            .await
+            .unwrap());
         fixture.drain().await;
 
         let inner = fixture.state.test_tx().await;
@@ -4091,39 +4089,35 @@ mod tests {
             lease_token: None,
             last_error: None,
         };
-        assert!(
-            fixture
-                .state
-                .store
-                .enqueue_webhook_delivery(&delivery)
-                .await
-                .unwrap()
-        );
+        assert!(fixture
+            .state
+            .backend
+            .enqueue_webhook_delivery(&delivery)
+            .await
+            .unwrap());
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
         let lease_token = claimed[0].lease_token.as_deref().unwrap();
-        assert!(
-            fixture
-                .state
-                .store
-                .fail_webhook_delivery(
-                    &delivery.delivery_id,
-                    lease_token,
-                    "permanent test failure",
-                    true,
-                    None,
-                )
-                .await
-                .unwrap()
-        );
+        assert!(fixture
+            .state
+            .backend
+            .fail_webhook_delivery(
+                &delivery.delivery_id,
+                lease_token,
+                "permanent test failure",
+                true,
+                None,
+            )
+            .await
+            .unwrap());
 
         let failed = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery(&delivery.delivery_id)
             .await
             .unwrap()
@@ -4135,7 +4129,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&redelivery)
                 .await
                 .unwrap(),
@@ -4143,7 +4137,7 @@ mod tests {
         );
         let reopened = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery(&delivery.delivery_id)
             .await
             .unwrap()
@@ -4155,7 +4149,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&redelivery)
                 .await
                 .unwrap(),
@@ -4183,22 +4177,18 @@ mod tests {
             received_at_us: crate::store::now_us(),
             ..corrupt.clone()
         };
-        assert!(
-            fixture
-                .state
-                .store
-                .enqueue_webhook_delivery(&corrupt)
-                .await
-                .unwrap()
-        );
-        assert!(
-            fixture
-                .state
-                .store
-                .enqueue_webhook_delivery(&valid)
-                .await
-                .unwrap()
-        );
+        assert!(fixture
+            .state
+            .backend
+            .enqueue_webhook_delivery(&corrupt)
+            .await
+            .unwrap());
+        assert!(fixture
+            .state
+            .backend
+            .enqueue_webhook_delivery(&valid)
+            .await
+            .unwrap());
 
         let db_path = temp.path().join("state").join("preloop.db");
         let connection = rusqlite::Connection::open(db_path).unwrap();
@@ -4212,7 +4202,7 @@ mod tests {
 
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -4223,7 +4213,7 @@ mod tests {
         assert_eq!(
             fixture
                 .state
-                .store
+                .backend
                 .count_dead_letter_webhook_deliveries()
                 .await
                 .unwrap(),
@@ -4232,7 +4222,7 @@ mod tests {
 
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -4242,14 +4232,12 @@ mod tests {
             "a corrupt FIFO row must not wedge later valid deliveries"
         );
         let lease_token = claimed[0].lease_token.as_deref().unwrap();
-        assert!(
-            fixture
-                .state
-                .store
-                .complete_webhook_delivery(&valid.delivery_id, lease_token)
-                .await
-                .unwrap()
-        );
+        assert!(fixture
+            .state
+            .backend
+            .complete_webhook_delivery(&valid.delivery_id, lease_token)
+            .await
+            .unwrap());
     }
     #[tokio::test]
     async fn webhook_processing_lease_can_be_renewed() {
@@ -4268,13 +4256,13 @@ mod tests {
         };
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&delivery)
             .await
             .unwrap();
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 1)
             .await
             .unwrap();
@@ -4284,24 +4272,22 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .renew_webhook_delivery("delivery-lease", "stale-token", 60)
                 .await
                 .unwrap(),
             "a stale worker must not renew a reclaimed lease"
         );
-        assert!(
-            fixture
-                .state
-                .store
-                .renew_webhook_delivery("delivery-lease", lease_token, 60)
-                .await
-                .unwrap()
-        );
+        assert!(fixture
+            .state
+            .backend
+            .renew_webhook_delivery("delivery-lease", lease_token, 60)
+            .await
+            .unwrap());
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery("delivery-lease", "stale-token")
                 .await
                 .unwrap(),
@@ -4309,7 +4295,7 @@ mod tests {
         );
         let renewed = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-lease")
             .await
             .unwrap()
@@ -4336,13 +4322,13 @@ mod tests {
         };
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&delivery)
             .await
             .unwrap();
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 0)
             .await
             .unwrap();
@@ -4352,7 +4338,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .renew_webhook_delivery(&delivery.delivery_id, lease_token, 60)
                 .await
                 .unwrap(),
@@ -4361,7 +4347,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery(&delivery.delivery_id, lease_token)
                 .await
                 .unwrap(),
@@ -4370,7 +4356,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(
                     &delivery.delivery_id,
                     lease_token,
@@ -4384,7 +4370,7 @@ mod tests {
         );
         let retained = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery(&delivery.delivery_id)
             .await
             .unwrap()
@@ -4403,7 +4389,7 @@ mod tests {
         {
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&WebhookDeliveryRecord {
                     delivery_id: delivery_id.to_owned(),
                     event: "push".to_owned(),
@@ -4421,7 +4407,7 @@ mod tests {
 
         let pruned = fixture
             .state
-            .store
+            .backend
             .prune_webhook_deliveries(now - 1_000_000, 10)
             .await
             .unwrap();
@@ -4429,7 +4415,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .get_webhook_delivery("delivery-old")
                 .await
                 .unwrap()
@@ -4438,7 +4424,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .get_webhook_delivery("delivery-fresh")
                 .await
                 .unwrap()
