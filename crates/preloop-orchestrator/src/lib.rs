@@ -681,6 +681,8 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         Ok(file) => file,
         Err(_) => return false,
     };
+    #[cfg(unix)]
+    lock_staging_file(&file);
 
     // The body is copied chunk by chunk rather than through `bytes()`. A golden
     // carries the apt baseline, the Node externals and the VM's storage volume,
@@ -985,6 +987,8 @@ async fn stream_golden_response(
             return Err(format!("could not create temporary OCI golden: {error}"));
         }
     };
+    #[cfg(unix)]
+    lock_staging_file(&file);
     let total_bytes = response.content_length().or(expected_total_bytes);
     let mut downloaded_bytes = 0_u64;
     let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
@@ -3333,8 +3337,16 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     payload.display()
                 ))
             })?;
-        if let Err(error) = self.provider.pack(&name, &temporary).await {
+        let lock_path = PathBuf::from(format!("{}.lock", temporary.display()));
+        let lock_file = std::fs::File::create(&lock_path).ok();
+        #[cfg(unix)]
+        if let Some(f) = &lock_file {
+            lock_staging_file(f);
+        }
+        let pack_res = self.provider.pack(&name, &temporary).await;
+        if let Err(error) = pack_res {
             let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::remove_file(&lock_path);
             return Err(error.into());
         }
         // smolvm pack writes two files: `<output>` (ELF executable stub) and
@@ -3342,11 +3354,12 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // artifact consumed by `machine create --from`; the stub is only a
         // launcher and is discarded.
         let sidecar = PathBuf::from(format!("{}.smolmachine", temporary.display()));
-        std::fs::rename(&sidecar, &payload).inspect_err(|_| {
-            let _ = std::fs::remove_file(&temporary);
+        let rename_res = std::fs::rename(&sidecar, &payload);
+        let _ = std::fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(&lock_path);
+        rename_res.inspect_err(|_| {
             let _ = std::fs::remove_file(&sidecar);
         })?;
-        let _ = std::fs::remove_file(&temporary);
         self.provider.delete(&name).await?;
         if !payload.is_file() {
             return Err(OrchestratorError::Config(format!(
@@ -3436,7 +3449,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            let stale_tmp = name.starts_with(".tmp-golden-");
+            let stale_tmp = if name.starts_with(".tmp-golden-") {
+                if name.ends_with(".lock") {
+                    !staging_file_has_active_writer(&path)
+                } else {
+                    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+                    let lock_active =
+                        lock_path.is_file() && staging_file_has_active_writer(&lock_path);
+                    let file_active = staging_file_has_active_writer(&path);
+                    !lock_active && !file_active
+                }
+            } else {
+                false
+            };
             // A stale payload is `<stem>-<64-hex>`: the fingerprint suffix
             // shape keeps the sweep from touching unrelated files that happen
             // to share the stem prefix.
@@ -3463,6 +3488,52 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if swept > 0 {
             info!(swept, directory = %directory.display(), "swept stale golden artifacts");
         }
+    }
+}
+/// Acquire an advisory exclusive non-blocking lock on a staging file descriptor.
+///
+/// Holds `flock(LOCK_EX)` so concurrent pool instances or startup sweeps
+/// recognize the file as actively written and will not delete it.
+#[cfg(unix)]
+fn lock_staging_file<F: std::os::unix::io::AsRawFd>(file: &F) {
+    let fd = file.as_raw_fd();
+    unsafe {
+        libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB);
+    }
+}
+
+/// Check if a staging file currently has an active writer holding an advisory lock.
+///
+/// Returns `true` if another process holds an exclusive lock (or the file cannot
+/// be locked because it is in active use).
+fn staging_file_has_active_writer(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .or_else(|_| std::fs::OpenOptions::new().read(true).open(path))
+        else {
+            return false;
+        };
+        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if res != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || err.raw_os_error() == Some(libc::EAGAIN)
+            {
+                return true;
+            }
+        } else {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -8071,6 +8142,60 @@ chmod +x "$dest/bin/node"
         assert!(!tmp.exists(), "tmp-golden staging file is swept");
         assert!(unrelated.is_file(), "unrelated file survives");
         assert!(goldens.is_dir(), "goldens/ record dir survives");
+    }
+
+    /// An active writer holding an advisory lock on a `.tmp-golden-*` staging
+    /// file (or its `.lock` companion) must survive the startup sweep so
+    /// concurrent pools sharing the artifact directory cannot delete each
+    /// other's in-flight bakes or downloads.
+    #[tokio::test]
+    async fn sweep_stale_artifacts_spares_active_writer_staging_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let vms = temp.path().join("vms");
+        std::fs::create_dir_all(&vms).unwrap();
+        let mut config = test_config(false);
+        config.artifact_stem = vms.join("preloop-image-aarch64");
+        // SAFETY: test-only env for config validation; the pool is never run.
+        unsafe { std::env::set_var("LIFECYCLE_TEST_TOKEN", "test") };
+        let pool = RunnerPool::new(
+            Arc::new(TestProvider::new(false, false, false, false, false)),
+            config.clone(),
+        )
+        .expect("pool config validates");
+
+        let active_tmp = vms.join(".tmp-golden-active");
+        let active_file = std::fs::File::create(&active_tmp).unwrap();
+        #[cfg(unix)]
+        lock_staging_file(&active_file);
+
+        let active_pack = vms.join(".tmp-golden-pack");
+        let active_lock = vms.join(".tmp-golden-pack.lock");
+        std::fs::write(&active_pack, b"pack in flight").unwrap();
+        let pack_lock_file = std::fs::File::create(&active_lock).unwrap();
+        #[cfg(unix)]
+        lock_staging_file(&pack_lock_file);
+
+        let stale_tmp = vms.join(".tmp-golden-stale");
+        std::fs::write(&stale_tmp, b"stale").unwrap();
+
+        pool.sweep_stale_artifacts().await;
+
+        #[cfg(unix)]
+        {
+            assert!(
+                active_tmp.exists(),
+                "active staging file with held lock survives"
+            );
+            assert!(
+                active_pack.exists(),
+                "staging file with active companion lock survives"
+            );
+            assert!(active_lock.exists(), "active companion lock file survives");
+        }
+        assert!(!stale_tmp.exists(), "unlocked stale staging file is swept");
+
+        drop(active_file);
+        drop(pack_lock_file);
     }
 
     #[tokio::test]

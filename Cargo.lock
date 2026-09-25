@@ -2666,6 +2666,7 @@ dependencies = [
  "base64",
  "futures",
  "hex",
+ "libc",
  "preloop-gha-parser",
  "preloop-gha-protocol",
  "preloop-observability",

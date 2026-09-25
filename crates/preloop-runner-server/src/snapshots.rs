@@ -2715,7 +2715,19 @@ pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
     };
     let mut swept = 0usize;
     let mut rearmed = 0usize;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                warn!(
+                    path = %snapshots_dir.display(),
+                    %error,
+                    "Failed to read entry during workspace snapshot sweep"
+                );
+                break;
+            }
+        };
         let path = entry.path();
         let Ok(name) = entry.file_name().into_string() else {
             continue;
@@ -2763,7 +2775,16 @@ pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
                     discard_workspace_snapshot(&shared.state.state_dir, run_id).await;
                     swept += 1;
                 }
-                _ => {}
+                Some(age) => {
+                    let state_dir = shared.state.state_dir.clone();
+                    let remaining = retention - age;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(remaining).await;
+                        discard_workspace_snapshot(&state_dir, run_id).await;
+                    });
+                    rearmed += 1;
+                }
+                None => {}
             },
         }
     }
@@ -5194,6 +5215,27 @@ mod snapshot_sweep_tests {
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         tokio::task::yield_now().await;
         assert!(!dir.exists(), "re-armed timer discards the snapshot");
+    }
+
+    /// An unreferenced snapshot (no surviving run record) inside its window
+    /// gets the discard timer re-armed, so it expires after retention without
+    /// waiting for another server restart.
+    #[tokio::test]
+    async fn sweep_rearms_fresh_unreferenced_snapshot() {
+        let (_temp, shared) = fixture(1).await;
+
+        let run_id = RunId::new();
+        let dir = snapshot_dir(&shared, run_id);
+
+        sweep_workspace_snapshots(&shared).await;
+        assert!(dir.is_dir(), "inside retention at sweep time");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !dir.exists(),
+            "re-armed timer discards unreferenced snapshot"
+        );
     }
 }
 

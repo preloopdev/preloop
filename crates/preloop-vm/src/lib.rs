@@ -1232,23 +1232,22 @@ impl VmProvider for SmolVmProvider {
         let mut known_dirs = std::collections::BTreeSet::new();
         let mut roots = std::collections::BTreeSet::new();
         for name in &registered {
-            if let Ok(dir) = self.machine_data_dir(name).await {
-                if let Some(parent) = dir.parent() {
-                    roots.insert(parent.to_path_buf());
-                }
-                known_dirs.insert(dir);
+            let dir = self.machine_data_dir(name).await?;
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
             }
+            known_dirs.insert(dir);
         }
         // Conventional roots cover the empty-registry case: with no machines
         // left, registered data dirs cannot reveal where orphans live.
-        if let Some(home) = effective_preloop_home() {
+        // Only scan the root belonging to the active registry configuration.
+        if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
+            roots.insert(data_dir.join("vms"));
+        } else if let Some(home) = effective_preloop_home() {
             #[cfg(target_os = "macos")]
             roots.insert(home.join("smolvm-home/Library/Caches/smolvm/vms"));
             #[cfg(not(target_os = "macos"))]
             roots.insert(home.join("smolvm/vms"));
-        }
-        if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
-            roots.insert(data_dir.join("vms"));
         }
         let roots: Vec<PathBuf> = roots.into_iter().collect();
         tokio::task::spawn_blocking(move || {
@@ -1621,7 +1620,6 @@ const ORPHAN_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120
 /// Delete children of `roots` that are not in `known_dirs` and are older than
 /// `grace`. Synchronous: the sweep runs inside `spawn_blocking` because a
 /// leaked VM dir can be gigabytes of metadata.
-
 fn sweep_orphaned_dirs(
     roots: &[PathBuf],
     known_dirs: &std::collections::BTreeSet<PathBuf>,
@@ -1637,12 +1635,12 @@ fn sweep_orphaned_dirs(
             if known_dirs.contains(&path) || !path.is_dir() {
                 continue;
             }
-            let young = std::fs::metadata(&path)
+            let old_enough = std::fs::metadata(&path)
                 .and_then(|meta| meta.modified())
                 .ok()
                 .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age < grace);
-            if young {
+                .is_some_and(|age| age >= grace);
+            if !old_enough {
                 continue;
             }
             match std::fs::remove_dir_all(&path) {

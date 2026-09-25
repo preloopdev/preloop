@@ -53,12 +53,23 @@ install and 19× lower peak memory:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+export PATH="$HOME/.local/bin:$PATH"
 preloop-runner configure --url https://github.com/owner/repo --token <registration-token>
 preloop-runner run
 ```
 
-Or the container image: `docker run ghcr.io/preloopdev/preloop-runner:latest
-configure --url … --token …`. Details: [docs/setup.md](docs/setup.md#just-the-runner).
+Or use the container image with a persistent volume:
+
+```sh
+docker run --rm -v preloop-runner-data:/runner \
+  ghcr.io/preloopdev/preloop-runner:latest \
+  --runner-root /runner configure --url … --token … --unattended
+docker run --rm -v preloop-runner-data:/runner \
+  ghcr.io/preloopdev/preloop-runner:latest \
+  --runner-root /runner run
+```
+
+Details: [docs/setup.md](docs/setup.md#just-the-runner).
 
 ## What makes it different vs others.
 
