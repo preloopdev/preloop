@@ -45,6 +45,8 @@ use runtime_scheduling::*;
 pub mod control;
 pub mod timeline_logs;
 use timeline_logs::*;
+mod live_log_segments;
+pub(crate) use live_log_segments::LiveLogSegments;
 pub mod routes;
 use routes::build_app;
 pub use routes::{app, app_with_test_api};

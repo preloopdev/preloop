@@ -2914,7 +2914,7 @@ impl ControlBackend for PostgresBackend {
         .await
     }
 
-    async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
+    async fn create_log(&self, _plan_id: &str) -> Result<i64, ControlError> {
         let mut client = self.client.lock().await;
         let tx = client.transaction().await.map_err(ControlError::backend)?;
         let row = tx
@@ -2926,105 +2926,8 @@ impl ControlBackend for PostgresBackend {
             )
             .await
             .map_err(ControlError::backend)?;
-        let next_id: i64 = row.get(0);
-        let key = format!("{plan_id}/{next_id}");
-        let now_us = system_to_us(std::time::SystemTime::now());
-        tx.execute(
-            "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
-             VALUES ($1, 0, 0, $2)",
-            &[&key, &now_us],
-        )
-        .await
-        .map_err(ControlError::backend)?;
         tx.commit().await.map_err(ControlError::backend)?;
-        Ok(next_id)
-    }
-
-    async fn append_log_chunk(
-        &self,
-        key: &str,
-        chunk_index: i64,
-        payload: &[u8],
-        byte_count: i64,
-        line_count: i64,
-    ) -> Result<(), ControlError> {
-        let mut client = self.client.lock().await;
-        let tx = client.transaction().await.map_err(ControlError::backend)?;
-        let now_us = system_to_us(std::time::SystemTime::now());
-        tx.execute(
-            "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT(log_key) DO UPDATE SET \
-               byte_count = EXCLUDED.byte_count, \
-               line_count = EXCLUDED.line_count, \
-               updated_at_us = EXCLUDED.updated_at_us",
-            &[&key, &byte_count, &line_count, &now_us],
-        )
-        .await
-        .map_err(ControlError::backend)?;
-        tx.execute(
-            "INSERT INTO log_chunks(log_key, chunk_index, payload, written_at_us) \
-             VALUES ($1, $2, $3, $4)",
-            &[&key, &chunk_index, &payload, &now_us],
-        )
-        .await
-        .map_err(ControlError::backend)?;
-        let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
-        if cutoff > 0 {
-            tx.execute(
-                "DELETE FROM log_chunks WHERE log_key = $1 AND chunk_index <= $2",
-                &[&key, &cutoff],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-        }
-        tx.commit().await.map_err(ControlError::backend)
-    }
-
-    async fn delete_log(&self, key: &str) -> Result<(), ControlError> {
-        let client = self.client.lock().await;
-        client
-            .execute("DELETE FROM log_files WHERE log_key = $1", &[&key])
-            .await
-            .map_err(ControlError::backend)?;
-        Ok(())
-    }
-
-    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError> {
-        let client = self.checkout_reader().await?;
-        let result = client
-            .query(
-                "SELECT f.log_key, f.byte_count, f.line_count, c.payload \
-                 FROM log_files f \
-                 LEFT JOIN log_chunks c ON c.log_key = f.log_key \
-                 ORDER BY f.updated_at_us, f.log_key, c.chunk_index",
-                &[],
-            )
-            .await
-            .map_err(ControlError::backend)
-            .map(|rows| {
-                let mut logs: Vec<DurableLog> = Vec::new();
-                for row in rows {
-                    let key: String = row.get(0);
-                    if logs.last().is_none_or(|log| log.key != key) {
-                        logs.push(DurableLog {
-                            key,
-                            payload: Vec::new(),
-                            byte_count: row.get::<_, i64>(1).max(0) as usize,
-                            line_count: row.get::<_, i64>(2).max(0) as usize,
-                        });
-                    }
-                    if let Some(payload) = row.get::<_, Option<Vec<u8>>>(3) {
-                        logs.last_mut()
-                            .expect("log row was inserted")
-                            .payload
-                            .extend_from_slice(&payload);
-                    }
-                }
-                logs
-            });
-        self.return_reader(client).await;
-        result
+        Ok(row.get(0))
     }
 
     async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {

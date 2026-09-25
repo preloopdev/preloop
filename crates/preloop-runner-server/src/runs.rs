@@ -3143,65 +3143,65 @@ pub async fn get_run_logs(
         .await
         .map_err(ApiError::from)?;
 
-    // Node-local console blocks, keyed `plan_id/log_id`.
-    let sources = {
-        let inner = shared.state.inner.lock().await;
-        requests
-            .iter()
-            .zip(manifests.iter())
-            .map(|(request, manifest)| {
-                let prefix = format!("{}/", request.plan_id);
-                let mut blocks: Vec<(&str, &[u8])> = inner
-                    .logs
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        key.strip_prefix(&prefix)
-                            .map(|log_id| (log_id, value.as_slice()))
-                    })
-                    .collect();
-                blocks.sort_by(|(left, _), (right, _)| {
-                    match (left.parse::<u64>(), right.parse::<u64>()) {
-                        (Ok(left), Ok(right)) => left.cmp(&right),
-                        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                        (Err(_), Err(_)) => left.cmp(right),
-                    }
-                });
-                // Two views: declared steps in workflow order decide `--step`,
-                // because a synthetic "Set up job" record must not occupy a
-                // slot; every id in execution order decides the whole-job
-                // concatenation, where synthetic output belongs in place.
-                let workflow_step_ids = manifest
-                    .as_ref()
-                    .map(|records| {
-                        StepRecord::workflow_steps(records)
-                            .into_iter()
-                            .map(|step| step.id.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|ids| !ids.is_empty());
-                let execution_step_ids = manifest
-                    .as_ref()
-                    .map(|records| {
-                        let mut ordered = records.clone();
-                        StepRecord::sort_execution_order(&mut ordered);
-                        ordered.into_iter().map(|step| step.id).collect::<Vec<_>>()
-                    })
-                    .filter(|ids| !ids.is_empty());
-                (
-                    request.plan_id.clone(),
-                    request.agent_job_id.to_string(),
-                    request.job_id.0.clone(),
-                    blocks
-                        .into_iter()
-                        .map(|(_, block)| block.to_vec())
-                        .collect::<Vec<_>>(),
-                    workflow_step_ids,
-                    execution_step_ids,
-                )
+    // Node-local console blocks: read from file-backed segments (with unflushed
+    // in-memory tail), falling back to in-memory `inner.logs` if empty.
+    let mut sources = Vec::new();
+    for (request, manifest) in requests.iter().zip(manifests.iter()) {
+        let mut blocks = shared
+            .state
+            .log_segments
+            .read_blocks_for_plan(&request.plan_id)
+            .await;
+        if blocks.is_empty() {
+            let inner = shared.state.inner.lock().await;
+            let prefix = format!("{}/", request.plan_id);
+            let mut mem_blocks: Vec<(String, Vec<u8>)> = inner
+                .logs
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix(&prefix)
+                        .map(|log_id| (log_id.to_string(), value.clone()))
+                })
+                .collect();
+            mem_blocks.sort_by(|(left, _), (right, _)| {
+                match (left.parse::<u64>(), right.parse::<u64>()) {
+                    (Ok(left), Ok(right)) => left.cmp(&right),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => left.cmp(right),
+                }
+            });
+            blocks = mem_blocks;
+        }
+        let workflow_step_ids = manifest
+            .as_ref()
+            .map(|records| {
+                StepRecord::workflow_steps(records)
+                    .into_iter()
+                    .map(|step| step.id.clone())
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-    };
+            .filter(|ids| !ids.is_empty());
+        let execution_step_ids = manifest
+            .as_ref()
+            .map(|records| {
+                let mut ordered = records.clone();
+                StepRecord::sort_execution_order(&mut ordered);
+                ordered.into_iter().map(|step| step.id).collect::<Vec<_>>()
+            })
+            .filter(|ids| !ids.is_empty());
+        sources.push((
+            request.plan_id.clone(),
+            request.agent_job_id.to_string(),
+            request.job_id.0.clone(),
+            blocks
+                .into_iter()
+                .map(|(_, block)| block)
+                .collect::<Vec<_>>(),
+            workflow_step_ids,
+            execution_step_ids,
+        ));
+    }
     let state_dir = shared.state.state_dir.clone();
 
     let mut merged = Vec::new();

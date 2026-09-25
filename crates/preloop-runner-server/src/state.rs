@@ -547,6 +547,8 @@ pub struct AppState {
     pub environment_rules: crate::config::EnvironmentRulesMap,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
+    /// File-backed live log segments for real-time console tail persistence.
+    pub(crate) log_segments: LiveLogSegments,
     /// Native API administrator credential for this server instance.
     pub system_token: String,
     /// Registration policy for new runners; see [`RegistrationPolicy`].
@@ -1133,25 +1135,7 @@ impl AppState {
         if let Some(meta) = crate::control::backend::ControlBackend::load_meta(&*backend).await? {
             crate::store::apply_local_meta_snapshot(&mut inner, meta);
         }
-        // Live-log tails are owned by the authoritative backend. Replace any
-        // transitional auxiliary-store copy instead of merging duplicate
-        // chunks.
-        inner.logs.clear();
-        inner.log_metadata.clear();
-        inner.log_order.clear();
-        inner.log_bytes_total = 0;
-        for log in crate::control::backend::ControlBackend::load_logs(&*backend).await? {
-            inner.log_bytes_total = inner.log_bytes_total.saturating_add(log.payload.len());
-            inner.log_order.push_back(log.key.clone());
-            inner.log_metadata.insert(
-                log.key.clone(),
-                crate::models::LogMetadata {
-                    byte_count: log.byte_count,
-                    line_count: log.line_count,
-                },
-            );
-            inner.logs.insert(log.key, log.payload);
-        }
+        let log_segments = LiveLogSegments::new(state_dir.join("live-logs"));
         let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
             crate::control::backend::ControlBackend::terminal_jobs(&*backend).await?,
         ));
@@ -1194,6 +1178,7 @@ impl AppState {
             retention_days,
             environment_rules: config.environment_rules.clone(),
             state_dir,
+            log_segments,
             system_token,
             registration_policy: RegistrationPolicy::from_env(),
             local_jwt_key,

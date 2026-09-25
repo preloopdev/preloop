@@ -3168,7 +3168,7 @@ impl ControlBackend for SqliteBackend {
                 .ok_or_else(|| ControlError::NotFound("request".to_owned()))
         })
     }
-    async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError> {
+    async fn create_log(&self, _plan_id: &str) -> Result<i64, ControlError> {
         run_blocking(|| {
             let mut conn = self.conn.lock();
             let tx = conn.transaction().map_err(ControlError::backend)?;
@@ -3181,107 +3181,8 @@ impl ControlBackend for SqliteBackend {
                     |row| row.get(0),
                 )
                 .map_err(ControlError::backend)?;
-            let key = format!("{plan_id}/{next_id}");
-            tx.execute(
-                "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
-                 VALUES (?1, 0, 0, ?2)",
-                params![key, system_to_us(std::time::SystemTime::now())],
-            )
-            .map_err(ControlError::backend)?;
             tx.commit().map_err(ControlError::backend)?;
             Ok(next_id)
-        })
-    }
-
-    async fn append_log_chunk(
-        &self,
-        key: &str,
-        chunk_index: i64,
-        payload: &[u8],
-        byte_count: i64,
-        line_count: i64,
-    ) -> Result<(), ControlError> {
-        run_blocking(|| {
-            let mut conn = self.conn.lock();
-            let tx = conn.transaction().map_err(ControlError::backend)?;
-            let now_us = system_to_us(std::time::SystemTime::now());
-            tx.execute(
-                "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(log_key) DO UPDATE SET \
-                   byte_count = excluded.byte_count, \
-                   line_count = excluded.line_count, \
-                   updated_at_us = excluded.updated_at_us",
-                params![key, byte_count, line_count, now_us],
-            )
-            .map_err(ControlError::backend)?;
-            tx.execute(
-                "INSERT INTO log_chunks(log_key, chunk_index, payload, written_at_us) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![key, chunk_index, payload, now_us],
-            )
-            .map_err(ControlError::backend)?;
-            let cutoff = byte_count - crate::memory_caps::MAX_LOG_BYTES_PER_KEY as i64;
-            if cutoff > 0 {
-                tx.execute(
-                    "DELETE FROM log_chunks WHERE log_key = ?1 AND chunk_index <= ?2",
-                    params![key, cutoff],
-                )
-                .map_err(ControlError::backend)?;
-            }
-            tx.commit().map_err(ControlError::backend)
-        })
-    }
-
-    async fn delete_log(&self, key: &str) -> Result<(), ControlError> {
-        run_blocking(|| {
-            self.conn
-                .lock()
-                .execute("DELETE FROM log_files WHERE log_key = ?1", params![key])
-                .map_err(ControlError::backend)?;
-            Ok(())
-        })
-    }
-
-    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError> {
-        self.with_reader(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT f.log_key, f.byte_count, f.line_count, c.payload \
-                     FROM log_files f \
-                     LEFT JOIN log_chunks c ON c.log_key = f.log_key \
-                     ORDER BY f.updated_at_us, f.log_key, c.chunk_index",
-                )
-                .map_err(ControlError::backend)?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                    ))
-                })
-                .map_err(ControlError::backend)?;
-            let mut logs: Vec<DurableLog> = Vec::new();
-            for row in rows {
-                let (key, byte_count, line_count, payload) = row.map_err(ControlError::backend)?;
-                if logs.last().is_none_or(|log| log.key != key) {
-                    logs.push(DurableLog {
-                        key,
-                        payload: Vec::new(),
-                        byte_count: byte_count.max(0) as usize,
-                        line_count: line_count.max(0) as usize,
-                    });
-                }
-                if let Some(payload) = payload {
-                    logs.last_mut()
-                        .expect("log row was inserted")
-                        .payload
-                        .extend_from_slice(&payload);
-                }
-            }
-            Ok(logs)
         })
     }
 

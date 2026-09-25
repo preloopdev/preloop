@@ -35,7 +35,8 @@
 /// - 7: `outbox` dropped — declared but never read or written.
 /// - 8: SQLite text primary keys made explicitly `NOT NULL`.
 /// - 9: durable control events moved into the authoritative backend.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 9;
+/// - 10: live logs moved to file-backed segments; log_chunks and log_files dropped.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 10;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -202,6 +203,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
         DROP TABLE meta;
         ALTER TABLE meta_v8 RENAME TO meta;
         "#,
+    ),
+    // v10: live logs moved to file-backed segments; log_chunks and log_files dropped.
+    (
+        10,
+        "DROP TABLE IF EXISTS log_chunks; DROP TABLE IF EXISTS log_files;",
     ),
 ];
 
@@ -451,23 +457,6 @@ CREATE TABLE IF NOT EXISTS control_events (
     created_at_us       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS control_events_run ON control_events(run_id, id);
-
--- ── Live log recovery buffer ─────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS log_files (
-    log_key             TEXT PRIMARY KEY NOT NULL,
-    byte_count          INTEGER NOT NULL DEFAULT 0,
-    line_count          INTEGER NOT NULL DEFAULT 0,
-    updated_at_us       INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS log_chunks (
-    log_key             TEXT NOT NULL,
-    chunk_index         INTEGER NOT NULL,
-    payload             BLOB NOT NULL,
-    written_at_us       INTEGER NOT NULL,
-    PRIMARY KEY (log_key, chunk_index),
-    FOREIGN KEY (log_key) REFERENCES log_files(log_key) ON DELETE CASCADE
-);
-
 -- ── Durable webhook inbox and repair state ───────────────────────────
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     delivery_id         TEXT PRIMARY KEY NOT NULL,
@@ -534,7 +523,8 @@ CREATE TABLE IF NOT EXISTS meta (
 ///   listen token; only they count toward the duplicate live-session conflict.
 /// - 7: `outbox` dropped — declared but never read or written.
 /// - 8: durable control events moved into the authoritative backend.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 8;
+/// - 9: live logs moved to file-backed segments; log_chunks and log_files dropped.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 9;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -578,6 +568,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
     // v7: `outbox` dropped — the transactional-outbox table was declared but
     // never read or written (no producer or consumer exists).
     (7, "DROP TABLE IF EXISTS control.outbox"),
+    // v9: live logs moved to file-backed segments; log_chunks and log_files dropped.
+    (
+        9,
+        "DROP TABLE IF EXISTS control.log_chunks; DROP TABLE IF EXISTS control.log_files;",
+    ),
 ];
 
 /// The Postgres DDL: the same table families as [`SQLITE_DDL`] in Postgres
@@ -808,22 +803,6 @@ CREATE TABLE IF NOT EXISTS control_events (
     created_at_us       BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS control_events_run ON control_events(run_id, id);
-
--- ── Live log recovery buffer ─────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS log_files (
-    log_key             TEXT PRIMARY KEY,
-    byte_count          BIGINT NOT NULL DEFAULT 0,
-    line_count          BIGINT NOT NULL DEFAULT 0,
-    updated_at_us       BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS log_chunks (
-    log_key             TEXT NOT NULL,
-    chunk_index         BIGINT NOT NULL,
-    payload             BYTEA NOT NULL,
-    written_at_us       BIGINT NOT NULL,
-    PRIMARY KEY (log_key, chunk_index),
-    FOREIGN KEY (log_key) REFERENCES log_files(log_key) ON DELETE CASCADE
-);
 
 -- ── Durable webhook inbox and repair state ───────────────────────────
 CREATE TABLE IF NOT EXISTS webhook_deliveries (

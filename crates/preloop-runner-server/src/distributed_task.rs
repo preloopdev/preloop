@@ -1286,7 +1286,12 @@ pub async fn complete_job_inner(
             })
             .await
             .unwrap_or_default();
-        tokio::spawn(async move { prune_replay_results(&state_dir, &active_plans).await });
+        let log_segments = shared.state.log_segments.clone();
+        let plans_clone = active_plans.clone();
+        tokio::spawn(async move {
+            prune_replay_results(&state_dir, &active_plans).await;
+            log_segments.prune_inactive_plans(&plans_clone).await;
+        });
     }
     Ok(Json(record))
 }

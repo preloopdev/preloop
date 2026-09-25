@@ -127,13 +127,11 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                     line_count: 1,
                 },
             );
-            // Log bytes now go through `log_chunks`; the per-file counter
-            // is UPSERTed on the same path.
             state
-                .backend
-                .append_log_chunk("plan-1/7", 0, b"durable log\n", 13, 1)
-                .await
-                .unwrap();
+                .log_segments
+                .append("plan-1", "7", b"durable log\n")
+                .await;
+            state.log_segments.flush_all().await;
             inner.cache_v2_pending.insert(
                 "cache-upload".to_owned(),
                 CacheV2Pending {
@@ -162,8 +160,10 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
         assert_eq!(tx.ready().count(), 1);
         assert_eq!(tx.ready().next().unwrap().job_id.0, "build");
         let inner = recovered.inner.lock().await;
-        assert_eq!(inner.logs["plan-1/7"], b"durable log\n");
-        assert_eq!(inner.log_metadata["plan-1/7"].line_count, 1);
+        assert_eq!(
+            recovered.log_segments.read_all("plan-1", "7").await,
+            b"durable log\n"
+        );
         assert_eq!(inner.cache_v2_pending["cache-upload"].key, "cache-key");
     }
     let recovered_app = app(recovered, CancellationToken::new());
@@ -268,17 +268,16 @@ async fn sqlite_recovery_restores_post_restart_state() {
         )
         .await;
 
-        // Persist a log chunk (A: log_chunks hot path).
+        // Persist a log chunk (live-log segments).
         state
-            .backend
-            .append_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
-            .await
-            .unwrap();
+            .log_segments
+            .append("plan-1", "0", b"first line\n")
+            .await;
         state
-            .backend
-            .append_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
-            .await
-            .unwrap();
+            .log_segments
+            .append("plan-1", "0", b"second line\n")
+            .await;
+        state.log_segments.flush_all().await;
 
         (run_id, rid, session_id, public_xml)
     };
@@ -319,23 +318,11 @@ async fn sqlite_recovery_restores_post_restart_state() {
         "cancel status must survive restart"
     );
 
-    // A: log_chunks restored into the in-memory buffer.
+    // A: log segments restored from disk.
     assert_eq!(
-        recovered_inner
-            .logs
-            .get("plan-1/0")
-            .cloned()
-            .unwrap_or_default(),
+        recovered.log_segments.read_all("plan-1", "0").await,
         b"first line\nsecond line\n".to_vec(),
-        "log bytes must survive restart via log_chunks"
-    );
-    assert_eq!(
-        recovered_inner
-            .log_metadata
-            .get("plan-1/0")
-            .map(|m| (m.byte_count, m.line_count)),
-        Some((23, 2)),
-        "log counter must survive restart"
+        "log bytes must survive restart via live-log segments"
     );
 
     // C6: queue_depth restored.
@@ -524,18 +511,16 @@ async fn postgres_recovery_restores_post_restart_state() {
             "claimed job must round-trip through the postgres store"
         );
 
-        // Persist log chunks (hot path) and a full snapshot so every table
-        // is written through the translated SQL before the restart.
+        // Persist log segments.
         state
-            .backend
-            .append_log_chunk("plan-1/0", 0, b"first line\n", 11, 1)
-            .await
-            .unwrap();
+            .log_segments
+            .append("plan-1", "0", b"first line\n")
+            .await;
         state
-            .backend
-            .append_log_chunk("plan-1/0", 11, b"second line\n", 23, 2)
-            .await
-            .unwrap();
+            .log_segments
+            .append("plan-1", "0", b"second line\n")
+            .await;
+        state.log_segments.flush_all().await;
         (run_id, runner_id, session_id, public_xml, first_number)
     };
 
@@ -573,7 +558,6 @@ async fn postgres_recovery_restores_post_restart_state() {
         assert!(tx.runners.contains_key(&runner_id));
         assert!(tx.sessions.contains_key(&session_id));
         let tx = recovered.test_tx().await;
-        let inner = recovered.inner.lock().await;
         assert_eq!(
             tx.runner_rsa_public_keys
                 .get(&runner_id)
@@ -586,19 +570,11 @@ async fn postgres_recovery_restores_post_restart_state() {
             "session_keys must survive restart"
         );
 
-        // Log chunks survive.
+        // Log segments survive.
         assert_eq!(
-            inner.logs.get("plan-1/0").cloned().unwrap_or_default(),
+            recovered.log_segments.read_all("plan-1", "0").await,
             b"first line\nsecond line\n".to_vec(),
-            "log bytes must survive restart via log_chunks"
-        );
-        assert_eq!(
-            inner
-                .log_metadata
-                .get("plan-1/0")
-                .map(|m| (m.byte_count, m.line_count)),
-            Some((23, 2)),
-            "log counter must survive restart"
+            "log bytes must survive restart via live-log segments"
         );
     }
 

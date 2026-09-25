@@ -371,8 +371,8 @@ pub async fn create_log(
         trim_plan_logs(&mut inner, &plan_id)
     };
     for key in &evicted {
-        if let Err(error) = shared.state.backend.delete_log(key).await {
-            warn!(?error, key, "failed to delete evicted log");
+        if let Some((plan, log)) = key.split_once('/') {
+            shared.state.log_segments.delete_log(plan, log).await;
         }
     }
     Ok(Json(
@@ -401,7 +401,7 @@ pub async fn append_log(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
-    let (masked, chunk_index, byte_count, line_count, evicted) = {
+    let (masked, evicted) = {
         let mut inner = shared.state.inner.lock().await;
         let is_new = !inner.logs.contains_key(&key);
         let byte_count = masked.len();
@@ -443,28 +443,18 @@ pub async fn append_log(
         // append. The counter is small and idempotent; the chunk is the
         // append-only event stream. We use the new byte count as the chunk
         // index so each append maps to a unique `(log_key, chunk_index)` row.
-        let meta = inner.log_metadata.get(&key).cloned().unwrap_or_default();
-        (
-            masked,
-            meta.byte_count as i64,
-            meta.byte_count as i64,
-            meta.line_count as i64,
-            evicted,
-        )
+        (masked, evicted)
     };
     for key in &evicted {
-        if let Err(error) = shared.state.backend.delete_log(key).await {
-            warn!(?error, key, "failed to delete evicted log");
+        if let Some((plan, log)) = key.split_once('/') {
+            shared.state.log_segments.delete_log(plan, log).await;
         }
     }
-    if let Err(error) = shared
+    shared
         .state
-        .backend
-        .append_log_chunk(&key, chunk_index, &masked, byte_count, line_count)
-        .await
-    {
-        warn!(?error, "failed to persist appended log chunk");
-    }
+        .log_segments
+        .append(&plan_id, &log_id, &masked)
+        .await;
     StatusCode::ACCEPTED
 }
 

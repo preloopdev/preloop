@@ -1973,6 +1973,22 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
+    let flusher_shared = shared.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await;
+        while !flusher_shared.shutdown.is_cancelled() {
+            tokio::select! {
+                _ = interval.tick() => {
+                    flusher_shared.state.log_segments.flush_stale().await;
+                }
+                _ = flusher_shared.shutdown.cancelled() => {
+                    break;
+                }
+            }
+        }
+        flusher_shared.state.log_segments.flush_all().await;
+    });
 
     let webhook_worker_heartbeat = state.observability.heartbeat().clone();
     let webhook_worker_handle = webhook_worker_heartbeat.register(

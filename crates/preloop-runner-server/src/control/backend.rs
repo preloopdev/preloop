@@ -34,15 +34,6 @@ pub(crate) struct RunListFilter {
     pub(crate) limit: usize,
 }
 
-/// Bounded live-log tail restored after restart.
-#[derive(Debug, Clone)]
-pub(crate) struct DurableLog {
-    pub(crate) key: String,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) byte_count: usize,
-    pub(crate) line_count: usize,
-}
-
 /// Extract the optional run identity carried by a durable event.
 pub(crate) fn event_run_id(event: &NdjsonEvent) -> Option<RunId> {
     match event {
@@ -256,22 +247,6 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Allocate a plan-local log id and create its empty durable row.
     async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError>;
-
-    /// Append one masked live-log chunk and update its aggregate counters.
-    async fn append_log_chunk(
-        &self,
-        key: &str,
-        chunk_index: i64,
-        payload: &[u8],
-        byte_count: i64,
-        line_count: i64,
-    ) -> Result<(), ControlError>;
-
-    /// Delete a live-log tail and all of its chunks.
-    async fn delete_log(&self, key: &str) -> Result<(), ControlError>;
-
-    /// Restore bounded live-log tails after restart.
-    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError>;
 
     /// Persist node-local artifact/cache/timeline metadata as one sealed value.
     async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError>;
@@ -822,37 +797,6 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.create_log(plan_id).await,
             Self::Postgres(b) => b.create_log(plan_id).await,
-        }
-    }
-    async fn append_log_chunk(
-        &self,
-        key: &str,
-        chunk_index: i64,
-        payload: &[u8],
-        byte_count: i64,
-        line_count: i64,
-    ) -> Result<(), ControlError> {
-        match self {
-            Self::Sqlite(b) => {
-                b.append_log_chunk(key, chunk_index, payload, byte_count, line_count)
-                    .await
-            }
-            Self::Postgres(b) => {
-                b.append_log_chunk(key, chunk_index, payload, byte_count, line_count)
-                    .await
-            }
-        }
-    }
-    async fn delete_log(&self, key: &str) -> Result<(), ControlError> {
-        match self {
-            Self::Sqlite(b) => b.delete_log(key).await,
-            Self::Postgres(b) => b.delete_log(key).await,
-        }
-    }
-    async fn load_logs(&self) -> Result<Vec<DurableLog>, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.load_logs().await,
-            Self::Postgres(b) => b.load_logs().await,
         }
     }
     async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
