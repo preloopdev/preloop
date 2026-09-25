@@ -898,7 +898,7 @@ pub fn config_path() -> PathBuf {
     // config through the default path; route the default through the pinned
     // per-process temp file. Callers that set `PRELOOP_CONFIG` explicitly
     // are left alone.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pin_test_config_path();
     std::env::var_os(CONFIG_PATH_ENV)
         .map(PathBuf::from)
@@ -916,7 +916,7 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
     // configured GitHub App leaks credentials into every `AppState::new`.
     // Pin the path to a per-process temp file, and serialize config I/O so
     // parallel tests never observe each other's temp files.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let _config_guard = {
         // Held across the read, not just the pin: dropped early, a concurrent
         // test could swap `PRELOOP_CONFIG` between resolve and read.
@@ -1376,7 +1376,7 @@ fn validate_execution_protection(config: &ConfigFile) -> anyhow::Result<()> {
 
 /// Atomically write the config file with mode 0600.
 pub fn write_config(config: &ConfigFile) -> anyhow::Result<PathBuf> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let _config_guard = CONFIG_PATH_LOCK.lock();
     let path = config_path();
     write_config_to(&path, config)?;
@@ -1433,10 +1433,10 @@ pub fn env_or<T>(env_value: Option<T>, config_value: Option<T>) -> Option<T> {
 /// Serializes env-resolved config I/O in tests so a test that pins
 /// `PRELOOP_CONFIG` (the secrets API tests in `lib_tests.rs` do) cannot swap
 /// the path out from under another test between resolve and read/write.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CONFIG_PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn pin_test_config_path() {
     use std::sync::LazyLock;
     static TEST_CONFIG_PATH: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
