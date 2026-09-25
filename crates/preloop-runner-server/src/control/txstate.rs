@@ -284,6 +284,9 @@ pub(crate) struct TxScope {
     /// point to — not every run in the table. Ignored when `runs` is
     /// `None` (already everything).
     pub(crate) runs_via_requests: bool,
+    /// Read-only projection for a named historical run. Write commands must
+    /// never load archived rows into their mutable working set.
+    pub(crate) include_archived: bool,
 }
 
 impl Default for TxScope {
@@ -307,6 +310,7 @@ impl TxScope {
             job_requests_all: false,
             pending_expansions: true,
             runs_via_requests: false,
+            include_archived: false,
         }
     }
 
@@ -330,6 +334,7 @@ impl TxScope {
             job_requests_all: false,
             pending_expansions: false,
             runs_via_requests: false,
+            include_archived: false,
         }
     }
 
@@ -350,6 +355,7 @@ impl TxScope {
             job_requests_all: true,
             pending_expansions: false,
             runs_via_requests: false,
+            include_archived: false,
         }
     }
 
@@ -368,7 +374,13 @@ impl TxScope {
             job_requests_all: true,
             pending_expansions: false,
             runs_via_requests: true,
+            include_archived: false,
         }
+    }
+
+    pub(crate) fn with_history(mut self) -> Self {
+        self.include_archived = true;
+        self
     }
 
     /// True when a run-scoped family should load a given `run_id`.

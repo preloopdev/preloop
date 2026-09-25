@@ -2726,7 +2726,7 @@ pub async fn get_run(
 ) -> Result<Json<RunRecord>, ApiError> {
     // Scoped to this run — `project_run` reads `held_runs`/`job_steps`/
     // `job_requests`, all of which load under `runs: {run_id}`.
-    let scope = crate::control::txstate::TxScope::run(run_id);
+    let scope = crate::control::txstate::TxScope::run(run_id).with_history();
     shared
         .state
         .backend
@@ -2750,7 +2750,7 @@ pub async fn get_public_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<axum::response::Html<String>, ApiError> {
-    let scope = crate::control::txstate::TxScope::run(run_id);
+    let scope = crate::control::txstate::TxScope::run(run_id).with_history();
     let run = shared
         .state
         .backend
@@ -3092,10 +3092,11 @@ pub async fn get_run_logs(
     // separately below.
     let job_filter = query.job.clone();
     let step_requested = query.step.is_some();
+    let scope = crate::control::txstate::TxScope::run(run_id).with_history();
     let (requests, manifests) = shared
         .state
         .backend
-        .read(move |tx| {
+        .read_scoped(&scope, move |tx| {
             if !tx.runs.contains_key(&run_id) {
                 return Err(crate::control::ControlError::NotFound(
                     "run not found".to_owned(),

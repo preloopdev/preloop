@@ -1765,6 +1765,7 @@ pub async fn broker_complete_job(
         .await
         .map_err(ApiError::from)?;
     let scope = crate::control::txstate::TxScope {
+        include_archived: false,
         runs: Some(
             request_run
                 .map(|(_, run_id)| std::collections::BTreeSet::from([run_id]))

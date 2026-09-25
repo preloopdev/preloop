@@ -846,6 +846,7 @@ pub async fn complete_job_inner(
             .map_err(ApiError::from)?,
     };
     let scope = crate::control::txstate::TxScope {
+        include_archived: false,
         runs: Some(std::collections::BTreeSet::from([comp.run_id])),
         // `ready_queue`/`blocked_jobs` stay unloaded: `complete_job`
         // promotes `pending_jobs`, and `needs:` never cross runs, so this

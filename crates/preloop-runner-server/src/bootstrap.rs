@@ -742,6 +742,29 @@ async fn run_checkout_cache_pruner(shared: Arc<SharedState>) {
     }
 }
 
+/// Move settled run rows out of the hot scheduler tables. A missed wakeup or
+/// process crash is repaired by the next scan; each batch commits atomically.
+async fn run_history_archiver(shared: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                loop {
+                    match shared.state.backend.archive_finished_runs(32).await {
+                        Ok(32) => continue,
+                        Ok(_) => break,
+                        Err(error) => {
+                            tracing::warn!(?error, "run history archive failed; will retry");
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = shared.shutdown.cancelled() => break,
+        }
+    }
+}
+
 /// Everything the operational snapshot reads from `inner`, collected under a
 /// single lock acquisition. The 5s sampler and the startup seed after a store
 /// restore both build their snapshots from this, so the two cannot drift.
@@ -1973,6 +1996,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
+    let archive_shared = shared.clone();
+    tokio::spawn(async move { run_history_archiver(archive_shared).await });
     let flusher_shared = shared.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

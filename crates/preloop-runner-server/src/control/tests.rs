@@ -1047,7 +1047,9 @@ mod sqlite {
             conn.execute_batch(crate::control::schema::SQLITE_DDL)
                 .unwrap();
             conn.execute_batch(
-                "PRAGMA user_version=11;
+                "DROP INDEX runs_archive_pending;
+                 ALTER TABLE runs DROP COLUMN archived_at_us;
+                 PRAGMA user_version=11;
                  INSERT INTO runs(run_id,namespace,status,run_number,record_blob,created_at_us)
                    VALUES ('run-1','tenant-a','queued',3,X'02',42);
                  INSERT INTO jobs(run_id,job_id,status,queue_kind,queue_position,seq,runs_on)
@@ -1160,6 +1162,98 @@ mod sqlite {
             panic!("expected claim, got {poll:?}");
         };
         assert_eq!(claim.queued.job_id.0, "high");
+    }
+
+    #[tokio::test]
+    async fn archive_moves_three_jobs_and_retains_attempts_for_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let backend = SqliteBackend::open(
+            &path,
+            super::test_cipher(),
+            false,
+            false,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        let runner = backend
+            .register_runner(super::register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![
+                    super::submit_job(run_id, "build", 1),
+                    super::submit_job(run_id, "test", 2),
+                    super::submit_job(run_id, "deploy", 3),
+                ],
+            ))
+            .await
+            .unwrap();
+        for expected in ["build", "test", "deploy"] {
+            let poll = backend
+                .poll_session(super::poll(&session.session_id, runner.runner.id))
+                .await
+                .unwrap();
+            let crate::control::types::PollOutcome::Claimed(claim) = poll else {
+                panic!("expected {expected}, got {poll:?}");
+            };
+            assert_eq!(claim.queued.job_id.0, expected);
+            backend
+                .complete_job(crate::control::backend::JobCompletionInput {
+                    run_id,
+                    job_id: JobId(expected.to_owned()),
+                    agent_job_id: Some(claim.request.agent_job_id),
+                    status: ExecutionStatus::Success,
+                    outputs: Default::default(),
+                    runner_id: Some(runner.runner.id),
+                })
+                .await
+                .unwrap();
+        }
+        // Simulate passage of the documented callback grace interval.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE runs SET completed_at_us=1 WHERE run_id=?1",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(backend.archive_finished_runs(8).await.unwrap(), 1);
+        assert_eq!(backend.archive_finished_runs(8).await.unwrap(), 0);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for (table, expected) in [
+            ("jobs", 0),
+            ("job_requests", 0),
+            ("job_history", 3),
+            ("attempt_history", 3),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id=?1"),
+                    [run_id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "{table}");
+        }
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(record.jobs.len(), 3);
+        assert!(record.jobs.values().all(|s| *s == ExecutionStatus::Success));
+        let listed = backend
+            .list_runs(crate::control::backend::RunListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed[0].jobs.len(), 3);
     }
 
     /// At-rest encryption: the run record and job payload blobs must be
@@ -1460,6 +1554,7 @@ mod sqlite {
         let mut scope_runs = BTreeSet::new();
         scope_runs.insert(run_a);
         let scope = TxScope {
+            include_archived: false,
             runs: Some(scope_runs),
             ready_queue: false,
             blocked_jobs: false,
@@ -1593,6 +1688,7 @@ mod sqlite {
         let mut scope_runs = BTreeSet::new();
         scope_runs.insert(run_a);
         let scope = TxScope {
+            include_archived: false,
             runs: Some(scope_runs),
             ready_queue: true,
             blocked_jobs: false,
@@ -1798,6 +1894,7 @@ mod sqlite {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(b_only),
                     ..TxScope::full()
                 },
@@ -1822,6 +1919,7 @@ mod sqlite {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(scope_runs),
                     ready_queue: true,
                     blocked_jobs: false,
@@ -1887,6 +1985,7 @@ mod sqlite {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(b_only),
                     ..TxScope::full()
                 },
@@ -1924,6 +2023,7 @@ mod sqlite {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(scope_runs),
                     ready_queue: false,
                     blocked_jobs: true,
@@ -2000,6 +2100,7 @@ mod sqlite {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(scope_runs),
                     ready_queue: true,
                     blocked_jobs: false,
@@ -2538,6 +2639,7 @@ mod postgres {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(b_only),
                     ..TxScope::full()
                 },
@@ -2559,6 +2661,7 @@ mod postgres {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(scope_runs),
                     ready_queue: true,
                     blocked_jobs: false,
@@ -2624,6 +2727,7 @@ mod postgres {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(scope_runs),
                     ready_queue: true,
                     blocked_jobs: false,
@@ -2695,6 +2799,7 @@ mod postgres {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(b_only),
                     ..TxScope::full()
                 },
@@ -2726,6 +2831,7 @@ mod postgres {
         backend
             .transact_scoped(
                 &TxScope {
+                    include_archived: false,
                     runs: Some(scope_runs),
                     ready_queue: false,
                     blocked_jobs: true,

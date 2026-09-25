@@ -235,6 +235,11 @@ impl PostgresBackend {
         scope: &TxScope,
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
+        if scope.include_archived {
+            return Err(ControlError::BadRequest(
+                "history scope is read-only".into(),
+            ));
+        }
         let mut client = self.client.lock().await;
         let txn = client.transaction().await.map_err(ControlError::backend)?;
         // Serialize writers across processes: the `client` mutex orders
@@ -504,27 +509,40 @@ impl PostgresBackend {
         let result = async {
             let rows = client
                 .query(
-                    "SELECT selected.run_id, selected.record_blob, j.job_id, j.status, \
-                            j.queue_kind, js.steps_blob \
-                     FROM ( \
-                         SELECT run_id, record_blob, \
-                                CASE WHEN status IN ('success','failure','skipped','cancelled') \
-                                     THEN 1 ELSE 0 END AS terminal_rank, \
-                                COALESCE(completed_at_us, started_at_us, created_at_us) AS sort_at \
-                         FROM runs \
-                         WHERE ($1::TEXT IS NULL OR POSITION($1 IN workflow_path) > 0) \
-                           AND ($2::TEXT IS NULL OR status = $2) \
-                           AND ($3::TEXT IS NULL OR event = $3) \
-                         ORDER BY terminal_rank, sort_at DESC \
-                         LIMIT $4 \
-                     ) AS selected \
-                     LEFT JOIN jobs j ON j.run_id = selected.run_id \
-                     LEFT JOIN job_steps js ON js.agent_job_id = ( \
-                         SELECT jr.agent_job_id FROM job_requests jr \
-                         WHERE jr.run_id = j.run_id AND jr.job_id = j.job_id \
-                         ORDER BY jr.request_id DESC LIMIT 1 \
-                     ) \
-                     ORDER BY selected.terminal_rank, selected.sort_at DESC, j.job_id",
+                    "SELECT selected.run_id, selected.record_blob,
+                            COALESCE(j.job_id,h.job_id), COALESCE(j.status,h.status),
+                            COALESCE(j.queue_kind,'none'),
+                            COALESCE(js.steps_blob, (
+                                SELECT ah.steps_blob FROM attempt_history ah
+                                WHERE ah.run_id=selected.run_id
+                                  AND ah.run_attempt=selected.run_attempt
+                                  AND ah.run_created_at_us=selected.created_at_us
+                                  AND ah.job_id=h.job_id
+                                ORDER BY ah.request_id DESC LIMIT 1
+                            ))
+                     FROM (
+                         SELECT run_id, record_blob, run_attempt, created_at_us, archived_at_us,
+                                CASE WHEN status IN ('success','failure','skipped','cancelled')
+                                     THEN 1 ELSE 0 END AS terminal_rank,
+                                COALESCE(completed_at_us, started_at_us, created_at_us) AS sort_at
+                         FROM runs
+                         WHERE ($1::TEXT IS NULL OR POSITION($1 IN workflow_path) > 0)
+                           AND ($2::TEXT IS NULL OR status = $2)
+                           AND ($3::TEXT IS NULL OR event = $3)
+                         ORDER BY terminal_rank, sort_at DESC LIMIT $4
+                     ) AS selected
+                     LEFT JOIN jobs j ON j.run_id=selected.run_id AND selected.archived_at_us IS NULL
+                     LEFT JOIN job_history h ON h.run_id=selected.run_id
+                         AND h.run_attempt=selected.run_attempt
+                         AND h.run_created_at_us=selected.created_at_us
+                         AND selected.archived_at_us IS NOT NULL
+                     LEFT JOIN job_steps js ON js.agent_job_id = (
+                         SELECT jr.agent_job_id FROM job_requests jr
+                         WHERE jr.run_id=j.run_id AND jr.job_id=j.job_id
+                         ORDER BY jr.request_id DESC LIMIT 1
+                     )
+                     ORDER BY selected.terminal_rank, selected.sort_at DESC,
+                              COALESCE(j.job_id,h.job_id)",
                     &[&filter.workflow, &filter.status, &filter.event, &limit],
                 )
                 .await
@@ -591,8 +609,12 @@ impl PostgresBackend {
         let client = self.checkout_reader().await?;
         let result = client
             .query(
-                "SELECT run_id, job_id FROM jobs \
-                 WHERE status IN ('success','failure','skipped','cancelled')",
+                "SELECT run_id, job_id FROM jobs
+                 WHERE status IN ('success','failure','skipped','cancelled')
+                 UNION ALL SELECT h.run_id,h.job_id FROM job_history h
+                 JOIN runs r ON r.run_id=h.run_id
+                 WHERE h.run_attempt=r.run_attempt AND h.run_created_at_us=r.created_at_us
+                   AND h.status IN ('success','failure','skipped','cancelled')",
                 &[],
             )
             .await
@@ -1597,7 +1619,84 @@ async fn load_txstate(
         tx.workflow_run_counters.insert(key, value as u64);
     }
 
+    if scope.include_archived {
+        load_archived_txstate(conn, &mut tx, cipher).await?;
+    }
     Ok((tx, effective_scope))
+}
+
+async fn load_archived_txstate(
+    conn: &Tx<'_>,
+    tx: &mut TxState,
+    cipher: &store::Envelope,
+) -> Result<(), ControlError> {
+    if tx.runs.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = tx.runs.keys().map(|id| id.to_string()).collect();
+    let jobs = conn
+        .query(
+            "SELECT h.run_id,h.job_id,h.status FROM job_history h
+         JOIN runs r ON r.run_id=h.run_id
+         WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
+           AND h.run_created_at_us=r.created_at_us AND h.run_id = ANY($1)",
+            &[&ids],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    for row in jobs {
+        let run: String = row.get(0);
+        let job: String = row.get(1);
+        let status: String = row.get(2);
+        if let Some(record) = tx.runs.get_mut(&parse_run_id(&run)) {
+            record.jobs.insert(JobId(job), status_parse(&status));
+        }
+    }
+    let attempts = conn
+        .query(
+            "SELECT h.request_id,h.run_id,h.job_id,h.agent_job_id,h.plan_id,h.timeline_id,
+                h.result,h.owner_runner_id,h.claimed_at_us,h.started_at_us,h.steps_blob
+         FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
+         WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
+           AND h.run_created_at_us=r.created_at_us AND h.run_id = ANY($1)
+         ORDER BY h.request_id",
+            &[&ids],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    for row in attempts {
+        let run_id: String = row.get(1);
+        let job_id: String = row.get(2);
+        let agent_id: String = row.get(3);
+        let plan_id: String = row.get(4);
+        let timeline_id: String = row.get(5);
+        let result: Option<String> = row.get(6);
+        let claimed_at: Option<i64> = row.get(8);
+        let started_at: Option<i64> = row.get(9);
+        let steps: Option<Vec<u8>> = row.get(10);
+        let agent_job_id = parse_uuid(&agent_id);
+        tx.insert_request(TaskAgentJobRequestRecord {
+            request_id: row.get(0),
+            run_id: parse_run_id(&run_id),
+            job_id: JobId(job_id),
+            agent_job_id,
+            plan_id,
+            plan_type: String::new(),
+            timeline_id: parse_uuid(&timeline_id),
+            result: result.as_deref().map(status_parse),
+            locked_until: String::new(),
+            claimed_at: claimed_at.map(us_to_system),
+            owner_runner_id: row.get(7),
+            started_at: started_at.map(us_to_system),
+            last_renewed_at: None,
+            timeout_triggered: false,
+            debug_token_issued: false,
+        });
+        if let Some(bytes) = steps {
+            tx.job_steps.insert(agent_job_id, blob(cipher, &bytes)?);
+        }
+    }
+    Ok(())
 }
 
 /// Delete rows keyed by a loaded-set: `full` clears the table, a narrow scope
@@ -2508,6 +2607,7 @@ impl ControlBackend for PostgresBackend {
         // holder). `runs_referenced` is off: submit never promotes queued
         // jobs, so ready/blocked runs stay foreign.
         let scope = TxScope {
+            include_archived: false,
             runs: Some(run_ids),
             ready_queue: false,
             blocked_jobs: false,
@@ -2527,6 +2627,7 @@ impl ControlBackend for PostgresBackend {
         // Only `workflow_run_counters` is touched — a full load would parse
         // every `record_blob`/`payload_blob` per submission for one counter.
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::new()),
             ready_queue: false,
             blocked_jobs: false,
@@ -2554,6 +2655,7 @@ impl ControlBackend for PostgresBackend {
         // concurrency holders) is widened in at load. `sessions: {session_id}`
         // narrows the session families to this poller.
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::new()),
             ready_queue: true,
             // `poll` claims ready work only — no blocked-job promotion, no
@@ -2581,6 +2683,7 @@ impl ControlBackend for PostgresBackend {
             .await?
             .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::from([run_id])),
             ready_queue: false,
             blocked_jobs: false,
@@ -2640,6 +2743,7 @@ impl ControlBackend for PostgresBackend {
         .into_iter()
         .collect();
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::from([completion.run_id])),
             ready_queue: true,
             pending_expansions: false,
@@ -2668,6 +2772,7 @@ impl ControlBackend for PostgresBackend {
         // are resolved before the transaction.
         let sessions = self.find_sessions_by_run(run_id).await?;
         let scope = TxScope {
+            include_archived: false,
             pending_expansions: false,
             runs_via_requests: false,
             runs: Some(BTreeSet::from([run_id])),
@@ -2700,6 +2805,7 @@ impl ControlBackend for PostgresBackend {
         let job_id = job_id.clone();
         let sessions = self.find_sessions_by_run(run_id).await?;
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::from([run_id])),
             ready_queue: true,
             blocked_jobs: true,
@@ -2786,6 +2892,7 @@ impl ControlBackend for PostgresBackend {
         // nodes; `runs_referenced` widens `runs` to their runs so
         // `plan_expansion` sees the claimed node's `RunRecord`.
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::new()),
             ready_queue: false,
             blocked_jobs: false,
@@ -2828,6 +2935,7 @@ impl ControlBackend for PostgresBackend {
         // Scoped to the expanded node's run — `sched::apply_expansion`
         // registers the built legs into that same run.
         let scope = TxScope {
+            include_archived: false,
             runs: Some(BTreeSet::from([claim.job.run_id])),
             ready_queue: false,
             blocked_jobs: false,
@@ -2916,7 +3024,7 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn run_record(&self, run_id: RunId) -> Result<RunRecord, ControlError> {
-        self.read(|tx| {
+        self.read_scoped(&TxScope::run(run_id).with_history(), |tx| {
             tx.runs
                 .get(&run_id)
                 .cloned()
@@ -2938,6 +3046,96 @@ impl ControlBackend for PostgresBackend {
 
     async fn terminal_jobs(&self) -> Result<BTreeSet<(RunId, JobId)>, ControlError> {
         self.terminal_job_rows().await
+    }
+
+    async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError> {
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(ControlError::backend)?;
+        let now: i64 = tx
+            .query_one(
+                "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::BIGINT",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)?
+            .get(0);
+        let cutoff = now - 60_000_000;
+        let limit = limit.min(64) as i64;
+        let rows = tx
+            .query(
+                "SELECT r.run_id FROM runs r
+             WHERE r.archived_at_us IS NULL
+               AND r.completed_at_us IS NOT NULL AND r.completed_at_us <= $1
+               AND r.status IN ('success','failure','skipped','cancelled')
+               AND NOT EXISTS (SELECT 1 FROM job_requests q
+                               WHERE q.run_id=r.run_id AND q.result IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM job_requests q
+                               JOIN runner_sessions s ON s.active_request_id=q.request_id
+                               WHERE q.run_id=r.run_id)
+               AND NOT EXISTS (SELECT 1 FROM cancellation_queue c WHERE c.run_id=r.run_id)
+             ORDER BY r.completed_at_us, r.run_id LIMIT $2
+             FOR UPDATE OF r SKIP LOCKED",
+                &[&cutoff, &limit],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        for row in &rows {
+            let run_id: String = row.get(0);
+            tx.execute(
+                "INSERT INTO job_history(namespace_id,run_id,run_attempt,run_created_at_us,
+                    job_id,status,base_id,pool_key,priority,run_order,job_order)
+                 SELECT r.namespace,r.run_id,r.run_attempt,r.created_at_us,
+                        j.job_id,j.status,j.base_id,j.pool_key,j.priority,j.run_order,j.job_order
+                 FROM jobs j JOIN runs r ON r.run_id=j.run_id WHERE r.run_id=$1",
+                &[&run_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.execute(
+                "INSERT INTO attempt_history(namespace_id,run_id,run_attempt,run_created_at_us,
+                    request_id,job_id,agent_job_id,plan_id,timeline_id,result,owner_runner_id,
+                    claimed_at_us,started_at_us,steps_blob)
+                 SELECT r.namespace,r.run_id,r.run_attempt,r.created_at_us,
+                        q.request_id,q.job_id,q.agent_job_id,q.plan_id,q.timeline_id,q.result,
+                        q.owner_runner_id,q.claimed_at_us,q.started_at_us,s.steps_blob
+                 FROM job_requests q JOIN runs r ON r.run_id=q.run_id
+                 LEFT JOIN job_steps s ON s.agent_job_id=q.agent_job_id
+                 WHERE r.run_id=$1",
+                &[&run_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.execute(
+                "DELETE FROM job_steps WHERE agent_job_id IN
+                 (SELECT agent_job_id FROM job_requests WHERE run_id=$1)",
+                &[&run_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            for table in [
+                "job_requests",
+                "id_token_grants",
+                "oidc_job_contexts",
+                "job_assignments",
+                "pool_pending",
+                "cancellation_queue",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE run_id=$1"), &[&run_id])
+                    .await
+                    .map_err(ControlError::backend)?;
+            }
+            tx.execute("DELETE FROM jobs WHERE run_id=$1", &[&run_id])
+                .await
+                .map_err(ControlError::backend)?;
+            tx.execute(
+                "UPDATE runs SET archived_at_us=$2 WHERE run_id=$1",
+                &[&run_id, &now],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        tx.commit().await.map_err(ControlError::backend)?;
+        Ok(rows.len())
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {

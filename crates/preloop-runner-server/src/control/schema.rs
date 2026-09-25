@@ -37,8 +37,9 @@
 /// - 9: durable control events moved into the authoritative backend.
 /// - 10: live logs moved to file-backed segments; log_chunks and log_files dropped.
 /// - 11: jobs gains ordering and pool columns.
-/// - 12: seed persistent FIFO counters; backfill ordering from run timestamps.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 12;
+/// - 12: seed persistent FIFO counters and backfill ordering.
+/// - 13: terminal-run archive switch and history tables.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 13;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -271,6 +272,7 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
          INSERT INTO counters(name,value) SELECT 'next_job_seq', COALESCE(MAX(seq),0)+1 FROM jobs WHERE true \
              ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value, excluded.value);",
     ),
+    (13, "ALTER TABLE runs ADD COLUMN archived_at_us INTEGER;"),
 ];
 
 /// The SQLite DDL, applied as one migration. `IF NOT EXISTS` makes it
@@ -303,11 +305,14 @@ CREATE TABLE IF NOT EXISTS runs (
     record_blob         BLOB NOT NULL,
     created_at_us       INTEGER NOT NULL,
     started_at_us       INTEGER,
-    completed_at_us     INTEGER
+    completed_at_us     INTEGER,
+    archived_at_us      INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id, workflow_path)
     WHERE webhook_delivery_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS runs_archive_pending ON runs(completed_at_us, run_id)
+    WHERE archived_at_us IS NULL AND completed_at_us IS NOT NULL;
 
 -- ── Jobs ─────────────────────────────────────────────────────────────
 -- One row per (run, logical job). `status` is canonical workflow truth;
@@ -347,6 +352,45 @@ CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
     WHERE queue_kind = 'ready';
 -- Per-run scans (cancel, fail-fast, promote).
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
+
+-- Terminal runs move into these tables atomically. Runner-facing payloads
+-- and request message blobs contain credentials and are not archived.
+CREATE TABLE IF NOT EXISTS job_history (
+    namespace_id        TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    run_attempt         INTEGER NOT NULL,
+    run_created_at_us   INTEGER NOT NULL,
+    job_id              TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    base_id             TEXT NOT NULL,
+    pool_key            TEXT NOT NULL,
+    priority            INTEGER NOT NULL,
+    run_order           INTEGER NOT NULL,
+    job_order           INTEGER NOT NULL,
+    PRIMARY KEY (run_id, run_attempt, job_id)
+);
+CREATE INDEX IF NOT EXISTS job_history_run ON job_history(run_id, run_attempt);
+
+CREATE TABLE IF NOT EXISTS attempt_history (
+    namespace_id        TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    run_attempt         INTEGER NOT NULL,
+    run_created_at_us   INTEGER NOT NULL,
+    request_id          INTEGER NOT NULL,
+    job_id              TEXT NOT NULL,
+    agent_job_id        TEXT NOT NULL,
+    plan_id             TEXT NOT NULL,
+    timeline_id         TEXT NOT NULL,
+    result              TEXT,
+    owner_runner_id     INTEGER,
+    claimed_at_us       INTEGER,
+    started_at_us       INTEGER,
+    steps_blob          BLOB,
+    PRIMARY KEY (run_id, run_attempt, request_id)
+);
+CREATE INDEX IF NOT EXISTS attempt_history_run ON attempt_history(run_id, job_id, request_id);
+CREATE INDEX IF NOT EXISTS attempt_history_agent ON attempt_history(agent_job_id);
+
 
 -- ── Job requests (execution attempts) ────────────────────────────────
 -- One row per dispatch attempt. `result IS NULL` = inflight. The lease
@@ -596,8 +640,9 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 8: durable control events moved into the authoritative backend.
 /// - 9: live logs moved to file-backed segments; log_chunks and log_files dropped.
 /// - 10: jobs gains ordering and pool columns.
-/// - 11: seed persistent FIFO counters; backfill ordering from run timestamps.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 11;
+/// - 11: seed persistent FIFO counters and backfill ordering.
+/// - 12: terminal-run archive switch and history tables.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 12;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -672,6 +717,7 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
          INSERT INTO control.counters(name,value) SELECT 'next_job_seq', COALESCE(MAX(seq),0)+1 FROM control.jobs \
              ON CONFLICT(name) DO UPDATE SET value=GREATEST(counters.value, EXCLUDED.value);",
     ),
+    (12, "ALTER TABLE control.runs ADD COLUMN IF NOT EXISTS archived_at_us BIGINT"),
 ];
 
 /// The Postgres DDL: the same table families as [`SQLITE_DDL`] in Postgres
@@ -711,11 +757,14 @@ CREATE TABLE IF NOT EXISTS runs (
     record_blob         BYTEA NOT NULL,
     created_at_us       BIGINT NOT NULL,
     started_at_us       BIGINT,
-    completed_at_us     BIGINT
+    completed_at_us     BIGINT,
+    archived_at_us      BIGINT
 );
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id, workflow_path)
     WHERE webhook_delivery_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS runs_archive_pending ON runs(completed_at_us, run_id)
+    WHERE archived_at_us IS NULL AND completed_at_us IS NOT NULL;
 
 -- ── Jobs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS jobs (
@@ -749,6 +798,45 @@ CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(pool_key, namespace_id, priority D
 CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
     WHERE queue_kind = 'ready';
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
+
+CREATE TABLE IF NOT EXISTS job_history (
+    namespace_id        TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    run_attempt         BIGINT NOT NULL,
+    run_created_at_us   BIGINT NOT NULL,
+    job_id              TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    base_id             TEXT NOT NULL,
+    pool_key            TEXT NOT NULL,
+    priority            SMALLINT NOT NULL,
+    run_order           BIGINT NOT NULL,
+    job_order           BIGINT NOT NULL,
+    PRIMARY KEY (run_id, run_attempt, job_id, run_created_at_us)
+) PARTITION BY RANGE (run_created_at_us);
+CREATE TABLE IF NOT EXISTS job_history_default PARTITION OF job_history DEFAULT;
+CREATE INDEX IF NOT EXISTS job_history_run ON job_history(run_id, run_attempt, run_created_at_us);
+
+CREATE TABLE IF NOT EXISTS attempt_history (
+    namespace_id        TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    run_attempt         BIGINT NOT NULL,
+    run_created_at_us   BIGINT NOT NULL,
+    request_id          BIGINT NOT NULL,
+    job_id              TEXT NOT NULL,
+    agent_job_id        TEXT NOT NULL,
+    plan_id             TEXT NOT NULL,
+    timeline_id         TEXT NOT NULL,
+    result              TEXT,
+    owner_runner_id     BIGINT,
+    claimed_at_us       BIGINT,
+    started_at_us       BIGINT,
+    steps_blob          BYTEA,
+    PRIMARY KEY (run_id, run_attempt, request_id, run_created_at_us)
+) PARTITION BY RANGE (run_created_at_us);
+CREATE TABLE IF NOT EXISTS attempt_history_default PARTITION OF attempt_history DEFAULT;
+CREATE INDEX IF NOT EXISTS attempt_history_run ON attempt_history(run_id, job_id, request_id, run_created_at_us);
+CREATE INDEX IF NOT EXISTS attempt_history_agent ON attempt_history(agent_job_id);
+
 
 -- ── Job requests ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS job_requests (

@@ -19019,6 +19019,7 @@ async fn generated_server_dag_properties_1000_cases() {
             let queued = {
                 let inner = state
                     .test_tx_scoped(&crate::control::txstate::TxScope {
+                        include_archived: false,
                         runs: Some(std::collections::BTreeSet::from([run_id])),
                         ready_queue: true,
                         blocked_jobs: false,
@@ -19056,6 +19057,7 @@ async fn generated_server_dag_properties_1000_cases() {
         }
         let inner = state
             .test_tx_scoped(&crate::control::txstate::TxScope {
+                include_archived: false,
                 runs: Some(std::collections::BTreeSet::from([run_id])),
                 ready_queue: false,
                 blocked_jobs: false,
