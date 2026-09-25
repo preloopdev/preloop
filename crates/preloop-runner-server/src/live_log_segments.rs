@@ -1,60 +1,145 @@
-//! File-backed live log segments for real-time console tail persistence.
+//! Bounded, file-backed preview of live console output.
 //!
-//! Replaces database-backed `log_chunks` and `log_files` tables.
-//! Masked log lines are buffered in memory and flushed periodically or when the
-//! buffer exceeds a size threshold to sequential, immutable segment files under
-//! `<state_dir>/live-logs/<plan_id>/<log_id>/seg-<seq:06>.log`.
-//!
-//! Readers (e.g. `get_run_logs`) read contiguous segments from disk and any
-//! pending in-memory buffer. Completed jobs upload authoritative step logs
-//! separately to BlobStore.
+//! The official runner uploads complete step logs separately. These segments
+//! preserve the already-masked live preview across a server restart. A local
+//! filesystem is not a shared BlobStore: another control node cannot read it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-log-key retained byte cap on disk (16 MiB). Oldest segments are pruned
-/// when disk usage exceeds this threshold.
 pub(crate) const MAX_LIVE_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
-
-/// Flush pending buffer when it reaches 1 MiB.
 pub(crate) const FLUSH_BYTES_THRESHOLD: usize = 1024 * 1024;
-
-/// Max time pending bytes can sit in memory before background flush (5 seconds).
 pub(crate) const FLUSH_STALE_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_ACTIVE_KEYS: usize = 4096;
 
-/// Sanitize plan_id / log_id for safe filesystem paths (no directory traversal).
-fn sanitize_id(id: &str) -> String {
-    let sanitized: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        "default".to_string()
-    } else {
-        sanitized
-    }
-}
-
-pub(crate) struct KeyState {
-    plan_id: String,
-    log_id: String,
+#[derive(Default)]
+struct KeyState {
     pending: Vec<u8>,
-    last_write: Instant,
-    next_seq: u64,
+    next_seq: Option<u64>,
+    last_write: Option<Instant>,
 }
+
+type KeyEntries = BTreeMap<(String, String), Arc<tokio::sync::Mutex<KeyState>>>;
 
 #[derive(Clone)]
 pub(crate) struct LiveLogSegments {
     root: PathBuf,
-    entries: Arc<parking_lot::Mutex<BTreeMap<String, KeyState>>>,
+    entries: Arc<parking_lot::Mutex<KeyEntries>>,
+}
+
+// Encode the complete UTF-8 component injectively; replacing punctuation with
+// '_' mapped different authenticated plan IDs onto the same directory.
+fn component(id: &str) -> io::Result<String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid log identity length",
+        ));
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(id.len() * 2);
+    for byte in id.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    Ok(encoded)
+}
+
+fn decode_component(encoded: &str) -> Option<String> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)? as u8;
+            let lo = (pair[1] as char).to_digit(16)? as u8;
+            Some((hi << 4) | lo)
+        })
+        .collect();
+    String::from_utf8(bytes?).ok()
+}
+
+fn segment_number(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("seg-")?
+        .strip_suffix(".log")?
+        .parse()
+        .ok()
+}
+
+fn segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf, u64)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if let Some(seq) = segment_number(&entry.path()) {
+            let meta = entry.metadata()?;
+            if meta.is_file() {
+                out.push((seq, entry.path(), meta.len()));
+            }
+        }
+    }
+    out.sort_by_key(|(seq, _, _)| *seq);
+    Ok(out)
+}
+
+fn publish(dir: &Path, seq: u64, bytes: &[u8]) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let target = dir.join(format!("seg-{seq:020}.log"));
+    let temp = dir.join(format!("seg-{seq:020}-{}.tmp", uuid::Uuid::new_v4()));
+    let result: io::Result<()> = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        // `rename` would overwrite an existing segment on Unix. Never do so.
+        match std::fs::hard_link(&temp, &target) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && std::fs::read(&target)? == bytes => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result?;
+    let mut kept = segments(dir)?;
+    let mut total: u64 = kept.iter().map(|(_, _, size)| *size).sum();
+    for (_, path, size) in kept.drain(..) {
+        if total <= MAX_LIVE_LOG_BYTES_PER_KEY as u64 {
+            break;
+        }
+        // The segment was already published. A failed prune must not cause
+        // retrying a successful append and duplicating its bytes.
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::warn!(%error, path = %path.display(), "failed to prune live log");
+        } else {
+            total -= size;
+        }
+    }
+    Ok(())
+}
+
+fn read_segments(dir: &Path) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (_, path, _) in segments(dir)? {
+        out.extend_from_slice(&std::fs::read(path)?);
+    }
+    Ok(out)
 }
 
 impl LiveLogSegments {
@@ -65,320 +150,250 @@ impl LiveLogSegments {
         }
     }
 
-    fn key(plan_id: &str, log_id: &str) -> String {
-        format!("{plan_id}/{log_id}")
+    fn log_dir(&self, plan: &str, log: &str) -> io::Result<PathBuf> {
+        Ok(self.root.join(component(plan)?).join(component(log)?))
     }
 
-    fn log_dir(&self, plan_id: &str, log_id: &str) -> PathBuf {
-        self.root
-            .join(sanitize_id(plan_id))
-            .join(sanitize_id(log_id))
-    }
-
-    fn plan_dir(&self, plan_id: &str) -> PathBuf {
-        self.root.join(sanitize_id(plan_id))
-    }
-
-    /// Append masked log bytes to the pending buffer. Flushes to disk if the
-    /// buffer reaches [`FLUSH_BYTES_THRESHOLD`].
-    pub(crate) async fn append(&self, plan_id: &str, log_id: &str, chunk: &[u8]) {
-        let key = Self::key(plan_id, log_id);
-        let flush_payload = {
-            let mut guard = self.entries.lock();
-            let entry = guard.entry(key.clone()).or_insert_with(|| KeyState {
-                plan_id: plan_id.to_string(),
-                log_id: log_id.to_string(),
-                pending: Vec::new(),
-                last_write: Instant::now(),
-                next_seq: 0,
+    fn state(&self, plan: &str, log: &str) -> io::Result<Arc<tokio::sync::Mutex<KeyState>>> {
+        // Validate identities before registering a key (including before a
+        // new tiny chunk could allocate a buffer).
+        self.log_dir(plan, log)?;
+        let mut entries = self.entries.lock();
+        let key = (plan.to_owned(), log.to_owned());
+        if let Some(state) = entries.get(&key) {
+            return Ok(state.clone());
+        }
+        if entries.len() >= MAX_ACTIVE_KEYS {
+            // Idle entries can be reconstructed from published segments.
+            // Keep a key with pending bytes or an in-flight operation.
+            entries.retain(|_, state| {
+                if Arc::strong_count(state) > 1 {
+                    return true;
+                }
+                state
+                    .try_lock()
+                    .map_or(true, |guard| !guard.pending.is_empty())
             });
-            entry.pending.extend_from_slice(chunk);
-            entry.last_write = Instant::now();
-            if entry.pending.len() >= FLUSH_BYTES_THRESHOLD {
-                let bytes = std::mem::take(&mut entry.pending);
-                let seq = entry.next_seq;
-                entry.next_seq += 1;
-                Some((entry.plan_id.clone(), entry.log_id.clone(), seq, bytes))
-            } else {
-                None
+            if entries.len() >= MAX_ACTIVE_KEYS {
+                return Err(io::Error::other("too many active live log keys"));
             }
-        };
-
-        if let Some((plan, log, seq, bytes)) = flush_payload {
-            let dir = self.log_dir(&plan, &log);
-            let _ = tokio::task::spawn_blocking(move || {
-                write_and_prune_segment(&dir, seq, &bytes);
-            })
-            .await;
         }
+        let state = Arc::new(tokio::sync::Mutex::new(KeyState::default()));
+        entries.insert(key, state.clone());
+        Ok(state)
     }
 
-    /// Flush all pending logs whose last write is older than [`FLUSH_STALE_INTERVAL`].
-    pub(crate) async fn flush_stale(&self) {
-        let now = Instant::now();
-        let flushes: Vec<(String, String, u64, Vec<u8>)> = {
-            let mut guard = self.entries.lock();
-            let mut to_flush = Vec::new();
-            for entry in guard.values_mut() {
-                if !entry.pending.is_empty()
-                    && now.duration_since(entry.last_write) >= FLUSH_STALE_INTERVAL
-                {
-                    let bytes = std::mem::take(&mut entry.pending);
-                    let seq = entry.next_seq;
-                    entry.next_seq += 1;
-                    to_flush.push((entry.plan_id.clone(), entry.log_id.clone(), seq, bytes));
-                }
-            }
-            to_flush
-        };
-
-        for (plan, log, seq, bytes) in flushes {
-            let dir = self.log_dir(&plan, &log);
-            let _ = tokio::task::spawn_blocking(move || {
-                write_and_prune_segment(&dir, seq, &bytes);
-            })
-            .await;
+    async fn flush(&self, plan: &str, log: &str, state: &mut KeyState) -> io::Result<()> {
+        if state.pending.is_empty() {
+            return Ok(());
         }
-    }
-
-    /// Flush all pending bytes across all keys immediately (used during shutdown).
-    pub(crate) async fn flush_all(&self) {
-        let flushes: Vec<(String, String, u64, Vec<u8>)> = {
-            let mut guard = self.entries.lock();
-            let mut to_flush = Vec::new();
-            for entry in guard.values_mut() {
-                if !entry.pending.is_empty() {
-                    let bytes = std::mem::take(&mut entry.pending);
-                    let seq = entry.next_seq;
-                    entry.next_seq += 1;
-                    to_flush.push((entry.plan_id.clone(), entry.log_id.clone(), seq, bytes));
-                }
-            }
-            to_flush
+        let dir = self.log_dir(plan, log)?;
+        let seq = match state.next_seq {
+            Some(seq) => seq,
+            None => segments(&dir)?.last().map_or(0, |(seq, _, _)| seq + 1),
         };
-
-        for (plan, log, seq, bytes) in flushes {
-            let dir = self.log_dir(&plan, &log);
-            let _ = tokio::task::spawn_blocking(move || {
-                write_and_prune_segment(&dir, seq, &bytes);
-            })
-            .await;
-        }
-    }
-
-    /// Read all logs for a plan as sorted `(log_id, bytes)` pairs.
-    /// Flushes any pending buffers for this plan first so all writes are visible.
-    pub(crate) async fn read_blocks_for_plan(&self, plan_id: &str) -> Vec<(String, Vec<u8>)> {
-        // Flush pending for this plan first.
-        let flushes: Vec<(String, String, u64, Vec<u8>)> = {
-            let mut guard = self.entries.lock();
-            let mut to_flush = Vec::new();
-            for entry in guard.values_mut() {
-                if entry.plan_id == plan_id && !entry.pending.is_empty() {
-                    let bytes = std::mem::take(&mut entry.pending);
-                    let seq = entry.next_seq;
-                    entry.next_seq += 1;
-                    to_flush.push((entry.plan_id.clone(), entry.log_id.clone(), seq, bytes));
-                }
-            }
-            to_flush
-        };
-        for (plan, log, seq, bytes) in flushes {
-            let dir = self.log_dir(&plan, &log);
-            let _ = tokio::task::spawn_blocking(move || {
-                write_and_prune_segment(&dir, seq, &bytes);
-            })
-            .await;
-        }
-
-        let plan_dir = self.plan_dir(plan_id);
-        tokio::task::spawn_blocking(move || {
-            let mut results = Vec::new();
-            let entries = match std::fs::read_dir(&plan_dir) {
-                Ok(entries) => entries,
-                Err(_) => return results,
-            };
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let log_id = entry.file_name().to_string_lossy().into_owned();
-                let bytes = read_all_segments_sync(&entry.path());
-                results.push((log_id, bytes));
-            }
-            // Sort by numeric log_id ascending.
-            results.sort_by(|(left, _), (right, _)| {
-                match (left.parse::<u64>(), right.parse::<u64>()) {
-                    (Ok(left), Ok(right)) => left.cmp(&right),
-                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                    (Err(_), Err(_)) => left.cmp(right),
-                }
-            });
-            results
-        })
-        .await
-        .unwrap_or_default()
-    }
-
-    /// Read all bytes for one log key.
-    pub(crate) async fn read_all(&self, plan_id: &str, log_id: &str) -> Vec<u8> {
-        let key = Self::key(plan_id, log_id);
-        let pending_flush = {
-            let mut guard = self.entries.lock();
-            guard.get_mut(&key).and_then(|entry| {
-                if !entry.pending.is_empty() {
-                    let bytes = std::mem::take(&mut entry.pending);
-                    let seq = entry.next_seq;
-                    entry.next_seq += 1;
-                    Some((entry.plan_id.clone(), entry.log_id.clone(), seq, bytes))
-                } else {
-                    None
-                }
-            })
-        };
-        if let Some((plan, log, seq, bytes)) = pending_flush {
-            let dir = self.log_dir(&plan, &log);
-            let _ = tokio::task::spawn_blocking(move || {
-                write_and_prune_segment(&dir, seq, &bytes);
-            })
-            .await;
-        }
-
-        let dir = self.log_dir(plan_id, log_id);
-        tokio::task::spawn_blocking(move || read_all_segments_sync(&dir))
+        // The key mutex remains held across blocking I/O on the blocking
+        // pool, serializing publication, read and pruning for this key.
+        let bytes = state.pending.clone();
+        tokio::task::spawn_blocking(move || publish(&dir, seq, &bytes))
             .await
-            .unwrap_or_default()
+            .map_err(io::Error::other)??;
+        state.pending.clear();
+        state.next_seq = Some(seq + 1);
+        Ok(())
     }
 
-    /// Delete all live log segments for a plan.
-    pub(crate) async fn delete_plan(&self, plan_id: &str) {
-        {
-            let mut guard = self.entries.lock();
-            guard.retain(|_, v| v.plan_id != plan_id);
+    pub(crate) async fn append(&self, plan: &str, log: &str, bytes: &[u8]) -> io::Result<()> {
+        let state = self.state(plan, log)?;
+        let mut state = state.lock().await;
+        // One very large runner batch must not sit unbounded in memory.
+        for chunk in bytes.chunks(FLUSH_BYTES_THRESHOLD) {
+            state.pending.extend_from_slice(chunk);
+            state.last_write = Some(Instant::now());
+            if state.pending.len() >= FLUSH_BYTES_THRESHOLD {
+                self.flush(plan, log, &mut state).await?;
+            }
         }
-        let dir = self.plan_dir(plan_id);
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(&dir);
-        })
-        .await;
+        Ok(())
     }
 
-    /// Delete all live log segments for one log file.
-    pub(crate) async fn delete_log(&self, plan_id: &str, log_id: &str) {
-        let key = Self::key(plan_id, log_id);
-        {
-            let mut guard = self.entries.lock();
-            guard.remove(&key);
+    pub(crate) async fn flush_stale(&self) -> io::Result<()> {
+        let entries: Vec<_> = self
+            .entries
+            .lock()
+            .iter()
+            .map(|(key, state)| (key.clone(), state.clone()))
+            .collect();
+        for ((plan, log), state) in entries {
+            let mut state = state.lock().await;
+            if state
+                .last_write
+                .is_some_and(|at| at.elapsed() >= FLUSH_STALE_INTERVAL)
+            {
+                self.flush(&plan, &log, &mut state).await?;
+            }
         }
-        let dir = self.log_dir(plan_id, log_id);
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(&dir);
-        })
-        .await;
+        Ok(())
     }
 
-    /// Prune plans not in `active_plans`, mirroring `prune_replay_results`.
-    pub(crate) async fn prune_inactive_plans(
+    pub(crate) async fn flush_all(&self) -> io::Result<()> {
+        let entries: Vec<_> = self
+            .entries
+            .lock()
+            .iter()
+            .map(|(key, state)| (key.clone(), state.clone()))
+            .collect();
+        for ((plan, log), state) in entries {
+            let mut guard = state.lock().await;
+            self.flush(&plan, &log, &mut guard).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn read_all(&self, plan: &str, log: &str) -> io::Result<Vec<u8>> {
+        let state = self.state(plan, log)?;
+        let mut state = state.lock().await;
+        self.flush(plan, log, &mut state).await?;
+        let dir = self.log_dir(plan, log)?;
+        tokio::task::spawn_blocking(move || read_segments(&dir))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    pub(crate) async fn read_blocks_for_plan(
         &self,
-        active_plans: &std::collections::BTreeSet<String>,
-    ) {
-        let root = self.root.clone();
-        let active = active_plans.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let entries = match std::fs::read_dir(&root) {
-                Ok(entries) => entries,
-                Err(_) => return,
-            };
-            for entry in entries.flatten() {
-                if !entry.path().is_dir() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !active.contains(&name) {
-                    let _ = std::fs::remove_dir_all(entry.path());
+        plan: &str,
+    ) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let dir = self.root.join(component(plan)?);
+        let mut keys: BTreeSet<String> = self
+            .entries
+            .lock()
+            .keys()
+            .filter(|(p, _)| p == plan)
+            .map(|(_, log)| log.clone())
+            .collect();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    if let Some(id) = decode_component(&entry.file_name().to_string_lossy()) {
+                        keys.insert(id);
+                    }
                 }
             }
-        })
-        .await;
-    }
-}
-
-/// Atomically write a segment and prune oldest segments if total size exceeds budget.
-fn write_and_prune_segment(dir: &Path, seq: u64, bytes: &[u8]) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(?e, path = %dir.display(), "failed to create live-log segment dir");
-        return;
-    }
-    let target = dir.join(format!("seg-{seq:06}.log"));
-    let temp = dir.join(format!("seg-{seq:06}.tmp"));
-    if let Err(e) = std::fs::write(&temp, bytes) {
-        tracing::warn!(?e, path = %temp.display(), "failed to write live-log temp segment");
-        return;
-    }
-    if let Err(e) = std::fs::rename(&temp, &target) {
-        tracing::warn!(?e, from = %temp.display(), to = %target.display(), "failed to publish live-log segment");
-        let _ = std::fs::remove_file(&temp);
-        return;
-    }
-
-    // Prune oldest segments if total byte count exceeds limit.
-    prune_old_segments(dir);
-}
-
-fn prune_old_segments(dir: &Path) {
-    let mut segments = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("seg-") && n.ends_with(".log"))
-        {
-            if let Ok(meta) = entry.metadata() {
-                segments.push((path, meta.len() as usize));
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for log in keys {
+            results.push((log.clone(), self.read_all(plan, &log).await?));
+        }
+        results.sort_by(|(left, _), (right, _)| {
+            match (left.parse::<u64>(), right.parse::<u64>()) {
+                (Ok(l), Ok(r)) => l.cmp(&r),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                _ => left.cmp(right),
             }
-        }
+        });
+        Ok(results)
     }
-    segments.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut total: usize = segments.iter().map(|(_, sz)| *sz).sum();
-    for (path, sz) in segments {
-        if total <= MAX_LIVE_LOG_BYTES_PER_KEY {
-            break;
+
+    /// Retain the newest inactive plan directories, as with completed results.
+    /// Never delete a still-active plan merely because another job completed.
+    pub(crate) async fn prune_inactive_plans(&self, active: &BTreeSet<String>) -> io::Result<()> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut inactive = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if decode_component(&name).is_some_and(|id| active.contains(&id)) {
+                continue;
+            }
+            inactive.push((entry.metadata()?.modified()?, entry.path()));
         }
-        let _ = std::fs::remove_file(&path);
-        total = total.saturating_sub(sz);
+        inactive.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
+        for (_, path) in inactive
+            .into_iter()
+            .skip(crate::blob_store::REPLAY_PLANS_RETAINED)
+        {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(())
     }
 }
 
-fn read_all_segments_sync(dir: &Path) -> Vec<u8> {
-    let mut segments = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("seg-") && n.ends_with(".log"))
-        {
-            segments.push(path);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn restart_appends_without_overwriting_published_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = LiveLogSegments::new(tmp.path().to_path_buf());
+        first.append("plan", "0", b"one\n").await.unwrap();
+        first.flush_all().await.unwrap();
+        let second = LiveLogSegments::new(tmp.path().to_path_buf());
+        second.append("plan", "0", b"two\n").await.unwrap();
+        second.flush_all().await.unwrap();
+        assert_eq!(second.read_all("plan", "0").await.unwrap(), b"one\ntwo\n");
     }
-    segments.sort();
-    let mut out = Vec::new();
-    for path in segments {
-        if let Ok(bytes) = std::fs::read(&path) {
-            out.extend_from_slice(&bytes);
-        }
+
+    #[tokio::test]
+    async fn path_encoding_does_not_alias_or_traverse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LiveLogSegments::new(tmp.path().to_path_buf());
+        store.append("a/b", "0", b"a").await.unwrap();
+        store.append("a_b", "0", b"b").await.unwrap();
+        assert_eq!(store.read_all("a/b", "0").await.unwrap(), b"a");
+        assert_eq!(store.read_all("a_b", "0").await.unwrap(), b"b");
     }
-    out
+    #[tokio::test]
+    async fn failed_flush_preserves_pending_bytes_for_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let store = LiveLogSegments::new(root.clone());
+        store.append("plan", "0", b"line\n").await.unwrap();
+        assert!(store.flush_all().await.is_err());
+        std::fs::remove_file(&root).unwrap();
+        store.flush_all().await.unwrap();
+        assert_eq!(store.read_all("plan", "0").await.unwrap(), b"line\n");
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_and_flushes_do_not_duplicate_or_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LiveLogSegments::new(tmp.path().to_path_buf());
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .append("plan", "0", format!("{i:02}\n").as_bytes())
+                    .await
+                    .unwrap();
+                store.flush_all().await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let contents = String::from_utf8(store.read_all("plan", "0").await.unwrap()).unwrap();
+        let mut values: Vec<_> = contents.lines().collect();
+        values.sort_unstable();
+        assert_eq!(
+            values,
+            (0..32).map(|i| format!("{i:02}")).collect::<Vec<_>>()
+        );
+    }
 }

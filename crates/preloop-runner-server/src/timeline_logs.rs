@@ -370,11 +370,9 @@ pub async fn create_log(
         }
         trim_plan_logs(&mut inner, &plan_id)
     };
-    for key in &evicted {
-        if let Some((plan, log)) = key.split_once('/') {
-            shared.state.log_segments.delete_log(plan, log).await;
-        }
-    }
+    // Eviction bounds the node-local preview only. Published segments remain
+    // available until retained-plan cleanup or final-log publication.
+    let _ = evicted;
     Ok(Json(
         serde_json::to_value(&log).unwrap_or(json!({ "ok": true })),
     ))
@@ -401,7 +399,16 @@ pub async fn append_log(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
-    let (masked, evicted) = {
+    if let Err(error) = shared
+        .state
+        .log_segments
+        .append(&plan_id, &log_id, &masked)
+        .await
+    {
+        warn!(?error, key = %key, "failed to buffer/publish live log");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    let evicted = {
         let mut inner = shared.state.inner.lock().await;
         let is_new = !inner.logs.contains_key(&key);
         let byte_count = masked.len();
@@ -415,11 +422,8 @@ pub async fn append_log(
         if is_new && !inner.log_order.iter().any(|k| k == &key) {
             inner.log_order.push_back(key.clone());
         }
-        // F1: keep only the newest bytes in memory. `log_chunks` is the live
-        // console recovery buffer (read only by restart to refill this map),
-        // bounded to the SAME per-key budget in `store_log_chunk` — see D2.
-        // The complete, permanent logs are the step/job-log blobs the runner
-        // uploads separately, so trimming this tail never drops real log data.
+        // Keep only the newest bytes in the node-local preview. Published
+        // segments and the runner's complete uploaded logs are independent.
         if let Some(retained) = inner.logs.get_mut(&key) {
             // Only trim once the buffer grows a full slack window past the cap,
             // then drop back down to the cap — amortizes the O(n) front-shift
@@ -437,24 +441,11 @@ pub async fn append_log(
             meta.byte_count += byte_count;
             meta.line_count += line_count;
         }
-        let evicted = trim_plan_logs(&mut inner, &plan_id);
-        // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
-        // counter, instead of rewriting the entire meta snapshot for every
-        // append. The counter is small and idempotent; the chunk is the
-        // append-only event stream. We use the new byte count as the chunk
-        // index so each append maps to a unique `(log_key, chunk_index)` row.
-        (masked, evicted)
+        trim_plan_logs(&mut inner, &plan_id)
     };
-    for key in &evicted {
-        if let Some((plan, log)) = key.split_once('/') {
-            shared.state.log_segments.delete_log(plan, log).await;
-        }
-    }
-    shared
-        .state
-        .log_segments
-        .append(&plan_id, &log_id, &masked)
-        .await;
+    // Evict only the in-memory preview; the file-backed segments are
+    // independent and remain readable after a restart.
+    let _ = evicted;
     StatusCode::ACCEPTED
 }
 

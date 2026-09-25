@@ -1980,14 +1980,18 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         while !flusher_shared.shutdown.is_cancelled() {
             tokio::select! {
                 _ = interval.tick() => {
-                    flusher_shared.state.log_segments.flush_stale().await;
+                    if let Err(error) = flusher_shared.state.log_segments.flush_stale().await {
+                        tracing::warn!(%error, "failed to flush live-log segments");
+                    }
                 }
                 _ = flusher_shared.shutdown.cancelled() => {
                     break;
                 }
             }
         }
-        flusher_shared.state.log_segments.flush_all().await;
+        if let Err(error) = flusher_shared.state.log_segments.flush_all().await {
+            tracing::error!(%error, "failed to flush live-log segments on shutdown");
+        }
     });
 
     let webhook_worker_heartbeat = state.observability.heartbeat().clone();

@@ -3143,15 +3143,16 @@ pub async fn get_run_logs(
         .await
         .map_err(ApiError::from)?;
 
-    // Node-local console blocks: read from file-backed segments (with unflushed
-    // in-memory tail), falling back to in-memory `inner.logs` if empty.
+    // Read published segments plus the unflushed tail. The node-local preview
+    // remains a fallback for logs created before the segment writer cutover.
     let mut sources = Vec::new();
     for (request, manifest) in requests.iter().zip(manifests.iter()) {
         let mut blocks = shared
             .state
             .log_segments
             .read_blocks_for_plan(&request.plan_id)
-            .await;
+            .await
+            .map_err(|error| ApiError::internal(format!("failed to read live logs: {error}")))?;
         if blocks.is_empty() {
             let inner = shared.state.inner.lock().await;
             let prefix = format!("{}/", request.plan_id);

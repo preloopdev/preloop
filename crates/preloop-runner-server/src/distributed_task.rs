@@ -1290,7 +1290,9 @@ pub async fn complete_job_inner(
         let plans_clone = active_plans.clone();
         tokio::spawn(async move {
             prune_replay_results(&state_dir, &active_plans).await;
-            log_segments.prune_inactive_plans(&plans_clone).await;
+            if let Err(error) = log_segments.prune_inactive_plans(&plans_clone).await {
+                tracing::warn!(%error, "failed to prune live-log segments");
+            }
         });
     }
     Ok(Json(record))
