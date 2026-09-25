@@ -1008,12 +1008,23 @@ mod sqlite {
                 .unwrap();
             assert_eq!(not_null, 1, "{table}.{column} must be NOT NULL");
 
-            let count: i64 = connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, 1, "{table} row must survive migration");
+            if table == "counters" {
+                let original: i64 = connection
+                    .query_row(
+                        "SELECT value FROM counters WHERE name='request'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(original, 4, "original counter must survive migration");
+            } else {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 1, "{table} row must survive migration");
+            }
         }
 
         let error = connection
@@ -1025,6 +1036,130 @@ mod sqlite {
                 .contains("NOT NULL constraint failed: counters.name"),
             "unexpected NULL-key error: {error}"
         );
+    }
+
+    #[test]
+    fn v11_ready_jobs_keep_identity_order_and_labels_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(crate::control::schema::SQLITE_DDL)
+                .unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version=11;
+                 INSERT INTO runs(run_id,namespace,status,run_number,record_blob,created_at_us)
+                   VALUES ('run-1','tenant-a','queued',3,X'02',42);
+                 INSERT INTO jobs(run_id,job_id,status,queue_kind,queue_position,seq,runs_on)
+                   VALUES ('run-1','build','queued','ready',900,700,
+                           '[\"self-hosted\",\"linux\"]');",
+            )
+            .unwrap();
+        }
+        let backend = SqliteBackend::open(
+            &path,
+            super::test_cipher(),
+            false,
+            false,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        drop(backend);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (namespace, run_order, job_order, pool_key): (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT namespace_id,run_order,job_order,pool_key FROM jobs WHERE job_id='build'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(namespace, "tenant-a");
+        assert_eq!((run_order, job_order), (42, 900));
+        assert_eq!(
+            pool_key,
+            crate::control::types::compute_pool_key(&["self-hosted".into(), "linux".into()], None)
+        );
+        let next: i64 = conn
+            .query_row(
+                "SELECT value FROM counters WHERE name='next_queue_position'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, 901);
+    }
+
+    #[tokio::test]
+    async fn submission_namespace_is_written_to_run_and_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let backend = SqliteBackend::open(
+            &path,
+            super::test_cipher(),
+            false,
+            false,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let mut submit = super::submit_run(run_id, vec![super::submit_job(run_id, "build", 1)]);
+        submit.namespace = "tenant-a".to_owned();
+        backend.submit_run(submit).await.unwrap();
+        drop(backend);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (run_ns, job_ns): (String, String) = conn.query_row(
+            "SELECT r.namespace,j.namespace_id FROM runs r JOIN jobs j USING(run_id) WHERE j.job_id='build'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!((run_ns.as_str(), job_ns.as_str()), ("tenant-a", "tenant-a"));
+    }
+
+    #[tokio::test]
+    async fn priority_changes_the_claimed_job_within_a_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let backend = SqliteBackend::open(
+            &path,
+            super::test_cipher(),
+            false,
+            false,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        let runner = backend
+            .register_runner(super::register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![
+                    super::submit_job(run_id, "low", 1),
+                    super::submit_job(run_id, "high", 2),
+                ],
+            ))
+            .await
+            .unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET priority=2 WHERE run_id=?1 AND job_id='high'",
+                [run_id.to_string()],
+            )
+            .unwrap();
+        let poll = backend
+            .poll_session(super::poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let crate::control::types::PollOutcome::Claimed(claim) = poll else {
+            panic!("expected claim, got {poll:?}");
+        };
+        assert_eq!(claim.queued.job_id.0, "high");
     }
 
     /// At-rest encryption: the run record and job payload blobs must be
@@ -1354,6 +1489,11 @@ mod sqlite {
         // (1) Foreign rows: every row not keyed to run A is unchanged — the
         // scoped-delete families must not wipe or re-insert-conflict run B.
         for (table, before_rows) in &before {
+            // A new ready job legitimately advances global FIFO allocators.
+            // This test guards foreign run rows, not counter implementation.
+            if table == "counters" {
+                continue;
+            }
             let after_rows = after.get(table).cloned().unwrap_or_default();
             let mut before_foreign: Vec<String> = before_rows
                 .iter()

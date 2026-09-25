@@ -17,16 +17,15 @@ use preloop_gha_protocol::{ExecutionStatus, JobId, RegisteredRunner, RunId};
 /// identical.
 pub const DEFAULT_NAMESPACE: &str = "default";
 
-/// Compute a normalized, deterministic pool key from a job's runs-on labels and runner group.
+/// Canonical label-set identity for an indexed eligibility lookup. A runner
+/// matches a *subset*, not one identical key; the backend still enforces
+/// capability matching before a policy can use this as a pool filter.
 pub(crate) fn compute_pool_key(runs_on: &[String], runner_group: Option<&str>) -> String {
     let mut labels: Vec<String> = runs_on.iter().map(|s| s.to_ascii_lowercase()).collect();
-    labels.sort();
+    labels.sort_unstable();
+    labels.dedup();
     let group = runner_group.unwrap_or("").to_ascii_lowercase();
-    if group.is_empty() {
-        labels.join(",")
-    } else {
-        format!("{group}:{}", labels.join(","))
-    }
+    serde_json::to_string(&(group, labels)).expect("strings serialize to JSON")
 }
 
 /// Queue classification for a job row. `jobs.state` (the `ExecutionStatus`

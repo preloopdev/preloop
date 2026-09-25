@@ -36,8 +36,9 @@
 /// - 8: SQLite text primary keys made explicitly `NOT NULL`.
 /// - 9: durable control events moved into the authoritative backend.
 /// - 10: live logs moved to file-backed segments; log_chunks and log_files dropped.
-/// - 11: jobs gains namespace_id, priority, run_order, job_order, pool_key, not_before_us.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 11;
+/// - 11: jobs gains ordering and pool columns.
+/// - 12: seed persistent FIFO counters; backfill ordering from run timestamps.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 12;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -259,6 +260,16 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
             WHERE queue_kind = 'ready';
         CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
         "#,
+    ),
+    (
+        12,
+        "UPDATE jobs SET namespace_id=COALESCE((SELECT namespace FROM runs WHERE runs.run_id=jobs.run_id), 'default'), \
+            run_order=COALESCE((SELECT created_at_us FROM runs WHERE runs.run_id=jobs.run_id), 0), \
+            job_order=COALESCE(queue_position, seq, 0); \
+         INSERT INTO counters(name,value) SELECT 'next_queue_position', COALESCE(MAX(queue_position),0)+1 FROM jobs WHERE true \
+             ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value, excluded.value); \
+         INSERT INTO counters(name,value) SELECT 'next_job_seq', COALESCE(MAX(seq),0)+1 FROM jobs WHERE true \
+             ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value, excluded.value);",
     ),
 ];
 
@@ -584,8 +595,9 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 7: `outbox` dropped — declared but never read or written.
 /// - 8: durable control events moved into the authoritative backend.
 /// - 9: live logs moved to file-backed segments; log_chunks and log_files dropped.
-/// - 10: jobs gains namespace_id, priority, run_order, job_order, pool_key, not_before_us.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 10;
+/// - 10: jobs gains ordering and pool columns.
+/// - 11: seed persistent FIFO counters; backfill ordering from run timestamps.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 11;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -649,6 +661,16 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
              WHERE queue_kind = 'ready'; \
          CREATE INDEX IF NOT EXISTS jobs_ready_pos ON control.jobs(queue_position) \
              WHERE queue_kind = 'ready';",
+    ),
+    (
+        11,
+        "UPDATE control.jobs j SET namespace_id=COALESCE(r.namespace, 'default'), \
+            run_order=r.created_at_us, job_order=COALESCE(j.queue_position,j.seq,0) \
+            FROM control.runs r WHERE r.run_id=j.run_id; \
+         INSERT INTO control.counters(name,value) SELECT 'next_queue_position', COALESCE(MAX(queue_position),0)+1 FROM control.jobs \
+             ON CONFLICT(name) DO UPDATE SET value=GREATEST(counters.value, EXCLUDED.value); \
+         INSERT INTO control.counters(name,value) SELECT 'next_job_seq', COALESCE(MAX(seq),0)+1 FROM control.jobs \
+             ON CONFLICT(name) DO UPDATE SET value=GREATEST(counters.value, EXCLUDED.value);",
     ),
 ];
 

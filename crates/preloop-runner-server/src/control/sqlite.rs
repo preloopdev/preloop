@@ -151,6 +151,43 @@ impl SqliteBackend {
         // jobset_admissions→runs) actually fire under targeted deletes.
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(ControlError::backend)?;
+        // v11 created a queryable pool key. Backfill legacy rows from their
+        // actual labels; a default empty key would make migrated jobs
+        // invisible to indexed claimers after restart.
+        let missing_pool_keys = {
+            let mut stmt = conn
+                .prepare("SELECT run_id, job_id, runs_on, runner_group FROM jobs WHERE pool_key=''")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(ControlError::backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::backend)?;
+            rows
+        };
+        if !missing_pool_keys.is_empty() {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(ControlError::backend)?;
+            for (run_id, job_id, labels_json, group) in missing_pool_keys {
+                let labels: Vec<String> =
+                    serde_json::from_str(&labels_json).map_err(ControlError::backend)?;
+                let key = compute_pool_key(&labels, group.as_deref());
+                tx.execute(
+                    "UPDATE jobs SET pool_key=?1 WHERE run_id=?2 AND job_id=?3",
+                    params![key, run_id, job_id],
+                )
+                .map_err(ControlError::backend)?;
+            }
+            tx.commit().map_err(ControlError::backend)?;
+        }
         // A small pool of read-only connections. WAL lets readers run
         // concurrently with the single writer; `query_only` makes a write
         // through a reader a hard error rather than silent corruption.
@@ -996,7 +1033,7 @@ fn load_txstate(
     // map, which we rebuild from the `jobs` table. Scoped to `scope.runs`.
     {
         let (sql, params) = scoped_select(
-            "SELECT run_id, record_blob FROM runs",
+            "SELECT run_id, record_blob, namespace FROM runs",
             "run_id",
             scope.runs.as_ref(),
             |id| id.0.to_string(),
@@ -1004,14 +1041,19 @@ fn load_txstate(
         let mut stmt = conn.prepare(&sql).map_err(ControlError::backend)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })
             .map_err(ControlError::backend)?;
         for row in rows {
-            let (run_id_s, record) = row.map_err(ControlError::backend)?;
+            let (run_id_s, record, namespace) = row.map_err(ControlError::backend)?;
             let run_id = parse_run_id(&run_id_s);
             let mut run: RunRecord = blob(cipher, &record)?;
             run.jobs.clear(); // rebuilt from the jobs table below
+            tx.run_namespaces.insert(run_id, namespace);
             tx.runs.insert(run_id, run);
             tx.loaded.runs.insert(run_id);
         }
@@ -1025,7 +1067,7 @@ fn load_txstate(
         let mut sql = String::from(
             "SELECT run_id, job_id, status, queue_kind, queue_position, seq, \
              reaper_first_seen_us, expand_generation, enqueued_at_us, payload_blob, \
-             priority, run_order, job_order, not_before_us \
+             priority, run_order, job_order, not_before_us, namespace_id, pool_key \
              FROM jobs",
         );
         let mut params: Vec<String> = Vec::new();
@@ -1061,7 +1103,13 @@ fn load_txstate(
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" OR "));
         }
-        sql.push_str(" ORDER BY seq");
+        sql.push_str(
+            " ORDER BY CASE WHEN queue_kind='ready' THEN 0 ELSE 1 END, \
+                      CASE WHEN queue_kind='ready' THEN -priority ELSE 0 END, \
+                      CASE WHEN queue_kind='ready' THEN run_order ELSE 0 END, \
+                      CASE WHEN queue_kind='ready' THEN job_order ELSE 0 END, \
+                      seq, run_id, job_id",
+        );
         let mut stmt = conn.prepare(&sql).map_err(ControlError::backend)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |r| {
@@ -1080,6 +1128,8 @@ fn load_txstate(
                     r.get::<_, Option<i64>>(11)?,
                     r.get::<_, Option<i64>>(12)?,
                     r.get::<_, Option<i64>>(13)?,
+                    r.get::<_, String>(14)?,
+                    r.get::<_, String>(15)?,
                 ))
             })
             .map_err(ControlError::backend)?;
@@ -1099,6 +1149,8 @@ fn load_txstate(
                 run_order,
                 job_order,
                 not_before_us,
+                namespace_id,
+                pool_key,
             ) = row.map_err(ControlError::backend)?;
             let run_id = parse_run_id(&run_id_s);
             let job_id = JobId(job_id_s);
@@ -1116,6 +1168,8 @@ fn load_txstate(
                     run_order: run_order.unwrap_or(0),
                     job_order: job_order.unwrap_or(0),
                     not_before_us,
+                    namespace_id,
+                    pool_key,
                 },
             );
             if let Some(run) = tx.runs.get_mut(&run_id) {
@@ -1175,21 +1229,11 @@ fn load_txstate(
             |r| r.get(0),
         )
         .unwrap_or(0);
-    tx.next_queue_position = conn
-        .query_row(
-            "SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs WHERE queue_kind='ready'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(1);
-    tx.next_seq = conn
-        .query_row("SELECT COALESCE(MAX(seq),0)+1 FROM jobs", [], |r| r.get(0))
-        .unwrap_or(1);
     // Global queue-front labels — unscoped, for pool next-image selection.
     tx.next_queue_labels = conn
         .query_row(
             "SELECT payload_blob FROM jobs WHERE queue_kind='ready' \
-             ORDER BY queue_position LIMIT 1",
+             ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id LIMIT 1",
             [],
             |r| r.get::<_, Vec<u8>>(0),
         )
@@ -1951,6 +1995,19 @@ fn load_txstate(
 // Write-back: TxState delta → rows
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Reserve a FIFO value through one atomic counter update, not MAX()+1 over
+/// the job table. The counter is seeded from legacy positions by migration.
+fn alloc_job_counter(conn: &Connection, name: &str) -> Result<i64, ControlError> {
+    conn.query_row(
+        "INSERT INTO counters(name, value) VALUES (?1, 2) \
+         ON CONFLICT(name) DO UPDATE SET value=counters.value+1 \
+         RETURNING value-1",
+        params![name],
+        |row| row.get(0),
+    )
+    .map_err(ControlError::backend)
+}
+
 /// Persist the working set inside the transaction. Upserts every present
 /// row and deletes rows that were loaded but removed by the command. The
 /// `loaded` bookkeeping is what makes deletion precise: a key present at
@@ -1972,8 +2029,8 @@ fn write_txstate(
         conn.execute(
             "INSERT INTO runs (run_id, status, run_number, run_attempt, run_name, event, \
              workflow_path, conclusion, webhook_delivery_id, record_blob, created_at_us, \
-             started_at_us, completed_at_us) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
+             started_at_us, completed_at_us, namespace) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
              ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, \
              conclusion=excluded.conclusion, record_blob=excluded.record_blob, \
              started_at_us=excluded.started_at_us, completed_at_us=excluded.completed_at_us",
@@ -1991,6 +2048,10 @@ fn write_txstate(
                 system_to_us(run.created_at.into()),
                 run.started_at.map(|t| system_to_us(t.into())),
                 run.completed_at.map(|t| system_to_us(t.into())),
+                tx.run_namespaces
+                    .get(run_id)
+                    .map(String::as_str)
+                    .unwrap_or(DEFAULT_NAMESPACE),
             ],
         )
         .map_err(ControlError::backend)?;
@@ -2005,10 +2066,6 @@ fn write_txstate(
         }
     }
     let mut seen_jobs: BTreeSet<(RunId, JobId)> = BTreeSet::new();
-    // Fresh position/seq allocators for genuinely new jobs (those not in
-    // `job_row_state`); existing jobs keep their loaded values via write_job.
-    let mut next_pos = tx.next_queue_position;
-    let mut next_seq = tx.next_seq;
 
     // `write_job` resolves a job's `queue_position`/`seq` from three inputs:
     //   - `fresh`: the job is newly enqueued or requeued via `tx.queue`
@@ -2023,8 +2080,6 @@ fn write_txstate(
     let write_job = |conn: &Connection,
                      tx: &TxState,
                      seen: &mut BTreeSet<(RunId, JobId)>,
-                     next_seq: &mut i64,
-                     next_pos: &mut i64,
                      fresh: bool,
                      run_id: RunId,
                      job_id: &JobId,
@@ -2044,12 +2099,9 @@ fn write_txstate(
         } else {
             // Transition or fresh/requeued: new FIFO seq; a position only if
             // the job is landing in the ready queue.
-            let s = *next_seq;
-            *next_seq += 1;
+            let s = alloc_job_counter(conn, "next_job_seq")?;
             let p = if kind == QueueKind::Ready {
-                let v = *next_pos;
-                *next_pos += 1;
-                Some(v)
+                Some(alloc_job_counter(conn, "next_queue_position")?)
             } else {
                 None
             };
@@ -2077,29 +2129,31 @@ fn write_txstate(
             Some(j) => {
                 crate::control::types::compute_pool_key(&j.runs_on, j.runner_group.as_deref())
             }
-            None => String::new(),
+            None => preserved.map(|p| p.pool_key.clone()).unwrap_or_default(),
         };
         let run_order = preserved.map(|p| p.run_order).unwrap_or_else(|| {
             tx.runs
                 .get(&run_id)
-                .map(|r| r.run_number as i64)
+                .map(|r| r.created_at.timestamp_micros())
                 .unwrap_or(0)
         });
-        let job_order = if same_slot {
-            preserved.map(|p| p.job_order).unwrap_or(0)
-        } else {
+        let job_order = if kind == QueueKind::Ready && !same_slot {
             position.unwrap_or(0)
+        } else {
+            preserved.map(|p| p.job_order).unwrap_or(0)
         };
         let priority = preserved.map(|p| p.priority).unwrap_or(0);
         let not_before_us = preserved.and_then(|p| p.not_before_us);
-        let is_initial_insert = !tx.loaded.jobs.contains_key(&key);
         let (base_id, runs_on, runner_group, enqueued_us, payload) = match job {
             Some(j) => (
                 j.base_id.clone(),
                 serde_json::to_string(&j.runs_on).unwrap_or_default(),
                 j.runner_group.clone(),
                 Some(j.enqueued_at_unix_nanos / 1000),
-                if is_initial_insert {
+                // Promotion/requeue stamps dependency and enqueue times in
+                // QueuedJob. Persist those changes; a same-slot write keeps
+                // the existing sealed value.
+                if !same_slot {
                     Some(unblob(cipher, j)?)
                 } else {
                     None
@@ -2149,7 +2203,11 @@ fn write_txstate(
                 claimed.map(|c| system_to_us(c.at)),
                 expand_generation,
                 payload,
-                "default",
+                tx.run_namespaces
+                    .get(&run_id)
+                    .map(String::as_str)
+                    .or_else(|| preserved.map(|p| p.namespace_id.as_str()))
+                    .unwrap_or(DEFAULT_NAMESPACE),
                 pool_key,
                 priority,
                 run_order,
@@ -2171,8 +2229,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -2185,8 +2241,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             true,
             job.run_id,
             &job.job_id,
@@ -2199,8 +2253,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -2213,8 +2265,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -2227,8 +2277,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -2248,8 +2296,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             false,
             *run_id,
             job_id,
@@ -2262,8 +2308,6 @@ fn write_txstate(
             conn,
             tx,
             &mut seen_jobs,
-            &mut next_seq,
-            &mut next_pos,
             false,
             *run_id,
             job_id,
@@ -2277,8 +2321,6 @@ fn write_txstate(
                 conn,
                 tx,
                 &mut seen_jobs,
-                &mut next_seq,
-                &mut next_pos,
                 false,
                 *run_id,
                 &job.job_id,
@@ -2296,8 +2338,6 @@ fn write_txstate(
                     conn,
                     tx,
                     &mut seen_jobs,
-                    &mut next_seq,
-                    &mut next_pos,
                     false,
                     *run_id,
                     job_id,

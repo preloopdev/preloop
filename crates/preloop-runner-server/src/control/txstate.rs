@@ -31,6 +31,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 pub(crate) struct TxState {
     // ── Runs and queue collections ────────────────────────────────────
     pub(crate) runs: BTreeMap<RunId, RunRecord>,
+    /// Tenant identity persisted alongside each run, including scoped
+    /// foreign runs selected through the ready queue.
+    pub(crate) run_namespaces: BTreeMap<RunId, String>,
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
     /// Ready-queue jobs *in this working set*. The global queue is the
     /// `jobs` table (`queue_kind='ready'` ordered by `queue_position`); this
@@ -45,14 +48,9 @@ pub(crate) struct TxState {
     /// Global ready-queue size at load time, adjusted as this transaction
     /// pushes/pops — reported back for the supervisor atomic.
     pub(crate) ready_count: i64,
-    /// Next free `queue_position` for newly enqueued jobs.
-    pub(crate) next_queue_position: i64,
-    /// Next free `seq` (global write-order counter) for newly inserted jobs —
-    /// `MAX(seq)+1` at load, so a new row sorts after every preserved one.
-    pub(crate) next_seq: i64,
-    /// `runs-on` labels of the global ready-queue front, captured unscoped at
-    /// load (`ORDER BY queue_position LIMIT 1`). Pool scaling reads this; a
-    /// scoped `ready_index` head would name the wrong platform.
+    /// `runs-on` labels of the global ready-queue front, captured unscoped.
+    /// Pool scaling reads this; a scoped `ready_index` head can name the
+    /// wrong platform.
     pub(crate) next_queue_labels: Vec<String>,
     /// Whether the global ready queue was loaded into `ready_index` this
     /// transaction (`scope.ready_queue`). When true, `next_job_labels` reads
@@ -162,11 +160,8 @@ pub(crate) struct TxState {
     pub(crate) side: TxSideEffects,
 }
 
-/// The persisted `(status, queue_position, seq)` of one `jobs` row at load.
-/// Restored verbatim on write-back for jobs whose run the scope did not load
-/// (widened in by a global queue-kind clause), so a scoped write leaves
-/// foreign rows byte-identical instead of recomputing status/position/seq.
-#[derive(Clone, Copy)]
+/// Persisted columns of a loaded job, preserved for widened foreign rows.
+#[derive(Clone)]
 pub(crate) struct JobRowState {
     pub(crate) status: ExecutionStatus,
     pub(crate) queue_position: Option<i64>,
@@ -175,6 +170,8 @@ pub(crate) struct JobRowState {
     pub(crate) run_order: i64,
     pub(crate) job_order: i64,
     pub(crate) not_before_us: Option<i64>,
+    pub(crate) namespace_id: String,
+    pub(crate) pool_key: String,
 }
 
 /// Rows loaded into a [`TxState`], used to compute deletions at write-back:
@@ -225,9 +222,8 @@ pub(crate) struct LoadedRows {
 ///   unhostable_platform), `concurrency_*`/`holder_keys`/`jobset_*` (a different
 ///   run's release unblocks a waiter), and `counters`/`workflow_run_counters`
 ///   (allocators must never read 0) load unconditionally.
-/// - **Global scalars are unscoped queries, not derived.** `ready_count`,
-///   `next_queue_position`, `next_queue_labels` come from `COUNT(*)`/`MAX`/
-///   `LIMIT 1` against the table — never from the loaded subset.
+/// - **Global scalars are unscoped queries.** `ready_count` and
+///   `next_queue_labels` come from the whole ready table, not the loaded set.
 /// - **Concurrency is always global.** `concurrency_groups`, `holder_keys`,
 ///   `jobset_admissions`, `jobset_ready` and `concurrency_blocked` jobs are
 ///   never run-scoped: a *different* run releasing a shared `(repo, group)`
@@ -240,9 +236,8 @@ pub(crate) struct LoadedRows {
 ///   `.retain`) only expires the loaded subset — stale bindings for unloaded
 ///   runs survive (the "leaked job bindings" failure mode). A narrow poll
 ///   scope must move expiry to an unscoped `DELETE WHERE at_us < cutoff`.
-/// - `queue_position`/`seq` are renumbered from 0 each transaction; a scoped
-///   write must allocate from the persisted `next_queue_position`, not
-///   recompute, or global FIFO order is lost.
+/// - FIFO positions/seqs come from atomic database counters. A scoped writer
+///   must never derive them from the subset it happened to load.
 #[derive(Debug, Clone)]
 pub(crate) struct TxScope {
     /// Run-scoped families (`runs`, `jobs`, `job_requests`, `run_concurrency`,

@@ -194,6 +194,7 @@ pub(crate) fn submit_run_tx(
     } else {
         ExecutionStatus::Queued
     };
+    tx.run_namespaces.insert(run_id, submit.namespace);
     tx.runs.insert(run_id, record.clone());
     if let Some(wf) = &submit.workflow_concurrency {
         tx.run_concurrency.insert(run_id, wf.raw.clone());

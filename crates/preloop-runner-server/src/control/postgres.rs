@@ -131,6 +131,29 @@ impl PostgresBackend {
             )
             .await
             .map_err(ControlError::backend)?;
+        let missing_pool_keys = client
+            .query(
+                "SELECT run_id, job_id, runs_on, runner_group FROM jobs WHERE pool_key=''",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        for row in missing_pool_keys {
+            let run_id: String = row.get(0);
+            let job_id: String = row.get(1);
+            let labels_json: String = row.get(2);
+            let group: Option<String> = row.get(3);
+            let labels: Vec<String> =
+                serde_json::from_str(&labels_json).map_err(ControlError::backend)?;
+            let key = compute_pool_key(&labels, group.as_deref());
+            client
+                .execute(
+                    "UPDATE jobs SET pool_key=$1 WHERE run_id=$2 AND job_id=$3",
+                    &[&key, &run_id, &job_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+        }
         // A small pool of read connections. Read-only commands check one
         // out and run a `BEGIN` read transaction, so a read never queues
         // behind the writer's mutex.
@@ -842,14 +865,14 @@ async fn load_txstate(
             Vec::new()
         } else {
             conn.query(
-                "SELECT run_id, record_blob FROM runs WHERE run_id = ANY($1)",
+                "SELECT run_id, record_blob, namespace FROM runs WHERE run_id = ANY($1)",
                 &[&run_ids],
             )
             .await
             .map_err(ControlError::backend)?
         }
     } else {
-        conn.query("SELECT run_id, record_blob FROM runs", &[])
+        conn.query("SELECT run_id, record_blob, namespace FROM runs", &[])
             .await
             .map_err(ControlError::backend)?
     };
@@ -859,6 +882,7 @@ async fn load_txstate(
         let run_id = parse_run_id(&run_id_s);
         let mut run: RunRecord = blob(cipher, &record)?;
         run.jobs.clear();
+        tx.run_namespaces.insert(run_id, row.get(2));
         tx.runs.insert(run_id, run);
         tx.loaded.runs.insert(run_id);
     }
@@ -878,7 +902,7 @@ async fn load_txstate(
     let jobs_rows = {
         let base = "SELECT run_id, job_id, status, queue_kind, queue_position, seq, \
              reaper_first_seen_us, expand_generation, enqueued_at_us, payload_blob, \
-             priority, run_order, job_order, not_before_us FROM jobs";
+             priority, run_order, job_order, not_before_us, namespace_id, pool_key FROM jobs";
         // `runs == None` means the run predicate is TRUE, which makes the
         // whole OR true — emit no WHERE and load every job. Only when the
         // scope names a run set do the queue-kind clauses matter.
@@ -896,10 +920,15 @@ async fn load_txstate(
                 conds.push(format!("queue_kind = ANY(${})", params.len()));
             }
         }
+        let order = " ORDER BY CASE WHEN queue_kind='ready' THEN 0 ELSE 1 END, \
+                     CASE WHEN queue_kind='ready' THEN -priority ELSE 0 END, \
+                     CASE WHEN queue_kind='ready' THEN run_order ELSE 0 END, \
+                     CASE WHEN queue_kind='ready' THEN job_order ELSE 0 END, \
+                     seq, run_id, job_id";
         let sql = if conds.is_empty() {
-            format!("{base} ORDER BY seq")
+            format!("{base}{order}")
         } else {
-            format!("{base} WHERE {} ORDER BY seq", conds.join(" OR "))
+            format!("{base} WHERE {}{order}", conds.join(" OR "))
         };
         conn.query(&sql, &params)
             .await
@@ -920,6 +949,8 @@ async fn load_txstate(
         let run_order: Option<i64> = row.get(11);
         let job_order: Option<i64> = row.get(12);
         let not_before_us: Option<i64> = row.get(13);
+        let namespace_id: String = row.get(14);
+        let pool_key: String = row.get(15);
         let run_id = parse_run_id(&run_id_s);
         let job_id = JobId(job_id_s);
         let status = status_parse(&status);
@@ -936,6 +967,8 @@ async fn load_txstate(
                 run_order: run_order.unwrap_or(0),
                 job_order: job_order.unwrap_or(0),
                 not_before_us,
+                namespace_id,
+                pool_key,
             },
         );
         if let Some(run) = tx.runs.get_mut(&run_id) {
@@ -987,24 +1020,11 @@ async fn load_txstate(
         .await
         .map(|r| r.get(0))
         .unwrap_or(0);
-    tx.next_queue_position = conn
-        .query_one(
-            "SELECT COALESCE(MAX(queue_position),0)+1 FROM jobs WHERE queue_kind='ready'",
-            &[],
-        )
-        .await
-        .map(|r| r.get(0))
-        .unwrap_or(1);
-    tx.next_seq = conn
-        .query_one("SELECT COALESCE(MAX(seq),0)+1 FROM jobs", &[])
-        .await
-        .map(|r| r.get(0))
-        .unwrap_or(1);
     // Global queue-front labels — unscoped, for pool next-image selection.
     tx.next_queue_labels = conn
         .query_opt(
             "SELECT payload_blob FROM jobs WHERE queue_kind='ready' \
-             ORDER BY queue_position LIMIT 1",
+             ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id LIMIT 1",
             &[],
         )
         .await
@@ -1660,6 +1680,17 @@ async fn delete_scoped_queue(
 // ─────────────────────────────────────────────────────────────────────────
 // Write-back: TxState delta → rows
 // ─────────────────────────────────────────────────────────────────────────
+async fn alloc_job_counter(conn: &Tx<'_>, name: &str) -> Result<i64, ControlError> {
+    conn.query_one(
+        "INSERT INTO counters(name,value) VALUES ($1,2) \
+         ON CONFLICT(name) DO UPDATE SET value=counters.value+1 RETURNING value-1",
+        &[&name],
+    )
+    .await
+    .map(|row| row.get(0))
+    .map_err(ControlError::backend)
+}
+
 async fn write_txstate(
     conn: &Tx<'_>,
     tx: &TxState,
@@ -1677,8 +1708,8 @@ async fn write_txstate(
         conn.execute(
             "INSERT INTO runs (run_id, status, run_number, run_attempt, run_name, event, \
              workflow_path, conclusion, webhook_delivery_id, record_blob, created_at_us, \
-             started_at_us, completed_at_us) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             started_at_us, completed_at_us, namespace) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
              ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, \
              conclusion=excluded.conclusion, record_blob=excluded.record_blob, \
              started_at_us=excluded.started_at_us, completed_at_us=excluded.completed_at_us",
@@ -1696,6 +1727,10 @@ async fn write_txstate(
                 &system_to_us(run.created_at.into()),
                 &run.started_at.map(|t| system_to_us(t.into())),
                 &run.completed_at.map(|t| system_to_us(t.into())),
+                &tx.run_namespaces
+                    .get(run_id)
+                    .map(String::as_str)
+                    .unwrap_or(DEFAULT_NAMESPACE),
             ],
         )
         .await
@@ -1711,10 +1746,6 @@ async fn write_txstate(
 
     // Jobs.
     let mut seen_jobs: BTreeSet<(RunId, JobId)> = BTreeSet::new();
-    // Fresh position/seq allocators for genuinely new jobs (those not in
-    // `job_row_state`); existing jobs keep their loaded values via write_job.
-    let mut next_pos = tx.next_queue_position;
-    let mut next_seq = tx.next_seq;
 
     // Resolves `queue_position`/`seq` from `fresh` (newly enqueued/requeued
     // via `tx.queue`), the persisted kind in `tx.loaded.jobs` vs the written
@@ -1724,8 +1755,6 @@ async fn write_txstate(
     async fn write_job(
         conn: &Tx<'_>,
         tx: &TxState,
-        next_seq: &mut i64,
-        next_pos: &mut i64,
         fresh: bool,
         run_id: RunId,
         job_id: &JobId,
@@ -1742,12 +1771,9 @@ async fn write_txstate(
                 None => (None, 0),
             }
         } else {
-            let s = *next_seq;
-            *next_seq += 1;
+            let s = alloc_job_counter(conn, "next_job_seq").await?;
             let p = if kind == QueueKind::Ready {
-                let v = *next_pos;
-                *next_pos += 1;
-                Some(v)
+                Some(alloc_job_counter(conn, "next_queue_position").await?)
             } else {
                 None
             };
@@ -1774,29 +1800,30 @@ async fn write_txstate(
             Some(j) => {
                 crate::control::types::compute_pool_key(&j.runs_on, j.runner_group.as_deref())
             }
-            None => String::new(),
+            None => preserved.map(|p| p.pool_key.clone()).unwrap_or_default(),
         };
         let run_order = preserved.map(|p| p.run_order).unwrap_or_else(|| {
             tx.runs
                 .get(&run_id)
-                .map(|r| r.run_number as i64)
+                .map(|r| r.created_at.timestamp_micros())
                 .unwrap_or(0)
         });
-        let job_order = if same_slot {
-            preserved.map(|p| p.job_order).unwrap_or(0)
-        } else {
+        let job_order = if kind == QueueKind::Ready && !same_slot {
             position.unwrap_or(0)
+        } else {
+            preserved.map(|p| p.job_order).unwrap_or(0)
         };
         let priority = preserved.map(|p| p.priority).unwrap_or(0);
         let not_before_us = preserved.and_then(|p| p.not_before_us);
-        let is_initial_insert = !tx.loaded.jobs.contains_key(&key);
         let (base_id, runs_on, runner_group, enqueued_us, payload) = match job {
             Some(j) => (
                 j.base_id.clone(),
                 serde_json::to_string(&j.runs_on).unwrap_or_default(),
                 j.runner_group.clone(),
                 Some(j.enqueued_at_unix_nanos / 1000),
-                if is_initial_insert {
+                // Promotion/requeue changes timestamps inside QueuedJob.
+                // Only a same-slot write can reuse the sealed payload.
+                if !same_slot {
                     Some(unblob(cipher, j)?)
                 } else {
                     None
@@ -1846,7 +1873,11 @@ async fn write_txstate(
                 &claimed.map(|c| system_to_us(c.at)),
                 &expand_generation,
                 &payload,
-                &"default",
+                &tx.run_namespaces
+                    .get(&run_id)
+                    .map(String::as_str)
+                    .or_else(|| preserved.map(|p| p.namespace_id.as_str()))
+                    .unwrap_or(DEFAULT_NAMESPACE),
                 &pool_key,
                 &priority,
                 &run_order,
@@ -1865,8 +1896,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -1881,8 +1910,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             true,
             job.run_id,
             &job.job_id,
@@ -1897,8 +1924,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -1913,8 +1938,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -1929,8 +1952,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             false,
             job.run_id,
             &job.job_id,
@@ -1948,8 +1969,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             false,
             *run_id,
             job_id,
@@ -1964,8 +1983,6 @@ async fn write_txstate(
         write_job(
             conn,
             tx,
-            &mut next_seq,
-            &mut next_pos,
             false,
             *run_id,
             job_id,
@@ -1981,8 +1998,6 @@ async fn write_txstate(
             write_job(
                 conn,
                 tx,
-                &mut next_seq,
-                &mut next_pos,
                 false,
                 *run_id,
                 &job.job_id,
@@ -2000,8 +2015,6 @@ async fn write_txstate(
                 write_job(
                     conn,
                     tx,
-                    &mut next_seq,
-                    &mut next_pos,
                     false,
                     *run_id,
                     job_id,
