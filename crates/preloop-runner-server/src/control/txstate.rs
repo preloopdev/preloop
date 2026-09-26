@@ -78,7 +78,7 @@ pub(crate) struct TxState {
     pub(crate) expanding: BTreeSet<(RunId, JobId)>,
     /// Payloads of claimed-but-unapplied expansion nodes, kept at load so a
     /// crash recovery can push them back onto `pending_expansions` instead
-    /// of losing the node (the row's `payload_blob` survives write-back).
+    /// of losing the node (the row's payload columns and sealed message survive write-back).
     pub(crate) expanding_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
     /// Generation this transaction claimed each expanding node under.
     pub(crate) expand_generations: BTreeMap<(RunId, JobId), i64>,
@@ -203,6 +203,9 @@ pub(crate) struct LoadedRows {
     /// so a step transition is a one-row upsert and untouched steps are never
     /// rewritten.
     pub(crate) steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
+    /// Run records as loaded, decomposed into their table rows. Write-back
+    /// diffs against these so only changed runs/jobs/submissions are written.
+    pub(crate) run_parts: BTreeMap<RunId, super::rows::RunParts>,
     pub(crate) holder_key_runs: BTreeSet<RunId>,
     /// Counters loaded (name → value at load).
     pub(crate) counters: BTreeMap<String, i64>,

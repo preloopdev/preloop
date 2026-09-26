@@ -849,7 +849,7 @@ pub async fn complete_job_inner(
         // `ready_queue`/`blocked_jobs` stay unloaded: `complete_job`
         // promotes `pending_jobs`, and `needs:` never cross runs, so this
         // run's own pending rows already load via the `runs` clause.
-        // Loading every queued/blocked `payload_blob` is O(#queued) per
+        // Loading every queued/blocked job payload is O(#queued) per
         // completion for no benefit. `queue_nonempty`/`next_runs_on` read
         // the O(1) `ready_index`/`next_queue_labels` snapshots.
         ready_queue: false,
@@ -1078,7 +1078,7 @@ pub async fn complete_job_inner(
         .read_scoped(
             // No queue families: `ready_count`/`next_queue_labels` are O(1)
             // SQL snapshots — loading `ready_queue` would parse every queued
-            // `payload_blob` per completion.
+            // job payload per completion.
             &crate::control::txstate::TxScope::runs(Default::default()),
             |tx| {
                 Ok((

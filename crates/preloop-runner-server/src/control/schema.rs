@@ -41,7 +41,13 @@
 /// - 13: terminal-run archive switch and history tables.
 /// - 14: concurrency gates as rows (holds/waits/jobset_gates); legacy blob tables dropped.
 /// - 15: step manifests as rows (`job_steps`, `step_history`); step blobs dropped.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 15;
+/// - 16: job payload as columns + `job_needs` + sealed `job_messages`;
+///   `jobs.payload_blob` dropped. In-flight payloads are not carried over:
+///   upgrade with a drained queue.
+/// - 17: run record decomposed into `runs` columns, `run_submissions`
+///   (secrets sealed), `run_jobs`, `run_base_jobs`, `reusable_calls`;
+///   `runs.record_blob` dropped. Pre-v17 runs keep their scalar columns only.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 17;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -342,6 +348,73 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
          DROP TABLE attempt_history;
          ALTER TABLE attempt_history_v15 RENAME TO attempt_history;",
     ),
+    (
+        16,
+        "CREATE TABLE jobs_v16 (
+            run_id              TEXT NOT NULL,
+            job_id              TEXT NOT NULL,
+            status              TEXT NOT NULL,
+            queue_kind          TEXT NOT NULL DEFAULT 'none',
+            queue_position      INTEGER,
+            seq                 INTEGER,
+            base_id             TEXT NOT NULL DEFAULT '',
+            runs_on             TEXT NOT NULL DEFAULT '[]',
+            runner_group        TEXT,
+            enqueued_at_us      INTEGER,
+            reaper_first_seen_us INTEGER,
+            claimed_by          INTEGER,
+            claimed_at_us       INTEGER,
+            expand_generation   INTEGER NOT NULL DEFAULT 0,
+            created_at_ns       INTEGER,
+            deps_ready_at_ns    INTEGER,
+            concurrency_wait_at_ns INTEGER,
+            concurrency_acquired_at_ns INTEGER,
+            if_condition        TEXT,
+            max_parallel        INTEGER,
+            environment_json    TEXT,
+            concurrency_json    TEXT,
+            matrix_json         TEXT NOT NULL DEFAULT '{}',
+            deferred_matrix     TEXT,
+            reusable_call_json  TEXT,
+            namespace_id        TEXT NOT NULL DEFAULT 'default',
+            priority            INTEGER NOT NULL DEFAULT 0,
+            run_order           INTEGER NOT NULL DEFAULT 0,
+            job_order           INTEGER NOT NULL DEFAULT 0,
+            pool_key            TEXT NOT NULL DEFAULT '',
+            not_before_us       INTEGER,
+            PRIMARY KEY (run_id, job_id),
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+         );
+         INSERT INTO jobs_v16 (run_id, job_id, status, queue_kind, queue_position, seq, base_id, runs_on, runner_group, enqueued_at_us, reaper_first_seen_us, claimed_by, claimed_at_us, expand_generation, namespace_id, priority, run_order, job_order, pool_key, not_before_us) SELECT run_id, job_id, status, queue_kind, queue_position, seq, base_id, runs_on, runner_group, enqueued_at_us, reaper_first_seen_us, claimed_by, claimed_at_us, expand_generation, namespace_id, priority, run_order, job_order, pool_key, not_before_us FROM jobs;
+         DROP TABLE jobs;
+         ALTER TABLE jobs_v16 RENAME TO jobs;",
+    ),
+    (
+        17,
+        "CREATE TABLE runs_v17 (
+            run_id              TEXT PRIMARY KEY NOT NULL,
+            namespace           TEXT NOT NULL DEFAULT 'default',
+            status              TEXT NOT NULL,
+            run_number          INTEGER NOT NULL,
+            run_attempt         INTEGER NOT NULL DEFAULT 1,
+            run_name            TEXT,
+            event               TEXT NOT NULL DEFAULT '',
+            workflow_path       TEXT NOT NULL DEFAULT '',
+            conclusion          TEXT,
+            webhook_delivery_id TEXT,
+            head_sha            TEXT NOT NULL DEFAULT '',
+            workflow_ref        TEXT NOT NULL DEFAULT '',
+            push_state_json     TEXT,
+            snapshot_timing_json TEXT,
+            created_at_us       INTEGER NOT NULL,
+            started_at_us       INTEGER,
+            completed_at_us     INTEGER,
+            archived_at_us      INTEGER
+         );
+         INSERT INTO runs_v17 (run_id, namespace, status, run_number, run_attempt, run_name, event, workflow_path, conclusion, webhook_delivery_id, created_at_us, started_at_us, completed_at_us, archived_at_us) SELECT run_id, namespace, status, run_number, run_attempt, run_name, event, workflow_path, conclusion, webhook_delivery_id, created_at_us, started_at_us, completed_at_us, archived_at_us FROM runs;
+         DROP TABLE runs;
+         ALTER TABLE runs_v17 RENAME TO runs;",
+    ),
 ];
 
 /// The SQLite DDL, applied as one migration. `IF NOT EXISTS` makes it
@@ -368,10 +441,10 @@ CREATE TABLE IF NOT EXISTS runs (
     workflow_path       TEXT NOT NULL DEFAULT '',
     conclusion          TEXT,
     webhook_delivery_id TEXT,                       -- dedup key for replays
-    -- The full RunRecord minus the derived `jobs` map, as sealed JSON.
-    -- Contains submission, github, head_sha, workflow_ref, snapshot,
-    -- caller_plans, reusable_calls, job_* maps, timestamps, push_state.
-    record_blob         BLOB NOT NULL,
+    head_sha            TEXT NOT NULL DEFAULT '',
+    workflow_ref        TEXT NOT NULL DEFAULT '',
+    push_state_json     TEXT,
+    snapshot_timing_json TEXT,
     created_at_us       INTEGER NOT NULL,
     started_at_us       INTEGER,
     completed_at_us     INTEGER,
@@ -382,6 +455,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id, wor
     WHERE webhook_delivery_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS runs_archive_pending ON runs(completed_at_us, run_id)
     WHERE archived_at_us IS NULL AND completed_at_us IS NOT NULL;
+-- The request a run was created from. Only secret values are sealed;
+-- everything else is plain JSON so operators can inspect it.
+CREATE TABLE IF NOT EXISTS run_submissions (
+    run_id              TEXT PRIMARY KEY NOT NULL,
+    submission_json     TEXT NOT NULL,              -- WorkflowSubmission minus secrets
+    secrets_blob        BLOB NOT NULL,           -- sealed secret name -> value map
+    github_json         TEXT NOT NULL,              -- github context at submission
+    workspace_snapshot_json TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+-- Per-job workflow facts, one row per job id in the run (including caller
+-- and planned jobs that never get a dispatch row). Columns are NULL when
+-- the fact does not apply to the job.
+CREATE TABLE IF NOT EXISTS run_jobs (
+    run_id              TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    base_id             TEXT,
+    display_name        TEXT,
+    needs_json          TEXT,
+    outputs_json        TEXT,
+    check_run_id        INTEGER,
+    detail_json         TEXT,                       -- JobDetail (annotations, conclusion)
+    detail_position     INTEGER,
+    caller_plan_json    TEXT,                       -- deferred reusable caller plan
+    PRIMARY KEY (run_id, job_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+-- Per base-job strategy flags (keyed by the matrix base id).
+CREATE TABLE IF NOT EXISTS run_base_jobs (
+    run_id              TEXT NOT NULL,
+    base_id             TEXT NOT NULL,
+    fail_fast           INTEGER,
+    continue_on_error   INTEGER,
+    PRIMARY KEY (run_id, base_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+-- Reusable-workflow callers and the inner jobs they expanded into.
+CREATE TABLE IF NOT EXISTS reusable_calls (
+    run_id              TEXT NOT NULL,
+    caller_job_id       TEXT NOT NULL,
+    metadata_json       TEXT NOT NULL,              -- ReusableCallMetadata
+    PRIMARY KEY (run_id, caller_job_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
 
 -- ── Jobs ─────────────────────────────────────────────────────────────
 -- One row per (run, logical job). `status` is canonical workflow truth;
@@ -403,7 +520,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     claimed_by          INTEGER,                    -- runner_id holding claim
     claimed_at_us       INTEGER,                    -- when the claim was taken
     expand_generation   INTEGER NOT NULL DEFAULT 0, -- expansion fencing
-    payload_blob        BLOB,                       -- QueuedJob (sealed JSON)
+    created_at_ns       INTEGER,                    -- job creation (ns)
+    deps_ready_at_ns    INTEGER,                    -- `needs:` satisfied (ns)
+    concurrency_wait_at_ns INTEGER,                 -- first gate wait (ns)
+    concurrency_acquired_at_ns INTEGER,             -- gate admitted (ns)
+    if_condition        TEXT,
+    max_parallel        INTEGER,
+    environment_json    TEXT,
+    concurrency_json    TEXT,                       -- raw job-level concurrency
+    matrix_json         TEXT NOT NULL DEFAULT '{}',
+    deferred_matrix     TEXT,                       -- dynamic matrix expression
+    reusable_call_json  TEXT,                       -- deferred `uses:` plan
     namespace_id        TEXT NOT NULL DEFAULT 'default',
     priority            INTEGER NOT NULL DEFAULT 0,
     run_order           INTEGER NOT NULL DEFAULT 0,
@@ -421,6 +548,28 @@ CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
     WHERE queue_kind = 'ready';
 -- Per-run scans (cancel, fail-fast, promote).
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
+-- `needs:` edges, one row per dependency in declaration order. The reverse
+-- index answers "who waits on X" when X settles.
+CREATE TABLE IF NOT EXISTS job_needs (
+    run_id              TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    position            INTEGER NOT NULL,
+    needs_job_id        TEXT NOT NULL,
+    PRIMARY KEY (run_id, job_id, position),
+    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS job_needs_reverse ON job_needs(run_id, needs_job_id);
+-- The runner-bound message and the `if:` evaluation context both embed
+-- secrets, so they are the only sealed part of a job. Replayed verbatim,
+-- never queried.
+CREATE TABLE IF NOT EXISTS job_messages (
+    run_id              TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    message_blob        BLOB NOT NULL,           -- sealed AgentJobRequestMessage
+    condition_context_blob BLOB NOT NULL,        -- sealed expression Context
+    PRIMARY KEY (run_id, job_id),
+    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+);
 
 -- Terminal runs move into these tables atomically. Runner-facing payloads
 -- and request message blobs contain credentials and are not archived.
@@ -761,7 +910,10 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 12: terminal-run archive switch and history tables.
 /// - 13: concurrency gates as rows (holds/waits/jobset_gates); legacy blob tables dropped.
 /// - 14: step manifests as rows (`job_steps`, `step_history`); step blobs dropped.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 14;
+/// - 15: job payload as columns + `job_needs` + sealed `job_messages`;
+///   `jobs.payload_blob` dropped (upgrade with a drained queue).
+/// - 16: run record decomposed (see SQLite v17); `runs.record_blob` dropped.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 16;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -884,6 +1036,29 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
         "DROP TABLE IF EXISTS control.job_steps;
          ALTER TABLE control.attempt_history DROP COLUMN IF EXISTS steps_blob;",
     ),
+    (
+        15,
+        "ALTER TABLE control.jobs DROP COLUMN IF EXISTS payload_blob;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS created_at_ns BIGINT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS deps_ready_at_ns BIGINT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS concurrency_wait_at_ns BIGINT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS concurrency_acquired_at_ns BIGINT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS if_condition TEXT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS max_parallel BIGINT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS environment_json TEXT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS concurrency_json TEXT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS matrix_json TEXT NOT NULL DEFAULT '{}';
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS deferred_matrix TEXT;
+         ALTER TABLE control.jobs ADD COLUMN IF NOT EXISTS reusable_call_json TEXT;",
+    ),
+    (
+        16,
+        "ALTER TABLE control.runs DROP COLUMN IF EXISTS record_blob;
+         ALTER TABLE control.runs ADD COLUMN IF NOT EXISTS head_sha TEXT NOT NULL DEFAULT '';
+         ALTER TABLE control.runs ADD COLUMN IF NOT EXISTS workflow_ref TEXT NOT NULL DEFAULT '';
+         ALTER TABLE control.runs ADD COLUMN IF NOT EXISTS push_state_json TEXT;
+         ALTER TABLE control.runs ADD COLUMN IF NOT EXISTS snapshot_timing_json TEXT;",
+    ),
 ];
 
 /// The Postgres DDL: the same table families as [`SQLITE_DDL`] in Postgres
@@ -920,7 +1095,10 @@ CREATE TABLE IF NOT EXISTS runs (
     workflow_path       TEXT NOT NULL DEFAULT '',
     conclusion          TEXT,
     webhook_delivery_id TEXT,
-    record_blob         BYTEA NOT NULL,
+    head_sha            TEXT NOT NULL DEFAULT '',
+    workflow_ref        TEXT NOT NULL DEFAULT '',
+    push_state_json     TEXT,
+    snapshot_timing_json TEXT,
     created_at_us       BIGINT NOT NULL,
     started_at_us       BIGINT,
     completed_at_us     BIGINT,
@@ -931,6 +1109,50 @@ CREATE UNIQUE INDEX IF NOT EXISTS runs_delivery ON runs(webhook_delivery_id, wor
     WHERE webhook_delivery_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS runs_archive_pending ON runs(completed_at_us, run_id)
     WHERE archived_at_us IS NULL AND completed_at_us IS NOT NULL;
+-- The request a run was created from. Only secret values are sealed;
+-- everything else is plain JSON so operators can inspect it.
+CREATE TABLE IF NOT EXISTS run_submissions (
+    run_id              TEXT PRIMARY KEY,
+    submission_json     TEXT NOT NULL,              -- WorkflowSubmission minus secrets
+    secrets_blob        BYTEA NOT NULL,           -- sealed secret name -> value map
+    github_json         TEXT NOT NULL,              -- github context at submission
+    workspace_snapshot_json TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+-- Per-job workflow facts, one row per job id in the run (including caller
+-- and planned jobs that never get a dispatch row). Columns are NULL when
+-- the fact does not apply to the job.
+CREATE TABLE IF NOT EXISTS run_jobs (
+    run_id              TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    base_id             TEXT,
+    display_name        TEXT,
+    needs_json          TEXT,
+    outputs_json        TEXT,
+    check_run_id        BIGINT,
+    detail_json         TEXT,                       -- JobDetail (annotations, conclusion)
+    detail_position     BIGINT,
+    caller_plan_json    TEXT,                       -- deferred reusable caller plan
+    PRIMARY KEY (run_id, job_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+-- Per base-job strategy flags (keyed by the matrix base id).
+CREATE TABLE IF NOT EXISTS run_base_jobs (
+    run_id              TEXT NOT NULL,
+    base_id             TEXT NOT NULL,
+    fail_fast           BIGINT,
+    continue_on_error   BIGINT,
+    PRIMARY KEY (run_id, base_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+-- Reusable-workflow callers and the inner jobs they expanded into.
+CREATE TABLE IF NOT EXISTS reusable_calls (
+    run_id              TEXT NOT NULL,
+    caller_job_id       TEXT NOT NULL,
+    metadata_json       TEXT NOT NULL,              -- ReusableCallMetadata
+    PRIMARY KEY (run_id, caller_job_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
 
 -- ── Jobs ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS jobs (
@@ -948,7 +1170,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     claimed_by          BIGINT,
     claimed_at_us       BIGINT,
     expand_generation   BIGINT NOT NULL DEFAULT 0,
-    payload_blob        BYTEA,
+    created_at_ns       BIGINT,
+    deps_ready_at_ns    BIGINT,
+    concurrency_wait_at_ns BIGINT,
+    concurrency_acquired_at_ns BIGINT,
+    if_condition        TEXT,
+    max_parallel        BIGINT,
+    environment_json    TEXT,
+    concurrency_json    TEXT,
+    matrix_json         TEXT NOT NULL DEFAULT '{}',
+    deferred_matrix     TEXT,
+    reusable_call_json  TEXT,
     namespace_id        TEXT NOT NULL DEFAULT 'default',
     priority            SMALLINT NOT NULL DEFAULT 0,
     run_order           BIGINT NOT NULL DEFAULT 0,
@@ -964,6 +1196,28 @@ CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(pool_key, namespace_id, priority D
 CREATE INDEX IF NOT EXISTS jobs_ready_pos ON jobs(queue_position)
     WHERE queue_kind = 'ready';
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id, queue_kind);
+-- `needs:` edges, one row per dependency in declaration order. The reverse
+-- index answers "who waits on X" when X settles.
+CREATE TABLE IF NOT EXISTS job_needs (
+    run_id              TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    position            BIGINT NOT NULL,
+    needs_job_id        TEXT NOT NULL,
+    PRIMARY KEY (run_id, job_id, position),
+    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS job_needs_reverse ON job_needs(run_id, needs_job_id);
+-- The runner-bound message and the `if:` evaluation context both embed
+-- secrets, so they are the only sealed part of a job. Replayed verbatim,
+-- never queried.
+CREATE TABLE IF NOT EXISTS job_messages (
+    run_id              TEXT NOT NULL,
+    job_id              TEXT NOT NULL,
+    message_blob        BYTEA NOT NULL,           -- sealed AgentJobRequestMessage
+    condition_context_blob BYTEA NOT NULL,        -- sealed expression Context
+    PRIMARY KEY (run_id, job_id),
+    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS job_history (
     namespace_id        TEXT NOT NULL,

@@ -69,6 +69,81 @@ fn run_record(run_id: RunId) -> RunRecord {
     }
 }
 
+/// A run record exercising every decomposed table: secrets, per-job maps,
+/// base-job flags, reusable calls, detail order and push/snapshot state.
+/// Timestamps are whole microseconds, the storage precision.
+fn rich_run(run_id: RunId) -> RunRecord {
+    let mut run = run_record(run_id);
+    let mut submission = submission();
+    submission.secrets.insert(
+        "DEPLOY_KEY".to_owned(),
+        preloop_gha_protocol::SecretString::new("rich-secret-value"),
+    );
+    submission.vars.insert("REGION".to_owned(), "eu".to_owned());
+    run.submission = Arc::new(submission);
+    run.webhook_delivery_id = Some("delivery-1".to_owned());
+    run.created_at = chrono::DateTime::from_timestamp_micros(1_700_000_000_000_001).unwrap();
+    let build = JobId("build".to_owned());
+    let test = JobId("test (linux)".to_owned());
+    run.job_base_ids.insert(build.clone(), "build".to_owned());
+    run.job_base_ids.insert(test.clone(), "test".to_owned());
+    run.job_names
+        .insert(test.clone(), "test / linux".to_owned());
+    run.job_needs.insert(test.clone(), vec![build.clone()]);
+    run.job_outputs.insert(
+        build.clone(),
+        BTreeMap::from([("artifact".to_owned(), serde_json::json!("a.tgz"))]),
+    );
+    run.job_check_run_ids.insert(build.clone(), 4242);
+    run.job_fail_fast.insert("test".to_owned(), false);
+    run.job_continue_on_error.insert("test".to_owned(), true);
+    // Detail order is display order and must survive (not key order).
+    run.jobs_list = ["test (linux)", "build"]
+        .into_iter()
+        .map(|job| crate::models::JobDetail {
+            job_id: job.to_owned(),
+            name: job.to_owned(),
+            conclusion: "success".to_owned(),
+            steps: Vec::new(),
+            annotations: vec![serde_json::json!({"message": "ok"})],
+        })
+        .collect();
+    run.snapshot_timing = Some(crate::models::SnapshotTiming {
+        duration_ms: 12,
+        object_count: 3,
+        pack_bytes: 99,
+    });
+    run.reusable_calls.insert(
+        "deploy".to_owned(),
+        serde_json::from_value(serde_json::json!({
+            "caller_job_id": "deploy",
+            "output_definitions": {"url": "${{ jobs.ship.outputs.url }}"},
+            "inner_job_ids": ["deploy / ship"],
+        }))
+        .unwrap(),
+    );
+    run
+}
+
+/// Run equality via the full persisted JSON form, which includes the
+/// `#[serde(skip)]` fields and exposes secret values.
+fn assert_same_run(actual: &RunRecord, expected: &RunRecord) {
+    let mut actual = actual.clone();
+    let mut expected = expected.clone();
+    actual.jobs.clear();
+    expected.jobs.clear();
+    let actual = crate::store::run_record_value(&actual).unwrap();
+    let expected = crate::store::run_record_value(&expected).unwrap();
+    for (key, want) in expected.as_object().unwrap() {
+        assert_eq!(
+            actual.get(key),
+            Some(want),
+            "run record field `{key}` must round-trip through its tables unchanged"
+        );
+    }
+    assert_eq!(actual, expected);
+}
+
 fn job_message(
     job_id: &str,
     request_id: i64,
@@ -111,6 +186,36 @@ fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
         deferred_matrix: None,
         reusable_call: None,
     }
+}
+
+/// A job exercising every decomposed payload column, `needs:` order and the
+/// sealed message/context. Timestamps are whole microseconds so the
+/// `enqueued_at_us` column round-trips exactly.
+fn rich_job(run_id: RunId, job_id: &str) -> QueuedJob {
+    let mut job = queued_job(run_id, job_id, 77);
+    job.created_at_unix_nanos = 1_700_000_000_000_001_000;
+    job.dependencies_ready_at_unix_nanos = Some(1_700_000_000_000_002_000);
+    job.concurrency_wait_started_at_unix_nanos = Some(1_700_000_000_000_003_000);
+    job.concurrency_acquired_at_unix_nanos = Some(1_700_000_000_000_004_000);
+    job.enqueued_at_unix_nanos = 1_700_000_000_000_005_000;
+    job.needs = vec![JobId("zeta".to_owned()), JobId("alpha".to_owned())];
+    job.if_condition = Some("${{ success() && matrix.os == 'linux' }}".to_owned());
+    job.max_parallel = Some(3);
+    job.runs_on = vec!["self-hosted".to_owned(), "linux".to_owned()];
+    job.runner_group = Some("builders".to_owned());
+    job.environment = Some(serde_json::json!({"name": "prod", "url": "https://x"}));
+    job.matrix = BTreeMap::from([("os".to_owned(), serde_json::json!("linux"))]);
+    job.deferred_matrix = Some("${{ fromJSON(needs.plan.outputs.m) }}".to_owned());
+    job
+}
+
+/// Payload equality via the serialized form (`QueuedJob` has no `PartialEq`).
+fn assert_same_job(actual: &QueuedJob, expected: &QueuedJob) {
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap(),
+        "job payload must round-trip through rows unchanged"
+    );
 }
 
 fn request_record(run_id: RunId, job_id: &str, request_id: i64) -> TaskAgentJobRequestRecord {
@@ -401,6 +506,29 @@ pub(crate) mod suite {
             .expect("secret must survive the round-trip");
         assert_eq!(secret.expose(), "s3cr3t-value");
         assert_ne!(secret.expose(), "<redacted>");
+    }
+
+    pub(crate) async fn run_record_round_trips_through_tables(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let expected = super::rich_run(run_id);
+        backend
+            .submit_run(SubmitRun {
+                namespace: "default".to_owned(),
+                record: expected.clone(),
+                jobs: vec![submit_job(run_id, "build", 1)],
+                workflow_concurrency: None,
+                empty_concurrency_group: false,
+                check_hostable: false,
+            })
+            .await
+            .unwrap();
+        let loaded = backend.run_record(run_id).await.unwrap();
+        super::assert_same_run(&loaded, &expected);
+        assert_eq!(
+            loaded.submission.secrets["DEPLOY_KEY"].expose(),
+            "rich-secret-value",
+            "sealed secrets must unseal on load"
+        );
     }
 
     pub(crate) async fn concurrency_gate_serializes_group(backend: &dyn ControlBackend) {
@@ -797,6 +925,67 @@ mod sqlite {
     }
 
     #[tokio::test]
+    async fn run_record_round_trips_through_tables() {
+        suite::run_record_round_trips_through_tables(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn job_payload_round_trips_through_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        let open = || {
+            SqliteBackend::open(
+                &path,
+                super::test_cipher(),
+                false,
+                false,
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap()
+        };
+        let run_id = RunId::new();
+        let expected = super::rich_job(run_id, "rich");
+        {
+            let backend = open();
+            backend
+                .submit_run(super::submit_run(
+                    run_id,
+                    vec![super::submit_job(run_id, "seed", 1)],
+                ))
+                .await
+                .unwrap();
+            let job = expected.clone();
+            backend
+                .transact(move |tx| {
+                    tx.pending_jobs.push_back(job);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // Reopen: the payload must come back from columns + edges + the
+        // sealed message alone.
+        let backend = open();
+        let loaded = backend
+            .read_scoped(&crate::control::txstate::TxScope::full(), |tx| {
+                Ok(tx
+                    .pending_jobs
+                    .iter()
+                    .find(|j| j.job_id.0 == "rich")
+                    .cloned())
+            })
+            .unwrap()
+            .expect("pending job must load");
+        super::assert_same_job(&loaded, &expected);
+        // `needs:` is a real relation: the reverse edge is plain SQL.
+        let waiters: Vec<String> = backend
+            .dump_tables()
+            .get("job_needs")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(waiters.len(), 2, "one row per needs edge");
+    }
+
+    #[tokio::test]
     async fn reconcile_recovers_orphaned_claim() {
         suite::reconcile_recovers_orphaned_claim(&SqliteBackend::in_memory().unwrap()).await;
     }
@@ -882,15 +1071,18 @@ mod sqlite {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The pre-v15 blob-shaped `job_steps` table. Historical migrations
-    /// (v8) rebuild this shape, so an old database built from the current
-    /// DDL must swap it back in before stamping an old `user_version`.
+    /// Pre-v15/v16 table shapes. Historical migrations (v8, v11) rebuild the
+    /// blob-shaped `job_steps` and copy `jobs.payload_blob`, so an old
+    /// database built from the current DDL must swap these back in before
+    /// stamping an old `user_version`.
     const PRE_V15_JOB_STEPS: &str = "DROP TABLE job_steps;
          CREATE TABLE job_steps (
              agent_job_id TEXT PRIMARY KEY,
              steps_blob   BLOB NOT NULL,
              revision     INTEGER NOT NULL DEFAULT 0
-         );";
+         );
+         ALTER TABLE jobs ADD COLUMN payload_blob BLOB;
+         ALTER TABLE runs ADD COLUMN record_blob BLOB;";
 
     /// v5 → v6 migration: a database created with `jobs.claim_generation`
     /// must open cleanly — the dead column is dropped and existing job rows
@@ -1065,6 +1257,7 @@ mod sqlite {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(crate::control::schema::SQLITE_DDL)
                 .unwrap();
+            conn.execute_batch(PRE_V15_JOB_STEPS).unwrap();
             conn.execute_batch(
                 "DROP INDEX runs_archive_pending;
                  ALTER TABLE runs DROP COLUMN archived_at_us;
@@ -1317,8 +1510,14 @@ mod sqlite {
         // Every sealed column across the schema must be ciphertext. The
         // marker byte 0x02 is the envelope version; plaintext JSON would
         // start with '{'.
-        for (table, column) in [("runs", "record_blob"), ("jobs", "payload_blob")] {
-            for blob in backend.raw_column(table, column) {
+        for (table, column) in [
+            ("run_submissions", "secrets_blob"),
+            ("job_messages", "message_blob"),
+            ("job_messages", "condition_context_blob"),
+        ] {
+            let blobs = backend.raw_column(table, column);
+            assert!(!blobs.is_empty(), "{table}.{column} has no rows to check");
+            for blob in blobs {
                 assert_eq!(blob.first(), Some(&0x02), "{table}.{column} not sealed");
                 let haystack = String::from_utf8_lossy(&blob);
                 assert!(
@@ -1327,11 +1526,20 @@ mod sqlite {
                 );
             }
         }
+        // Decomposed plain columns must never carry the secret either.
+        for (table, rows) in backend.dump_tables() {
+            for row in rows {
+                assert!(
+                    !row.contains("s3cr3t-at-rest-value"),
+                    "{table} leaked secret plaintext: {row}"
+                );
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Depth benchmark: seed N ready jobs, time `poll_session`. The load
-    /// deserializes every ready `payload_blob` to pick one claim — this is
+    /// decodes every ready job payload to pick one claim — this is
     /// the O(depth) cost the metadata-only ready index would remove. Run
     /// with `--ignored --nocapture` to see timings.
     #[tokio::test]
@@ -2343,6 +2551,46 @@ mod postgres {
     async fn concurrency_gate_serializes_group() {
         let (_pg, backend) = backend().await;
         suite::concurrency_gate_serializes_group(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn run_record_round_trips_through_tables() {
+        let (_pg, backend) = backend().await;
+        suite::run_record_round_trips_through_tables(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn job_payload_round_trips_through_rows() {
+        let (_pg, backend) = backend().await;
+        let run_id = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "seed", 1)],
+            ))
+            .await
+            .unwrap();
+        let expected = super::rich_job(run_id, "rich");
+        let job = expected.clone();
+        backend
+            .transact(move |tx| {
+                tx.pending_jobs.push_back(job);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let loaded = backend
+            .read_scoped(&crate::control::txstate::TxScope::full(), |tx| {
+                Ok(tx
+                    .pending_jobs
+                    .iter()
+                    .find(|j| j.job_id.0 == "rich")
+                    .cloned())
+            })
+            .await
+            .unwrap()
+            .expect("pending job must load");
+        super::assert_same_job(&loaded, &expected);
     }
 
     #[tokio::test]

@@ -432,21 +432,17 @@ impl PostgresBackend {
     ) -> Result<Option<RunRecord>, ControlError> {
         let client = self.checkout_reader().await?;
         let result = async {
-            let row = client
-                .query_opt(
-                    "SELECT run_id, record_blob FROM runs \
-                     WHERE webhook_delivery_id = $1 AND workflow_path = $2",
-                    &[&delivery_id, &workflow_path],
-                )
-                .await
-                .map_err(ControlError::backend)?;
-            let Some(row) = row else {
+            let Some((_, _, mut run, _)) = load_runs(
+                &client,
+                &self.cipher,
+                " WHERE webhook_delivery_id = $1 AND workflow_path = $2",
+                &[&delivery_id, &workflow_path],
+            )
+            .await?
+            .pop() else {
                 return Ok(None);
             };
-            let run_id_s: String = row.get(0);
-            let record: Vec<u8> = row.get(1);
-            let mut run: RunRecord = blob(&self.cipher, &record)?;
-            run.jobs.clear();
+            let run_id_s = run.run_id.0.to_string();
             let rows = client
                 .query(
                     "SELECT job_id, status FROM jobs WHERE run_id = $1",
@@ -568,7 +564,7 @@ impl PostgresBackend {
         let result = async {
             let rows = client
                 .query(
-                    "SELECT selected.run_id, selected.record_blob,
+                    "SELECT selected.run_id,
                             COALESCE(j.job_id,h.job_id), COALESCE(j.status,h.status),
                             COALESCE(j.queue_kind,'none'),
                             COALESCE((
@@ -584,7 +580,7 @@ impl PostgresBackend {
                                 ORDER BY ah.request_id DESC LIMIT 1
                             ))
                      FROM (
-                         SELECT run_id, record_blob, run_attempt, created_at_us, archived_at_us,
+                         SELECT run_id, run_attempt, created_at_us, archived_at_us,
                                 CASE WHEN status IN ('success','failure','skipped','cancelled')
                                      THEN 1 ELSE 0 END AS terminal_rank,
                                 COALESCE(completed_at_us, started_at_us, created_at_us) AS sort_at
@@ -609,7 +605,7 @@ impl PostgresBackend {
             // batched read instead of one decode per job.
             let attempts: Vec<String> = rows
                 .iter()
-                .filter_map(|row| row.get::<_, Option<String>>(5))
+                .filter_map(|row| row.get::<_, Option<String>>(4))
                 .collect();
             let mut steps: std::collections::BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>> =
                 std::collections::BTreeMap::new();
@@ -632,6 +628,15 @@ impl PostgresBackend {
                     steps.entry(agent).or_default().push(record);
                 }
             }
+            // The selected runs' records, assembled in one batched read.
+            let mut run_ids: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+            run_ids.dedup();
+            let mut records: std::collections::HashMap<String, RunRecord> =
+                load_runs(&client, &self.cipher, " WHERE run_id = ANY($1)", &[&run_ids])
+                    .await?
+                    .into_iter()
+                    .map(|(run_id, _, record, _)| (run_id.0.to_string(), record))
+                    .collect();
             let mut runs = Vec::new();
             let mut current_id: Option<String> = None;
             let mut current_run: Option<RunRecord> = None;
@@ -642,14 +647,13 @@ impl PostgresBackend {
                     if let Some(run) = current_run.take() {
                         runs.push(project_run_rows(run, std::mem::take(&mut current_jobs)));
                     }
-                    let record: Vec<u8> = row.get(1);
+                    current_run = records.remove(&run_id);
                     current_id = Some(run_id);
-                    current_run = Some(blob(&self.cipher, &record)?);
                 }
-                let job_id: Option<String> = row.get(2);
-                let status: Option<String> = row.get(3);
-                let queue_kind: Option<String> = row.get(4);
-                let agent: Option<String> = row.get(5);
+                let job_id: Option<String> = row.get(1);
+                let status: Option<String> = row.get(2);
+                let queue_kind: Option<String> = row.get(3);
+                let agent: Option<String> = row.get(4);
                 if let (Some(job_id), Some(status), Some(queue_kind)) = (job_id, status, queue_kind)
                 {
                     let job_steps = agent.and_then(|a| steps.get(&parse_uuid(&a)).cloned());
@@ -918,6 +922,415 @@ async fn write_step_delta(
     Ok(())
 }
 
+/// Load run records for the runs matching `filter` (a `WHERE …` clause over
+/// `runs` binding `params`, or empty for all) from their decomposed tables.
+/// Returns each run's namespace, its assembled record (the `jobs` status map
+/// empty — callers rebuild it from `jobs`) and the row snapshot write-back
+/// diffs against.
+async fn load_runs<C: tokio_postgres::GenericClient + Sync>(
+    conn: &C,
+    cipher: &store::Envelope,
+    filter: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<(RunId, String, RunRecord, super::rows::RunParts)>, ControlError> {
+    use super::rows::{RunBaseJobRow, RunJobRow, RunParts, RunScalars, RunSubmissionRow};
+    let default_submission = RunSubmissionRow {
+        submission_json:
+            serde_json::to_string(&preloop_gha_protocol::WorkflowSubmission::default())
+                .map_err(ControlError::backend)?,
+        secrets: std::collections::BTreeMap::new(),
+        github_json: "null".to_owned(),
+        workspace_snapshot_json: None,
+    };
+    let mut parts: std::collections::BTreeMap<String, (String, RunParts)> =
+        std::collections::BTreeMap::new();
+    for r in conn
+        .query(
+            &format!(
+                "SELECT run_id, namespace, status, run_number, run_attempt, run_name, event, \
+                 workflow_path, conclusion, webhook_delivery_id, head_sha, workflow_ref, \
+                 push_state_json, snapshot_timing_json, created_at_us, started_at_us, \
+                 completed_at_us FROM runs{filter}"
+            ),
+            params,
+        )
+        .await
+        .map_err(ControlError::backend)?
+    {
+        let status: String = r.get(2);
+        parts.insert(
+            r.get(0),
+            (
+                r.get(1),
+                RunParts {
+                    scalars: RunScalars {
+                        status: status_parse(&status),
+                        run_number: r.get(3),
+                        run_attempt: r.get(4),
+                        run_name: r.get(5),
+                        event: r.get(6),
+                        workflow_path: r.get(7),
+                        conclusion: r.get(8),
+                        webhook_delivery_id: r.get(9),
+                        head_sha: r.get(10),
+                        workflow_ref: r.get(11),
+                        push_state_json: r.get(12),
+                        snapshot_timing_json: r.get(13),
+                        created_at_us: r.get(14),
+                        started_at_us: r.get(15),
+                        completed_at_us: r.get(16),
+                    },
+                    // Pre-v16 runs have no submission row: they load with
+                    // an empty submission rather than failing.
+                    submission: default_submission.clone(),
+                    jobs: std::collections::BTreeMap::new(),
+                    base_jobs: std::collections::BTreeMap::new(),
+                    reusable_calls: std::collections::BTreeMap::new(),
+                },
+            ),
+        );
+    }
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let child = |table: &str, columns: &str| {
+        format!(
+            "SELECT run_id, {columns} FROM {table} \
+             WHERE run_id IN (SELECT run_id FROM runs{filter})"
+        )
+    };
+    for r in conn
+        .query(
+            &child(
+                "run_submissions",
+                "submission_json, secrets_blob, github_json, workspace_snapshot_json",
+            ),
+            params,
+        )
+        .await
+        .map_err(ControlError::backend)?
+    {
+        let run_id: String = r.get(0);
+        let Some((_, part)) = parts.get_mut(&run_id) else {
+            continue;
+        };
+        let secrets: Vec<u8> = r.get(2);
+        part.submission = RunSubmissionRow {
+            submission_json: r.get(1),
+            secrets: blob(cipher, &secrets)?,
+            github_json: r.get(3),
+            workspace_snapshot_json: r.get(4),
+        };
+    }
+    for r in conn
+        .query(
+            &child(
+                "run_jobs",
+                "job_id, base_id, display_name, needs_json, outputs_json, check_run_id, \
+                 detail_json, detail_position, caller_plan_json",
+            ),
+            params,
+        )
+        .await
+        .map_err(ControlError::backend)?
+    {
+        let run_id: String = r.get(0);
+        let Some((_, part)) = parts.get_mut(&run_id) else {
+            continue;
+        };
+        part.jobs.insert(
+            r.get(1),
+            RunJobRow {
+                base_id: r.get(2),
+                display_name: r.get(3),
+                needs_json: r.get(4),
+                outputs_json: r.get(5),
+                check_run_id: r.get(6),
+                detail_json: r.get(7),
+                detail_position: r.get(8),
+                caller_plan_json: r.get(9),
+            },
+        );
+    }
+    for r in conn
+        .query(
+            &child("run_base_jobs", "base_id, fail_fast, continue_on_error"),
+            params,
+        )
+        .await
+        .map_err(ControlError::backend)?
+    {
+        let run_id: String = r.get(0);
+        let Some((_, part)) = parts.get_mut(&run_id) else {
+            continue;
+        };
+        let fail_fast: Option<i64> = r.get(2);
+        let continue_on_error: Option<i64> = r.get(3);
+        part.base_jobs.insert(
+            r.get(1),
+            RunBaseJobRow {
+                fail_fast: fail_fast.map(|v| v != 0),
+                continue_on_error: continue_on_error.map(|v| v != 0),
+            },
+        );
+    }
+    for r in conn
+        .query(
+            &child("reusable_calls", "caller_job_id, metadata_json"),
+            params,
+        )
+        .await
+        .map_err(ControlError::backend)?
+    {
+        let run_id: String = r.get(0);
+        let Some((_, part)) = parts.get_mut(&run_id) else {
+            continue;
+        };
+        part.reusable_calls.insert(r.get(1), r.get(2));
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for (run_id_s, (namespace, part)) in parts {
+        let run_id = parse_run_id(&run_id_s);
+        let record = part
+            .clone()
+            .into_record(run_id)
+            .map_err(ControlError::backend)?;
+        out.push((run_id, namespace, record, part));
+    }
+    Ok(out)
+}
+
+/// Write one run's decomposed rows, touching only what differs from the
+/// loaded snapshot `prev` (`None` = new run: write everything).
+async fn write_run(
+    conn: &Tx<'_>,
+    cipher: &store::Envelope,
+    run_id: &RunId,
+    namespace: &str,
+    prev: Option<&super::rows::RunParts>,
+    next: &super::rows::RunParts,
+) -> Result<(), ControlError> {
+    let run = run_id.0.to_string();
+    if prev.map(|p| &p.scalars) != Some(&next.scalars) {
+        let s = &next.scalars;
+        conn.execute(
+            "INSERT INTO runs (run_id, namespace, status, run_number, run_attempt, run_name, \
+             event, workflow_path, conclusion, webhook_delivery_id, head_sha, workflow_ref, \
+             push_state_json, snapshot_timing_json, created_at_us, started_at_us, \
+             completed_at_us) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
+             ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, \
+             run_name=excluded.run_name, conclusion=excluded.conclusion, \
+             head_sha=excluded.head_sha, workflow_ref=excluded.workflow_ref, \
+             push_state_json=excluded.push_state_json, \
+             snapshot_timing_json=excluded.snapshot_timing_json, \
+             started_at_us=excluded.started_at_us, completed_at_us=excluded.completed_at_us",
+            &[
+                &run,
+                &namespace,
+                &status_str(s.status),
+                &s.run_number,
+                &s.run_attempt,
+                &s.run_name,
+                &s.event,
+                &s.workflow_path,
+                &s.conclusion,
+                &s.webhook_delivery_id,
+                &s.head_sha,
+                &s.workflow_ref,
+                &s.push_state_json,
+                &s.snapshot_timing_json,
+                &s.created_at_us,
+                &s.started_at_us,
+                &s.completed_at_us,
+            ],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    if prev.map(|p| &p.submission) != Some(&next.submission) {
+        let s = &next.submission;
+        conn.execute(
+            "INSERT INTO run_submissions (run_id, submission_json, secrets_blob, github_json, \
+             workspace_snapshot_json) VALUES ($1,$2,$3,$4,$5) \
+             ON CONFLICT(run_id) DO UPDATE SET submission_json=excluded.submission_json, \
+             secrets_blob=excluded.secrets_blob, github_json=excluded.github_json, \
+             workspace_snapshot_json=excluded.workspace_snapshot_json",
+            &[
+                &run,
+                &s.submission_json,
+                &unblob(cipher, &s.secrets)?,
+                &s.github_json,
+                &s.workspace_snapshot_json,
+            ],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    for (job, row) in &next.jobs {
+        if prev.and_then(|p| p.jobs.get(job)) == Some(row) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO run_jobs (run_id, job_id, base_id, display_name, needs_json, \
+             outputs_json, check_run_id, detail_json, detail_position, caller_plan_json) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT(run_id, job_id) DO UPDATE SET base_id=excluded.base_id, \
+             display_name=excluded.display_name, needs_json=excluded.needs_json, \
+             outputs_json=excluded.outputs_json, check_run_id=excluded.check_run_id, \
+             detail_json=excluded.detail_json, detail_position=excluded.detail_position, \
+             caller_plan_json=excluded.caller_plan_json",
+            &[
+                &run,
+                job,
+                &row.base_id,
+                &row.display_name,
+                &row.needs_json,
+                &row.outputs_json,
+                &row.check_run_id,
+                &row.detail_json,
+                &row.detail_position,
+                &row.caller_plan_json,
+            ],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    for (base, row) in &next.base_jobs {
+        if prev.and_then(|p| p.base_jobs.get(base)) == Some(row) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO run_base_jobs (run_id, base_id, fail_fast, continue_on_error) \
+             VALUES ($1,$2,$3,$4) ON CONFLICT(run_id, base_id) DO UPDATE SET \
+             fail_fast=excluded.fail_fast, continue_on_error=excluded.continue_on_error",
+            &[
+                &run,
+                base,
+                &row.fail_fast.map(i64::from),
+                &row.continue_on_error.map(i64::from),
+            ],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    for (caller, meta) in &next.reusable_calls {
+        if prev.and_then(|p| p.reusable_calls.get(caller)) == Some(meta) {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO reusable_calls (run_id, caller_job_id, metadata_json) \
+             VALUES ($1,$2,$3) ON CONFLICT(run_id, caller_job_id) DO UPDATE SET \
+             metadata_json=excluded.metadata_json",
+            &[&run, caller, meta],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    if let Some(prev) = prev {
+        for job in prev.jobs.keys().filter(|k| !next.jobs.contains_key(*k)) {
+            conn.execute(
+                "DELETE FROM run_jobs WHERE run_id=$1 AND job_id=$2",
+                &[&run, job],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        for base in prev
+            .base_jobs
+            .keys()
+            .filter(|k| !next.base_jobs.contains_key(*k))
+        {
+            conn.execute(
+                "DELETE FROM run_base_jobs WHERE run_id=$1 AND base_id=$2",
+                &[&run, base],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+        for caller in prev
+            .reusable_calls
+            .keys()
+            .filter(|k| !next.reusable_calls.contains_key(*k))
+        {
+            conn.execute(
+                "DELETE FROM reusable_calls WHERE run_id=$1 AND caller_job_id=$2",
+                &[&run, caller],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+    }
+    Ok(())
+}
+
+/// Persist a job's payload: queryable columns, `needs:` edges and the sealed
+/// runner message + `if:` context. Runs after the `jobs` upsert (FK order).
+async fn write_job_payload(
+    conn: &Tx<'_>,
+    cipher: &store::Envelope,
+    run_id: &RunId,
+    job_id: &JobId,
+    job: &QueuedJob,
+) -> Result<(), ControlError> {
+    let run = run_id.0.to_string();
+    let row = super::rows::JobPayloadRow::from_job(job);
+    conn.execute(
+        "UPDATE jobs SET created_at_ns=$3, deps_ready_at_ns=$4, concurrency_wait_at_ns=$5, \
+         concurrency_acquired_at_ns=$6, if_condition=$7, max_parallel=$8, \
+         environment_json=$9, concurrency_json=$10, matrix_json=$11, deferred_matrix=$12, \
+         reusable_call_json=$13 WHERE run_id=$1 AND job_id=$2",
+        &[
+            &run,
+            &job_id.0,
+            &row.created_at_ns,
+            &row.deps_ready_at_ns,
+            &row.concurrency_wait_at_ns,
+            &row.concurrency_acquired_at_ns,
+            &row.if_condition,
+            &row.max_parallel,
+            &row.environment_json,
+            &row.concurrency_json,
+            &row.matrix_json,
+            &row.deferred_matrix,
+            &row.reusable_call_json,
+        ],
+    )
+    .await
+    .map_err(ControlError::backend)?;
+    conn.execute(
+        "DELETE FROM job_needs WHERE run_id=$1 AND job_id=$2",
+        &[&run, &job_id.0],
+    )
+    .await
+    .map_err(ControlError::backend)?;
+    if !row.needs.is_empty() {
+        let positions: Vec<i64> = (0..row.needs.len() as i64).collect();
+        conn.execute(
+            "INSERT INTO job_needs (run_id, job_id, position, needs_job_id) \
+             SELECT $1, $2, p, n FROM UNNEST($3::bigint[], $4::text[]) AS e(p, n)",
+            &[&run, &job_id.0, &positions, &row.needs],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    conn.execute(
+        "INSERT INTO job_messages (run_id, job_id, message_blob, condition_context_blob) \
+         VALUES ($1,$2,$3,$4) ON CONFLICT(run_id, job_id) DO UPDATE SET \
+         message_blob=excluded.message_blob, \
+         condition_context_blob=excluded.condition_context_blob",
+        &[
+            &run,
+            &job_id.0,
+            &unblob(cipher, &job.message)?,
+            &unblob(cipher, &job.condition_context)?,
+        ],
+    )
+    .await
+    .map_err(ControlError::backend)?;
+    Ok(())
+}
+
 async fn load_txstate(
     conn: &Tx<'_>,
     scope: &TxScope,
@@ -1022,31 +1435,16 @@ async fn load_txstate(
         .as_ref()
         .map(|s| s.iter().map(|id| id.0.to_string()).collect())
         .unwrap_or_default();
-    let runs_rows = if let Some(runs) = scope.runs.as_ref() {
-        if runs.is_empty() {
-            Vec::new()
-        } else {
-            conn.query(
-                "SELECT run_id, record_blob, namespace FROM runs WHERE run_id = ANY($1)",
-                &[&run_ids],
-            )
-            .await
-            .map_err(ControlError::backend)?
-        }
-    } else {
-        conn.query("SELECT run_id, record_blob, namespace FROM runs", &[])
-            .await
-            .map_err(ControlError::backend)?
+    let loaded_runs = match scope.runs.as_ref() {
+        Some(runs) if runs.is_empty() => Vec::new(),
+        Some(_) => load_runs(conn, cipher, " WHERE run_id = ANY($1)", &[&run_ids]).await?,
+        None => load_runs(conn, cipher, "", &[]).await?,
     };
-    for row in runs_rows {
-        let run_id_s: String = row.get(0);
-        let record: Vec<u8> = row.get(1);
-        let run_id = parse_run_id(&run_id_s);
-        let mut run: RunRecord = blob(cipher, &record)?;
-        run.jobs.clear();
-        tx.run_namespaces.insert(run_id, row.get(2));
+    for (run_id, namespace, run, parts) in loaded_runs {
+        tx.run_namespaces.insert(run_id, namespace);
         tx.runs.insert(run_id, run);
         tx.loaded.runs.insert(run_id);
+        tx.loaded.run_parts.insert(run_id, parts);
     }
 
     // Jobs — a row loads when its run is in scope OR it sits in a global
@@ -1062,9 +1460,15 @@ async fn load_txstate(
         kinds.push("expand");
     }
     let jobs_rows = {
-        let base = "SELECT run_id, job_id, status, queue_kind, queue_position, seq, \
-             reaper_first_seen_us, expand_generation, enqueued_at_us, payload_blob, \
-             priority, run_order, job_order, not_before_us, namespace_id, pool_key FROM jobs";
+        let base = "SELECT j.run_id, j.job_id, j.status, j.queue_kind, j.queue_position, j.seq, \
+             j.reaper_first_seen_us, j.expand_generation, j.enqueued_at_us, \
+             j.priority, j.run_order, j.job_order, j.not_before_us, j.namespace_id, j.pool_key, \
+             j.base_id, j.runs_on, j.runner_group, \
+             j.created_at_ns, j.deps_ready_at_ns, j.concurrency_wait_at_ns, \
+             j.concurrency_acquired_at_ns, j.if_condition, j.max_parallel, \
+             j.environment_json, j.concurrency_json, j.matrix_json, j.deferred_matrix, \
+             j.reusable_call_json, m.message_blob, m.condition_context_blob \
+             FROM jobs j LEFT JOIN job_messages m ON m.run_id=j.run_id AND m.job_id=j.job_id";
         // `runs == None` means the run predicate is TRUE, which makes the
         // whole OR true — emit no WHERE and load every job. Only when the
         // scope names a run set do the queue-kind clauses matter.
@@ -1075,21 +1479,23 @@ async fn load_txstate(
                 conds.push("false".to_owned());
             } else {
                 params.push(&run_ids);
-                conds.push(format!("run_id = ANY(${})", params.len()));
+                conds.push(format!("j.run_id = ANY(${})", params.len()));
             }
             if !kinds.is_empty() {
                 params.push(&kinds);
-                conds.push(format!("queue_kind = ANY(${})", params.len()));
+                conds.push(format!("j.queue_kind = ANY(${})", params.len()));
             }
         }
-        let order = " ORDER BY CASE WHEN queue_kind='ready' THEN 0 ELSE 1 END, \
-                     CASE WHEN queue_kind='ready' THEN -priority ELSE 0 END, \
-                     CASE WHEN queue_kind='ready' THEN run_order ELSE 0 END, \
-                     CASE WHEN queue_kind='ready' THEN job_order ELSE 0 END, \
-                     seq, run_id, job_id";
+        let order = " ORDER BY CASE WHEN j.queue_kind='ready' THEN 0 ELSE 1 END, \
+                     CASE WHEN j.queue_kind='ready' THEN -j.priority ELSE 0 END, \
+                     CASE WHEN j.queue_kind='ready' THEN j.run_order ELSE 0 END, \
+                     CASE WHEN j.queue_kind='ready' THEN j.job_order ELSE 0 END, \
+                     j.seq, j.run_id, j.job_id";
         let is_poll = scope.runs.as_ref().is_some_and(|r| r.is_empty()) && scope.ready_queue;
+        // Lock only the job rows: the message side of the outer join is
+        // nullable and may not be locked.
         let lock_suffix = if is_poll {
-            " FOR UPDATE SKIP LOCKED LIMIT 16"
+            " FOR UPDATE OF j SKIP LOCKED LIMIT 16"
         } else {
             ""
         };
@@ -1102,6 +1508,30 @@ async fn load_txstate(
             .await
             .map_err(ControlError::backend)?
     };
+    // `needs:` edges for exactly the loaded jobs (never the whole queue:
+    // a poll locks at most 16 rows and must not read every edge).
+    let mut needs: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    if !jobs_rows.is_empty() {
+        let run_keys: Vec<String> = jobs_rows.iter().map(|r| r.get(0)).collect();
+        let job_keys: Vec<String> = jobs_rows.iter().map(|r| r.get(1)).collect();
+        for row in conn
+            .query(
+                "SELECT n.run_id, n.job_id, n.needs_job_id FROM job_needs n \
+                 JOIN UNNEST($1::text[], $2::text[]) AS k(run_id, job_id) \
+                   ON k.run_id=n.run_id AND k.job_id=n.job_id \
+                 ORDER BY n.run_id, n.job_id, n.position",
+                &[&run_keys, &job_keys],
+            )
+            .await
+            .map_err(ControlError::backend)?
+        {
+            needs
+                .entry((row.get(0), row.get(1)))
+                .or_default()
+                .push(row.get(2));
+        }
+    }
     for row in jobs_rows {
         let run_id_s: String = row.get(0);
         let job_id_s: String = row.get(1);
@@ -1112,15 +1542,14 @@ async fn load_txstate(
         let reaper_us: Option<i64> = row.get(6);
         let expand_generation: i64 = row.get(7);
         let enqueued_us: Option<i64> = row.get(8);
-        let payload: Option<Vec<u8>> = row.get::<_, Option<Vec<u8>>>(9);
-        let priority: Option<i16> = row.get(10);
-        let run_order: Option<i64> = row.get(11);
-        let job_order: Option<i64> = row.get(12);
-        let not_before_us: Option<i64> = row.get(13);
-        let namespace_id: String = row.get(14);
-        let pool_key: String = row.get(15);
+        let priority: Option<i16> = row.get(9);
+        let run_order: Option<i64> = row.get(10);
+        let job_order: Option<i64> = row.get(11);
+        let not_before_us: Option<i64> = row.get(12);
+        let namespace_id: String = row.get(13);
+        let pool_key: String = row.get(14);
         let run_id = parse_run_id(&run_id_s);
-        let job_id = JobId(job_id_s);
+        let job_id = JobId(job_id_s.clone());
         let status = status_parse(&status);
         // Preserve the persisted row state for every loaded job — a job whose
         // run isn't in `tx.runs` was widened in by a queue-kind clause and must
@@ -1153,33 +1582,58 @@ async fn load_txstate(
             tx.expand_generations
                 .insert((run_id, job_id.clone()), expand_generation);
         }
-        if let Some(payload) = payload {
-            let mut job: QueuedJob = blob(cipher, &payload)?;
-            // `enqueued_at_us` is authoritative: the payload blob is only
-            // re-sealed on a slot change, so a rewritten enqueue time would
-            // otherwise be masked by the stale blob.
-            if let Some(us) = enqueued_us {
-                job.enqueued_at_unix_nanos = us * 1000;
+        // A job is dispatchable only with its sealed message; a row without
+        // one (terminal/placeholder) routes nowhere.
+        let message: Option<Vec<u8>> = row.get(29);
+        let context: Option<Vec<u8>> = row.get(30);
+        let (Some(message), Some(context)) = (message, context) else {
+            continue;
+        };
+        let payload = super::rows::JobPayloadRow {
+            created_at_ns: row.get::<_, Option<i64>>(18).unwrap_or(0),
+            deps_ready_at_ns: row.get(19),
+            concurrency_wait_at_ns: row.get(20),
+            concurrency_acquired_at_ns: row.get(21),
+            if_condition: row.get(22),
+            max_parallel: row.get(23),
+            environment_json: row.get(24),
+            concurrency_json: row.get(25),
+            matrix_json: row.get(26),
+            deferred_matrix: row.get(27),
+            reusable_call_json: row.get(28),
+            needs: needs.remove(&(run_id_s, job_id_s)).unwrap_or_default(),
+        };
+        let runs_on: String = row.get(16);
+        let job = payload
+            .into_job(
+                run_id,
+                job_id.clone(),
+                row.get(15),
+                &runs_on,
+                row.get(17),
+                enqueued_us,
+                blob(cipher, &message)?,
+                blob(cipher, &context)?,
+            )
+            .map_err(ControlError::backend)?;
+        match kind {
+            QueueKind::Ready => tx.ready_index.push_back(job),
+            QueueKind::Pending => tx.pending_jobs.push_back(job),
+            QueueKind::Blocked => tx.concurrency_blocked.push_back(job),
+            QueueKind::Expand => {
+                if expand_generation == 0 {
+                    tx.pending_expansions.push_back(job);
+                } else {
+                    tx.expanding_jobs.insert((run_id, job_id), job);
+                }
             }
-            match kind {
-                QueueKind::Ready => tx.ready_index.push_back(job),
-                QueueKind::Pending => tx.pending_jobs.push_back(job),
-                QueueKind::Blocked => tx.concurrency_blocked.push_back(job),
-                QueueKind::Expand => {
-                    if expand_generation == 0 {
-                        tx.pending_expansions.push_back(job);
-                    } else {
-                        tx.expanding_jobs.insert((run_id, job_id), job);
-                    }
-                }
-                QueueKind::Claimed => {
-                    tx.claimed_jobs.insert((run_id, job_id), job);
-                }
-                QueueKind::Held => {
-                    tx.held_runs.entry(run_id).or_default().push(job);
-                }
-                QueueKind::None => {}
+            QueueKind::Claimed => {
+                tx.claimed_jobs.insert((run_id, job_id), job);
             }
+            QueueKind::Held => {
+                tx.held_runs.entry(run_id).or_default().push(job);
+            }
+            QueueKind::None => {}
         }
     }
     // Global ready-queue size — unscoped COUNT, not the loaded subset.
@@ -1189,18 +1643,17 @@ async fn load_txstate(
         .map(|r| r.get(0))
         .unwrap_or(0);
     // Global queue-front labels — unscoped, for pool next-image selection.
+    // Read straight from the `runs_on` column; no payload decode.
     tx.next_queue_labels = conn
         .query_opt(
-            "SELECT payload_blob FROM jobs WHERE queue_kind='ready' \
+            "SELECT runs_on FROM jobs WHERE queue_kind='ready' \
              ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id LIMIT 1",
             &[],
         )
         .await
         .ok()
         .flatten()
-        .and_then(|r| r.get::<_, Option<Vec<u8>>>(0))
-        .and_then(|b| blob::<QueuedJob>(cipher, &b).ok())
-        .map(|j| j.runs_on)
+        .and_then(|r| serde_json::from_str(&r.get::<_, String>(0)).ok())
         .unwrap_or_default();
 
     // Requests — run-scoped via `run_scope_clause`. `job_requests_all` loads
@@ -1989,42 +2442,21 @@ async fn write_txstate(
 ) -> Result<(), ControlError> {
     let now_us = system_to_us(std::time::SystemTime::now());
 
-    // Runs.
+    // Runs: write only the rows that differ from the loaded snapshot.
     for (run_id, run) in &tx.runs {
-        let mut record = run.clone();
-        record.jobs.clear();
-        let value = store::run_record_value(&record).map_err(ControlError::backend)?;
-        let record_blob = unblob(cipher, &value)?;
-        conn.execute(
-            "INSERT INTO runs (run_id, status, run_number, run_attempt, run_name, event, \
-             workflow_path, conclusion, webhook_delivery_id, record_blob, created_at_us, \
-             started_at_us, completed_at_us, namespace) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
-             ON CONFLICT(run_id) DO UPDATE SET status=excluded.status, \
-             conclusion=excluded.conclusion, record_blob=excluded.record_blob, \
-             started_at_us=excluded.started_at_us, completed_at_us=excluded.completed_at_us",
-            &[
-                &run_id.0.to_string(),
-                &status_str(run.status),
-                &(run.run_number as i64),
-                &(run.run_attempt as i64),
-                &run.run_name,
-                &run.event,
-                &run.workflow_path_str,
-                &run.conclusion,
-                &run.webhook_delivery_id,
-                &record_blob,
-                &system_to_us(run.created_at.into()),
-                &run.started_at.map(|t| system_to_us(t.into())),
-                &run.completed_at.map(|t| system_to_us(t.into())),
-                &tx.run_namespaces
-                    .get(run_id)
-                    .map(String::as_str)
-                    .unwrap_or(DEFAULT_NAMESPACE),
-            ],
+        let parts = super::rows::RunParts::from_record(run);
+        write_run(
+            conn,
+            cipher,
+            run_id,
+            tx.run_namespaces
+                .get(run_id)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_NAMESPACE),
+            tx.loaded.run_parts.get(run_id),
+            &parts,
         )
-        .await
-        .map_err(ControlError::backend)?;
+        .await?;
     }
     for run_id in &tx.loaded.runs {
         if !tx.runs.contains_key(run_id) {
@@ -2105,21 +2537,14 @@ async fn write_txstate(
         };
         let priority = preserved.map(|p| p.priority).unwrap_or(0);
         let not_before_us = preserved.and_then(|p| p.not_before_us);
-        let (base_id, runs_on, runner_group, enqueued_us, payload) = match job {
+        let (base_id, runs_on, runner_group, enqueued_us) = match job {
             Some(j) => (
                 j.base_id.clone(),
                 serde_json::to_string(&j.runs_on).unwrap_or_default(),
                 j.runner_group.clone(),
                 Some(j.enqueued_at_unix_nanos / 1000),
-                // Promotion/requeue changes timestamps inside QueuedJob.
-                // Only a same-slot write can reuse the sealed payload.
-                if !same_slot {
-                    Some(unblob(cipher, j)?)
-                } else {
-                    None
-                },
             ),
-            None => (String::new(), "[]".to_owned(), None, None, None),
+            None => (String::new(), "[]".to_owned(), None, None),
         };
         let reaper_us = tx
             .queued_at
@@ -2134,16 +2559,15 @@ async fn write_txstate(
         conn.execute(
             "INSERT INTO jobs (run_id, job_id, status, queue_kind, queue_position, seq, \
              base_id, runs_on, runner_group, enqueued_at_us, reaper_first_seen_us, \
-             claimed_by, claimed_at_us, expand_generation, payload_blob, \
+             claimed_by, claimed_at_us, expand_generation, \
              namespace_id, pool_key, priority, run_order, job_order, not_before_us) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
              ON CONFLICT(run_id,job_id) DO UPDATE SET status=excluded.status, \
              queue_kind=excluded.queue_kind, queue_position=excluded.queue_position, \
              seq=excluded.seq, enqueued_at_us=excluded.enqueued_at_us, \
              reaper_first_seen_us=excluded.reaper_first_seen_us, \
              claimed_by=excluded.claimed_by, claimed_at_us=excluded.claimed_at_us, \
              expand_generation=excluded.expand_generation, \
-             payload_blob=COALESCE(excluded.payload_blob, jobs.payload_blob), \
              namespace_id=excluded.namespace_id, pool_key=excluded.pool_key, \
              priority=excluded.priority, run_order=excluded.run_order, \
              job_order=excluded.job_order, not_before_us=excluded.not_before_us",
@@ -2162,7 +2586,6 @@ async fn write_txstate(
                 &claimed.and_then(|c| c.runner_id),
                 &claimed.map(|c| system_to_us(c.at)),
                 &expand_generation,
-                &payload,
                 &tx.run_namespaces
                     .get(&run_id)
                     .map(String::as_str)
@@ -2177,6 +2600,12 @@ async fn write_txstate(
         )
         .await
         .map_err(ControlError::backend)?;
+        // Promotion/requeue stamps dependency and enqueue times in the
+        // payload. Persist it on any slot change; a same-slot write leaves
+        // the payload columns and sealed message untouched.
+        if let Some(j) = job.filter(|_| !same_slot) {
+            write_job_payload(conn, cipher, &run_id, job_id, j).await?;
+        }
         Ok(())
     }
 
@@ -2895,7 +3324,7 @@ impl ControlBackend for PostgresBackend {
     async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
         let workflow_path = workflow_path.to_owned();
         // Only `workflow_run_counters` is touched — a full load would parse
-        // every `record_blob`/`payload_blob` per submission for one counter.
+        // every `record_blob`/job payload per submission for one counter.
         let scope = TxScope {
             include_archived: false,
             runs: Some(BTreeSet::new()),
@@ -2930,7 +3359,7 @@ impl ControlBackend for PostgresBackend {
             ready_queue: true,
             // `poll` claims ready work only — no blocked-job promotion, no
             // concurrency-gate mutation. Loading those families is O(#blocked
-            // + #gates) `payload_blob`s for no benefit.
+            // + #gates) job payloads for no benefit.
             blocked_jobs: false,
             sessions: Some(BTreeSet::from([poll.session_id.clone()])),
             concurrency: false,
