@@ -271,9 +271,11 @@ CREATE TABLE job_requests (
     run_id                  uuid NOT NULL,
     job_id                  text NOT NULL,
     namespace_id            text NOT NULL,
+    -- runner-protocol ids: request_id for acquire/renew/complete, agent_job_id
+    -- (message `jobId`) for cancel/timeline. The message's plan reference is
+    -- derived (plan_id = agent_job_id, plan_type = 'actions'), not stored;
+    -- plan-addressed callbacks route by agent_job_id.
     agent_job_id            uuid NOT NULL UNIQUE,
-    plan_id                 uuid NOT NULL,
-    plan_type               text NOT NULL,
     timeline_id             uuid NOT NULL UNIQUE,
     runner_id               bigint,
     session_id              uuid,
@@ -286,7 +288,6 @@ CREATE TABLE job_requests (
     finished_at             timestamptz,
     FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
 ) WITH (fillfactor = 90);
-CREATE INDEX job_requests_plan ON job_requests(plan_id);
 CREATE UNIQUE INDEX job_requests_inflight ON job_requests(run_id, job_id) WHERE result IS NULL;
 CREATE INDEX job_requests_session ON job_requests(session_id) WHERE result IS NULL;
 
@@ -637,7 +638,6 @@ CREATE TABLE attempt_history (
     job_id                  text NOT NULL,
     namespace_id            text NOT NULL,
     agent_job_id            uuid NOT NULL,
-    plan_id                 uuid NOT NULL,
     timeline_id             uuid NOT NULL,
     runner_id               bigint,
     result                  text,
