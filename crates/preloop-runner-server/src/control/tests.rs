@@ -882,6 +882,16 @@ mod sqlite {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The pre-v15 blob-shaped `job_steps` table. Historical migrations
+    /// (v8) rebuild this shape, so an old database built from the current
+    /// DDL must swap it back in before stamping an old `user_version`.
+    const PRE_V15_JOB_STEPS: &str = "DROP TABLE job_steps;
+         CREATE TABLE job_steps (
+             agent_job_id TEXT PRIMARY KEY,
+             steps_blob   BLOB NOT NULL,
+             revision     INTEGER NOT NULL DEFAULT 0
+         );";
+
     /// v5 → v6 migration: a database created with `jobs.claim_generation`
     /// must open cleanly — the dead column is dropped and existing job rows
     /// survive. Builds a v5-shaped `jobs` table by applying the current DDL
@@ -898,6 +908,7 @@ mod sqlite {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(crate::control::schema::SQLITE_DDL)
                 .unwrap();
+            conn.execute_batch(PRE_V15_JOB_STEPS).unwrap();
             conn.execute_batch(
                 "ALTER TABLE jobs ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0; \
                  PRAGMA user_version = 5;",
@@ -953,6 +964,7 @@ mod sqlite {
             let v7_ddl = crate::control::schema::SQLITE_DDL
                 .replace("TEXT PRIMARY KEY NOT NULL", "TEXT PRIMARY KEY");
             connection.execute_batch(&v7_ddl).unwrap();
+            connection.execute_batch(PRE_V15_JOB_STEPS).unwrap();
             connection
                 .execute_batch(
                     "PRAGMA user_version = 7;
@@ -1017,6 +1029,13 @@ mod sqlite {
                     )
                     .unwrap();
                 assert_eq!(original, 4, "original counter must survive migration");
+            } else if table == "job_steps" {
+                // v15 replaces blob manifests with step rows and does not
+                // carry legacy blobs forward (no backward compatibility).
+                let count: i64 = connection
+                    .query_row("SELECT count(*) FROM job_steps", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, 0, "legacy step blobs are dropped at v15");
             } else {
                 let count: i64 = connection
                     .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {

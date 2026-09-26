@@ -40,7 +40,8 @@
 /// - 12: seed persistent FIFO counters and backfill ordering.
 /// - 13: terminal-run archive switch and history tables.
 /// - 14: concurrency gates as rows (holds/waits/jobset_gates); legacy blob tables dropped.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 14;
+/// - 15: step manifests as rows (`job_steps`, `step_history`); step blobs dropped.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 15;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -316,6 +317,31 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
         );
         CREATE INDEX IF NOT EXISTS concurrency_waits_run ON concurrency_waits(holder_run_id);",
     ),
+    (
+        15,
+        "DROP TABLE IF EXISTS job_steps;
+         CREATE TABLE attempt_history_v15 (
+            namespace_id        TEXT NOT NULL,
+            run_id              TEXT NOT NULL,
+            run_attempt         INTEGER NOT NULL,
+            run_created_at_us   INTEGER NOT NULL,
+            request_id          INTEGER NOT NULL,
+            job_id              TEXT NOT NULL,
+            agent_job_id        TEXT NOT NULL,
+            plan_id             TEXT NOT NULL,
+            timeline_id         TEXT NOT NULL,
+            result              TEXT,
+            owner_runner_id     INTEGER,
+            claimed_at_us       INTEGER,
+            started_at_us       INTEGER,
+            PRIMARY KEY (run_id, run_attempt, request_id)
+         );
+         INSERT INTO attempt_history_v15 SELECT namespace_id, run_id, run_attempt,
+            run_created_at_us, request_id, job_id, agent_job_id, plan_id, timeline_id,
+            result, owner_runner_id, claimed_at_us, started_at_us FROM attempt_history;
+         DROP TABLE attempt_history;
+         ALTER TABLE attempt_history_v15 RENAME TO attempt_history;",
+    ),
 ];
 
 /// The SQLite DDL, applied as one migration. `IF NOT EXISTS` makes it
@@ -428,11 +454,29 @@ CREATE TABLE IF NOT EXISTS attempt_history (
     owner_runner_id     INTEGER,
     claimed_at_us       INTEGER,
     started_at_us       INTEGER,
-    steps_blob          BLOB,
     PRIMARY KEY (run_id, run_attempt, request_id)
 );
 CREATE INDEX IF NOT EXISTS attempt_history_run ON attempt_history(run_id, job_id, request_id);
 CREATE INDEX IF NOT EXISTS attempt_history_agent ON attempt_history(agent_job_id);
+CREATE TABLE IF NOT EXISTS step_history (
+    namespace_id        TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    run_attempt         INTEGER NOT NULL,
+    run_created_at_us   INTEGER NOT NULL,
+    agent_job_id        TEXT NOT NULL,
+    step_id             TEXT NOT NULL,              -- TaskStep.id (protocol identity)
+    position            INTEGER NOT NULL,           -- manifest order
+    kind                TEXT NOT NULL,              -- workflow | synthetic
+    workflow_index      INTEGER,                    -- what `--step N` indexes
+    runner_number       INTEGER,                    -- runner timeline position
+    context_name        TEXT,                       -- stable across runs
+    name                TEXT NOT NULL,
+    conclusion          TEXT NOT NULL,
+    started_at_us       INTEGER,
+    finished_at_us      INTEGER,
+    PRIMARY KEY (agent_job_id, step_id)
+);
+CREATE INDEX IF NOT EXISTS step_history_run ON step_history(run_id, run_attempt);
 
 
 -- ── Job requests (execution attempts) ────────────────────────────────
@@ -487,11 +531,22 @@ CREATE TABLE IF NOT EXISTS oidc_job_contexts (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 
--- Step manifests per attempt, with a revision for conditional updates.
+-- One row per step per execution attempt. A step transition is a one-row
+-- upsert; the attempt's request row owns its steps (cascade on delete).
 CREATE TABLE IF NOT EXISTS job_steps (
-    agent_job_id        TEXT PRIMARY KEY NOT NULL,  -- uuid
-    steps_blob          BLOB NOT NULL,              -- Vec<StepRecord>
-    revision            INTEGER NOT NULL DEFAULT 0
+    agent_job_id        TEXT NOT NULL,              -- uuid (execution attempt)
+    step_id             TEXT NOT NULL,              -- TaskStep.id (protocol identity)
+    position            INTEGER NOT NULL,           -- manifest order
+    kind                TEXT NOT NULL,              -- workflow | synthetic
+    workflow_index      INTEGER,                    -- what `--step N` indexes
+    runner_number       INTEGER,                    -- runner timeline position
+    context_name        TEXT,                       -- stable across runs
+    name                TEXT NOT NULL,
+    conclusion          TEXT NOT NULL,
+    started_at_us       INTEGER,
+    finished_at_us      INTEGER,
+    PRIMARY KEY (agent_job_id, step_id),
+    FOREIGN KEY (agent_job_id) REFERENCES job_requests(agent_job_id) ON DELETE CASCADE
 );
 
 -- ── Runners and sessions ─────────────────────────────────────────────
@@ -705,7 +760,8 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 11: seed persistent FIFO counters and backfill ordering.
 /// - 12: terminal-run archive switch and history tables.
 /// - 13: concurrency gates as rows (holds/waits/jobset_gates); legacy blob tables dropped.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 13;
+/// - 14: step manifests as rows (`job_steps`, `step_history`); step blobs dropped.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 14;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -823,6 +879,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
         );
         CREATE INDEX IF NOT EXISTS concurrency_waits_run ON control.concurrency_waits(holder_run_id);",
     ),
+    (
+        14,
+        "DROP TABLE IF EXISTS control.job_steps;
+         ALTER TABLE control.attempt_history DROP COLUMN IF EXISTS steps_blob;",
+    ),
 ];
 
 /// The Postgres DDL: the same table families as [`SQLITE_DDL`] in Postgres
@@ -935,12 +996,31 @@ CREATE TABLE IF NOT EXISTS attempt_history (
     owner_runner_id     BIGINT,
     claimed_at_us       BIGINT,
     started_at_us       BIGINT,
-    steps_blob          BYTEA,
     PRIMARY KEY (run_id, run_attempt, request_id, run_created_at_us)
 ) PARTITION BY RANGE (run_created_at_us);
 CREATE TABLE IF NOT EXISTS attempt_history_default PARTITION OF attempt_history DEFAULT;
 CREATE INDEX IF NOT EXISTS attempt_history_run ON attempt_history(run_id, job_id, request_id, run_created_at_us);
 CREATE INDEX IF NOT EXISTS attempt_history_agent ON attempt_history(agent_job_id);
+CREATE TABLE IF NOT EXISTS step_history (
+    namespace_id        TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    run_attempt         BIGINT NOT NULL,
+    run_created_at_us   BIGINT NOT NULL,
+    agent_job_id        TEXT NOT NULL,
+    step_id             TEXT NOT NULL,
+    position            BIGINT NOT NULL,
+    kind                TEXT NOT NULL,
+    workflow_index      BIGINT,
+    runner_number       BIGINT,
+    context_name        TEXT,
+    name                TEXT NOT NULL,
+    conclusion          TEXT NOT NULL,
+    started_at_us       BIGINT,
+    finished_at_us      BIGINT,
+    PRIMARY KEY (agent_job_id, step_id, run_created_at_us)
+) PARTITION BY RANGE (run_created_at_us);
+CREATE TABLE IF NOT EXISTS step_history_default PARTITION OF step_history DEFAULT;
+CREATE INDEX IF NOT EXISTS step_history_run ON step_history(run_id, run_attempt, run_created_at_us);
 
 
 -- ── Job requests ─────────────────────────────────────────────────────
@@ -990,9 +1070,19 @@ CREATE TABLE IF NOT EXISTS oidc_job_contexts (
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS job_steps (
-    agent_job_id        TEXT PRIMARY KEY,
-    steps_blob          BYTEA NOT NULL,
-    revision            BIGINT NOT NULL DEFAULT 0
+    agent_job_id        TEXT NOT NULL,
+    step_id             TEXT NOT NULL,
+    position            BIGINT NOT NULL,
+    kind                TEXT NOT NULL,
+    workflow_index      BIGINT,
+    runner_number       BIGINT,
+    context_name        TEXT,
+    name                TEXT NOT NULL,
+    conclusion          TEXT NOT NULL,
+    started_at_us       BIGINT,
+    finished_at_us      BIGINT,
+    PRIMARY KEY (agent_job_id, step_id),
+    FOREIGN KEY (agent_job_id) REFERENCES job_requests(agent_job_id) ON DELETE CASCADE
 );
 
 -- ── Runners and sessions ─────────────────────────────────────────────

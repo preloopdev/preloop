@@ -161,8 +161,8 @@ pub async fn patch_timeline_records(
     };
 
     // Backend: reconcile the run's `jobs_list` detail and the attempt's step
-    // manifest (`job_steps`/`job_steps_revision` are durable TxState — the
-    // commit persists them, so no separate `store_job_steps` write).
+    // manifest (`job_steps` is durable TxState — the commit persists the
+    // changed step rows, so no separate `store_job_steps` write).
     if let (Some(run_id), Some(job_id)) = (run_id, logical_job_id.clone()) {
         let records_for_tx = records.clone();
         let job_status = job_status_for_run;
@@ -271,11 +271,6 @@ pub async fn patch_timeline_records(
                             }),
                         }
                     }
-                    // Bumped under the same transaction that mutated the
-                    // manifest, so the committed revision is strictly newer
-                    // than any snapshot taken before it.
-                    let counter = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
-                    *counter += 1;
                 }
                 Ok(())
             })

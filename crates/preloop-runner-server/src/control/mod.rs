@@ -12,6 +12,7 @@
 //!   the old `InnerState` scheduling fields.
 //! - [`sched`]: the scheduling state machine ported to run on `TxState`.
 //! - [`schema`]: the unified table families both backends implement.
+//! - [`rows`]: backend-neutral row codecs for decomposed families (steps).
 //! - [`sqlite`] / [`postgres`]: the two `ControlBackend` implementations.
 
 // The submodules use `use super::*` to reach the crate prelude, matching how
@@ -24,6 +25,7 @@ pub(crate) use crate::*;
 pub mod backend;
 pub mod commands;
 pub mod postgres;
+pub mod rows;
 pub mod sched;
 pub mod schema;
 pub mod sqlite;

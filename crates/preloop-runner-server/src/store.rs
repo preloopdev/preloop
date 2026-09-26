@@ -664,17 +664,12 @@ impl StoreSnapshot {
                 .iter()
                 .map(|(id, message)| (*id, message.clone()))
                 .collect(),
+            // The control backend no longer tracks a manifest revision; the
+            // legacy snapshot keeps its column at 0.
             job_steps: tx
                 .job_steps
                 .iter()
-                .map(|(agent_job_id, records)| {
-                    let revision = tx
-                        .job_steps_revision
-                        .get(agent_job_id)
-                        .copied()
-                        .unwrap_or(0);
-                    (*agent_job_id, records.clone(), revision)
-                })
+                .map(|(agent_job_id, records)| (*agent_job_id, records.clone(), 0))
                 .collect(),
             meta: build_meta_snapshot_tx(tx, inner),
         }
@@ -2187,8 +2182,7 @@ impl SqliteStore {
         // guessing, so the run's step history has to come back here.
         let mut step_stmt = connection.prepare(
             "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
-                    context_name, name_blob, conclusion, started_at_us, finished_at_us,
-                    revision
+                    context_name, name_blob, conclusion, started_at_us, finished_at_us
              FROM job_steps
              ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
                       COALESCE(workflow_index, 2147483647), step_id",
@@ -2205,7 +2199,6 @@ impl SqliteStore {
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<i64>>(8)?,
                 row.get::<_, Option<i64>>(9)?,
-                row.get::<_, i64>(10)?,
             ))
         })? {
             let (
@@ -2219,7 +2212,6 @@ impl SqliteStore {
                 conclusion,
                 started_at_us,
                 finished_at_us,
-                revision,
             ) = row?;
             let Ok(agent_job_id) = agent_job_id.parse::<uuid::Uuid>() else {
                 tracing::warn!(%agent_job_id, "dropping step row with an unparseable attempt id");
@@ -2245,12 +2237,6 @@ impl SqliteStore {
                     continue;
                 }
             };
-            // The guard compares against the persisted revision, so the
-            // counter has to resume above it. Left at zero, the first writes
-            // after a restart carry revisions the rows already exceed and are
-            // silently discarded.
-            let seen = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
-            *seen = (*seen).max(revision.max(0) as u64);
             tx.job_steps
                 .entry(agent_job_id)
                 .or_default()

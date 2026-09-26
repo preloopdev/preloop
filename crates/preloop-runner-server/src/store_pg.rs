@@ -871,8 +871,7 @@ impl Store for PgStore {
         let rows = client
             .query(
                 "SELECT agent_job_id, step_id, kind, workflow_index, runner_number,
-                        context_name, name_blob, conclusion, started_at_us, finished_at_us,
-                        revision
+                        context_name, name_blob, conclusion, started_at_us, finished_at_us
                  FROM job_steps
                  ORDER BY agent_job_id, COALESCE(runner_number, 2147483647),
                           COALESCE(workflow_index, 2147483647), step_id",
@@ -894,7 +893,6 @@ impl Store for PgStore {
             let conclusion: String = row.get(7);
             let started_at_us: Option<i64> = row.get(8);
             let finished_at_us: Option<i64> = row.get(9);
-            let revision: i64 = row.get(10);
             let name = match self.cipher.unseal(&name_blob) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                 Err(error) => {
@@ -902,10 +900,6 @@ impl Store for PgStore {
                     continue;
                 }
             };
-            // See the SQLite twin: the counter must resume above the
-            // persisted revision or the guard discards post-restart writes.
-            let seen = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
-            *seen = (*seen).max(revision.max(0) as u64);
             tx.job_steps
                 .entry(agent_job_id)
                 .or_default()

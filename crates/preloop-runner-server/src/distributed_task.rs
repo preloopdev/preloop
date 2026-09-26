@@ -814,8 +814,6 @@ pub async fn complete_job_inner(
         newly_terminal_success: bool,
         finalized_callers: Vec<JobId>,
         live_log_key: String,
-        completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)>,
-        completion_revision: u64,
     }
 
     let comp = completion.clone();
@@ -889,8 +887,6 @@ pub async fn complete_job_inner(
                         newly_terminal_success: false,
                         finalized_callers: Vec::new(),
                         live_log_key: String::new(),
-                        completed_attempt: None,
-                        completion_revision: 0,
                     });
                 }
                 let tolerated = run
@@ -970,8 +966,6 @@ pub async fn complete_job_inner(
                 .get(&comp.run_id)
                 .and_then(|r| r.jobs.get(&comp.job_id).copied())
                 .unwrap_or(comp.status);
-            let mut completed_attempt: Option<(uuid::Uuid, Vec<StepRecord>)> = None;
-            let mut completion_revision = 0_u64;
             if let Some(agent_job_id) = comp.agent_job_id.or_else(|| {
                 tx.job_requests
                     .values()
@@ -1001,10 +995,6 @@ pub async fn complete_job_inner(
                             step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
                         }
                     }
-                    completed_attempt = Some((agent_job_id, manifest.clone()));
-                    let counter = tx.job_steps_revision.entry(agent_job_id).or_insert(0);
-                    *counter += 1;
-                    completion_revision = *counter;
                 }
             }
             let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
@@ -1054,8 +1044,6 @@ pub async fn complete_job_inner(
                 newly_terminal_success,
                 finalized_callers,
                 live_log_key,
-                completed_attempt,
-                completion_revision,
             })
         })
         .await

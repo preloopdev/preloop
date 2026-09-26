@@ -571,8 +571,12 @@ impl PostgresBackend {
                     "SELECT selected.run_id, selected.record_blob,
                             COALESCE(j.job_id,h.job_id), COALESCE(j.status,h.status),
                             COALESCE(j.queue_kind,'none'),
-                            COALESCE(js.steps_blob, (
-                                SELECT ah.steps_blob FROM attempt_history ah
+                            COALESCE((
+                                SELECT jr.agent_job_id FROM job_requests jr
+                                WHERE jr.run_id=j.run_id AND jr.job_id=j.job_id
+                                ORDER BY jr.request_id DESC LIMIT 1
+                            ), (
+                                SELECT ah.agent_job_id FROM attempt_history ah
                                 WHERE ah.run_id=selected.run_id
                                   AND ah.run_attempt=selected.run_attempt
                                   AND ah.run_created_at_us=selected.created_at_us
@@ -595,17 +599,39 @@ impl PostgresBackend {
                          AND h.run_attempt=selected.run_attempt
                          AND h.run_created_at_us=selected.created_at_us
                          AND selected.archived_at_us IS NOT NULL
-                     LEFT JOIN job_steps js ON js.agent_job_id = (
-                         SELECT jr.agent_job_id FROM job_requests jr
-                         WHERE jr.run_id=j.run_id AND jr.job_id=j.job_id
-                         ORDER BY jr.request_id DESC LIMIT 1
-                     )
                      ORDER BY selected.terminal_rank, selected.sort_at DESC,
                               COALESCE(j.job_id,h.job_id)",
                     &[&filter.workflow, &filter.status, &filter.event, &limit],
                 )
                 .await
                 .map_err(ControlError::backend)?;
+            // Steps for each job's latest attempt, live or archived, in one
+            // batched read instead of one decode per job.
+            let attempts: Vec<String> = rows
+                .iter()
+                .filter_map(|row| row.get::<_, Option<String>>(5))
+                .collect();
+            let mut steps: std::collections::BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>> =
+                std::collections::BTreeMap::new();
+            if !attempts.is_empty() {
+                let sql = format!(
+                    "SELECT {STEP_COLUMNS} FROM (
+                         SELECT {STEP_COLUMNS}, position FROM job_steps
+                         WHERE agent_job_id = ANY($1)
+                         UNION ALL
+                         SELECT {STEP_COLUMNS}, position FROM step_history
+                         WHERE agent_job_id = ANY($1)) s
+                     ORDER BY agent_job_id, position"
+                );
+                for row in client
+                    .query(&sql, &[&attempts])
+                    .await
+                    .map_err(ControlError::backend)?
+                {
+                    let (agent, record) = step_from_row(&row);
+                    steps.entry(agent).or_default().push(record);
+                }
+            }
             let mut runs = Vec::new();
             let mut current_id: Option<String> = None;
             let mut current_run: Option<RunRecord> = None;
@@ -623,13 +649,11 @@ impl PostgresBackend {
                 let job_id: Option<String> = row.get(2);
                 let status: Option<String> = row.get(3);
                 let queue_kind: Option<String> = row.get(4);
-                let steps: Option<Vec<u8>> = row.get(5);
+                let agent: Option<String> = row.get(5);
                 if let (Some(job_id), Some(status), Some(queue_kind)) = (job_id, status, queue_kind)
                 {
-                    let steps = steps
-                        .map(|bytes| blob::<Vec<crate::models::StepRecord>>(&self.cipher, &bytes))
-                        .transpose()?;
-                    current_jobs.push((JobId(job_id), status_parse(&status), queue_kind, steps));
+                    let job_steps = agent.and_then(|a| steps.get(&parse_uuid(&a)).cloned());
+                    current_jobs.push((JobId(job_id), status_parse(&status), queue_kind, job_steps));
                 }
             }
             if let Some(run) = current_run {
@@ -823,6 +847,76 @@ fn scope_params(ids: &Option<Vec<String>>) -> Vec<&(dyn tokio_postgres::types::T
 }
 
 type Tx<'a> = tokio_postgres::Transaction<'a>;
+
+/// Columns every step read selects, in [`step_from_row`] order. The same
+/// list serves `job_steps` and `step_history`.
+const STEP_COLUMNS: &str = "agent_job_id, step_id, kind, workflow_index, runner_number, \
+     context_name, name, conclusion, started_at_us, finished_at_us";
+
+/// Decode one row selected with [`STEP_COLUMNS`].
+fn step_from_row(row: &tokio_postgres::Row) -> (uuid::Uuid, crate::models::StepRecord) {
+    let agent: String = row.get(0);
+    let kind: String = row.get(2);
+    (
+        parse_uuid(&agent),
+        super::rows::StepRow::into_record(
+            row.get(1),
+            &kind,
+            row.get(3),
+            row.get(4),
+            row.get(5),
+            row.get(6),
+            row.get(7),
+            row.get(8),
+            row.get(9),
+        ),
+    )
+}
+
+/// Apply one attempt's step delta: upsert changed rows, delete removed ids.
+async fn write_step_delta(
+    conn: &Tx<'_>,
+    agent_job_id: &uuid::Uuid,
+    delta: &super::rows::StepDelta,
+) -> Result<(), ControlError> {
+    let agent = agent_job_id.to_string();
+    for id in &delta.deletes {
+        conn.execute(
+            "DELETE FROM job_steps WHERE agent_job_id=$1 AND step_id=$2",
+            &[&agent, id],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    for row in &delta.upserts {
+        conn.execute(
+            "INSERT INTO job_steps (agent_job_id, step_id, position, kind, workflow_index, \
+             runner_number, context_name, name, conclusion, started_at_us, finished_at_us) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             ON CONFLICT(agent_job_id, step_id) DO UPDATE SET position=excluded.position, \
+             kind=excluded.kind, workflow_index=excluded.workflow_index, \
+             runner_number=excluded.runner_number, context_name=excluded.context_name, \
+             name=excluded.name, conclusion=excluded.conclusion, \
+             started_at_us=excluded.started_at_us, finished_at_us=excluded.finished_at_us",
+            &[
+                &agent,
+                &row.step_id,
+                &row.position,
+                &row.kind,
+                &row.workflow_index,
+                &row.runner_number,
+                &row.context_name,
+                &row.name,
+                &row.conclusion,
+                &row.started_at_us,
+                &row.finished_at_us,
+            ],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    }
+    Ok(())
+}
 
 async fn load_txstate(
     conn: &Tx<'_>,
@@ -1251,38 +1345,31 @@ async fn load_txstate(
     {
         // `agent_job_id` maps to a request — push the run scope through a
         // subquery on `job_requests` so a narrow scope skips the table.
-        let (sql, ids) = match scope.runs.as_ref() {
-            None => (
-                "SELECT agent_job_id, steps_blob, revision FROM job_steps".to_owned(),
-                None,
-            ),
-            Some(set) if set.is_empty() => (
-                "SELECT agent_job_id, steps_blob, revision FROM job_steps WHERE false".to_owned(),
-                None,
-            ),
+        let (filter, ids) = match scope.runs.as_ref() {
+            None => (String::new(), None),
+            Some(set) if set.is_empty() => (" WHERE false".to_owned(), None),
             Some(set) => (
-                "SELECT agent_job_id, steps_blob, revision FROM job_steps \
-                 WHERE agent_job_id IN (SELECT agent_job_id FROM job_requests \
+                " WHERE agent_job_id IN (SELECT agent_job_id FROM job_requests \
                  WHERE run_id = ANY($1))"
                     .to_owned(),
                 Some(set.iter().map(|id| id.0.to_string()).collect()),
             ),
         };
+        let sql =
+            format!("SELECT {STEP_COLUMNS} FROM job_steps{filter} ORDER BY agent_job_id, position");
         for row in conn
             .query(&sql, &scope_params(&ids))
             .await
             .map_err(ControlError::backend)?
         {
-            let agent_job_id_s: String = row.get(0);
-            let steps: Vec<u8> = row.get(1);
-            let revision: i64 = row.get(2);
-            let agent_job_id = parse_uuid(&agent_job_id_s);
-            if let Ok(steps) = blob(cipher, &steps) {
-                tx.job_steps.insert(agent_job_id, steps);
-                tx.job_steps_revision.insert(agent_job_id, revision as u64);
+            let (agent_job_id, record) = step_from_row(&row);
+            // In scope when the request carrying this agent_job_id loaded.
+            if !tx.agent_job_requests.contains_key(&agent_job_id) {
+                continue;
             }
-            tx.loaded.step_attempts.insert(agent_job_id);
+            tx.job_steps.entry(agent_job_id).or_default().push(record);
         }
+        tx.loaded.steps = tx.job_steps.clone();
     }
 
     // Runners — always global. `claim_permitted` checks the runner holding a
@@ -1715,16 +1802,12 @@ async fn load_txstate(
     }
 
     if scope.include_archived {
-        load_archived_txstate(conn, &mut tx, cipher).await?;
+        load_archived_txstate(conn, &mut tx).await?;
     }
     Ok((tx, effective_scope))
 }
 
-async fn load_archived_txstate(
-    conn: &Tx<'_>,
-    tx: &mut TxState,
-    cipher: &store::Envelope,
-) -> Result<(), ControlError> {
+async fn load_archived_txstate(conn: &Tx<'_>, tx: &mut TxState) -> Result<(), ControlError> {
     if tx.runs.is_empty() {
         return Ok(());
     }
@@ -1750,7 +1833,7 @@ async fn load_archived_txstate(
     let attempts = conn
         .query(
             "SELECT h.request_id,h.run_id,h.job_id,h.agent_job_id,h.plan_id,h.timeline_id,
-                h.result,h.owner_runner_id,h.claimed_at_us,h.started_at_us,h.steps_blob
+                h.result,h.owner_runner_id,h.claimed_at_us,h.started_at_us
          FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
          WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
            AND h.run_created_at_us=r.created_at_us AND h.run_id = ANY($1)
@@ -1768,7 +1851,6 @@ async fn load_archived_txstate(
         let result: Option<String> = row.get(6);
         let claimed_at: Option<i64> = row.get(8);
         let started_at: Option<i64> = row.get(9);
-        let steps: Option<Vec<u8>> = row.get(10);
         let agent_job_id = parse_uuid(&agent_id);
         tx.insert_request(TaskAgentJobRequestRecord {
             request_id: row.get(0),
@@ -1787,9 +1869,23 @@ async fn load_archived_txstate(
             timeout_triggered: false,
             debug_token_issued: false,
         });
-        if let Some(bytes) = steps {
-            tx.job_steps.insert(agent_job_id, blob(cipher, &bytes)?);
-        }
+    }
+    let steps = conn
+        .query(
+            &format!(
+                "SELECT {STEP_COLUMNS} FROM step_history
+                 WHERE (run_id, run_attempt, run_created_at_us) IN (
+                     SELECT run_id, run_attempt, created_at_us FROM runs
+                     WHERE archived_at_us IS NOT NULL AND run_id = ANY($1))
+                 ORDER BY agent_job_id, position"
+            ),
+            &[&ids],
+        )
+        .await
+        .map_err(ControlError::backend)?;
+    for row in steps {
+        let (agent_job_id, record) = step_from_row(&row);
+        tx.job_steps.entry(agent_job_id).or_default().push(record);
     }
     Ok(())
 }
@@ -2321,26 +2417,21 @@ async fn write_txstate(
         .await
         .map_err(ControlError::backend)?;
     }
+    // Steps: per-attempt row delta against the loaded manifest, so a step
+    // transition is a one-row upsert. Steps only exist under a live request
+    // (FK); an attempt whose request this command removed is cascaded away
+    // with it and must not be re-inserted.
+    let live_attempts: std::collections::HashSet<uuid::Uuid> =
+        tx.job_requests.values().map(|r| r.agent_job_id).collect();
     for (agent_job_id, steps) in &tx.job_steps {
-        let revision = tx
-            .job_steps_revision
-            .get(agent_job_id)
-            .copied()
-            .unwrap_or(0);
-        conn.execute(
-            "INSERT INTO job_steps (agent_job_id, steps_blob, revision) VALUES ($1,$2,$3) \
-             ON CONFLICT(agent_job_id) DO UPDATE SET steps_blob=excluded.steps_blob, \
-             revision=excluded.revision",
-            &[
-                &agent_job_id.to_string(),
-                &unblob(cipher, steps)?,
-                &(revision as i64),
-            ],
-        )
-        .await
-        .map_err(ControlError::backend)?;
+        if !live_attempts.contains(agent_job_id) {
+            continue;
+        }
+        let delta =
+            super::rows::step_delta(tx.loaded.steps.get(agent_job_id).map(Vec::as_slice), steps);
+        write_step_delta(conn, agent_job_id, &delta).await?;
     }
-    for agent_job_id in &tx.loaded.step_attempts {
+    for agent_job_id in tx.loaded.steps.keys() {
         if !tx.job_steps.contains_key(agent_job_id) {
             conn.execute(
                 "DELETE FROM job_steps WHERE agent_job_id=$1",
@@ -3274,24 +3365,33 @@ impl ControlBackend for PostgresBackend {
                 tx.execute(
                     "INSERT INTO attempt_history(namespace_id,run_id,run_attempt,run_created_at_us,
                     request_id,job_id,agent_job_id,plan_id,timeline_id,result,owner_runner_id,
-                    claimed_at_us,started_at_us,steps_blob)
+                    claimed_at_us,started_at_us)
                  SELECT r.namespace,r.run_id,r.run_attempt,r.created_at_us,
                         q.request_id,q.job_id,q.agent_job_id,q.plan_id,q.timeline_id,q.result,
-                        q.owner_runner_id,q.claimed_at_us,q.started_at_us,s.steps_blob
+                        q.owner_runner_id,q.claimed_at_us,q.started_at_us
                  FROM job_requests q JOIN runs r ON r.run_id=q.run_id
-                 LEFT JOIN job_steps s ON s.agent_job_id=q.agent_job_id
                  WHERE r.run_id=$1",
                     &[&run_id],
                 )
                 .await
                 .map_err(ControlError::backend)?;
                 tx.execute(
-                    "DELETE FROM job_steps WHERE agent_job_id IN
-                 (SELECT agent_job_id FROM job_requests WHERE run_id=$1)",
+                    "INSERT INTO step_history(namespace_id,run_id,run_attempt,run_created_at_us,
+                    agent_job_id,step_id,position,kind,workflow_index,runner_number,
+                    context_name,name,conclusion,started_at_us,finished_at_us)
+                 SELECT r.namespace,r.run_id,r.run_attempt,r.created_at_us,
+                        s.agent_job_id,s.step_id,s.position,s.kind,s.workflow_index,
+                        s.runner_number,s.context_name,s.name,s.conclusion,
+                        s.started_at_us,s.finished_at_us
+                 FROM job_steps s JOIN job_requests q ON q.agent_job_id=s.agent_job_id
+                 JOIN runs r ON r.run_id=q.run_id
+                 WHERE r.run_id=$1",
                     &[&run_id],
                 )
                 .await
                 .map_err(ControlError::backend)?;
+                // `job_steps` rows cascade away with their `job_requests`
+                // rows below.
                 for table in [
                     "job_requests",
                     "id_token_grants",

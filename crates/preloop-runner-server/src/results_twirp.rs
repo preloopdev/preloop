@@ -45,8 +45,8 @@ pub async fn twirp_workflow_steps_update(
     };
 
     // Resolve the callback identity and apply the step manifest update in one
-    // backend transaction — `job_steps`/`job_steps_revision` are durable
-    // TxState, so the commit persists them (no separate store write).
+    // backend transaction — `job_steps` is durable TxState, so the commit
+    // persists exactly the steps that changed (no separate store write).
     shared
         .state
         .backend
@@ -130,12 +130,6 @@ pub async fn twirp_workflow_steps_update(
                     }),
                 }
             }
-
-            // Bumped under the same transaction that mutated the manifest, so
-            // the committed revision is strictly newer than any snapshot taken
-            // before it.
-            let counter = tx.job_steps_revision.entry(job_uuid).or_insert(0);
-            *counter += 1;
             Ok(())
         })
         .await

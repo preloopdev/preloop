@@ -130,8 +130,9 @@ pub(crate) struct TxState {
     pub(crate) next_request_id: i64,
 
     // ── Steps ─────────────────────────────────────────────────────────
+    /// Step manifest per execution attempt (`agent_job_id`), in manifest
+    /// order. Persisted one row per step in `job_steps`.
     pub(crate) job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
-    pub(crate) job_steps_revision: BTreeMap<uuid::Uuid, u64>,
 
     // ── Concurrency and jobsets ───────────────────────────────────────
     pub(crate) concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
@@ -198,7 +199,10 @@ pub(crate) struct LoadedRows {
     pub(crate) jobset_snapshot: BTreeMap<JobSetId, JobSetAdmission>,
     pub(crate) assignments: BTreeSet<(RunId, JobId)>,
     pub(crate) cancellations: BTreeSet<(RunId, JobId, uuid::Uuid)>,
-    pub(crate) step_attempts: BTreeSet<uuid::Uuid>,
+    /// Step manifests as loaded, per attempt. Write-back diffs against this
+    /// so a step transition is a one-row upsert and untouched steps are never
+    /// rewritten.
+    pub(crate) steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
     pub(crate) holder_key_runs: BTreeSet<RunId>,
     /// Counters loaded (name → value at load).
     pub(crate) counters: BTreeMap<String, i64>,
