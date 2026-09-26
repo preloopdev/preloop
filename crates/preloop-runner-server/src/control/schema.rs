@@ -39,7 +39,7 @@
 /// - 11: jobs gains ordering and pool columns.
 /// - 12: seed persistent FIFO counters and backfill ordering.
 /// - 13: terminal-run archive switch and history tables.
-/// - 14: concurrency gates as rows (holds/waits/jobset_gates); blob families stay for backfill.
+/// - 14: concurrency gates as rows (holds/waits/jobset_gates); legacy blob tables dropped.
 pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 14;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
@@ -704,7 +704,7 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 10: jobs gains ordering and pool columns.
 /// - 11: seed persistent FIFO counters and backfill ordering.
 /// - 12: terminal-run archive switch and history tables.
-/// - 13: concurrency gates as rows (holds/waits/jobset_gates); blob families stay for backfill.
+/// - 13: concurrency gates as rows (holds/waits/jobset_gates); legacy blob tables dropped.
 pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 13;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
