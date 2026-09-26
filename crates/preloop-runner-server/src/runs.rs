@@ -783,31 +783,29 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     if !allow_secrets {
         submission.secrets.clear();
     } else {
-        // Global secrets first, then per-repository secrets for the
-        // submitting repository. Precedence: submission-provided secrets
-        // (already in the map) > per-repo tier > global tier — mirroring
-        // GitHub, where repo secrets override org secrets of the same name.
-        let secret_store = shared.state.secrets.read();
+        // Precedence per name: submission-provided > stored tiers (resolved
+        // by the provider as repo > global) — mirroring GitHub, where repo
+        // secrets override org secrets of the same name.
+        let stored = shared
+            .state
+            .secret_provider
+            .resolve(crate::secret_provider::SecretScope {
+                repository: &submission.repository,
+                environment: None,
+            })
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "secret provider `{}` failed: {error}",
+                    shared.state.secret_provider.name()
+                ))
+            })?;
         let submission_names: BTreeSet<String> = submission.secrets.keys().cloned().collect();
         // Remember the caller-provided names so per-job environment overlays
         // (applied later, in `build_job_artifacts`) keep these values
         // winning per name over the stored environment tier.
-        submission.submission_names = submission_names.clone();
-        for (name, value) in &secret_store.global {
-            submission
-                .secrets
-                .entry(name.clone())
-                .or_insert_with(|| preloop_gha_protocol::SecretString::new(value.clone()));
-        }
-        if let Some(repo_secrets) = secret_store.repo.get(&submission.repository) {
-            for (name, value) in repo_secrets {
-                if !submission_names.contains(name) {
-                    submission.secrets.insert(
-                        name.clone(),
-                        preloop_gha_protocol::SecretString::new(value.clone()),
-                    );
-                }
-            }
+        submission.submission_names = submission_names;
+        for (name, value) in stored {
+            submission.secrets.entry(name).or_insert(value);
         }
     }
     let secrets_ms = t_parse.elapsed().as_secs_f64() * 1000.0 - remote_ms;
@@ -2250,24 +2248,28 @@ pub fn build_job_artifacts(
     // Precedence per name: submission-provided > environment > repo > global,
     // mirroring GitHub's env-over-repo-over-org rule with the local
     // `--secret` escape hatch kept on top.
-    // Overlay lazily: most jobs have no `environment:` tier, and the base
-    // map can be large — copying it per job would be pure allocation cost.
-    // The original map is borrowed directly in that case.
+    // Only jobs with an `environment:` get an overlay; the rest borrow the
+    // submission-level map directly instead of copying it per job.
     let mut env_overlay: Option<BTreeMap<String, String>> = None;
-    if policy.allows_secrets
-        && let Some(env_name) = job.oidc_environment.as_deref()
-    {
-        let env_secrets = shared
-            .state
-            .secrets
-            .read()
-            .env
-            .get(&submission.repository)
-            .and_then(|envs| envs.get(env_name))
-            .cloned();
-        if let Some(env_secrets) = env_secrets {
+    if policy.allows_secrets {
+        if let Some(env_name) = job.oidc_environment.as_deref() {
+            let scoped = shared
+                .state
+                .secret_provider
+                .resolve(crate::secret_provider::SecretScope {
+                    repository: &submission.repository,
+                    environment: Some(env_name),
+                })
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "secret provider `{}` failed: {error}",
+                        shared.state.secret_provider.name()
+                    ))
+                })?;
+            // `scoped` is env > repo > global; submission-provided names
+            // keep their value on top.
             let mut merged = secrets_exposed.clone();
-            for (name, value) in env_secrets {
+            for (name, value) in preloop_gha_protocol::masking::expose_all(&scoped) {
                 if !submission.submission_names.contains(&name) {
                     merged.insert(name, value);
                 }

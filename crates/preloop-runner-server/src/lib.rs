@@ -36,6 +36,7 @@ use secrets_api::*;
 pub mod execution_protection_api;
 use execution_protection_api::*;
 pub mod reusable_workflows;
+pub mod secret_provider;
 use reusable_workflows::*;
 pub mod remote_workflows;
 pub mod runs;

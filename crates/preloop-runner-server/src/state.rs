@@ -613,6 +613,9 @@ pub struct AppState {
     /// take precedence per name. Writable at runtime by the live secrets
     /// API, which also persists the config file.
     pub secrets: Arc<parking_lot::RwLock<SecretStore>>,
+    /// Resolves workflow secrets for a job's scope. The built-in provider
+    /// reads `secrets`; hosted/bring-your-own providers plug in here.
+    pub secret_provider: Arc<dyn crate::secret_provider::SecretProvider>,
     /// Serializes the live secrets API's load → mutate → persist → publish
     /// sequence. `set_secret`/`delete_secret` read the whole config file,
     /// change one entry and write the file back; without mutual exclusion
@@ -1072,6 +1075,9 @@ impl AppState {
             env: config.env_secrets,
             environments: config.environments,
         }));
+        let secret_provider: Arc<dyn crate::secret_provider::SecretProvider> = Arc::new(
+            crate::secret_provider::BuiltinSecretProvider::new(secrets.clone()),
+        );
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let mut pr_config = config.github.pr.clone();
@@ -1185,6 +1191,7 @@ impl AppState {
             runner_version_deprecated,
             scheduler: None,
             secrets,
+            secret_provider,
             secret_mutation: Arc::new(Mutex::new(())),
             policy_mutation: Arc::new(Mutex::new(())),
             store_mutation: Arc::new(Mutex::new(())),
