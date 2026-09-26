@@ -39,7 +39,8 @@
 /// - 11: jobs gains ordering and pool columns.
 /// - 12: seed persistent FIFO counters and backfill ordering.
 /// - 13: terminal-run archive switch and history tables.
-pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 13;
+/// - 14: concurrency gates as rows (holds/waits/jobset_gates); blob families stay for backfill.
+pub(crate) const SQLITE_SCHEMA_VERSION: i64 = 14;
 
 /// SQLite migrations as `(version, sql)` steps, applied in order to any
 /// database whose `user_version` predates them — the same append-only model
@@ -273,6 +274,48 @@ pub(crate) const SQLITE_MIGRATIONS: &[(i64, &str)] = &[
              ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value, excluded.value);",
     ),
     (13, "ALTER TABLE runs ADD COLUMN archived_at_us INTEGER;"),
+    (
+        14,
+        "DROP TABLE IF EXISTS concurrency_groups;
+         DROP TABLE IF EXISTS holder_keys;
+         DROP TABLE IF EXISTS jobset_admissions;
+         CREATE TABLE IF NOT EXISTS concurrency_holds (
+            repo                TEXT NOT NULL,
+            group_name          TEXT NOT NULL,
+            display_name        TEXT NOT NULL DEFAULT '',
+            holder_kind         TEXT NOT NULL,
+            holder_run_id       TEXT NOT NULL,
+            holder_job_id       TEXT,
+            holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+            held_at_us          INTEGER NOT NULL,
+            PRIMARY KEY (repo, group_name)
+        );
+        CREATE TABLE IF NOT EXISTS concurrency_waits (
+            repo                TEXT NOT NULL,
+            group_name          TEXT NOT NULL,
+            position            INTEGER NOT NULL,
+            holder_kind         TEXT NOT NULL,
+            holder_run_id       TEXT NOT NULL,
+            holder_job_id       TEXT,
+            holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+            queued_at_us        INTEGER NOT NULL,
+            PRIMARY KEY (repo, group_name, position)
+        );
+        CREATE TABLE IF NOT EXISTS jobset_gates (
+            run_id              TEXT NOT NULL,
+            job_ids             TEXT NOT NULL,
+            gate_index          INTEGER NOT NULL,
+            gate_repo           TEXT NOT NULL,
+            gate_group          TEXT NOT NULL,
+            display_name        TEXT NOT NULL DEFAULT '',
+            cancel_in_progress  INTEGER NOT NULL DEFAULT 0,
+            queue_mode          TEXT NOT NULL DEFAULT 'single',
+            acquired            INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (run_id, job_ids, gate_index),
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS concurrency_waits_run ON concurrency_waits(holder_run_id);",
+    ),
 ];
 
 /// The SQLite DDL, applied as one migration. `IF NOT EXISTS` makes it
@@ -501,29 +544,6 @@ CREATE TABLE IF NOT EXISTS broker_messages (
 );
 
 -- ── Concurrency ──────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS concurrency_groups (
-    repo                TEXT NOT NULL,
-    group_name          TEXT NOT NULL,
-    display_name        TEXT NOT NULL DEFAULT '',
-    running_holder      BLOB,                       -- concurrency::Holder JSON
-    pending_holders     BLOB NOT NULL DEFAULT '[]', -- Vec<Holder> JSON
-    PRIMARY KEY (repo, group_name)
-);
-CREATE TABLE IF NOT EXISTS holder_keys (
-    run_id              TEXT NOT NULL,
-    repo                TEXT NOT NULL,
-    group_name          TEXT NOT NULL,
-    PRIMARY KEY (run_id, repo, group_name),
-    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS jobset_admissions (
-    run_id              TEXT NOT NULL,
-    job_ids             TEXT NOT NULL,              -- sorted JobId list JSON
-    gates_blob          BLOB NOT NULL,              -- Vec<JobSetGate>
-    acquired_keys       BLOB NOT NULL DEFAULT '[]', -- Vec<(repo,group)>
-    PRIMARY KEY (run_id, job_ids),
-    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-);
 CREATE TABLE IF NOT EXISTS jobset_ready (
     run_id              TEXT NOT NULL,
     job_ids             TEXT NOT NULL,
@@ -535,6 +555,48 @@ CREATE TABLE IF NOT EXISTS run_concurrency (
     concurrency_blob    BLOB NOT NULL,              -- parser::Concurrency
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
+
+-- ── Concurrency gates as queryable rows ──────────────────────────────
+-- Holders and waiters replace the sealed running_holder/pending_holders
+-- blobs; queue depth and oldest waiter are plain SQL. holder_keys is
+-- derived at load and no longer persisted. jobset_gates replaces
+-- gates_blob/acquired_keys the same way.
+CREATE TABLE IF NOT EXISTS concurrency_holds (
+    repo                TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    display_name        TEXT NOT NULL DEFAULT '',
+    holder_kind         TEXT NOT NULL,
+    holder_run_id       TEXT NOT NULL,
+    holder_job_id       TEXT,
+    holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+    held_at_us          INTEGER NOT NULL,
+    PRIMARY KEY (repo, group_name)
+);
+CREATE TABLE IF NOT EXISTS concurrency_waits (
+    repo                TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    position            INTEGER NOT NULL,
+    holder_kind         TEXT NOT NULL,
+    holder_run_id       TEXT NOT NULL,
+    holder_job_id       TEXT,
+    holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+    queued_at_us        INTEGER NOT NULL,
+    PRIMARY KEY (repo, group_name, position)
+);
+CREATE TABLE IF NOT EXISTS jobset_gates (
+    run_id              TEXT NOT NULL,
+    job_ids             TEXT NOT NULL,
+    gate_index          INTEGER NOT NULL,
+    gate_repo           TEXT NOT NULL,
+    gate_group          TEXT NOT NULL,
+    display_name        TEXT NOT NULL DEFAULT '',
+    cancel_in_progress  INTEGER NOT NULL DEFAULT 0,
+    queue_mode          TEXT NOT NULL DEFAULT 'single',
+    acquired            INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, job_ids, gate_index),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS concurrency_waits_run ON concurrency_waits(holder_run_id);
 
 -- ── Assignments, pool waitlist, cancellations ────────────────────────
 CREATE TABLE IF NOT EXISTS job_assignments (
@@ -642,7 +704,8 @@ CREATE TABLE IF NOT EXISTS meta (
 /// - 10: jobs gains ordering and pool columns.
 /// - 11: seed persistent FIFO counters and backfill ordering.
 /// - 12: terminal-run archive switch and history tables.
-pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 12;
+/// - 13: concurrency gates as rows (holds/waits/jobset_gates); blob families stay for backfill.
+pub(crate) const POSTGRES_SCHEMA_VERSION: i64 = 13;
 
 /// Postgres migrations as `(version, sql)` steps, applied in order to any
 /// database whose `schema_migrations` max predates them — the same
@@ -718,6 +781,48 @@ pub(crate) const POSTGRES_MIGRATIONS: &[(i64, &str)] = &[
              ON CONFLICT(name) DO UPDATE SET value=GREATEST(counters.value, EXCLUDED.value);",
     ),
     (12, "ALTER TABLE control.runs ADD COLUMN IF NOT EXISTS archived_at_us BIGINT"),
+    (
+        13,
+        "DROP TABLE IF EXISTS control.concurrency_groups;
+         DROP TABLE IF EXISTS control.holder_keys;
+         DROP TABLE IF EXISTS control.jobset_admissions;
+         CREATE TABLE IF NOT EXISTS control.concurrency_holds (
+            repo                TEXT NOT NULL,
+            group_name          TEXT NOT NULL,
+            display_name        TEXT NOT NULL DEFAULT '',
+            holder_kind         TEXT NOT NULL,
+            holder_run_id       TEXT NOT NULL,
+            holder_job_id       TEXT,
+            holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+            held_at_us          BIGINT NOT NULL,
+            PRIMARY KEY (repo, group_name)
+        );
+        CREATE TABLE IF NOT EXISTS control.concurrency_waits (
+            repo                TEXT NOT NULL,
+            group_name          TEXT NOT NULL,
+            position            BIGINT NOT NULL,
+            holder_kind         TEXT NOT NULL,
+            holder_run_id       TEXT NOT NULL,
+            holder_job_id       TEXT,
+            holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+            queued_at_us        BIGINT NOT NULL,
+            PRIMARY KEY (repo, group_name, position)
+        );
+        CREATE TABLE IF NOT EXISTS control.jobset_gates (
+            run_id              TEXT NOT NULL,
+            job_ids             TEXT NOT NULL,
+            gate_index          BIGINT NOT NULL,
+            gate_repo           TEXT NOT NULL,
+            gate_group          TEXT NOT NULL,
+            display_name        TEXT NOT NULL DEFAULT '',
+            cancel_in_progress  BIGINT NOT NULL DEFAULT 0,
+            queue_mode          TEXT NOT NULL DEFAULT 'single',
+            acquired            BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (run_id, job_ids, gate_index),
+            FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS concurrency_waits_run ON control.concurrency_waits(holder_run_id);",
+    ),
 ];
 
 /// The Postgres DDL: the same table families as [`SQLITE_DDL`] in Postgres
@@ -934,29 +1039,6 @@ CREATE TABLE IF NOT EXISTS broker_messages (
 );
 
 -- ── Concurrency ──────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS concurrency_groups (
-    repo                TEXT NOT NULL,
-    group_name          TEXT NOT NULL,
-    display_name        TEXT NOT NULL DEFAULT '',
-    running_holder      BYTEA,
-    pending_holders     BYTEA NOT NULL,
-    PRIMARY KEY (repo, group_name)
-);
-CREATE TABLE IF NOT EXISTS holder_keys (
-    run_id              TEXT NOT NULL,
-    repo                TEXT NOT NULL,
-    group_name          TEXT NOT NULL,
-    PRIMARY KEY (run_id, repo, group_name),
-    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS jobset_admissions (
-    run_id              TEXT NOT NULL,
-    job_ids             TEXT NOT NULL,
-    gates_blob          BYTEA NOT NULL,
-    acquired_keys       BYTEA NOT NULL,
-    PRIMARY KEY (run_id, job_ids),
-    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
-);
 CREATE TABLE IF NOT EXISTS jobset_ready (
     run_id              TEXT NOT NULL,
     job_ids             TEXT NOT NULL,
@@ -968,6 +1050,43 @@ CREATE TABLE IF NOT EXISTS run_concurrency (
     concurrency_blob    BYTEA NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS concurrency_holds (
+    repo                TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    display_name        TEXT NOT NULL DEFAULT '',
+    holder_kind         TEXT NOT NULL,
+    holder_run_id       TEXT NOT NULL,
+    holder_job_id       TEXT,
+    holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+    held_at_us          BIGINT NOT NULL,
+    PRIMARY KEY (repo, group_name)
+);
+CREATE TABLE IF NOT EXISTS concurrency_waits (
+    repo                TEXT NOT NULL,
+    group_name          TEXT NOT NULL,
+    position            BIGINT NOT NULL,
+    holder_kind         TEXT NOT NULL,
+    holder_run_id       TEXT NOT NULL,
+    holder_job_id       TEXT,
+    holder_job_ids      TEXT NOT NULL DEFAULT '[]',
+    queued_at_us        BIGINT NOT NULL,
+    PRIMARY KEY (repo, group_name, position)
+);
+CREATE TABLE IF NOT EXISTS jobset_gates (
+    run_id              TEXT NOT NULL,
+    job_ids             TEXT NOT NULL,
+    gate_index          BIGINT NOT NULL,
+    gate_repo           TEXT NOT NULL,
+    gate_group          TEXT NOT NULL,
+    display_name        TEXT NOT NULL DEFAULT '',
+    cancel_in_progress  BIGINT NOT NULL DEFAULT 0,
+    queue_mode          TEXT NOT NULL DEFAULT 'single',
+    acquired            BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, job_ids, gate_index),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS concurrency_waits_run ON concurrency_waits(holder_run_id);
 
 -- ── Assignments, pool waitlist, cancellations ────────────────────────
 CREATE TABLE IF NOT EXISTS job_assignments (

@@ -755,7 +755,7 @@ impl JobSetId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSetGate {
     pub key: (String, String),
     pub display_name: String,
@@ -763,7 +763,7 @@ pub struct JobSetGate {
     pub queue: preloop_gha_parser::ConcurrencyQueue,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSetAdmission {
     pub gates: Vec<JobSetGate>,
     pub acquired_keys: BTreeSet<(String, String)>,

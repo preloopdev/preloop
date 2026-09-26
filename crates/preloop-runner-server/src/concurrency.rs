@@ -67,8 +67,78 @@ impl Holder {
     }
 }
 
+/// Row encoding of a [`Holder`] for the `concurrency_holds`/`concurrency_waits`
+/// tables: `(kind, run_id, job_id, job_ids_json)`. `job_ids_json` is the
+/// sorted id list for `JobSet` holders, `'[]'` otherwise.
+pub fn holder_row(holder: &Holder) -> (&'static str, String, Option<String>, String) {
+    match holder {
+        Holder::Run(run_id) => ("run", run_id.to_string(), None, "[]".to_owned()),
+        Holder::Job { run_id, job_id } => (
+            "job",
+            run_id.to_string(),
+            Some(job_id.0.clone()),
+            "[]".to_owned(),
+        ),
+        Holder::JobSet { run_id, job_ids } => {
+            let ids: Vec<String> = job_ids.iter().map(|j| j.0.clone()).collect();
+            (
+                "jobset",
+                run_id.to_string(),
+                None,
+                serde_json::to_string(&ids).unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// Decode a holder row. Unknown kinds and unparseable ids fail closed.
+pub fn holder_from_row(
+    kind: &str,
+    run_id: &str,
+    job_id: Option<&str>,
+    job_ids_json: &str,
+) -> Option<Holder> {
+    let run_id = run_id.parse::<RunId>().ok()?;
+    match kind {
+        "run" => Some(Holder::Run(run_id)),
+        "job" => Some(Holder::Job {
+            run_id,
+            job_id: JobId(job_id?.to_owned()),
+        }),
+        "jobset" => {
+            let ids: BTreeSet<JobId> = serde_json::from_str::<Vec<String>>(job_ids_json)
+                .ok()?
+                .into_iter()
+                .map(JobId)
+                .collect();
+            Some(Holder::JobSet {
+                run_id,
+                job_ids: ids,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Row encoding of a [`ConcurrencyQueue`] mode.
+pub fn queue_mode_row(queue: &ConcurrencyQueue) -> &'static str {
+    match queue {
+        ConcurrencyQueue::Single => "single",
+        ConcurrencyQueue::Max => "max",
+    }
+}
+
+/// Decode a queue mode; unknown values fail closed to `Single` (at most one
+/// pending holder), matching the parser default.
+pub fn queue_mode_from_row(mode: &str) -> ConcurrencyQueue {
+    match mode {
+        "max" => ConcurrencyQueue::Max,
+        _ => ConcurrencyQueue::Single,
+    }
+}
+
 /// One concurrency group (repo + group name, case-insensitive key).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConcurrencyGroup {
     /// Display-case group name as first evaluated.
     pub display_name: String,

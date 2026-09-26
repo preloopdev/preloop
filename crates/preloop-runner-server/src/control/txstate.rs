@@ -189,7 +189,13 @@ pub(crate) struct LoadedRows {
     pub(crate) inflight_sessions: BTreeSet<String>,
     pub(crate) runners: BTreeSet<i64>,
     pub(crate) groups: BTreeSet<(String, String)>,
+    /// Loaded `concurrency_groups` snapshots, keyed by (repo, group). A group
+    /// whose snapshot equals the working value is written as nothing — its
+    /// hold/waiter rows stay byte-identical (`held_at_us` is not re-stamped).
+    pub(crate) group_snapshot: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
     pub(crate) jobsets: BTreeSet<JobSetId>,
+    /// Loaded `jobset_admissions` snapshots for the same change-skip rule.
+    pub(crate) jobset_snapshot: BTreeMap<JobSetId, JobSetAdmission>,
     pub(crate) assignments: BTreeSet<(RunId, JobId)>,
     pub(crate) cancellations: BTreeSet<(RunId, JobId, uuid::Uuid)>,
     pub(crate) step_attempts: BTreeSet<uuid::Uuid>,

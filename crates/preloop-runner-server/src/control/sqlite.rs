@@ -38,7 +38,7 @@ use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, SessionId};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 /// The SQLite control backend. `conn` is the single writer (`BEGIN
 /// IMMEDIATE`); `readers` is a pool of `query_only` connections that serve
@@ -151,6 +151,7 @@ impl SqliteBackend {
         // jobset_admissions→runs) actually fire under targeted deletes.
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(ControlError::backend)?;
+
         // v11 created a queryable pool key. Backfill legacy rows from their
         // actual labels; a default empty key would make migrated jobs
         // invisible to indexed claimers after restart.
@@ -938,37 +939,22 @@ fn load_txstate(
     // `try_acquire_concurrency`/`release_concurrency_for_*` can cancel or
     // promote a *different* run's holder; `cancel_run_inner`/`settle_request`
     // must see that run's rows or the cancellation silently no-ops and the
-    // run's jobs stay queued. `concurrency_groups` is small (active gates
-    // only), so the extra scan is cheap; the full load below re-reads it.
+    // run's jobs stay queued. Hold/waiter tables are small (active gates
+    // only), so the extra scan is cheap; the full load below re-reads them.
     let mut effective_scope = scope.clone();
     if let Some(runs) = effective_scope.runs.as_mut() {
-        // Widen `runs` with every run a concurrency holder references.
-        // `try_acquire_concurrency`/`release_concurrency_for_*` can cancel or
-        // promote a *different* run's holder; `cancel_run_inner`/
-        // `settle_request` must see that run's rows or the cancellation
-        // silently no-ops and the run's jobs stay queued. `concurrency_groups`
-        // is small (active gates only), so the extra scan is cheap.
         if scope.concurrency {
             let mut stmt = conn
-                .prepare("SELECT running_holder, pending_holders FROM concurrency_groups")
+                .prepare(
+                    "SELECT holder_run_id FROM concurrency_holds \
+                     UNION SELECT holder_run_id FROM concurrency_waits",
+                )
                 .map_err(ControlError::backend)?;
             let rows = stmt
-                .query_map([], |r| {
-                    Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, Vec<u8>>(1)?))
-                })
+                .query_map([], |r| r.get::<_, String>(0))
                 .map_err(ControlError::backend)?;
             for row in rows {
-                let (running, pending) = row.map_err(ControlError::backend)?;
-                if let Some(b) = running {
-                    if let Ok(h) = blob::<concurrency::Holder>(cipher, &b) {
-                        runs.insert(h.run_id());
-                    }
-                }
-                let pending: VecDeque<concurrency::Holder> =
-                    blob(cipher, &pending).unwrap_or_default();
-                for h in pending {
-                    runs.insert(h.run_id());
-                }
+                runs.insert(parse_run_id(&row.map_err(ControlError::backend)?));
             }
         }
         // `runs_referenced`: widen `runs` with the runs of every row this
@@ -1683,12 +1669,13 @@ fn load_txstate(
     }
 
     // Concurrency — always-global (a different run's release unblocks
-    // waiters), loaded fully under any scope that asks for it.
+    // waiters), loaded fully under any scope that asks for it. Gates load
+    // from queryable hold/waiter rows; `holder_keys` is derived, never read.
     if scope.concurrency {
         let mut stmt = conn
             .prepare(
-                "SELECT repo, group_name, display_name, running_holder, pending_holders \
-                 FROM concurrency_groups",
+                "SELECT repo, group_name, display_name, holder_kind, holder_run_id, \
+                 holder_job_id, holder_job_ids FROM concurrency_holds",
             )
             .map_err(ControlError::backend)?;
         let rows = stmt
@@ -1697,29 +1684,45 @@ fn load_txstate(
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<Vec<u8>>>(3)?,
-                    r.get::<_, Vec<u8>>(4)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })
             .map_err(ControlError::backend)?;
         for row in rows {
-            let (repo, group_name, display_name, running, pending) =
+            let (repo, group_name, display_name, kind, run_id, job_id, job_ids) =
                 row.map_err(ControlError::backend)?;
-            let running: Option<concurrency::Holder> = running.and_then(|b| blob(cipher, &b).ok());
-            let pending: VecDeque<concurrency::Holder> = blob(cipher, &pending).unwrap_or_default();
-            tx.concurrency_groups.insert(
-                (repo.clone(), group_name.clone()),
+            let running =
+                crate::concurrency::holder_from_row(&kind, &run_id, job_id.as_deref(), &job_ids);
+            let key = (repo.clone(), group_name.clone());
+            let group = tx.concurrency_groups.entry(key.clone()).or_insert_with(|| {
                 concurrency::ConcurrencyGroup {
-                    display_name,
-                    running,
-                    pending,
-                },
-            );
-            tx.loaded.groups.insert((repo, group_name));
+                    display_name: display_name.clone(),
+                    ..Default::default()
+                }
+            });
+            if group.display_name.is_empty() {
+                group.display_name = display_name;
+            }
+            // Self-healing: an undecodable hold marks the group loaded so
+            // write-back drops the bad row instead of preserving it.
+            if let Some(holder) = running {
+                group.running = Some(holder.clone());
+                tx.holder_keys
+                    .entry(holder.run_id())
+                    .or_default()
+                    .push(key.clone());
+            }
+            tx.loaded.groups.insert(key);
         }
         {
             let mut stmt = conn
-                .prepare("SELECT run_id, repo, group_name FROM holder_keys")
+                .prepare(
+                    "SELECT repo, group_name, holder_kind, holder_run_id, holder_job_id, \
+                     holder_job_ids FROM concurrency_waits ORDER BY position",
+                )
                 .map_err(ControlError::backend)?;
             let rows = stmt
                 .query_map([], |r| {
@@ -1727,35 +1730,57 @@ fn load_txstate(
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
                     ))
                 })
                 .map_err(ControlError::backend)?;
             for row in rows {
-                let (run_id_s, repo, group_name) = row.map_err(ControlError::backend)?;
-                let run_id = parse_run_id(&run_id_s);
-                tx.holder_keys
-                    .entry(run_id)
-                    .or_default()
-                    .push((repo, group_name));
-                tx.loaded.holder_key_runs.insert(run_id);
+                let (repo, group_name, kind, run_id, job_id, job_ids) =
+                    row.map_err(ControlError::backend)?;
+                let key = (repo.clone(), group_name.clone());
+                if let Some(holder) =
+                    crate::concurrency::holder_from_row(&kind, &run_id, job_id.as_deref(), &job_ids)
+                {
+                    tx.holder_keys
+                        .entry(holder.run_id())
+                        .or_default()
+                        .push(key.clone());
+                    tx.concurrency_groups
+                        .entry(key.clone())
+                        .or_default()
+                        .pending
+                        .push_back(holder);
+                }
+                tx.loaded.groups.insert(key);
             }
         }
         {
             let mut stmt = conn
-                .prepare("SELECT run_id, job_ids, gates_blob, acquired_keys FROM jobset_admissions")
+                .prepare(
+                    "SELECT run_id, job_ids, gate_repo, gate_group, display_name, \
+                     cancel_in_progress, queue_mode, acquired FROM jobset_gates \
+                     ORDER BY gate_index",
+                )
                 .map_err(ControlError::backend)?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
-                        r.get::<_, Vec<u8>>(2)?,
-                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, i64>(7)?,
                     ))
                 })
                 .map_err(ControlError::backend)?;
             for row in rows {
-                let (run_id_s, job_ids_s, gates, acquired) = row.map_err(ControlError::backend)?;
+                let (run_id_s, job_ids_s, repo, group, display_name, cancel, mode, acquired) =
+                    row.map_err(ControlError::backend)?;
                 let run_id = parse_run_id(&run_id_s);
                 let job_ids: BTreeSet<JobId> = serde_json::from_str::<BTreeSet<String>>(&job_ids_s)
                     .unwrap_or_default()
@@ -1763,18 +1788,22 @@ fn load_txstate(
                     .map(JobId)
                     .collect();
                 let id = JobSetId { run_id, job_ids };
-                if let (Ok(gates), Ok(acquired_keys)) =
-                    (blob(cipher, &gates), blob(cipher, &acquired))
-                {
-                    tx.jobset_admissions.insert(
-                        id.clone(),
-                        crate::state::JobSetAdmission {
-                            gates,
-                            acquired_keys,
-                        },
-                    );
-                    tx.loaded.jobsets.insert(id);
+                let admission = tx.jobset_admissions.entry(id.clone()).or_insert_with(|| {
+                    crate::state::JobSetAdmission {
+                        gates: Vec::new(),
+                        acquired_keys: BTreeSet::new(),
+                    }
+                });
+                admission.gates.push(crate::state::JobSetGate {
+                    key: (repo.clone(), group.clone()),
+                    display_name,
+                    cancel_in_progress: cancel != 0,
+                    queue: crate::concurrency::queue_mode_from_row(&mode),
+                });
+                if acquired != 0 {
+                    admission.acquired_keys.insert((repo, group));
                 }
+                tx.loaded.jobsets.insert(id);
             }
         }
         {
@@ -1795,6 +1824,10 @@ fn load_txstate(
                 tx.jobset_ready.insert(JobSetId { run_id, job_ids });
             }
         }
+        // Snapshot the loaded gate state so write-back can skip unchanged
+        // groups/jobsets (their rows stay byte-identical, incl. `held_at_us`).
+        tx.loaded.group_snapshot = tx.concurrency_groups.clone();
+        tx.loaded.jobset_snapshot = tx.jobset_admissions.clone();
     }
     // run_concurrency is run-scoped (one row per run's workflow gate).
     {
@@ -2752,53 +2785,128 @@ fn write_txstate(
     }
 
     // Concurrency — always-global, written only when the scope loaded it.
+    // Each group/jobset writes its own rows; groups present at load but gone
+    // now are deleted. Untouched groups are never rewritten. `holder_keys`
+    // is derived and no longer persisted.
     if scope.concurrency {
-        conn.execute("DELETE FROM concurrency_groups", [])
-            .map_err(ControlError::backend)?;
+        // Skip groups whose loaded snapshot equals the working value —
+        // write-back only touches gates this command actually changed.
         for ((repo, group_name), group) in &tx.concurrency_groups {
+            if tx
+                .loaded
+                .group_snapshot
+                .get(&(repo.clone(), group_name.clone()))
+                == Some(group)
+            {
+                continue;
+            }
+            if let Some(holder) = &group.running {
+                let (kind, run_id, job_id, job_ids) = crate::concurrency::holder_row(holder);
+                conn.execute(
+                    "INSERT INTO concurrency_holds (repo, group_name, display_name, holder_kind, \
+                     holder_run_id, holder_job_id, holder_job_ids, held_at_us) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+                     ON CONFLICT(repo,group_name) DO UPDATE SET display_name=excluded.display_name, \
+                     holder_kind=excluded.holder_kind, holder_run_id=excluded.holder_run_id, \
+                     holder_job_id=excluded.holder_job_id, holder_job_ids=excluded.holder_job_ids, \
+                     held_at_us=excluded.held_at_us",
+                    params![
+                        repo, group_name, group.display_name, kind, run_id, job_id, job_ids, now_us
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            } else {
+                conn.execute(
+                    "DELETE FROM concurrency_holds WHERE repo=?1 AND group_name=?2",
+                    params![repo, group_name],
+                )
+                .map_err(ControlError::backend)?;
+            }
             conn.execute(
-                "INSERT INTO concurrency_groups (repo, group_name, display_name, running_holder, \
-                 pending_holders) VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    repo,
-                    group_name,
-                    group.display_name,
-                    group
-                        .running
-                        .as_ref()
-                        .map(|h| unblob(cipher, h))
-                        .transpose()?,
-                    unblob(cipher, &group.pending)?,
-                ],
+                "DELETE FROM concurrency_waits WHERE repo=?1 AND group_name=?2",
+                params![repo, group_name],
             )
             .map_err(ControlError::backend)?;
-        }
-        conn.execute("DELETE FROM holder_keys", [])
-            .map_err(ControlError::backend)?;
-        for (run_id, keys) in &tx.holder_keys {
-            for (repo, group_name) in keys {
+            for (position, holder) in group.pending.iter().enumerate() {
+                let (kind, run_id, job_id, job_ids) = crate::concurrency::holder_row(holder);
                 conn.execute(
-                    "INSERT INTO holder_keys (run_id, repo, group_name) VALUES (?1,?2,?3)",
-                    params![run_id.0.to_string(), repo, group_name],
+                    "INSERT INTO concurrency_waits (repo, group_name, position, holder_kind, \
+                     holder_run_id, holder_job_id, holder_job_ids, queued_at_us) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        repo,
+                        group_name,
+                        position as i64,
+                        kind,
+                        run_id,
+                        job_id,
+                        job_ids,
+                        now_us
+                    ],
                 )
                 .map_err(ControlError::backend)?;
             }
         }
-        conn.execute("DELETE FROM jobset_admissions", [])
-            .map_err(ControlError::backend)?;
+        for (repo, group_name) in &tx.loaded.groups {
+            if !tx
+                .concurrency_groups
+                .contains_key(&(repo.clone(), group_name.clone()))
+            {
+                conn.execute(
+                    "DELETE FROM concurrency_holds WHERE repo=?1 AND group_name=?2",
+                    params![repo, group_name],
+                )
+                .map_err(ControlError::backend)?;
+                conn.execute(
+                    "DELETE FROM concurrency_waits WHERE repo=?1 AND group_name=?2",
+                    params![repo, group_name],
+                )
+                .map_err(ControlError::backend)?;
+            }
+        }
         for (id, admission) in &tx.jobset_admissions {
+            if tx.loaded.jobset_snapshot.get(id) == Some(admission) {
+                continue;
+            }
             let job_ids: Vec<String> = id.job_ids.iter().map(|j| j.0.clone()).collect();
+            let job_ids_s = serde_json::to_string(&job_ids).unwrap_or_default();
             conn.execute(
-                "INSERT INTO jobset_admissions (run_id, job_ids, gates_blob, acquired_keys) \
-                 VALUES (?1,?2,?3,?4)",
-                params![
-                    id.run_id.0.to_string(),
-                    serde_json::to_string(&job_ids).unwrap_or_default(),
-                    unblob(cipher, &admission.gates)?,
-                    unblob(cipher, &admission.acquired_keys)?,
-                ],
+                "DELETE FROM jobset_gates WHERE run_id=?1 AND job_ids=?2",
+                params![id.run_id.0.to_string(), job_ids_s],
             )
             .map_err(ControlError::backend)?;
+            for (index, gate) in admission.gates.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO jobset_gates (run_id, job_ids, gate_index, gate_repo, gate_group, \
+                     display_name, cancel_in_progress, queue_mode, acquired) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![
+                        id.run_id.0.to_string(),
+                        job_ids_s,
+                        index as i64,
+                        gate.key.0,
+                        gate.key.1,
+                        gate.display_name,
+                        i64::from(gate.cancel_in_progress),
+                        crate::concurrency::queue_mode_row(&gate.queue),
+                        i64::from(admission.acquired_keys.contains(&gate.key)),
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            }
+        }
+        for id in &tx.loaded.jobsets {
+            if !tx.jobset_admissions.contains_key(id) {
+                let job_ids: Vec<String> = id.job_ids.iter().map(|j| j.0.clone()).collect();
+                conn.execute(
+                    "DELETE FROM jobset_gates WHERE run_id=?1 AND job_ids=?2",
+                    params![
+                        id.run_id.0.to_string(),
+                        serde_json::to_string(&job_ids).unwrap_or_default()
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            }
         }
         conn.execute("DELETE FROM jobset_ready", [])
             .map_err(ControlError::backend)?;
