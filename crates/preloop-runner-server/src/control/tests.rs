@@ -447,6 +447,59 @@ pub(crate) mod suite {
         assert_eq!(second.queued_jobs, 0);
     }
 
+    pub(crate) async fn request_lookup_uses_latest_correlation(backend: &dyn ControlBackend) {
+        let first = RunId::new();
+        let second = RunId::new();
+        let timeline = uuid::Uuid::new_v4();
+        let mut initial = submit_job(first, "build", 1);
+        initial.request.as_mut().unwrap().timeline_id = timeline;
+        backend
+            .submit_run(submit_run(first, vec![initial]))
+            .await
+            .unwrap();
+        let first_request = backend
+            .request(RequestKey::PlanId("plan".into()))
+            .await
+            .unwrap();
+        assert_eq!(first_request.run_id, first);
+        assert_eq!(
+            backend
+                .request(RequestKey::AgentJobId(first_request.agent_job_id))
+                .await
+                .unwrap()
+                .request_id,
+            first_request.request_id
+        );
+
+        let mut later = submit_job(second, "build", 2);
+        later.request.as_mut().unwrap().timeline_id = timeline;
+        backend
+            .submit_run(submit_run(second, vec![later]))
+            .await
+            .unwrap();
+        let newest = backend
+            .request(RequestKey::PlanId("plan".into()))
+            .await
+            .unwrap();
+        assert_eq!(newest.run_id, second);
+        assert_eq!(
+            backend
+                .request(RequestKey::TimelineId(timeline))
+                .await
+                .unwrap()
+                .request_id,
+            newest.request_id
+        );
+        assert_eq!(
+            backend
+                .request(RequestKey::Id(first_request.request_id))
+                .await
+                .unwrap()
+                .run_id,
+            first
+        );
+    }
+
     pub(crate) async fn cancel_run_queues_cancellation(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -921,6 +974,11 @@ mod sqlite {
     #[tokio::test]
     async fn webhook_replay_is_idempotent() {
         suite::webhook_replay_is_idempotent(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn request_lookup_uses_latest_correlation() {
+        suite::request_lookup_uses_latest_correlation(&SqliteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2598,6 +2656,12 @@ mod postgres {
     async fn webhook_replay_is_idempotent() {
         let (_pg, backend) = backend().await;
         suite::webhook_replay_is_idempotent(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn request_lookup_uses_latest_correlation() {
+        let (_pg, backend) = backend().await;
+        suite::request_lookup_uses_latest_correlation(&backend).await;
     }
 
     #[tokio::test]

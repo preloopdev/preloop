@@ -762,23 +762,24 @@ pub async fn authorize_reporting_callback(
     timeline_id: Option<uuid::Uuid>,
     agent_job_id: Option<uuid::Uuid>,
 ) -> Result<(), ApiError> {
-    let request = shared
-        .state
-        .backend
-        .read_scoped(&crate::control::txstate::TxScope::requests_only(), {
-            let plan_id = plan_id.to_owned();
-            move |tx| {
-                let request_id = agent_job_id
-                    .and_then(|id| tx.agent_job_requests.get(&id).copied())
-                    .or_else(|| timeline_id.and_then(|id| tx.timeline_requests.get(&id).copied()))
-                    .or_else(|| tx.plan_requests.get(&plan_id).copied());
-                Ok(request_id
-                    .and_then(|id| tx.job_requests.get(&id).cloned())
-                    .filter(|request| request.plan_id == plan_id))
+    use crate::control::backend::RequestKey;
+    let keys = [
+        agent_job_id.map(RequestKey::AgentJobId),
+        timeline_id.map(RequestKey::TimelineId),
+        Some(RequestKey::PlanId(plan_id.to_owned())),
+    ];
+    let mut request = None;
+    for key in keys.into_iter().flatten() {
+        match shared.state.backend.request(key).await {
+            Ok(found) => {
+                request = Some(found);
+                break;
             }
-        })
-        .await
-        .map_err(ApiError::from)?;
+            Err(crate::control::ControlError::NotFound(_)) => {}
+            Err(error) => return Err(ApiError::from(error)),
+        }
+    }
+    let request = request.filter(|request| request.plan_id == plan_id);
     crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
 }
 

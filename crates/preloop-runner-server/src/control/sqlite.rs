@@ -4009,26 +4009,53 @@ impl ControlBackend for SqliteBackend {
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
-        self.read_scoped(&TxScope::requests_only(), |tx| {
-            let record = match &key {
-                RequestKey::Id(id) => tx.job_requests.get(id),
-                RequestKey::PlanId(plan) => tx
-                    .plan_requests
-                    .get(plan)
-                    .and_then(|id| tx.job_requests.get(id)),
-
-                RequestKey::AgentJobId(id) => tx
-                    .agent_job_requests
-                    .get(id)
-                    .and_then(|rid| tx.job_requests.get(rid)),
-                RequestKey::TimelineId(id) => tx
-                    .timeline_requests
-                    .get(id)
-                    .and_then(|rid| tx.job_requests.get(rid)),
+        const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
+            plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id,
+            started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued
+            FROM job_requests";
+        self.with_reader(|conn| {
+            let (sql, string_key) = match &key {
+                RequestKey::Id(_) => (format!("{COLUMNS} WHERE request_id = ?1"), None),
+                RequestKey::PlanId(plan) => (
+                    format!("{COLUMNS} WHERE plan_id = ?1 ORDER BY request_id DESC LIMIT 1"),
+                    Some(plan.clone()),
+                ),
+                RequestKey::AgentJobId(id) => (
+                    format!("{COLUMNS} WHERE agent_job_id = ?1"),
+                    Some(id.to_string()),
+                ),
+                RequestKey::TimelineId(id) => (
+                    format!("{COLUMNS} WHERE timeline_id = ?1 ORDER BY request_id DESC LIMIT 1"),
+                    Some(id.to_string()),
+                ),
             };
-            record
-                .cloned()
-                .ok_or_else(|| ControlError::NotFound("request".to_owned()))
+            let param: &dyn rusqlite::ToSql = match &key {
+                RequestKey::Id(id) => id,
+                _ => string_key.as_ref().expect("text key for non-id lookup"),
+            };
+            conn.query_row(&sql, [param], |row| {
+                let result: Option<String> = row.get(7)?;
+                Ok(TaskAgentJobRequestRecord {
+                    request_id: row.get(0)?,
+                    run_id: parse_run_id(&row.get::<_, String>(1)?),
+                    job_id: JobId(row.get(2)?),
+                    agent_job_id: parse_uuid(&row.get::<_, String>(3)?),
+                    plan_id: row.get(4)?,
+                    plan_type: row.get(5)?,
+                    timeline_id: parse_uuid(&row.get::<_, String>(6)?),
+                    result: result.as_deref().map(status_parse),
+                    locked_until: row.get(8)?,
+                    claimed_at: row.get::<_, Option<i64>>(9)?.map(us_to_system),
+                    owner_runner_id: row.get(10)?,
+                    started_at: row.get::<_, Option<i64>>(11)?.map(us_to_system),
+                    last_renewed_at: row.get::<_, Option<i64>>(12)?.map(us_to_system),
+                    timeout_triggered: row.get::<_, i64>(13)? != 0,
+                    debug_token_issued: row.get::<_, i64>(14)? != 0,
+                })
+            })
+            .optional()
+            .map_err(ControlError::backend)?
+            .ok_or_else(|| ControlError::NotFound("request".to_owned()))
         })
     }
     async fn create_log(&self, _plan_id: &str) -> Result<i64, ControlError> {
