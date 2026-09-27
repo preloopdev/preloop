@@ -282,12 +282,12 @@ pub async fn delete_pool_message(
 ) -> StatusCode {
     let session_id = params.get("sessionId").map(String::as_str).unwrap_or("");
     if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        let sid = session_id.to_owned();
         let owns = shared
             .state
             .backend
-            .read(move |tx| Ok(tx.runner_id_for_session(&sid) == Some(runner_id)))
+            .session_owner(session_id)
             .await
+            .map(|owner| owner.is_some_and(|(id, _)| id == runner_id))
             .unwrap_or(false);
         if !owns {
             return StatusCode::FORBIDDEN;
@@ -300,19 +300,10 @@ pub async fn ack_message(
     session_id: &str,
     message_id: i64,
 ) -> StatusCode {
-    let sid = session_id.to_owned();
     let _ = shared
         .state
         .backend
-        .transact(move |tx| {
-            if let Some(messages) = tx.inflight_messages.get_mut(&sid) {
-                messages.remove(&message_id);
-                if messages.is_empty() {
-                    tx.inflight_messages.remove(&sid);
-                }
-            }
-            Ok(())
-        })
+        .delete_inflight(session_id, message_id)
         .await;
     StatusCode::NO_CONTENT
 }
@@ -357,44 +348,36 @@ pub async fn complete_job_compat_authenticated(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let target = {
-        let run_id = path.0;
-        let job_key = path.1.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| {
-                Ok(tx
-                    .job_requests
-                    .values()
-                    .filter(|request| request.run_id == run_id && request.job_id.0 == job_key)
-                    .max_by_key(|request| request.request_id)
-                    .cloned())
-            })
-            .await
-            .map_err(ApiError::from)?
-    };
+    let target = shared
+        .state
+        .backend
+        .request(crate::control::backend::RequestKey::Job(
+            path.0,
+            JobId(path.1.clone()),
+        ))
+        .await
+        .ok();
     crate::auth::authorize_reporting_request(&shared.state, &headers, target.as_ref())?;
     complete_job_compat(State(shared), Path(path), Json(body)).await
 }
 
-fn runner_owns_agent_request(
-    tx: &crate::control::txstate::TxState,
+/// `Some(owned)` when the request exists — `owned` = the runner owns it via
+/// the recorded owner or the owner session's runner. `Err(Forbidden)` when
+/// an owner exists and differs; unowned requests report owned.
+async fn agent_request_owned_by(
+    backend: &crate::control::backend::Backend,
     request_id: i64,
     runner_id: i64,
-) -> bool {
-    if let Some(owner) = tx
-        .job_requests
-        .get(&request_id)
-        .and_then(|request| request.owner_runner_id)
-    {
-        return owner == runner_id;
+) -> Result<Option<bool>, crate::control::ControlError> {
+    let Some((owner, session_runner)) = backend.request_owner(request_id).await? else {
+        return Ok(None);
+    };
+    match owner.or(session_runner) {
+        Some(owner) if owner != runner_id => Err(crate::control::ControlError::Forbidden(
+            "agent request belongs to another runner".to_owned(),
+        )),
+        _ => Ok(Some(true)),
     }
-    tx.session_active_requests
-        .iter()
-        .any(|(session_id, active_id)| {
-            *active_id == request_id && tx.runner_id_for_session(session_id) == Some(runner_id)
-        })
 }
 
 /// GET /_apis/v1/AgentRequest/:pool_id/:request_id to query a job request lease/result.
@@ -413,21 +396,14 @@ pub async fn agent_request_get(
     let request = shared
         .state
         .backend
-        .read(move |tx| {
-            let request = tx.job_requests.get(&request_id).ok_or_else(|| {
-                crate::control::ControlError::NotFound("agent request not found".to_owned())
-            })?;
-            if let Some(runner_id) = runner_id {
-                if !runner_owns_agent_request(tx, request_id, runner_id) {
-                    return Err(crate::control::ControlError::Forbidden(
-                        "agent request belongs to another runner".to_owned(),
-                    ));
-                }
-            }
-            Ok(request.clone())
-        })
+        .request(crate::control::backend::RequestKey::Id(request_id))
         .await
         .map_err(ApiError::from)?;
+    if let Some(runner_id) = runner_id {
+        agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+            .await
+            .map_err(ApiError::from)?;
+    }
     Ok(Json(agent_request_json(pool_id, &request)))
 }
 
@@ -438,19 +414,7 @@ pub async fn agent_request_ack(
     identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        shared
-            .state
-            .backend
-            .read(move |tx| {
-                if tx.job_requests.contains_key(&request_id)
-                    && !runner_owns_agent_request(tx, request_id, runner_id)
-                {
-                    return Err(crate::control::ControlError::Forbidden(
-                        "agent request belongs to another runner".to_owned(),
-                    ));
-                }
-                Ok(())
-            })
+        agent_request_owned_by(&shared.state.backend, request_id, runner_id)
             .await
             .map_err(ApiError::from)?;
     }
@@ -497,76 +461,59 @@ pub async fn agent_request_patch(
             Some(status) => status,
             None => {
                 info!(
-                        request_id,
-                        result = %result_hint,
-                        "unknown agent_request_patch result; skipping completion"
+                    request_id,
+                    result = %result_hint,
+                    "unknown agent_request_patch result; skipping completion"
                 );
                 return Ok(Json(
                     json!({ "requestId": request_id, "lockedUntil": agent_request_locked_until() }),
                 ));
             }
         };
-        // Look up (run_id, job_id) under the inner lock, then drop it before calling
-        // complete_job_inner which acquires the lock itself.
-        let completion = shared
+        if let Some(runner_id) = verified_runner_id {
+            if let Some(false) =
+                agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+                    .await
+                    .map_err(ApiError::from)?
+            {
+                return Err(ApiError::from(crate::control::ControlError::Forbidden(
+                    "agent request belongs to another runner".to_owned(),
+                )));
+            }
+        }
+        // One guarded UPDATE settles a live request; `None` means the row
+        // was already completed (duplicate PATCH) or never existed.
+        let settled = shared
             .state
             .backend
-            .transact(move |tx| {
-                if let Some(runner_id) = verified_runner_id {
-                    if tx.job_requests.contains_key(&request_id)
-                        && !runner_owns_agent_request(tx, request_id, runner_id)
-                    {
-                        return Err(crate::control::ControlError::Forbidden(
-                            "agent request belongs to another runner".to_owned(),
-                        ));
-                    }
-                }
-                let already_completed = tx
-                    .job_requests
-                    .get(&request_id)
-                    .is_some_and(|request| request.result.is_some());
-                if already_completed {
-                    info!(
-                        request_id,
-                        result = %result_hint,
-                        "agent request already completed; ignoring duplicate completion"
-                    );
-                    return Ok(None);
-                }
-                if let Some(request) = tx.job_requests.get_mut(&request_id) {
-                    request.result = Some(new_status);
-                    request.locked_until = agent_request_locked_until();
-                }
-                if let Some((run_id, job_id)) = tx.inflight_requests.remove(&request_id) {
-                    info!(
-                        %run_id,
-                        %job_id,
-                        result = %result_hint,
-                        "job completed via agent_request_patch"
-                    );
-                    Ok(Some(JobCompletion {
-                        run_id,
-                        job_id,
-                        // The patched request is the attempt that reported.
-                        agent_job_id: tx
-                            .job_requests
-                            .get(&request_id)
-                            .map(|record| record.agent_job_id),
-                        status: new_status,
-                        outputs: Default::default(),
-                        annotations: Vec::new(),
-                        step_results: Vec::new(),
-                    }))
-                } else {
-                    info!(
-                        request_id,
-                        "no inflight job for request_id; ignoring result"
-                    );
-                    Ok(None)
-                }
-            })
+            .settle_agent_request(request_id, new_status, &agent_request_locked_until())
             .await
             .map_err(ApiError::from)?;
+        if settled.is_none() {
+            info!(
+                request_id,
+                result = %result_hint,
+                "agent request already completed or unknown; ignoring result"
+            );
+        }
+        let completion = settled.map(|(run_id, job_id, agent_job_id)| {
+            info!(
+                %run_id,
+                %job_id,
+                result = %result_hint,
+                "job completed via agent_request_patch"
+            );
+            JobCompletion {
+                run_id,
+                job_id,
+                // The patched request is the attempt that reported.
+                agent_job_id: Some(agent_job_id),
+                status: new_status,
+                outputs: Default::default(),
+                annotations: Vec::new(),
+                step_results: Vec::new(),
+            }
+        });
         if let Some(c) = completion {
             let _ = complete_job_inner(shared.clone(), c).await;
         }
@@ -575,32 +522,22 @@ pub async fn agent_request_patch(
         ));
     }
     // Renewal — runner is still working; just extend the lock. Completed
-    // requests are immutable, so a late duplicate cannot rewrite their timing.
+    // requests are immutable, so a late duplicate cannot rewrite their
+    // timing: the guarded UPDATE skips settled/unknown requests.
+    if let Some(runner_id) = verified_runner_id {
+        if let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+            .await
+            .map_err(ApiError::from)?
+        {
+            return Err(ApiError::from(crate::control::ControlError::Forbidden(
+                "agent request belongs to another runner".to_owned(),
+            )));
+        }
+    }
     shared
         .state
         .backend
-        .transact(move |tx| {
-            if let Some(runner_id) = verified_runner_id {
-                if tx.job_requests.contains_key(&request_id)
-                    && !runner_owns_agent_request(tx, request_id, runner_id)
-                {
-                    return Err(crate::control::ControlError::Forbidden(
-                        "agent request belongs to another runner".to_owned(),
-                    ));
-                }
-            }
-            let request_active = tx
-                .job_requests
-                .get(&request_id)
-                .is_some_and(|request| request.result.is_none());
-            if request_active {
-                if let Some(request) = tx.job_requests.get_mut(&request_id) {
-                    request.locked_until = agent_request_locked_until();
-                    request.last_renewed_at = Some(std::time::SystemTime::now());
-                }
-            }
-            Ok(())
-        })
+        .renew_agent_request(request_id, &agent_request_locked_until())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(
@@ -616,20 +553,9 @@ pub async fn agent_request_response(
     shared
         .state
         .backend
-        .read(move |tx| {
-            Ok(tx
-                .job_requests
-                .get(&request_id)
-                .map(|request| agent_request_json(pool_id, request))
-                .unwrap_or_else(|| {
-                    json!({
-                        "requestId": request_id,
-                        "poolId": pool_id,
-                        "lockedUntil": agent_request_locked_until(),
-                    })
-                }))
-        })
+        .request(crate::control::backend::RequestKey::Id(request_id))
         .await
+        .map(|request| agent_request_json(pool_id, &request))
         .unwrap_or_else(|_| {
             json!({
                 "requestId": request_id,
@@ -1189,19 +1115,12 @@ pub(crate) async fn complete_job_settling(
     // the returned record reflect the post-expansion state — publishing the
     // pre-expansion snapshot would report a failed/empty expansion as still
     // in progress and skip terminal workspace cleanup.
-    let record = {
-        let run_id = completion.run_id;
-        shared
-            .state
-            .backend
-            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                tx.runs.get(&run_id).cloned().ok_or_else(|| {
-                    crate::control::ControlError::NotFound("run not found".to_owned())
-                })
-            })
-            .await
-            .map_err(ApiError::from)?
-    };
+    let record = shared
+        .state
+        .backend
+        .run_record(completion.run_id)
+        .await
+        .map_err(ApiError::from)?;
 
     // Webhook-driven auto-PR: a successful push run may open a PR per
     // policy. Fires only after deferred expansions have settled: an
@@ -1352,14 +1271,7 @@ pub(crate) async fn complete_job_settling(
         let active_plans = shared
             .state
             .backend
-            .read_scoped(&crate::control::txstate::TxScope::requests_only(), |tx| {
-                Ok(tx
-                    .job_requests
-                    .values()
-                    .filter(|r| r.result.is_none())
-                    .map(|r| r.plan_id.clone())
-                    .collect::<std::collections::BTreeSet<_>>())
-            })
+            .active_plan_ids()
             .await
             .unwrap_or_default();
         let log_segments = shared.state.log_segments.clone();

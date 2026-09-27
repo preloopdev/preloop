@@ -4698,6 +4698,17 @@ impl ControlBackend for PostgresBackend {
                         )
                         .await
                 }
+                RequestKey::Job(run_id, job_id) => {
+                    client
+                        .query_opt(
+                            &format!(
+                                "{COLUMNS} WHERE run_id = $1 AND job_id = $2 \
+                                 ORDER BY request_id DESC LIMIT 1"
+                            ),
+                            &[&run_id.0.to_string(), &job_id.0],
+                        )
+                        .await
+                }
             }
             .map_err(ControlError::backend)?
             .ok_or_else(|| ControlError::NotFound("request".to_owned()))?;
@@ -5328,6 +5339,106 @@ impl ControlBackend for PostgresBackend {
             super::types::renew_miss(row, runner_id)
         }
         .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn request_owner(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT jr.owner_runner_id, sess.runner_id FROM job_requests jr \
+                 LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
+                 WHERE jr.request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|row| row.map(|row| (row.get(0), row.get(1))));
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn renew_agent_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .execute(
+                "UPDATE job_requests SET locked_until = $1, last_renewed_at_us = $2 \
+                 WHERE request_id = $3 AND result IS NULL",
+                &[
+                    &locked_until,
+                    &system_to_us(std::time::SystemTime::now()),
+                    &request_id,
+                ],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|n| n == 1);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn settle_agent_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
+        let status = status_str(result).to_owned();
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "UPDATE job_requests SET result = $1, locked_until = $2 \
+                 WHERE request_id = $3 AND result IS NULL \
+                 RETURNING run_id, job_id, agent_job_id",
+                &[&status, &locked_until, &request_id],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|row| {
+                row.map(|row| {
+                    (
+                        parse_run_id(&row.get::<_, String>(0)),
+                        JobId(row.get::<_, String>(1)),
+                        parse_uuid(&row.get::<_, String>(2)),
+                    )
+                })
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn delete_inflight(&self, session_id: &str, message_id: i64) -> Result<(), ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .execute(
+                "DELETE FROM broker_messages WHERE session_id = $1 AND message_id = $2",
+                &[&session_id, &message_id],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|_| ());
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn active_plan_ids(&self) -> Result<BTreeSet<String>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query(
+                "SELECT DISTINCT plan_id FROM job_requests WHERE result IS NULL",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|rows| rows.iter().map(|row| row.get::<_, String>(0)).collect());
         self.return_reader(client).await;
         result
     }

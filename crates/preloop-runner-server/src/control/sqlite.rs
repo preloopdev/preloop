@@ -4156,26 +4156,33 @@ impl ControlBackend for SqliteBackend {
             started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued
             FROM job_requests";
         self.with_reader(|conn| {
-            let (sql, string_key) = match &key {
-                RequestKey::Id(_) => (format!("{COLUMNS} WHERE request_id = ?1"), None),
+            let (sql, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = match &key {
+                RequestKey::Id(id) => (
+                    format!("{COLUMNS} WHERE request_id = ?1"),
+                    vec![Box::new(*id)],
+                ),
                 RequestKey::PlanId(plan) => (
                     format!("{COLUMNS} WHERE plan_id = ?1 ORDER BY request_id DESC LIMIT 1"),
-                    Some(plan.clone()),
+                    vec![Box::new(plan.clone())],
                 ),
                 RequestKey::AgentJobId(id) => (
                     format!("{COLUMNS} WHERE agent_job_id = ?1"),
-                    Some(id.to_string()),
+                    vec![Box::new(id.to_string())],
                 ),
                 RequestKey::TimelineId(id) => (
                     format!("{COLUMNS} WHERE timeline_id = ?1 ORDER BY request_id DESC LIMIT 1"),
-                    Some(id.to_string()),
+                    vec![Box::new(id.to_string())],
+                ),
+                RequestKey::Job(run_id, job_id) => (
+                    format!(
+                        "{COLUMNS} WHERE run_id = ?1 AND job_id = ?2 \
+                         ORDER BY request_id DESC LIMIT 1"
+                    ),
+                    vec![Box::new(run_id.0.to_string()), Box::new(job_id.0.clone())],
                 ),
             };
-            let param: &dyn rusqlite::ToSql = match &key {
-                RequestKey::Id(id) => id,
-                _ => string_key.as_ref().expect("text key for non-id lookup"),
-            };
-            conn.query_row(&sql, [param], |row| {
+            let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+            conn.query_row(&sql, rusqlite::params_from_iter(refs), |row| {
                 let result: Option<String> = row.get(7)?;
                 Ok(TaskAgentJobRequestRecord {
                     request_id: row.get(0)?,
@@ -4775,6 +4782,103 @@ impl ControlBackend for SqliteBackend {
                 .optional()
                 .map_err(ControlError::backend)?;
             super::types::renew_miss(row, runner_id)
+        })
+    }
+
+    async fn request_owner(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError> {
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT jr.owner_runner_id, sess.runner_id FROM job_requests jr \
+                 LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
+                 WHERE jr.request_id = ?1",
+                params![request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn renew_agent_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        let locked_until = locked_until.to_owned();
+        run_blocking(move || {
+            let conn = self.conn.lock();
+            let renewed = conn
+                .execute(
+                    "UPDATE job_requests SET locked_until = ?1, last_renewed_at_us = ?2 \
+                     WHERE request_id = ?3 AND result IS NULL",
+                    params![
+                        locked_until,
+                        system_to_us(std::time::SystemTime::now()),
+                        request_id
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            Ok(renewed == 1)
+        })
+    }
+
+    async fn settle_agent_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
+        let status = status_str(result).to_owned();
+        let locked_until = locked_until.to_owned();
+        run_blocking(move || {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "UPDATE job_requests SET result = ?1, locked_until = ?2 \
+                 WHERE request_id = ?3 AND result IS NULL \
+                 RETURNING run_id, job_id, agent_job_id",
+                params![status, locked_until, request_id],
+                |row| {
+                    Ok((
+                        parse_run_id(&row.get::<_, String>(0)?),
+                        JobId(row.get::<_, String>(1)?),
+                        parse_uuid(&row.get::<_, String>(2)?),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn delete_inflight(&self, session_id: &str, message_id: i64) -> Result<(), ControlError> {
+        let session_id = session_id.to_owned();
+        run_blocking(move || {
+            let conn = self.conn.lock();
+            conn.execute(
+                "DELETE FROM broker_messages WHERE session_id = ?1 AND message_id = ?2",
+                params![session_id, message_id],
+            )
+            .map_err(ControlError::backend)?;
+            Ok(())
+        })
+    }
+
+    async fn active_plan_ids(&self) -> Result<BTreeSet<String>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT plan_id FROM job_requests WHERE result IS NULL")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(ControlError::backend)?;
+            let mut plans = BTreeSet::new();
+            for plan in rows {
+                plans.insert(plan.map_err(ControlError::backend)?);
+            }
+            Ok(plans)
         })
     }
 

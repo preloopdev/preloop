@@ -23,7 +23,7 @@ use crate::models::{
 };
 use preloop_gha_protocol::azdo;
 use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Indexed run-list query. Backends apply filtering, ordering and limiting in
 /// SQL; handlers never deserialize the complete control state to list runs.
@@ -432,6 +432,41 @@ pub(crate) trait ControlBackend: Send + Sync {
         locked_until: &str,
     ) -> Result<bool, ControlError>;
 
+    /// `(recorded owner, owner-session runner)` for `request_id`; `None`
+    /// when no such request. Drives the AgentRequest ownership check.
+    async fn request_owner(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError>;
+
+    /// Renew an in-flight AgentRequest's lease (`locked_until` +
+    /// `last_renewed_at`) when `result IS NULL`. Returns whether a row was
+    /// renewed; completed or unknown requests silently renew nothing,
+    /// matching the PATCH contract.
+    async fn renew_agent_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError>;
+
+    /// Settle an AgentRequest (`result`, `locked_until`) iff it is still in
+    /// flight. `Ok(None)` = already completed (duplicate PATCH); `Ok(Some)`
+    /// carries the attempt's `(run_id, job_id, agent_job_id)` for the
+    /// completion fan-out.
+    async fn settle_agent_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError>;
+
+    /// Drop one undelivered session message (DELETE-ack); a missing row is
+    /// not an error.
+    async fn delete_inflight(&self, session_id: &str, message_id: i64) -> Result<(), ControlError>;
+
+    /// `plan_id`s of every in-flight request (live-log/replay-result
+    /// pruning after a terminal run).
+    async fn active_plan_ids(&self) -> Result<BTreeSet<String>, ControlError>;
     // ── Webhook inbox and repair state ────────────────────────────────
 
     async fn enqueue_webhook_delivery(
@@ -599,6 +634,8 @@ pub(crate) enum RequestKey {
     PlanId(String),
     AgentJobId(uuid::Uuid),
     TimelineId(uuid::Uuid),
+    /// Latest request for a `(run, job)` pair (highest request_id wins).
+    Job(RunId, JobId),
 }
 
 /// What boot reconcile recovered.
@@ -1242,6 +1279,54 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.renew_lease(agent_job_id, runner_id, locked_until).await,
             Self::Postgres(b) => b.renew_lease(agent_job_id, runner_id, locked_until).await,
+        }
+    }
+    async fn request_owner(
+        &self,
+        request_id: i64,
+    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.request_owner(request_id).await,
+            Self::Postgres(b) => b.request_owner(request_id).await,
+        }
+    }
+    async fn renew_agent_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.renew_agent_request(request_id, locked_until).await,
+            Self::Postgres(b) => b.renew_agent_request(request_id, locked_until).await,
+        }
+    }
+    async fn settle_agent_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.settle_agent_request(request_id, result, locked_until)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.settle_agent_request(request_id, result, locked_until)
+                    .await
+            }
+        }
+    }
+    async fn delete_inflight(&self, session_id: &str, message_id: i64) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.delete_inflight(session_id, message_id).await,
+            Self::Postgres(b) => b.delete_inflight(session_id, message_id).await,
+        }
+    }
+    async fn active_plan_ids(&self) -> Result<BTreeSet<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.active_plan_ids().await,
+            Self::Postgres(b) => b.active_plan_ids().await,
         }
     }
     async fn enqueue_webhook_delivery(
