@@ -299,6 +299,190 @@ impl PostgresBackend {
         result
     }
 
+    /// The common poll as direct statements: a clean idle session (no
+    /// undelivered message, no active request) with assignments off claims
+    /// the first ready job it can run, or learns there is none. `None` sends
+    /// every other case to the working-set path, which owns redelivery,
+    /// cancellations, busy runners and assignment rules.
+    async fn poll_claim_direct(
+        &self,
+        poll: &PollRequest,
+    ) -> Result<Option<PollOutcome>, ControlError> {
+        let assignments = self
+            .pool_assignments_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .require_job_assignments
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if poll.busy || assignments {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let txn = client.transaction().await.map_err(ControlError::backend)?;
+            // Session state, row-locked so a concurrent poll of the same
+            // session serializes here.
+            let Some(session) = txn
+                .query_opt(
+                    "SELECT runner_id, active_request_id, \
+                     EXISTS(SELECT 1 FROM broker_messages m WHERE m.session_id = s.session_id) \
+                     FROM runner_sessions s WHERE session_id = $1 FOR UPDATE",
+                    &[&poll.session_id],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            else {
+                return Ok(None);
+            };
+            let session_runner: Option<i64> = session.get(0);
+            let active: Option<i64> = session.get(1);
+            let inflight: bool = session.get(2);
+            let Some(session_runner) = session_runner else {
+                return Ok(None);
+            };
+            if active.is_some() || inflight {
+                return Ok(None);
+            }
+            if poll
+                .verified_runner_id
+                .is_some_and(|id| id != session_runner)
+            {
+                return Err(ControlError::Forbidden(
+                    "session belongs to another runner".to_owned(),
+                ));
+            }
+            let now_us = system_to_us(std::time::SystemTime::now());
+            txn.execute(
+                "UPDATE runner_sessions SET last_seen_at_us = $1 WHERE session_id = $2",
+                &[&now_us, &poll.session_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            let candidates = lock_poll_candidates(&txn, &poll.runner, 1).await?;
+            let locked = started.elapsed();
+            let Some((run_s, job_s)) = candidates.into_iter().next() else {
+                txn.commit().await.map_err(ControlError::backend)?;
+                return Ok(Some(PollOutcome::Empty));
+            };
+            // A stale binding on this job is an assignment-rule decision.
+            let bound: bool = txn
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM job_assignments WHERE run_id=$1 AND job_id=$2) \
+                     OR EXISTS(SELECT 1 FROM pool_pending WHERE run_id=$1 AND job_id=$2)",
+                    &[&run_s, &job_s],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            if bound {
+                return Ok(None);
+            }
+            let Some(request_row) = txn
+                .query_opt(
+                    "SELECT request_id, agent_job_id, plan_id, plan_type, timeline_id, \
+                     timeout_triggered, debug_token_issued FROM job_requests \
+                     WHERE run_id = $1 AND job_id = $2 AND result IS NULL \
+                     ORDER BY request_id LIMIT 1 FOR UPDATE",
+                    &[&run_s, &job_s],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            else {
+                return Ok(None);
+            };
+            let Some(queued) = load_queued_job(&txn, &self.cipher, &run_s, &job_s).await? else {
+                return Ok(None);
+            };
+            let request_id: i64 = request_row.get(0);
+            let locked_until = crate::distributed_task::agent_request_locked_until();
+            let now = us_to_system(now_us);
+            txn.execute(
+                "UPDATE job_requests SET owner_runner_id = $2, claimed_at_us = $3, \
+                 started_at_us = $3, last_renewed_at_us = $3, locked_until = $4 \
+                 WHERE request_id = $1",
+                &[&request_id, &session_runner, &now_us, &locked_until],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            let seq = alloc_job_counter(&txn, "job_seq").await?;
+            txn.execute(
+                "UPDATE jobs SET queue_kind = 'claimed', status = 'in_progress', \
+                 queue_position = NULL, seq = $3, claimed_by = NULL, claimed_at_us = NULL \
+                 WHERE run_id = $1 AND job_id = $2",
+                &[&run_s, &job_s, &seq],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            txn.execute(
+                "UPDATE runs SET status = 'in_progress', \
+                 started_at_us = COALESCE(started_at_us, $2) WHERE run_id = $1",
+                &[&run_s, &now_us],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            txn.execute(
+                "UPDATE runner_sessions SET active_request_id = $2 WHERE session_id = $1",
+                &[&poll.session_id, &request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            let depth: i64 = txn
+                .query_one("SELECT COUNT(*) FROM jobs WHERE queue_kind = 'ready'", &[])
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            let next_runs_on: Vec<String> = txn
+                .query_opt(
+                    "SELECT runs_on FROM jobs WHERE queue_kind = 'ready' \
+                     ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id LIMIT 1",
+                    &[],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .and_then(|row| serde_json::from_str(&row.get::<_, String>(0)).ok())
+                .unwrap_or_default();
+            let written = started.elapsed();
+            txn.commit().await.map_err(ControlError::backend)?;
+            crate::control::txn_stats::record(
+                "poll_claim_direct",
+                true,
+                locked,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                written - locked,
+                started.elapsed() - written,
+            );
+            let request = TaskAgentJobRequestRecord {
+                request_id,
+                run_id: queued.run_id,
+                job_id: queued.job_id.clone(),
+                agent_job_id: parse_uuid(&request_row.get::<_, String>(1)),
+                plan_id: request_row.get(2),
+                plan_type: request_row.get(3),
+                timeline_id: parse_uuid(&request_row.get::<_, String>(4)),
+                result: None,
+                locked_until,
+                claimed_at: Some(now),
+                owner_runner_id: Some(session_runner),
+                started_at: Some(now),
+                last_renewed_at: Some(now),
+                timeout_triggered: request_row.get::<_, i64>(5) != 0,
+                debug_token_issued: request_row.get::<_, i64>(6) != 0,
+            };
+            Ok(Some(PollOutcome::Claimed(Box::new(ClaimedJob {
+                queued,
+                request,
+                runner_id: session_runner,
+                queue_depth: depth.max(0) as usize,
+                next_runs_on,
+            }))))
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
     async fn transact_on<T>(
         &self,
         client: &mut Client,
@@ -1508,6 +1692,73 @@ async fn lock_runs<'a>(
             .map(drop)
             .map_err(ControlError::backend),
     }
+}
+
+/// Decode one job row (payload columns, sealed message, `needs:` edges) into
+/// the dispatchable job.
+async fn load_queued_job(
+    conn: &Tx<'_>,
+    cipher: &store::Envelope,
+    run_s: &str,
+    job_s: &str,
+) -> Result<Option<QueuedJob>, ControlError> {
+    let Some(row) = conn
+        .query_opt(
+            "SELECT j.base_id, j.runs_on, j.runner_group, j.enqueued_at_us, \
+             j.created_at_ns, j.deps_ready_at_ns, j.concurrency_wait_at_ns, \
+             j.concurrency_acquired_at_ns, j.if_condition, j.max_parallel, \
+             j.environment_json, j.concurrency_json, j.matrix_json, j.deferred_matrix, \
+             j.reusable_call_json, m.message_blob, m.condition_context_blob \
+             FROM jobs j JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
+             WHERE j.run_id = $1 AND j.job_id = $2",
+            &[&run_s, &job_s],
+        )
+        .await
+        .map_err(ControlError::backend)?
+    else {
+        return Ok(None);
+    };
+    let needs: Vec<String> = conn
+        .query(
+            "SELECT needs_job_id FROM job_needs WHERE run_id = $1 AND job_id = $2 \
+             ORDER BY position",
+            &[&run_s, &job_s],
+        )
+        .await
+        .map_err(ControlError::backend)?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let payload = super::rows::JobPayloadRow {
+        created_at_ns: row.get::<_, Option<i64>>(4).unwrap_or(0),
+        deps_ready_at_ns: row.get(5),
+        concurrency_wait_at_ns: row.get(6),
+        concurrency_acquired_at_ns: row.get(7),
+        if_condition: row.get(8),
+        max_parallel: row.get(9),
+        environment_json: row.get(10),
+        concurrency_json: row.get(11),
+        matrix_json: row.get(12),
+        deferred_matrix: row.get(13),
+        reusable_call_json: row.get(14),
+        needs,
+    };
+    let runs_on: String = row.get(1);
+    let message: Vec<u8> = row.get(15);
+    let context: Vec<u8> = row.get(16);
+    payload
+        .into_job(
+            parse_run_id(run_s),
+            JobId(job_s.to_owned()),
+            row.get(0),
+            &runs_on,
+            row.get(2),
+            row.get(3),
+            blob(cipher, &message)?,
+            blob(cipher, &context)?,
+        )
+        .map(Some)
+        .map_err(ControlError::backend)
 }
 
 async fn load_txstate(
@@ -3753,6 +4004,9 @@ impl ControlBackend for PostgresBackend {
             runs_via_requests: false,
             job_requests_all: false,
         };
+        if let Some(outcome) = self.poll_claim_direct(&poll).await? {
+            return Ok(outcome);
+        }
         let runner = poll.runner.clone();
         self.transact_poll(&scope, &runner, |tx| commands::poll_session_tx(tx, poll))
             .await
