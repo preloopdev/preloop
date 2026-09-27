@@ -17,6 +17,7 @@ use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 /// `VmProvider` implementation can model the handshake this pool relies on.
 pub use preloop_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
+use futures::future::BoxFuture;
 use futures::StreamExt as _;
 use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
@@ -510,6 +511,51 @@ fn default_golden_url(release_version: &str) -> String {
     )
 }
 
+/// GitHub's permanent redirect to whichever release currently carries the
+/// asset.
+///
+/// The golden is only attached to releases that baked one, so an engine whose
+/// own release predates the artifact (or whose release has only the `.sig`
+/// sidecar) otherwise 404s and falls back to a local build even though a
+/// published golden exists.
+fn latest_golden_url() -> String {
+    format!(
+        "https://github.com/preloopdev/preloop/releases/latest/download/preloop-ubuntu-24.04-{}",
+        std::env::consts::ARCH
+    )
+}
+
+/// Release-asset URLs to try, in order. An operator-provided
+/// `PRELOOP_GOLDEN_URL` replaces both: it is the only source they asked for.
+fn golden_url_candidates(release_version: &str, forced_url: Option<String>) -> Vec<String> {
+    match forced_url {
+        Some(forced) => vec![forced],
+        None => {
+            let versioned = default_golden_url(release_version);
+            let latest = latest_golden_url();
+            if latest == versioned {
+                vec![versioned]
+            } else {
+                vec![versioned, latest]
+            }
+        }
+    }
+}
+
+/// Where an in-flight transfer of `payload` is kept.
+///
+/// Deliberately stable rather than per-attempt: a retried attempt, an engine
+/// restart, or a second start after a crash all resume the same file instead
+/// of discarding gigabytes. The install renames it onto `payload` only after
+/// the checksum matches, so a partial file is never mistaken for a golden.
+fn golden_partial_path(payload: &Path) -> PathBuf {
+    let name = payload
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "golden".to_owned());
+    payload.with_file_name(format!("{name}.partial"))
+}
+
 /// Public OCI artifact carrying the official arm64 packed VM golden.
 ///
 /// This is deliberately separate from the `runner-images` base-image package:
@@ -536,6 +582,16 @@ const DEFAULT_GOLDEN_OCI_REF: &str =
 /// two-thirds through and fell back to a local bake that looked like the
 /// artifact was missing.
 const GOLDEN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Transfer attempts for one golden source before it is abandoned.
+///
+/// Each attempt resumes from the bytes already on disk, so a link that drops
+/// mid-body costs only the bytes in flight instead of the whole artifact. The
+/// packed golden runs to several gigabytes and the registry edge drops long
+/// bodies often enough that a single attempt is not a reliable transfer.
+const GOLDEN_DOWNLOAD_ATTEMPTS: usize = 5;
+/// Pause before a resumed attempt: long enough for a dropped connection's
+/// state to clear, short enough that a flapping link still finishes.
+const GOLDEN_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// How often a download reports progress. 256 MB puts a ~9.6 GB pull at
 /// roughly one line every 25 s on a 100 Mbps link: often enough to show
 /// movement, sparse enough not to bury the log.
@@ -615,15 +671,6 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         info!(reference, "OCI golden unavailable; trying release asset");
     }
 
-    let default_url = default_golden_url(release_version);
-    let url = forced_url.unwrap_or(default_url);
-
-    info!(
-        url = %url,
-        target = %payload.display(),
-        "Downloading pre-baked golden from release asset (this may take several minutes)"
-    );
-
     let client = match reqwest::Client::builder()
         .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
         .build()
@@ -635,8 +682,26 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         }
     };
 
-    let response = match client.get(&url).send().await {
-        Ok(res) if res.status().is_success() => res,
+    for url in golden_url_candidates(release_version, forced_url) {
+        info!(
+            url = %url,
+            target = %payload.display(),
+            "Downloading pre-baked golden from release asset (this may take several minutes)"
+        );
+        if download_release_asset(&client, &url, payload).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fetch one release asset into `payload`: probe, checksum, transfer, install.
+///
+/// The transfer resumes from whatever a previous attempt left behind, so a
+/// dropped connection costs the bytes in flight rather than the artifact.
+async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &Path) -> bool {
+    let probe = match client.get(url).send().await {
+        Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             info!(
                 status = %response.status(),
@@ -672,100 +737,214 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         warn!(url = %format!("{url}.sha256"), "no golden checksum published; downloading without verification");
     }
 
-    let tmp_payload = match payload.parent() {
-        Some(parent) => parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4())),
-        None => return false,
+    let partial = golden_partial_path(payload);
+    let downloaded_bytes = {
+        let client = client.clone();
+        let url = url.to_owned();
+        download_golden_with_resume(&partial, "release", None, Some(probe), move |offset| {
+            let client = client.clone();
+            let url = url.clone();
+            Box::pin(async move {
+                let mut request = client.get(&url);
+                if offset > 0 {
+                    request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+                }
+                request
+                    .send()
+                    .await
+                    .map_err(|error| format!("request failed: {error}"))
+            }) as BoxFuture<'static, Result<reqwest::Response, String>>
+        })
+        .await
+    };
+    let downloaded_bytes = match downloaded_bytes {
+        Ok(downloaded_bytes) => downloaded_bytes,
+        Err(error) => {
+            warn!(url = %url, %error, "Pre-baked golden release download failed; will build locally");
+            return false;
+        }
     };
 
+    if let Some(expected) = expected_sha256 {
+        match sha256_file(&partial).await {
+            Ok(actual) if actual == expected => {}
+            Ok(actual) => {
+                warn!(
+                    expected,
+                    %actual,
+                    "golden checksum mismatch; discarding download and building locally"
+                );
+                let _ = tokio::fs::remove_file(&partial).await;
+                return false;
+            }
+            Err(error) => {
+                warn!(%error, "could not hash downloaded golden; building locally");
+                let _ = tokio::fs::remove_file(&partial).await;
+                return false;
+            }
+        }
+    }
+
+    if tokio::fs::rename(&partial, payload).await.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return false;
+    }
+    report_golden_download_progress("release", downloaded_bytes, None);
+    info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
+    true
+}
+
+/// Transfer one golden source into `partial`, resuming across attempts.
+///
+/// `request_at` issues the request for a given byte offset; the caller decides
+/// how to authenticate (a plain GET for a release asset, a registry token for
+/// an OCI blob). Returns the bytes the file holds once the server has sent the
+/// whole body.
+async fn download_golden_with_resume(
+    partial: &Path,
+    source: &str,
+    expected_total_bytes: Option<u64>,
+    initial_response: Option<reqwest::Response>,
+    mut request_at: impl FnMut(u64) -> BoxFuture<'static, Result<reqwest::Response, String>>,
+) -> Result<u64, String> {
     // Claim the companion lock before creating the payload: a staging file
     // without a fresh lock reads as orphaned to a concurrent sweep.
-    let _staging_guard = StagingLockGuard::claim(staging_lock_path(&tmp_payload));
-    let mut file = match tokio::fs::File::create(&tmp_payload).await {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-
-    // The body is copied chunk by chunk rather than through `bytes()`. A golden
-    // carries the apt baseline, the Node externals and the VM's storage volume,
-    // so it runs to hundreds of megabytes; buffering it whole would peak at the
-    // full image size on a host that has not yet built anything, and the OOM
-    // killer arriving here takes out the very process that would otherwise fall
-    // back to building locally.
-    let total_bytes = response.content_length();
-    let mut downloaded_bytes = 0_u64;
-    let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
-    let mut stream = response.bytes_stream();
-    let mut streamed = true;
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            streamed = false;
-            break;
-        };
-        if file.write_all(&chunk).await.is_err() {
-            streamed = false;
-            break;
+    let _staging_guard = StagingLockGuard::claim(staging_lock_path(partial));
+    // The caller's probe already holds the first body; reusing it keeps the
+    // transfer at one request per attempt.
+    let mut pending_response = initial_response;
+    let mut last_error = String::from("no attempt was made");
+    for attempt in 1..=GOLDEN_DOWNLOAD_ATTEMPTS {
+        let have = tokio::fs::metadata(partial)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        if have > 0 && expected_total_bytes == Some(have) {
+            return Ok(have);
         }
+        // A file larger than the artifact is left over from a different build:
+        // appending to it would mix two images, so start over.
+        if expected_total_bytes.is_some_and(|total| have > total) {
+            let _ = tokio::fs::remove_file(partial).await;
+            continue;
+        }
+        let response = match pending_response.take().filter(|_| have == 0) {
+            Some(response) => response,
+            None => match request_at(have).await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = error;
+                    if attempt < GOLDEN_DOWNLOAD_ATTEMPTS {
+                        tokio::time::sleep(GOLDEN_DOWNLOAD_RETRY_DELAY).await;
+                    }
+                    continue;
+                }
+            },
+        };
+        match response.status() {
+            // Nothing left to send: the file already holds the whole artifact.
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE => return Ok(have),
+            status if status.is_success() => {
+                let resuming = status == reqwest::StatusCode::PARTIAL_CONTENT && have > 0;
+                let offset = if resuming { have } else { 0 };
+                match stream_golden_body(
+                    response,
+                    partial,
+                    resuming,
+                    offset,
+                    source,
+                    expected_total_bytes,
+                )
+                .await
+                {
+                    Ok(downloaded_bytes) => return Ok(downloaded_bytes),
+                    Err(error) => last_error = error,
+                }
+            }
+            // A 404 on the versioned URL is the caller's cue to try the next
+            // candidate; retrying it here would only burn the retry budget.
+            status if status.is_client_error() => return Err(format!("HTTP {status}")),
+            status => last_error = format!("HTTP {status}"),
+        }
+        if attempt < GOLDEN_DOWNLOAD_ATTEMPTS {
+            warn!(
+                source,
+                attempt,
+                error = %last_error,
+                "golden transfer attempt failed; resuming from the bytes on disk"
+            );
+            tokio::time::sleep(GOLDEN_DOWNLOAD_RETRY_DELAY).await;
+        }
+    }
+    Err(last_error)
+}
+
+/// Copy a response body into `partial`, appending when the server resumed.
+///
+/// Returns the total bytes the file now holds. The file is left in place on
+/// failure so the next attempt resumes it; the caller's checksum decides
+/// whether what is on disk is usable.
+async fn stream_golden_body(
+    response: reqwest::Response,
+    partial: &Path,
+    resuming: bool,
+    already_have: u64,
+    source: &str,
+    expected_total_bytes: Option<u64>,
+) -> Result<u64, String> {
+    let mut file = if resuming {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(partial)
+            .await
+    } else {
+        tokio::fs::File::create(partial).await
+    }
+    .map_err(|error| format!("could not open {}: {error}", partial.display()))?;
+    let total_bytes = response
+        .content_length()
+        .map(|remaining| remaining.saturating_add(already_have))
+        .or(expected_total_bytes);
+    let mut downloaded_bytes = already_have;
+    let mut next_progress = downloaded_bytes.saturating_add(GOLDEN_PROGRESS_INTERVAL);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| format!("stream failed after {downloaded_bytes} bytes: {error}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("write failed after {downloaded_bytes} bytes: {error}"))?;
         downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
         if downloaded_bytes >= next_progress {
-            report_golden_download_progress("release", downloaded_bytes, total_bytes);
+            report_golden_download_progress(source, downloaded_bytes, total_bytes);
             next_progress = next_progress.saturating_add(GOLDEN_PROGRESS_INTERVAL);
         }
     }
-
     // `write_all` only queues work on a `tokio::fs::File`; the flush is what
-    // surfaces a failed write-back. Skipping it would let a short write reach
-    // the rename below and publish a truncated image that only fails much
-    // later, when a VM tries to boot it.
-    if !streamed || file.flush().await.is_err() {
-        drop(file);
-        let _ = tokio::fs::remove_file(&tmp_payload).await;
-        return false;
-    }
-    drop(file);
-
-    if let Some(expected) = expected_sha256 {
-        let actual = match tokio::task::spawn_blocking({
-            let tmp_payload = tmp_payload.clone();
-            move || {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                let mut file = std::fs::File::open(&tmp_payload)?;
-                std::io::copy(&mut file, &mut hasher)?;
-                let mut hex = String::with_capacity(64);
-                for byte in hasher.finalize() {
-                    use std::fmt::Write as _;
-                    let _ = write!(hex, "{byte:02x}");
-                }
-                Ok::<String, std::io::Error>(hex)
-            }
-        })
+    // surfaces a failed write-back before the caller trusts the file.
+    file.flush()
         .await
-        {
-            Ok(Ok(actual)) => actual,
-            _ => {
-                let _ = tokio::fs::remove_file(&tmp_payload).await;
-                return false;
-            }
-        };
-        if actual != expected {
-            warn!(
-                expected,
-                %actual,
-                "golden checksum mismatch; discarding download and building locally"
-            );
-            let _ = tokio::fs::remove_file(&tmp_payload).await;
-            return false;
-        }
-    }
+        .map_err(|error| format!("flush failed after {downloaded_bytes} bytes: {error}"))?;
+    Ok(downloaded_bytes)
+}
 
-    if tokio::fs::rename(&tmp_payload, payload).await.is_err() {
-        let _ = tokio::fs::remove_file(&tmp_payload).await;
-        return false;
+/// SHA-256 of a file, lowercase hex.
+async fn sha256_file(path: &Path) -> Result<String, String> {
+    let hashed = path.to_owned();
+    let display = path.display().to_string();
+    match tokio::task::spawn_blocking(move || {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let mut file = std::fs::File::open(&hashed)?;
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok::<String, std::io::Error>(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    {
+        Ok(Ok(digest)) => Ok(digest),
+        Ok(Err(error)) => Err(format!("could not hash {display}: {error}")),
+        Err(error) => Err(format!("could not join hash task: {error}")),
     }
-
-    report_golden_download_progress("release", downloaded_bytes, total_bytes);
-    info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
-    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -811,7 +990,7 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
     let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
     let accept = "application/vnd.oci.image.manifest.v1+json, \
                   application/vnd.docker.distribution.manifest.v2+json";
-    let response = match registry_get(&client, &manifest_url, accept).await {
+    let response = match registry_get(&client, &manifest_url, accept, None).await {
         Ok(response) => response,
         Err(error) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
@@ -842,34 +1021,59 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         reference,
         payload.display()
     );
-    let response = match registry_get(&client, &blob_url, "*/*").await {
-        Ok(response) => response,
-        Err(error) => {
-            warn!(reference, %error, "OCI golden layer unavailable");
-            return false;
-        }
+    let partial = golden_partial_path(payload);
+    let downloaded = {
+        let client = client.clone();
+        let blob_url = blob_url.clone();
+        download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
+            let client = client.clone();
+            let url = blob_url.clone();
+            Box::pin(async move {
+                registry_get(&client, &url, "*/*", (offset > 0).then_some(offset)).await
+            }) as BoxFuture<'static, Result<reqwest::Response, String>>
+        })
+        .await
     };
-    let Some(parent) = payload.parent() else {
-        return false;
-    };
-    let tmp_payload = parent.join(format!(".tmp-golden-{}", uuid::Uuid::new_v4()));
-    match stream_golden_response(response, &tmp_payload, Some(layer_digest), layer_size).await {
+    match downloaded {
         Ok(downloaded_bytes) => {
-            if let Err(error) = tokio::fs::rename(&tmp_payload, payload).await {
-                warn!(
-                    reference,
-                    %error,
-                    target = %payload.display(),
-                    "Downloaded OCI golden but could not install it"
-                );
-            } else {
-                info!(
-                    reference,
-                    target = %payload.display(),
-                    downloaded_bytes,
-                    "Downloaded OCI pre-baked golden microVM image successfully"
-                );
-                return true;
+            // The layer digest is the artifact's identity: a transfer that
+            // resumed across attempts must still hash to the manifest's digest
+            // before it is installed.
+            let expected = layer_digest
+                .strip_prefix("sha256:")
+                .unwrap_or(&layer_digest)
+                .to_owned();
+            match sha256_file(&partial).await {
+                Ok(actual) if actual == expected => {
+                    if let Err(error) = tokio::fs::rename(&partial, payload).await {
+                        warn!(
+                            reference,
+                            %error,
+                            target = %payload.display(),
+                            "Downloaded OCI golden but could not install it"
+                        );
+                    } else {
+                        info!(
+                            reference,
+                            target = %payload.display(),
+                            downloaded_bytes,
+                            "Downloaded OCI pre-baked golden microVM image successfully"
+                        );
+                        return true;
+                    }
+                }
+                Ok(actual) => {
+                    warn!(
+                        expected,
+                        %actual,
+                        "OCI golden digest mismatch; discarding download"
+                    );
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                Err(error) => {
+                    warn!(reference, %error, "could not hash downloaded OCI golden");
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
             }
         }
         Err(error) => {
@@ -880,7 +1084,6 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
             );
         }
     }
-    let _ = tokio::fs::remove_file(&tmp_payload).await;
     false
 }
 
@@ -888,10 +1091,13 @@ async fn registry_get(
     client: &reqwest::Client,
     url: &str,
     accept: &str,
+    resume_from: Option<u64>,
 ) -> Result<reqwest::Response, String> {
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, accept)
+    let with_range = |request: reqwest::RequestBuilder| match resume_from {
+        Some(offset) => request.header(reqwest::header::RANGE, format!("bytes={offset}-")),
+        None => request,
+    };
+    let response = with_range(client.get(url).header(reqwest::header::ACCEPT, accept))
         .send()
         .await
         .map_err(|error| format!("request failed: {error}"))?;
@@ -924,13 +1130,15 @@ async fn registry_get(
         .json::<OciToken>()
         .await
         .map_err(|error| format!("registry token response was invalid: {error}"))?;
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, accept)
-        .bearer_auth(token.token)
-        .send()
-        .await
-        .map_err(|error| format!("authenticated registry request failed: {error}"))?;
+    let response = with_range(
+        client
+            .get(url)
+            .header(reqwest::header::ACCEPT, accept)
+            .bearer_auth(token.token),
+    )
+    .send()
+    .await
+    .map_err(|error| format!("authenticated registry request failed: {error}"))?;
     if response.status().is_success() {
         Ok(response)
     } else {
@@ -964,99 +1172,6 @@ fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
         repository.to_owned(),
         version.to_owned(),
     ))
-}
-
-/// Stream the OCI layer to a temporary file, verify its digest against the
-/// manifest descriptor, then install it at the payload path.
-///
-/// The published `application/vnd.preloop.smolmachine.v1+zstd` layer is the
-/// raw `.smolmachine` sidecar: zstd-compressed asset frames followed by the
-/// uncompressed manifest and `SMOLPACK` footer. The media type's `+zstd`
-/// suffix describes the internal asset compression, not the layer itself —
-/// the layer bytes are NOT a bare zstd stream (verified: the blob ends with
-/// an uncompressed `SMOLPACK` trailer), and `machine create --from` reads
-/// the sidecar container directly. Do not decompress the layer.
-async fn stream_golden_response(
-    response: reqwest::Response,
-    tmp_payload: &Path,
-    expected_sha256: Option<String>,
-    expected_total_bytes: Option<u64>,
-) -> Result<u64, String> {
-    // Claim the companion lock before creating the payload: a staging file
-    // without a fresh lock reads as orphaned to a concurrent sweep.
-    let _staging_guard = StagingLockGuard::claim(staging_lock_path(tmp_payload));
-    let mut file = match tokio::fs::File::create(tmp_payload).await {
-        Ok(file) => file,
-        Err(error) => {
-            return Err(format!("could not create temporary OCI golden: {error}"));
-        }
-    };
-    let total_bytes = response.content_length().or(expected_total_bytes);
-    let mut downloaded_bytes = 0_u64;
-    let mut next_progress = GOLDEN_PROGRESS_INTERVAL;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(tmp_payload).await;
-                return Err(format!(
-                    "stream failed after {downloaded_bytes} bytes: {error}"
-                ));
-            }
-        };
-        if let Err(error) = file.write_all(&chunk).await {
-            let _ = tokio::fs::remove_file(tmp_payload).await;
-            return Err(format!(
-                "write failed after {downloaded_bytes} bytes: {error}"
-            ));
-        }
-        downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
-        if downloaded_bytes >= next_progress {
-            report_golden_download_progress("OCI", downloaded_bytes, total_bytes);
-            next_progress = next_progress.saturating_add(GOLDEN_PROGRESS_INTERVAL);
-        }
-    }
-    if let Err(error) = file.flush().await {
-        let _ = tokio::fs::remove_file(tmp_payload).await;
-        return Err(format!(
-            "flush failed after {downloaded_bytes} bytes: {error}"
-        ));
-    }
-    drop(file);
-    if let Some(expected) = expected_sha256 {
-        let digest = match tokio::task::spawn_blocking({
-            let path = tmp_payload.to_owned();
-            move || {
-                use sha2::{Digest, Sha256};
-                let mut hasher = Sha256::new();
-                let mut file = std::fs::File::open(path)?;
-                std::io::copy(&mut file, &mut hasher)?;
-                Ok::<String, std::io::Error>(format!("{:x}", hasher.finalize()))
-            }
-        })
-        .await
-        {
-            Ok(Ok(digest)) => digest,
-            Ok(Err(error)) => {
-                let _ = tokio::fs::remove_file(tmp_payload).await;
-                return Err(format!("could not hash downloaded OCI golden: {error}"));
-            }
-            Err(error) => {
-                let _ = tokio::fs::remove_file(tmp_payload).await;
-                return Err(format!("could not join OCI golden hash task: {error}"));
-            }
-        };
-        let expected = expected.strip_prefix("sha256:").unwrap_or(&expected);
-        if digest != expected {
-            let _ = tokio::fs::remove_file(tmp_payload).await;
-            return Err(format!(
-                "digest mismatch: expected {expected}, received {digest}"
-            ));
-        }
-    }
-    report_golden_download_progress("OCI", downloaded_bytes, total_bytes);
-    Ok(downloaded_bytes)
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
@@ -8509,27 +8624,119 @@ mod golden_download_tests {
         assert!(leftovers(directory.path()).is_empty());
     }
 
+    /// Answers `plan.len()` sequential requests, recording each request line
+    /// and headers. Closing after a short body is what turns a truncated
+    /// transfer into a stream error the client can resume from.
+    async fn serve_sequence(
+        plan: Vec<(String, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        tokio::spawn(async move {
+            for (head, body) in plan {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = vec![0_u8; 4096];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                recorder
+                    .lock()
+                    .await
+                    .push(String::from_utf8_lossy(&request[..read]).into_owned());
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{address}/golden"), seen)
+    }
+
+    #[test]
+    fn golden_url_candidates_prefer_the_own_release_then_latest() {
+        let candidates = golden_url_candidates("0.33.2", None);
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert!(
+            candidates[0].contains("/releases/download/v0.33.2/"),
+            "{candidates:?}"
+        );
+        // An engine on a release that carries no golden must still find the
+        // published one instead of baking locally.
+        assert!(
+            candidates[1].contains("/releases/latest/download/"),
+            "{candidates:?}"
+        );
+
+        // An operator-provided URL replaces both candidates: it is the only
+        // source they asked for.
+        let forced =
+            golden_url_candidates("0.33.2", Some("https://example.test/golden".to_owned()));
+        assert_eq!(forced, vec!["https://example.test/golden".to_owned()]);
+    }
+
     #[tokio::test]
-    async fn truncated_oci_download_reports_progress_before_failure() {
+    async fn interrupted_golden_transfer_resumes_instead_of_restarting() {
         let directory = tempfile::tempdir().unwrap();
-        let payload = directory.path().join("golden.smolmachine");
-        let body = vec![0xEF_u8; 64 * 1024];
-        let url = serve_once(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                body.len() + 4096
+        let partial = directory.path().join("golden.smolmachine.partial");
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let cut = body.len() / 2;
+        let (url, requests) = serve_sequence(vec![
+            // First attempt: the headers promise the whole artifact and the
+            // connection dies halfway — the failure a long registry pull hits.
+            (
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()),
+                body[..cut].to_vec(),
             ),
-            body,
-        )
+            // Second attempt: only the missing tail is served.
+            (
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\r\n",
+                    body.len() - cut
+                ),
+                body[cut..].to_vec(),
+            ),
+        ])
         .await;
-        let response = reqwest::get(url).await.unwrap();
 
-        let error = stream_golden_response(response, &payload, None, None)
-            .await
-            .expect_err("truncated OCI body must fail");
+        let downloaded = download_golden_with_resume(
+            &partial,
+            "test",
+            Some(body.len() as u64),
+            None,
+            move |offset| {
+                let url = url.clone();
+                Box::pin(async move {
+                    let mut request = reqwest::Client::new().get(&url);
+                    if offset > 0 {
+                        request =
+                            request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+                    }
+                    request
+                        .send()
+                        .await
+                        .map_err(|error| format!("request failed: {error}"))
+                }) as BoxFuture<'static, Result<reqwest::Response, String>>
+            },
+        )
+        .await
+        .expect("a resumed transfer completes");
 
-        assert!(error.contains("stream failed after"), "{error}");
-        assert!(!payload.exists());
+        assert_eq!(downloaded, body.len() as u64);
+        assert_eq!(
+            std::fs::read(&partial).unwrap(),
+            body,
+            "the resumed file must hold exactly one artifact"
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2, "the transfer must retry once");
+        assert!(
+            requests[1]
+                .to_lowercase()
+                .contains(&format!("range: bytes={cut}-")),
+            "second attempt must ask for the missing tail: {}",
+            requests[1]
+        );
     }
 
     #[tokio::test]
