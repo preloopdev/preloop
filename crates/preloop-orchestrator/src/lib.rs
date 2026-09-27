@@ -525,21 +525,135 @@ fn latest_golden_url() -> String {
     )
 }
 
-/// Release-asset URLs to try, in order. An operator-provided
-/// `PRELOOP_GOLDEN_URL` replaces both: it is the only source they asked for.
-fn golden_url_candidates(release_version: &str, forced_url: Option<String>) -> Vec<String> {
-    match forced_url {
-        Some(forced) => vec![forced],
-        None => {
-            let versioned = default_golden_url(release_version);
-            let latest = latest_golden_url();
-            if latest == versioned {
-                vec![versioned]
-            } else {
-                vec![versioned, latest]
-            }
+/// The asset name every release carries the packed golden under.
+fn golden_asset_name() -> String {
+    format!("preloop-ubuntu-24.04-{}", std::env::consts::ARCH)
+}
+
+/// Release-asset URL for a specific tag (`v0.33.6`, as GitHub spells it).
+fn tagged_golden_url(tag: &str) -> String {
+    format!(
+        "https://github.com/preloopdev/preloop/releases/download/{tag}/{}",
+        golden_asset_name()
+    )
+}
+
+/// Release-asset URLs to try, in order.
+///
+/// The engine's own release comes first, then the newest release that actually
+/// carries the artifact, then GitHub's `latest` redirect (which needs no API
+/// call and covers a resolution that failed). An operator-provided
+/// `PRELOOP_GOLDEN_URL` replaces all of them: it is the only source they asked
+/// for.
+fn golden_url_candidates(
+    release_version: &str,
+    resolved_tag: Option<&str>,
+    forced_url: Option<String>,
+) -> Vec<String> {
+    if let Some(forced) = forced_url {
+        return vec![forced];
+    }
+    let mut candidates = vec![default_golden_url(release_version)];
+    for url in [
+        resolved_tag.map(tagged_golden_url),
+        Some(latest_golden_url()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidates.contains(&url) {
+            candidates.push(url);
         }
     }
+    candidates
+}
+
+/// Resolved golden-tag lookups, keyed by API base: a GHES host and github.com
+/// must not share an answer.
+type GoldenTagCache =
+    tokio::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<String>)>>;
+
+/// How long a resolved golden tag is reused before the API is asked again.
+/// Unauthenticated GitHub API calls are capped at 60/hour per address, and the
+/// answer only changes when a release is published.
+const LATEST_GOLDEN_TAG_TTL: Duration = Duration::from_secs(300);
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+/// Newest published release whose assets carry the packed golden for this
+/// architecture.
+///
+/// The newest *release* is not the same as the newest release *with a golden*:
+/// a tag whose golden step failed (or that predates the artifact) has none, so
+/// `/releases/latest/download/…` 404s there while a usable golden sits one
+/// release back. Stable releases win over prereleases; drafts are ignored.
+/// Best effort: any failure returns `None` and the caller falls through to the
+/// `latest` redirect.
+async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> Option<String> {
+    static CACHE: std::sync::OnceLock<GoldenTagCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some((fetched_at, tag)) = cache.lock().await.get(api_base) {
+        if fetched_at.elapsed() < LATEST_GOLDEN_TAG_TTL {
+            return tag.clone();
+        }
+    }
+
+    let url = format!("{api_base}/repos/preloopdev/preloop/releases?per_page=30");
+    let releases = match client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<Vec<GitHubRelease>>().await {
+                Ok(releases) => releases,
+                Err(error) => {
+                    info!(%error, "golden release lookup returned an unreadable body");
+                    Vec::new()
+                }
+            }
+        }
+        Ok(response) => {
+            info!(status = %response.status(), "golden release lookup unavailable");
+            Vec::new()
+        }
+        Err(error) => {
+            info!(%error, "golden release lookup failed");
+            Vec::new()
+        }
+    };
+
+    let asset = golden_asset_name();
+    let carries_golden = |release: &GitHubRelease| {
+        !release.draft && release.assets.iter().any(|entry| entry.name == asset)
+    };
+    let tag = releases
+        .iter()
+        .find(|release| carries_golden(release) && !release.prerelease)
+        .or_else(|| releases.iter().find(|release| carries_golden(release)))
+        .map(|release| release.tag_name.clone());
+
+    cache.lock().await.insert(
+        api_base.to_owned(),
+        (std::time::Instant::now(), tag.clone()),
+    );
+    tag
 }
 
 /// Where an in-flight transfer of `payload` is kept.
@@ -682,7 +796,15 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         }
     };
 
-    for url in golden_url_candidates(release_version, forced_url) {
+    // The tag is only resolved once the engine's own release has failed: the
+    // common case needs no API call, and an unauthenticated lookup is rate
+    // limited.
+    let resolved_tag = if forced_url.is_none() {
+        resolve_latest_golden_tag(&client, GITHUB_API_BASE).await
+    } else {
+        None
+    };
+    for url in golden_url_candidates(release_version, resolved_tag.as_deref(), forced_url) {
         info!(
             url = %url,
             target = %payload.display(),
@@ -8654,25 +8776,69 @@ mod golden_download_tests {
     }
 
     #[test]
-    fn golden_url_candidates_prefer_the_own_release_then_latest() {
-        let candidates = golden_url_candidates("0.33.2", None);
-        assert_eq!(candidates.len(), 2, "{candidates:?}");
+    fn golden_url_candidates_prefer_the_own_release_then_the_newest_with_a_golden() {
+        let candidates = golden_url_candidates("0.33.2", Some("v0.33.6"), None);
+        assert_eq!(candidates.len(), 3, "{candidates:?}");
         assert!(
             candidates[0].contains("/releases/download/v0.33.2/"),
             "{candidates:?}"
         );
         // An engine on a release that carries no golden must still find the
-        // published one instead of baking locally.
+        // published one instead of baking locally — even when the newest
+        // release is not the one holding the artifact.
         assert!(
-            candidates[1].contains("/releases/latest/download/"),
+            candidates[1].contains("/releases/download/v0.33.6/"),
+            "{candidates:?}"
+        );
+        // The `latest` redirect is the last try: it needs no API call, so it
+        // still covers a lookup that failed.
+        assert!(
+            candidates[2].contains("/releases/latest/download/"),
             "{candidates:?}"
         );
 
-        // An operator-provided URL replaces both candidates: it is the only
+        // A resolved tag equal to the engine's own release is not retried.
+        let same = golden_url_candidates("0.33.6", Some("v0.33.6"), None);
+        assert_eq!(same.len(), 2, "{same:?}");
+
+        // An operator-provided URL replaces every candidate: it is the only
         // source they asked for.
-        let forced =
-            golden_url_candidates("0.33.2", Some("https://example.test/golden".to_owned()));
+        let forced = golden_url_candidates(
+            "0.33.2",
+            Some("v0.33.6"),
+            Some("https://example.test/golden".to_owned()),
+        );
         assert_eq!(forced, vec!["https://example.test/golden".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn golden_release_lookup_prefers_the_newest_release_that_has_it() {
+        let body = serde_json::json!([
+            // Newest release, but its golden step produced nothing.
+            {"tag_name": "v9.9.9", "assets": [{"name": "preloop-cli-aarch64.tar.gz"}]},
+            // A prerelease with the artifact must not outrank a stable one.
+            {"tag_name": "v9.9.8", "prerelease": true, "assets": [{"name": golden_asset_name()}]},
+            {"tag_name": "v9.9.7", "assets": [{"name": golden_asset_name()}]},
+            {"tag_name": "v9.9.6", "assets": [{"name": golden_asset_name()}]}
+        ])
+        .to_string();
+        let url = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            ),
+            body.into_bytes(),
+        )
+        .await;
+        let api_base = url.trim_end_matches("/golden").to_owned();
+
+        let tag = resolve_latest_golden_tag(&reqwest::Client::new(), &api_base).await;
+
+        assert_eq!(
+            tag.as_deref(),
+            Some("v9.9.7"),
+            "the newest stable release carrying the golden wins"
+        );
     }
 
     #[tokio::test]

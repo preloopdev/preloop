@@ -112,11 +112,14 @@ toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
   removing the valid seeded pair. The pool stores the downloaded artifact at
   a base-image-specific path below `<preloop_home>/vms/` (`preloop_home` is
   `~/.preloop` unless `PRELOOP_HOME` says otherwise).
-- The pool fetches that asset from its own release first and then from
-  `/releases/latest/download/…`, so an engine whose release carries no golden
-  (the seed step failed, or the tag predates the artifact) still finds the
-  published one instead of baking locally. `PRELOOP_GOLDEN_URL` replaces both
-  candidates.
+- The pool fetches that asset from its own release first, then from the newest
+  release that actually carries it (a GitHub API lookup, cached for five
+  minutes, stable releases over prereleases), and finally from
+  `/releases/latest/download/…`, which needs no API call and covers a lookup
+  that failed. An engine whose release carries no golden — the seed step
+  failed, or the tag predates the artifact — therefore still finds the
+  published one instead of baking locally. `PRELOOP_GOLDEN_URL` replaces every
+  candidate.
 - Transfers resume. The in-flight download lives at `<payload>.partial` and
   each retry asks for `Range: bytes=<have>-`, so a link that drops mid-body
   costs the bytes in flight rather than the whole artifact — the packed golden
