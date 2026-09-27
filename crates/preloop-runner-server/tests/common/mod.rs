@@ -1736,6 +1736,7 @@ pub async fn r1_10_register_live_job_with_run(
             job_fail_fast: Default::default(),
             job_continue_on_error: Default::default(),
             job_check_run_ids: Default::default(),
+            reports_check_runs: false,
             reusable_calls: Default::default(),
             jobs_list: Vec::new(),
             created_at: chrono::Utc::now(),

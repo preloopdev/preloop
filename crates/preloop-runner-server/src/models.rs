@@ -318,6 +318,13 @@ pub struct RunRecord {
     pub job_continue_on_error: BTreeMap<String, bool>,
     #[serde(default)]
     pub job_check_run_ids: BTreeMap<JobId, u64>,
+    /// Whether intake reported GitHub check runs for this run (webhook,
+    /// dispatch, push, or rerun path). Gates late check-run minting for jobs
+    /// materialized after submission — runtime-expanded matrix legs and
+    /// reusable callee jobs — and the terminal reporters' self-heal mint.
+    /// Persisted so a restart keeps reporting for already-reported runs.
+    #[serde(default)]
+    pub reports_check_runs: bool,
     #[serde(default)]
     pub reusable_calls: BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
     #[serde(default)]

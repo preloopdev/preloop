@@ -285,6 +285,13 @@ pub struct WorkflowSubmission {
     /// this value because it differs from payload `after` for PR-family events.
     #[serde(default)]
     pub resolved_sha: Option<String>,
+    /// SHA the run's GitHub check runs attach to. Webhook adapters set this
+    /// when the check target differs from the checkout SHA — for example the
+    /// PR head commit while `sha`/`resolved_sha` name the base or merge —
+    /// and it is persisted with the run so check runs minted later (runtime
+    /// job expansion) land on the same commit as the intake-time checks.
+    #[serde(default)]
+    pub status_check_sha: Option<String>,
     /// Explicitly resolved changed paths. An empty list is meaningful only
     /// when `changed_paths_known` is true.
     #[serde(default)]

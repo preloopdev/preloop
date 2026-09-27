@@ -3003,6 +3003,7 @@ fn register_expanded_jobs(
     inner: &mut InnerState,
     run_id: RunId,
     jobs: Vec<BuiltJob>,
+    outcome: &mut SchedulingOutcome,
 ) -> Vec<QueuedJob> {
     let mut queued = Vec::with_capacity(jobs.len());
     // The submit path concludes `runs-on: windows-*`/`macos-*` jobs when no
@@ -3036,6 +3037,10 @@ fn register_expanded_jobs(
                 run.job_needs.insert(plan.id.clone(), plan.needs.clone());
                 run.job_names.insert(plan.id.clone(), plan.name.clone());
             }
+            // Terminal at materialization: the failed outcome drives the
+            // check-run completion report (which mints the check on demand),
+            // so the leg reports like a submit-time unhostable job.
+            outcome.failed.push((run_id, plan.id.clone()));
             continue;
         }
         let job_request = artifacts.job_request;
@@ -3221,7 +3226,10 @@ fn node_settle_status(inner: &InnerState, run_id: RunId, node_id: &JobId) -> Exe
 ///
 /// Membership test for the per-job paths ([`cancel_job_inner`]), which need
 /// one answer rather than the run-wide set [`expandable_job_ids`] builds.
-fn is_expandable_node(inner: &InnerState, run_id: RunId, job_id: &JobId) -> bool {
+/// Check-run reporting uses the same test: GitHub mints checks only for
+/// materialized jobs, so intake skips placeholders and the materialized legs
+/// mint their own at expansion time.
+pub(crate) fn is_expandable_node(inner: &InnerState, run_id: RunId, job_id: &JobId) -> bool {
     inner
         .pending_jobs
         .iter()
@@ -3496,7 +3504,7 @@ fn apply_expansion(
             Vec::new()
         }
         BuiltExpansion::Matrix { jobs } => {
-            let queued = register_expanded_jobs(inner, run_id, jobs);
+            let queued = register_expanded_jobs(inner, run_id, jobs, outcome);
             if let Some(run) = inner.runs.get_mut(&run_id) {
                 // The placeholder is replaced by its combinations; GitHub shows
                 // the fan-out, never the node that produced it.
@@ -3530,7 +3538,7 @@ fn apply_expansion(
             reusable_calls,
         } => {
             let inner_ids: Vec<String> = jobs.iter().map(|job| job.plan.id.0.clone()).collect();
-            let queued = register_expanded_jobs(inner, run_id, jobs);
+            let queued = register_expanded_jobs(inner, run_id, jobs, outcome);
             if let Some(run) = inner.runs.get_mut(&run_id) {
                 if let Some(meta) = run.reusable_calls.get_mut(&caller_id.0) {
                     meta.inner_job_ids = inner_ids;
@@ -3554,7 +3562,7 @@ fn apply_expansion(
 /// workflow YAML and constructs a runner message plus a runtime token per
 /// inner job, which scales with the width of the callee matrix. Holding the
 /// mutex across that stalls every other request.
-pub async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
+pub async fn drain_expansions(shared: &Arc<SharedState>) -> SchedulingOutcome {
     let mut outcome = SchedulingOutcome::default();
     loop {
         // Phase 1 (locked): claim one node and snapshot its inputs.
@@ -3601,7 +3609,20 @@ pub async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
         {
             inner.pending_expansions.pop_front();
         }
+        let job_run_id = job.run_id;
         let ready = apply_expansion(&mut inner, job, built, &mut outcome);
+        // Newly materialized jobs get their `queued` check runs here, the way
+        // GitHub mints one check per job as it materializes. Skips nested
+        // expandable nodes (deferred matrices/callers among the legs — their
+        // own expansions mint later) and legs already terminal at register
+        // (their completion report mints the check directly).
+        let mint_ids: Vec<JobId> = ready
+            .iter()
+            .filter(|queued_job| {
+                queued_job.deferred_matrix.is_none() && queued_job.reusable_call.is_none()
+            })
+            .map(|queued_job| queued_job.job_id.clone())
+            .collect();
         inner.pending_jobs.extend(ready);
         let promoted = promote_ready_jobs(
             &mut inner,
@@ -3614,6 +3635,15 @@ pub async fn drain_expansions(shared: &SharedState) -> SchedulingOutcome {
             .queue_depth
             .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
         sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+        if !mint_ids.is_empty() {
+            let shared = Arc::clone(shared);
+            let run_id = job_run_id;
+            tokio::spawn(async move {
+                for job_id in mint_ids {
+                    crate::github::ensure_check_run_mapped(&shared, run_id, &job_id).await;
+                }
+            });
+        }
     }
 }
 
@@ -3968,6 +3998,7 @@ mod assignment_tests {
                 job_fail_fast: BTreeMap::new(),
                 job_continue_on_error: BTreeMap::new(),
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: BTreeMap::new(),
                 jobs_list: Vec::new(),
                 created_at: chrono::Utc::now(),
@@ -4043,6 +4074,7 @@ mod assignment_tests {
                 job_fail_fast: BTreeMap::new(),
                 job_continue_on_error: BTreeMap::new(),
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: BTreeMap::new(),
                 jobs_list: Vec::new(),
                 created_at: chrono::Utc::now(),
@@ -4127,6 +4159,7 @@ mod assignment_tests {
                 job_fail_fast: BTreeMap::new(),
                 job_continue_on_error: BTreeMap::new(),
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: BTreeMap::new(),
                 jobs_list: Vec::new(),
                 created_at: chrono::Utc::now(),
@@ -4212,6 +4245,7 @@ mod assignment_tests {
                 job_fail_fast: BTreeMap::new(),
                 job_continue_on_error: BTreeMap::new(),
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: BTreeMap::new(),
                 jobs_list: Vec::new(),
                 created_at: chrono::Utc::now(),
@@ -4281,6 +4315,7 @@ mod assignment_tests {
                 job_fail_fast: BTreeMap::new(),
                 job_continue_on_error: BTreeMap::new(),
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: BTreeMap::new(),
                 jobs_list: Vec::new(),
                 created_at: chrono::Utc::now(),
@@ -4401,6 +4436,7 @@ mod assignment_tests {
                 job_fail_fast: BTreeMap::new(),
                 job_continue_on_error: BTreeMap::new(),
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: BTreeMap::new(),
                 jobs_list: Vec::new(),
                 created_at: chrono::Utc::now(),

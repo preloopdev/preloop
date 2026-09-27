@@ -1662,6 +1662,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     job_continue_on_error: BTreeMap::new(),
                     status: ExecutionStatus::Failure,
                     job_check_run_ids: BTreeMap::new(),
+                    reports_check_runs: false,
                     reusable_calls,
                     jobs_list: Vec::new(),
                     created_at,
@@ -1897,6 +1898,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                             job_continue_on_error,
                             status: ExecutionStatus::Cancelled,
                             job_check_run_ids: BTreeMap::new(),
+                            reports_check_runs: false,
                             reusable_calls,
                             jobs_list: Vec::new(),
                             created_at,
@@ -1994,6 +1996,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     job_continue_on_error,
                     status: ExecutionStatus::Pending,
                     job_check_run_ids: BTreeMap::new(),
+                    reports_check_runs: false,
                     reusable_calls,
                     jobs_list: Vec::new(),
                     created_at,
@@ -2059,6 +2062,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 job_continue_on_error: job_continue_on_error.clone(),
                 status: ExecutionStatus::Queued,
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls: reusable_calls.clone(),
                 jobs_list: Vec::new(),
                 created_at,
@@ -2301,6 +2305,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 job_continue_on_error,
                 status: initial_status,
                 job_check_run_ids: BTreeMap::new(),
+                reports_check_runs: false,
                 reusable_calls,
                 jobs_list: Vec::new(),
                 created_at,
@@ -2471,14 +2476,28 @@ pub async fn submit_run(
             // sequential GitHub Check API calls. Jobs resolved terminal at
             // submission get their completion reported immediately.
             let (repository, sha, jobs) = {
-                let inner = shared.state.inner.lock().await;
+                let mut inner = shared.state.inner.lock().await;
+                // Stamped before filtering: an all-expandable push reports
+                // nothing at intake yet still needs the flag for its
+                // materialized legs.
+                if let Some(run) = inner.runs.get_mut(&run_id) {
+                    run.reports_check_runs = true;
+                }
                 let Some(run) = inner.runs.get(&run_id) else {
                     return Ok(Json(accepted));
                 };
                 (
                     run.submission.repository.clone(),
                     run.submission.sha.clone(),
-                    run.jobs.keys().cloned().collect::<Vec<_>>(),
+                    // Expandable nodes (deferred matrices, reusable callers)
+                    // mint no check at intake; their materialized legs do.
+                    run.jobs
+                        .keys()
+                        .filter(|job_id| {
+                            !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
                 )
             };
             let reporter = Arc::clone(&shared);
