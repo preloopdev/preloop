@@ -3249,4 +3249,80 @@ mod postgres {
             "concurrent pollers must claim different jobs"
         );
     }
+
+    /// Polls no longer serialize on the global lock: many runners on two
+    /// nodes poll one fan-out run at once. Every job is claimed exactly once,
+    /// and same-run polls coexist (a shared run lock), so the run drains in
+    /// about `jobs / runners` rounds instead of one claim per round.
+    #[tokio::test]
+    async fn concurrent_polls_across_nodes_claim_each_job_once() {
+        use crate::control::types::PollOutcome;
+        const JOBS: usize = 24;
+        const RUNNERS: usize = 12;
+        let (_pg, node_a, node_b) = backend_pair().await;
+        let nodes = [std::sync::Arc::new(node_a), std::sync::Arc::new(node_b)];
+        let mut sessions = Vec::new();
+        for i in 0..RUNNERS {
+            let node = &nodes[i % 2];
+            let runner = node
+                .register_runner(super::register_runner(&format!("r{i}")))
+                .await
+                .unwrap();
+            let session = node
+                .create_session(super::create_session(runner.runner.id))
+                .await
+                .unwrap();
+            sessions.push((i % 2, session.session_id, runner.runner.id));
+        }
+        let run_id = RunId::new();
+        let jobs = (0..JOBS)
+            .map(|i| super::submit_job(run_id, &format!("j{i}"), i as i64 + 1))
+            .collect();
+        nodes[0]
+            .submit_run(super::submit_run(run_id, jobs))
+            .await
+            .unwrap();
+
+        let mut claimed = std::collections::BTreeSet::new();
+        let mut rounds = 0;
+        while claimed.len() < JOBS {
+            rounds += 1;
+            assert!(rounds <= 6, "fan-out drained too slowly: {claimed:?}");
+            let polls = sessions.iter().map(|(node, session_id, runner_id)| {
+                let node = nodes[*node].clone();
+                let poll = super::poll(session_id, *runner_id);
+                tokio::spawn(async move { node.poll_session(poll).await })
+            });
+            let mut finished = Vec::new();
+            for outcome in futures::future::join_all(polls).await {
+                if let PollOutcome::Claimed(claim) = outcome.unwrap().unwrap() {
+                    assert!(
+                        claimed.insert(claim.queued.job_id.clone()),
+                        "job {} claimed twice",
+                        claim.queued.job_id.0
+                    );
+                    finished.push((
+                        claim.queued.job_id,
+                        claim.request.agent_job_id,
+                        claim.runner_id,
+                    ));
+                }
+            }
+            // Finish this round's jobs so each runner is free to claim again.
+            for (job_id, agent_job_id, runner_id) in finished {
+                nodes[0]
+                    .complete_job(crate::control::backend::JobCompletionInput {
+                        run_id,
+                        job_id,
+                        agent_job_id: Some(agent_job_id),
+                        status: ExecutionStatus::Success,
+                        outputs: std::collections::BTreeMap::new(),
+                        runner_id: Some(runner_id),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(claimed.len(), JOBS);
+    }
 }

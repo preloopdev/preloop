@@ -282,7 +282,11 @@ pub(crate) fn choose_claim_position(
         tx.pool_pending.retain(|_, at| assignment_fresh(*at, now));
     }
     let claimable = |job: &QueuedJob| {
-        job_matches_runner_capabilities(job, runner) && claim_permitted(tx, job, verified_runner_id)
+        tx.poll_claimable
+            .as_ref()
+            .is_none_or(|locked| locked.contains(&(job.run_id, job.job_id.clone())))
+            && job_matches_runner_capabilities(job, runner)
+            && claim_permitted(tx, job, verified_runner_id)
     };
     let assigned_to_this_runner = |job: &QueuedJob| {
         let Some(runner_id) = verified_runner_id else {

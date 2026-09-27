@@ -1621,6 +1621,7 @@ fn load_txstate(
                     not_before_us,
                     namespace_id,
                     pool_key,
+                    row_sig: None,
                 },
             );
             if let Some(run) = tx.runs.get_mut(&run_id) {
@@ -4140,6 +4141,22 @@ impl ControlBackend for SqliteBackend {
                 },
             )
             .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
+        let run_id = run_id.0.to_string();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_concurrency WHERE run_id=?1) \
+                 OR EXISTS(SELECT 1 FROM jobset_gates WHERE run_id=?1) \
+                 OR EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 AND concurrency_json IS NOT NULL) \
+                 OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=?1) \
+                 OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=?1)",
+                params![run_id],
+                |row| row.get(0),
+            )
             .map_err(ControlError::backend)
         })
     }

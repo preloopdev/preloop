@@ -843,6 +843,12 @@ pub async fn complete_job_inner(
             .await
             .map_err(ApiError::from)?,
     };
+    let in_concurrency = shared
+        .state
+        .backend
+        .run_in_concurrency(comp.run_id)
+        .await
+        .map_err(ApiError::from)?;
     let scope = crate::control::txstate::TxScope {
         include_archived: false,
         runs: Some(std::collections::BTreeSet::from([comp.run_id])),
@@ -855,7 +861,9 @@ pub async fn complete_job_inner(
         ready_queue: false,
         blocked_jobs: false,
         sessions: Some(sessions),
-        concurrency: true,
+        // Only a run in a concurrency group can release a gate that wakes
+        // another run; every other completion stays under its run lock.
+        concurrency: in_concurrency,
         runs_referenced: true,
         job_requests_all: false,
         pending_expansions: false,

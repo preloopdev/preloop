@@ -979,6 +979,10 @@ CREATE TABLE IF NOT EXISTS counters (
     name                TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0
 );
+-- FIFO stamps for job slot changes. Sequences, not `counters` rows: a
+-- counter row stays locked until commit and would serialize every writer.
+CREATE SEQUENCE IF NOT EXISTS job_seq;
+CREATE SEQUENCE IF NOT EXISTS queue_position_seq;
 CREATE TABLE IF NOT EXISTS workflow_run_counters (
     key                 TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0

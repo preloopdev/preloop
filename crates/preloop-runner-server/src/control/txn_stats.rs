@@ -46,7 +46,22 @@ impl Phase {
 static RUN_SCOPED: Phase = Phase::new();
 static GLOBAL: Phase = Phase::new();
 
+/// Per-caller totals: `(count, lock_us, total_us)`, keyed by the enclosing
+/// function of the transaction closure.
+type CallerTotals = std::collections::BTreeMap<(&'static str, bool), (u64, u64, u64)>;
+static BY_CALLER: std::sync::Mutex<CallerTotals> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The function a closure was written in: its type name minus the
+/// `::{{closure}}` segments.
+pub(crate) fn caller_of<F>(_: &F) -> &'static str {
+    let name = std::any::type_name::<F>();
+    let name = name.split("::{{closure}}").next().unwrap_or(name);
+    name.strip_prefix("preloop_runner_server::").unwrap_or(name)
+}
+
 pub(crate) fn record(
+    caller: &'static str,
     run_scoped: bool,
     lock: Duration,
     load: Duration,
@@ -64,6 +79,12 @@ pub(crate) fn record(
     phase.commit_us.fetch_add(us(commit), Ordering::Relaxed);
     let total = us(lock + load + decide + write + commit);
     phase.max_total_us.fetch_max(total, Ordering::Relaxed);
+    if let Ok(mut by_caller) = BY_CALLER.lock() {
+        let entry = by_caller.entry((caller, run_scoped)).or_default();
+        entry.0 += 1;
+        entry.1 += us(lock);
+        entry.2 += total;
+    }
 }
 
 /// Current cumulative stats.
@@ -71,5 +92,19 @@ pub(crate) fn snapshot() -> serde_json::Value {
     serde_json::json!({
         "run_scoped": RUN_SCOPED.snapshot(),
         "global": GLOBAL.snapshot(),
+        "by_caller": BY_CALLER.lock().map(|by_caller| {
+            by_caller
+                .iter()
+                .map(|((caller, run_scoped), (count, lock_us, total_us))| {
+                    serde_json::json!({
+                        "caller": caller,
+                        "run_scoped": run_scoped,
+                        "count": count,
+                        "lock_ms": *lock_us as f64 / 1000.0,
+                        "total_ms": *total_us as f64 / 1000.0,
+                    })
+                })
+                .collect::<Vec<_>>()
+        }).unwrap_or_default(),
     })
 }

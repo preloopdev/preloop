@@ -48,6 +48,11 @@ pub(crate) struct TxState {
     /// Global ready-queue size at load time, adjusted as this transaction
     /// pushes/pops — reported back for the supervisor atomic.
     pub(crate) ready_count: i64,
+    /// Set by a Postgres poll: the ready jobs this transaction locked. Other
+    /// loaded ready jobs (siblings in a candidate run) may be claimed by a
+    /// concurrent poll and must not be chosen here. `None`: every loaded
+    /// ready job is claimable (single-writer and global transactions).
+    pub(crate) poll_claimable: Option<BTreeSet<(RunId, JobId)>>,
     /// `runs-on` labels of the global ready-queue front, captured unscoped.
     /// Pool scaling reads this; a scoped `ready_index` head can name the
     /// wrong platform.
@@ -173,6 +178,62 @@ pub(crate) struct JobRowState {
     pub(crate) not_before_us: Option<i64>,
     pub(crate) namespace_id: String,
     pub(crate) pool_key: String,
+    /// Signature of every `jobs` column as loaded ([`job_row_sig`]). A
+    /// same-slot job whose written columns hash identically is not
+    /// rewritten, so an unchanged stale row never overwrites a concurrent
+    /// writer's claim. `None` (SQLite: single writer) always writes.
+    pub(crate) row_sig: Option<u64>,
+}
+
+/// Hash of one `jobs` row's written columns, in their stored forms.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn job_row_sig(
+    status: &str,
+    kind: &str,
+    queue_position: Option<i64>,
+    seq: i64,
+    base_id: &str,
+    runs_on: &str,
+    runner_group: Option<&str>,
+    enqueued_us: Option<i64>,
+    reaper_us: Option<i64>,
+    claimed_by: Option<i64>,
+    claimed_at_us: Option<i64>,
+    expand_generation: i64,
+    namespace_id: &str,
+    pool_key: &str,
+    priority: i16,
+    run_order: i64,
+    job_order: i64,
+    not_before_us: Option<i64>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        status,
+        kind,
+        queue_position,
+        seq,
+        base_id,
+        runs_on,
+        runner_group,
+        enqueued_us,
+        reaper_us,
+    )
+        .hash(&mut h);
+    (
+        claimed_by,
+        claimed_at_us,
+        expand_generation,
+        namespace_id,
+        pool_key,
+        priority,
+        run_order,
+        job_order,
+        not_before_us,
+    )
+        .hash(&mut h);
+    h.finish()
 }
 
 /// Rows loaded into a [`TxState`], used to compute deletions at write-back:
@@ -214,6 +275,17 @@ pub(crate) struct LoadedRows {
     /// Signature of each runner / request row as loaded. Write-back skips
     /// rows whose signature is unchanged: re-writing an unchanged loaded row
     /// is at best a no-op and at worst reverts a concurrent writer.
+    /// Per-key signatures of the keyed side families, for the same
+    /// skip-unchanged rule: write-back upserts changed keys and deletes only
+    /// loaded keys that are gone. (A scoped delete + reinsert races any
+    /// concurrent writer of the same scope: its insert collides with rows
+    /// the other committed after this delete began.)
+    pub(crate) token_sigs: BTreeMap<i64, u64>,
+    pub(crate) grant_sigs: BTreeMap<(RunId, JobId), u64>,
+    pub(crate) oidc_sigs: BTreeMap<(RunId, JobId), u64>,
+    pub(crate) run_concurrency_sigs: BTreeMap<RunId, u64>,
+    pub(crate) assignment_sigs: BTreeMap<(RunId, JobId), u64>,
+    pub(crate) pool_pending_sigs: BTreeMap<(RunId, JobId), u64>,
     pub(crate) runner_sigs: BTreeMap<i64, u64>,
     pub(crate) request_sigs: BTreeMap<i64, u64>,
 }
@@ -665,8 +737,28 @@ pub(crate) fn request_sig(tx: &TxState, request_id: i64) -> Option<u64> {
     Some(sig_of(&[record, &tx.broker_messages.get(&request_id)]))
 }
 
+/// Signature of one family value.
+pub(crate) fn value_sig(value: &dyn std::fmt::Debug) -> u64 {
+    sig_of(&[value])
+}
+
+fn sigs<K: Ord + Clone, V: std::fmt::Debug>(map: &BTreeMap<K, V>) -> BTreeMap<K, u64> {
+    map.iter().map(|(k, v)| (k.clone(), value_sig(v))).collect()
+}
+
 /// Record load-time signatures (call once, at the end of a load).
 pub(crate) fn snapshot_row_sigs(tx: &mut TxState) {
+    tx.loaded.token_sigs = sigs(&tx.github_token_requests);
+    tx.loaded.grant_sigs = sigs(&tx.id_token_grants);
+    tx.loaded.oidc_sigs = sigs(&tx.oidc_job_contexts);
+    tx.loaded.run_concurrency_sigs = sigs(&tx.run_concurrency);
+    tx.loaded.assignment_sigs = sigs(&tx.job_assignments);
+    tx.loaded.pool_pending_sigs = sigs(&tx.pool_pending);
+    tx.loaded.cancellations = tx
+        .cancellation_queue
+        .iter()
+        .map(|c| (c.run_id, c.job_id.clone(), c.agent_job_id))
+        .collect();
     tx.loaded.runner_sigs = tx
         .runners
         .keys()

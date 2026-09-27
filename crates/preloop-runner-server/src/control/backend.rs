@@ -301,6 +301,11 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Drop timelines not patched since `before_us`. Returns timelines removed.
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
 
+    /// Whether `run_id` takes part in any concurrency group (run- or
+    /// job-level, holding or waiting). A run that doesn't can settle a job
+    /// under its own run lock: nothing it releases can wake another run.
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError>;
+
     /// Resolve a runner callback (plan id, else timeline id) to its attempt:
     /// `(request_id, run_id, job_id, agent_job_id, job status)`, newest
     /// attempt first. One indexed query instead of loading every request.
@@ -944,6 +949,12 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.prune_timelines(before_us).await,
             Self::Postgres(b) => b.prune_timelines(before_us).await,
+        }
+    }
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_in_concurrency(run_id).await,
+            Self::Postgres(b) => b.run_in_concurrency(run_id).await,
         }
     }
     async fn callback_job(
