@@ -1483,6 +1483,82 @@ pub fn build_meta_snapshot(inner: &InnerState) -> MetaSnapshot {
     }
 }
 
+fn restored_holder_tier(
+    inner: &InnerState,
+    holder: &concurrency::Holder,
+) -> Option<crate::events::trust_tier::TrustTier> {
+    inner
+        .runs
+        .get(&holder.run_id())
+        .and_then(|run| crate::events::trust_tier::tier_of(&run.submission))
+}
+
+fn rekey_restored_concurrency_groups(
+    inner: &InnerState,
+    groups: Vec<((String, String), concurrency::ConcurrencyGroup)>,
+) -> BTreeMap<(String, String), concurrency::ConcurrencyGroup> {
+    let mut rekeyed = BTreeMap::new();
+    for ((repo, legacy_group), group) in groups {
+        let concurrency::ConcurrencyGroup {
+            display_name,
+            running,
+            pending,
+        } = group;
+        let mut add = |holder: concurrency::Holder, running: bool| {
+            let tier = restored_holder_tier(inner, &holder);
+            let key = concurrency::concurrency_key_for_tier(&repo, &display_name, tier);
+            let entry = rekeyed
+                .entry(key)
+                .or_insert_with(|| concurrency::ConcurrencyGroup {
+                    display_name: display_name.clone(),
+                    ..Default::default()
+                });
+            if running && entry.running.is_none() {
+                entry.running = Some(holder);
+            } else {
+                entry.pending.push_back(holder);
+            }
+        };
+
+        let was_empty = running.is_none() && pending.is_empty();
+        if let Some(holder) = running {
+            add(holder, true);
+        }
+        for holder in pending {
+            add(holder, false);
+        }
+        if was_empty {
+            rekeyed
+                .entry((repo, legacy_group))
+                .or_insert_with(|| concurrency::ConcurrencyGroup {
+                    display_name,
+                    ..Default::default()
+                });
+        }
+    }
+    rekeyed
+}
+
+fn rebuild_holder_keys(inner: &mut InnerState) {
+    inner.holder_keys.clear();
+    for (key, group) in &inner.concurrency_groups {
+        if let Some(holder) = &group.running {
+            inner
+                .holder_keys
+                .entry(holder.run_id())
+                .or_default()
+                .push(key.clone());
+        }
+        for holder in &group.pending {
+            inner
+                .holder_keys
+                .entry(holder.run_id())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+}
+
 /// Apply a restored metadata snapshot onto in-memory state.
 pub fn apply_meta_snapshot(
     inner: &mut InnerState,
@@ -1509,7 +1585,39 @@ pub fn apply_meta_snapshot(
         .into_iter()
         .map(|(run_id, job_id, granted)| ((run_id, job_id), granted))
         .collect();
-    inner.concurrency_groups = meta.concurrency_groups.into_iter().collect();
+    inner.concurrency_groups = rekey_restored_concurrency_groups(inner, meta.concurrency_groups);
+    // Rekey JobSet admissions BEFORE reconcile/promote: a promoted JobSet gate
+    // inserts its key into acquired_keys and creates live group entries, so
+    // advancing admissions on stale keys would split the JobSet's identity
+    // across old and new namespaces (the JobSet ends up queued behind itself).
+    inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
+    for (id, admission) in &mut inner.jobset_admissions {
+        let tier = inner
+            .runs
+            .get(&id.run_id)
+            .and_then(|run| crate::events::trust_tier::tier_of(&run.submission));
+        // Persisted acquired keys are canonical keys, not display names:
+        // re-deriving them from (repo, group) would stack a second namespace
+        // on keys written by this build and break identity with the gate they
+        // belong to. Translate each through its gate's old→new key instead.
+        let mut key_map = std::collections::BTreeMap::new();
+        for gate in &mut admission.gates {
+            let old_key = gate.key.clone();
+            let repo = gate.key.0.clone();
+            gate.key = concurrency::concurrency_key_for_tier(&repo, &gate.display_name, tier);
+            key_map.insert(old_key, gate.key.clone());
+        }
+        let acquired = std::mem::take(&mut admission.acquired_keys);
+        admission.acquired_keys = acquired
+            .into_iter()
+            .map(|key| {
+                key_map
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| concurrency::concurrency_key_for_tier(&key.0, &key.1, tier))
+            })
+            .collect();
+    }
     // A restored group may name a holder whose run is already terminal (the
     // snapshot predates the completion) or missing entirely; leaving it in
     // place parks every later submission in that group forever. Reconcile
@@ -1517,9 +1625,9 @@ pub fn apply_meta_snapshot(
     // unblock.
     crate::runtime_scheduling::reconcile_concurrency_groups(inner);
     crate::runtime_scheduling::promote_ready_jobs(inner, environment_rules, &[]);
-    inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
     inner.run_concurrency = meta.run_concurrency.into_iter().collect();
     inner.holder_keys = meta.holder_keys.into_iter().collect();
+    rebuild_holder_keys(inner);
     inner.artifacts = meta.artifacts.into_iter().collect();
     inner.log_metadata = meta.log_metadata.into_iter().collect();
     inner.timeline_events = meta.timeline_events.into_iter().collect();

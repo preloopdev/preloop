@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::events::trust_tier::TrustTier;
+
 /// Official cancel grace period body value (TimeSpan).
 pub const CANCEL_TIMEOUT: &str = "00:05:00";
 
@@ -189,8 +191,47 @@ fn build_eval_context(ctx: &ConcurrencyContext<'_>) -> Context {
 }
 
 /// Lowercased (repo, group) key.
+///
+/// This preserves the original GitHub-compatible key for callers that do not
+/// have provenance information, such as old persisted state and unit tests.
 pub fn concurrency_key(repo: &str, group: &str) -> (String, String) {
     (repo.to_ascii_lowercase(), group.to_ascii_lowercase())
+}
+
+/// Separator between the trust-tier namespace and the repository component of
+/// a concurrency key. `0x1f` (unit separator) cannot appear in a GitHub
+/// repository name or a workflow `concurrency:` expression, so a namespaced
+/// key can never be forged by a literal group/repo string, and stripping a
+/// prior namespace is always unambiguous.
+const TIER_KEY_SEP: char = '\u{1f}';
+
+/// Lowercased concurrency key with an optional provenance namespace.
+///
+/// New webhook submissions carry a trust tier. Namespacing those keys prevents
+/// a `pull_request_target` or fork-restricted run from sharing a cancellation
+/// slot with a trusted run that evaluates the same workflow group. The tier is
+/// encoded in the repository component (`TIER\x1fREPO`) rather than in the
+/// group name, so a workflow that literally names its group `trusted::deploy`
+/// still occupies a different slot than a trusted run on `deploy`.
+///
+/// The namespace is part of the internal key only; the user-visible group name
+/// remains unchanged. The function strips any pre-existing namespace, which
+/// keeps restore-time rekeying of already-namespaced persisted keys
+/// idempotent.
+pub fn concurrency_key_for_tier(
+    repo: &str,
+    group: &str,
+    tier: Option<TrustTier>,
+) -> (String, String) {
+    let bare = repo.rsplit(TIER_KEY_SEP).next().unwrap_or(repo);
+    let (repo, group) = concurrency_key(bare, group);
+    let Some(tier) = tier else {
+        return (repo, group);
+    };
+    (
+        format!("{}{TIER_KEY_SEP}{repo}", tier.concurrency_namespace()),
+        group,
+    )
 }
 
 /// Parse concurrency fields stored on a queued job plan.
@@ -387,6 +428,65 @@ mod properties {
             ]
             .boxed()
         }
+    }
+
+    #[test]
+    fn trust_tier_namespaces_cancellation_keys() {
+        let trusted =
+            concurrency_key_for_tier("Owner/Repo", "Deploy-Main", Some(TrustTier::Trusted));
+        let target = concurrency_key_for_tier(
+            "owner/repo",
+            "deploy-main",
+            Some(TrustTier::PullRequestTarget),
+        );
+        let fork = concurrency_key_for_tier(
+            "owner/repo",
+            "deploy-main",
+            Some(TrustTier::UntrustedForkPullRequest),
+        );
+
+        assert_ne!(trusted, target);
+        assert_ne!(trusted, fork);
+        assert_ne!(target, fork);
+        // The tier rides on the repo component; the group component stays the
+        // plain lowercased display name.
+        assert_eq!(trusted.1, target.1);
+        assert_eq!(trusted.0, "trusted\u{1f}owner/repo");
+        assert_eq!(target.0, "pull-request-target\u{1f}owner/repo");
+        assert_eq!(fork.0, "untrusted-fork-pull-request\u{1f}owner/repo");
+    }
+
+    #[test]
+    fn tier_key_cannot_be_forged_by_group_name() {
+        // A tierless submission whose workflow literally names its group
+        // `trusted::deploy` must not collide with a trusted-tier run on
+        // `deploy` — the finding behind encoding the tier in the repo
+        // component rather than as a `tier::` group prefix.
+        let forged = concurrency_key_for_tier("owner/repo", "trusted::deploy", None);
+        let trusted = concurrency_key_for_tier("owner/repo", "deploy", Some(TrustTier::Trusted));
+        assert_ne!(forged, trusted);
+        // Same shape the other way: a trusted run on a literal `trusted::x`
+        // group also stays distinct.
+        let trusted_literal =
+            concurrency_key_for_tier("owner/repo", "trusted::x", Some(TrustTier::Trusted));
+        let tierless = concurrency_key_for_tier("owner/repo", "x", None);
+        assert_ne!(trusted_literal, tierless);
+    }
+
+    #[test]
+    fn tier_key_rekeying_is_idempotent() {
+        // Restoring persisted keys must not stack namespaces.
+        let once = concurrency_key_for_tier("owner/repo", "g", Some(TrustTier::Trusted));
+        let twice = concurrency_key_for_tier(&once.0, &once.1, Some(TrustTier::Trusted));
+        assert_eq!(once, twice);
+        // Re-tiering an old tierless persisted key.
+        let legacy = concurrency_key("owner/repo", "g");
+        assert_eq!(
+            concurrency_key_for_tier(&legacy.0, &legacy.1, Some(TrustTier::Trusted)),
+            once
+        );
+        // Tierless path preserves pre-PR keys exactly.
+        assert_eq!(concurrency_key_for_tier("owner/repo", "g", None), legacy);
     }
 
     // ---- property tests ----

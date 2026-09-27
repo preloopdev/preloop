@@ -82,6 +82,22 @@ impl TrustTier {
             TrustTier::UntrustedForkPullRequest | TrustTier::Untrusted
         )
     }
+
+    /// Stable namespace used when concurrency isolation includes provenance.
+    pub fn concurrency_namespace(&self) -> &'static str {
+        match self {
+            TrustTier::Trusted => "trusted",
+            TrustTier::Internal => "internal",
+            TrustTier::InternalPullRequest => "internal-pull-request",
+            TrustTier::UntrustedForkPullRequest => "untrusted-fork-pull-request",
+            TrustTier::PullRequestTarget => "pull-request-target",
+            TrustTier::AdminManual => "admin-manual",
+            TrustTier::AppDispatch => "app-dispatch",
+            TrustTier::Deployment => "deployment",
+            TrustTier::Schedule => "schedule",
+            TrustTier::Untrusted => "untrusted",
+        }
+    }
 }
 
 /// The single effective job-authorization policy for a trust tier.

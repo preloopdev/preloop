@@ -190,7 +190,8 @@ pub fn try_acquire_job_gate(
         return JobGateOutcome::Failed(ExecutionStatus::Failure);
     }
 
-    let key = concurrency::concurrency_key(&submission.repository, &group);
+    let tier = crate::events::trust_tier::tier_of(submission);
+    let key = concurrency::concurrency_key_for_tier(&submission.repository, &group, tier);
     let holder = concurrency::Holder::Job {
         run_id: queued_job.run_id,
         job_id: queued_job.job_id.clone(),
@@ -2484,10 +2485,15 @@ fn caller_jobset_gates(
         };
         match concurrency::evaluate_concurrency(raw, &eval_ctx) {
             Ok((group, cancel_in_progress, queue)) if !group.trim().is_empty() => {
+                let tier = crate::events::trust_tier::tier_of(submission);
                 merge_jobset_gate(
                     &mut gates,
                     JobSetGate {
-                        key: concurrency::concurrency_key(&submission.repository, &group),
+                        key: concurrency::concurrency_key_for_tier(
+                            &submission.repository,
+                            &group,
+                            tier,
+                        ),
                         display_name: group,
                         cancel_in_progress,
                         queue,
