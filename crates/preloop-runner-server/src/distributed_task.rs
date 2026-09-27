@@ -369,7 +369,7 @@ async fn agent_request_owned_by(
     request_id: i64,
     runner_id: i64,
 ) -> Result<Option<bool>, crate::control::ControlError> {
-    let Some((owner, session_runner)) = backend.request_owner(request_id).await? else {
+    let Some((owner, session_runner, _)) = backend.request_owner(request_id).await? else {
         return Ok(None);
     };
     match owner.or(session_runner) {

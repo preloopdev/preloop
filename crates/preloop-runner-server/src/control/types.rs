@@ -78,6 +78,33 @@ impl QueueKind {
     }
 }
 
+/// `jobs.status` / `job_requests.result` wire form (the `ExecutionStatus`
+/// stored copy).
+pub(crate) fn status_str(s: ExecutionStatus) -> &'static str {
+    match s {
+        ExecutionStatus::Queued => "queued",
+        ExecutionStatus::Pending => "pending",
+        ExecutionStatus::InProgress => "in_progress",
+        ExecutionStatus::Success => "success",
+        ExecutionStatus::Failure => "failure",
+        ExecutionStatus::Skipped => "skipped",
+        ExecutionStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Inverse of [`status_str`]; unknown strings map to `Queued`.
+pub(crate) fn status_parse(s: &str) -> ExecutionStatus {
+    match s {
+        "pending" => ExecutionStatus::Pending,
+        "in_progress" => ExecutionStatus::InProgress,
+        "success" => ExecutionStatus::Success,
+        "failure" => ExecutionStatus::Failure,
+        "skipped" => ExecutionStatus::Skipped,
+        "cancelled" => ExecutionStatus::Cancelled,
+        _ => ExecutionStatus::Queued,
+    }
+}
+
 /// Everything the submit path pre-built outside the transaction: the run
 /// record plus one queue entry per non-skipped job and the correlation
 /// records minted for dispatchable jobs.

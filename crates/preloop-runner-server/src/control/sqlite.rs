@@ -895,29 +895,6 @@ fn system_to_us(t: std::time::SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-fn status_str(s: ExecutionStatus) -> &'static str {
-    match s {
-        ExecutionStatus::Queued => "queued",
-        ExecutionStatus::Pending => "pending",
-        ExecutionStatus::InProgress => "in_progress",
-        ExecutionStatus::Success => "success",
-        ExecutionStatus::Failure => "failure",
-        ExecutionStatus::Skipped => "skipped",
-        ExecutionStatus::Cancelled => "cancelled",
-    }
-}
-
-fn status_parse(s: &str) -> ExecutionStatus {
-    match s {
-        "pending" => ExecutionStatus::Pending,
-        "in_progress" => ExecutionStatus::InProgress,
-        "success" => ExecutionStatus::Success,
-        "failure" => ExecutionStatus::Failure,
-        "skipped" => ExecutionStatus::Skipped,
-        "cancelled" => ExecutionStatus::Cancelled,
-        _ => ExecutionStatus::Queued,
-    }
-}
 fn parse_run_id(s: &str) -> RunId {
     RunId(s.parse().unwrap_or_default())
 }
@@ -4862,14 +4839,347 @@ impl ControlBackend for SqliteBackend {
     async fn request_owner(
         &self,
         request_id: i64,
-    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError> {
+    ) -> Result<Option<(Option<i64>, Option<i64>, bool)>, ControlError> {
         self.with_reader(move |conn| {
             conn.query_row(
-                "SELECT jr.owner_runner_id, sess.runner_id FROM job_requests jr \
+                "SELECT jr.owner_runner_id, sess.runner_id, sess.session_id IS NOT NULL \
+                 FROM job_requests jr \
                  LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
                  WHERE jr.request_id = ?1",
                 params![request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn renew_broker_request(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<(), ControlError> {
+        let agent = agent_job_id.to_string();
+        let locked_until = locked_until.to_owned();
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let row = tx
+                .query_row(
+                    "SELECT jr.request_id, jr.owner_runner_id, jr.result IS NOT NULL, \
+                     sess.runner_id, sess.session_id IS NOT NULL \
+                     FROM job_requests jr \
+                     LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
+                     WHERE jr.agent_job_id = ?1 \
+                     ORDER BY jr.request_id DESC LIMIT 1",
+                    params![agent],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, bool>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some((request_id, owner, settled, session_runner, has_session)) = row else {
+                return Err(ControlError::NotFound(
+                    "broker renew request not found".to_owned(),
+                ));
+            };
+            // Same ladder as ensure_broker_request_owner: recorded owner
+            // first, then the owning session's runner, then replay-compat
+            // "assigned but unowned".
+            let effective = owner.or(session_runner);
+            match effective {
+                Some(owner) if owner != runner_id => {
+                    return Err(ControlError::Forbidden(
+                        "broker request belongs to another runner".to_owned(),
+                    ));
+                }
+                None if !has_session => {
+                    return Err(ControlError::NotFound(
+                        "broker request is not assigned to a session".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            if settled {
+                return Err(ControlError::Conflict(
+                    "broker request already completed".to_owned(),
+                ));
+            }
+            let renewed = tx
+                .execute(
+                    "UPDATE job_requests SET locked_until = ?1, last_renewed_at_us = ?2 \
+                     WHERE request_id = ?3 AND result IS NULL",
+                    params![
+                        locked_until,
+                        system_to_us(std::time::SystemTime::now()),
+                        request_id
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            if renewed == 0 {
+                // Lost a settle race between the SELECT and the UPDATE.
+                return Err(ControlError::Conflict(
+                    "broker request already completed".to_owned(),
+                ));
+            }
+            tx.commit().map_err(ControlError::backend)
+        })
+    }
+
+    async fn create_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+        encryption: &SessionEncryption,
+    ) -> Result<(), ControlError> {
+        let session_id = session_id.to_owned();
+        let sealed = self
+            .cipher
+            .seal(&encryption.key)
+            .map_err(ControlError::backend)?;
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            // Liveness check and insert must share a transaction: the sweep
+            // may purge the runner between the two statements.
+            let live = tx
+                .query_row(
+                    "SELECT 1 FROM runners WHERE runner_id = ?1",
+                    params![runner_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(ControlError::backend)?
+                .is_some();
+            if !live {
+                return Err(ControlError::Forbidden(
+                    "runner registration is no longer active".to_owned(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
+                 encryption_blob, created_at_us) VALUES (?1, ?2, 'broker', ?3, ?4) \
+                 ON CONFLICT(session_id) DO UPDATE SET runner_id = excluded.runner_id, \
+                 encryption_blob = excluded.encryption_blob",
+                params![
+                    session_id,
+                    runner_id,
+                    sealed,
+                    system_to_us(std::time::SystemTime::now())
+                ],
+            )
+            .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)
+        })
+    }
+
+    async fn delete_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+    ) -> Result<bool, ControlError> {
+        let session_id = session_id.to_owned();
+        run_blocking(move || {
+            let conn = self.conn.lock();
+            let owner = conn
+                .query_row(
+                    "SELECT runner_id FROM runner_sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            match owner {
+                Some(Some(owner)) if owner != runner_id => Err(ControlError::Forbidden(
+                    "broker session belongs to another runner".to_owned(),
+                )),
+                Some(_) => {
+                    // Session row carries the binding, the sealed key and the
+                    // active request: one DELETE retires all of it (messages
+                    // cascade).
+                    conn.execute(
+                        "DELETE FROM runner_sessions WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(ControlError::backend)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
+    async fn orphaned_claims(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.request_id, r.run_id, r.job_id FROM job_requests r \
+                     WHERE r.result IS NULL \
+                     AND (r.owner_runner_id IS NOT NULL OR EXISTS ( \
+                         SELECT 1 FROM runner_sessions s2 WHERE s2.active_request_id = r.request_id)) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM runner_sessions s JOIN runners rn ON rn.runner_id = s.runner_id \
+                         WHERE s.active_request_id = r.request_id)",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        parse_run_id(&row.get::<_, String>(1)?),
+                        JobId(row.get::<_, String>(2)?),
+                    ))
+                })
+                .map_err(ControlError::backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(ControlError::backend)
+        })
+    }
+
+    async fn release_claimed_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        let locked_until = locked_until.to_owned();
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let released = tx
+                .execute(
+                    "UPDATE job_requests SET owner_runner_id = NULL, started_at_us = NULL, \
+                     last_renewed_at_us = NULL, timeout_triggered = 0, locked_until = ?1 \
+                     WHERE request_id = ?2 AND result IS NULL",
+                    params![locked_until, request_id],
+                )
+                .map_err(ControlError::backend)?;
+            if released == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE runner_sessions SET active_request_id = NULL \
+                 WHERE active_request_id = ?1",
+                params![request_id],
+            )
+            .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)?;
+            Ok(true)
+        })
+    }
+
+    async fn settle_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
+        let status = status_str(result).to_owned();
+        let locked_until = locked_until.to_owned();
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let row = tx
+                .query_row(
+                    "SELECT run_id, job_id, agent_job_id FROM job_requests WHERE request_id = ?1",
+                    params![request_id],
+                    |row| {
+                        Ok((
+                            parse_run_id(&row.get::<_, String>(0)?),
+                            JobId(row.get::<_, String>(1)?),
+                            parse_uuid(&row.get::<_, String>(2)?),
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some(tuple) = row else {
+                return Ok(None);
+            };
+            tx.execute(
+                "DELETE FROM github_token_requests WHERE request_id = ?1",
+                params![request_id],
+            )
+            .map_err(ControlError::backend)?;
+            // The owner session's queued JobCancellation is moot once the
+            // request settles — drop it so the next (busy) poll cannot
+            // redeliver a cancellation for finished work.
+            let sessions: Vec<String> = {
+                let mut stmt = tx
+                    .prepare("SELECT session_id FROM runner_sessions WHERE active_request_id = ?1")
+                    .map_err(ControlError::backend)?;
+                let rows = stmt
+                    .query_map(params![request_id], |row| row.get::<_, String>(0))
+                    .map_err(ControlError::backend)?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(ControlError::backend)?
+            };
+            for session_id in sessions {
+                let stale: Vec<i64> = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT message_id, message_blob FROM broker_messages \
+                             WHERE session_id = ?1",
+                        )
+                        .map_err(ControlError::backend)?;
+                    let rows = stmt
+                        .query_map(params![session_id], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                        })
+                        .map_err(ControlError::backend)?;
+                    rows.filter_map(|row| {
+                        let (message_id, sealed) = row.ok()?;
+                        let msg: preloop_gha_protocol::azdo::TaskAgentMessage =
+                            blob(&self.cipher, &sealed).ok()?;
+                        (msg.message_type
+                            == preloop_gha_protocol::azdo::message_type::JOB_CANCELLED)
+                            .then_some(message_id)
+                    })
+                    .collect()
+                };
+                for message_id in stale {
+                    tx.execute(
+                        "DELETE FROM broker_messages WHERE session_id = ?1 AND message_id = ?2",
+                        params![session_id, message_id],
+                    )
+                    .map_err(ControlError::backend)?;
+                }
+            }
+            tx.execute(
+                "UPDATE runner_sessions SET active_request_id = NULL \
+                 WHERE active_request_id = ?1",
+                params![request_id],
+            )
+            .map_err(ControlError::backend)?;
+            tx.execute(
+                "UPDATE job_requests SET result = ?1, locked_until = ?2 \
+                 WHERE request_id = ?3 AND result IS NULL",
+                params![status, locked_until, request_id],
+            )
+            .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)?;
+            Ok(Some(tuple))
+        })
+    }
+
+    async fn job_queue_state(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<(String, String)>, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT queue_kind, status FROM jobs WHERE run_id = ?1 AND job_id = ?2",
+                params![run, job],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(ControlError::backend)

@@ -1133,30 +1133,6 @@ fn system_to_us(t: std::time::SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
-fn status_str(s: ExecutionStatus) -> &'static str {
-    match s {
-        ExecutionStatus::Queued => "queued",
-        ExecutionStatus::Pending => "pending",
-        ExecutionStatus::InProgress => "in_progress",
-        ExecutionStatus::Success => "success",
-        ExecutionStatus::Failure => "failure",
-        ExecutionStatus::Skipped => "skipped",
-        ExecutionStatus::Cancelled => "cancelled",
-    }
-}
-
-fn status_parse(s: &str) -> ExecutionStatus {
-    match s {
-        "pending" => ExecutionStatus::Pending,
-        "in_progress" => ExecutionStatus::InProgress,
-        "success" => ExecutionStatus::Success,
-        "failure" => ExecutionStatus::Failure,
-        "skipped" => ExecutionStatus::Skipped,
-        "cancelled" => ExecutionStatus::Cancelled,
-        _ => ExecutionStatus::Queued,
-    }
-}
-
 /// Deserialize a sealed `*_blob` column. Every blob the control backend
 /// writes is AEAD-sealed; unsealed input is rejected outright — pre-seal
 /// databases are not supported and must be recreated.
@@ -5420,18 +5396,369 @@ impl ControlBackend for PostgresBackend {
     async fn request_owner(
         &self,
         request_id: i64,
-    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError> {
+    ) -> Result<Option<(Option<i64>, Option<i64>, bool)>, ControlError> {
         let client = self.checkout_reader().await?;
         let result = client
             .query_opt(
-                "SELECT jr.owner_runner_id, sess.runner_id FROM job_requests jr \
+                "SELECT jr.owner_runner_id, sess.runner_id, sess.session_id IS NOT NULL \
+                 FROM job_requests jr \
                  LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
                  WHERE jr.request_id = $1",
                 &[&request_id],
             )
             .await
             .map_err(ControlError::backend)
-            .map(|row| row.map(|row| (row.get(0), row.get(1))));
+            .map(|row| row.map(|row| (row.get(0), row.get(1), row.get(2))));
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn renew_broker_request(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<(), ControlError> {
+        let agent = agent_job_id.to_string();
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let row = tx
+                .query_opt(
+                    "SELECT jr.request_id, jr.run_id, jr.owner_runner_id, \
+                     jr.result IS NOT NULL, sess.runner_id, sess.session_id IS NOT NULL \
+                     FROM job_requests jr \
+                     LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
+                     WHERE jr.agent_job_id = $1 \
+                     ORDER BY jr.request_id DESC LIMIT 1",
+                    &[&agent],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let Some(row) = row else {
+                return Err(ControlError::NotFound(
+                    "broker renew request not found".to_owned(),
+                ));
+            };
+            let request_id: i64 = row.get(0);
+            let run_id = parse_run_id(&row.get::<_, String>(1));
+            let owner: Option<i64> = row.get(2);
+            let settled: bool = row.get(3);
+            let session_runner: Option<i64> = row.get(4);
+            let has_session: bool = row.get(5);
+            // Same ladder as ensure_broker_request_owner: recorded owner
+            // first, then the owning session's runner, then replay-compat
+            // "assigned but unowned".
+            match owner.or(session_runner) {
+                Some(owner) if owner != runner_id => {
+                    return Err(ControlError::Forbidden(
+                        "broker request belongs to another runner".to_owned(),
+                    ));
+                }
+                None if !has_session => {
+                    return Err(ControlError::NotFound(
+                        "broker request is not assigned to a session".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            if settled {
+                return Err(ControlError::Conflict(
+                    "broker request already completed".to_owned(),
+                ));
+            }
+            // The run lock serializes against a scoped write-back carrying a
+            // stale copy of this request row.
+            lock_runs(&tx, std::iter::once(&run_id)).await?;
+            let renewed = tx
+                .execute(
+                    "UPDATE job_requests SET locked_until = $1, last_renewed_at_us = $2 \
+                     WHERE request_id = $3 AND result IS NULL",
+                    &[
+                        &locked_until,
+                        &system_to_us(std::time::SystemTime::now()),
+                        &request_id,
+                    ],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            if renewed == 0 {
+                return Err(ControlError::Conflict(
+                    "broker request already completed".to_owned(),
+                ));
+            }
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn create_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+        encryption: &SessionEncryption,
+    ) -> Result<(), ControlError> {
+        let sealed = self
+            .cipher
+            .seal(&encryption.key)
+            .map_err(ControlError::backend)?;
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            // Liveness check and insert must share a transaction: the sweep
+            // may purge the runner between the two statements.
+            let live = tx
+                .query_opt("SELECT 1 FROM runners WHERE runner_id = $1", &[&runner_id])
+                .await
+                .map_err(ControlError::backend)?
+                .is_some();
+            if !live {
+                return Err(ControlError::Forbidden(
+                    "runner registration is no longer active".to_owned(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
+                 encryption_blob, created_at_us) VALUES ($1, $2, 'broker', $3, $4) \
+                 ON CONFLICT(session_id) DO UPDATE SET runner_id = excluded.runner_id, \
+                 encryption_blob = excluded.encryption_blob",
+                &[
+                    &session_id,
+                    &runner_id,
+                    &sealed,
+                    &system_to_us(std::time::SystemTime::now()),
+                ],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn delete_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+    ) -> Result<bool, ControlError> {
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let owner = tx
+                .query_opt(
+                    "SELECT runner_id FROM runner_sessions WHERE session_id = $1",
+                    &[&session_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let outcome = match owner {
+                Some(row) => {
+                    let owner: Option<i64> = row.get(0);
+                    if owner.is_some_and(|owner| owner != runner_id) {
+                        return Err(ControlError::Forbidden(
+                            "broker session belongs to another runner".to_owned(),
+                        ));
+                    }
+                    // One DELETE retires the binding, the sealed key and the
+                    // active request; undelivered messages cascade.
+                    tx.execute(
+                        "DELETE FROM runner_sessions WHERE session_id = $1",
+                        &[&session_id],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                    true
+                }
+                None => false,
+            };
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(outcome)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn orphaned_claims(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query(
+                "SELECT r.request_id, r.run_id, r.job_id FROM job_requests r \
+                 WHERE r.result IS NULL \
+                 AND (r.owner_runner_id IS NOT NULL OR EXISTS ( \
+                     SELECT 1 FROM runner_sessions s2 WHERE s2.active_request_id = r.request_id)) \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM runner_sessions s JOIN runners rn ON rn.runner_id = s.runner_id \
+                     WHERE s.active_request_id = r.request_id)",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.get::<_, i64>(0),
+                            parse_run_id(&row.get::<_, String>(1)),
+                            JobId(row.get::<_, String>(2)),
+                        )
+                    })
+                    .collect()
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn release_claimed_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let released = tx
+                .execute(
+                    "UPDATE job_requests SET owner_runner_id = NULL, started_at_us = NULL, \
+                     last_renewed_at_us = NULL, timeout_triggered = 0, locked_until = $1 \
+                     WHERE request_id = $2 AND result IS NULL",
+                    &[&locked_until, &request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            if released == 0 {
+                tx.commit().await.map_err(ControlError::backend)?;
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE runner_sessions SET active_request_id = NULL \
+                 WHERE active_request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(true)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn settle_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
+        let status = status_str(result).to_owned();
+        let locked_until = locked_until.to_owned();
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let row = tx
+                .query_opt(
+                    "SELECT run_id, job_id, agent_job_id FROM job_requests WHERE request_id = $1",
+                    &[&request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let Some(row) = row else {
+                tx.commit().await.map_err(ControlError::backend)?;
+                return Ok(None);
+            };
+            let tuple = (
+                parse_run_id(&row.get::<_, String>(0)),
+                JobId(row.get::<_, String>(1)),
+                parse_uuid(&row.get::<_, String>(2)),
+            );
+            // The run lock serializes against a scoped write-back carrying a
+            // stale copy of this request row.
+            lock_runs(&tx, std::iter::once(&tuple.0)).await?;
+            tx.execute(
+                "DELETE FROM github_token_requests WHERE request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            // The owner session's queued JobCancellation is moot once the
+            // request settles — drop it so the next (busy) poll cannot
+            // redeliver a cancellation for finished work.
+            let sessions = tx
+                .query(
+                    "SELECT session_id FROM runner_sessions WHERE active_request_id = $1",
+                    &[&request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            for session in sessions {
+                let session_id: String = session.get(0);
+                let messages = tx
+                    .query(
+                        "SELECT message_id, message_blob FROM broker_messages \
+                         WHERE session_id = $1",
+                        &[&session_id],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                for message in messages {
+                    let sealed: Vec<u8> = message.get(1);
+                    let msg: preloop_gha_protocol::azdo::TaskAgentMessage =
+                        match blob(&self.cipher, &sealed) {
+                            Ok(msg) => msg,
+                            Err(_) => continue,
+                        };
+                    if msg.message_type == preloop_gha_protocol::azdo::message_type::JOB_CANCELLED {
+                        tx.execute(
+                            "DELETE FROM broker_messages WHERE session_id = $1 AND message_id = $2",
+                            &[&session_id, &message.get::<_, i64>(0)],
+                        )
+                        .await
+                        .map_err(ControlError::backend)?;
+                    }
+                }
+            }
+            tx.execute(
+                "UPDATE runner_sessions SET active_request_id = NULL \
+                 WHERE active_request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.execute(
+                "UPDATE job_requests SET result = $1, locked_until = $2 \
+                 WHERE request_id = $3 AND result IS NULL",
+                &[&status, &locked_until, &request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(Some(tuple))
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn job_queue_state(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<(String, String)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let run = run_id.0.to_string();
+        let result = client
+            .query_opt(
+                "SELECT queue_kind, status FROM jobs WHERE run_id = $1 AND job_id = $2",
+                &[&run, &job_id.0],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|row| row.map(|row| (row.get::<_, String>(0), row.get::<_, String>(1))));
         self.return_reader(client).await;
         result
     }

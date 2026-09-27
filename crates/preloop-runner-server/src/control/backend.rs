@@ -449,12 +449,82 @@ pub(crate) trait ControlBackend: Send + Sync {
         locked_until: &str,
     ) -> Result<bool, ControlError>;
 
-    /// `(recorded owner, owner-session runner)` for `request_id`; `None`
-    /// when no such request. Drives the AgentRequest ownership check.
+    /// `(recorded owner, owner-session runner, session-bound)` for
+    /// `request_id`; `None` when no such request. `session-bound` is true
+    /// when a session still claims the request — it distinguishes "assigned
+    /// but unowned" (replay-compat accept) from "never assigned"
+    /// (`NotFound`). Drives the AgentRequest ownership check.
     async fn request_owner(
         &self,
         request_id: i64,
-    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError>;
+    ) -> Result<Option<(Option<i64>, Option<i64>, bool)>, ControlError>;
+
+    /// Broker-path renew: resolve `agent_job_id`, apply the
+    /// recorded-owner → session-owner → session-bound ownership ladder and
+    /// renew the lease in one transaction. Errors: `NotFound` (unknown or
+    /// never-assigned request), `Forbidden` (foreign owner), `Conflict`
+    /// (already completed).
+    async fn renew_broker_request(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<(), ControlError>;
+
+    /// Create a broker (`runner_sessions`) row owned by `runner_id`.
+    /// `Forbidden` when the runner registration no longer exists — the
+    /// liveness check and the insert run in one transaction.
+    async fn create_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+        encryption: &preloop_gha_protocol::crypto::SessionEncryption,
+    ) -> Result<(), ControlError>;
+
+    /// Delete a broker session owned by `runner_id`; `Forbidden` when the
+    /// session belongs to another runner, `Ok(false)` when it does not
+    /// exist (the broker delete contract answers 204 either way).
+    async fn delete_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+    ) -> Result<bool, ControlError>;
+
+    /// Unfinished requests whose claiming session no longer exists — either
+    /// owned by a (possibly dead) runner or still bound to a dead session.
+    /// Boot reconcile input: `(request_id, run_id, job_id)`.
+    async fn orphaned_claims(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError>;
+
+    /// Release a claimed request for redelivery (`release_request_for_retry`
+    /// in SQL): clears the session binding, owner, start/renew stamps and
+    /// timeout flag, and extends the lease. `Ok(false)` when the request is
+    /// already settled or unknown.
+    async fn release_claimed_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError>;
+
+    /// Settle a claimed request once (first result wins) with full
+    /// `settle_request` bookkeeping in SQL: drops the deferred token
+    /// request, clears the session binding and the owner session's queued
+    /// job-cancellation messages, then stamps `result`/`locked_until`.
+    /// Returns the attempt's `(run_id, job_id, agent_job_id)` when the
+    /// request exists.
+    async fn settle_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError>;
+
+    /// `jobs` row (`queue_kind`, `status`) for one logical job; `None` when
+    /// absent. Boot reconcile classifies orphaned claims with it.
+    async fn job_queue_state(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<(String, String)>, ControlError>;
 
     /// Renew an in-flight AgentRequest's lease (`locked_until` +
     /// `last_renewed_at`) when `result IS NULL`. Returns whether a row was
@@ -1322,10 +1392,91 @@ impl ControlBackend for Backend {
     async fn request_owner(
         &self,
         request_id: i64,
-    ) -> Result<Option<(Option<i64>, Option<i64>)>, ControlError> {
+    ) -> Result<Option<(Option<i64>, Option<i64>, bool)>, ControlError> {
         match self {
             Self::Sqlite(b) => b.request_owner(request_id).await,
             Self::Postgres(b) => b.request_owner(request_id).await,
+        }
+    }
+    async fn renew_broker_request(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.renew_broker_request(agent_job_id, runner_id, locked_until)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.renew_broker_request(agent_job_id, runner_id, locked_until)
+                    .await
+            }
+        }
+    }
+    async fn create_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+        encryption: &preloop_gha_protocol::crypto::SessionEncryption,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.create_broker_session(session_id, runner_id, encryption)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.create_broker_session(session_id, runner_id, encryption)
+                    .await
+            }
+        }
+    }
+    async fn settle_request(
+        &self,
+        request_id: i64,
+        result: ExecutionStatus,
+        locked_until: &str,
+    ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.settle_request(request_id, result, locked_until).await,
+            Self::Postgres(b) => b.settle_request(request_id, result, locked_until).await,
+        }
+    }
+    async fn job_queue_state(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<(String, String)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_queue_state(run_id, job_id).await,
+            Self::Postgres(b) => b.job_queue_state(run_id, job_id).await,
+        }
+    }
+    async fn delete_broker_session(
+        &self,
+        session_id: &str,
+        runner_id: i64,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.delete_broker_session(session_id, runner_id).await,
+            Self::Postgres(b) => b.delete_broker_session(session_id, runner_id).await,
+        }
+    }
+    async fn orphaned_claims(&self) -> Result<Vec<(i64, RunId, JobId)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.orphaned_claims().await,
+            Self::Postgres(b) => b.orphaned_claims().await,
+        }
+    }
+    async fn release_claimed_request(
+        &self,
+        request_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.release_claimed_request(request_id, locked_until).await,
+            Self::Postgres(b) => b.release_claimed_request(request_id, locked_until).await,
         }
     }
     async fn renew_agent_request(
