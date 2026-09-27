@@ -1707,6 +1707,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             crate::retention::sweep_once(&shared).await;
         });
     }
+    let queue = state.backend.queue_stats().await.unwrap_or_default();
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -1714,11 +1715,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         // nothing will refresh it from a broker poll. Re-arm it with the
         // ready-queue size recovered from the store, or every job queued
         // before the restart sits forever with the pool asleep.
-        let queue_len = state
-            .backend
-            .read(|tx| Ok(tx.ready_count.max(0) as usize))
-            .await
-            .unwrap_or_default();
+        let queue_len = queue.ready;
         state
             .queue_depth
             .store(queue_len, std::sync::atomic::Ordering::Release);
@@ -1733,11 +1730,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         }
     }
     {
-        let labels = state
-            .backend
-            .read(|tx| Ok(crate::control::sched::next_job_labels(tx)))
-            .await
-            .unwrap_or_default();
+        let labels = queue.next_runs_on;
         if let Ok(mut guard) = state.next_job_runs_on.write() {
             *guard = labels;
         }

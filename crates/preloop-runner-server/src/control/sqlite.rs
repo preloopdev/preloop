@@ -4731,21 +4731,48 @@ impl ControlBackend for SqliteBackend {
     }
 
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
-        // NOTE: this endpoint must stay on `TxScope::full()` (via `read`).
-        // `ready` reads the global `ready_count` counter, but `pending`,
-        // `blocked`, `held`, `claimed` and `expanding` are loaded-subset
-        // lengths — under a narrower scope they would undercount while
-        // `ready` stayed global, giving an inconsistently half-global stat.
-        self.read(|tx| {
-            Ok(QueueStats {
-                ready: tx.ready_count.max(0) as usize,
-                pending: tx.pending_jobs.len(),
-                blocked: tx.concurrency_blocked.len(),
-                held: tx.held_runs.values().map(|v| v.len()).sum(),
-                claimed: tx.claimed_jobs.len(),
-                expanding: tx.pending_expansions.len(),
-                next_runs_on: sched::next_job_labels(tx),
-            })
+        self.with_reader(|conn| {
+            let mut stats = QueueStats::default();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT queue_kind, COUNT(*) FROM jobs
+                     WHERE queue_kind NOT IN ('none', 'expand')
+                     GROUP BY queue_kind
+                     UNION ALL
+                     SELECT 'expand', COUNT(*) FROM jobs
+                     WHERE queue_kind = 'expand' AND expand_generation = 0",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                let (kind, count) = row.map_err(ControlError::backend)?;
+                let count = count.max(0) as usize;
+                match kind.as_str() {
+                    "ready" => stats.ready = count,
+                    "pending" => stats.pending = count,
+                    "blocked" => stats.blocked = count,
+                    "held" => stats.held = count,
+                    "claimed" => stats.claimed = count,
+                    "expand" => stats.expanding = count,
+                    _ => {}
+                }
+            }
+            stats.next_runs_on = conn
+                .query_row(
+                    "SELECT runs_on FROM jobs WHERE queue_kind = 'ready'
+                     ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?
+                .and_then(|runs_on| serde_json::from_str(&runs_on).ok())
+                .unwrap_or_default();
+            Ok(stats)
         })
     }
 

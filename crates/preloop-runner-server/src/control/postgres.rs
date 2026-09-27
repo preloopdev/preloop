@@ -321,13 +321,17 @@ impl PostgresBackend {
         let mut client = self.checkout_writer().await?;
         let result = async {
             let txn = client.transaction().await.map_err(ControlError::backend)?;
-            // Session state, row-locked so a concurrent poll of the same
-            // session serializes here.
+            // The candidate's shared run lock and job row lock come before
+            // any session/request row lock: run-scoped writers use this order.
+            let candidates = lock_poll_candidates(&txn, &poll.runner, 1).await?;
+            let locked = started.elapsed();
+            // A concurrent completion can own the session. Never wait on it
+            // while holding a run/job lock; roll back and re-evaluate.
             let Some(session) = txn
                 .query_opt(
                     "SELECT runner_id, active_request_id, \
                      EXISTS(SELECT 1 FROM broker_messages m WHERE m.session_id = s.session_id) \
-                     FROM runner_sessions s WHERE session_id = $1 FOR UPDATE",
+                     FROM runner_sessions s WHERE session_id = $1 FOR UPDATE SKIP LOCKED",
                     &[&poll.session_id],
                 )
                 .await
@@ -359,8 +363,6 @@ impl PostgresBackend {
             )
             .await
             .map_err(ControlError::backend)?;
-            let candidates = lock_poll_candidates(&txn, &poll.runner, 1).await?;
-            let locked = started.elapsed();
             let Some((run_s, job_s)) = candidates.into_iter().next() else {
                 txn.commit().await.map_err(ControlError::backend)?;
                 return Ok(Some(PollOutcome::Empty));
@@ -383,7 +385,7 @@ impl PostgresBackend {
                     "SELECT request_id, agent_job_id, plan_id, plan_type, timeline_id, \
                      timeout_triggered, debug_token_issued FROM job_requests \
                      WHERE run_id = $1 AND job_id = $2 AND result IS NULL \
-                     ORDER BY request_id LIMIT 1 FOR UPDATE",
+                     ORDER BY request_id LIMIT 1 FOR UPDATE SKIP LOCKED",
                     &[&run_s, &job_s],
                 )
                 .await
@@ -5277,21 +5279,49 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
-        // NOTE: must stay on `TxScope::full()` (via `read`) — `ready` is the
-        // global `ready_count` counter while the other five counts are
-        // loaded-subset lengths; a narrower scope would mix the two.
-        self.read(|tx| {
-            Ok(QueueStats {
-                ready: tx.ready_count.max(0) as usize,
-                pending: tx.pending_jobs.len(),
-                blocked: tx.concurrency_blocked.len(),
-                held: tx.held_runs.values().map(|v| v.len()).sum(),
-                claimed: tx.claimed_jobs.len(),
-                expanding: tx.pending_expansions.len(),
-                next_runs_on: sched::next_job_labels(tx),
-            })
-        })
-        .await
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let mut stats = QueueStats::default();
+            for row in client
+                .query(
+                    "SELECT queue_kind, COUNT(*) FROM jobs
+                     WHERE queue_kind NOT IN ('none', 'expand')
+                     GROUP BY queue_kind
+                     UNION ALL
+                     SELECT 'expand', COUNT(*) FROM jobs
+                     WHERE queue_kind = 'expand' AND expand_generation = 0",
+                    &[],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            {
+                let count: i64 = row.get(1);
+                let count = count.max(0) as usize;
+                match row.get::<_, String>(0).as_str() {
+                    "ready" => stats.ready = count,
+                    "pending" => stats.pending = count,
+                    "blocked" => stats.blocked = count,
+                    "held" => stats.held = count,
+                    "claimed" => stats.claimed = count,
+                    "expand" => stats.expanding = count,
+                    _ => {}
+                }
+            }
+            stats.next_runs_on = client
+                .query_opt(
+                    "SELECT runs_on FROM jobs WHERE queue_kind = 'ready'
+                     ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id LIMIT 1",
+                    &[],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .and_then(|row| serde_json::from_str(&row.get::<_, String>(0)).ok())
+                .unwrap_or_default();
+            Ok(stats)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
     }
 
     async fn live_assignments(

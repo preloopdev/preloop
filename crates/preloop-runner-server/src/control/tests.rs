@@ -385,6 +385,9 @@ pub(crate) mod suite {
         assert_eq!(outcome.run_id, run_id);
         assert_eq!(outcome.queued_jobs, 1);
         assert!(outcome.existing.is_none());
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!((stats.ready, stats.claimed), (1, 0));
+        assert_eq!(stats.next_runs_on, vec!["self-hosted"]);
 
         let poll = backend
             .poll_session(poll(&session.session_id, runner.runner.id))
@@ -395,6 +398,9 @@ pub(crate) mod suite {
         };
         assert_eq!(claimed.queued.job_id, JobId("build".to_owned()));
         assert_eq!(claimed.request.request_id, 1);
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!((stats.ready, stats.claimed), (0, 1));
+        assert!(stats.next_runs_on.is_empty());
 
         let ctx = backend.acquire_context(1).await.unwrap();
         assert_eq!(ctx.request.request_id, 1);
@@ -414,6 +420,8 @@ pub(crate) mod suite {
         assert_eq!(done.effective_status, ExecutionStatus::Success);
         assert!(done.newly_terminal_success);
         assert_eq!(done.record.status, ExecutionStatus::Success);
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!((stats.ready, stats.claimed), (0, 0));
     }
 
     pub(crate) async fn webhook_replay_is_idempotent(backend: &dyn ControlBackend) {
