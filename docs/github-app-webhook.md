@@ -89,14 +89,14 @@ The system is configured using the following environment variables:
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
 | `PRELOOP_WEBHOOK_SECRET`            | Secret key configured on the GitHub App to verify payload signatures.                                                                        | `my-secure-webhook-secret`                 |
 | `PRELOOP_LOCAL_WORKSPACE`           | Path to a local Git worktree used for offline workflow loading and immutable local-source checkouts.                                         | `/path/to/my-repo`                         |
-| `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available. When no App is configured the PAT is also embedded as every non-fork job's `GITHUB_TOKEN`; submission then introspects the PAT's classic OAuth scopes and refuses runs whose declared `permissions:` are narrower than the PAT. Prefer a GitHub App so tokens are minted least-privilege. | `ghp_...`                                  |
+| `PRELOOP_GITHUB_TOKEN`              | Fallback GitHub Personal Access Token for workflow retrieval and Check Run updates when no configured GitHub App is available. When no App is configured the PAT is also embedded as every non-fork job's `GITHUB_TOKEN`, but only when its OAuth scopes are introspected and don't exceed declared `permissions:`; otherwise it is withheld (`runs.rs`) or the run is refused. Prefer a GitHub App so tokens are minted least-privilege. | `ghp_...`                                  |
 | `PRELOOP_GITHUB_APPS_JSON`          | JSON array of additional registered Apps overriding `github.apps`; each entry: `app_id`, `pem`, optional `webhook_secret`/`installation_id`. | `[{"app_id":12345,"pem":"-----BEGIN..."}]` |
 | `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` | Comma-separated creation-time event list for the App-manifest flow; defaults to `push,pull_request`.                                         | `push,pull_request`                        |
 
 
 ### Security Best Practices
 
-- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: a static PAT cannot be narrowed per job, so in PAT mode workflow `permissions:` blocks are not enforced — submission refuses runs whose declared permissions are narrower than the PAT's OAuth scopes, and the PAT is embedded verbatim otherwise. A GitHub App mints least-privilege installation tokens per job.
+- **Prefer a GitHub App over `PRELOOP_GITHUB_TOKEN`**: a static PAT cannot be narrowed per job, so it is embedded only when its classic OAuth scopes are introspected and don't exceed declared `permissions:`; a broader PAT refuses the run, and unverifiable bounds withhold the PAT (jobs keep the runtime token). A GitHub App mints least-privilege installation tokens per job.
 - **Git-Ignore Credentials**: Never check `.env`, `*.pem`, or `*.key` files into Git. These files are excluded in the root `.gitignore`.
 - **Production Key Management**: In production, do not write private keys or secrets to plaintext files on the server disk. Instead:
   - Load them directly into memory at runtime using a Secrets Manager (e.g. HashiCorp Vault, AWS Secrets Manager, or Kubernetes Secrets).
@@ -142,8 +142,10 @@ different workflow during delivery.
    checkout inputs to preloop's authenticated smart-HTTP endpoint. Tracked
    modifications, deletions, and untracked non-ignored files are included
    without modifying the user's index or workflow YAML. Explicit
-   repository/ref/token/server checkout inputs retain their original remote
-   behavior.
+   `repository`, `ref`, or `github-server-url` inputs (and non-default
+   `fetch-depth`/`fetch-tags`) retain their original remote behavior; an
+   explicit `token` is overwritten with the job's local JWT, which the
+   snapshot endpoint can verify.
 2. **GitHub API (Remote/Production Mode)**:
  If `PRELOOP_LOCAL_WORKSPACE` is not configured, but
  `PRELOOP_GITHUB_TOKEN` or a configured GitHub App is available, `preloop`
@@ -186,9 +188,9 @@ fully offline execution.
    events are required. For an existing App, tick additional events manually
    under the App's settings → Webhooks → Edit.
  At minimum, tick the trigger events: `push`, `pull_request`,
- `pull_request_target`, `pull_request_review`, `workflow_dispatch`,
- `workflow_run`, `repository_dispatch`, `issue_comment`, `issues`,
- `check_run`, `check_suite`, `create`, `delete`, `release`.
+ `pull_request_review`, `workflow_dispatch`, `workflow_run`,
+ `repository_dispatch`, `issue_comment`, `issues`, `check_run`, `check_suite`,
+ `create`, `delete`, `release`.
 
 ### Step 2: Start `preloop-runner-server`
 
@@ -293,13 +295,17 @@ GitHub App token minting is strictly all-or-nothing:
 
 ### 8.4 Cross-Compiled Runner Bundle &amp; `cargo clean`
 
-The microVM orchestrator requires the cross-compiled Linux ARM64 runner binary at `target/aarch64-unknown-linux-gnu/debug/preloop-runner`:
+The microVM orchestrator requires the cross-compiled Linux runner binary,
+located by searching the install prefix (`lib/preloop/runner/<triple>/`),
+`target/<triple>/{debug,release}`, or `PRELOOP_RUNNER_BUNDLE`:
 
 - Running `cargo clean` removes this binary, causing `preloop serve` to log:
   ```text
-  WARN preloop: local runner provisioning unavailable; jobs queue until a runner is available error=Linux runner bundle unavailable...
+  WARN preloop: no runner pool: jobs will fail after the queue grace window. Install the Linux guest runner with `preloop update`, or set PRELOOP_RUNNER_BUNDLE to a directory containing preloop-runner (see docs/vm-images.md)
   ```
-- **Recovery**: Rebuild the runner bundle with `cargo zigbuild` before starting the server:
+- **Recovery**: `preloop update` is the recommended fix — it installs the
+  Linux guest runner into the install prefix. For development builds, rebuild
+  the runner bundle with `cargo zigbuild` before starting the server:
   ```sh
   cargo zigbuild -p preloop-runner --target aarch64-unknown-linux-gnu
   ```
@@ -327,7 +333,7 @@ If **any** commit in a push batch contains a skip label, the entire push is supp
 
 ### 8.6 Guest Network Isolation, Origin Routing &amp; the Tunnel Hairpin
 
-Runner VMs run under `NetworkPolicy::PublicOnly` — guest egress can reach the public internet but the hypervisor's egress floor deliberately refuses guest→host private addresses (loopback or LAN IP; verified: guest curl domehan the host LAN URL hangs indefinitely). Guests reach the control plane through exactly one sanctioned path:
+Runner VMs run under `NetworkPolicy::PublicOnly` — guest egress can reach the public internet but the hypervisor's egress floor deliberately refuses guest→host private addresses (loopback or LAN IP; verified: guest curl to the host LAN URL hangs indefinitely). Guests reach the control plane through exactly one sanctioned path:
 
 1. **Runner transport** — the runner's own control-plane HTTP (connectionData, long-poll, broker) rides the mounted unix socket `/run/preloop-control/engine.sock` when `PRELOOP_CONTROL_SOCKET`/`PRELOOP_CONTROL_ORIGIN` are set (always set by the orchestrator when a control socket is configured).
 2. **Job-side programs** (`actions/checkout`'s git, `curl`, Node actions) only know URLs. The runner binds the advertised origin *inside the guest on loopback* and splices each accepted connection onto the socket (`preloop-runner/src/control_bridge.rs`). Blast radius: one host endpoint.

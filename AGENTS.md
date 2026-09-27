@@ -13,17 +13,22 @@
 | `preloop-gha-parser`                   | Workflow YAML → typed model → job DAG/matrix expansion                                     |
 | `preloop-gha-expressions`              | `${{ }}` parser/evaluator                                                                  |
 | `preloop-gha-protocol`                 | Wire DTOs, session crypto, secret wrappers, NDJSON events                                  |
-| `preloop-runner`                       | Rust runner: Listener + Worker (faithful to `actions/runner` v2.336.0)                     |
+| `preloop-runner`                       | Rust runner: Listener + Worker (faithful to `actions/runner` v2.335.1 wire protocol; official runner pin 2.336.0 in `versions.toml`) |
 | `preloop-runner-client`                | CLI for submitting workflows                                                               |
 | `preloop-cache` / `preloop-artifacts`     | File-backed protocol storage                                                               |
 | `preloop-dap`                          | Debug Adapter Protocol bridge                                                              |
 | `preloop-conformance` / `runner-watch` | Conformance harnesses and protocol-diff tooling                                            |
+| `preloop-cli`                          | The `preloop` binary (run/serve/debug/push CLI)                                            |
+| `preloop-orchestrator`                 | Golden/env provisioning and the runner pool                                                |
+| `preloop-vm`                           | `VmProvider` backends (SmolVM/libkrun, AgentENV)                                           |
+| `preloop-observability`                | Logging/metrics/OTel export                                                                |
+| `preloop-socket-activation`            | systemd socket activation                                                                  |
 
 
 ## Commands
 
 ```sh
-just test-ci    # fmt-check + clippy + test (the full gate)
+just test-ci    # fmt-check + clippy + zizmor + test + conform replay (the full gate)
 just serve      # cargo run --release -p preloop-runner-server -- serve --listen 127.0.0.1:9090
 just dogfood    # E2E with real runner
 ```
