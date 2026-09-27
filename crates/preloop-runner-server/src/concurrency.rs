@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::events::trust_tier::TrustTier;
+
 /// Official cancel grace period body value (TimeSpan).
 pub const CANCEL_TIMEOUT: &str = "00:05:00";
 
@@ -189,8 +191,30 @@ fn build_eval_context(ctx: &ConcurrencyContext<'_>) -> Context {
 }
 
 /// Lowercased (repo, group) key.
+///
+/// This preserves the original GitHub-compatible key for callers that do not
+/// have provenance information, such as old persisted state and unit tests.
 pub fn concurrency_key(repo: &str, group: &str) -> (String, String) {
     (repo.to_ascii_lowercase(), group.to_ascii_lowercase())
+}
+
+/// Lowercased concurrency key with an optional provenance namespace.
+///
+/// New webhook submissions carry a trust tier. Namespacing those keys prevents
+/// a `pull_request_target` or fork-restricted run from sharing a cancellation
+/// slot with a trusted run that evaluates the same workflow group. The
+/// namespace is part of the internal key only; the user-visible group name
+/// remains unchanged.
+pub fn concurrency_key_for_tier(
+    repo: &str,
+    group: &str,
+    tier: Option<TrustTier>,
+) -> (String, String) {
+    let (repo, group) = concurrency_key(repo, group);
+    let Some(tier) = tier else {
+        return (repo, group);
+    };
+    (repo, format!("{}::{group}", tier.concurrency_namespace()))
 }
 
 /// Parse concurrency fields stored on a queued job plan.
@@ -387,6 +411,30 @@ mod properties {
             ]
             .boxed()
         }
+    }
+
+    #[test]
+    fn trust_tier_namespaces_cancellation_keys() {
+        let trusted =
+            concurrency_key_for_tier("Owner/Repo", "Deploy-Main", Some(TrustTier::Trusted));
+        let target = concurrency_key_for_tier(
+            "owner/repo",
+            "deploy-main",
+            Some(TrustTier::PullRequestTarget),
+        );
+        let fork = concurrency_key_for_tier(
+            "owner/repo",
+            "deploy-main",
+            Some(TrustTier::UntrustedForkPullRequest),
+        );
+
+        assert_ne!(trusted, target);
+        assert_ne!(trusted, fork);
+        assert_ne!(target, fork);
+        assert_eq!(trusted.0, target.0);
+        assert_eq!(trusted.1, "trusted::deploy-main");
+        assert_eq!(target.1, "pull-request-target::deploy-main");
+        assert_eq!(fork.1, "untrusted-fork-pull-request::deploy-main");
     }
 
     // ---- property tests ----

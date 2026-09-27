@@ -1810,10 +1810,13 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             built_jobs.push(queued_job);
         }
 
-        // Workflow-level concurrency gate.
         let mut hold_entire_run = false;
+        // Workflow-level concurrency is isolated by the run's provenance.
+        // The display name remains the workflow's evaluated group; only the
+        // internal admission key gains the trust namespace.
         if let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
-            let key = concurrency::concurrency_key(&submission.repository, group);
+            let tier = crate::events::trust_tier::tier_of(&submission);
+            let key = concurrency::concurrency_key_for_tier(&submission.repository, group, tier);
             match try_acquire_concurrency(
                 &mut inner,
                 key,
