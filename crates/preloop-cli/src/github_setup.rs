@@ -827,16 +827,25 @@ fn collect_permissions(doc: &serde_yaml::Value, out: &mut std::collections::BTre
 /// Expand a scalar `permissions:` value (`read-all`/`write-all`) over the
 /// parser's complete permission-scope list. GitHub applies these to every
 /// scope, so the checklist must too — `permissions: read-all` is not just
-/// `contents: read`.
+/// `contents: read`. Read-only scopes (no write level on GitHub) are capped
+/// at `read`, matching the parser's expansion.
 fn scalar_permission_lines(access: &str) -> Vec<String> {
     let level = match access {
         "read-all" => "read",
         "write-all" => "write",
         _ => return Vec::new(),
     };
+    let read_only = preloop_gha_parser::READ_ONLY_SCOPES;
     preloop_gha_parser::PERMISSION_SCOPES
         .iter()
-        .map(|scope| format!("{scope}: {level}"))
+        .map(|scope| {
+            let granted = if level == "write" && read_only.contains(scope) {
+                "read"
+            } else {
+                level
+            };
+            format!("{scope}: {granted}")
+        })
         .collect()
 }
 
@@ -1436,6 +1445,9 @@ mod tests {
                 checklist.contains(&format!("{scope}: read")),
                 "read-all must expand to {scope}: read, got {checklist:?}"
             );
+            if preloop_gha_parser::READ_ONLY_SCOPES.contains(&scope) {
+                continue;
+            }
             assert!(
                 checklist.contains(&format!("{scope}: write")),
                 "write-all must expand to {scope}: write, got {checklist:?}"

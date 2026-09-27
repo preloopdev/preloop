@@ -366,8 +366,9 @@ fn non_empty_services(services: Option<serde_json::Value>) -> Option<serde_json:
 }
 
 /// Every permission scope a workflow `permissions:` block can name, in workflow
-/// (kebab-case) spelling. `read-all` and `write-all` expand to all of them.
-pub const PERMISSION_SCOPES: [&str; 14] = [
+/// (kebab-case) spelling. `read-all` and `write-all` expand to all of them,
+/// except that read-only scopes ([`READ_ONLY_SCOPES`]) never receive `write`.
+pub const PERMISSION_SCOPES: [&str; 15] = [
     "actions",
     "attestations",
     "checks",
@@ -382,7 +383,16 @@ pub const PERMISSION_SCOPES: [&str; 14] = [
     "repository-projects",
     "security-events",
     "statuses",
+    "vulnerability-alerts",
 ];
+
+/// Permission scopes GitHub defines with no write level (read/none only).
+/// `write-all` still covers them — it grants `read`, never `write`.
+///
+/// `id-token` is likewise read-only on GitHub, but preloop's OIDC grant keys
+/// off a `write` declaration, so it keeps its existing behavior and is not
+/// listed here.
+pub const READ_ONLY_SCOPES: [&str; 1] = ["vulnerability-alerts"];
 
 /// `GITHUB_TOKEN` permissions for a job whose workflow declares no
 /// `permissions:` block at all.
@@ -423,7 +433,9 @@ pub fn effective_token_permissions(
 /// Resolve the effective permissions map from workflow/job YAML.
 ///
 /// `permissions: read-all` → all scopes set to `read`.
-/// `permissions: write-all` → all scopes set to `write`.
+/// `permissions: write-all` → all scopes set to `write`, except the
+/// read-only scopes ([`READ_ONLY_SCOPES`]), which are capped at `read`
+/// because GitHub defines no write level for them.
 /// `permissions: {}` → empty map (no permissions).
 /// `permissions: { contents: read, issues: write }` → explicit map.
 /// Job-level overrides workflow-level entirely (not merged).
@@ -442,7 +454,14 @@ fn resolve_permissions(
             Some(
                 PERMISSION_SCOPES
                     .into_iter()
-                    .map(|s| (s.to_owned(), level.to_owned()))
+                    .map(|s| {
+                        let granted = if level == "write" && READ_ONLY_SCOPES.contains(&s) {
+                            "read"
+                        } else {
+                            level
+                        };
+                        (s.to_owned(), granted.to_owned())
+                    })
                     .collect(),
             )
         }

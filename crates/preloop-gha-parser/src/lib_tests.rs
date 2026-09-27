@@ -1706,11 +1706,102 @@ jobs:
 
     let inherited = by_id("inherited");
     assert_eq!(inherited.len(), PERMISSION_SCOPES.len());
-    assert!(
-        PERMISSION_SCOPES
-            .iter()
-            .all(|scope| inherited.get(*scope).map(String::as_str) == Some("write")),
-        "`write-all` expands to every known scope: {inherited:?}"
+    for scope in PERMISSION_SCOPES {
+        let expected = if READ_ONLY_SCOPES.contains(&scope) {
+            "read"
+        } else {
+            "write"
+        };
+        assert_eq!(
+            inherited.get(scope).map(String::as_str),
+            Some(expected),
+            "`write-all` expands `{scope}` to `{expected}`: {inherited:?}"
+        );
+    }
+}
+
+#[test]
+fn declared_vulnerability_alerts_read_is_effective() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions:
+  vulnerability-alerts: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let effective = effective_token_permissions(jobs[0].permissions.as_ref());
+    assert_eq!(
+        effective.get("vulnerability-alerts").map(String::as_str),
+        Some("read"),
+        "declaring `vulnerability-alerts: read` must surface in effective permissions"
+    );
+    let wire: BTreeMap<String, String> =
+        serde_json::from_str(&crate::job_builder::token_permissions_wire_json(&effective)).unwrap();
+    assert_eq!(
+        wire.get("VulnerabilityAlerts").map(String::as_str),
+        Some("read"),
+        "the runner must be told about the grant in the wire spelling"
+    );
+}
+
+#[test]
+fn read_all_grants_vulnerability_alerts_read() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: read-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let effective = effective_token_permissions(jobs[0].permissions.as_ref());
+    assert_eq!(
+        effective.get("vulnerability-alerts").map(String::as_str),
+        Some("read"),
+        "`read-all` must grant the new scope"
+    );
+}
+
+#[test]
+fn write_all_caps_vulnerability_alerts_at_read() {
+    let workflow = parse_workflow(
+        r#"
+on: push
+permissions: write-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+    )
+    .unwrap();
+
+    let jobs = expand_jobs(&workflow).unwrap();
+    let effective = effective_token_permissions(jobs[0].permissions.as_ref());
+    assert_eq!(
+        effective.get("vulnerability-alerts").map(String::as_str),
+        Some("read"),
+        "`write-all` must not grant `write` on a scope GitHub defines as read-only"
+    );
+    assert_eq!(
+        effective.get("contents").map(String::as_str),
+        Some("write"),
+        "`write-all` still grants `write` on write-capable scopes"
     );
 }
 
