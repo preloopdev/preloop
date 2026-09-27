@@ -4525,6 +4525,23 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn attempt_job(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT run_id, job_id FROM job_requests WHERE agent_job_id=$1",
+                &[&agent_job_id.to_string()],
+            )
+            .await
+            .map(|row| row.map(|row| (parse_run_id(&row.get::<_, String>(0)), JobId(row.get(1)))))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         let client = self.checkout_reader().await?;
         let result = client

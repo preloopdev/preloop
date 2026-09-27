@@ -797,6 +797,25 @@ pub async fn complete_job_inner(
     shared: Arc<SharedState>,
     completion: JobCompletion,
 ) -> Result<Json<RunRecord>, ApiError> {
+    complete_job_settling(shared, completion, None).await
+}
+
+/// A runner's own completion report: settle the attempt it owns inside the
+/// completion transaction instead of a separate one.
+#[derive(Clone, Copy)]
+pub(crate) struct AttemptSettle {
+    pub(crate) agent_job_id: uuid::Uuid,
+    pub(crate) runner_id: i64,
+}
+
+/// Complete a job. With `settle`, the reporting runner's attempt is verified,
+/// marked finished and released from its session in the same transaction; a
+/// duplicate or already-released report returns the run unchanged.
+pub(crate) async fn complete_job_settling(
+    shared: Arc<SharedState>,
+    completion: JobCompletion,
+    settle: Option<AttemptSettle>,
+) -> Result<Json<RunRecord>, ApiError> {
     if !completion.status.is_terminal() {
         return Err(ApiError::bad_request(
             "job completion status must be terminal",
@@ -813,6 +832,9 @@ pub async fn complete_job_inner(
         newly_terminal_success: bool,
         finalized_callers: Vec<JobId>,
         live_log_key: String,
+        /// Committed ready-queue depth and next job labels (pool wake).
+        queue_len: usize,
+        next_labels: Vec<String>,
     }
 
     let comp = completion.clone();
@@ -872,6 +894,57 @@ pub async fn complete_job_inner(
         .state
         .backend
         .transact_scoped(&scope, move |tx| {
+            if let Some(settle) = settle {
+                let skip = |tx: &crate::control::txstate::TxState| {
+                    let run = tx.runs.get(&comp.run_id).cloned().ok_or_else(|| {
+                        crate::control::ControlError::NotFound("run not found".to_owned())
+                    })?;
+                    Ok(CompletionTx {
+                        early: Some(run),
+                        effective_status: comp.status,
+                        cancelled_siblings: Vec::new(),
+                        scheduling: runtime_scheduling::SchedulingOutcome::default(),
+                        queue_nonempty: false,
+                        newly_terminal_success: false,
+                        finalized_callers: Vec::new(),
+                        live_log_key: String::new(),
+                        queue_len: 0,
+                        next_labels: Vec::new(),
+                    })
+                };
+                let request_id = tx
+                    .agent_job_requests
+                    .get(&settle.agent_job_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::control::ControlError::NotFound(
+                            "broker complete request not found".to_owned(),
+                        )
+                    })?;
+                crate::broker::ensure_broker_request_owner(tx, request_id, settle.runner_id)?;
+                if tx
+                    .job_requests
+                    .get(&request_id)
+                    .is_some_and(|record| record.result.is_some())
+                {
+                    tracing::info!(request_id, "broker complete: ignoring duplicate completion");
+                    return skip(tx);
+                }
+                if let Some(record) = tx.job_requests.get_mut(&request_id) {
+                    record.result = Some(comp.status);
+                    record.locked_until = agent_request_locked_until();
+                }
+                // Free the session so the next poll can take a new job now.
+                tx.session_active_requests
+                    .retain(|_, &mut rid| rid != request_id);
+                if tx.inflight_requests.remove(&request_id).is_none() {
+                    tracing::warn!(
+                        request_id,
+                        "broker complete: no inflight_requests entry found"
+                    );
+                    return skip(tx);
+                }
+            }
             let mut newly_terminal_success = false;
             tx.claimed_jobs.remove(&(comp.run_id, comp.job_id.clone()));
             let finalized_callers: Vec<JobId>;
@@ -894,6 +967,8 @@ pub async fn complete_job_inner(
                         newly_terminal_success: false,
                         finalized_callers: Vec::new(),
                         live_log_key: String::new(),
+                        queue_len: 0,
+                        next_labels: Vec::new(),
                     });
                 }
                 let tolerated = run
@@ -1042,8 +1117,21 @@ pub async fn complete_job_inner(
             let queue_nonempty = tx.ready_count > 0
                 || !tx.ready_index.is_empty()
                 || !tx.cancellation_queue.is_empty();
+            let queue_len = tx.ready_count.max(0) as usize;
+            // The load-time queue front, or this completion's first promotion
+            // when the queue was empty.
+            let next_labels = match crate::control::sched::next_job_labels(tx) {
+                labels if labels.is_empty() => tx
+                    .queue
+                    .front()
+                    .map(|job| job.runs_on.clone())
+                    .unwrap_or_default(),
+                labels => labels,
+            };
             Ok(CompletionTx {
                 early: None,
+                queue_len,
+                next_labels,
                 effective_status,
                 cancelled_siblings,
                 scheduling,
@@ -1067,6 +1155,8 @@ pub async fn complete_job_inner(
         newly_terminal_success,
         finalized_callers: _,
         live_log_key,
+        queue_len: tx_queue_len,
+        next_labels: tx_next_labels,
         ..
     } = tx_out;
 
@@ -1079,23 +1169,7 @@ pub async fn complete_job_inner(
     }
     // Refresh the on-demand pool wake atomic and the next-job labels from the
     // committed scheduling state.
-    let (queue_len, next_labels) = shared
-        .state
-        .backend
-        .read_scoped(
-            // No queue families: `ready_count`/`next_queue_labels` are O(1)
-            // SQL snapshots — loading `ready_queue` would parse every queued
-            // job payload per completion.
-            &crate::control::txstate::TxScope::runs(Default::default()),
-            |tx| {
-                Ok((
-                    tx.ready_count.max(0) as usize,
-                    crate::control::sched::next_job_labels(tx),
-                ))
-            },
-        )
-        .await
-        .unwrap_or((0, Vec::new()));
+    let (queue_len, next_labels) = (tx_queue_len, tx_next_labels);
     shared
         .state
         .queue_depth

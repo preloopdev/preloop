@@ -1769,110 +1769,32 @@ pub async fn broker_complete_job(
         }
     }
 
-    // Resolve the request's run + owner session before the transaction so
-    // the working set stays narrow: `agent_job_id` → `(request_id, run_id)`
-    // is O(1) via `job_requests_agent`, and `agent_job_id` → owner session is
-    // O(1) via `session_active_requests`. `ensure_broker_request_owner`
-    // verifies the owner inside the transaction; `session_active_requests`
-    // cleanup needs the owning session loaded.
-    let request_run = shared
+    // One transaction: settle the attempt this runner owns and complete its
+    // job (see `complete_job_settling`).
+    let (run_id, job_id) = shared
         .state
         .backend
-        .find_request_by_agent_job_id(request.job_id)
+        .attempt_job(request.job_id)
         .await
-        .map_err(ApiError::from)?;
-    let owner_session = shared
-        .state
-        .backend
-        .find_session_by_agent_job_id(request.job_id)
-        .await
-        .map_err(ApiError::from)?;
-    let scope = crate::control::txstate::TxScope {
-        include_archived: false,
-        runs: Some(
-            request_run
-                .map(|(_, run_id)| std::collections::BTreeSet::from([run_id]))
-                .unwrap_or_default(),
-        ),
-        ready_queue: false,
-        blocked_jobs: false,
-        sessions: Some(owner_session.into_iter().collect()),
-        concurrency: false,
-        runs_referenced: false,
-        job_requests_all: false,
-        pending_expansions: false,
-        runs_via_requests: false,
-    };
-    let completion = {
-        let job_id = request.job_id;
-        let outputs = outputs.clone();
-        let annotations = request.annotations.clone();
-        let step_results = request.step_results.clone();
-        shared
-            .state
-            .backend
-            .transact_scoped(&scope, move |tx| {
-                let request_id = tx.agent_job_requests.get(&job_id).copied().ok_or_else(|| {
-                    ControlError::NotFound("broker complete request not found".to_owned())
-                })?;
-                ensure_broker_request_owner(tx, request_id, runner_id)?;
-                if tx
-                    .job_requests
-                    .get(&request_id)
-                    .is_some_and(|record| record.result.is_some())
-                {
-                    info!(request_id, "broker complete: ignoring duplicate completion");
-                    return Ok(None);
-                }
-                debug!(request_id, job_id = %job_id, "broker complete: found request");
-                if let Some(record) = tx.job_requests.get_mut(&request_id) {
-                    record.result = Some(status);
-                    record.locked_until = agent_request_locked_until();
-                }
-                // Free the session so the next broker poll can take a new job
-                // immediately (otherwise the poll arm waits until it observes
-                // result.is_some()).
-                tx.session_active_requests
-                    .retain(|_, &mut rid| rid != request_id);
-                let run_job = tx.inflight_requests.remove(&request_id).or_else(|| {
-                    tx.job_requests
-                        .get(&request_id)
-                        .map(|record| (record.run_id, record.job_id.clone()))
-                });
-                match run_job {
-                    Some((run_id, job_id)) => {
-                        info!(%run_id, %job_id, "broker complete: completing job");
-                        Ok(Some(JobCompletion {
-                            run_id,
-                            job_id,
-                            // This request *is* the attempt that finished, so
-                            // the server never has to guess which dispatch
-                            // reported.
-                            agent_job_id: tx
-                                .job_requests
-                                .get(&request_id)
-                                .map(|record| record.agent_job_id),
-                            status,
-                            outputs,
-                            annotations,
-                            step_results,
-                        }))
-                    }
-                    None => {
-                        warn!(
-                            request_id,
-                            "broker complete: no inflight_requests entry found"
-                        );
-                        Ok(None)
-                    }
-                }
-            })
-            .await
-            .map_err(ApiError::from)?
-    };
-    if let Some(completion) = completion {
-        let _ = complete_job_inner(shared.clone(), completion).await?;
-    }
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("broker complete request not found"))?;
+    let _ = crate::distributed_task::complete_job_settling(
+        shared.clone(),
+        JobCompletion {
+            run_id,
+            job_id,
+            agent_job_id: Some(request.job_id),
+            status,
+            outputs,
+            annotations: request.annotations.clone(),
+            step_results: request.step_results.clone(),
+        },
+        Some(crate::distributed_task::AttemptSettle {
+            agent_job_id: request.job_id,
+            runner_id,
+        }),
+    )
+    .await?;
     // Wake long-polling runners so a queued successor job is delivered promptly
     // after cancel/complete (concurrency release path).
     shared.state.message_notify.notify_waiters();

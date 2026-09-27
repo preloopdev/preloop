@@ -301,6 +301,12 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Drop timelines not patched since `before_us`. Returns timelines removed.
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
 
+    /// The logical job an execution attempt belongs to.
+    async fn attempt_job(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<(RunId, JobId)>, ControlError>;
+
     /// Upsert an attempt's runner-reported steps directly (no run lock).
     async fn patch_steps(
         &self,
@@ -1017,6 +1023,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.job_detail_missing(run_id, job_id).await,
             Self::Postgres(b) => b.job_detail_missing(run_id, job_id).await,
+        }
+    }
+
+    async fn attempt_job(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.attempt_job(agent_job_id).await,
+            Self::Postgres(b) => b.attempt_job(agent_job_id).await,
         }
     }
 

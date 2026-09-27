@@ -4226,6 +4226,23 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn attempt_job(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        let agent = agent_job_id.to_string();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT run_id, job_id FROM job_requests WHERE agent_job_id=?1",
+                params![agent],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map(|row| row.map(|(run, job)| (parse_run_id(&run), JobId(job))))
+            .map_err(ControlError::backend)
+        })
+    }
+
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         let run_id = run_id.0.to_string();
         self.with_reader(|conn| {
