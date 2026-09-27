@@ -5275,16 +5275,18 @@ impl ControlBackend for PostgresBackend {
         &self,
         plan_id: &str,
         timeline_id: Option<uuid::Uuid>,
+        agent_job_id: Option<uuid::Uuid>,
     ) -> Result<Option<CallbackJob>, ControlError> {
         let client = self.checkout_reader().await?;
         let timeline = timeline_id.map(|id| id.to_string()).unwrap_or_default();
+        let agent = agent_job_id.map(|id| id.to_string()).unwrap_or_default();
         let result = client
             .query_opt(
                 "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id, j.status \
                  FROM job_requests r LEFT JOIN jobs j ON j.run_id = r.run_id AND j.job_id = r.job_id \
-                 WHERE r.plan_id = $1 OR r.timeline_id = $2 \
+                 WHERE r.plan_id = $1 OR r.timeline_id = $2 OR r.agent_job_id = $3 \
                  ORDER BY (r.plan_id = $1) DESC, r.request_id DESC LIMIT 1",
-                &[&plan_id, &timeline],
+                &[&plan_id, &timeline, &agent],
             )
             .await
             .map_err(ControlError::backend)
@@ -5296,6 +5298,78 @@ impl ControlBackend for PostgresBackend {
                     agent_job_id: parse_uuid(&row.get::<_, String>(3)),
                     job_status: row.get::<_, Option<String>>(4).map(|s| status_parse(&s)),
                 })
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let run = run_id.0.to_string();
+        let result = client
+            .query_opt(
+                "SELECT secrets_blob FROM run_submissions WHERE run_id = $1",
+                &[&run],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .and_then(|row| {
+                row.map(|row| {
+                    let sealed: Vec<u8> = row.get(0);
+                    let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
+                    Ok(map.into_values().collect())
+                })
+                .transpose()
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let rows = client
+                .query("SELECT secrets_blob FROM run_submissions", &[])
+                .await
+                .map_err(ControlError::backend)?;
+            let mut values = Vec::new();
+            for row in rows {
+                let sealed: Vec<u8> = row.get(0);
+                let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
+                values.extend(map.into_values());
+            }
+            Ok(values)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn sole_inflight_request(
+        &self,
+    ) -> Result<Option<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query(
+                "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id \
+                 FROM job_requests r \
+                 JOIN runner_sessions s ON s.active_request_id = r.request_id \
+                 WHERE r.result IS NULL LIMIT 2",
+                &[],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|rows| {
+                if rows.len() != 1 {
+                    return None;
+                }
+                let row = &rows[0];
+                Some((
+                    row.get::<_, i64>(0),
+                    parse_run_id(&row.get::<_, String>(1)),
+                    JobId(row.get::<_, String>(2)),
+                    parse_uuid(&row.get::<_, String>(3)),
+                ))
             });
         self.return_reader(client).await;
         result
@@ -5367,21 +5441,46 @@ impl ControlBackend for PostgresBackend {
         request_id: i64,
         locked_until: &str,
     ) -> Result<bool, ControlError> {
-        let client = self.checkout_reader().await?;
-        let result = client
-            .execute(
-                "UPDATE job_requests SET locked_until = $1, last_renewed_at_us = $2 \
-                 WHERE request_id = $3 AND result IS NULL",
-                &[
-                    &locked_until,
-                    &system_to_us(std::time::SystemTime::now()),
-                    &request_id,
-                ],
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let run = tx
+                .query_opt(
+                    "SELECT run_id FROM job_requests WHERE request_id = $1",
+                    &[&request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let Some(run) = run else {
+                // Unknown request: the PATCH renew contract is a silent
+                // no-op.
+                tx.commit().await.map_err(ControlError::backend)?;
+                return Ok(false);
+            };
+            // The run lock serializes against a scoped write-back carrying
+            // a stale copy of this request row.
+            lock_runs(
+                &tx,
+                std::iter::once(&parse_run_id(&run.get::<_, String>(0))),
             )
-            .await
-            .map_err(ControlError::backend)
-            .map(|n| n == 1);
-        self.return_reader(client).await;
+            .await?;
+            let renewed = tx
+                .execute(
+                    "UPDATE job_requests SET locked_until = $1, last_renewed_at_us = $2 \
+                     WHERE request_id = $3 AND result IS NULL",
+                    &[
+                        &locked_until,
+                        &system_to_us(std::time::SystemTime::now()),
+                        &request_id,
+                    ],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(renewed == 1)
+        }
+        .await;
+        self.return_writer(client).await;
         result
     }
 
@@ -5392,26 +5491,50 @@ impl ControlBackend for PostgresBackend {
         locked_until: &str,
     ) -> Result<Option<(RunId, JobId, uuid::Uuid)>, ControlError> {
         let status = status_str(result).to_owned();
-        let client = self.checkout_reader().await?;
-        let result = client
-            .query_opt(
-                "UPDATE job_requests SET result = $1, locked_until = $2 \
-                 WHERE request_id = $3 AND result IS NULL \
-                 RETURNING run_id, job_id, agent_job_id",
-                &[&status, &locked_until, &request_id],
+        let locked_until = locked_until.to_owned();
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let run = tx
+                .query_opt(
+                    "SELECT run_id FROM job_requests WHERE request_id = $1",
+                    &[&request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let Some(run) = run else {
+                // Unknown request: the PATCH complete contract is a silent
+                // no-op (the row never settles, so no completion fans out).
+                tx.commit().await.map_err(ControlError::backend)?;
+                return Ok(None);
+            };
+            // The run lock serializes against a scoped write-back carrying
+            // a stale copy of this request row.
+            lock_runs(
+                &tx,
+                std::iter::once(&parse_run_id(&run.get::<_, String>(0))),
             )
-            .await
-            .map_err(ControlError::backend)
-            .map(|row| {
-                row.map(|row| {
-                    (
-                        parse_run_id(&row.get::<_, String>(0)),
-                        JobId(row.get::<_, String>(1)),
-                        parse_uuid(&row.get::<_, String>(2)),
-                    )
-                })
-            });
-        self.return_reader(client).await;
+            .await?;
+            let settled = tx
+                .query_opt(
+                    "UPDATE job_requests SET result = $1, locked_until = $2 \
+                     WHERE request_id = $3 AND result IS NULL \
+                     RETURNING run_id, job_id, agent_job_id",
+                    &[&status, &locked_until, &request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(settled.map(|row| {
+                (
+                    parse_run_id(&row.get::<_, String>(0)),
+                    JobId(row.get::<_, String>(1)),
+                    parse_uuid(&row.get::<_, String>(2)),
+                )
+            }))
+        }
+        .await;
+        self.return_writer(client).await;
         result
     }
 

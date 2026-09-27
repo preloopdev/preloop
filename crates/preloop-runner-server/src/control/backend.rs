@@ -412,14 +412,31 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// under its own run lock: nothing it releases can wake another run.
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError>;
 
-    /// Resolve a runner callback (plan id, else timeline id) to its attempt:
-    /// `(request_id, run_id, job_id, agent_job_id, job status)`, newest
-    /// attempt first. One indexed query instead of loading every request.
+    /// Resolve a runner callback (plan id, else timeline id, else agent job
+    /// id) to its attempt: `(request_id, run_id, job_id, agent_job_id, job
+    /// status)`, newest attempt first. One indexed query instead of loading
+    /// every request.
     async fn callback_job(
         &self,
         plan_id: &str,
         timeline_id: Option<uuid::Uuid>,
+        agent_job_id: Option<uuid::Uuid>,
     ) -> Result<Option<CallbackJob>, ControlError>;
+
+    /// Exposed secret values of one run's stored submission; `None` when no
+    /// such run. The log masker caches this per plan.
+    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError>;
+
+    /// Exposed secret values across every live run — the masker's fallback
+    /// union when a plan resolves to no run.
+    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError>;
+
+    /// The session-claimed request that is still in flight, when exactly one
+    /// exists (the finish_job compatibility fallback). More than one active
+    /// request returns `None`.
+    async fn sole_inflight_request(
+        &self,
+    ) -> Result<Option<(i64, RunId, JobId, uuid::Uuid)>, ControlError>;
 
     /// Renew an attempt's lease with one conditional statement. `Ok(false)`
     /// when the attempt has no recorded owner (callers fall back to the
@@ -1253,6 +1270,26 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.reap_inputs().await,
         }
     }
+    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_secret_values(run_id).await,
+            Self::Postgres(b) => b.run_secret_values(run_id).await,
+        }
+    }
+    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.all_secret_values().await,
+            Self::Postgres(b) => b.all_secret_values().await,
+        }
+    }
+    async fn sole_inflight_request(
+        &self,
+    ) -> Result<Option<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sole_inflight_request().await,
+            Self::Postgres(b) => b.sole_inflight_request().await,
+        }
+    }
 
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         match self {
@@ -1264,10 +1301,11 @@ impl ControlBackend for Backend {
         &self,
         plan_id: &str,
         timeline_id: Option<uuid::Uuid>,
+        agent_job_id: Option<uuid::Uuid>,
     ) -> Result<Option<CallbackJob>, ControlError> {
         match self {
-            Self::Sqlite(b) => b.callback_job(plan_id, timeline_id).await,
-            Self::Postgres(b) => b.callback_job(plan_id, timeline_id).await,
+            Self::Sqlite(b) => b.callback_job(plan_id, timeline_id, agent_job_id).await,
+            Self::Postgres(b) => b.callback_job(plan_id, timeline_id, agent_job_id).await,
         }
     }
     async fn renew_lease(

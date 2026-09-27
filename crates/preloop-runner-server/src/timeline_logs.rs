@@ -39,7 +39,7 @@ pub async fn patch_timeline_records(
     let callback = shared
         .state
         .backend
-        .callback_job(&plan_id, timeline_id.parse().ok())
+        .callback_job(&plan_id, timeline_id.parse().ok(), None)
         .await
         .unwrap_or(None);
     let run_id = callback
@@ -359,39 +359,26 @@ pub async fn mask_log_bytes_cached(
         }
     }
 
-    // Slow path: resolve plan_id → run_id → secrets under a narrow scope.
-    // Returns (secrets, resolved) — `resolved` is true only when the plan
-    // mapped to a concrete run row, so the fallback union is never cached as
-    // if it were the run's real masker.
-    let plan_id_owned = plan_id.to_owned();
-    let (secrets, resolved) = shared
+    // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
+    // only when the plan mapped to a concrete run row, so the fallback
+    // union is never cached as if it were the run's real masker.
+    let resolved_run_id = shared
         .state
         .backend
-        .read_scoped(
-            &crate::control::txstate::TxScope::request_correlation(),
-            move |tx| {
-                let resolved_run_id = resolve_callback_job(tx, &plan_id_owned, None, None)
-                    .map(|(_, run_id, _)| run_id)
-                    .or_else(|| plan_id_owned.parse::<RunId>().ok());
-                match resolved_run_id.and_then(|run_id| tx.runs.get(&run_id)) {
-                    Some(run) => Ok((
-                        preloop_gha_protocol::masking::expose_values(
-                            run.submission.secrets.values(),
-                        ),
-                        true,
-                    )),
-                    None => Ok((
-                        preloop_gha_protocol::masking::expose_values(
-                            tx.runs
-                                .values()
-                                .flat_map(|run| run.submission.secrets.values()),
-                        ),
-                        false,
-                    )),
-                }
-            },
-        )
-        .await?;
+        .callback_job(plan_id, None, None)
+        .await
+        .ok()
+        .flatten()
+        .map(|callback| callback.run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let run_secrets = match resolved_run_id {
+        Some(run_id) => shared.state.backend.run_secret_values(run_id).await?,
+        None => None,
+    };
+    let (secrets, resolved) = match run_secrets {
+        Some(values) => (values, true),
+        None => (shared.state.backend.all_secret_values().await?, false),
+    };
 
     {
         let mut inner = shared.state.inner.lock().await;
@@ -435,24 +422,17 @@ pub async fn console_log(
     )>,
     body: Bytes,
 ) -> StatusCode {
-    // Resolve the callback to the run-scoped agent-job key. Falling back to
-    // the plan id preserves compatibility for callbacks that arrive before a
-    // request record exists.
+    // Resolve the callback to the run-scoped agent-job key with one indexed
+    // query. Falling back to the plan id preserves compatibility for
+    // callbacks that arrive before a request record exists.
     if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
-        // Narrow scope: `job_requests` (for the plan→run/job lookup) only —
-        // no queues, sessions, or concurrency families on this hot path.
         let resolved = shared
             .state
             .backend
-            .read_scoped(&crate::control::txstate::TxScope::requests_only(), {
-                let plan_id = plan_id.clone();
-                move |tx| {
-                    Ok(resolve_callback_job(tx, &plan_id, None, None)
-                        .map(|(_, run_id, job_id)| (run_id, job_id.0)))
-                }
-            })
+            .callback_job(&plan_id, None, None)
             .await
-            .unwrap_or(None);
+            .unwrap_or(None)
+            .map(|callback| (callback.run_id, callback.job_id.0));
         match resolved {
             Some((run_id, job_id)) => {
                 crate::live_logs::record_live_log_wrapper_for_run(
@@ -478,48 +458,60 @@ pub async fn finish_job(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect();
-    let completion = {
-        let plan_id = plan_id.clone();
-        let event = event.clone();
-        shared
+    let callback = shared
+        .state
+        .backend
+        .callback_job(&plan_id, Some(event.timeline_id), Some(event.job_id))
+        .await
+        .unwrap_or(None);
+    // Compatibility: when no request carries this callback's identifiers,
+    // fall back to the single in-flight request (old runners); failing
+    // that, a plan id that *is* a run id still completes the job record.
+    let resolved = match callback {
+        Some(callback) => Some((
+            callback.request_id,
+            callback.run_id,
+            callback.job_id,
+            Some(callback.agent_job_id),
+        )),
+        None => shared
             .state
             .backend
-            .transact(move |tx| {
-                let callback_resolved =
-                    resolve_callback_job(tx, &plan_id, Some(event.timeline_id), Some(event.job_id));
-                let active_resolved =
-                    sole_active_unfinished_request(tx).and_then(|id| job_request_tuple(tx, id));
-                let resolved = callback_resolved.or(active_resolved).or_else(|| {
-                    plan_id
-                        .parse::<RunId>()
-                        .ok()
-                        .map(|run_id| (0, run_id, JobId(event.job_id.to_string())))
-                });
-                if let Some((request_id, run_id, job_id)) = resolved {
-                    if let Some(request) = tx.job_requests.get_mut(&request_id) {
-                        request.result = Some(status);
-                        request.locked_until = agent_request_locked_until();
-                    }
-                    Ok(Some(JobCompletion {
-                        run_id,
-                        job_id,
-                        // Resolved from the callback's own request record.
-                        agent_job_id: tx
-                            .job_requests
-                            .get(&request_id)
-                            .map(|record| record.agent_job_id),
-                        status,
-                        outputs,
-                        annotations: Vec::new(),
-                        step_results: Vec::new(),
-                    }))
-                } else {
-                    Ok(None)
-                }
-            })
+            .sole_inflight_request()
             .await
-            .map_err(crate::ApiError::from)
             .unwrap_or(None)
+            .map(|(request_id, run_id, job_id, agent_job_id)| {
+                (request_id, run_id, job_id, Some(agent_job_id))
+            })
+            .or_else(|| {
+                plan_id
+                    .parse::<RunId>()
+                    .ok()
+                    .map(|run_id| (0, run_id, JobId(event.job_id.to_string()), None))
+            }),
+    };
+    let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
+        if request_id != 0 {
+            // Settle is a guarded UPDATE — an already-settled row keeps its
+            // first result, but the completion still fans out below.
+            let _ = shared
+                .state
+                .backend
+                .settle_agent_request(request_id, status, &agent_request_locked_until())
+                .await;
+        }
+        Some(JobCompletion {
+            run_id,
+            job_id,
+            // Resolved from the callback's own request record.
+            agent_job_id,
+            status,
+            outputs,
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        })
+    } else {
+        None
     };
 
     info!(
@@ -684,39 +676,53 @@ pub async fn finish_job_plan(
         "finish_job_plan"
     );
 
-    let completion = shared
+    let callback = shared
         .state
         .backend
-        .transact(move |tx| {
-            let resolved = resolve_callback_job(tx, &plan_id, None, None).or_else(|| {
-                sole_active_unfinished_request(tx).and_then(|id| job_request_tuple(tx, id))
-            });
-            if let Some((request_id, run_id, job_id)) = resolved {
-                if let Some(request) = tx.job_requests.get_mut(&request_id) {
-                    request.result = Some(status);
-                    request.locked_until = agent_request_locked_until();
-                }
-                Ok(Some(JobCompletion {
-                    run_id,
-                    job_id,
-                    // Resolved from the callback's own request record.
-                    agent_job_id: tx
-                        .job_requests
-                        .get(&request_id)
-                        .map(|record| record.agent_job_id),
-                    status,
-                    outputs,
-                    annotations: Vec::new(),
-                    step_results: Vec::new(),
-                }))
-            } else {
-                warn!(plan_id, "finish_job_plan: could not resolve run/job");
-                Ok(None)
-            }
-        })
+        .callback_job(&plan_id, None, None)
         .await
-        .map_err(crate::ApiError::from)
         .unwrap_or(None);
+    // Compatibility fallback: the single in-flight request, when exactly
+    // one exists (older runners correlate only by plan).
+    let resolved = match callback {
+        Some(callback) => Some((
+            callback.request_id,
+            callback.run_id,
+            callback.job_id,
+            Some(callback.agent_job_id),
+        )),
+        None => shared
+            .state
+            .backend
+            .sole_inflight_request()
+            .await
+            .unwrap_or(None)
+            .map(|(request_id, run_id, job_id, agent_job_id)| {
+                (request_id, run_id, job_id, Some(agent_job_id))
+            }),
+    };
+    let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
+        // Settle is a guarded UPDATE — an already-settled row keeps its
+        // first result, but the completion still fans out below.
+        let _ = shared
+            .state
+            .backend
+            .settle_agent_request(request_id, status, &agent_request_locked_until())
+            .await;
+        Some(JobCompletion {
+            run_id,
+            job_id,
+            // Resolved from the callback's own request record.
+            agent_job_id,
+            status,
+            outputs,
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        })
+    } else {
+        warn!(plan_id, "finish_job_plan: could not resolve run/job");
+        None
+    };
     if let Some(c) = completion {
         let _ = complete_job_inner(shared, c).await;
     }

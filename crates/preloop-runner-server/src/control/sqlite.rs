@@ -4725,15 +4725,17 @@ impl ControlBackend for SqliteBackend {
         &self,
         plan_id: &str,
         timeline_id: Option<uuid::Uuid>,
+        agent_job_id: Option<uuid::Uuid>,
     ) -> Result<Option<CallbackJob>, ControlError> {
         let timeline = timeline_id.map(|id| id.to_string()).unwrap_or_default();
+        let agent = agent_job_id.map(|id| id.to_string()).unwrap_or_default();
         self.with_reader(|conn| {
             conn.query_row(
                 "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id, j.status \
                  FROM job_requests r LEFT JOIN jobs j ON j.run_id = r.run_id AND j.job_id = r.job_id \
-                 WHERE r.plan_id = ?1 OR r.timeline_id = ?2 \
+                 WHERE r.plan_id = ?1 OR r.timeline_id = ?2 OR r.agent_job_id = ?3 \
                  ORDER BY (r.plan_id = ?1) DESC, r.request_id DESC LIMIT 1",
-                params![plan_id, timeline],
+                params![plan_id, timeline, agent],
                 |row| {
                     Ok(CallbackJob {
                         request_id: row.get(0)?,
@@ -4746,6 +4748,78 @@ impl ControlBackend for SqliteBackend {
             )
             .optional()
             .map_err(ControlError::backend)
+        })
+    }
+
+    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT secrets_blob FROM run_submissions WHERE run_id = ?1",
+                params![run],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(ControlError::backend)?
+            .map(|sealed| {
+                let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
+                Ok(map.into_values().collect())
+            })
+            .transpose()
+        })
+    }
+
+    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT secrets_blob FROM run_submissions")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(ControlError::backend)?;
+            let mut values = Vec::new();
+            for sealed in rows {
+                let sealed = sealed.map_err(ControlError::backend)?;
+                let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
+                values.extend(map.into_values());
+            }
+            Ok(values)
+        })
+    }
+
+    async fn sole_inflight_request(
+        &self,
+    ) -> Result<Option<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
+        self.with_reader(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id \
+                     FROM job_requests r \
+                     JOIN runner_sessions s ON s.active_request_id = r.request_id \
+                     WHERE r.result IS NULL",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        parse_run_id(&row.get::<_, String>(1)?),
+                        JobId(row.get::<_, String>(2)?),
+                        parse_uuid(&row.get::<_, String>(3)?),
+                    ))
+                })
+                .map_err(ControlError::backend)?;
+            let mut found = None;
+            for row in rows {
+                let row = row.map_err(ControlError::backend)?;
+                if found.is_some() {
+                    // More than one active request — the compatibility
+                    // fallback only fires on a unique match.
+                    return Ok(None);
+                }
+                found = Some(row);
+            }
+            Ok(found)
         })
     }
 
