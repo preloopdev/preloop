@@ -4059,17 +4059,7 @@ async fn authorize_snapshot_token(
     // and its derived `agent_job_requests` are TxState, scoped to this run).
     let belongs_to_run = state
         .backend
-        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx
-                .agent_job_requests
-                .get(&identity.job_id)
-                .and_then(|request_id| tx.job_requests.get(request_id))
-                .is_some_and(|request| {
-                    request.run_id == run_id
-                        && request.plan_id == identity.plan_id
-                        && request.agent_job_id == identity.job_id
-                }))
-        })
+        .attempt_in_run(run_id, &identity.plan_id, identity.job_id)
         .await
         .map_err(ApiError::from)?;
     if !belongs_to_run {

@@ -771,25 +771,12 @@ pub async fn drain_expansions(shared: &Arc<SharedState>) -> SchedulingOutcome {
         }
 
         // Refresh node-local scheduling mirrors from committed state.
-        if let Ok((queue_len, labels)) = shared
-            .state
-            .backend
-            .read_scoped(
-                &crate::control::txstate::TxScope::runs(Default::default()),
-                |tx| {
-                    Ok((
-                        tx.ready_count.max(0) as usize,
-                        crate::control::sched::next_job_labels(tx),
-                    ))
-                },
-            )
-            .await
-        {
+        if let Ok(stats) = shared.state.backend.queue_stats().await {
             shared
                 .state
                 .queue_depth
-                .store(queue_len, std::sync::atomic::Ordering::Release);
-            *shared.state.next_job_runs_on.write().unwrap() = labels;
+                .store(stats.ready, std::sync::atomic::Ordering::Release);
+            *shared.state.next_job_runs_on.write().unwrap() = stats.next_runs_on;
         }
     }
 }

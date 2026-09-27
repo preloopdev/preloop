@@ -31,6 +31,7 @@ use preloop_gha_protocol::debug_session::{
 };
 
 use crate::auth::{JobRuntimeIdentity, WorkerJob};
+use crate::control::backend::ControlBackend;
 use crate::errors::ApiError;
 use crate::state::SharedState;
 
@@ -885,60 +886,7 @@ pub async fn issue_worker_token(
     let (run_id, plan_id) = shared
         .state
         .backend
-        .transact(move |tx| {
-            let request_id = tx
-                .agent_job_requests
-                .get(&req.agent_job_id)
-                .copied()
-                .filter(|id| {
-                    tx.job_requests
-                        .get(id)
-                        .is_some_and(|record| record.result.is_none())
-                })
-                .ok_or_else(|| {
-                    crate::control::ControlError::NotFound(format!(
-                        "no active job request for agent job {}",
-                        req.agent_job_id
-                    ))
-                })?;
-
-            let record = tx
-                .job_requests
-                .get(&request_id)
-                .expect("request id came from a liveness-filtered lookup");
-            let (run_id, plan_id, already_issued) = (
-                record.run_id,
-                record.plan_id.clone(),
-                record.debug_token_issued,
-            );
-
-            // The runner only builds a pause client under
-            // `preloopPreserveOnFailure`, so gating on the same flag issues
-            // the credential exactly when it is used, and never otherwise.
-            let preserve = tx
-                .runs
-                .get(&run_id)
-                .is_some_and(|run| run.submission.preserve_on_failure);
-            if !preserve {
-                return Err(crate::control::ControlError::Forbidden(
-                    "this run did not enable pause-on-failure".to_owned(),
-                ));
-            }
-            if already_issued {
-                // Distinct from a 403 so a worker can tell "someone beat me
-                // to it" from "not allowed at all" in its log.
-                return Err(crate::control::ControlError::Conflict(format!(
-                    "debug-worker token already issued for agent job {}",
-                    req.agent_job_id
-                )));
-            }
-
-            tx.job_requests
-                .get_mut(&request_id)
-                .expect("request id came from a liveness-filtered lookup")
-                .debug_token_issued = true;
-            Ok((run_id, plan_id))
-        })
+        .issue_debug_token(req.agent_job_id)
         .await
         .map_err(ApiError::from)?;
 

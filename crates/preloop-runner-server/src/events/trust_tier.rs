@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::control::backend::ControlBackend;
+
 /// Trust tier stamped on every webhook-driven run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -169,38 +171,31 @@ pub async fn fork_restricted_from_token(
         | Err(crate::auth::ResultsIdentityError::MalformedJobSubject) => return Some(true),
     };
     let job = identity.job_id;
-    // Backend: agent_job → request → run → submission tier. `job_requests`
-    // and `runs` are TxState; scope to the run-scoped families only (the
-    // request maps derive from `job_requests`, so `runs: None` loads them).
+    // Every hop of the correlation must survive. When the job is retired or
+    // purged mid-flight the worker still holds a valid JWT, and the missing
+    // record must widen the denial, not the access.
     state
         .backend
-        .read_scoped(
-            &crate::control::txstate::TxScope::request_correlation(),
-            move |tx| {
-                // Every hop of the correlation must survive. When the job is
-                // retired or purged mid-flight the worker still holds a valid
-                // JWT, and the missing record must widen the denial, not the
-                // access.
-                let Some(request_id) = tx.agent_job_requests.get(&job).copied() else {
-                    return Ok(Some(true));
-                };
-                let Some(record) = tx.job_requests.get(&request_id) else {
-                    return Ok(Some(true));
-                };
-                let Some(run) = tx.runs.get(&record.run_id) else {
-                    return Ok(Some(true));
-                };
-                // A submission without a tier field is a native (trusted)
-                // submission and stays allowed; `tier_of`'s
-                // parse-failure-is-trusted convention matches the secret
-                // policy.
-                Ok(Some(
-                    tier_of(&run.submission).is_some_and(|tier| tier.is_fork_restricted()),
-                ))
-            },
-        )
+        .submission_json_for_attempt(job)
         .await
-        .unwrap_or(Some(true))
+        .map(|json| {
+            // `Some(None)` means the attempt no longer resolves to a run —
+            // the missing record widens the denial rather than the access.
+            json.map(|json| {
+                serde_json::from_str::<preloop_gha_protocol::WorkflowSubmission>(&json)
+                    // A submission without a tier field is a native
+                    // (trusted) submission and stays allowed; `tier_of`'s
+                    // parse-failure-is-trusted convention matches the secret
+                    // policy.
+                    .map(|submission| {
+                        tier_of(&submission).is_some_and(|tier| tier.is_fork_restricted())
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+        })
+        .ok()
+        .or(Some(true))
 }
 
 /// Reject a cache write when the calling job is a fork-restricted run.

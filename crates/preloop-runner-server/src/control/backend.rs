@@ -350,6 +350,37 @@ pub(crate) trait ControlBackend: Send + Sync {
         patches: Vec<StepPatch>,
     ) -> Result<(), ControlError>;
 
+    /// Reconcile a `WorkflowStepsUpdate` report against `job_steps` rows.
+    /// Resolves the callback identity (`plan_id` then `agent_job_id`, like
+    /// [`resolve_callback_job`]), merges each reported step in one
+    /// transaction, and returns `false` when no request matches.
+    async fn report_steps(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+        steps: Vec<serde_json::Value>,
+    ) -> Result<bool, ControlError>;
+
+    /// Repository of the live run owning `agent_job_id` (job_requests →
+    /// run_submissions, only while the run row exists). `None` when the
+    /// attempt is unknown or its run is archived.
+    async fn attempt_repository(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError>;
+
+    /// Whether `agent_job_id` is a request of `run_id` under `plan_id`
+    /// (snapshot Git-token membership check).
+    async fn attempt_in_run(
+        &self,
+        run_id: RunId,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<bool, ControlError>;
+
+    /// Every job id belonging to `run_id` (jobs ∪ its requests' job ids),
+    /// sorted. `NotFound` when the run row does not exist.
+    async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError>;
     /// Whether the run's `jobs_list` has no detail entry for `job_id` yet.
     async fn job_detail_missing(&self, run_id: RunId, job_id: &JobId)
         -> Result<bool, ControlError>;
@@ -394,6 +425,110 @@ pub(crate) trait ControlBackend: Send + Sync {
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<Option<String>, ControlError>;
+
+    /// Check-run reporting inputs for one run: repository + head sha (from
+    /// `run_submissions.submission_json`), and every job's id, display name,
+    /// status and check-run id. One indexed read — the per-job dispatch fan
+    /// -out and completion reporter must not load the run's working set.
+    async fn run_dispatch_info(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<RunDispatchInfo>, ControlError>;
+
+    /// `(repository, sha, base_ref, git_ref)` for push/push-snapshot paths;
+    /// `None` when no such run.
+    async fn submission_fields(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubmissionFields>, ControlError>;
+
+    /// The persisted check-run id of `job_id` (`run_jobs.check_run_id`).
+    async fn job_check_run_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError>;
+
+    /// A run's `jobs` map — status per logical job id.
+    async fn run_job_statuses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<Vec<(JobId, ExecutionStatus)>>, ControlError>;
+
+    /// Live-log key for `job_id` in `run_id`: the latest request's
+    /// `agent_job_id`, else the logical key when the job belongs to the run.
+    /// Also reports whether the run or that job is terminal.
+    /// `Ok(None)` when the run does not exist.
+    async fn live_log_key(
+        &self,
+        run_id: RunId,
+        job_id: &str,
+    ) -> Result<Option<(String, bool)>, ControlError>;
+
+    /// All of a run's request records, sorted by request id (run-logs
+    /// endpoint — cold path).
+    async fn run_requests(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError>;
+
+    /// A run's stored `job_steps` manifests keyed by agent job id.
+    async fn run_step_manifests(
+        &self,
+        run_id: RunId,
+    ) -> Result<BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>, ControlError>;
+
+    /// Issue the one-shot pause-on-failure debug credential: `NotFound`
+    /// when no in-flight request owns `agent_job_id`, `Forbidden` when the
+    /// run did not opt in, `Conflict` on a second issue. Returns
+    /// `(run_id, plan_id)` on success — the mutation and the checks are one
+    /// statement-guarded transaction.
+    async fn issue_debug_token(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<(RunId, String), ControlError>;
+
+    /// `sweep_stale_bindings` in SQL: drop assignment/pool-pending rows for
+    /// jobs no longer ready (assignments on), or expired by TTL (both flags
+    /// off), or release dead/expired runner bindings back to the waitlist.
+    /// Returns rows changed.
+    async fn sweep_stale_bindings(&self) -> Result<usize, ControlError>;
+
+    /// Resolve a check-run rerequest to `(run_id, job_id)`: an exact
+    /// `run_jobs.check_run_id` hit on a terminal run matching repository and
+    /// head sha; else the check-run `name` matched against job ids and
+    /// display names on terminal runs of that repository. `details_run_id`
+    /// (parsed from `details_url`) is tried first, then every terminal run.
+    async fn check_run_target(
+        &self,
+        check_run_id: u64,
+        repository: &str,
+        head_sha: Option<&str>,
+        job_name: Option<&str>,
+        details_run_id: Option<RunId>,
+    ) -> Result<Option<(RunId, JobId)>, ControlError>;
+
+    /// `submission_json` of the run that owns `agent_job_id`'s newest
+    /// request — one join, no record assembly. `None` when the attempt no
+    /// longer resolves to a run.
+    async fn submission_json_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError>;
+
+    /// The push that already published `sha` for `workflow_path` on
+    /// `repository` — a concluded run with a recorded `push_state`, matched
+    /// on the submitted sha or the push's `effective_sha`.
+    async fn published_run(
+        &self,
+        repository: &str,
+        sha: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError>;
+
+    /// Whether `run_id` currently waits on a concurrency slot
+    /// (`jobs.queue_kind='held'` row). Point read.
+    async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError>;
 
     /// Whether `runner_id` is registered (indexed point read).
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError>;
@@ -1259,6 +1394,18 @@ impl ControlBackend for Backend {
         }
     }
 
+    async fn report_steps(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+        steps: Vec<serde_json::Value>,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.report_steps(plan_id, agent_job_id, steps).await,
+            Self::Postgres(b) => b.report_steps(plan_id, agent_job_id, steps).await,
+        }
+    }
+
     async fn set_job_check_run(
         &self,
         run_id: RunId,
@@ -1271,6 +1418,27 @@ impl ControlBackend for Backend {
         }
     }
 
+    async fn attempt_repository(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.attempt_repository(agent_job_id).await,
+            Self::Postgres(b) => b.attempt_repository(agent_job_id).await,
+        }
+    }
+
+    async fn attempt_in_run(
+        &self,
+        run_id: RunId,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.attempt_in_run(run_id, plan_id, agent_job_id).await,
+            Self::Postgres(b) => b.attempt_in_run(run_id, plan_id, agent_job_id).await,
+        }
+    }
     async fn clear_job_check_run(
         &self,
         run_id: RunId,
@@ -1309,6 +1477,13 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.job_detail_missing(run_id, job_id).await,
             Self::Postgres(b) => b.job_detail_missing(run_id, job_id).await,
+        }
+    }
+
+    async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_job_ids(run_id).await,
+            Self::Postgres(b) => b.run_job_ids(run_id).await,
         }
     }
 
@@ -1430,6 +1605,131 @@ impl ControlBackend for Backend {
                 b.create_broker_session(session_id, runner_id, encryption)
                     .await
             }
+        }
+    }
+    async fn run_dispatch_info(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<RunDispatchInfo>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_dispatch_info(run_id).await,
+            Self::Postgres(b) => b.run_dispatch_info(run_id).await,
+        }
+    }
+    async fn submission_fields(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubmissionFields>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.submission_fields(run_id).await,
+            Self::Postgres(b) => b.submission_fields(run_id).await,
+        }
+    }
+    async fn job_check_run_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_check_run_id(run_id, job_id).await,
+            Self::Postgres(b) => b.job_check_run_id(run_id, job_id).await,
+        }
+    }
+    async fn run_job_statuses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<Vec<(JobId, ExecutionStatus)>>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_job_statuses(run_id).await,
+            Self::Postgres(b) => b.run_job_statuses(run_id).await,
+        }
+    }
+    async fn live_log_key(
+        &self,
+        run_id: RunId,
+        job_id: &str,
+    ) -> Result<Option<(String, bool)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.live_log_key(run_id, job_id).await,
+            Self::Postgres(b) => b.live_log_key(run_id, job_id).await,
+        }
+    }
+    async fn run_requests(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_requests(run_id).await,
+            Self::Postgres(b) => b.run_requests(run_id).await,
+        }
+    }
+    async fn run_step_manifests(
+        &self,
+        run_id: RunId,
+    ) -> Result<BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_step_manifests(run_id).await,
+            Self::Postgres(b) => b.run_step_manifests(run_id).await,
+        }
+    }
+    async fn issue_debug_token(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<(RunId, String), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.issue_debug_token(agent_job_id).await,
+            Self::Postgres(b) => b.issue_debug_token(agent_job_id).await,
+        }
+    }
+    async fn check_run_target(
+        &self,
+        check_run_id: u64,
+        repository: &str,
+        head_sha: Option<&str>,
+        job_name: Option<&str>,
+        details_run_id: Option<RunId>,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.check_run_target(check_run_id, repository, head_sha, job_name, details_run_id)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.check_run_target(check_run_id, repository, head_sha, job_name, details_run_id)
+                    .await
+            }
+        }
+    }
+    async fn published_run(
+        &self,
+        repository: &str,
+        sha: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.published_run(repository, sha, workflow_path).await,
+            Self::Postgres(b) => b.published_run(repository, sha, workflow_path).await,
+        }
+    }
+    async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_held(run_id).await,
+            Self::Postgres(b) => b.run_held(run_id).await,
+        }
+    }
+    async fn submission_json_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.submission_json_for_attempt(agent_job_id).await,
+            Self::Postgres(b) => b.submission_json_for_attempt(agent_job_id).await,
+        }
+    }
+    async fn sweep_stale_bindings(&self) -> Result<usize, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.sweep_stale_bindings().await,
+            Self::Postgres(b) => b.sweep_stale_bindings().await,
         }
     }
     async fn settle_request(

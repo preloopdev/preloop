@@ -46,11 +46,36 @@ pub fn shapes() -> Vec<Shape> {
         s = steps(12)
     );
     vec![
-        Shape { name: "single", weight: 40, jobs: 1, yaml: single },
-        Shape { name: "fanout", weight: 30, jobs: 3, yaml: fanout },
-        Shape { name: "chain", weight: 15, jobs: 4, yaml: chain },
-        Shape { name: "matrix", weight: 12, jobs: 10, yaml: matrix },
-        Shape { name: "big_matrix", weight: 3, jobs: 51, yaml: big_matrix },
+        Shape {
+            name: "single",
+            weight: 40,
+            jobs: 1,
+            yaml: single,
+        },
+        Shape {
+            name: "fanout",
+            weight: 30,
+            jobs: 3,
+            yaml: fanout,
+        },
+        Shape {
+            name: "chain",
+            weight: 15,
+            jobs: 4,
+            yaml: chain,
+        },
+        Shape {
+            name: "matrix",
+            weight: 12,
+            jobs: 10,
+            yaml: matrix,
+        },
+        Shape {
+            name: "big_matrix",
+            weight: 3,
+            jobs: 51,
+            yaml: big_matrix,
+        },
     ]
 }
 
@@ -105,11 +130,7 @@ pub fn api_submission(shape: &Shape, repository: &str, sequence: u64) -> serde_j
 }
 
 /// A signed GitHub `push` delivery for the load workspace's HEAD commit.
-pub fn webhook_push(
-    repository: &str,
-    head_sha: &str,
-    secret: &str,
-) -> (Vec<u8>, String, String) {
+pub fn webhook_push(repository: &str, head_sha: &str, secret: &str) -> (Vec<u8>, String, String) {
     let body = serde_json::to_vec(&serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
@@ -136,7 +157,11 @@ pub fn prepare_workspace(dir: &std::path::Path, mix: &Mix) -> anyhow::Result<Str
     std::fs::create_dir_all(&workflows)?;
     // A push to a typical repository triggers a couple of workflows, not the
     // whole mix: lint + ci (four jobs per push).
-    for shape in mix.shapes.iter().filter(|s| matches!(s.name, "single" | "fanout")) {
+    for shape in mix
+        .shapes
+        .iter()
+        .filter(|s| matches!(s.name, "single" | "fanout"))
+    {
         std::fs::write(workflows.join(format!("{}.yml", shape.name)), &shape.yaml)?;
     }
     let git = |args: &[&str]| -> anyhow::Result<String> {

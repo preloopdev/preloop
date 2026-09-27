@@ -25,7 +25,9 @@ pub struct Fault {
 impl std::str::FromStr for Fault {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> anyhow::Result<Self> {
-        let (kind, rest) = s.split_once('@').ok_or_else(|| anyhow::anyhow!("fault: {s}"))?;
+        let (kind, rest) = s
+            .split_once('@')
+            .ok_or_else(|| anyhow::anyhow!("fault: {s}"))?;
         let (window, param) = rest.split_once(':').unwrap_or((rest, "0"));
         let (at, duration) = window
             .split_once('+')
@@ -69,7 +71,10 @@ pub async fn run_proxy(
             for fault in ordered {
                 let wait = fault.at.saturating_sub(started.elapsed());
                 tokio::time::sleep(wait).await;
-                eprintln!("[chaos] {} for {:?} (param {})", fault.kind, fault.duration, fault.param);
+                eprintln!(
+                    "[chaos] {} for {:?} (param {})",
+                    fault.kind, fault.duration, fault.param
+                );
                 metrics.incr(&format!("chaos.{}", fault.kind));
                 match fault.kind.as_str() {
                     "reset" => {

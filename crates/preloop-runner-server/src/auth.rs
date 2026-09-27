@@ -974,25 +974,14 @@ pub async fn job_repository_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let run_id = state
+    let repository = state
         .backend
-        .run_for_attempt(job_id)
+        .attempt_repository(job_id)
         .await
-        .map_err(ApiError::from)?;
-    let repository = match run_id {
-        Some(run_id) => state
-            .backend
-            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                Ok(tx
-                    .runs
-                    .get(&run_id)
-                    .map(|run| run.submission.repository.clone()))
-            })
-            .await
-            .map_err(ApiError::from)?,
-        None => None,
-    }
-    .ok_or_else(|| ApiError::forbidden("job runtime token is not bound to a live workflow run"))?;
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::forbidden("job runtime token is not bound to a live workflow run")
+        })?;
     Ok(Some(repository))
 }
 

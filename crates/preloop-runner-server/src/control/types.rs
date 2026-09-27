@@ -336,6 +336,41 @@ pub(crate) struct QueueStats {
     pub(crate) next_runs_on: Vec<String>,
 }
 
+/// Check-run reporting inputs for one run (see `run_dispatch_info`).
+#[derive(Debug)]
+pub(crate) struct RunDispatchInfo {
+    pub(crate) repository: String,
+    pub(crate) sha: String,
+    pub(crate) started_at: Option<std::time::SystemTime>,
+    pub(crate) completed_at: Option<std::time::SystemTime>,
+    /// Per logical job, in `job_id` order.
+    pub(crate) jobs: Vec<RunDispatchJob>,
+}
+
+/// One logical job's reporting inputs.
+#[derive(Debug)]
+pub(crate) struct RunDispatchJob {
+    pub(crate) job_id: JobId,
+    pub(crate) status: ExecutionStatus,
+    /// `run_jobs.display_name` — the evaluated GitHub name, when stored.
+    pub(crate) display_name: Option<String>,
+    pub(crate) check_run_id: Option<u64>,
+    /// Stored `jobs_list` entry (annotations, step projection) if present.
+    pub(crate) detail: Option<crate::models::JobDetail>,
+    /// Latest attempt's step manifest (`job_steps`), empty pre-dispatch.
+    pub(crate) steps: Vec<crate::models::StepRecord>,
+}
+
+/// Submission fields the push paths read (`submission_json` holds the
+/// workflow submission — decoded by the backend).
+#[derive(Debug)]
+pub(crate) struct SubmissionFields {
+    pub(crate) repository: String,
+    pub(crate) sha: String,
+    pub(crate) base_ref: Option<String>,
+    pub(crate) git_ref: String,
+}
+
 /// Errors every backend maps onto the same domain vocabulary. Handlers
 #[derive(Debug)]
 pub(crate) enum ControlError {
@@ -557,4 +592,70 @@ pub(crate) struct ReapInputs {
     pub(crate) stale_runners: std::collections::BTreeSet<i64>,
     /// Registrations older than the liveness timeout with no session.
     pub(crate) phantom_runners: std::collections::BTreeSet<i64>,
+}
+
+/// One reconciled step report, ready to upsert into `job_steps`.
+///
+/// `report_steps` resolves conclusions against the job's current status and
+/// the report's wire shape (`WorkflowStepsUpdate` `status`/`conclusion`
+/// numbers); backends store the result verbatim.
+#[derive(Debug)]
+pub(crate) struct StepReport {
+    pub(crate) step_id: String,
+    pub(crate) runner_number: Option<i64>,
+    /// Reported display name; `None` keeps the stored name.
+    pub(crate) name: Option<String>,
+    pub(crate) conclusion: String,
+    /// `Some` only when this report first observed the step running/finished.
+    /// A terminal-only report never invents `started_at == finished_at`.
+    pub(crate) started_at_us: Option<i64>,
+    pub(crate) finished_at_us: Option<i64>,
+}
+
+/// Fold one `steps[]` entry of `WorkflowStepsUpdate` into a `StepReport`.
+///
+/// `job_cancelled` selects the cancelled conclusion for numeric 3; `observed`
+/// is the server receive time. `None` means the step has no `external_id`
+/// and is dropped — guessing by display name merged distinct same-named
+/// steps before.
+pub(crate) fn step_report(
+    step: &serde_json::Value,
+    job_cancelled: bool,
+    observed: chrono::DateTime<chrono::Utc>,
+) -> Option<StepReport> {
+    let external_id = step["external_id"].as_str().unwrap_or("");
+    if external_id.is_empty() {
+        return None;
+    }
+    let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
+    let status_num = step["status"].as_u64().unwrap_or(0);
+    let terminal = status_num == 6;
+    let conclusion = if terminal {
+        match conclusion_num {
+            2 => "success",
+            3 if job_cancelled => "cancelled",
+            3 => "failure",
+            7 => "skipped",
+            _ => "success",
+        }
+    } else {
+        "in_progress"
+    };
+    let runner_number = step["number"].as_u64().and_then(|n| i64::try_from(n).ok());
+    // The runner reports the rendered display name ("Run actions/checkout@v4"),
+    // the same string GitHub's UI shows, so it wins over the message's name:
+    // the server leaves that empty for steps without an explicit `name:`.
+    let name = step["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let observed_us = observed.timestamp_micros();
+    Some(StepReport {
+        step_id: external_id.to_owned(),
+        runner_number,
+        name,
+        conclusion: conclusion.to_owned(),
+        started_at_us: (!terminal).then_some(observed_us),
+        finished_at_us: terminal.then_some(observed_us),
+    })
 }

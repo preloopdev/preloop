@@ -4462,13 +4462,36 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn run_record(&self, run_id: RunId) -> Result<RunRecord, ControlError> {
-        self.read_scoped(&TxScope::run(run_id).with_history(), |tx| {
-            tx.runs
-                .get(&run_id)
-                .cloned()
-                .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))
-        })
-        .await
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let mut loaded = load_runs(&client, &self.cipher, " WHERE run_id = $1", &[&run])
+                .await?
+                .into_iter();
+            let Some((_, _, mut record, _)) = loaded.next() else {
+                return Err(ControlError::NotFound(format!("run {run_id}")));
+            };
+            // Live jobs plus their archived copies — `into_record` leaves the
+            // status map empty by contract.
+            let rows = client
+                .query(
+                    "SELECT job_id, status FROM jobs WHERE run_id=$1 \
+                     UNION ALL SELECT job_id, status FROM job_history WHERE run_id=$1",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            for row in &rows {
+                record.jobs.insert(
+                    JobId(row.get::<_, String>(0)),
+                    status_parse(&row.get::<_, String>(1)),
+                );
+            }
+            Ok(record)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
     }
 
     async fn list_runs(&self, filter: RunListFilter) -> Result<Vec<RunRecord>, ControlError> {
@@ -4710,6 +4733,617 @@ impl ControlBackend for PostgresBackend {
         self.return_reader(client).await;
         result
     }
+
+    async fn run_dispatch_info(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<RunDispatchInfo>, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let Some(head) = client
+                .query_opt(
+                    "SELECT s.submission_json, r.started_at_us, r.completed_at_us \
+                     FROM run_submissions s JOIN runs r ON r.run_id=s.run_id \
+                     WHERE s.run_id=$1",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            else {
+                return Ok(None);
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&head.get::<_, String>(0)).map_err(ControlError::backend)?;
+            let job_rows = client
+                .query(
+                    "SELECT j.job_id, j.status, r.display_name, r.check_run_id, \
+                            r.detail_json, \
+                            (SELECT q.agent_job_id FROM job_requests q \
+                              WHERE q.run_id=j.run_id AND q.job_id=j.job_id \
+                              ORDER BY q.request_id DESC LIMIT 1) AS agent \
+                     FROM jobs j LEFT JOIN run_jobs r \
+                       ON r.run_id=j.run_id AND r.job_id=j.job_id \
+                     WHERE j.run_id=$1 ORDER BY j.job_id",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let mut jobs = Vec::with_capacity(job_rows.len());
+            for row in &job_rows {
+                let agent: Option<String> = row.get(5);
+                let mut steps = Vec::new();
+                if let Some(agent) = &agent {
+                    let step_rows = client
+                        .query(
+                            &format!(
+                                "SELECT {STEP_COLUMNS} FROM job_steps \
+                                 WHERE agent_job_id=$1 ORDER BY position"
+                            ),
+                            &[agent],
+                        )
+                        .await
+                        .map_err(ControlError::backend)?;
+                    for step_row in &step_rows {
+                        steps.push(step_from_row(step_row).1);
+                    }
+                }
+                jobs.push(RunDispatchJob {
+                    job_id: JobId(row.get::<_, String>(0)),
+                    status: status_parse(&row.get::<_, String>(1)),
+                    display_name: row.get::<_, Option<String>>(2),
+                    check_run_id: row.get::<_, Option<i64>>(3).map(|id| id as u64),
+                    detail: row
+                        .get::<_, Option<String>>(4)
+                        .and_then(|d| serde_json::from_str(&d).ok()),
+                    steps,
+                });
+            }
+            Ok(Some(RunDispatchInfo {
+                repository: value["repository"].as_str().unwrap_or_default().to_owned(),
+                sha: value["sha"].as_str().unwrap_or_default().to_owned(),
+                started_at: head.get::<_, Option<i64>>(1).map(us_to_system),
+                completed_at: head.get::<_, Option<i64>>(2).map(us_to_system),
+                jobs,
+            }))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn submission_fields(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubmissionFields>, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let Some(json) = client
+                .query_opt(
+                    "SELECT submission_json FROM run_submissions WHERE run_id=$1",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| row.get::<_, String>(0))
+            else {
+                return Ok(None);
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&json).map_err(ControlError::backend)?;
+            Ok(Some(SubmissionFields {
+                repository: value["repository"].as_str().unwrap_or_default().to_owned(),
+                sha: value["sha"].as_str().unwrap_or_default().to_owned(),
+                base_ref: value["base_ref"].as_str().map(str::to_owned),
+                git_ref: value["git_ref"].as_str().unwrap_or_default().to_owned(),
+            }))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn job_check_run_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT check_run_id FROM run_jobs WHERE run_id=$1 AND job_id=$2",
+                &[&run, &job],
+            )
+            .await
+            .map(|row| {
+                row.and_then(|row| row.get::<_, Option<i64>>(0))
+                    .map(|id| id as u64)
+            })
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_job_statuses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<Vec<(JobId, ExecutionStatus)>>, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let exists = client
+                .query_one("SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=$1)", &[&run])
+                .await
+                .map_err(ControlError::backend)?
+                .get::<_, bool>(0);
+            if !exists {
+                return Ok(None);
+            }
+            let rows = client
+                .query(
+                    "SELECT job_id, status FROM jobs WHERE run_id=$1 ORDER BY job_id",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            Ok(Some(
+                rows.iter()
+                    .map(|row| {
+                        (
+                            JobId(row.get::<_, String>(0)),
+                            status_parse(&row.get::<_, String>(1)),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn live_log_key(
+        &self,
+        run_id: RunId,
+        job_id: &str,
+    ) -> Result<Option<(String, bool)>, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.to_owned();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let Some(status) = client
+                .query_opt("SELECT status FROM runs WHERE run_id=$1", &[&run])
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| row.get::<_, String>(0))
+            else {
+                return Ok(None);
+            };
+            let run_terminal = status_parse(&status).is_terminal();
+            // A logical job key names the current attempt; an agent job id
+            // names exactly one record. `ORDER BY request_id DESC` picks the
+            // latest attempt for the logical key, never a dead feed.
+            let record = client
+                .query_opt(
+                    "SELECT agent_job_id FROM job_requests \
+                     WHERE run_id=$1 AND (job_id=$2 OR agent_job_id=$2) \
+                     ORDER BY request_id DESC LIMIT 1",
+                    &[&run, &job],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| row.get::<_, String>(0));
+            let key = match record {
+                Some(agent) => agent,
+                None => {
+                    // A bare logical key is valid only when the run owns it —
+                    // never accept an arbitrary key that could leak another
+                    // run's output.
+                    let owned = client
+                        .query_one(
+                            "SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id=$1 AND job_id=$2)",
+                            &[&run, &job],
+                        )
+                        .await
+                        .map_err(ControlError::backend)?
+                        .get::<_, bool>(0);
+                    if !owned {
+                        return Ok(None);
+                    }
+                    job.clone()
+                }
+            };
+            // `job` is the logical id or a (missed) agent job id — the same
+            // lookup the old code did against the in-memory map.
+            let job_terminal = client
+                .query_opt(
+                    "SELECT status FROM jobs WHERE run_id=$1 AND job_id=$2",
+                    &[&run, &job],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| status_parse(&row.get::<_, String>(0)).is_terminal())
+                .unwrap_or(false);
+            Ok(Some((key, run_terminal || job_terminal)))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_requests(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let rows = client
+                .query(
+                    "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
+                            plan_type, timeline_id, result, locked_until, claimed_at_us,
+                            owner_runner_id, started_at_us, last_renewed_at_us,
+                            timeout_triggered, debug_token_issued
+                     FROM job_requests WHERE run_id=$1
+                     UNION ALL
+                     SELECT h.request_id, h.run_id, h.job_id, h.agent_job_id,
+                            h.plan_id, '', h.timeline_id, h.result, '', h.claimed_at_us,
+                            h.owner_runner_id, h.started_at_us, NULL::bigint, 0, 0
+                     FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
+                     WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
+                       AND h.run_created_at_us=r.created_at_us AND h.run_id=$1
+                     ORDER BY 1",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            Ok(rows
+                .iter()
+                .map(|row| TaskAgentJobRequestRecord {
+                    request_id: row.get(0),
+                    run_id: parse_run_id(&row.get::<_, String>(1)),
+                    job_id: JobId(row.get(2)),
+                    agent_job_id: parse_uuid(&row.get::<_, String>(3)),
+                    plan_id: row.get(4),
+                    plan_type: row.get(5),
+                    timeline_id: parse_uuid(&row.get::<_, String>(6)),
+                    result: row.get::<_, Option<String>>(7).as_deref().map(status_parse),
+                    locked_until: row.get(8),
+                    claimed_at: row.get::<_, Option<i64>>(9).map(us_to_system),
+                    owner_runner_id: row.get(10),
+                    started_at: row.get::<_, Option<i64>>(11).map(us_to_system),
+                    last_renewed_at: row.get::<_, Option<i64>>(12).map(us_to_system),
+                    timeout_triggered: row.get::<_, i64>(13) != 0,
+                    debug_token_issued: row.get::<_, i64>(14) != 0,
+                })
+                .collect())
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_step_manifests(
+        &self,
+        run_id: RunId,
+    ) -> Result<BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            // Latest manifests live in `job_steps`; an archived run's are in
+            // `step_history` (matched to the live row's attempt + created_at).
+            let rows = client
+                .query(
+                    "SELECT s.agent_job_id, s.step_id, s.kind, s.workflow_index,                      s.runner_number, s.context_name, s.name, s.conclusion,                      s.started_at_us, s.finished_at_us, s.position FROM job_steps s                      JOIN job_requests r ON r.agent_job_id=s.agent_job_id                      WHERE r.run_id=$1                      UNION ALL                      SELECT h.agent_job_id, h.step_id, h.kind, h.workflow_index,                      h.runner_number, h.context_name, h.name, h.conclusion,                      h.started_at_us, h.finished_at_us, h.position FROM step_history h                      JOIN runs r2 ON r2.run_id=h.run_id AND r2.run_attempt=h.run_attempt                        AND r2.created_at_us=h.run_created_at_us                      WHERE h.run_id=$1 AND r2.archived_at_us IS NOT NULL                      ORDER BY 1, 11",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let mut manifests: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>> =
+                BTreeMap::new();
+            for row in &rows {
+                let (agent, record) = step_from_row(row);
+                manifests.entry(agent).or_default().push(record);
+            }
+            Ok(manifests)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn issue_debug_token(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<(RunId, String), ControlError> {
+        let agent = agent_job_id.to_string();
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let Some(row) = tx
+                .query_opt(
+                    "SELECT request_id, run_id, plan_id, debug_token_issued \
+                     FROM job_requests WHERE agent_job_id=$1 AND result IS NULL \
+                     ORDER BY request_id DESC LIMIT 1",
+                    &[&agent],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            else {
+                return Err(ControlError::NotFound(format!(
+                    "no active job request for agent job {agent}"
+                )));
+            };
+            let request_id: i64 = row.get(0);
+            let run_id: String = row.get(1);
+            let plan_id: String = row.get(2);
+            // The runner only builds a pause client under
+            // `preloopPreserveOnFailure`, so gating on the same flag issues
+            // the credential exactly when it is used, and never otherwise.
+            let submission: Option<String> = tx
+                .query_opt(
+                    "SELECT submission_json FROM run_submissions WHERE run_id=$1",
+                    &[&run_id],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| row.get(0));
+            let preserve = submission
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .and_then(|value| value["preserve_on_failure"].as_bool())
+                .unwrap_or(false);
+            if !preserve {
+                return Err(ControlError::Forbidden(
+                    "this run did not enable pause-on-failure".to_owned(),
+                ));
+            }
+            if row.get::<_, i64>(3) != 0 {
+                // Distinct from a 403 so a worker can tell "someone beat me
+                // to it" from "not allowed at all" in its log.
+                return Err(ControlError::Conflict(format!(
+                    "debug-worker token already issued for agent job {agent}"
+                )));
+            }
+            tx.execute(
+                "UPDATE job_requests SET debug_token_issued=1 WHERE request_id=$1",
+                &[&request_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok((parse_run_id(&run_id), plan_id))
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn sweep_stale_bindings(&self) -> Result<usize, ControlError> {
+        let pool_on = self
+            .pool_assignments_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let require_on = self
+            .require_job_assignments
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let now_us = system_to_us(std::time::SystemTime::now());
+        // Freshness windows mirror `assignment_fresh`/`binding_fresh`.
+        let assignment_cutoff = now_us - sched::ASSIGNMENT_TTL.as_micros() as i64;
+        let binding_cutoff = now_us - sched::CLAIM_BINDING_TTL.as_micros() as i64;
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            let mut swept = 0u64;
+            if pool_on {
+                swept += tx
+                    .execute(
+                        "DELETE FROM job_assignments WHERE (run_id, job_id) NOT IN \
+                         (SELECT run_id, job_id FROM jobs WHERE queue_kind='ready')",
+                        &[],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                swept += tx
+                    .execute(
+                        "DELETE FROM pool_pending WHERE (run_id, job_id) NOT IN \
+                         (SELECT run_id, job_id FROM jobs WHERE queue_kind='ready')",
+                        &[],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+            }
+            if !require_on && !pool_on {
+                swept += tx
+                    .execute(
+                        "DELETE FROM job_assignments WHERE at_us < $1",
+                        &[&assignment_cutoff],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                swept += tx
+                    .execute(
+                        "DELETE FROM pool_pending WHERE at_us < $1",
+                        &[&assignment_cutoff],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+            } else {
+                // Release (not delete) stale or dead-runner bindings: the job
+                // goes back to the pool waitlist.
+                let stale = tx
+                    .query(
+                        "SELECT a.run_id, a.job_id FROM job_assignments a \
+                         WHERE a.runner_id IS NOT NULL \
+                         AND (a.at_us < $1 OR NOT EXISTS ( \
+                             SELECT 1 FROM runners r WHERE r.runner_id=a.runner_id))",
+                        &[&binding_cutoff],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                for row in stale {
+                    let run_id: String = row.get(0);
+                    let job_id: String = row.get(1);
+                    tx.execute(
+                        "UPDATE job_assignments SET runner_id=NULL \
+                         WHERE run_id=$1 AND job_id=$2",
+                        &[&run_id, &job_id],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                    tx.execute(
+                        "INSERT INTO pool_pending (run_id, job_id, at_us) \
+                         VALUES ($1,$2,$3) \
+                         ON CONFLICT(run_id, job_id) DO UPDATE SET at_us=excluded.at_us",
+                        &[&run_id, &job_id, &now_us],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                    swept += 1;
+                }
+            }
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(swept as usize)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn check_run_target(
+        &self,
+        check_run_id: u64,
+        repository: &str,
+        head_sha: Option<&str>,
+        job_name: Option<&str>,
+        details_run_id: Option<RunId>,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        let check_run_id = check_run_id as i64;
+        let repository = repository.to_owned();
+        let head_sha = head_sha.map(str::to_owned);
+        let job_name = job_name.map(str::to_owned);
+        let details = details_run_id.map(|id| id.0.to_string());
+        let client = self.checkout_reader().await?;
+        let result = async {
+            // A rerequest targets a terminal run of this repository at this
+            // head. `details_run_id` (from the check run's details_url) wins
+            // when it matches; otherwise runs are considered in id order —
+            // the same order the old full-map scan produced.
+            let hit = client
+                .query_opt(
+                    "SELECT j.run_id, j.job_id FROM run_jobs j \
+                     JOIN runs r ON r.run_id=j.run_id \
+                     JOIN run_submissions s ON s.run_id=j.run_id \
+                     WHERE j.check_run_id=$1 \
+                       AND s.submission_json::jsonb->>'repository'=$2 \
+                       AND ($3::text IS NULL OR r.head_sha=$3) \
+                       AND r.status IN ('success','failure','skipped','cancelled') \
+                     ORDER BY (j.run_id=$4) DESC, j.run_id LIMIT 1",
+                    &[&check_run_id, &repository, &head_sha, &details],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            if let Some(row) = hit {
+                return Ok(Some((
+                    parse_run_id(&row.get::<_, String>(0)),
+                    JobId(row.get::<_, String>(1)),
+                )));
+            }
+            let Some(name) = job_name else {
+                return Ok(None);
+            };
+            // Fallback parity: the check-run `name` against the logical job
+            // key and the display name (the check run is created under the
+            // display name).
+            let hit = client
+                .query_opt(
+                    "SELECT j.run_id, j.job_id FROM run_jobs j \
+                     JOIN runs r ON r.run_id=j.run_id \
+                     JOIN run_submissions s ON s.run_id=j.run_id \
+                     WHERE (j.job_id=$5 OR j.display_name=$5) \
+                       AND s.submission_json::jsonb->>'repository'=$2 \
+                       AND ($3::text IS NULL OR r.head_sha=$3) \
+                       AND r.status IN ('success','failure','skipped','cancelled') \
+                     ORDER BY (j.run_id=$4) DESC, j.run_id LIMIT 1",
+                    &[&check_run_id, &repository, &head_sha, &details, &name],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            Ok(hit.map(|row| {
+                (
+                    parse_run_id(&row.get::<_, String>(0)),
+                    JobId(row.get::<_, String>(1)),
+                )
+            }))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn submission_json_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        let agent = agent_job_id.to_string();
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT s.submission_json FROM job_requests q \
+                 JOIN run_submissions s ON s.run_id=q.run_id \
+                 WHERE q.agent_job_id=$1 ORDER BY q.request_id DESC LIMIT 1",
+                &[&agent],
+            )
+            .await
+            .map(|row| row.map(|row| row.get::<_, String>(0)))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn published_run(
+        &self,
+        repository: &str,
+        sha: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        let repository = repository.to_owned();
+        let sha = sha.to_owned();
+        let workflow_path = workflow_path.to_owned();
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT r.run_id FROM runs r JOIN run_submissions s ON s.run_id=r.run_id \
+                 WHERE r.push_state_json IS NOT NULL AND r.conclusion IS NOT NULL \
+                   AND s.submission_json::jsonb->>'repository'=$1 \
+                   AND s.submission_json::jsonb->>'workflow_path'=$3 \
+                   AND (s.submission_json::jsonb->>'sha'=$2 \
+                        OR r.push_state_json::jsonb->>'effective_sha'=$2) \
+                 ORDER BY r.run_id LIMIT 1",
+                &[&repository, &sha, &workflow_path],
+            )
+            .await
+            .map(|row| row.map(|row| parse_run_id(&row.get::<_, String>(0))))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id=$1 AND queue_kind='held')",
+                &[&run],
+            )
+            .await
+            .map(|row| row.get::<_, bool>(0))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
     async fn artifact_scopes(
         &self,
         plan_ids: &[String],
@@ -4898,6 +5532,57 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn attempt_repository(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT s.submission_json FROM job_requests q \
+                 JOIN run_submissions s ON s.run_id = q.run_id \
+                 WHERE q.agent_job_id = $1 \
+                 AND EXISTS (SELECT 1 FROM runs WHERE run_id = q.run_id)",
+                &[&agent_job_id.to_string()],
+            )
+            .await
+            .map_err(ControlError::backend)?
+            .map(|row| {
+                let json: String = row.get(0);
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v["repository"].as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        ControlError::backend(anyhow::anyhow!(
+                            "submission_json missing repository"
+                        ))
+                    })
+            })
+            .transpose();
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn attempt_in_run(
+        &self,
+        run_id: RunId,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<bool, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM job_requests \
+                 WHERE run_id = $1 AND plan_id = $2 AND agent_job_id = $3)",
+                &[&run_id.0.to_string(), &plan_id, &agent_job_id.to_string()],
+            )
+            .await
+            .map(|row| row.get::<_, bool>(0))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
     async fn patch_steps(
         &self,
         agent_job_id: uuid::Uuid,
@@ -4942,6 +5627,118 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn report_steps(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+        steps: Vec<serde_json::Value>,
+    ) -> Result<bool, ControlError> {
+        if steps.is_empty() {
+            return Ok(true);
+        }
+        let agent = agent_job_id.to_string();
+        let plan = plan_id.to_owned();
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            // `resolve_callback_job` precedence for a twirp report: the
+            // plan's latest request wins; the agent job id is the fallback.
+            let resolved: Option<(String, String, bool)> = match tx
+                .query_opt(
+                    "SELECT q.run_id, q.job_id, j.status = 'cancelled' \
+                     FROM job_requests q JOIN jobs j \
+                       ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                     WHERE q.plan_id = $1 ORDER BY q.request_id DESC LIMIT 1",
+                    &[&plan],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            {
+                Some(row) => Some((row.get(0), row.get(1), row.get(2))),
+                None => tx
+                    .query_opt(
+                        "SELECT q.run_id, q.job_id, j.status = 'cancelled' \
+                         FROM job_requests q JOIN jobs j \
+                           ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                         WHERE q.agent_job_id = $1",
+                        &[&agent],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?
+                    .map(|row| (row.get(0), row.get(1), row.get(2))),
+            };
+            let Some((run_id, job_id, job_cancelled)) = resolved else {
+                return Ok(false);
+            };
+            let observed = chrono::Utc::now();
+            for step in &steps {
+                let Some(report) = crate::control::types::step_report(
+                    step,
+                    job_cancelled,
+                    observed,
+                ) else {
+                    tracing::warn!(
+                        run_id, job = %job_id,
+                        "dropping step report with no external_id"
+                    );
+                    continue;
+                };
+                // UPDATE first: a reported `NULL` name/runner_number keeps the
+                // stored value; a fresh `started_at`/`finished_at` never
+                // overwrites one already recorded.
+                let updated = tx
+                    .execute(
+                        "UPDATE job_steps SET \
+                         runner_number = COALESCE($3::bigint, runner_number), \
+                         name = COALESCE($4::text, name), \
+                         conclusion = $5::text, \
+                         started_at_us = COALESCE(started_at_us, $6::bigint), \
+                         finished_at_us = COALESCE(finished_at_us, $7::bigint) \
+                         WHERE agent_job_id = $1 AND step_id = $2",
+                        &[
+                            &agent,
+                            &report.step_id,
+                            &report.runner_number,
+                            &report.name,
+                            &report.conclusion,
+                            &report.started_at_us,
+                            &report.finished_at_us,
+                        ],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                if updated == 0 {
+                    tx.execute(
+                        "INSERT INTO job_steps (agent_job_id, step_id, position, kind, \
+                         workflow_index, runner_number, context_name, name, conclusion, \
+                         started_at_us, finished_at_us) \
+                         SELECT $1::text, $2::text, COALESCE((SELECT MAX(position) + 1 \
+                         FROM job_steps WHERE agent_job_id = $1::text), 0), 'synthetic', \
+                         NULL, $3::bigint, NULL, COALESCE($4::text, ''), $5::text, \
+                         $6::bigint, $7::bigint \
+                         WHERE EXISTS (SELECT 1 FROM job_requests WHERE agent_job_id = $1::text FOR KEY SHARE)",
+                        &[
+                            &agent,
+                            &report.step_id,
+                            &report.runner_number,
+                            &report.name,
+                            &report.conclusion,
+                            &report.started_at_us,
+                            &report.finished_at_us,
+                        ],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?;
+                }
+            }
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(true)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
     async fn job_detail_missing(
         &self,
         run_id: RunId,
@@ -4956,6 +5753,38 @@ impl ControlBackend for PostgresBackend {
             .await
             .map(|row| row.is_none_or(|row| row.get::<_, bool>(0)))
             .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError> {
+        let run = run_id.0.to_string();
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let exists: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=$1)",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            if !exists {
+                return Err(ControlError::NotFound("run not found".to_owned()));
+            }
+            client
+                .query(
+                    "SELECT job_id FROM jobs WHERE run_id=$1 \
+                     UNION \
+                     SELECT job_id FROM job_requests WHERE run_id=$1 \
+                     ORDER BY 1",
+                    &[&run],
+                )
+                .await
+                .map(|rows| rows.iter().map(|row| row.get::<_, String>(0)).collect())
+                .map_err(ControlError::backend)
+        }
+        .await;
         self.return_reader(client).await;
         result
     }

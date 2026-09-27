@@ -208,18 +208,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // Stale-binding sweep: the claim/pair path writes
     // `job_assignments`/`pool_pending`; with none present there is nothing
     // to reap (the "leaked job bindings" failure mode needs a binding).
-    let now = SystemTime::now();
     if inputs.has_bindings {
-        if let Err(error) = shared
-            .state
-            .backend
-            .transact(move |tx| {
-                crate::control::sched::sweep_stale_bindings(tx, now);
-                Ok(())
-            })
-            .await
-        {
-            warn!(?error, "stale-binding sweep failed");
+        match shared.state.backend.sweep_stale_bindings().await {
+            Ok(0) => {}
+            Ok(swept) => debug!(swept, "swept stale job bindings"),
+            Err(error) => warn!(?error, "stale-binding sweep failed"),
         }
     }
     // ── Node-local inputs: pool flags + start time ──────────────────────

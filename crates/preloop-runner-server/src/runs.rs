@@ -1973,51 +1973,35 @@ pub async fn submit_run(
             // webhook adapter does for delivered events, so GitHub shows the
             // run from the moment it is accepted. Jobs resolved terminal at
             // submission (skipped, unsatisfiable needs) get their completion
-            // immediately.
             let snap = shared
                 .state
                 .backend
-                .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                    Ok(tx.runs.get(&run_id).map(|run| {
-                        (
-                            run.submission.repository.clone(),
-                            run.submission.sha.clone(),
-                            run.jobs.keys().cloned().collect::<Vec<_>>(),
-                        )
-                    }))
-                })
+                .run_dispatch_info(run_id)
                 .await
                 .map_err(ApiError::from)?;
-            let Some((repository, sha, jobs)) = snap else {
+            let Some(info) = snap else {
                 return Ok(Json(accepted));
             };
-            for job_id in &jobs {
+            for job in &info.jobs {
                 if let Err(error) = crate::github::report_check_run_queued(
                     &shared,
-                    &repository,
-                    &sha,
-                    job_id,
+                    &info.repository,
+                    &info.sha,
+                    &job.job_id,
                     run_id,
                 )
                 .await
                 {
-                    tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                    tracing::warn!(%run_id, job_id = %job.job_id.0, ?error, "failed to report queued GitHub check run");
                 }
-                let jid = job_id.clone();
-                let status = shared
-                    .state
-                    .backend
-                    .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                        Ok(tx
-                            .runs
-                            .get(&run_id)
-                            .and_then(|run| run.jobs.get(&jid).copied()))
-                    })
-                    .await
-                    .map_err(ApiError::from)?;
-                if let Some(status) = status.filter(|status| status.is_terminal()) {
-                    crate::github::report_check_run_completed(&shared, run_id, job_id, status)
-                        .await;
+                if job.status.is_terminal() {
+                    crate::github::report_check_run_completed(
+                        &shared,
+                        run_id,
+                        &job.job_id,
+                        job.status,
+                    )
+                    .await;
                 }
             }
         }
@@ -2661,8 +2645,13 @@ pub fn latest_attempt_steps(
 /// Shared by the single-run and list endpoints. Step records live in the
 /// attempt-scoped manifest rather than in the stored run, so a caller that
 /// clones `inner.runs` directly returns empty step arrays — which is exactly
-/// what the list endpoint did.
-pub fn project_run(tx: &crate::control::txstate::TxState, mut run: RunRecord) -> RunRecord {
+/// what the list endpoint did. `held` is whether the run sits on a
+/// concurrency slot; `steps_for` resolves a job's latest-attempt manifest.
+pub fn project_run_data(
+    mut run: RunRecord,
+    held: bool,
+    steps_for: &dyn Fn(RunId, &JobId) -> Option<Vec<StepRecord>>,
+) -> RunRecord {
     let run_id = run.run_id;
 
     // GitHub's run record shows a gate-passed reusable caller only as its
@@ -2709,7 +2698,7 @@ pub fn project_run(tx: &crate::control::txstate::TxState, mut run: RunRecord) ->
             // Steps live in the attempt-scoped manifest, so the run record
             // shows the newest attempt: a retry supersedes what the previous
             // dispatch reported.
-            if let Some(manifest) = latest_attempt_steps(tx, run_id, job_id) {
+            if let Some(manifest) = steps_for(run_id, job_id) {
                 detail.steps = manifest;
             }
             detail
@@ -2727,7 +2716,7 @@ pub fn project_run(tx: &crate::control::txstate::TxState, mut run: RunRecord) ->
             .values()
             .any(|status| matches!(status, ExecutionStatus::InProgress))
     {
-        run.status = if tx.held_runs.contains_key(&run_id) {
+        run.status = if held {
             ExecutionStatus::Pending
         } else {
             ExecutionStatus::Queued
@@ -2737,25 +2726,60 @@ pub fn project_run(tx: &crate::control::txstate::TxState, mut run: RunRecord) ->
     run
 }
 
+/// `project_run_data` reading its inputs from a transaction snapshot.
+pub fn project_run(tx: &crate::control::txstate::TxState, run: RunRecord) -> RunRecord {
+    let held = tx.held_runs.contains_key(&run.run_id);
+    project_run_data(run, held, &|run_id, job_id| {
+        latest_attempt_steps(tx, run_id, job_id)
+    })
+}
 pub async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    // Scoped to this run — `project_run` reads `held_runs`/`job_steps`/
-    // `job_requests`, all of which load under `runs: {run_id}`.
-    let scope = crate::control::txstate::TxScope::run(run_id).with_history();
-    shared
-        .state
-        .backend
-        .read_scoped(&scope, move |tx| {
-            let run = tx.runs.get(&run_id).cloned().ok_or_else(|| {
-                crate::control::ControlError::NotFound("run not found".to_owned())
-            })?;
-            Ok(project_run(tx, run))
-        })
+    // Indexed point reads — no working-set load. Steps resolve through the
+    // request↔manifest join; a held run is `pending`, never `queued`.
+    let backend = &shared.state.backend;
+    let run = backend
+        .run_record(run_id)
         .await
-        .map(Json)
-        .map_err(ApiError::from)
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
+    let (held, requests, manifests) = tokio::try_join!(
+        async { backend.run_held(run_id).await },
+        async { backend.run_requests(run_id).await },
+        async { backend.run_step_manifests(run_id).await },
+    )
+    .map_err(ApiError::from)?;
+    let latest_agent: std::collections::BTreeMap<&JobId, (i64, uuid::Uuid)> = requests
+        .iter()
+        .map(|request| (&request.job_id, (request.request_id, request.agent_job_id)))
+        .fold(
+            std::collections::BTreeMap::new(),
+            |mut map, (job_id, pair)| {
+                map.entry(job_id)
+                    .and_modify(|slot| {
+                        if pair.0 > slot.0 {
+                            *slot = pair;
+                        }
+                    })
+                    .or_insert(pair);
+                map
+            },
+        );
+    let projected = project_run_data(run, held, &|_run, job_id| {
+        latest_agent
+            .get(job_id)
+            .and_then(|(_, agent)| manifests.get(agent))
+            .map(|steps| {
+                let mut steps = steps.clone();
+                crate::models::StepRecord::sort_execution_order(&mut steps);
+                steps
+            })
+    });
+    Ok(Json(projected))
 }
 
 /// Browser-safe status page linked from GitHub Check Runs.
@@ -2767,14 +2791,15 @@ pub async fn get_public_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<axum::response::Html<String>, ApiError> {
-    let scope = crate::control::txstate::TxScope::run(run_id).with_history();
     let run = shared
         .state
         .backend
-        .read_scoped(&scope, move |tx| Ok(tx.runs.get(&run_id).cloned()))
+        .run_record(run_id)
         .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
 
     let jobs = run
         .jobs
@@ -3109,57 +3134,55 @@ pub async fn get_run_logs(
     // separately below.
     let job_filter = query.job.clone();
     let step_requested = query.step.is_some();
-    let scope = crate::control::txstate::TxScope::run(run_id).with_history();
-    let (requests, manifests) = shared
-        .state
-        .backend
-        .read_scoped(&scope, move |tx| {
-            if !tx.runs.contains_key(&run_id) {
-                return Err(crate::control::ControlError::NotFound(
-                    "run not found".to_owned(),
-                ));
-            }
-            let mut requests: Vec<TaskAgentJobRequestRecord> = tx
-                .job_requests
-                .values()
-                .filter(|request| request.run_id == run_id)
-                .cloned()
-                .collect();
-            requests.sort_by_key(|request| request.request_id);
+    // Backend: two indexed reads — the run's job requests and each attempt's
+    // step manifest. `inner.logs` (console blocks) is node-local and read
+    // below.
+    let backend = &shared.state.backend;
+    let mut requests = backend.run_requests(run_id).await.map_err(ApiError::from)?;
+    if requests.is_empty() {
+        // An existing run with no dispatched attempts still reads as having
+        // no requests, so confirm the run itself before reporting the job.
+        backend
+            .run_record(run_id)
+            .await
+            .map_err(|error| match error {
+                crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+                other => ApiError::from(other),
+            })?;
+    }
 
-            if let Some(job) = &job_filter {
-                // Same matching rule as the live-log feed: workflow job key
-                // or agent job UUID, so one value works across both surfaces.
-                requests.retain(|request| {
-                    request.job_id.0 == *job || request.agent_job_id.to_string() == *job
-                });
-                if requests.is_empty() {
-                    return Err(crate::control::ControlError::NotFound(format!(
-                        "job `{job}` not found in this run"
-                    )));
-                }
-            } else if step_requested && requests.len() > 1 {
-                // Numbering restarts per job, so an unqualified step in a
-                // multi-job run names more than one thing.
-                let jobs: Vec<&str> = requests
-                    .iter()
-                    .map(|request| request.job_id.0.as_str())
-                    .collect();
-                return Err(crate::control::ControlError::BadRequest(format!(
-                    "`step` needs `job` when a run has {} jobs: {}",
-                    jobs.len(),
-                    jobs.join(", ")
-                )));
-            }
+    if let Some(job) = &job_filter {
+        // Same matching rule as the live-log feed: workflow job key or agent
+        // job UUID, so one value works across both surfaces.
+        requests
+            .retain(|request| request.job_id.0 == *job || request.agent_job_id.to_string() == *job);
+        if requests.is_empty() {
+            return Err(ApiError::not_found(format!(
+                "job `{job}` not found in this run"
+            )));
+        }
+    } else if step_requested && requests.len() > 1 {
+        // Numbering restarts per job, so an unqualified step in a multi-job
+        // run names more than one thing.
+        let jobs: Vec<&str> = requests
+            .iter()
+            .map(|request| request.job_id.0.as_str())
+            .collect();
+        return Err(ApiError::bad_request(format!(
+            "`step` needs `job` when a run has {} jobs: {}",
+            jobs.len(),
+            jobs.join(", ")
+        )));
+    }
 
-            let manifests = requests
-                .iter()
-                .map(|request| tx.job_steps.get(&request.agent_job_id).cloned())
-                .collect::<Vec<_>>();
-            Ok((requests, manifests))
-        })
+    let manifests_map = backend
+        .run_step_manifests(run_id)
         .await
         .map_err(ApiError::from)?;
+    let manifests: Vec<Option<Vec<crate::models::StepRecord>>> = requests
+        .iter()
+        .map(|request| manifests_map.get(&request.agent_job_id).cloned())
+        .collect();
 
     // Read published segments plus the unflushed tail. The node-local preview
     // remains a fallback for logs created before the segment writer cutover.
@@ -3609,16 +3632,15 @@ pub async fn run_events(
     let receiver = shared.state.events.subscribe();
 
     // Backend: run status + job statuses. Node-local: the timeline-event
-    // buffer (`inner.timeline_events`). Read them under their own owners.
     let run = shared
         .state
         .backend
-        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx.runs.get(&run_id).cloned())
-        })
+        .run_record(run_id)
         .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
     let mut snapshot = event_to_ndjson(&NdjsonEvent::RunStatus {
         run_id,
         status: run.status,

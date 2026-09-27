@@ -3988,11 +3988,38 @@ impl ControlBackend for SqliteBackend {
     }
 
     async fn run_record(&self, run_id: RunId) -> Result<RunRecord, ControlError> {
-        self.read_scoped(&TxScope::run(run_id).with_history(), |tx| {
-            tx.runs
-                .get(&run_id)
-                .cloned()
-                .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))
+        let run = run_id.0.to_string();
+        let cipher = self.cipher.clone();
+        self.with_reader(move |conn| {
+            let mut loaded = load_runs(
+                conn,
+                &cipher,
+                " WHERE run_id = ?1",
+                std::slice::from_ref(&run),
+            )?
+            .into_iter();
+            let Some((_, _, mut record, _)) = loaded.next() else {
+                return Err(ControlError::NotFound(format!("run {run_id}")));
+            };
+            // Live jobs plus their archived copies — `into_record` leaves the
+            // status map empty by contract.
+            let mut stmt = conn
+                .prepare(
+                    "SELECT job_id, status FROM jobs WHERE run_id = ?1 \
+                     UNION ALL SELECT job_id, status FROM job_history WHERE run_id = ?1",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(params![run], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(ControlError::backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::backend)?;
+            for (job_id, status) in rows {
+                record.jobs.insert(JobId(job_id), status_parse(&status));
+            }
+            Ok(record)
         })
     }
 
@@ -4184,6 +4211,566 @@ impl ControlBackend for SqliteBackend {
             .ok_or_else(|| ControlError::NotFound("request".to_owned()))
         })
     }
+    async fn run_dispatch_info(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<RunDispatchInfo>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            let head = conn
+                .query_row(
+                    "SELECT s.submission_json, r.started_at_us, r.completed_at_us \
+                     FROM run_submissions s JOIN runs r ON r.run_id = s.run_id \
+                     WHERE s.run_id = ?1",
+                    params![run],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some((json, started_at_us, completed_at_us)) = head else {
+                return Ok(None);
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&json).map_err(ControlError::backend)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT j.job_id, j.status, r.display_name, r.check_run_id, \
+                            r.detail_json, \
+                            (SELECT q.agent_job_id FROM job_requests q \
+                              WHERE q.run_id=j.run_id AND q.job_id=j.job_id \
+                              ORDER BY q.request_id DESC LIMIT 1) AS agent \
+                     FROM jobs j LEFT JOIN run_jobs r \
+                       ON r.run_id=j.run_id AND r.job_id=j.job_id \
+                     WHERE j.run_id=?1 ORDER BY j.job_id",
+                )
+                .map_err(ControlError::backend)?;
+            let job_rows = stmt
+                .query_map(params![run], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })
+                .map_err(ControlError::backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::backend)?;
+            drop(stmt);
+            let mut jobs = Vec::with_capacity(job_rows.len());
+            for (job, status, display, check_run, detail_json, agent) in job_rows {
+                let mut steps = Vec::new();
+                if let Some(agent) = &agent {
+                    for (row_agent, record) in
+                        read_step_rows(conn, &format!("SELECT {STEP_COLUMNS} FROM job_steps WHERE agent_job_id=?1 ORDER BY position"), std::slice::from_ref(agent))?
+                    {
+                        let _ = row_agent;
+                        steps.push(record);
+                    }
+                }
+                jobs.push(RunDispatchJob {
+                    job_id: JobId(job),
+                    status: status_parse(&status),
+                    display_name: display,
+                    check_run_id: check_run.map(|id| id as u64),
+                    detail: detail_json
+                        .and_then(|d| serde_json::from_str(&d).ok()),
+                    steps,
+                });
+            }
+            Ok(Some(RunDispatchInfo {
+                repository: value["repository"].as_str().unwrap_or_default().to_owned(),
+                sha: value["sha"].as_str().unwrap_or_default().to_owned(),
+                started_at: started_at_us.map(us_to_system),
+                completed_at: completed_at_us.map(us_to_system),
+                jobs,
+            }))
+        })
+    }
+
+    async fn submission_fields(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<SubmissionFields>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            let submission = conn
+                .query_row(
+                    "SELECT submission_json FROM run_submissions WHERE run_id = ?1",
+                    params![run],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some(json) = submission else {
+                return Ok(None);
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&json).map_err(ControlError::backend)?;
+            Ok(Some(SubmissionFields {
+                repository: value["repository"].as_str().unwrap_or_default().to_owned(),
+                sha: value["sha"].as_str().unwrap_or_default().to_owned(),
+                base_ref: value["base_ref"].as_str().map(str::to_owned),
+                git_ref: value["git_ref"].as_str().unwrap_or_default().to_owned(),
+            }))
+        })
+    }
+
+    async fn job_check_run_id(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<u64>, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT check_run_id FROM run_jobs WHERE run_id = ?1 AND job_id = ?2",
+                params![run, job],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(|id| id.flatten().map(|id| id as u64))
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn run_job_statuses(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<Vec<(JobId, ExecutionStatus)>>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            let exists = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1)",
+                    params![run],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(ControlError::backend)?;
+            if !exists {
+                return Ok(None);
+            }
+            let mut stmt = conn
+                .prepare("SELECT job_id, status FROM jobs WHERE run_id = ?1 ORDER BY job_id")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(params![run], |row| {
+                    Ok((
+                        JobId(row.get::<_, String>(0)?),
+                        status_parse(&row.get::<_, String>(1)?),
+                    ))
+                })
+                .map_err(ControlError::backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::backend)?;
+            Ok(Some(rows))
+        })
+    }
+
+    async fn live_log_key(
+        &self,
+        run_id: RunId,
+        job_id: &str,
+    ) -> Result<Option<(String, bool)>, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.to_owned();
+        self.with_reader(move |conn| {
+            let run_status = conn
+                .query_row(
+                    "SELECT status FROM runs WHERE run_id = ?1",
+                    params![run],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some(status) = run_status else {
+                return Ok(None);
+            };
+            let run_terminal = status_parse(&status).is_terminal();
+            // A logical job key names the current attempt; an agent job id
+            // names exactly one record. `ORDER BY request_id DESC` picks the
+            // latest attempt for the logical key, never a dead feed.
+            let record = conn
+                .query_row(
+                    "SELECT agent_job_id FROM job_requests \
+                     WHERE run_id = ?1 AND (job_id = ?2 OR agent_job_id = ?2) \
+                     ORDER BY request_id DESC LIMIT 1",
+                    params![run, job],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let key = match record {
+                Some(agent) => agent,
+                None => {
+                    // A bare logical key is valid only when the run owns it —
+                    // never accept an arbitrary key that could leak another
+                    // run's output.
+                    let owned = conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id = ?1 AND job_id = ?2)",
+                            params![run, job],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(ControlError::backend)?;
+                    if !owned {
+                        return Ok(None);
+                    }
+                    job.clone()
+                }
+            };
+            // `job` is the logical id or a (missed) agent job id — the same
+            // lookup the old code did against the in-memory map.
+            let job_terminal = conn
+                .query_row(
+                    "SELECT status FROM jobs WHERE run_id = ?1 AND job_id = ?2",
+                    params![run, job],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?
+                .map(|s| status_parse(&s).is_terminal())
+                .unwrap_or(false);
+            Ok(Some((key, run_terminal || job_terminal)))
+        })
+    }
+
+    async fn run_requests(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<TaskAgentJobRequestRecord>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
+                            plan_type, timeline_id, result, locked_until, claimed_at_us,
+                            owner_runner_id, started_at_us, last_renewed_at_us,
+                            timeout_triggered, debug_token_issued
+                     FROM job_requests WHERE run_id = ?1
+                     UNION ALL
+                     SELECT h.request_id, h.run_id, h.job_id, h.agent_job_id,
+                            h.plan_id, '', h.timeline_id, h.result, '', h.claimed_at_us,
+                            h.owner_runner_id, h.started_at_us, NULL, 0, 0
+                     FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
+                     WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
+                       AND h.run_created_at_us=r.created_at_us AND h.run_id=?1
+                     ORDER BY 1",
+                )
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(params![run], |row| {
+                    let result: Option<String> = row.get(7)?;
+                    Ok(TaskAgentJobRequestRecord {
+                        request_id: row.get(0)?,
+                        run_id: parse_run_id(&row.get::<_, String>(1)?),
+                        job_id: JobId(row.get(2)?),
+                        agent_job_id: parse_uuid(&row.get::<_, String>(3)?),
+                        plan_id: row.get(4)?,
+                        plan_type: row.get(5)?,
+                        timeline_id: parse_uuid(&row.get::<_, String>(6)?),
+                        result: result.as_deref().map(status_parse),
+                        locked_until: row.get(8)?,
+                        claimed_at: row.get::<_, Option<i64>>(9)?.map(us_to_system),
+                        owner_runner_id: row.get(10)?,
+                        started_at: row.get::<_, Option<i64>>(11)?.map(us_to_system),
+                        last_renewed_at: row.get::<_, Option<i64>>(12)?.map(us_to_system),
+                        timeout_triggered: row.get::<_, i64>(13)? != 0,
+                        debug_token_issued: row.get::<_, i64>(14)? != 0,
+                    })
+                })
+                .map_err(ControlError::backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::backend)?;
+            Ok(rows)
+        })
+    }
+
+    async fn run_step_manifests(
+        &self,
+        run_id: RunId,
+    ) -> Result<BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            // Latest manifests live in `job_steps`; an archived run's are in
+            // `step_history` (matched to the live row's attempt + created_at).
+            let sql = "SELECT s.agent_job_id, s.step_id, s.kind, s.workflow_index,                  s.runner_number, s.context_name, s.name, s.conclusion,                  s.started_at_us, s.finished_at_us, s.position FROM job_steps s                  JOIN job_requests r ON r.agent_job_id = s.agent_job_id                  WHERE r.run_id = ?1                  UNION ALL                  SELECT h.agent_job_id, h.step_id, h.kind, h.workflow_index,                  h.runner_number, h.context_name, h.name, h.conclusion,                  h.started_at_us, h.finished_at_us, h.position FROM step_history h                  JOIN runs r2 ON r2.run_id=h.run_id AND r2.run_attempt=h.run_attempt                    AND r2.created_at_us=h.run_created_at_us                  WHERE h.run_id=?1 AND r2.archived_at_us IS NOT NULL                  ORDER BY 1, 11";
+            let mut manifests: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>> =
+                BTreeMap::new();
+            for (agent, record) in read_step_rows(conn, sql, &[run])? {
+                manifests.entry(agent).or_default().push(record);
+            }
+            Ok(manifests)
+        })
+    }
+
+    async fn issue_debug_token(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<(RunId, String), ControlError> {
+        let agent = agent_job_id.to_string();
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let row = tx
+                .query_row(
+                    "SELECT request_id, run_id, plan_id, debug_token_issued \
+                     FROM job_requests WHERE agent_job_id = ?1 AND result IS NULL \
+                     ORDER BY request_id DESC LIMIT 1",
+                    params![agent],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let Some((request_id, run_id, plan_id, already_issued)) = row else {
+                return Err(ControlError::NotFound(format!(
+                    "no active job request for agent job {agent}"
+                )));
+            };
+            // The runner only builds a pause client under
+            // `preloopPreserveOnFailure`, so gating on the same flag issues
+            // the credential exactly when it is used, and never otherwise.
+            let submission: Option<String> = tx
+                .query_row(
+                    "SELECT submission_json FROM run_submissions WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            let preserve = submission
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .and_then(|value| value["preserve_on_failure"].as_bool())
+                .unwrap_or(false);
+            if !preserve {
+                return Err(ControlError::Forbidden(
+                    "this run did not enable pause-on-failure".to_owned(),
+                ));
+            }
+            if already_issued != 0 {
+                // Distinct from a 403 so a worker can tell "someone beat me
+                // to it" from "not allowed at all" in its log.
+                return Err(ControlError::Conflict(format!(
+                    "debug-worker token already issued for agent job {agent}"
+                )));
+            }
+            tx.execute(
+                "UPDATE job_requests SET debug_token_issued = 1 WHERE request_id = ?1",
+                params![request_id],
+            )
+            .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)?;
+            Ok((parse_run_id(&run_id), plan_id))
+        })
+    }
+
+    async fn sweep_stale_bindings(&self) -> Result<usize, ControlError> {
+        let pool_on = self
+            .pool_assignments_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let require_on = self
+            .require_job_assignments
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let now_us = system_to_us(std::time::SystemTime::now());
+        // Freshness windows mirror `assignment_fresh`/`binding_fresh`.
+        let assignment_cutoff = now_us - sched::ASSIGNMENT_TTL.as_micros() as i64;
+        let binding_cutoff = now_us - sched::CLAIM_BINDING_TTL.as_micros() as i64;
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            let mut swept = 0usize;
+            if pool_on {
+                swept += tx
+                    .execute(
+                        "DELETE FROM job_assignments WHERE (run_id, job_id) NOT IN \
+                         (SELECT run_id, job_id FROM jobs WHERE queue_kind = 'ready')",
+                        [],
+                    )
+                    .map_err(ControlError::backend)?;
+                swept += tx
+                    .execute(
+                        "DELETE FROM pool_pending WHERE (run_id, job_id) NOT IN \
+                         (SELECT run_id, job_id FROM jobs WHERE queue_kind = 'ready')",
+                        [],
+                    )
+                    .map_err(ControlError::backend)?;
+            }
+            if !require_on && !pool_on {
+                swept += tx
+                    .execute(
+                        "DELETE FROM job_assignments WHERE at_us < ?1",
+                        params![assignment_cutoff],
+                    )
+                    .map_err(ControlError::backend)?;
+                swept += tx
+                    .execute(
+                        "DELETE FROM pool_pending WHERE at_us < ?1",
+                        params![assignment_cutoff],
+                    )
+                    .map_err(ControlError::backend)?;
+            } else {
+                // Release (not delete) stale or dead-runner bindings: the job
+                // goes back to the pool waitlist.
+                let stale = {
+                    let mut stmt = tx
+                        .prepare(
+                            "SELECT a.run_id, a.job_id FROM job_assignments a \
+                             WHERE a.runner_id IS NOT NULL \
+                             AND (a.at_us < ?1 OR NOT EXISTS ( \
+                                 SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id))",
+                        )
+                        .map_err(ControlError::backend)?;
+                    let rows = stmt
+                        .query_map(params![binding_cutoff], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(ControlError::backend)?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(ControlError::backend)?
+                };
+                for (run_id, job_id) in stale {
+                    tx.execute(
+                        "UPDATE job_assignments SET runner_id = NULL WHERE run_id = ?1 AND job_id = ?2",
+                        params![run_id, job_id],
+                    )
+                    .map_err(ControlError::backend)?;
+                    tx.execute(
+                        "INSERT INTO pool_pending (run_id, job_id, at_us) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(run_id, job_id) DO UPDATE SET at_us = excluded.at_us",
+                        params![run_id, job_id, now_us],
+                    )
+                    .map_err(ControlError::backend)?;
+                    swept += 1;
+                }
+            }
+            tx.commit().map_err(ControlError::backend)?;
+            Ok(swept)
+        })
+    }
+
+    async fn check_run_target(
+        &self,
+        check_run_id: u64,
+        repository: &str,
+        head_sha: Option<&str>,
+        job_name: Option<&str>,
+        details_run_id: Option<RunId>,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        let check_run_id = check_run_id as i64;
+        let repository = repository.to_owned();
+        let head_sha = head_sha.map(str::to_owned);
+        let job_name = job_name.map(str::to_owned);
+        let details = details_run_id.map(|id| id.0.to_string());
+        self.with_reader(move |conn| {
+            // A rerequest targets a terminal run of this repository at this
+            // head. `details_run_id` (from the check run's details_url) wins
+            // when it matches; otherwise runs are considered in id order —
+            // the same order the old full-map scan produced.
+            let hit = conn
+                .query_row(
+                    "SELECT j.run_id, j.job_id FROM run_jobs j \
+                     JOIN runs r ON r.run_id=j.run_id \
+                     JOIN run_submissions s ON s.run_id=j.run_id \
+                     WHERE j.check_run_id=?1 \
+                       AND json_extract(s.submission_json,'$.repository')=?2 \
+                       AND (?3 IS NULL OR r.head_sha=?3) \
+                       AND r.status IN ('success','failure','skipped','cancelled') \
+                     ORDER BY (j.run_id=?4) DESC, j.run_id LIMIT 1",
+                    params![check_run_id, repository, head_sha, details],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            if let Some((run_id, job_id)) = hit {
+                return Ok(Some((parse_run_id(&run_id), JobId(job_id))));
+            }
+            let Some(name) = job_name else {
+                return Ok(None);
+            };
+            // Fallback parity: the check-run `name` against the logical job
+            // key and the display name (the check run is created under the
+            // display name).
+            let hit = conn
+                .query_row(
+                    "SELECT j.run_id, j.job_id FROM run_jobs j \
+                     JOIN runs r ON r.run_id=j.run_id \
+                     JOIN run_submissions s ON s.run_id=j.run_id \
+                     WHERE (j.job_id=?5 OR j.display_name=?5) \
+                       AND json_extract(s.submission_json,'$.repository')=?2 \
+                       AND (?3 IS NULL OR r.head_sha=?3) \
+                       AND r.status IN ('success','failure','skipped','cancelled') \
+                     ORDER BY (j.run_id=?4) DESC, j.run_id LIMIT 1",
+                    params![check_run_id, repository, head_sha, details, name],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            Ok(hit.map(|(run_id, job_id)| (parse_run_id(&run_id), JobId(job_id))))
+        })
+    }
+
+    async fn submission_json_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        let agent = agent_job_id.to_string();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT s.submission_json FROM job_requests q \
+                 JOIN run_submissions s ON s.run_id = q.run_id \
+                 WHERE q.agent_job_id = ?1 ORDER BY q.request_id DESC LIMIT 1",
+                params![agent],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn published_run(
+        &self,
+        repository: &str,
+        sha: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        let repository = repository.to_owned();
+        let sha = sha.to_owned();
+        let workflow_path = workflow_path.to_owned();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT r.run_id FROM runs r JOIN run_submissions s ON s.run_id=r.run_id \
+                 WHERE r.push_state_json IS NOT NULL AND r.conclusion IS NOT NULL \
+                   AND json_extract(s.submission_json,'$.repository')=?1 \
+                   AND json_extract(s.submission_json,'$.workflow_path')=?3 \
+                   AND (json_extract(s.submission_json,'$.sha')=?2 \
+                        OR json_extract(r.push_state_json,'$.effective_sha')=?2) \
+                 ORDER BY r.run_id LIMIT 1",
+                params![repository, sha, workflow_path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::backend)?
+            .map(|id| Ok(parse_run_id(&id)))
+            .transpose()
+        })
+    }
     async fn artifact_scopes(
         &self,
         plan_ids: &[String],
@@ -4216,6 +4803,18 @@ impl ControlBackend for SqliteBackend {
                     .or_insert_with(|| parse_run_id(&run_id));
             }
             Ok(scopes)
+        })
+    }
+
+    async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 AND queue_kind='held')",
+                params![run],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(ControlError::backend)
         })
     }
 
@@ -4361,6 +4960,56 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn attempt_repository(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<String>, ControlError> {
+        let agent = agent_job_id.to_string();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT s.submission_json FROM job_requests q \
+                 JOIN run_submissions s ON s.run_id = q.run_id \
+                 WHERE q.agent_job_id = ?1 \
+                 AND EXISTS (SELECT 1 FROM runs WHERE run_id = q.run_id)",
+                params![agent],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::backend)?
+            .map(|json| {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .ok()
+                    .and_then(|v| v["repository"].as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        ControlError::backend(anyhow::anyhow!(
+                            "submission_json missing repository"
+                        ))
+                    })
+            })
+            .transpose()
+        })
+    }
+
+    async fn attempt_in_run(
+        &self,
+        run_id: RunId,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<bool, ControlError> {
+        let run = run_id.0.to_string();
+        let plan = plan_id.to_owned();
+        let agent = agent_job_id.to_string();
+        self.with_reader(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM job_requests \
+                 WHERE run_id = ?1 AND plan_id = ?2 AND agent_job_id = ?3)",
+                params![run, plan, agent],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(ControlError::backend)
+        })
+    }
+
     async fn patch_steps(
         &self,
         agent_job_id: uuid::Uuid,
@@ -4398,6 +5047,108 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn report_steps(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+        steps: Vec<serde_json::Value>,
+    ) -> Result<bool, ControlError> {
+        let agent = agent_job_id.to_string();
+        let plan = plan_id.to_owned();
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            // `resolve_callback_job` precedence for a twirp report: the
+            // plan's latest request wins; the agent job id is the fallback.
+            // Job status comes from the resolved request's run_jobs row.
+            let resolved: Option<(String, String, bool)> = tx
+                .query_row(
+                    "SELECT q.run_id, q.job_id, j.status = 'cancelled' \
+                     FROM job_requests q JOIN jobs j \
+                       ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                     WHERE q.plan_id = ?1 ORDER BY q.request_id DESC LIMIT 1",
+                    params![plan],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(ControlError::backend)?
+                .or_else(|| {
+                    tx.query_row(
+                        "SELECT q.run_id, q.job_id, j.status = 'cancelled' \
+                         FROM job_requests q JOIN jobs j \
+                           ON j.run_id = q.run_id AND j.job_id = q.job_id \
+                         WHERE q.agent_job_id = ?1",
+                        params![agent],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                });
+            let Some((run_id, job_id, job_cancelled)) = resolved else {
+                return Ok(false);
+            };
+            let observed = chrono::Utc::now();
+            for step in &steps {
+                let Some(report) =
+                    crate::control::types::step_report(step, job_cancelled, observed)
+                else {
+                    tracing::warn!(
+                        run_id, job = %job_id,
+                        "dropping step report with no external_id"
+                    );
+                    continue;
+                };
+                // UPDATE first: a reported `NULL` name/runner_number keeps the
+                // stored value; a fresh `started_at`/`finished_at` never
+                // overwrites one already recorded.
+                let updated = tx
+                    .execute(
+                        "UPDATE job_steps SET \
+                         runner_number = COALESCE(?3, runner_number), \
+                         name = COALESCE(?4, name), \
+                         conclusion = ?5, \
+                         started_at_us = COALESCE(started_at_us, ?6), \
+                         finished_at_us = COALESCE(finished_at_us, ?7) \
+                         WHERE agent_job_id = ?1 AND step_id = ?2",
+                        params![
+                            agent,
+                            report.step_id,
+                            report.runner_number,
+                            report.name,
+                            report.conclusion,
+                            report.started_at_us,
+                            report.finished_at_us
+                        ],
+                    )
+                    .map_err(ControlError::backend)?;
+                if updated == 0 {
+                    tx.execute(
+                        "INSERT INTO job_steps (agent_job_id, step_id, position, kind, \
+                         workflow_index, runner_number, context_name, name, conclusion, \
+                         started_at_us, finished_at_us) \
+                         SELECT ?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM job_steps \
+                         WHERE agent_job_id = ?1), 0), 'synthetic', NULL, ?3, NULL, \
+                         COALESCE(?4, ''), ?5, ?6, ?7 \
+                         WHERE EXISTS (SELECT 1 FROM job_requests WHERE agent_job_id = ?1)",
+                        params![
+                            agent,
+                            report.step_id,
+                            report.runner_number,
+                            report.name,
+                            report.conclusion,
+                            report.started_at_us,
+                            report.finished_at_us
+                        ],
+                    )
+                    .map_err(ControlError::backend)?;
+                }
+            }
+            tx.commit().map_err(ControlError::backend)?;
+            Ok(true)
+        })
+    }
+
     async fn job_detail_missing(
         &self,
         run_id: RunId,
@@ -4414,6 +5165,38 @@ impl ControlBackend for SqliteBackend {
             .optional()
             .map(|missing| missing.unwrap_or(true))
             .map_err(ControlError::backend)
+        })
+    }
+
+    async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError> {
+        let run = run_id.0.to_string();
+        self.with_reader(move |conn| {
+            // `tx.runs.get(run_id)` semantics: an absent run is NotFound even
+            // when request rows still name it.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=?1)",
+                    params![run],
+                    |row| row.get(0),
+                )
+                .map_err(ControlError::backend)?;
+            if !exists {
+                return Err(ControlError::NotFound("run not found".to_owned()));
+            }
+            let mut rows = conn
+                .prepare(
+                    "SELECT job_id FROM jobs WHERE run_id=?1 \
+                     UNION \
+                     SELECT job_id FROM job_requests WHERE run_id=?1 \
+                     ORDER BY 1",
+                )
+                .map_err(ControlError::backend)?;
+            let ids = rows
+                .query_map(params![run], |row| row.get::<_, String>(0))
+                .map_err(ControlError::backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::backend)?;
+            Ok(ids)
         })
     }
 

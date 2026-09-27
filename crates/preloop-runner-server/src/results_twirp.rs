@@ -44,94 +44,13 @@ pub async fn twirp_workflow_steps_update(
         return Ok(Json(json!({"ok": true})));
     };
 
-    // Resolve the callback identity and apply the step manifest update in one
-    // backend transaction — `job_steps` is durable TxState, so the commit
-    // persists exactly the steps that changed (no separate store write).
+    // Resolve the callback identity and merge each reported step into
+    // `job_steps` in one backend transaction — an indexed write, no working
+    // set. Unresolvable identities are acknowledged and dropped.
     shared
         .state
         .backend
-        .transact(move |tx| {
-            let Some((_, run_id, job_id)) =
-                resolve_callback_job(tx, &plan_uuid.to_string(), None, Some(job_uuid))
-            else {
-                return Ok(());
-            };
-
-            let job_status = tx
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.jobs.get(&job_id).copied());
-            let observed = chrono::Utc::now();
-            let records = tx.job_steps.entry(job_uuid).or_default();
-
-            for step in &steps {
-                let external_id = step["external_id"].as_str().unwrap_or("");
-                if external_id.is_empty() {
-                    // With no identity there is nothing to reconcile against,
-                    // and guessing by display name is exactly what merged two
-                    // distinct same-named steps and lost one from the run.
-                    tracing::warn!(
-                        %run_id, job = %job_id.0,
-                        "dropping step report with no external_id"
-                    );
-                    continue;
-                }
-
-                let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
-                let status_num = step["status"].as_u64().unwrap_or(0);
-                let terminal = status_num == 6;
-                let conclusion = if terminal {
-                    match conclusion_num {
-                        2 => "success",
-                        3 if job_status == Some(ExecutionStatus::Cancelled) => "cancelled",
-                        3 => "failure",
-                        7 => "skipped",
-                        _ => "success",
-                    }
-                } else {
-                    "in_progress"
-                };
-                // The runner reports the rendered display name ("Run
-                // actions/checkout@v4"), the same string GitHub's UI shows, so
-                // it wins over the message's name: the server leaves that
-                // empty for steps without an explicit `name:`.
-                let reported_name = step["name"].as_str().filter(|name| !name.is_empty());
-                let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
-
-                match StepRecord::find_by_id(records, external_id) {
-                    Some(pos) => {
-                        let record = &mut records[pos];
-                        record.conclusion = conclusion.to_owned();
-                        record.runner_number = runner_number.or(record.runner_number);
-                        if let Some(name) = reported_name {
-                            record.name = name.to_owned();
-                        }
-                        // First non-terminal sighting is the start signal.
-                        if !terminal && record.started_at.is_none() {
-                            record.started_at = Some(observed);
-                        }
-                        if terminal && record.finished_at.is_none() {
-                            record.finished_at = Some(observed);
-                        }
-                    }
-                    None => records.push(StepRecord {
-                        id: external_id.to_owned(),
-                        kind: StepKind::Synthetic,
-                        workflow_index: None,
-                        runner_number,
-                        context_name: None,
-                        name: reported_name.unwrap_or_default().to_owned(),
-                        conclusion: conclusion.to_owned(),
-                        // Do not invent `started_at == finished_at`, which
-                        // forces duration 0 for a step that completed before
-                        // any in-progress update was processed.
-                        started_at: (!terminal).then_some(observed),
-                        finished_at: terminal.then_some(observed),
-                    }),
-                }
-            }
-            Ok(())
-        })
+        .report_steps(&plan_uuid.to_string(), job_uuid, steps)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({"ok": true})))

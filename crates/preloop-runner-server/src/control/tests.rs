@@ -430,6 +430,101 @@ pub(crate) mod suite {
         assert!(backend.live_assignments().await.unwrap().is_empty());
     }
 
+    /// `report_steps` merges a runner's `WorkflowStepsUpdate` into the
+    /// attempt's step rows: a reported display name wins, `runner_number`
+    /// persists, a non-terminal report stamps `started_at`, a terminal-only
+    /// report does not invent a start, and unknown identities are dropped.
+    pub(crate) async fn step_reports_merge_into_manifest(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_full(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let poll = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = poll else {
+            panic!("expected a claim, got {poll:?}");
+        };
+        let agent = claimed.request.agent_job_id;
+        let plan = claimed.request.plan_id.clone();
+
+        // In-progress report: renders the name, stamps start, keeps the
+        // declared workflow step's runner number when absent.
+        assert!(backend
+            .report_steps(
+                &plan,
+                agent,
+                vec![serde_json::json!({
+                    "external_id": "step-1",
+                    "number": 2,
+                    "name": "Run build",
+                    "status": 2,
+                    "conclusion": 0
+                })],
+            )
+            .await
+            .unwrap());
+        // Terminal report on a second, undeclared step + a name-less update.
+        assert!(backend
+            .report_steps(
+                &plan,
+                agent,
+                vec![
+                    serde_json::json!({
+                        "external_id": "step-1",
+                        "name": "",
+                        "status": 6,
+                        "conclusion": 2
+                    }),
+                    serde_json::json!({
+                        "external_id": "step-9",
+                        "number": 5,
+                        "name": "Post job",
+                        "status": 6,
+                        "conclusion": 2
+                    }),
+                ],
+            )
+            .await
+            .unwrap());
+        let manifests = backend.run_step_manifests(run_id).await.unwrap();
+        let steps = manifests.get(&agent).expect("manifest for the attempt");
+        let s1 = steps.iter().find(|s| s.id == "step-1").expect("step-1");
+        assert_eq!(s1.name, "Run build");
+        assert_eq!(s1.conclusion, "success");
+        assert!(s1.started_at.is_some(), "in_progress report stamps start");
+        assert!(s1.finished_at.is_some());
+        let s9 = steps.iter().find(|s| s.id == "step-9").expect("step-9");
+        assert_eq!(s9.runner_number, Some(5));
+        assert!(
+            s9.started_at.is_none(),
+            "a terminal-only sighting must not fake started_at"
+        );
+
+        // An unresolvable identity acknowledges and drops the report.
+        assert!(!backend
+            .report_steps(
+                "no-such-plan",
+                uuid::Uuid::new_v4(),
+                vec![serde_json::json!({"external_id": "x", "status": 6})],
+            )
+            .await
+            .unwrap());
+    }
+
     pub(crate) async fn webhook_replay_is_idempotent(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", 1)]);
@@ -1034,6 +1129,11 @@ mod sqlite {
     #[tokio::test]
     async fn submit_poll_complete_lifecycle() {
         suite::submit_poll_complete_lifecycle(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn step_reports_merge_into_manifest() {
+        suite::step_reports_merge_into_manifest(&SqliteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2501,6 +2601,12 @@ mod postgres {
     async fn submit_poll_complete_lifecycle() {
         let (_pg, backend) = backend().await;
         suite::submit_poll_complete_lifecycle(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn step_reports_merge_into_manifest() {
+        let (_pg, backend) = backend().await;
+        suite::step_reports_merge_into_manifest(&backend).await;
     }
 
     /// Lease renewal is one conditional statement: the owner renews; another

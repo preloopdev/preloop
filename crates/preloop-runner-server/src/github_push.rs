@@ -95,34 +95,10 @@ pub async fn already_published(
     sha: &str,
     workflow_path: &str,
 ) -> Option<RunId> {
-    let repository = repository.to_owned();
-    let sha = sha.to_owned();
-    let workflow_path = workflow_path.to_owned();
     shared
         .state
         .backend
-        .read(move |tx| {
-            Ok(tx
-                .runs
-                .values()
-                .find(|run| {
-                    run.push_state.is_some()
-                        // `conclusion` is what the push path itself treats as
-                        // terminal, so the two must agree or a published run
-                        // would still be re-run by its own echo.
-                        && run.conclusion.is_some()
-                        && run.submission.repository == repository
-                        && (run.submission.sha == sha
-                            || run
-                                .push_state
-                                .as_ref()
-                                .and_then(|state| state.effective_sha.as_deref())
-                                == Some(sha.as_str()))
-                        && run.submission.workflow_path.as_deref()
-                            == Some(workflow_path.as_str())
-                })
-                .map(|run| run.run_id))
-        })
+        .published_run(repository, sha, workflow_path)
         .await
         .unwrap_or(None)
 }
@@ -137,12 +113,12 @@ pub async fn push_run_to_github(
     let run = shared
         .state
         .backend
-        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx.runs.get(&run_id).cloned())
-        })
+        .run_record(run_id)
         .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
     let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs, dirty) = {
         let run = &run;
         if let Some(state) = &run.push_state {
@@ -313,14 +289,10 @@ pub async fn push_run_to_github(
     let base = match &shared
         .state
         .backend
-        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.submission.base_ref.clone()))
-        })
+        .submission_fields(run_id)
         .await
         .map_err(ApiError::from)?
+        .and_then(|fields| fields.base_ref)
     {
         Some(base) => base
             .strip_prefix("refs/heads/")
@@ -424,18 +396,13 @@ pub async fn push_run_to_github(
     //    loop may have been skipped or failed). Jobs with an existing check
     //    run were already updated through the normal lifecycle.
     for job_id in jobs.keys() {
-        let jid = job_id.clone();
         let has_check_run = shared
             .state
             .backend
-            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                Ok(tx
-                    .runs
-                    .get(&run_id)
-                    .is_some_and(|run| run.job_check_run_ids.contains_key(&jid)))
-            })
+            .job_check_run_id(run_id, job_id)
             .await
-            .unwrap_or(false);
+            .unwrap_or(None)
+            .is_some();
         if !has_check_run {
             if let Err(error) = crate::github::report_check_run_queued(
                 shared,

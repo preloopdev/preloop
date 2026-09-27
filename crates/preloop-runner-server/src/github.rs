@@ -264,12 +264,7 @@ pub async fn report_check_run_queued(
     let existing_check_run_id = shared
         .state
         .backend
-        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.job_check_run_ids.get(job_id).copied()))
-        })
+        .job_check_run_id(run_id, job_id)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let token = resolve_check_run_token(shared, repo).await;
@@ -613,26 +608,25 @@ pub async fn report_check_runs_for_run(
         let outcome = shared
             .state
             .backend
-            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                Ok(tx.runs.get(&run_id).map(|run| {
-                    (
-                        run.submission.repository.clone(),
-                        run.submission.sha.clone(),
-                        run.jobs.keys().cloned().collect::<Vec<_>>(),
-                    )
-                }))
-            })
+            .run_dispatch_info(run_id)
             .await
             .map_err(crate::ApiError::from)
             .ok()
             .flatten();
         match outcome {
-            Some(outcome) => outcome,
+            Some(info) => (
+                info.repository,
+                info.sha,
+                info.jobs
+                    .iter()
+                    .map(|job| (job.job_id.clone(), job.status))
+                    .collect::<Vec<_>>(),
+            ),
             None => return,
         }
     };
 
-    for job_id in jobs {
+    for (job_id, status) in jobs {
         if let Some((reused_job_id, check_run_id)) = &reused_check_run {
             if reused_job_id == &job_id {
                 if let Err(error) = report_existing_check_run_queued(
@@ -657,22 +651,7 @@ pub async fn report_check_runs_for_run(
             warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
         }
 
-        let status = {
-            let jid = job_id.clone();
-            shared
-                .state
-                .backend
-                .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                    Ok(tx
-                        .runs
-                        .get(&run_id)
-                        .and_then(|run| run.jobs.get(&jid).copied()))
-                })
-                .await
-                .ok()
-                .flatten()
-        };
-        if let Some(status) = status.filter(|status| status.is_terminal()) {
+        if status.is_terminal() {
             report_check_run_completed(shared, run_id, &job_id, status).await;
         }
     }
@@ -685,33 +664,31 @@ pub async fn report_check_run_in_progress(
     job_id: &JobId,
 ) {
     let (repo, check_run_id, job_name) = {
-        let outcome = shared
-            .state
-            .backend
-            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                Ok(tx.runs.get(&run_id).and_then(|run| {
-                    run.job_check_run_ids
-                        .get(job_id)
-                        .copied()
-                        .map(|check_run_id| {
-                            (
-                                run.submission.repository.clone(),
-                                check_run_id,
-                                run.job_names
-                                    .get(job_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| job_id.0.clone()),
-                            )
-                        })
-                }))
-            })
+        let backend = &shared.state.backend;
+        let Some(check_run_id) = backend
+            .job_check_run_id(run_id, job_id)
             .await
             .ok()
-            .flatten();
-        match outcome {
-            Some(outcome) => outcome,
-            None => return,
-        }
+            .flatten()
+        else {
+            return;
+        };
+        let repo = backend
+            .submission_fields(run_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|fields| fields.repository);
+        let Some(repo) = repo else {
+            return;
+        };
+        let job_name = backend
+            .job_display_name(run_id, job_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| job_id.0.clone());
+        (repo, check_run_id, job_name)
     };
 
     let token = resolve_check_run_token(shared, &repo).await;
@@ -819,64 +796,70 @@ pub async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    // Backend: run + projected job detail. Node-local: `timeline_events` for
+    // Backend: one indexed dispatch read. Node-local: `timeline_events` for
     // annotations. Read each under its own owner.
     let (repo, check_run_id, job_name, steps, started_at, completed_at, detail) = {
-        let scope = crate::control::txstate::TxScope::run(run_id);
         let outcome = shared
             .state
             .backend
-            .read_scoped(&scope, move |tx| {
-                let build = |tx: &crate::control::txstate::TxState| {
-                    let run = tx.runs.get(&run_id)?;
-                    let repo = run.submission.repository.clone();
-                    let check_run_id = run.job_check_run_ids.get(job_id).copied()?;
-                    let projected = crate::runs::project_run(tx, run.clone());
-                    let detail = projected
-                        .jobs_list
-                        .iter()
-                        .find(|detail| detail.job_id == job_id.0)
-                        .cloned();
-                    let job_name = detail
-                        .as_ref()
-                        .map(|detail| detail.name.clone())
-                        .or_else(|| run.job_names.get(job_id).cloned())
-                        .unwrap_or_else(|| job_id.0.clone());
-                    let steps = detail
-                        .as_ref()
-                        .map(|detail| detail.steps.clone())
-                        .unwrap_or_default();
-                    let started_at = steps
-                        .iter()
-                        .filter_map(|step| step.started_at)
-                        .min()
-                        .or(run.started_at);
-                    let completed_at = steps
-                        .iter()
-                        .filter_map(|step| step.finished_at)
-                        .max()
-                        .or(run.completed_at)
-                        .unwrap_or_else(chrono::Utc::now);
-                    Some((
-                        repo,
-                        check_run_id,
-                        job_name,
-                        steps,
-                        started_at,
-                        completed_at,
-                        detail,
-                    ))
-                };
-                Ok(build(tx))
-            })
+            .run_dispatch_info(run_id)
             .await
             .map_err(crate::ApiError::from)
             .ok()
             .flatten();
-        match outcome {
-            Some(outcome) => outcome,
-            None => return,
+        let Some(info) = outcome else {
+            return;
+        };
+        let Some(job) = info.jobs.iter().find(|job| job.job_id == *job_id) else {
+            return;
+        };
+        let Some(check_run_id) = job.check_run_id else {
+            return;
+        };
+        // `project_run`'s per-job projection, minus the pieces it derived
+        // from a second pass over the whole run: name, status conclusion and
+        // the latest attempt's step manifest.
+        let mut detail = job.detail.clone().unwrap_or(crate::models::JobDetail {
+            job_id: job.job_id.0.clone(),
+            name: job
+                .display_name
+                .clone()
+                .unwrap_or_else(|| job.job_id.0.clone()),
+            conclusion: crate::runtime_scheduling::status_string(job.status),
+            steps: Vec::new(),
+            annotations: Vec::new(),
+        });
+        detail.job_id = job.job_id.0.clone();
+        detail.name = job
+            .display_name
+            .clone()
+            .unwrap_or_else(|| job.job_id.0.clone());
+        detail.conclusion = crate::runtime_scheduling::status_string(job.status);
+        if !job.steps.is_empty() {
+            detail.steps = job.steps.clone();
         }
+        let job_name = detail.name.clone();
+        let steps = detail.steps.clone();
+        let started_at = steps
+            .iter()
+            .filter_map(|step| step.started_at)
+            .min()
+            .or_else(|| info.started_at.map(chrono::DateTime::from));
+        let completed_at = steps
+            .iter()
+            .filter_map(|step| step.finished_at)
+            .max()
+            .or_else(|| info.completed_at.map(chrono::DateTime::from))
+            .unwrap_or_else(chrono::Utc::now);
+        (
+            info.repository,
+            check_run_id,
+            job_name,
+            steps,
+            started_at,
+            completed_at,
+            Some(detail),
+        )
     };
 
     let (annotations, global_issues) = {
@@ -1679,47 +1662,12 @@ async fn process_check_run_rerequest(
                 .and_then(|value| value.parse::<RunId>().ok())
         });
 
-    let target = {
-        let repository = repository.to_owned();
-        shared
-            .state
-            .backend
-            .read(move |tx| {
-                let mut candidates = Vec::new();
-                if let Some(run_id) = details_run_id {
-                    candidates.push(run_id);
-                }
-                candidates.extend(
-                    tx.runs
-                        .keys()
-                        .filter(|run_id| Some(**run_id) != details_run_id)
-                        .copied(),
-                );
-
-                Ok(candidates.into_iter().find_map(|run_id| {
-                    let run = tx.runs.get(&run_id)?;
-                    if run.submission.repository != repository
-                        || head_sha.is_some_and(|sha| run.head_sha != sha)
-                        || !run.status.is_terminal()
-                    {
-                        return None;
-                    }
-
-                    let job_id = run
-                        .job_check_run_ids
-                        .iter()
-                        .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))
-                        .or_else(|| {
-                            job_name
-                                .map(|name| JobId(name.to_owned()))
-                                .filter(|job_id| run.jobs.contains_key(job_id))
-                        })?;
-                    Some((run_id, job_id))
-                }))
-            })
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let target = shared
+        .state
+        .backend
+        .check_run_target(check_run_id, repository, head_sha, job_name, details_run_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let Some((run_id, job_id, event, actor, workflow_file)) = target else {
         warn!(
@@ -2882,20 +2830,16 @@ async fn process_delivery_payload_with_lease(
                         .status_check_sha
                         .clone()
                         .unwrap_or_else(|| resolved_sha.clone());
-                    let jobs = shared
+                    let info = shared
                         .state
                         .backend
-                        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                            Ok(tx
-                                .runs
-                                .get(&run_id)
-                                .map(|r| r.jobs.keys().cloned().collect::<Vec<_>>()))
-                        })
+                        .run_dispatch_info(run_id)
                         .await
                         .ok()
                         .flatten();
-                    if let Some(jobs) = jobs {
-                        for job_id in jobs {
+                    if let Some(info) = info {
+                        for job in &info.jobs {
+                            let job_id = job.job_id.clone();
                             tokio::select! {
                                 _ = lease_lost.cancelled() => return WebhookOutcome::Success,
                                 res = report_check_run_queued(
@@ -2912,28 +2856,10 @@ async fn process_delivery_payload_with_lease(
                                     }
                                 }
                             };
-                            let status = tokio::select! {
-                                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
-                                status = async {
-                                    let jid = job_id.clone();
-                                    shared
-                                        .state
-                                        .backend
-                                        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                                            Ok(tx
-                                                .runs
-                                                .get(&run_id)
-                                                .and_then(|r| r.jobs.get(&jid).copied()))
-                                        })
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                } => status,
-                            };
-                            if let Some(status) = status.filter(|s| s.is_terminal()) {
+                            if job.status.is_terminal() {
                                 tokio::select! {
                                     _ = lease_lost.cancelled() => return WebhookOutcome::Success,
-                                    _ = report_check_run_completed(shared, run_id, &job_id, status) => {}
+                                    _ = report_check_run_completed(shared, run_id, &job_id, job.status) => {}
                                 }
                             }
                         }
