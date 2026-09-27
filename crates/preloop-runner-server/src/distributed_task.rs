@@ -796,169 +796,199 @@ pub(crate) async fn complete_job_settling(
         .run_in_concurrency(comp.run_id)
         .await
         .map_err(ApiError::from)?;
-    let scope = crate::control::txstate::TxScope {
-        include_archived: false,
-        runs: Some(std::collections::BTreeSet::from([comp.run_id])),
-        // `ready_queue`/`blocked_jobs` stay unloaded: `complete_job`
-        // promotes `pending_jobs`, and `needs:` never cross runs, so this
-        // run's own pending rows already load via the `runs` clause.
-        // Loading every queued/blocked job payload is O(#queued) per
-        // completion for no benefit. `queue_nonempty`/`next_runs_on` read
-        // the O(1) `ready_index`/`next_queue_labels` snapshots.
-        ready_queue: false,
-        blocked_jobs: false,
-        sessions: Some(sessions),
-        // Only a run in a concurrency group can release a gate that wakes
-        // another run; every other completion stays under its run lock.
-        concurrency: in_concurrency,
-        runs_referenced: true,
-        job_requests_all: false,
-        pending_expansions: false,
-        runs_via_requests: false,
-    };
-    let tx_out = shared
-        .state
-        .backend
-        .transact_scoped(&scope, move |tx| {
-            if let Some(settle) = settle {
-                let skip = |tx: &crate::control::txstate::TxState| {
-                    let run = tx.runs.get(&comp.run_id).cloned().ok_or_else(|| {
+    // A workflow-level group changes only when the whole run turns terminal,
+    // so such a run first settles under its own run lock and widens to the
+    // global scope only if this completion finishes the run. Sibling
+    // completions serialize on that run lock, so "did this finish the run"
+    // is decided against current state. Job-level gates always go global.
+    let mut widen = in_concurrency == crate::control::types::RunConcurrency::Gated;
+    let tx_out = loop {
+        // Narrow pass of a workflow-grouped run: must not finish the run.
+        let guard_terminal =
+            !widen && in_concurrency == crate::control::types::RunConcurrency::WorkflowOnly;
+        let scope = crate::control::txstate::TxScope {
+            include_archived: false,
+            runs: Some(std::collections::BTreeSet::from([comp.run_id])),
+            // `ready_queue`/`blocked_jobs` stay unloaded: `complete_job`
+            // promotes `pending_jobs`, and `needs:` never cross runs, so this
+            // run's own pending rows already load via the `runs` clause.
+            // Loading every queued/blocked job payload is O(#queued) per
+            // completion for no benefit. `queue_nonempty`/`next_runs_on` read
+            // the O(1) `ready_index`/`next_queue_labels` snapshots.
+            ready_queue: false,
+            blocked_jobs: false,
+            sessions: Some(sessions.clone()),
+            // Only a completion that can release a gate needs every holder's
+            // run (a released gate can wake another run).
+            concurrency: widen,
+            runs_referenced: true,
+            job_requests_all: false,
+            pending_expansions: false,
+            runs_via_requests: false,
+        };
+        let comp = comp.clone();
+        let attempt = shared
+            .state
+            .backend
+            .transact_scoped(&scope, move |tx| {
+                if let Some(settle) = settle {
+                    let skip = |tx: &crate::control::txstate::TxState| {
+                        let run = tx.runs.get(&comp.run_id).cloned().ok_or_else(|| {
+                            crate::control::ControlError::NotFound("run not found".to_owned())
+                        })?;
+                        Ok(CompletionTx {
+                            early: Some(run),
+                            effective_status: comp.status,
+                            cancelled_siblings: Vec::new(),
+                            scheduling: runtime_scheduling::SchedulingOutcome::default(),
+                            queue_nonempty: false,
+                            newly_terminal_success: false,
+                            finalized_callers: Vec::new(),
+                            live_log_key: String::new(),
+                            queue_len: 0,
+                            next_labels: Vec::new(),
+                        })
+                    };
+                    let request_id = tx
+                        .agent_job_requests
+                        .get(&settle.agent_job_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::control::ControlError::NotFound(
+                                "broker complete request not found".to_owned(),
+                            )
+                        })?;
+                    crate::broker::ensure_broker_request_owner(tx, request_id, settle.runner_id)?;
+                    if tx
+                        .job_requests
+                        .get(&request_id)
+                        .is_some_and(|record| record.result.is_some())
+                    {
+                        tracing::info!(
+                            request_id,
+                            "broker complete: ignoring duplicate completion"
+                        );
+                        return skip(tx);
+                    }
+                    if let Some(record) = tx.job_requests.get_mut(&request_id) {
+                        record.result = Some(comp.status);
+                        record.locked_until = agent_request_locked_until();
+                    }
+                    // Free the session so the next poll can take a new job now.
+                    tx.session_active_requests
+                        .retain(|_, &mut rid| rid != request_id);
+                    if tx.inflight_requests.remove(&request_id).is_none() {
+                        tracing::warn!(
+                            request_id,
+                            "broker complete: no inflight_requests entry found"
+                        );
+                        return skip(tx);
+                    }
+                }
+                let mut newly_terminal_success = false;
+                tx.claimed_jobs.remove(&(comp.run_id, comp.job_id.clone()));
+                let finalized_callers: Vec<JobId>;
+                {
+                    let run = tx.runs.get_mut(&comp.run_id).ok_or_else(|| {
                         crate::control::ControlError::NotFound("run not found".to_owned())
                     })?;
-                    Ok(CompletionTx {
-                        early: Some(run),
-                        effective_status: comp.status,
-                        cancelled_siblings: Vec::new(),
-                        scheduling: runtime_scheduling::SchedulingOutcome::default(),
-                        queue_nonempty: false,
-                        newly_terminal_success: false,
-                        finalized_callers: Vec::new(),
-                        live_log_key: String::new(),
-                        queue_len: 0,
-                        next_labels: Vec::new(),
-                    })
-                };
-                let request_id = tx
-                    .agent_job_requests
-                    .get(&settle.agent_job_id)
-                    .copied()
-                    .ok_or_else(|| {
-                        crate::control::ControlError::NotFound(
-                            "broker complete request not found".to_owned(),
-                        )
+                    let prior = run.jobs.get(&comp.job_id).copied().ok_or_else(|| {
+                        crate::control::ControlError::Backend(anyhow::anyhow!(
+                            "job does not belong to run"
+                        ))
                     })?;
-                crate::broker::ensure_broker_request_owner(tx, request_id, settle.runner_id)?;
-                if tx
-                    .job_requests
-                    .get(&request_id)
-                    .is_some_and(|record| record.result.is_some())
-                {
-                    tracing::info!(request_id, "broker complete: ignoring duplicate completion");
-                    return skip(tx);
-                }
-                if let Some(record) = tx.job_requests.get_mut(&request_id) {
-                    record.result = Some(comp.status);
-                    record.locked_until = agent_request_locked_until();
-                }
-                // Free the session so the next poll can take a new job now.
-                tx.session_active_requests
-                    .retain(|_, &mut rid| rid != request_id);
-                if tx.inflight_requests.remove(&request_id).is_none() {
-                    tracing::warn!(
-                        request_id,
-                        "broker complete: no inflight_requests entry found"
+                    if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
+                        return Ok(CompletionTx {
+                            early: Some(run.clone()),
+                            effective_status: prior,
+                            cancelled_siblings: Vec::new(),
+                            scheduling: runtime_scheduling::SchedulingOutcome::default(),
+                            queue_nonempty: false,
+                            newly_terminal_success: false,
+                            finalized_callers: Vec::new(),
+                            live_log_key: String::new(),
+                            queue_len: 0,
+                            next_labels: Vec::new(),
+                        });
+                    }
+                    let tolerated = run
+                        .job_continue_on_error
+                        .get(&comp.job_id.to_string())
+                        .copied()
+                        .unwrap_or(false);
+                    let reported_status = if tolerated && comp.status == ExecutionStatus::Failure {
+                        ExecutionStatus::Success
+                    } else {
+                        comp.status
+                    };
+                    let effective = match (prior, reported_status) {
+                        (ExecutionStatus::Cancelled, ExecutionStatus::Success)
+                        | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => {
+                            ExecutionStatus::Cancelled
+                        }
+                        _ => reported_status,
+                    };
+                    run.jobs.insert(comp.job_id.clone(), effective);
+                    let job_name = comp.job_id.0.clone();
+                    let annotations = mask_completion_annotations(run, &comp);
+                    if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
+                        detail.conclusion = format!("{:?}", effective).to_lowercase();
+                        if !comp.annotations.is_empty() {
+                            detail.annotations = annotations;
+                        }
+                    } else {
+                        run.jobs_list.push(JobDetail {
+                            job_id: job_name.clone(),
+                            name: job_name,
+                            conclusion: format!("{:?}", effective).to_lowercase(),
+                            steps: Vec::new(),
+                            annotations,
+                        });
+                    }
+                    run.job_outputs.insert(
+                        comp.job_id.clone(),
+                        comp.outputs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     );
-                    return skip(tx);
-                }
-            }
-            let mut newly_terminal_success = false;
-            tx.claimed_jobs.remove(&(comp.run_id, comp.job_id.clone()));
-            let finalized_callers: Vec<JobId>;
-            {
-                let run = tx.runs.get_mut(&comp.run_id).ok_or_else(|| {
-                    crate::control::ControlError::NotFound("run not found".to_owned())
-                })?;
-                let prior = run.jobs.get(&comp.job_id).copied().ok_or_else(|| {
-                    crate::control::ControlError::Backend(anyhow::anyhow!(
-                        "job does not belong to run"
-                    ))
-                })?;
-                if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
-                    return Ok(CompletionTx {
-                        early: Some(run.clone()),
-                        effective_status: prior,
-                        cancelled_siblings: Vec::new(),
-                        scheduling: runtime_scheduling::SchedulingOutcome::default(),
-                        queue_nonempty: false,
-                        newly_terminal_success: false,
-                        finalized_callers: Vec::new(),
-                        live_log_key: String::new(),
-                        queue_len: 0,
-                        next_labels: Vec::new(),
-                    });
-                }
-                let tolerated = run
-                    .job_continue_on_error
-                    .get(&comp.job_id.to_string())
-                    .copied()
-                    .unwrap_or(false);
-                let reported_status = if tolerated && comp.status == ExecutionStatus::Failure {
-                    ExecutionStatus::Success
-                } else {
-                    comp.status
-                };
-                let effective = match (prior, reported_status) {
-                    (ExecutionStatus::Cancelled, ExecutionStatus::Success)
-                    | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => {
-                        ExecutionStatus::Cancelled
+                    finalized_callers = propagate_reusable_outputs(run);
+                    run.status = summarize_run(run.jobs.values().copied());
+                    if run.started_at.is_none() {
+                        run.started_at = Some(chrono::Utc::now());
                     }
-                    _ => reported_status,
-                };
-                run.jobs.insert(comp.job_id.clone(), effective);
-                let job_name = comp.job_id.0.clone();
-                let annotations = mask_completion_annotations(run, &comp);
-                if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
-                    detail.conclusion = format!("{:?}", effective).to_lowercase();
-                    if !comp.annotations.is_empty() {
-                        detail.annotations = annotations;
+                    if matches!(
+                        run.status,
+                        ExecutionStatus::Success
+                            | ExecutionStatus::Failure
+                            | ExecutionStatus::Cancelled
+                            | ExecutionStatus::Skipped
+                    ) && run.completed_at.is_none()
+                    {
+                        run.completed_at = Some(chrono::Utc::now());
+                        run.conclusion = Some(status_string(run.status));
+                        newly_terminal_success = run.status == ExecutionStatus::Success;
                     }
-                } else {
-                    run.jobs_list.push(JobDetail {
-                        job_id: job_name.clone(),
-                        name: job_name,
-                        conclusion: format!("{:?}", effective).to_lowercase(),
-                        steps: Vec::new(),
-                        annotations,
-                    });
                 }
-                run.job_outputs.insert(
-                    comp.job_id.clone(),
-                    comp.outputs
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                );
-                finalized_callers = propagate_reusable_outputs(run);
-                run.status = summarize_run(run.jobs.values().copied());
-                if run.started_at.is_none() {
-                    run.started_at = Some(chrono::Utc::now());
-                }
-                if matches!(
-                    run.status,
-                    ExecutionStatus::Success
-                        | ExecutionStatus::Failure
-                        | ExecutionStatus::Cancelled
-                        | ExecutionStatus::Skipped
-                ) && run.completed_at.is_none()
-                {
-                    run.completed_at = Some(chrono::Utc::now());
-                    run.conclusion = Some(status_string(run.status));
-                    newly_terminal_success = run.status == ExecutionStatus::Success;
-                }
-            }
-            let live_log_key = comp
-                .agent_job_id
-                .or_else(|| {
+                let live_log_key = comp
+                    .agent_job_id
+                    .or_else(|| {
+                        tx.job_requests
+                            .values()
+                            .filter(|record| {
+                                record.run_id == comp.run_id && record.job_id == comp.job_id
+                            })
+                            .max_by_key(|record| record.request_id)
+                            .map(|record| record.agent_job_id)
+                    })
+                    .map(|agent_job_id| agent_job_id.to_string())
+                    .unwrap_or_else(|| comp.job_id.0.clone());
+                let effective_status = tx
+                    .runs
+                    .get(&comp.run_id)
+                    .and_then(|r| r.jobs.get(&comp.job_id).copied())
+                    .unwrap_or(comp.status);
+                if let Some(agent_job_id) = comp.agent_job_id.or_else(|| {
                     tx.job_requests
                         .values()
                         .filter(|record| {
@@ -966,109 +996,112 @@ pub(crate) async fn complete_job_settling(
                         })
                         .max_by_key(|record| record.request_id)
                         .map(|record| record.agent_job_id)
+                }) {
+                    if let Some(manifest) = tx.job_steps.get_mut(&agent_job_id) {
+                        for wire in &comp.step_results {
+                            let Some(external_id) = wire.external_id.as_deref() else {
+                                continue;
+                            };
+                            let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
+                                continue;
+                            };
+                            if let Some(conclusion) = completion_step_conclusion(wire) {
+                                manifest[pos].conclusion = conclusion;
+                            }
+                            if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                                manifest[pos].runner_number = Some(number);
+                            }
+                        }
+                        let orphan_conclusion = status_string(effective_status);
+                        for step in manifest.iter_mut() {
+                            if step.conclusion == "in_progress" {
+                                step.conclusion = orphan_conclusion.clone();
+                                step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+                            }
+                        }
+                    }
+                }
+                let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
+                    crate::control::sched::apply_matrix_fail_fast(tx, comp.run_id, &comp.job_id)
+                } else {
+                    Vec::new()
+                };
+                tx.retain_ready(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+                tx.pending_jobs
+                    .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+                tx.concurrency_blocked
+                    .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+                if let Some(held) = tx.held_runs.get_mut(&comp.run_id) {
+                    held.retain(|job| job.job_id != comp.job_id);
+                    if held.is_empty() {
+                        tx.held_runs.remove(&comp.run_id);
+                    }
+                }
+                crate::control::sched::release_concurrency_for_job(tx, comp.run_id, &comp.job_id);
+                for caller_id in &finalized_callers {
+                    crate::control::sched::release_concurrency_for_job(tx, comp.run_id, caller_id);
+                }
+                let scheduling = crate::control::sched::promote_ready_jobs(tx);
+                let finished_request_ids: Vec<i64> = tx
+                    .job_requests
+                    .iter()
+                    .filter(|(_, r)| r.run_id == comp.run_id && r.job_id == comp.job_id)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for request_id in &finished_request_ids {
+                    // Shared settlement also clears the session's moot
+                    // `JobCancellation` inflight message so it is not redelivered
+                    // on the post-completion busy poll.
+                    crate::control::sched::settle_request(tx, *request_id, effective_status);
+                }
+                // `ready_count` is the O(1) pre-tx global count; `ready_index`
+                // holds this tx's promotions under the narrow scope.
+                let queue_nonempty = tx.ready_count > 0
+                    || !tx.ready_index.is_empty()
+                    || !tx.cancellation_queue.is_empty();
+                let queue_len = tx.ready_count.max(0) as usize;
+                // The load-time queue front, or this completion's first promotion
+                // when the queue was empty.
+                let next_labels = match crate::control::sched::next_job_labels(tx) {
+                    labels if labels.is_empty() => tx
+                        .queue
+                        .front()
+                        .map(|job| job.runs_on.clone())
+                        .unwrap_or_default(),
+                    labels => labels,
+                };
+                // This completion finished the run: its workflow-level hold must
+                // be released, which needs every group and holder run. Roll back
+                // and rerun under the global scope.
+                if guard_terminal
+                    && tx.runs.get(&comp.run_id).is_some_and(|run| {
+                        crate::concurrency::holder_is_terminal(
+                            &crate::concurrency::Holder::Run(comp.run_id),
+                            &run.jobs,
+                        )
+                    })
+                {
+                    return Err(crate::control::ControlError::WidenScope);
+                }
+                Ok(CompletionTx {
+                    early: None,
+                    queue_len,
+                    next_labels,
+                    effective_status,
+                    cancelled_siblings,
+                    scheduling,
+                    queue_nonempty,
+                    newly_terminal_success,
+                    finalized_callers,
+                    live_log_key,
                 })
-                .map(|agent_job_id| agent_job_id.to_string())
-                .unwrap_or_else(|| comp.job_id.0.clone());
-            let effective_status = tx
-                .runs
-                .get(&comp.run_id)
-                .and_then(|r| r.jobs.get(&comp.job_id).copied())
-                .unwrap_or(comp.status);
-            if let Some(agent_job_id) = comp.agent_job_id.or_else(|| {
-                tx.job_requests
-                    .values()
-                    .filter(|record| record.run_id == comp.run_id && record.job_id == comp.job_id)
-                    .max_by_key(|record| record.request_id)
-                    .map(|record| record.agent_job_id)
-            }) {
-                if let Some(manifest) = tx.job_steps.get_mut(&agent_job_id) {
-                    for wire in &comp.step_results {
-                        let Some(external_id) = wire.external_id.as_deref() else {
-                            continue;
-                        };
-                        let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
-                            continue;
-                        };
-                        if let Some(conclusion) = completion_step_conclusion(wire) {
-                            manifest[pos].conclusion = conclusion;
-                        }
-                        if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
-                            manifest[pos].runner_number = Some(number);
-                        }
-                    }
-                    let orphan_conclusion = status_string(effective_status);
-                    for step in manifest.iter_mut() {
-                        if step.conclusion == "in_progress" {
-                            step.conclusion = orphan_conclusion.clone();
-                            step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-                        }
-                    }
-                }
-            }
-            let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
-                crate::control::sched::apply_matrix_fail_fast(tx, comp.run_id, &comp.job_id)
-            } else {
-                Vec::new()
-            };
-            tx.retain_ready(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
-            tx.pending_jobs
-                .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
-            tx.concurrency_blocked
-                .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
-            if let Some(held) = tx.held_runs.get_mut(&comp.run_id) {
-                held.retain(|job| job.job_id != comp.job_id);
-                if held.is_empty() {
-                    tx.held_runs.remove(&comp.run_id);
-                }
-            }
-            crate::control::sched::release_concurrency_for_job(tx, comp.run_id, &comp.job_id);
-            for caller_id in &finalized_callers {
-                crate::control::sched::release_concurrency_for_job(tx, comp.run_id, caller_id);
-            }
-            let scheduling = crate::control::sched::promote_ready_jobs(tx);
-            let finished_request_ids: Vec<i64> = tx
-                .job_requests
-                .iter()
-                .filter(|(_, r)| r.run_id == comp.run_id && r.job_id == comp.job_id)
-                .map(|(id, _)| *id)
-                .collect();
-            for request_id in &finished_request_ids {
-                // Shared settlement also clears the session's moot
-                // `JobCancellation` inflight message so it is not redelivered
-                // on the post-completion busy poll.
-                crate::control::sched::settle_request(tx, *request_id, effective_status);
-            }
-            // `ready_count` is the O(1) pre-tx global count; `ready_index`
-            // holds this tx's promotions under the narrow scope.
-            let queue_nonempty = tx.ready_count > 0
-                || !tx.ready_index.is_empty()
-                || !tx.cancellation_queue.is_empty();
-            let queue_len = tx.ready_count.max(0) as usize;
-            // The load-time queue front, or this completion's first promotion
-            // when the queue was empty.
-            let next_labels = match crate::control::sched::next_job_labels(tx) {
-                labels if labels.is_empty() => tx
-                    .queue
-                    .front()
-                    .map(|job| job.runs_on.clone())
-                    .unwrap_or_default(),
-                labels => labels,
-            };
-            Ok(CompletionTx {
-                early: None,
-                queue_len,
-                next_labels,
-                effective_status,
-                cancelled_siblings,
-                scheduling,
-                queue_nonempty,
-                newly_terminal_success,
-                finalized_callers,
-                live_log_key,
             })
-        })
-        .await
-        .map_err(ApiError::from)?;
+            .await;
+        match attempt {
+            Err(crate::control::ControlError::WidenScope) if !widen => widen = true,
+            other => break other.map_err(ApiError::from)?,
+        }
+    };
 
     if let Some(run) = tx_out.early {
         return Ok(Json(run));

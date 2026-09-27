@@ -16320,6 +16320,50 @@ jobs:
     assert_eq!(run_b["jobs"]["build"], "queued");
 }
 
+/// A workflow-level hold survives every non-final job completion and is
+/// released by the one that finishes the run. Non-final completions of a
+/// grouped run settle under the run lock alone; the final one must widen to
+/// the global scope, or the waiting run would stay pending forever.
+#[tokio::test]
+async fn workflow_concurrency_releases_when_the_last_job_finishes() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = app(
+        AppState::new(temp.path().to_path_buf()).await.unwrap(),
+        CancellationToken::new(),
+    );
+    let yaml = r#"
+on: push
+concurrency:
+  group: release-on-finish
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo one
+  two:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo two
+"#;
+    let a = submit_yaml(&app, yaml, "owner/repo").await;
+    let b = submit_yaml(&app, yaml, "owner/repo").await;
+    let a_id = a["run_id"].as_str().unwrap();
+    let b_id = b["run_id"].as_str().unwrap();
+    assert_eq!(get_run_json(&app, b_id).await["status"], "pending");
+
+    complete_via_api(&app, a_id, "one").await;
+    let run_b = get_run_json(&app, b_id).await;
+    assert_eq!(run_b["status"], "pending", "A still runs `two`: {run_b}");
+    assert_eq!(run_b["jobs"]["one"], "pending");
+
+    complete_via_api(&app, a_id, "two").await;
+    assert_eq!(get_run_json(&app, a_id).await["status"], "success");
+    let run_b = get_run_json(&app, b_id).await;
+    assert_eq!(run_b["status"], "queued", "A finished: {run_b}");
+    assert_eq!(run_b["jobs"]["one"], "queued");
+    assert_eq!(run_b["jobs"]["two"], "queued");
+}
+
 #[tokio::test]
 async fn workflow_concurrency_cancel_in_progress_cancels_running() {
     let temp = tempfile::tempdir().unwrap();

@@ -747,10 +747,13 @@ pub(crate) fn runner_sig(tx: &TxState, runner_id: i64) -> Option<u64> {
     ]))
 }
 
-/// Everything the `job_requests` row is written from.
+/// Everything a loaded `job_requests` row is rewritten from. The job message
+/// is excluded: it is sealed once when the request is minted and never
+/// changes inside a command, so write-back leaves it alone on existing rows.
 pub(crate) fn request_sig(tx: &TxState, request_id: i64) -> Option<u64> {
-    let record = tx.job_requests.get(&request_id)?;
-    Some(sig_of(&[record, &tx.broker_messages.get(&request_id)]))
+    tx.job_requests
+        .get(&request_id)
+        .map(|record| value_sig(record))
 }
 
 /// Signature of one family value.

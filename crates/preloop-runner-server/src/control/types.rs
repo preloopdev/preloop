@@ -371,6 +371,39 @@ pub(crate) struct SubmissionFields {
     pub(crate) git_ref: String,
 }
 
+/// How a run participates in concurrency groups, which decides the lock scope
+/// of a command on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunConcurrency {
+    /// No group: every command stays under the run lock.
+    None,
+    /// Only a workflow-level group (`Holder::Run`). Its hold changes only
+    /// when the whole run becomes terminal, so a command that leaves the run
+    /// non-terminal stays under the run lock.
+    WorkflowOnly,
+    /// Job-level or reusable-caller gates: any job transition may acquire or
+    /// release a group.
+    Gated,
+}
+
+impl RunConcurrency {
+    pub(crate) fn any(self) -> bool {
+        self != Self::None
+    }
+}
+
+impl RunConcurrency {
+    /// From the two facts both backends query: any job-level/jobset gate or
+    /// non-run hold (`gated`), and any concurrency at all (`any`).
+    pub(crate) fn classify(gated: bool, any: bool) -> Self {
+        match (gated, any) {
+            (true, _) => Self::Gated,
+            (false, true) => Self::WorkflowOnly,
+            (false, false) => Self::None,
+        }
+    }
+}
+
 /// Errors every backend maps onto the same domain vocabulary. Handlers
 #[derive(Debug)]
 pub(crate) enum ControlError {
@@ -381,6 +414,10 @@ pub(crate) enum ControlError {
     /// The fencing token presented (lease owner/generation) no longer owns
     /// the resource — a stale worker racing a successor.
     Stale(String),
+    /// A command ran under a narrow lock scope and found it must touch state
+    /// outside it; the transaction rolled back and the caller reruns it
+    /// under the wider scope. Never escapes the retrying caller.
+    WidenScope,
     /// Backend failure (connection, serialization, integrity). Transient
     /// failures are retried by the caller's own policy.
     Backend(anyhow::Error),
@@ -394,6 +431,7 @@ impl std::fmt::Display for ControlError {
             Self::Forbidden(m) => write!(f, "forbidden: {m}"),
             Self::BadRequest(m) => write!(f, "bad request: {m}"),
             Self::Stale(m) => write!(f, "stale fence: {m}"),
+            Self::WidenScope => write!(f, "command needs a wider lock scope"),
             Self::Backend(e) => write!(f, "backend: {e}"),
         }
     }
@@ -422,6 +460,10 @@ impl From<ControlError> for ApiError {
             ControlError::Forbidden(message) => ApiError::forbidden(message),
             ControlError::BadRequest(message) => ApiError::bad_request(message),
             ControlError::Stale(message) => ApiError::conflict(message),
+            ControlError::WidenScope => {
+                tracing::error!("scope-widening signal escaped its retry");
+                ApiError::internal("control backend error")
+            }
             ControlError::Backend(error) => {
                 // Driver detail (SQL text, constraint names, PG DETAIL echoing
                 // row values) is free schema/tenant reconnaissance for any

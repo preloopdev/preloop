@@ -3060,6 +3060,29 @@ fn write_txstate(
         {
             continue;
         }
+        // A loaded request's job message never changes inside a command:
+        // messages are only minted with a new request id. Existing rows get
+        // their mutable columns; only new rows seal and write the message.
+        if tx.loaded.requests.contains(request_id) {
+            conn.execute(
+                "UPDATE job_requests SET result=?2, locked_until=?3, claimed_at_us=?4, \
+                 owner_runner_id=?5, started_at_us=?6, last_renewed_at_us=?7, \
+                 timeout_triggered=?8, debug_token_issued=?9 WHERE request_id=?1",
+                params![
+                    request_id,
+                    r.result.map(status_str),
+                    r.locked_until,
+                    r.claimed_at.map(system_to_us),
+                    r.owner_runner_id,
+                    r.started_at.map(system_to_us),
+                    r.last_renewed_at.map(system_to_us),
+                    r.timeout_triggered as i64,
+                    r.debug_token_issued as i64,
+                ],
+            )
+            .map_err(ControlError::backend)?;
+            continue;
+        }
         let request_blob = tx
             .broker_messages
             .get(request_id)
@@ -5463,17 +5486,20 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
-    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<RunConcurrency, ControlError> {
         let run_id = run_id.0.to_string();
         self.with_reader(|conn| {
             conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM run_concurrency WHERE run_id=?1) \
-                 OR EXISTS(SELECT 1 FROM jobset_gates WHERE run_id=?1) \
-                 OR EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 AND concurrency_json IS NOT NULL) \
-                 OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=?1) \
-                 OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=?1)",
+                "SELECT \
+                   EXISTS(SELECT 1 FROM jobset_gates WHERE run_id=?1) \
+                   OR EXISTS(SELECT 1 FROM jobs WHERE run_id=?1 AND concurrency_json IS NOT NULL) \
+                   OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=?1 AND holder_kind<>'run') \
+                   OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=?1 AND holder_kind<>'run'), \
+                 EXISTS(SELECT 1 FROM run_concurrency WHERE run_id=?1) \
+                   OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=?1) \
+                   OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=?1)",
                 params![run_id],
-                |row| row.get(0),
+                |row| Ok(RunConcurrency::classify(row.get(0)?, row.get(1)?)),
             )
             .map_err(ControlError::backend)
         })

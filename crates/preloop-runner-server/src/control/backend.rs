@@ -542,10 +542,10 @@ pub(crate) trait ControlBackend: Send + Sync {
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<RunId>, ControlError>;
 
-    /// Whether `run_id` takes part in any concurrency group (run- or
-    /// job-level, holding or waiting). A run that doesn't can settle a job
-    /// under its own run lock: nothing it releases can wake another run.
-    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError>;
+    /// How `run_id` takes part in concurrency groups (holding or waiting,
+    /// workflow- or job-level). A run in none settles jobs under its own run
+    /// lock: nothing it releases can wake another run.
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<RunConcurrency, ControlError>;
 
     /// Resolve a runner callback (plan id, else timeline id, else agent job
     /// id) to its attempt: `(request_id, run_id, job_id, agent_job_id, job
@@ -1536,7 +1536,7 @@ impl ControlBackend for Backend {
         }
     }
 
-    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<RunConcurrency, ControlError> {
         match self {
             Self::Sqlite(b) => b.run_in_concurrency(run_id).await,
             Self::Postgres(b) => b.run_in_concurrency(run_id).await,

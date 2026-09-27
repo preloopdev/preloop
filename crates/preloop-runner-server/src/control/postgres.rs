@@ -81,6 +81,23 @@ const POSTGRES_WRITER_LOCK_KEY: i64 = 0x0070_7265_6c6f_6f70; // "preloop"
 /// Session advisory lock serializing schema setup across booting nodes.
 const SCHEMA_SETUP_LOCK_KEY: i64 = 0x0070_7265_6c73_6368; // "prelsch"
 
+/// Writer connections per node (`PRELOOP_PG_WRITERS`, default 16).
+const WRITERS_ENV: &str = "PRELOOP_PG_WRITERS";
+/// Reader connections per node (`PRELOOP_PG_READERS`, default 16).
+const READERS_ENV: &str = "PRELOOP_PG_READERS";
+const DEFAULT_POOL_SIZE: usize = 16;
+
+/// Pool size from `var`, clamped to at least one connection. An unset or
+/// unparsable value takes the default; size the pools so every node's
+/// `writers + readers + 2` (wake listener, aux store) fits `max_connections`.
+fn pool_size(var: &str) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_POOL_SIZE)
+        .max(1)
+}
+
 fn run_lock_key(run_id: &RunId) -> i64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -161,25 +178,25 @@ impl PostgresBackend {
             .await
             .map_err(ControlError::backend)?;
         setup?;
-        // A pool of writer connections replacing the single Mutex<Client>.
-        let (writers_tx, writers_rx) = tokio::sync::mpsc::channel(4);
-        writers_tx
-            .send(client)
-            .await
-            .map_err(|_| ControlError::backend(anyhow::anyhow!("writer pool closed")))?;
-        for _ in 1..4 {
+        // Writer and reader pools. Every claim, completion, submit, timeline
+        // write and webhook write holds a writer for its whole transaction,
+        // so the writer count is a hard cap on in-flight writes per node.
+        let writers = pool_size(WRITERS_ENV);
+        let readers = pool_size(READERS_ENV);
+        let (writers_tx, writers_rx) = tokio::sync::mpsc::channel(writers);
+        let (readers_tx, readers_rx) = tokio::sync::mpsc::channel(readers);
+        let extra =
+            futures::future::try_join_all((1..writers + readers).map(|_| connect_one(url))).await?;
+        let mut extra = extra.into_iter();
+        for conn in std::iter::once(client).chain(extra.by_ref().take(writers - 1)) {
             writers_tx
-                .send(connect_one(url).await?)
+                .send(conn)
                 .await
                 .map_err(|_| ControlError::backend(anyhow::anyhow!("writer pool closed")))?;
         }
-        // A small pool of read connections. Read-only commands check one
-        // out and run a `BEGIN` read transaction, so a read never queues
-        // behind writes.
-        let (readers_tx, readers_rx) = tokio::sync::mpsc::channel(4);
-        for _ in 0..4 {
+        for conn in extra {
             readers_tx
-                .send(connect_one(url).await?)
+                .send(conn)
                 .await
                 .map_err(|_| ControlError::backend(anyhow::anyhow!("reader pool closed")))?;
         }
@@ -1707,12 +1724,15 @@ async fn write_job_payload(
     Ok(())
 }
 
-/// Ready jobs a poll may claim, locked for this transaction: walk the queue
-/// head in claim order and keep a job only if its run lock is available in
-/// shared mode right now (`pg_try_advisory_xact_lock_shared`: polls of one
-/// run coexist, a run-scoped writer excludes them) and its row is unlocked
-/// (`SKIP LOCKED`: two polls never hold the same job). Neither step waits.
-/// Only jobs `runner` can run are considered. Returns at most `want`
+/// Ready jobs a poll may claim, locked for this transaction. One read of the
+/// queue head, label/group matching in Rust, then one `FOR UPDATE SKIP
+/// LOCKED` statement over the matches in claim order: concurrent polls get
+/// disjoint rows without waiting or walking past each other row by row. A
+/// locked row is kept only if its run lock is free in shared mode
+/// (`pg_try_advisory_xact_lock_shared`: polls of one run coexist, a
+/// run-scoped writer excludes them). Nothing here waits, so taking the run
+/// lock after the row lock cannot deadlock, and later statements only touch
+/// rows of runs whose shared lock is held. Returns at most `want`
 /// `(run_id, job_id)`.
 async fn lock_poll_candidates(
     conn: &Tx<'_>,
@@ -1720,6 +1740,11 @@ async fn lock_poll_candidates(
     want: usize,
 ) -> Result<Vec<(String, String)>, ControlError> {
     const POLL_SCAN: i64 = 256;
+    /// Label-matching candidates offered to one locking statement.
+    const CANDIDATES: usize = 64;
+    /// Locking statements per poll before giving up (each skips runs whose
+    /// exclusive lock a run-scoped writer holds).
+    const ATTEMPTS: usize = 3;
     let head = conn
         .query(
             "SELECT run_id, job_id, runs_on, runner_group FROM jobs WHERE queue_kind='ready' \
@@ -1728,46 +1753,74 @@ async fn lock_poll_candidates(
         )
         .await
         .map_err(ControlError::backend)?;
+    // Label and group matching stay in Rust (hosted-label OS mapping); the
+    // matches keep queue order.
+    let (mut runs, mut jobs): (Vec<String>, Vec<String>) = head
+        .iter()
+        .filter(|row| {
+            let runs_on: Vec<String> =
+                serde_json::from_str(&row.get::<_, String>(2)).unwrap_or_default();
+            let group: Option<String> = row.get(3);
+            super::sched::job_matches_runner(&runs_on, &runner.labels)
+                && super::sched::job_matches_runner_group(group.as_deref(), runner)
+        })
+        .take(CANDIDATES)
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .unzip();
     let mut locked = Vec::new();
-    let mut busy_runs = BTreeSet::new();
-    for row in head {
-        let run_id: String = row.get(0);
-        let job_id: String = row.get(1);
-        if busy_runs.contains(&run_id) {
-            continue;
+    for _ in 0..ATTEMPTS {
+        if runs.is_empty() || locked.len() == want {
+            break;
         }
-        let runs_on: Vec<String> =
-            serde_json::from_str(&row.get::<_, String>(2)).unwrap_or_default();
-        let group: Option<String> = row.get(3);
-        if !super::sched::job_matches_runner(&runs_on, &runner.labels)
-            || !super::sched::job_matches_runner_group(group.as_deref(), runner)
-        {
-            continue;
-        }
-        let key = run_lock_key(&parse_run_id(&run_id));
-        let got: bool = conn
-            .query_one("SELECT pg_try_advisory_xact_lock_shared($1)", &[&key])
-            .await
-            .map_err(ControlError::backend)?
-            .get(0);
-        if !got {
-            busy_runs.insert(run_id);
-            continue;
-        }
-        let row = conn
-            .query_opt(
-                "SELECT 1 FROM jobs WHERE run_id=$1 AND job_id=$2 AND queue_kind='ready' \
-                 FOR UPDATE SKIP LOCKED",
-                &[&run_id, &job_id],
+        // One statement locks the first unlocked candidates in queue order:
+        // rows a concurrent poll holds are skipped, never waited on.
+        let rows = conn
+            .query(
+                "SELECT j.run_id, j.job_id \
+                 FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS c(run_id, job_id, ord) \
+                 JOIN jobs j ON j.run_id = c.run_id AND j.job_id = c.job_id \
+                 WHERE j.queue_kind = 'ready' \
+                 ORDER BY c.ord LIMIT $3 FOR UPDATE OF j SKIP LOCKED",
+                &[&runs, &jobs, &((want - locked.len()) as i64)],
             )
             .await
             .map_err(ControlError::backend)?;
-        if row.is_some() {
-            locked.push((run_id, job_id));
-            if locked.len() == want {
-                break;
+        if rows.is_empty() {
+            break;
+        }
+        let mut busy_runs = BTreeSet::new();
+        for row in rows {
+            let run_id: String = row.get(0);
+            let job_id: String = row.get(1);
+            // Shared run lock: polls of one run coexist, a run-scoped writer
+            // (exclusive) excludes them. `try` never waits, so taking it
+            // after the row lock cannot deadlock.
+            let got: bool = conn
+                .query_one(
+                    "SELECT pg_try_advisory_xact_lock_shared($1)",
+                    &[&run_lock_key(&parse_run_id(&run_id))],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            if got {
+                locked.push((run_id, job_id));
+            } else {
+                busy_runs.insert(run_id);
             }
         }
+        // Next attempt: drop every candidate already taken or in a busy run.
+        let keep: Vec<bool> = runs
+            .iter()
+            .zip(&jobs)
+            .map(|(run, job)| {
+                !busy_runs.contains(run) && !locked.iter().any(|(r, j)| r == run && j == job)
+            })
+            .collect();
+        let mut flags = keep.iter();
+        runs.retain(|_| *flags.next().unwrap());
+        let mut flags = keep.iter();
+        jobs.retain(|_| *flags.next().unwrap());
     }
     Ok(locked)
 }
@@ -3417,6 +3470,30 @@ async fn write_txstate(
         {
             continue;
         }
+        // A loaded request's job message never changes inside a command:
+        // messages are only minted with a new request id. Existing rows get
+        // their mutable columns; only new rows seal and write the message.
+        if tx.loaded.requests.contains(request_id) {
+            conn.execute(
+                "UPDATE job_requests SET result=$2, locked_until=$3, claimed_at_us=$4, \
+                 owner_runner_id=$5, started_at_us=$6, last_renewed_at_us=$7, \
+                 timeout_triggered=$8, debug_token_issued=$9 WHERE request_id=$1",
+                &[
+                    request_id,
+                    &r.result.map(status_str),
+                    &r.locked_until,
+                    &r.claimed_at.map(system_to_us),
+                    &r.owner_runner_id,
+                    &r.started_at.map(system_to_us),
+                    &r.last_renewed_at.map(system_to_us),
+                    &(r.timeout_triggered as i64),
+                    &(r.debug_token_issued as i64),
+                ],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            continue;
+        }
         let request_blob = tx
             .broker_messages
             .get(request_id)
@@ -4363,7 +4440,7 @@ impl ControlBackend for PostgresBackend {
                 ready_queue: false,
                 blocked_jobs: false,
                 sessions: Some(BTreeSet::new()),
-                concurrency: self.run_in_concurrency(run_id).await?,
+                concurrency: self.run_in_concurrency(run_id).await?.any(),
                 runs_referenced: false,
                 job_requests_all: false,
                 pending_expansions: false,
@@ -4412,7 +4489,7 @@ impl ControlBackend for PostgresBackend {
             ready_queue: false,
             blocked_jobs: false,
             sessions: Some(BTreeSet::new()),
-            concurrency: self.run_in_concurrency(claim.job.run_id).await?,
+            concurrency: self.run_in_concurrency(claim.job.run_id).await?.any(),
             runs_referenced: false,
             job_requests_all: false,
             pending_expansions: false,
@@ -6091,19 +6168,22 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
-    async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
+    async fn run_in_concurrency(&self, run_id: RunId) -> Result<RunConcurrency, ControlError> {
         let client = self.checkout_reader().await?;
         let result = client
             .query_one(
-                "SELECT EXISTS(SELECT 1 FROM run_concurrency WHERE run_id=$1) \
-                 OR EXISTS(SELECT 1 FROM jobset_gates WHERE run_id=$1) \
-                 OR EXISTS(SELECT 1 FROM jobs WHERE run_id=$1 AND concurrency_json IS NOT NULL) \
-                 OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=$1) \
-                 OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=$1)",
+                "SELECT \
+                   EXISTS(SELECT 1 FROM jobset_gates WHERE run_id=$1) \
+                   OR EXISTS(SELECT 1 FROM jobs WHERE run_id=$1 AND concurrency_json IS NOT NULL) \
+                   OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=$1 AND holder_kind<>'run') \
+                   OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=$1 AND holder_kind<>'run'), \
+                 EXISTS(SELECT 1 FROM run_concurrency WHERE run_id=$1) \
+                   OR EXISTS(SELECT 1 FROM concurrency_holds WHERE holder_run_id=$1) \
+                   OR EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_run_id=$1)",
                 &[&run_id.0.to_string()],
             )
             .await
-            .map(|row| row.get(0))
+            .map(|row| RunConcurrency::classify(row.get(0), row.get(1)))
             .map_err(ControlError::backend);
         self.return_reader(client).await;
         result
