@@ -76,6 +76,8 @@ fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
 /// engines and distinct from application-level advisory locks. `xact` scope
 /// means the lock is released automatically on `COMMIT`/`ROLLBACK`.
 const POSTGRES_WRITER_LOCK_KEY: i64 = 0x0070_7265_6c6f_6f70; // "preloop"
+/// Session advisory lock serializing schema setup across booting nodes.
+const SCHEMA_SETUP_LOCK_KEY: i64 = 0x0070_7265_6c73_6368; // "prelsch"
 
 fn run_lock_key(run_id: &RunId) -> i64 {
     use std::hash::{Hash, Hasher};
@@ -101,44 +103,62 @@ impl PostgresBackend {
         runner_liveness_timeout: std::time::Duration,
     ) -> Result<Self, ControlError> {
         let client = connect_one(url).await?;
-        // Ensure the bookkeeping schema/table exist before probing the
-        // version (a fresh database has neither).
+        // Several engine nodes may boot against one database at once, and
+        // `CREATE … IF NOT EXISTS` is not race-safe in Postgres (the loser
+        // fails on `pg_type_typname_nsp_index`). Serialize schema setup on a
+        // session advisory lock; it is released right after.
         client
-            .batch_execute(
-                "CREATE SCHEMA IF NOT EXISTS control; \
-                 CREATE TABLE IF NOT EXISTS control.schema_migrations ( \
-                     version BIGINT PRIMARY KEY, \
-                     applied_at TIMESTAMPTZ NOT NULL DEFAULT now() \
-                 )",
-            )
+            .batch_execute(&format!("SELECT pg_advisory_lock({SCHEMA_SETUP_LOCK_KEY})"))
             .await
             .map_err(ControlError::backend)?;
-
-        let versions: Vec<i64> = client
-            .query("SELECT version FROM control.schema_migrations", &[])
-            .await
-            .map_err(ControlError::backend)?
-            .iter()
-            .map(|row| row.get(0))
-            .collect();
-        if let Some(other) = versions.iter().find(|v| **v != POSTGRES_SCHEMA_VERSION) {
-            return Err(ControlError::backend(anyhow::anyhow!(
-                "control schema has version {other}; this build supports only \
-                 {POSTGRES_SCHEMA_VERSION}. Recreate the database."
-            )));
+        let setup = async {
+            // Ensure the bookkeeping schema/table exist before probing the
+            // version (a fresh database has neither).
+            client
+                .batch_execute(
+                    "CREATE SCHEMA IF NOT EXISTS control; \
+                     CREATE TABLE IF NOT EXISTS control.schema_migrations ( \
+                         version BIGINT PRIMARY KEY, \
+                         applied_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+                     )",
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let versions: Vec<i64> = client
+                .query("SELECT version FROM control.schema_migrations", &[])
+                .await
+                .map_err(ControlError::backend)?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            if let Some(other) = versions.iter().find(|v| **v != POSTGRES_SCHEMA_VERSION) {
+                return Err(ControlError::backend(anyhow::anyhow!(
+                    "control schema has version {other}; this build supports only \
+                     {POSTGRES_SCHEMA_VERSION}. Recreate the database."
+                )));
+            }
+            client
+                .batch_execute(POSTGRES_DDL)
+                .await
+                .map_err(ControlError::backend)?;
+            client
+                .execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1) \
+                     ON CONFLICT (version) DO NOTHING",
+                    &[&POSTGRES_SCHEMA_VERSION],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            Ok(())
         }
+        .await;
         client
-            .batch_execute(POSTGRES_DDL)
+            .batch_execute(&format!(
+                "SELECT pg_advisory_unlock({SCHEMA_SETUP_LOCK_KEY})"
+            ))
             .await
             .map_err(ControlError::backend)?;
-        client
-            .execute(
-                "INSERT INTO schema_migrations (version) VALUES ($1) \
-                 ON CONFLICT (version) DO NOTHING",
-                &[&POSTGRES_SCHEMA_VERSION],
-            )
-            .await
-            .map_err(ControlError::backend)?;
+        setup?;
         // A pool of writer connections replacing the single Mutex<Client>.
         let (writers_tx, writers_rx) = tokio::sync::mpsc::channel(4);
         writers_tx
@@ -263,6 +283,7 @@ impl PostgresBackend {
         scope: &TxScope,
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
+        let started = std::time::Instant::now();
         let txn = client.transaction().await.map_err(ControlError::backend)?;
         let is_run_scoped = scope.runs.as_ref().is_some_and(|runs| {
             !runs.is_empty() && !scope.ready_queue && !scope.blocked_jobs && !scope.concurrency
@@ -284,11 +305,35 @@ impl PostgresBackend {
             .await
             .map_err(ControlError::backend)?;
         }
+        let locked = started.elapsed();
         let (tx, effective_scope) = load_txstate(&txn, scope, &self.cipher).await?;
+        let loaded = started.elapsed();
         let mut tx = tx.with_config(self.config());
         let result = run_blocking(|| f(&mut tx))?;
+        let decided = started.elapsed();
         write_txstate(&txn, &tx, &effective_scope, &self.cipher).await?;
+        let written = started.elapsed();
         txn.commit().await.map_err(ControlError::backend)?;
+        let total = started.elapsed();
+        crate::control::txn_stats::record(
+            is_run_scoped,
+            locked,
+            loaded - locked,
+            decided - loaded,
+            written - decided,
+            total - written,
+        );
+        if total > std::time::Duration::from_millis(250) {
+            tracing::warn!(
+                run_scoped = is_run_scoped,
+                lock_ms = locked.as_millis() as u64,
+                load_ms = (loaded - locked).as_millis() as u64,
+                decide_ms = (decided - loaded).as_millis() as u64,
+                write_ms = (written - decided).as_millis() as u64,
+                commit_ms = (total - written).as_millis() as u64,
+                "slow control transaction"
+            );
+        }
         Ok(result)
     }
 
@@ -3895,6 +3940,29 @@ impl ControlBackend for PostgresBackend {
             .map(|row| blob(&self.cipher, &row.get::<_, Vec<u8>>(0)))
             .transpose();
         self.return_reader(client).await;
+        result
+    }
+
+    async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
+        let client = self.checkout_writer().await?;
+        let result = async {
+            client
+                .execute(
+                    "INSERT INTO meta(key, value) VALUES ('key_fingerprint', $1) \
+                     ON CONFLICT(key) DO NOTHING",
+                    &[&fingerprint.as_bytes()],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let stored: Vec<u8> = client
+                .query_one("SELECT value FROM meta WHERE key = 'key_fingerprint'", &[])
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            super::types::check_key_fingerprint(&stored, fingerprint)
+        }
+        .await;
+        self.return_writer(client).await;
         result
     }
 

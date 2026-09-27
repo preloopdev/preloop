@@ -1,0 +1,29 @@
+[package]
+name = "preloop-control-load"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Open-loop load and chaos harness for the Postgres-backed control plane"
+
+[[bin]]
+name = "preloop-control-load"
+path = "src/main.rs"
+
+[dependencies]
+preloop-gha-protocol = { path = "../../crates/preloop-gha-protocol" }
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
+hex.workspace = true
+hmac.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_urlencoded = "0.7"
+rand_distr = "0.4"

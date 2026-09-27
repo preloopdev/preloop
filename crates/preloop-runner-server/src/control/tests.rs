@@ -2355,6 +2355,37 @@ mod postgres {
         suite::submit_poll_complete_lifecycle(&backend).await;
     }
 
+    /// Several engine nodes booting against one fresh database at once must
+    /// all start: unguarded `CREATE … IF NOT EXISTS` makes the losers fail on
+    /// `pg_type_typname_nsp_index`.
+    #[tokio::test]
+    async fn concurrent_node_boot_on_a_fresh_database_all_succeed() {
+        let (_pg, url) = fresh_database().await;
+        let boots = (0..6).map(|_| connect(&url));
+        let nodes = futures::future::join_all(boots).await;
+        assert_eq!(nodes.len(), 6);
+    }
+
+    /// Two nodes on one database with different keys: the second is refused
+    /// at startup instead of sealing rows the first cannot read.
+    #[tokio::test]
+    async fn a_node_with_a_different_key_is_refused() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        node_a
+            .ensure_key_fingerprint("cluster-key-a")
+            .await
+            .unwrap();
+        node_a
+            .ensure_key_fingerprint("cluster-key-a")
+            .await
+            .unwrap();
+        let error = node_b
+            .ensure_key_fingerprint("other-key")
+            .await
+            .expect_err("a different key must be refused");
+        assert!(error.to_string().contains("PRELOOP_HMAC_KEY"), "{error}");
+    }
+
     /// Greenfield schema: a database recording another schema version is
     /// refused at connect.
     #[tokio::test]

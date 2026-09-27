@@ -31,6 +31,7 @@ pub mod schema;
 pub mod sqlite;
 #[cfg(test)]
 mod tests;
+pub(crate) mod txn_stats;
 pub mod txstate;
 pub mod types;
 

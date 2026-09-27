@@ -258,6 +258,10 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Restore node-local metadata after restart.
     async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError>;
 
+    /// Record the cluster key fingerprint on first use; afterwards, refuse a
+    /// node whose key differs (it would seal rows no other node can read).
+    async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError>;
+
     // ── Webhook inbox and repair state ────────────────────────────────
 
     async fn enqueue_webhook_delivery(
@@ -819,6 +823,12 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.load_meta().await,
             Self::Postgres(b) => b.load_meta().await,
+        }
+    }
+    async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.ensure_key_fingerprint(fingerprint).await,
+            Self::Postgres(b) => b.ensure_key_fingerprint(fingerprint).await,
         }
     }
     async fn enqueue_webhook_delivery(

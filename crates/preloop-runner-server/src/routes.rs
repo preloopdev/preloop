@@ -326,6 +326,10 @@ pub fn build_app(
             "/api/v1/config/checkout-cache",
             get(crate::runs::checkout_cache_config),
         )
+        .route(
+            "/api/v1/debug/txn-stats",
+            get(|| async { axum::Json(crate::control::txn_stats::snapshot()) }),
+        )
         .route("/metrics", get(metrics))
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),

@@ -4063,6 +4063,26 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
+        run_blocking(|| {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('key_fingerprint', ?1) \
+                 ON CONFLICT(key) DO NOTHING",
+                params![fingerprint.as_bytes()],
+            )
+            .map_err(ControlError::backend)?;
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'key_fingerprint'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(ControlError::backend)?;
+            super::types::check_key_fingerprint(&stored, fingerprint)
+        })
+    }
+
     async fn enqueue_webhook_delivery(
         &self,
         delivery: &WebhookDeliveryRecord,

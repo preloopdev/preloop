@@ -370,3 +370,17 @@ impl From<ControlError> for ApiError {
         }
     }
 }
+
+/// Compare the stored cluster key fingerprint with this node's.
+pub(crate) fn check_key_fingerprint(stored: &[u8], fingerprint: &str) -> Result<(), ControlError> {
+    if stored == fingerprint.as_bytes() {
+        return Ok(());
+    }
+    Err(ControlError::backend(anyhow::anyhow!(
+        "this node's key (fingerprint {fingerprint}) differs from the one the control \
+         database was created with ({}). Every engine node on one database must share \
+         the same key: set {} to the cluster key.",
+        String::from_utf8_lossy(stored),
+        crate::state::HMAC_KEY_ENV,
+    )))
+}

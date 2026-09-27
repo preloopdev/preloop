@@ -1137,6 +1137,14 @@ impl AppState {
             )
             .await?,
         );
+        // Every node on one database must seal and sign with the same key; a
+        // mismatched node would write rows the rest of the cluster cannot
+        // read. Refuse to start instead.
+        crate::control::backend::ControlBackend::ensure_key_fingerprint(
+            &*backend,
+            &key_fingerprint(&local_jwt_key),
+        )
+        .await?;
         crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
         if let Some(meta) = crate::control::backend::ControlBackend::load_meta(&*backend).await? {
             crate::store::apply_local_meta_snapshot(&mut inner, meta);
@@ -1450,11 +1458,45 @@ fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Non-secret identifier of the cluster key, stored in the control database
+/// so a node started with a different key is refused.
+pub fn key_fingerprint(key: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"preloop-cluster-key-fingerprint\0");
+    hasher.update(key);
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// Environment variable carrying the cluster-wide 32-byte key (hex). Every
+/// engine node sharing one control database must use the same key: it signs
+/// runner tokens and derives the envelope that seals database rows.
+pub const HMAC_KEY_ENV: &str = "PRELOOP_HMAC_KEY";
+
+/// Parse a hex-encoded 32-byte key.
+pub fn parse_hmac_key(value: &str) -> anyhow::Result<Vec<u8>> {
+    let key = hex::decode(value.trim())
+        .map_err(|error| anyhow::anyhow!("{HMAC_KEY_ENV} is not hex: {error}"))?;
+    anyhow::ensure!(
+        key.len() == 32,
+        "{HMAC_KEY_ENV} must be 32 bytes (64 hex characters), got {}",
+        key.len()
+    );
+    Ok(key)
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 /// Load or generate a 32-byte HMAC key for local JWT signing.
 ///
-/// Persisted to `<state_dir>/hmac-key.bin` so runtime tokens survive restarts.
+/// `PRELOOP_HMAC_KEY` (the shared cluster key) wins; otherwise the key is
+/// persisted to `<state_dir>/hmac-key.bin`, which is correct only for a
+/// single node.
 pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    if let Ok(value) = std::env::var(HMAC_KEY_ENV) {
+        if !value.trim().is_empty() {
+            return parse_hmac_key(&value);
+        }
+    }
     let key_path = state_dir.join("hmac-key.bin");
     if key_path.exists() {
         let key = std::fs::read(&key_path).map_err(|error| {
@@ -1754,5 +1796,20 @@ mod termination_reason_tests {
             seen.insert(bounded_termination_reason(&format!("novel reason {i}")));
         }
         assert_eq!(seen.len(), 2, "expected exactly no_runner + unrecognized");
+    }
+}
+
+#[cfg(test)]
+mod cluster_key_tests {
+    #[test]
+    fn cluster_key_must_be_32_hex_bytes() {
+        let key = super::parse_hmac_key(&"ab".repeat(32)).unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(super::parse_hmac_key("abcd").is_err());
+        assert!(super::parse_hmac_key(&"zz".repeat(32)).is_err());
+        // Same key → same fingerprint; different key → different.
+        let a = super::key_fingerprint(&key);
+        assert_eq!(a, super::key_fingerprint(&key));
+        assert_ne!(a, super::key_fingerprint(&[0u8; 32]));
     }
 }
