@@ -500,6 +500,49 @@ pub(crate) mod suite {
         );
     }
 
+    pub(crate) async fn push_state_only_changes_its_run_column(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        backend
+            .set_push_state(
+                run_id,
+                crate::models::PushState {
+                    status: crate::models::PushStatus::Blocked,
+                    error: Some("diverged".into()),
+                    pr_number: None,
+                    effective_sha: None,
+                },
+            )
+            .await
+            .unwrap();
+        let run = backend.run_record(run_id).await.unwrap();
+        let push = run.push_state.unwrap();
+        assert_eq!(push.status, crate::models::PushStatus::Blocked);
+        assert_eq!(push.error.as_deref(), Some("diverged"));
+        assert_eq!(run.jobs[&JobId("build".into())], ExecutionStatus::Queued);
+        backend
+            .set_push_state(
+                run_id,
+                crate::models::PushState {
+                    status: crate::models::PushStatus::Synced,
+                    error: None,
+                    pr_number: Some(42),
+                    effective_sha: Some("tested-sha".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let run = backend.run_record(run_id).await.unwrap();
+        let push = run.push_state.unwrap();
+        assert_eq!(push.status, crate::models::PushStatus::Synced);
+        assert_eq!(push.pr_number, Some(42));
+        assert_eq!(push.effective_sha.as_deref(), Some("tested-sha"));
+        assert_eq!(run.jobs[&JobId("build".into())], ExecutionStatus::Queued);
+    }
+
     pub(crate) async fn cancel_run_queues_cancellation(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -979,6 +1022,11 @@ mod sqlite {
     #[tokio::test]
     async fn request_lookup_uses_latest_correlation() {
         suite::request_lookup_uses_latest_correlation(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn push_state_only_changes_its_run_column() {
+        suite::push_state_only_changes_its_run_column(&SqliteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2662,6 +2710,12 @@ mod postgres {
     async fn request_lookup_uses_latest_correlation() {
         let (_pg, backend) = backend().await;
         suite::request_lookup_uses_latest_correlation(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn push_state_only_changes_its_run_column() {
+        let (_pg, backend) = backend().await;
+        suite::push_state_only_changes_its_run_column(&backend).await;
     }
 
     #[tokio::test]

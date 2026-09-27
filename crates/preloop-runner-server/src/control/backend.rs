@@ -17,9 +17,9 @@
 use super::sched::{BuiltExpansion, SchedulingOutcome};
 use super::types::*;
 use crate::models::{
-    JobDetail, QueuedJob, RunRecord, StepRecord, TaskAgentJobRequestRecord, WebhookDeliveryRecord,
-    WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats, WebhookRedeliveryRecord,
-    WebhookWatchdogCursor,
+    JobDetail, PushState, QueuedJob, RunRecord, StepRecord, TaskAgentJobRequestRecord,
+    WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
+    WebhookRedeliveryRecord, WebhookWatchdogCursor,
 };
 use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
 use std::collections::BTreeMap;
@@ -243,6 +243,9 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// A request record by id, plan id, agent job id or timeline id.
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError>;
+    /// Change only a run's push-sync state. The run advisory lock serializes
+    /// this with scheduling transactions that may also rewrite run scalars.
+    async fn set_push_state(&self, run_id: RunId, state: PushState) -> Result<(), ControlError>;
 
     /// Queue pressure snapshot for status/metrics.
     async fn queue_stats(&self) -> Result<QueueStats, ControlError>;
@@ -829,6 +832,12 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.request(key).await,
             Self::Postgres(b) => b.request(key).await,
+        }
+    }
+    async fn set_push_state(&self, run_id: RunId, state: PushState) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_push_state(run_id, state).await,
+            Self::Postgres(b) => b.set_push_state(run_id, state).await,
         }
     }
     async fn release_request(&self, request_id: i64) -> Result<(), ControlError> {

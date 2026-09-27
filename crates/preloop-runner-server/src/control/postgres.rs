@@ -4541,6 +4541,29 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn set_push_state(
+        &self,
+        run_id: RunId,
+        state: crate::models::PushState,
+    ) -> Result<(), ControlError> {
+        let state_json = serde_json::to_string(&state).map_err(ControlError::backend)?;
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            lock_runs(&tx, std::iter::once(&run_id)).await?;
+            tx.execute(
+                "UPDATE runs SET push_state_json = $2 WHERE run_id = $1",
+                &[&run_id.to_string(), &state_json],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
         const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
             plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id,

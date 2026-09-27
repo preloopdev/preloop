@@ -1977,7 +1977,7 @@ pub async fn submit_run(
             let snap = shared
                 .state
                 .backend
-                .read(move |tx| {
+                .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                     Ok(tx.runs.get(&run_id).map(|run| {
                         (
                             run.submission.repository.clone(),
@@ -2007,7 +2007,7 @@ pub async fn submit_run(
                 let status = shared
                     .state
                     .backend
-                    .read(move |tx| {
+                    .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                         Ok(tx
                             .runs
                             .get(&run_id)
@@ -2024,17 +2024,15 @@ pub async fn submit_run(
         shared
             .state
             .backend
-            .transact(move |tx| {
-                if let Some(run) = tx.runs.get_mut(&run_id) {
-                    run.push_state = Some(PushState {
-                        status: PushStatus::Pending,
-                        error: None,
-                        pr_number: None,
-                        effective_sha: None,
-                    });
-                }
-                Ok(())
-            })
+            .set_push_state(
+                run_id,
+                PushState {
+                    status: PushStatus::Pending,
+                    error: None,
+                    pr_number: None,
+                    effective_sha: None,
+                },
+            )
             .await
             .map_err(ApiError::from)?;
     }
@@ -3467,7 +3465,9 @@ pub async fn rerun_run_inner(
     let submission = shared
         .state
         .backend
-        .read(move |tx| Ok(tx.runs.get(&run_id).map(|run| (*run.submission).clone())))
+        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+            Ok(tx.runs.get(&run_id).map(|run| (*run.submission).clone()))
+        })
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
@@ -3480,7 +3480,7 @@ pub async fn rerun_run_inner(
         shared
             .state
             .backend
-            .transact(move |tx| {
+            .transact_scoped(&crate::control::txstate::TxScope::run(new_run), move |tx| {
                 if let Some(run) = tx.runs.get_mut(&new_run) {
                     if run.jobs.contains_key(&jid) {
                         run.job_check_run_ids.insert(jid.clone(), check_run_id);
@@ -3623,7 +3623,9 @@ pub async fn run_events(
     let run = shared
         .state
         .backend
-        .read(move |tx| Ok(tx.runs.get(&run_id).cloned()))
+        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+            Ok(tx.runs.get(&run_id).cloned())
+        })
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("run not found"))?;

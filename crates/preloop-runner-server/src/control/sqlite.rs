@@ -4008,6 +4008,24 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn set_push_state(
+        &self,
+        run_id: RunId,
+        state: crate::models::PushState,
+    ) -> Result<(), ControlError> {
+        let state_json = serde_json::to_string(&state).map_err(ControlError::backend)?;
+        run_blocking(|| {
+            self.conn
+                .lock()
+                .execute(
+                    "UPDATE runs SET push_state_json = ?2 WHERE run_id = ?1",
+                    params![run_id.to_string(), state_json],
+                )
+                .map_err(ControlError::backend)?;
+            Ok(())
+        })
+    }
+
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
         const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
             plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id,
