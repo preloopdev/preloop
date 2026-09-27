@@ -48,18 +48,38 @@ impl Runner {
     /// Run until `deadline`, re-registering after any protocol failure
     /// (a restarted engine node answers "session expired").
     pub async fn run(self, deadline: Instant) {
+        let mut identity: Option<Identity> = None;
         while Instant::now() < deadline {
-            let identity = match self.register().await {
-                Ok(identity) => identity,
-                Err(error) => {
-                    self.metrics.incr("runner.register_error");
-                    eprintln!("[{}] register: {error:#}", self.name);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+            // Reconnect with the existing registration first; register anew
+            // only when the server no longer accepts it (runner purged).
+            if let Some(current) = identity.as_mut() {
+                match self
+                    .open_session(current.runner_id, &current.listen_token)
+                    .await
+                {
+                    Ok(session_id) => {
+                        current.session_id = session_id;
+                        self.metrics.incr("runner.reconnected");
+                    }
+                    Err(_) => identity = None,
                 }
-            };
-            self.metrics.incr("runner.registered");
-            if let Err(error) = self.serve(&identity, deadline).await {
+            }
+            if identity.is_none() {
+                match self.register().await {
+                    Ok(registered) => {
+                        self.metrics.incr("runner.registered");
+                        identity = Some(registered);
+                    }
+                    Err(error) => {
+                        self.metrics.incr("runner.register_error");
+                        eprintln!("[{}] register: {error:#}", self.name);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
+            let current = identity.as_ref().expect("identity set above");
+            if let Err(error) = self.serve(current, deadline).await {
                 self.metrics.incr("runner.session_lost");
                 eprintln!("[{}] session: {error:#}", self.name);
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -131,14 +151,24 @@ impl Runner {
             .as_str()
             .context("access_token")?
             .to_owned();
+        let session_id = self.open_session(runner_id, &listen_token).await?;
+        Ok(Identity {
+            runner_id,
+            listen_token,
+            session_id,
+        })
+    }
 
+    /// Open a session for an existing registration. What a real runner does
+    /// after its session is lost: it keeps its credentials.
+    async fn open_session(&self, runner_id: i64, listen_token: &str) -> Result<String> {
         let session: Value = self
             .http
             .post(format!(
                 "{}/runner/server/_apis/distributedtask/pools/1/sessions",
                 self.base
             ))
-            .bearer_auth(&listen_token)
+            .bearer_auth(listen_token)
             .json(&json!({
                 "agent": {"id": runner_id, "name": self.name, "version": "2.335.1"},
                 "ownerName": self.name,
@@ -150,14 +180,10 @@ impl Runner {
             .error_for_status()?
             .json()
             .await?;
-        Ok(Identity {
-            runner_id,
-            listen_token,
-            session_id: session["sessionId"]
-                .as_str()
-                .context("sessionId")?
-                .to_owned(),
-        })
+        Ok(session["sessionId"]
+            .as_str()
+            .context("sessionId")?
+            .to_owned())
     }
 
     async fn serve(&self, id: &Identity, deadline: Instant) -> Result<()> {
