@@ -65,6 +65,8 @@ pub mod dispatch;
 pub mod dispatch_auth;
 pub mod oauth;
 use oauth::*;
+pub mod runner_deprecations;
+use runner_deprecations::*;
 pub mod oidc_handlers;
 use oidc_handlers::*;
 pub mod results_twirp;
