@@ -2602,6 +2602,51 @@ mod postgres {
         );
     }
 
+    /// Two engine nodes on one database: node A allocates runner ids while
+    /// node B runs run-scoped transactions (different advisory lock, so they
+    /// overlap). B must never write its stale loaded counter back — that
+    /// handed a later registration an id already in use, and the `runners`
+    /// upsert silently replaced the earlier runner.
+    #[tokio::test]
+    async fn run_scoped_writes_never_rewind_id_counters() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        let run_id = RunId::new();
+        node_a
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+
+        const REGISTRATIONS: usize = 40;
+        let registering = async {
+            let mut ids = Vec::new();
+            for i in 0..REGISTRATIONS {
+                let row = node_a
+                    .register_runner(super::register_runner(&format!("runner-{i}")))
+                    .await
+                    .unwrap();
+                ids.push(row.runner.id);
+            }
+            ids
+        };
+        let scope = crate::control::txstate::TxScope::run(run_id);
+        let run_scoped = async {
+            for _ in 0..REGISTRATIONS * 3 {
+                node_b.transact_scoped(&scope, |_| Ok(())).await.unwrap();
+            }
+        };
+        let (ids, ()) = tokio::join!(registering, run_scoped);
+
+        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            REGISTRATIONS,
+            "runner ids were handed out twice: {ids:?}"
+        );
+    }
+
     /// ready→claimed (poll): claimed row clears `queue_position`, takes a
     /// fresh `seq`, and reads `in_progress` (claim sets run.jobs → InProgress).
     #[tokio::test]

@@ -2490,6 +2490,9 @@ fn load_txstate(
             .map_err(ControlError::backend)?;
         for row in rows {
             let (key, value) = row.map_err(ControlError::backend)?;
+            tx.loaded
+                .workflow_run_counters
+                .insert(key.clone(), value as u64);
             tx.workflow_run_counters.insert(key, value as u64);
         }
     }
@@ -3391,24 +3394,23 @@ fn write_txstate(
         .map_err(ControlError::backend)?;
     }
 
-    // Counters — always loaded, so always written.
-    for (name, value) in [
-        ("next_message_id", tx.next_message_id),
-        ("next_runner_id", tx.next_runner_id),
-        ("next_request_id", tx.next_request_id),
-    ] {
+    // Counters: write only what this transaction advanced, and never lower
+    // a stored value. A transaction that merely loaded a counter must not
+    // write its stale copy back over a concurrent allocation.
+    for (name, value) in super::txstate::advanced_counters(tx) {
         conn.execute(
             "INSERT INTO counters (name, value) VALUES (?1,?2) \
-             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+             ON CONFLICT(name) DO UPDATE SET value=MAX(counters.value, excluded.value)",
             params![name, value],
         )
         .map_err(ControlError::backend)?;
     }
-    for (key, value) in &tx.workflow_run_counters {
+    for (key, value) in super::txstate::advanced_run_counters(tx) {
         conn.execute(
             "INSERT INTO workflow_run_counters (key, value) VALUES (?1,?2) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key, *value as i64],
+             ON CONFLICT(key) DO UPDATE SET \
+             value=MAX(workflow_run_counters.value, excluded.value)",
+            params![key, value],
         )
         .map_err(ControlError::backend)?;
     }

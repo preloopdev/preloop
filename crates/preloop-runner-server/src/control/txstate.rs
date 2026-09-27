@@ -209,6 +209,8 @@ pub(crate) struct LoadedRows {
     pub(crate) holder_key_runs: BTreeSet<RunId>,
     /// Counters loaded (name → value at load).
     pub(crate) counters: BTreeMap<String, i64>,
+    /// Per-workflow run numbers loaded (key → value at load).
+    pub(crate) workflow_run_counters: BTreeMap<String, u64>,
 }
 
 /// Which rows a command's transaction loads and writes back.
@@ -589,4 +591,35 @@ impl TxState {
         self.next_request_id += 1;
         self.next_request_id
     }
+}
+
+/// Global counters this transaction advanced past their loaded value.
+pub(crate) fn advanced_counters(tx: &TxState) -> Vec<(&'static str, i64)> {
+    [
+        ("next_message_id", tx.next_message_id),
+        ("next_runner_id", tx.next_runner_id),
+        ("next_request_id", tx.next_request_id),
+    ]
+    .into_iter()
+    .filter(|(name, value)| {
+        tx.loaded
+            .counters
+            .get(*name)
+            .is_none_or(|loaded| value > loaded)
+    })
+    .collect()
+}
+
+/// Per-workflow run numbers this transaction advanced past their loaded value.
+pub(crate) fn advanced_run_counters(tx: &TxState) -> Vec<(String, i64)> {
+    tx.workflow_run_counters
+        .iter()
+        .filter(|(key, value)| {
+            tx.loaded
+                .workflow_run_counters
+                .get(*key)
+                .is_none_or(|loaded| *value > loaded)
+        })
+        .map(|(key, value)| (key.clone(), *value as i64))
+        .collect()
 }

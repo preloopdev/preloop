@@ -2223,6 +2223,9 @@ async fn load_txstate(
     {
         let key: String = row.get(0);
         let value: i64 = row.get(1);
+        tx.loaded
+            .workflow_run_counters
+            .insert(key.clone(), value as u64);
         tx.workflow_run_counters.insert(key, value as u64);
     }
 
@@ -3222,25 +3225,25 @@ async fn write_txstate(
         .map_err(ControlError::backend)?;
     }
 
-    // Counters — always loaded, so always written.
-    for (name, value) in [
-        ("next_message_id", tx.next_message_id),
-        ("next_runner_id", tx.next_runner_id),
-        ("next_request_id", tx.next_request_id),
-    ] {
+    // Counters: write only what this transaction advanced, and never lower
+    // a stored value. A run-scoped transaction runs concurrently with
+    // allocating ones; writing its stale loaded copy back would hand the
+    // same runner/message id or run number out twice.
+    for (name, value) in super::txstate::advanced_counters(tx) {
         conn.execute(
             "INSERT INTO counters (name, value) VALUES ($1,$2) \
-             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+             ON CONFLICT(name) DO UPDATE SET value=GREATEST(counters.value, excluded.value)",
             &[&name, &value],
         )
         .await
         .map_err(ControlError::backend)?;
     }
-    for (key, value) in &tx.workflow_run_counters {
+    for (key, value) in super::txstate::advanced_run_counters(tx) {
         conn.execute(
             "INSERT INTO workflow_run_counters (key, value) VALUES ($1,$2) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            &[key, &(*value as i64)],
+             ON CONFLICT(key) DO UPDATE SET \
+             value=GREATEST(workflow_run_counters.value, excluded.value)",
+            &[&key, &value],
         )
         .await
         .map_err(ControlError::backend)?;
