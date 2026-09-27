@@ -1168,8 +1168,14 @@ pub async fn complete_job_inner(
         }
     });
 
+    // Cancelled siblings must reach their runners (broadcast); promotions
+    // wake only as many waiters as jobs became claimable.
     if scheduling.promoted > 0 || !cancelled_siblings.is_empty() || queue_nonempty {
-        shared.state.message_notify.notify_waiters();
+        crate::state::wake_waiters(
+            &shared.state.message_notify,
+            scheduling.promoted.max(usize::from(queue_nonempty)),
+            !cancelled_siblings.is_empty(),
+        );
     }
 
     shared

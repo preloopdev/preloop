@@ -114,6 +114,12 @@ servers_csv=$(IFS=,; echo "${servers[*]}")
   --job-median-ms "$JOB_MEDIAN_MS" --pg-url "$db_url" "${burst_args[@]}" \
   2>"$out/harness.log" | tee "$out/stdout.txt"
 
+# Per-node transaction phase timing, captured before the nodes stop.
+for i in "${!servers[@]}"; do
+  curl -fsS -H "Authorization: Bearer preloop-system-token" \
+    "${servers[i]}/api/v1/debug/txn-stats" >"$out/txn-stats-node$i.json" 2>/dev/null || true
+done
+
 # Post-round integrity checks straight from the database.
 "$psql" "$db_url" -At >"$out/integrity.txt" <<'SQL'
 SET search_path TO control;

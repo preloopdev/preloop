@@ -34,6 +34,7 @@ mod tests;
 pub(crate) mod txn_stats;
 pub mod txstate;
 pub mod types;
+pub(crate) mod wake;
 
 pub(crate) use backend::Backend;
 pub(crate) use types::*;

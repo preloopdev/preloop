@@ -56,6 +56,8 @@ pub(crate) struct PostgresBackend {
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
+    /// Cross-node wake-ups from the `LISTEN` connection.
+    wakes: tokio::sync::broadcast::Sender<super::wake::Wake>,
 }
 
 /// Run `f` without stalling the async executor. On a multi-thread runtime
@@ -191,12 +193,18 @@ impl PostgresBackend {
             readers_rx: tokio::sync::Mutex::new(readers_rx),
             cipher,
             aux,
+            wakes: super::wake::spawn_listener(url.to_owned()),
             pool_assignments_enabled: std::sync::atomic::AtomicBool::new(pool_assignments_enabled),
             require_job_assignments: std::sync::atomic::AtomicBool::new(require_job_assignments),
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
                 runner_liveness_timeout.as_nanos() as u64,
             ),
         })
+    }
+
+    /// Subscribe to wake-ups committed by any node on this database.
+    pub(crate) fn subscribe_wakes(&self) -> tokio::sync::broadcast::Receiver<super::wake::Wake> {
+        self.wakes.subscribe()
     }
 
     /// The live scheduling config as a `with_config` argument tuple.
@@ -312,6 +320,27 @@ impl PostgresBackend {
         let result = run_blocking(|| f(&mut tx))?;
         let decided = started.elapsed();
         write_txstate(&txn, &tx, &effective_scope, &self.cipher).await?;
+        // Cross-node wake-up: delivered to every node's listener only if this
+        // transaction commits. Newly ready jobs wake that many runners; new
+        // cancellations wake everyone (the owning runner must see it).
+        let new_ready = tx.queue.len();
+        let new_cancels = tx
+            .cancellation_queue
+            .len()
+            .saturating_sub(tx.loaded.cancellations.len());
+        if new_ready > 0 || new_cancels > 0 {
+            let payload = super::wake::Wake {
+                ready: new_ready,
+                broadcast: new_cancels > 0,
+            }
+            .encode();
+            txn.execute(
+                "SELECT pg_notify($1, $2)",
+                &[&super::wake::CHANNEL, &payload],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
         let written = started.elapsed();
         txn.commit().await.map_err(ControlError::backend)?;
         let total = started.elapsed();
@@ -2277,6 +2306,7 @@ async fn load_txstate(
     if scope.include_archived {
         load_archived_txstate(conn, &mut tx).await?;
     }
+    super::txstate::snapshot_row_sigs(&mut tx);
     Ok((tx, effective_scope))
 }
 
@@ -2779,6 +2809,11 @@ async fn write_txstate(
 
     // Requests.
     for (request_id, r) in &tx.job_requests {
+        if tx.loaded.request_sigs.get(request_id)
+            == super::txstate::request_sig(tx, *request_id).as_ref()
+        {
+            continue;
+        }
         let request_blob = tx
             .broker_messages
             .get(request_id)
@@ -2893,6 +2928,11 @@ async fn write_txstate(
 
     // Runners.
     for (runner_id, runner) in &tx.runners {
+        if tx.loaded.runner_sigs.get(runner_id)
+            == super::txstate::runner_sig(tx, *runner_id).as_ref()
+        {
+            continue;
+        }
         let rsa_xml = tx
             .runner_rsa_public_keys
             .get(runner_id)
@@ -3963,6 +4003,242 @@ impl ControlBackend for PostgresBackend {
         }
         .await;
         self.return_writer(client).await;
+        result
+    }
+
+    async fn touch_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionProtocol>, ControlError> {
+        // A single autocommit UPDATE on a pooled (non-writer) connection:
+        // the heartbeat never queues behind writers holding the global lock.
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "UPDATE runner_sessions SET last_seen_at_us = $1 WHERE session_id = $2 \
+                 RETURNING protocol",
+                &[&system_to_us(std::time::SystemTime::now()), &session_id],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|row| row.map(|row| SessionProtocol::parse(&row.get::<_, String>(0))));
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn session_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(i64, crate::models::RunnerCapabilities)>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT s.runner_id, r.labels, r.runner_group_id, r.runner_group_name, \
+                 r.runner_id IS NOT NULL \
+                 FROM runner_sessions s LEFT JOIN runners r ON r.runner_id = s.runner_id \
+                 WHERE s.session_id = $1 AND s.runner_id IS NOT NULL",
+                &[&session_id],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|row| {
+                row.map(|row| {
+                    let labels: Option<String> = row.get(1);
+                    (
+                        row.get::<_, i64>(0),
+                        crate::models::RunnerCapabilities {
+                            known: row.get(4),
+                            labels: labels
+                                .and_then(|l| serde_json::from_str(&l).ok())
+                                .unwrap_or_default(),
+                            runner_group_id: row.get(2),
+                            runner_group_name: row.get(3),
+                        },
+                    )
+                })
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn callback_job(
+        &self,
+        plan_id: &str,
+        timeline_id: Option<uuid::Uuid>,
+    ) -> Result<Option<CallbackJob>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let timeline = timeline_id.map(|id| id.to_string()).unwrap_or_default();
+        let result = client
+            .query_opt(
+                "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id, j.status \
+                 FROM job_requests r LEFT JOIN jobs j ON j.run_id = r.run_id AND j.job_id = r.job_id \
+                 WHERE r.plan_id = $1 OR r.timeline_id = $2 \
+                 ORDER BY (r.plan_id = $1) DESC, r.request_id DESC LIMIT 1",
+                &[&plan_id, &timeline],
+            )
+            .await
+            .map_err(ControlError::backend)
+            .map(|row| {
+                row.map(|row| CallbackJob {
+                    request_id: row.get(0),
+                    run_id: parse_run_id(&row.get::<_, String>(1)),
+                    job_id: JobId(row.get(2)),
+                    agent_job_id: parse_uuid(&row.get::<_, String>(3)),
+                    job_status: row.get::<_, Option<String>>(4).map(|s| status_parse(&s)),
+                })
+            });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn renew_lease(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        // One conditional UPDATE on a pooled non-writer connection: a lease
+        // renewal never waits for the global writer lock.
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let agent = agent_job_id.to_string();
+            let renewed = client
+                .execute(
+                    "UPDATE job_requests SET locked_until = $1, last_renewed_at_us = $2 \
+                     WHERE agent_job_id = $3 AND result IS NULL AND owner_runner_id = $4",
+                    &[
+                        &locked_until,
+                        &system_to_us(std::time::SystemTime::now()),
+                        &agent,
+                        &runner_id,
+                    ],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            if renewed == 1 {
+                return Ok(true);
+            }
+            let row = client
+                .query_opt(
+                    "SELECT result, owner_runner_id FROM job_requests WHERE agent_job_id = $1",
+                    &[&agent],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| (row.get(0), row.get(1)));
+            super::types::renew_miss(row, runner_id)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn patch_timeline(
+        &self,
+        timeline_key: &str,
+        mut records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
+        // Own transaction on a pooled non-writer connection: no global lock.
+        // The `timelines` row lock serializes PATCHes of one timeline only.
+        let mut client = self.checkout_reader().await?;
+        let result = async {
+            let txn = client.transaction().await.map_err(ControlError::backend)?;
+            let now = std::time::SystemTime::now();
+            let change_id: i64 = txn
+                .query_one(
+                    "INSERT INTO timelines (timeline_key, change_id, updated_at_us) \
+                     VALUES ($1, 1, $2) ON CONFLICT (timeline_key) DO UPDATE \
+                     SET change_id = timelines.change_id + 1, updated_at_us = $2 \
+                     RETURNING change_id",
+                    &[&timeline_key, &system_to_us(now)],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .get(0);
+            let stamped = super::types::stamp_timeline_records(&mut records, change_id, now);
+            let (ids, bodies): (Vec<String>, Vec<String>) = stamped.into_iter().unzip();
+            if !ids.is_empty() {
+                txn.execute(
+                    "INSERT INTO timeline_records (timeline_key, record_id, record_json) \
+                     SELECT $1, id, body FROM UNNEST($2::text[], $3::text[]) AS r(id, body) \
+                     ON CONFLICT (timeline_key, record_id) \
+                     DO UPDATE SET record_json = EXCLUDED.record_json",
+                    &[&timeline_key, &ids, &bodies],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            }
+            let stored = txn
+                .query(
+                    "SELECT record_json FROM timeline_records WHERE timeline_key = $1 \
+                     ORDER BY record_id LIMIT $2",
+                    &[&timeline_key, &(super::types::MAX_TIMELINE_RECORDS as i64)],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            txn.commit().await.map_err(ControlError::backend)?;
+            let records = stored
+                .iter()
+                .filter_map(|row| serde_json::from_str(&row.get::<_, String>(0)).ok())
+                .collect();
+            Ok((change_id as i32, records))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn get_timeline(
+        &self,
+        timeline_key: &str,
+        skip: usize,
+        top: usize,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let change_id: i64 = client
+                .query_opt(
+                    "SELECT change_id FROM timelines WHERE timeline_key = $1",
+                    &[&timeline_key],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .map(|row| row.get(0))
+                .unwrap_or(0);
+            let rows = client
+                .query(
+                    "SELECT record_json FROM timeline_records WHERE timeline_key = $1 \
+                     ORDER BY record_id OFFSET $2 LIMIT $3",
+                    &[
+                        &timeline_key,
+                        &(skip.min(i64::MAX as usize) as i64),
+                        &(top.min(super::types::MAX_TIMELINE_RECORDS) as i64),
+                    ],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            Ok((
+                change_id as i32,
+                rows.iter()
+                    .filter_map(|row| serde_json::from_str(&row.get::<_, String>(0)).ok())
+                    .collect(),
+            ))
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .execute(
+                "DELETE FROM timelines WHERE updated_at_us < $1",
+                &[&before_us],
+            )
+            .await
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
         result
     }
 

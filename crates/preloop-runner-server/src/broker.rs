@@ -313,14 +313,10 @@ pub async fn next_message_broker_ref(
     let (runner_id, runner) = shared
         .state
         .backend
-        .read(|tx| {
-            let runner_id = tx.runner_id_for_session(&session_id).ok_or_else(|| {
-                ControlError::Forbidden("broker session has no runner owner".into())
-            })?;
-            Ok((runner_id, tx.runner_capabilities_for_session(&session_id)))
-        })
+        .session_owner(&session_id)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::forbidden("broker session has no runner owner"))?;
     if identity
         .as_ref()
         .and_then(|axum::Extension(identity)| identity.runner_id)
@@ -445,17 +441,17 @@ pub async fn next_message_disttask(
         .get("sessionId")
         .cloned()
         .unwrap_or_else(|| "default".to_owned());
-    // Mark the session seen and read its protocol in one transaction.
-    let sid = session_id.clone();
-    let is_azdo = shared
-        .state
-        .backend
-        .transact(move |tx| {
-            tx.mark_session_seen(&sid);
-            Ok(tx.azdo_sessions.contains(&sid))
-        })
-        .await
-        .map_err(ApiError::from)?;
+    // Heartbeat and protocol lookup in one statement — every poll runs this,
+    // so it must not load the working set or wait on the writer lock.
+    let is_azdo = matches!(
+        shared
+            .state
+            .backend
+            .touch_session(&session_id)
+            .await
+            .map_err(ApiError::from)?,
+        Some(crate::control::types::SessionProtocol::Azdo)
+    );
     if is_azdo {
         let (status, body) =
             next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await;
@@ -766,22 +762,28 @@ pub async fn next_message_broker_ref_root(
         .get("sessionId")
         .cloned()
         .ok_or_else(|| ApiError::bad_request("broker sessionId is required"))?;
-    // Verify the session is owned by this runner (auth + ownership in one tx).
-    let sid = session_id.clone();
+    // Heartbeat, then ownership + capabilities — two single statements, no
+    // working-set load and no writer lock on the per-poll path.
     shared
         .state
         .backend
-        .transact(move |tx| {
-            tx.mark_session_seen(&sid);
-            if tx.broker_session_runners.get(&sid) != Some(&runner_id) {
-                return Err(ControlError::Forbidden(
-                    "broker session belongs to another runner".to_owned(),
-                ));
-            }
-            Ok(())
-        })
+        .touch_session(&session_id)
         .await
         .map_err(ApiError::from)?;
+    let runner = match shared
+        .state
+        .backend
+        .session_owner(&session_id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        Some((owner, capabilities)) if owner == runner_id => capabilities,
+        _ => {
+            return Err(ApiError::forbidden(
+                "broker session belongs to another runner",
+            ))
+        }
+    };
 
     // Default to 50s long-poll (golden flows show ~50s waits between jobs)
     let wait = params
@@ -796,13 +798,6 @@ pub async fn next_message_broker_ref_root(
         .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
 
     let deadline = std::time::Instant::now() + Duration::from_secs(wait);
-
-    let runner = shared
-        .state
-        .backend
-        .read(|tx| Ok(tx.runner_capabilities_for_session(&session_id)))
-        .await
-        .map_err(ApiError::from)?;
 
     loop {
         let outcome = shared
@@ -1677,6 +1672,19 @@ pub async fn broker_renew_job(
     .await?;
 
     let job_id = request.job_id;
+    // Fast path: one conditional UPDATE, no working-set load, no writer
+    // lock. Falls back to the transactional path only for attempts without
+    // a recorded owner.
+    let locked_until = agent_request_locked_until();
+    if shared
+        .state
+        .backend
+        .renew_lease(job_id, runner_id, &locked_until)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Ok(Json(json!({"lockedUntil": locked_until})));
+    }
     let record = shared
         .state
         .backend

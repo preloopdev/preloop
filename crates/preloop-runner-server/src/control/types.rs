@@ -384,3 +384,65 @@ pub(crate) fn check_key_fingerprint(stored: &[u8], fingerprint: &str) -> Result<
         crate::state::HMAC_KEY_ENV,
     )))
 }
+
+/// Records kept per timeline (a runner timeline has tens of records; this
+/// bounds a misbehaving client).
+pub(crate) const MAX_TIMELINE_RECORDS: usize = 1024;
+
+/// Stamp patched timeline records with the new change id and modification
+/// time, returning `(record_id, json)` pairs ready to upsert.
+pub(crate) fn stamp_timeline_records(
+    records: &mut [preloop_gha_protocol::azdo::TimelineRecord],
+    change_id: i64,
+    now: std::time::SystemTime,
+) -> Vec<(String, String)> {
+    let modified = chrono::DateTime::<chrono::Utc>::from(now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    records
+        .iter_mut()
+        .map(|record| {
+            record.change_id = Some(change_id as i32);
+            record.last_modified = Some(modified.clone());
+            (
+                record.id.to_string(),
+                serde_json::to_string(record).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Why a conditional lease renewal matched no row, from the attempt's
+/// `(result, owner_runner_id)` (`None` = no such attempt). `Ok(false)` means
+/// the attempt has no recorded owner and the caller must use the
+/// transactional path.
+pub(crate) fn renew_miss(
+    row: Option<(Option<String>, Option<i64>)>,
+    runner_id: i64,
+) -> Result<bool, ControlError> {
+    match row {
+        None => Err(ControlError::NotFound(
+            "broker renew request not found".to_owned(),
+        )),
+        Some((Some(_), _)) => Err(ControlError::Conflict(
+            "broker request already completed".to_owned(),
+        )),
+        Some((None, Some(owner))) if owner != runner_id => Err(ControlError::Forbidden(
+            "broker request belongs to another runner".to_owned(),
+        )),
+        Some((None, None)) => Ok(false),
+        // Owner matches and still in flight: raced a concurrent writer; the
+        // caller retries through the transactional path.
+        Some((None, Some(_))) => Ok(false),
+    }
+}
+
+/// A runner callback resolved to its execution attempt.
+#[derive(Debug, Clone)]
+pub(crate) struct CallbackJob {
+    pub(crate) request_id: i64,
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) agent_job_id: uuid::Uuid,
+    /// The logical job's current status (`None` if its row is gone).
+    pub(crate) job_status: Option<ExecutionStatus>,
+}

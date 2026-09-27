@@ -31,53 +31,24 @@ pub async fn patch_timeline_records(
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
 ) -> Json<serde_json::Value> {
-    let mut records = wrapper.value;
+    let records = wrapper.value;
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
-    // Backend: resolve the callback job identity (plan/timeline → request →
-    // run/job) plus the agent job id and current job status the reconcile
-    // needs. Node-local `timeline_*` state is read under `inner` below.
-    let (callback_job, agent_job_id, job_status_for_run) = {
-        let plan_id = plan_id.clone();
-        let timeline_id = timeline_id.clone();
-        shared
-            .state
-            .backend
-            .read_scoped(
-                &crate::control::txstate::TxScope::request_correlation(),
-                move |tx| {
-                    let callback_job =
-                        resolve_callback_job(tx, &plan_id, timeline_id.parse().ok(), None);
-                    let run_id = callback_job
-                        .as_ref()
-                        .map(|(_, run_id, _)| *run_id)
-                        .or_else(|| plan_id.parse::<RunId>().ok());
-                    let logical_job_id = callback_job.as_ref().map(|(_, _, job_id)| job_id.clone());
-                    let agent_job_id = callback_job
-                        .as_ref()
-                        .and_then(|(request_id, _, _)| tx.job_requests.get(request_id))
-                        .map(|request| request.agent_job_id);
-                    let job_status = run_id.and_then(|run_id| {
-                        logical_job_id.as_ref().and_then(|job_id| {
-                            tx.runs
-                                .get(&run_id)
-                                .and_then(|run| run.jobs.get(job_id).copied())
-                        })
-                    });
-                    Ok((
-                        callback_job.map(|cb| (cb, run_id, logical_job_id)),
-                        agent_job_id,
-                        job_status,
-                    ))
-                },
-            )
-            .await
-            .map_err(crate::ApiError::from)
-            .unwrap_or((None, None, None))
-    };
-    let (_callback_job, run_id, logical_job_id) = match callback_job {
-        Some((cb, run_id, logical_job_id)) => (Some(cb), run_id, logical_job_id),
-        None => (None, plan_id.parse::<RunId>().ok(), None),
-    };
+    // Resolve the callback (plan/timeline → attempt → run/job + current job
+    // status) with one indexed query; node-local `timeline_*` state is read
+    // under `inner` below.
+    let callback = shared
+        .state
+        .backend
+        .callback_job(&plan_id, timeline_id.parse().ok())
+        .await
+        .unwrap_or(None);
+    let run_id = callback
+        .as_ref()
+        .map(|cb| cb.run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let logical_job_id = callback.as_ref().map(|cb| cb.job_id.clone());
+    let agent_job_id = callback.as_ref().map(|cb| cb.agent_job_id);
+    let job_status_for_run = callback.as_ref().and_then(|cb| cb.job_status);
     let mut projected = Vec::new();
     for record in &records {
         if let Some(state) = &record.state {
@@ -133,17 +104,9 @@ pub async fn patch_timeline_records(
         }
     }
 
-    // Node-local: bump the timeline change-id and merge the projected events
-    // into the per-run feed (persisted via `store_meta_only` below).
-    let new_change_id = {
+    // Node-local: merge the projected events into the per-run feed.
+    {
         let mut inner = shared.state.inner.lock().await;
-        let current = inner
-            .timeline_change_ids
-            .entry(timeline_key.clone())
-            .or_insert(0);
-        *current += 1;
-        let new_id = *current;
-
         let events = inner
             .timeline_events
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
@@ -157,8 +120,7 @@ pub async fn patch_timeline_records(
             &mut inner,
             run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
         );
-        new_id
-    };
+    }
 
     // Backend: reconcile the run's `jobs_list` detail and the attempt's step
     // manifest (`job_steps` is durable TxState — the commit persists the
@@ -281,42 +243,21 @@ pub async fn patch_timeline_records(
     for event in projected {
         shared.state.emit(event).await;
     }
-    // Stamp each record with server-computed fields.
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    for record in &mut records {
-        record.change_id = Some(new_change_id);
-        record.last_modified = Some(now.clone());
-    }
-
-    // Persist records (upsert by record ID) and return the full stored set.
-    let (response_records, meta) = {
-        let mut inner = shared.state.inner.lock().await;
-        let stored = inner
-            .timeline_records
-            .entry(timeline_key.clone())
-            .or_default();
-        // Ids just upserted by this PATCH — protect them from eviction so a
-        // low-sorting UUID isn't dropped out of the response/timeline.
-        let patched_ids: Vec<uuid::Uuid> = records.iter().map(|r| r.id).collect();
-        for record in records {
-            stored.insert(record.id, record);
+    // Persist the records (one shared row each; the change id is bumped in
+    // the same transaction) and return the full stored set. No node-local
+    // copy: a PATCH on one node and a GET on another must agree.
+    match shared
+        .state
+        .backend
+        .patch_timeline(&timeline_key, records)
+        .await
+    {
+        Ok((_change_id, stored)) => Json(json!({ "count": stored.len(), "value": stored })),
+        Err(error) => {
+            warn!(?error, "failed to persist timeline records");
+            Json(json!({ "count": 0, "value": [] }))
         }
-        trim_timeline_after_patch(&mut inner, &timeline_key, &patched_ids);
-        let vals: Vec<_> = inner
-            .timeline_records
-            .get(&timeline_key)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
-        let meta = crate::store::build_local_meta_snapshot(&inner);
-        (vals, meta)
-    };
-    // Persist after the lock is released so a slow backend does not serialize
-    // the control plane behind the metadata write.
-    if let Err(error) = shared.state.backend.store_meta(&meta).await {
-        warn!(?error, "failed to persist timeline records");
     }
-
-    Json(json!({ "count": response_records.len(), "value": response_records }))
 }
 pub fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
@@ -717,25 +658,22 @@ pub async fn get_timeline_records(
     Query(query): Query<TimelineQuery>,
 ) -> Json<serde_json::Value> {
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
-    let inner = shared.state.inner.lock().await;
-    let change_id = inner
-        .timeline_change_ids
-        .get(&timeline_key)
-        .copied()
-        .unwrap_or(0);
     // When `top` is absent the official runner expects the full timeline
-    // (it does not paginate). Storage itself is already capped at
-    // MAX_TIMELINE_RECORDS=1024, so returning all is bounded. When `top`
-    // is present we clamp to MAX_TOP_RECORDS.
+    // (it does not paginate); storage is capped at MAX_TIMELINE_RECORDS, so
+    // returning all is bounded. When `top` is present we clamp it.
     let (top, skip) = match query.top {
         Some(t) => (t.min(MAX_TOP_RECORDS), query.skip.unwrap_or(0)),
         None => (usize::MAX, query.skip.unwrap_or(0)),
     };
-    let records: Vec<_> = inner
-        .timeline_records
-        .get(&timeline_key)
-        .map(|m| m.values().skip(skip).take(top).cloned().collect())
-        .unwrap_or_default();
+    let (change_id, records) = shared
+        .state
+        .backend
+        .get_timeline(&timeline_key, skip, top)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(?error, "failed to read timeline records");
+            (0, Vec::new())
+        });
     Json(json!({
         "id": timeline_id,
         "changeId": change_id,

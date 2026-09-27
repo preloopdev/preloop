@@ -759,6 +759,12 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
                         }
                     }
                 }
+                // Timelines replay a running job to its runner; one idle for a
+                // week belongs to a job long finished.
+                let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).timestamp_micros();
+                if let Err(error) = shared.state.backend.prune_timelines(week_ago).await {
+                    tracing::warn!(?error, "timeline prune failed; will retry");
+                }
             }
             _ = shared.shutdown.cancelled() => break,
         }

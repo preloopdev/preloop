@@ -1145,6 +1145,24 @@ impl AppState {
             &key_fingerprint(&local_jwt_key),
         )
         .await?;
+        let message_notify = Arc::new(Notify::new());
+        // Cross-node wake-ups (Postgres LISTEN): a job committed through any
+        // node wakes runners long-polling this one.
+        if let Some(mut wakes) = backend.subscribe_wakes() {
+            let notify = message_notify.clone();
+            tokio::spawn(async move {
+                loop {
+                    match wakes.recv().await {
+                        Ok(wake) => wake_waiters(&notify, wake.ready, wake.broadcast),
+                        // Missed signals: wake everyone once; they re-check.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            notify.notify_waiters()
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
         if let Some(meta) = crate::control::backend::ControlBackend::load_meta(&*backend).await? {
             crate::store::apply_local_meta_snapshot(&mut inner, meta);
@@ -1160,7 +1178,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             backend,
             events,
-            message_notify: Arc::new(Notify::new()),
+            message_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
@@ -1811,5 +1829,51 @@ mod cluster_key_tests {
         let a = super::key_fingerprint(&key);
         assert_eq!(a, super::key_fingerprint(&key));
         assert_ne!(a, super::key_fingerprint(&[0u8; 32]));
+    }
+}
+
+/// Wake long-polling runners: at most `ready` of them for newly claimable
+/// jobs (waking every waiter for one job is a thundering herd: all of them
+/// race one claim), or all of them for broadcasts such as cancellations.
+pub(crate) fn wake_waiters(notify: &Notify, ready: usize, broadcast: bool) {
+    if broadcast {
+        notify.notify_waiters();
+        return;
+    }
+    for _ in 0..ready {
+        notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    /// Five runners wait; two jobs become ready: exactly two wake. Waking
+    /// all of them made every waiter race one claim transaction.
+    #[tokio::test]
+    async fn ready_jobs_wake_only_that_many_waiters() {
+        let notify = Arc::new(Notify::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::new();
+        for _ in 0..5 {
+            let (notify, woken) = (notify.clone(), woken.clone());
+            waiters.push(tokio::spawn(async move {
+                if tokio::time::timeout(std::time::Duration::from_millis(300), notify.notified())
+                    .await
+                    .is_ok()
+                {
+                    woken.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        super::wake_waiters(&notify, 2, false);
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
     }
 }

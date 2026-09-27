@@ -2499,6 +2499,7 @@ fn load_txstate(
     if scope.include_archived {
         load_archived_txstate(conn, &mut tx)?;
     }
+    super::txstate::snapshot_row_sigs(&mut tx);
     Ok((tx, effective_scope))
 }
 
@@ -2952,6 +2953,11 @@ fn write_txstate(
 
     // Requests: upsert present, delete removed.
     for (request_id, r) in &tx.job_requests {
+        if tx.loaded.request_sigs.get(request_id)
+            == super::txstate::request_sig(tx, *request_id).as_ref()
+        {
+            continue;
+        }
         let request_blob = tx
             .broker_messages
             .get(request_id)
@@ -3060,6 +3066,11 @@ fn write_txstate(
 
     // Runners.
     for (runner_id, runner) in &tx.runners {
+        if tx.loaded.runner_sigs.get(runner_id)
+            == super::txstate::runner_sig(tx, *runner_id).as_ref()
+        {
+            continue;
+        }
         let rsa_xml = tx
             .runner_rsa_public_keys
             .get(runner_id)
@@ -4080,6 +4091,223 @@ impl ControlBackend for SqliteBackend {
                 )
                 .map_err(ControlError::backend)?;
             super::types::check_key_fingerprint(&stored, fingerprint)
+        })
+    }
+
+    async fn touch_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionProtocol>, ControlError> {
+        run_blocking(|| {
+            self.conn
+                .lock()
+                .query_row(
+                    "UPDATE runner_sessions SET last_seen_at_us = ?1 WHERE session_id = ?2 \
+                     RETURNING protocol",
+                    params![system_to_us(std::time::SystemTime::now()), session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)
+                .map(|protocol| protocol.map(|p| SessionProtocol::parse(&p)))
+        })
+    }
+
+    async fn session_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(i64, crate::models::RunnerCapabilities)>, ControlError> {
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT s.runner_id, r.labels, r.runner_group_id, r.runner_group_name, \
+                 r.runner_id IS NOT NULL \
+                 FROM runner_sessions s LEFT JOIN runners r ON r.runner_id = s.runner_id \
+                 WHERE s.session_id = ?1 AND s.runner_id IS NOT NULL",
+                params![session_id],
+                |row| {
+                    let labels: Option<String> = row.get(1)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        crate::models::RunnerCapabilities {
+                            known: row.get(4)?,
+                            labels: labels
+                                .and_then(|l| serde_json::from_str(&l).ok())
+                                .unwrap_or_default(),
+                            runner_group_id: row.get(2)?,
+                            runner_group_name: row.get(3)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn callback_job(
+        &self,
+        plan_id: &str,
+        timeline_id: Option<uuid::Uuid>,
+    ) -> Result<Option<CallbackJob>, ControlError> {
+        let timeline = timeline_id.map(|id| id.to_string()).unwrap_or_default();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id, j.status \
+                 FROM job_requests r LEFT JOIN jobs j ON j.run_id = r.run_id AND j.job_id = r.job_id \
+                 WHERE r.plan_id = ?1 OR r.timeline_id = ?2 \
+                 ORDER BY (r.plan_id = ?1) DESC, r.request_id DESC LIMIT 1",
+                params![plan_id, timeline],
+                |row| {
+                    Ok(CallbackJob {
+                        request_id: row.get(0)?,
+                        run_id: parse_run_id(&row.get::<_, String>(1)?),
+                        job_id: JobId(row.get(2)?),
+                        agent_job_id: parse_uuid(&row.get::<_, String>(3)?),
+                        job_status: row.get::<_, Option<String>>(4)?.map(|s| status_parse(&s)),
+                    })
+                },
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn renew_lease(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        run_blocking(|| {
+            let conn = self.conn.lock();
+            let agent = agent_job_id.to_string();
+            let renewed = conn
+                .execute(
+                    "UPDATE job_requests SET locked_until = ?1, last_renewed_at_us = ?2 \
+                     WHERE agent_job_id = ?3 AND result IS NULL AND owner_runner_id = ?4",
+                    params![
+                        locked_until,
+                        system_to_us(std::time::SystemTime::now()),
+                        agent,
+                        runner_id
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            if renewed == 1 {
+                return Ok(true);
+            }
+            let row = conn
+                .query_row(
+                    "SELECT result, owner_runner_id FROM job_requests WHERE agent_job_id = ?1",
+                    params![agent],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(ControlError::backend)?;
+            super::types::renew_miss(row, runner_id)
+        })
+    }
+
+    async fn patch_timeline(
+        &self,
+        timeline_key: &str,
+        mut records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
+        run_blocking(|| {
+            let mut conn = self.conn.lock();
+            let txn = conn.transaction().map_err(ControlError::backend)?;
+            let now = std::time::SystemTime::now();
+            let change_id: i64 = txn
+                .query_row(
+                    "INSERT INTO timelines (timeline_key, change_id, updated_at_us) \
+                     VALUES (?1, 1, ?2) ON CONFLICT (timeline_key) DO UPDATE \
+                     SET change_id = timelines.change_id + 1, updated_at_us = ?2 \
+                     RETURNING change_id",
+                    params![timeline_key, system_to_us(now)],
+                    |row| row.get(0),
+                )
+                .map_err(ControlError::backend)?;
+            for (id, body) in super::types::stamp_timeline_records(&mut records, change_id, now) {
+                txn.execute(
+                    "INSERT INTO timeline_records (timeline_key, record_id, record_json) \
+                     VALUES (?1, ?2, ?3) ON CONFLICT (timeline_key, record_id) \
+                     DO UPDATE SET record_json = excluded.record_json",
+                    params![timeline_key, id, body],
+                )
+                .map_err(ControlError::backend)?;
+            }
+            let stored = {
+                let mut stmt = txn
+                    .prepare(
+                        "SELECT record_json FROM timeline_records WHERE timeline_key = ?1 \
+                         ORDER BY record_id LIMIT ?2",
+                    )
+                    .map_err(ControlError::backend)?;
+                let rows = stmt
+                    .query_map(
+                        params![timeline_key, super::types::MAX_TIMELINE_RECORDS as i64],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(ControlError::backend)?
+                    .filter_map(Result::ok)
+                    .filter_map(|json| serde_json::from_str(&json).ok())
+                    .collect();
+                rows
+            };
+            txn.commit().map_err(ControlError::backend)?;
+            Ok((change_id as i32, stored))
+        })
+    }
+
+    async fn get_timeline(
+        &self,
+        timeline_key: &str,
+        skip: usize,
+        top: usize,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
+        self.with_reader(|conn| {
+            let change_id: i64 = conn
+                .query_row(
+                    "SELECT change_id FROM timelines WHERE timeline_key = ?1",
+                    params![timeline_key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(ControlError::backend)?
+                .unwrap_or(0);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT record_json FROM timeline_records WHERE timeline_key = ?1 \
+                     ORDER BY record_id LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(ControlError::backend)?;
+            let records = stmt
+                .query_map(
+                    params![
+                        timeline_key,
+                        top.min(super::types::MAX_TIMELINE_RECORDS) as i64,
+                        skip.min(i64::MAX as usize) as i64
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(ControlError::backend)?
+                .filter_map(Result::ok)
+                .filter_map(|json| serde_json::from_str(&json).ok())
+                .collect();
+            Ok((change_id as i32, records))
+        })
+    }
+
+    async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError> {
+        run_blocking(|| {
+            self.conn
+                .lock()
+                .execute(
+                    "DELETE FROM timelines WHERE updated_at_us < ?1",
+                    params![before_us],
+                )
+                .map(|n| n as u64)
+                .map_err(ControlError::backend)
         })
     }
 

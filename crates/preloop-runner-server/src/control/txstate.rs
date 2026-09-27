@@ -211,6 +211,11 @@ pub(crate) struct LoadedRows {
     pub(crate) counters: BTreeMap<String, i64>,
     /// Per-workflow run numbers loaded (key → value at load).
     pub(crate) workflow_run_counters: BTreeMap<String, u64>,
+    /// Signature of each runner / request row as loaded. Write-back skips
+    /// rows whose signature is unchanged: re-writing an unchanged loaded row
+    /// is at best a no-op and at worst reverts a concurrent writer.
+    pub(crate) runner_sigs: BTreeMap<i64, u64>,
+    pub(crate) request_sigs: BTreeMap<i64, u64>,
 }
 
 /// Which rows a command's transaction loads and writes back.
@@ -622,4 +627,54 @@ pub(crate) fn advanced_run_counters(tx: &TxState) -> Vec<(String, i64)> {
         })
         .map(|(key, value)| (key.clone(), *value as i64))
         .collect()
+}
+
+fn sig_of(parts: &[&dyn std::fmt::Debug]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in parts {
+        format!("{part:?}").hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Everything the `runners` row is written from.
+pub(crate) fn runner_sig(tx: &TxState, runner_id: i64) -> Option<u64> {
+    let runner = tx.runners.get(&runner_id)?;
+    let rsa = tx
+        .runner_rsa_public_keys
+        .get(&runner_id)
+        .map(|k| k.to_xml_string());
+    let client = tx
+        .runner_client_ids
+        .iter()
+        .find(|(_, id)| **id == runner_id)
+        .map(|(c, _)| c);
+    Some(sig_of(&[
+        runner,
+        &rsa,
+        &client,
+        &tx.pool_proven_runners.contains(&runner_id),
+        &tx.runner_registered_at.get(&runner_id),
+    ]))
+}
+
+/// Everything the `job_requests` row is written from.
+pub(crate) fn request_sig(tx: &TxState, request_id: i64) -> Option<u64> {
+    let record = tx.job_requests.get(&request_id)?;
+    Some(sig_of(&[record, &tx.broker_messages.get(&request_id)]))
+}
+
+/// Record load-time signatures (call once, at the end of a load).
+pub(crate) fn snapshot_row_sigs(tx: &mut TxState) {
+    tx.loaded.runner_sigs = tx
+        .runners
+        .keys()
+        .filter_map(|id| runner_sig(tx, *id).map(|sig| (*id, sig)))
+        .collect();
+    tx.loaded.request_sigs = tx
+        .job_requests
+        .keys()
+        .filter_map(|id| request_sig(tx, *id).map(|sig| (*id, sig)))
+        .collect();
 }

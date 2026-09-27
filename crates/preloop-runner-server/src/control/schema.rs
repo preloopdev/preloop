@@ -480,6 +480,23 @@ CREATE TABLE IF NOT EXISTS webhook_redeliveries (
 CREATE INDEX IF NOT EXISTS webhook_redeliveries_open
     ON webhook_redeliveries(resolved_at_us, first_seen_at_us);
 
+-- Runner timelines (PATCH/GET replay), shared by every node: the change
+-- counter is bumped atomically per PATCH and records are upserted one row
+-- each, so a PATCH on one node and a GET on another agree.
+CREATE TABLE IF NOT EXISTS timelines (
+    timeline_key        TEXT PRIMARY KEY NOT NULL,  -- "{plan_id}/{timeline_id}"
+    change_id           INTEGER NOT NULL DEFAULT 0,
+    updated_at_us       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS timelines_updated ON timelines(updated_at_us);
+CREATE TABLE IF NOT EXISTS timeline_records (
+    timeline_key        TEXT NOT NULL,
+    record_id           TEXT NOT NULL,              -- uuid
+    record_json         TEXT NOT NULL,              -- TimelineRecord
+    PRIMARY KEY (timeline_key, record_id),
+    FOREIGN KEY (timeline_key) REFERENCES timelines(timeline_key) ON DELETE CASCADE
+);
+
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
     name                TEXT PRIMARY KEY NOT NULL,
@@ -939,6 +956,23 @@ CREATE TABLE IF NOT EXISTS webhook_redeliveries (
 );
 CREATE INDEX IF NOT EXISTS webhook_redeliveries_open
     ON webhook_redeliveries(resolved_at_us, first_seen_at_us);
+
+-- Runner timelines (PATCH/GET replay), shared by every node: the change
+-- counter is bumped atomically per PATCH and records are upserted one row
+-- each, so a PATCH on one node and a GET on another agree.
+CREATE TABLE IF NOT EXISTS timelines (
+    timeline_key        TEXT PRIMARY KEY,  -- "{plan_id}/{timeline_id}"
+    change_id           BIGINT NOT NULL DEFAULT 0,
+    updated_at_us       BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS timelines_updated ON timelines(updated_at_us);
+CREATE TABLE IF NOT EXISTS timeline_records (
+    timeline_key        TEXT NOT NULL,
+    record_id           TEXT NOT NULL,              -- uuid
+    record_json         TEXT NOT NULL,              -- TimelineRecord
+    PRIMARY KEY (timeline_key, record_id),
+    FOREIGN KEY (timeline_key) REFERENCES timelines(timeline_key) ON DELETE CASCADE
+);
 
 -- ── Counters, run counters, meta ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (

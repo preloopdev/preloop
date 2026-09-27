@@ -262,6 +262,65 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// node whose key differs (it would seal rows no other node can read).
     async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError>;
 
+    /// Record a session poll and return its protocol: one statement, no
+    /// working-set load. `None` when the session does not exist.
+    ///
+    /// Liveness is minute-granular; a concurrent write-back restoring an
+    /// older timestamp is harmless (the next poll bumps it again).
+    async fn touch_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionProtocol>, ControlError>;
+
+    /// The runner owning a session and its dispatch capabilities, read
+    /// directly (the per-poll lookup). `None` for unknown or runner-less
+    /// sessions.
+    async fn session_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(i64, crate::models::RunnerCapabilities)>, ControlError>;
+
+    /// Apply one timeline PATCH: bump the timeline's change counter, stamp
+    /// and upsert the patched records, and return the new change id plus
+    /// every stored record (ordered by record id). One transaction, shared
+    /// by every node.
+    async fn patch_timeline(
+        &self,
+        timeline_key: &str,
+        records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError>;
+
+    /// A timeline's change id and records (`skip`/`top` paging).
+    async fn get_timeline(
+        &self,
+        timeline_key: &str,
+        skip: usize,
+        top: usize,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError>;
+
+    /// Drop timelines not patched since `before_us`. Returns timelines removed.
+    async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
+
+    /// Resolve a runner callback (plan id, else timeline id) to its attempt:
+    /// `(request_id, run_id, job_id, agent_job_id, job status)`, newest
+    /// attempt first. One indexed query instead of loading every request.
+    async fn callback_job(
+        &self,
+        plan_id: &str,
+        timeline_id: Option<uuid::Uuid>,
+    ) -> Result<Option<CallbackJob>, ControlError>;
+
+    /// Renew an attempt's lease with one conditional statement. `Ok(false)`
+    /// when the attempt has no recorded owner (callers fall back to the
+    /// transactional path); errors distinguish unknown (`NotFound`),
+    /// finished (`Conflict`) and foreign (`Forbidden`) attempts.
+    async fn renew_lease(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError>;
+
     // ── Webhook inbox and repair state ────────────────────────────────
 
     async fn enqueue_webhook_delivery(
@@ -458,6 +517,17 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
+    /// Wake-ups committed by any node sharing this database. `None` on
+    /// SQLite: a single node wakes its own waiters directly.
+    pub(crate) fn subscribe_wakes(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<super::wake::Wake>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(b) => Some(b.subscribe_wakes()),
+        }
+    }
+
     /// Open the backend selected by `store_url`: `postgres://…` → PostgreSQL,
     /// anything else (`sqlite://<path>`, a bare path) → SQLite. The default
     /// authoritative database is `<state_dir>/preloop.db`.
@@ -829,6 +899,72 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.ensure_key_fingerprint(fingerprint).await,
             Self::Postgres(b) => b.ensure_key_fingerprint(fingerprint).await,
+        }
+    }
+    async fn touch_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionProtocol>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.touch_session(session_id).await,
+            Self::Postgres(b) => b.touch_session(session_id).await,
+        }
+    }
+    async fn session_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(i64, crate::models::RunnerCapabilities)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.session_owner(session_id).await,
+            Self::Postgres(b) => b.session_owner(session_id).await,
+        }
+    }
+    async fn patch_timeline(
+        &self,
+        timeline_key: &str,
+        records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.patch_timeline(timeline_key, records).await,
+            Self::Postgres(b) => b.patch_timeline(timeline_key, records).await,
+        }
+    }
+    async fn get_timeline(
+        &self,
+        timeline_key: &str,
+        skip: usize,
+        top: usize,
+    ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.get_timeline(timeline_key, skip, top).await,
+            Self::Postgres(b) => b.get_timeline(timeline_key, skip, top).await,
+        }
+    }
+    async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.prune_timelines(before_us).await,
+            Self::Postgres(b) => b.prune_timelines(before_us).await,
+        }
+    }
+    async fn callback_job(
+        &self,
+        plan_id: &str,
+        timeline_id: Option<uuid::Uuid>,
+    ) -> Result<Option<CallbackJob>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.callback_job(plan_id, timeline_id).await,
+            Self::Postgres(b) => b.callback_job(plan_id, timeline_id).await,
+        }
+    }
+    async fn renew_lease(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.renew_lease(agent_job_id, runner_id, locked_until).await,
+            Self::Postgres(b) => b.renew_lease(agent_job_id, runner_id, locked_until).await,
         }
     }
     async fn enqueue_webhook_delivery(

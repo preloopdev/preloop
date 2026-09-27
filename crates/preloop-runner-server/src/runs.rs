@@ -1827,7 +1827,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         let expansion = drain_expansions(shared).await;
         let drain_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
         if outcome.queued_jobs > 0 || expansion.promoted > 0 {
-            shared.state.message_notify.notify_waiters();
+            crate::state::wake_waiters(
+                &shared.state.message_notify,
+                outcome.queued_jobs + expansion.promoted,
+                false,
+            );
         }
 
         for (event_run_id, job_id) in initially_skipped {

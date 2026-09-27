@@ -2355,6 +2355,173 @@ mod postgres {
         suite::submit_poll_complete_lifecycle(&backend).await;
     }
 
+    /// Lease renewal is one conditional statement: the owner renews; another
+    /// runner, a finished attempt and an unknown attempt are refused; and a
+    /// concurrent stale write-back cannot rewind the renewal (the reaper
+    /// would requeue a job that is still running).
+    #[tokio::test]
+    async fn lease_renewal_is_fenced_and_never_rewound() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        let runner = node_a
+            .register_runner(super::register_runner("r1"))
+            .await
+            .unwrap();
+        let session = node_a
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let run_id = RunId::new();
+        node_a
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let crate::control::types::PollOutcome::Claimed(claimed) = node_a
+            .poll_session(super::poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a claim");
+        };
+        let agent = claimed.request.agent_job_id;
+        let owner = runner.runner.id;
+
+        // Node B loads the attempt (old last_renewed_at) and holds it while
+        // node A renews; B's write-back must not undo the renewal.
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let stale = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                node_b
+                    .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |_| {
+                        let _ = loaded_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok(())
+                    })
+                    .await
+            })
+        });
+        loaded_rx.await.unwrap();
+        assert!(node_a
+            .renew_lease(agent, owner, "2099-01-01T00:00:00Z")
+            .await
+            .unwrap());
+        let renewed_at = node_a
+            .request(crate::control::backend::RequestKey::AgentJobId(agent))
+            .await
+            .unwrap()
+            .last_renewed_at;
+        release_tx.send(()).unwrap();
+        stale.await.unwrap().unwrap();
+        let after = node_a
+            .request(crate::control::backend::RequestKey::AgentJobId(agent))
+            .await
+            .unwrap()
+            .last_renewed_at;
+        assert_eq!(after, renewed_at, "a stale write-back rewound the lease");
+
+        assert!(matches!(
+            node_a.renew_lease(agent, owner + 1, "x").await,
+            Err(crate::control::types::ControlError::Forbidden(_))
+        ));
+        assert!(matches!(
+            node_a.renew_lease(uuid::Uuid::new_v4(), owner, "x").await,
+            Err(crate::control::types::ControlError::NotFound(_))
+        ));
+        node_a
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(agent),
+                status: ExecutionStatus::Success,
+                outputs: std::collections::BTreeMap::new(),
+                runner_id: Some(owner),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            node_a.renew_lease(agent, owner, "x").await,
+            Err(crate::control::types::ControlError::Conflict(_))
+        ));
+    }
+
+    fn timeline_record(id: u128, name: &str) -> preloop_gha_protocol::azdo::TimelineRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::from_u128(id),
+            "name": name,
+            "type": "Task",
+            "state": "completed",
+            "result": "succeeded",
+        }))
+        .unwrap()
+    }
+
+    /// A runner's PATCH may land on one node and its GET on another (load
+    /// balancer): the timeline must be one shared row set with one counter.
+    #[tokio::test]
+    async fn timelines_are_shared_across_nodes() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        let key = "plan-1/timeline-1";
+        let (first, _) = node_a
+            .patch_timeline(key, vec![timeline_record(1, "one")])
+            .await
+            .unwrap();
+        let (second, stored) = node_b
+            .patch_timeline(
+                key,
+                vec![timeline_record(2, "two"), timeline_record(1, "uno")],
+            )
+            .await
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(stored.len(), 2, "upsert by record id, not append");
+
+        let (change_id, records) = node_a.get_timeline(key, 0, usize::MAX).await.unwrap();
+        assert_eq!(change_id, 2);
+        let names: Vec<_> = records.iter().filter_map(|r| r.name.clone()).collect();
+        assert_eq!(names, ["uno", "two"], "node A sees node B's upsert");
+        assert!(records.iter().all(|r| r.change_id.is_some()));
+
+        // Concurrent PATCHes from both nodes never reuse a change id.
+        let patches = (0..20).map(|i| {
+            let node = if i % 2 == 0 { &node_a } else { &node_b };
+            node.patch_timeline(key, vec![timeline_record(10 + i as u128, "x")])
+        });
+        let mut ids: Vec<i32> = futures::future::join_all(patches)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap().0)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (3..23).collect::<Vec<_>>());
+    }
+
+    /// A job enqueued through node A must wake runners long-polling node B:
+    /// the committing transaction notifies every node's listener.
+    #[tokio::test]
+    async fn enqueue_on_one_node_wakes_the_other() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        let mut wakes = node_b.subscribe_wakes();
+        // Let the listener connection issue LISTEN before the commit.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let run_id = RunId::new();
+        node_a
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let wake = tokio::time::timeout(std::time::Duration::from_secs(5), wakes.recv())
+            .await
+            .expect("node B was not woken")
+            .unwrap();
+        assert_eq!(wake.ready, 1);
+        assert!(!wake.broadcast);
+    }
+
     /// Several engine nodes booting against one fresh database at once must
     /// all start: unguarded `CREATE … IF NOT EXISTS` makes the losers fail on
     /// `pg_type_typname_nsp_index`.
