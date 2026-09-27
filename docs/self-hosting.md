@@ -175,6 +175,24 @@ never fetched. Blobs over 1 GiB per object, and batches already over
 prerequisite. Objects are stored as ordinary files: put the state directory on
 an encrypted volume if source retention needs encryption at rest.
 
+### Run retention
+
+Mirrors GitHub's Actions retention setting: checks, workflow runs, and
+statuses are cleaned up per the retention window instead of accumulating
+forever.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRELOOP_RETENTION_DAYS` | `90` | Days a finished run (plus its checks, statuses, artifacts, and logs) is kept. `0` disables cleanup |
+
+The same key lives at the top level of the config file as `retention_days`;
+the environment wins. Only runs that have finished are ever deleted — a
+run that is still queued, pending, or in progress is never a candidate, no
+matter how old it is. A background sweep deletes expired runs once at
+startup and hourly afterwards, from both memory and the durable store, so
+a restart cannot resurrect them. Workflows see the effective value as
+`github.retention_days`.
+
 ### Runner pool
 
 | Variable | Default | Meaning |

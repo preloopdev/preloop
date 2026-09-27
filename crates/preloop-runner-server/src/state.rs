@@ -490,6 +490,12 @@ pub struct AppState {
     /// checkouts before housekeeping deletes it. Zero discards immediately.
     /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: u64,
+    /// Run/check/status retention, in days, mirroring GitHub's Actions
+    /// retention setting. The retention sweep deletes terminal runs (plus
+    /// their checks, statuses, artifacts, and logs) older than this.
+    /// Default 90 follows GitHub; `0` disables the sweep. Resolved from
+    /// `retention_days` in the config file, `PRELOOP_RETENTION_DAYS` wins.
+    pub retention_days: u64,
     /// Per-environment protection rules (`[environment_rules]`), loaded at
     /// startup. Empty by default (no rules).
     pub environment_rules: crate::config::EnvironmentRulesMap,
@@ -1004,6 +1010,7 @@ impl AppState {
         let credential = crate::config::load_credential_secrets()?;
         crate::config::merge_secret_stores(&mut config, credential);
         let checkout_cache = crate::config::checkout_cache_config(&config)?;
+        let retention_days = crate::config::retention_days(&config)?;
         let github_apps = crate::github_app::load_from(&config)?;
         let github_app = github_apps
             .as_ref()
@@ -1157,6 +1164,7 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+            retention_days,
             environment_rules: config.environment_rules.clone(),
             state_dir,
             system_token,

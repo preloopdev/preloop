@@ -1146,7 +1146,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "repositoryUrl": format!("git://github.com/{}.git", submission.repository),
         "run_id": run_id.to_string(),
         "run_number": "1",
-        "retention_days": "90",
+        "retention_days": shared.state.retention_days.to_string(),
         "run_attempt": "1",
         "artifact_cache_size_limit": "10",
         "repository_visibility": "private",

@@ -85,6 +85,13 @@ pub trait Store: Send + Sync {
     /// cascade). Called when the in-memory retention caps evict a log key so
     /// the durable store cannot outgrow memory (D2).
     async fn delete_log(&self, key: &str) -> anyhow::Result<()>;
+    /// Delete a run's durable rows: the `runs` row (foreign-key cascades
+    /// take `run_secrets`, `jobs`, `job_requests`, and the rest), plus the
+    /// `control_events` and `runner_commands` rows, which carry no foreign
+    /// key. Called by the retention sweep after the run is purged from
+    /// memory, so a restart cannot resurrect it. Idempotent: deleting an
+    /// absent run is a no-op.
+    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<()>;
     /// Append a control event (`run_accepted` / `run_status` / `job_status`).
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()>;
     /// Enqueue a webhook delivery atomically. Returns `Ok(true)` if newly
@@ -351,6 +358,10 @@ impl Store for InstrumentedStore {
     async fn delete_log(&self, key: &str) -> anyhow::Result<()> {
         let start = Instant::now();
         self.record("delete_log", start, self.inner.delete_log(key).await)
+    }
+    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        let start = Instant::now();
+        self.record("delete_run", start, self.inner.delete_run(run_id).await)
     }
     async fn enqueue_webhook_delivery(
         &self,
@@ -2402,6 +2413,24 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Delete a run's durable rows. The FK-bearing tables (`run_secrets`,
+    /// `jobs`, `job_requests`, …) cascade from `runs`; `control_events`
+    /// and `runner_commands` carry no FK and are deleted explicitly.
+    /// Idempotent: deleting an absent run deletes nothing.
+    pub fn delete_run(&self, run_id: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        connection.execute(
+            "DELETE FROM control_events WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        connection.execute(
+            "DELETE FROM runner_commands WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        connection.execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
+        Ok(())
+    }
+
     pub fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().expect("store mutex poisoned");
         let tx = connection.transaction()?;
@@ -3733,6 +3762,14 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.delete_log(&key))
             .await
             .map_err(|error| anyhow::anyhow!("delete log task panicked: {error}"))?
+    }
+
+    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        let store = self.clone();
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || store.delete_run(&run_id))
+            .await
+            .map_err(|error| anyhow::anyhow!("delete run task panicked: {error}"))?
     }
 
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {

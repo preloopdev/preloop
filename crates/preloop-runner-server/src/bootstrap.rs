@@ -1712,6 +1712,20 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             crate::snapshots::prune_checkout_cache(&state_dir, &checkout_cache).await;
         });
     }
+    // Retention sweep once at startup: runs that aged past the retention
+    // window while the server was down should not wait a full interval.
+    // Runs hourly afterwards (see the retention sweeper spawn below). A
+    // fresh token is fine: the one-shot pass never watches for shutdown.
+    {
+        let startup_state = state.clone();
+        tokio::spawn(async move {
+            let shared = Arc::new(SharedState {
+                state: startup_state,
+                shutdown: CancellationToken::new(),
+            });
+            crate::retention::sweep_once(&shared).await;
+        });
+    }
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -1949,6 +1963,12 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let cache_pruner_shared = shared.clone();
     tokio::spawn(async move {
         run_checkout_cache_pruner(cache_pruner_shared).await;
+    });
+    // Hourly run/check/status retention sweep (GitHub Actions retention
+    // setting, default 90 days; `retention_days = 0` disables it).
+    let retention_sweeper_shared = shared.clone();
+    tokio::spawn(async move {
+        crate::retention::run_retention_sweeper(retention_sweeper_shared).await;
     });
 
     // Snapshots orphaned by a restart inside their retention window are
