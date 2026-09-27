@@ -818,8 +818,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         "DistributedTask.UseActionArchiveCache",
         "DistributedTask.UseWhich2",
         "RunService.FixEmbeddedIssues",
-        "actions.runner.usenode24bydefault",
-        "actions.runner.warnonnode20",
         "actions_add_check_run_id_to_job_context",
         "actions_container_action_runner_temp",
         "actions_display_helpful_actions_download_errors",
@@ -830,7 +828,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
         "actions_uses_cache_service_v2",
     ];
     const FALSE_FLAGS: &[&str] = &[
-        "actions.runner.requirenode24",
         "actions_batch_action_resolution",
         "actions_runner_compare_workflow_parser",
         "actions_runner_emit_composite_markers",
@@ -850,7 +847,6 @@ fn populate_runner_variables(variables: &mut BTreeMap<String, VariableValue>, pl
             .or_insert_with(|| VariableValue::new("false"));
     }
     for (key, value) in [
-        ("actions_runner_node20_removal_date", ""),
         ("actions_runner_node24_default_date", "June 16th, 2026"),
         ("system.from_run_service", "true"),
         ("system.github.job", plan.base_id.as_str()),
