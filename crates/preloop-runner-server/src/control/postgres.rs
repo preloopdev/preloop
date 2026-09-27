@@ -690,6 +690,95 @@ impl PostgresBackend {
         let _ = self.readers_tx.send(client).await;
     }
 
+    /// Shared read for `acquire_context` / `acquire_for_runner`: the request
+    /// row joined to its sealed message, token-mint request, id-token grant
+    /// and the run's submission fields — one statement on the reader pool.
+    async fn acquire_impl(
+        &self,
+        request_id: i64,
+        runner_id: Option<i64>,
+    ) -> Result<AcquireContext, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let row = client
+                .query_opt(
+                    "SELECT jr.request_id, jr.run_id, jr.job_id, jr.agent_job_id, \
+                     jr.plan_id, jr.plan_type, jr.timeline_id, jr.result, jr.locked_until, \
+                     jr.claimed_at_us, jr.owner_runner_id, jr.started_at_us, \
+                     jr.last_renewed_at_us, jr.timeout_triggered, jr.debug_token_issued, \
+                     jr.request_blob, \
+                     sub.submission_json, \
+                     tok.request_blob, \
+                     g.granted, \
+                     (sess.session_id IS NOT NULL), sess.runner_id \
+                     FROM job_requests jr \
+                     JOIN run_submissions sub ON sub.run_id = jr.run_id \
+                     LEFT JOIN github_token_requests tok ON tok.request_id = jr.request_id \
+                     LEFT JOIN id_token_grants g \
+                         ON g.run_id = jr.run_id AND g.job_id = jr.job_id \
+                     LEFT JOIN runner_sessions sess ON sess.active_request_id = jr.request_id \
+                     WHERE jr.request_id = $1",
+                    &[&request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?
+                .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
+            let record = TaskAgentJobRequestRecord {
+                request_id: row.get(0),
+                run_id: parse_run_id(&row.get::<_, String>(1)),
+                job_id: JobId(row.get(2)),
+                agent_job_id: parse_uuid(&row.get::<_, String>(3)),
+                plan_id: row.get(4),
+                plan_type: row.get(5),
+                timeline_id: parse_uuid(&row.get::<_, String>(6)),
+                result: row.get::<_, Option<String>>(7).as_deref().map(status_parse),
+                locked_until: row.get(8),
+                claimed_at: row.get::<_, Option<i64>>(9).map(us_to_system),
+                owner_runner_id: row.get(10),
+                started_at: row.get::<_, Option<i64>>(11).map(us_to_system),
+                last_renewed_at: row.get::<_, Option<i64>>(12).map(us_to_system),
+                timeout_triggered: row.get::<_, i64>(13) != 0,
+                debug_token_issued: row.get::<_, i64>(14) != 0,
+            };
+            if let Some(runner_id) = runner_id {
+                let has_session: bool = row.get(19);
+                let session_runner: Option<i64> = row.get(20);
+                ensure_request_owner(
+                    record.owner_runner_id,
+                    session_runner,
+                    has_session,
+                    runner_id,
+                )?;
+                if record.result.is_some() {
+                    return Err(ControlError::Conflict(
+                        "broker request already completed".to_owned(),
+                    ));
+                }
+            }
+            let message_blob: Option<Vec<u8>> = row.get(15);
+            let message_blob = message_blob
+                .ok_or_else(|| ControlError::NotFound(format!("request {request_id} message")))?;
+            let message = blob(&self.cipher, &message_blob)?;
+            let token_blob: Option<Vec<u8>> = row.get(17);
+            let token_request = token_blob.map(|b| blob(&self.cipher, &b)).transpose()?;
+            let granted: Option<i64> = row.get(18);
+            let submission_json: String = row.get(16);
+            let submission: preloop_gha_protocol::WorkflowSubmission =
+                serde_json::from_str(&submission_json).map_err(ControlError::backend)?;
+            Ok(AcquireContext {
+                request: record,
+                message,
+                token_request,
+                id_token_granted: granted.map(|g| g != 0),
+                repository: submission.repository,
+                trust_tier: submission.trust_tier,
+            })
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
     /// Find the run a webhook delivery already produced, by its durable
     /// `(delivery_id, workflow_path)` dedup key. O(1) via `runs_delivery` —
     /// the submit path calls this before `transact_scoped` so the replay
@@ -4018,55 +4107,59 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn acquire_context(&self, request_id: i64) -> Result<AcquireContext, ControlError> {
-        // Read-only — the reader pool serves it concurrently with the
-        // writer instead of serializing on the advisory write lock. Scoped
-        // to the request's run + owner session so it never loads the whole
-        // working set.
-        let (run_id, session_id) = self
-            .find_request_context(request_id)
-            .await?
-            .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
-        let scope = TxScope {
-            include_archived: false,
-            runs: Some(BTreeSet::from([run_id])),
-            ready_queue: false,
-            blocked_jobs: false,
-            sessions: Some(session_id.into_iter().collect()),
-            pending_expansions: false,
-            runs_via_requests: false,
-            concurrency: false,
-            job_requests_all: false,
-            runs_referenced: false,
-        };
-        self.read_scoped(&scope, |tx| {
-            let record = tx
-                .job_requests
-                .get(&request_id)
-                .cloned()
-                .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
-            let message = tx
-                .broker_messages
-                .get(&request_id)
-                .cloned()
-                .ok_or_else(|| ControlError::NotFound(format!("request {request_id} message")))?;
-            let run = tx
-                .runs
-                .get(&record.run_id)
-                .ok_or_else(|| ControlError::NotFound(format!("run {}", record.run_id)))?;
-            Ok(AcquireContext {
-                request: record.clone(),
-                message,
-                token_request: tx.github_token_requests.get(&request_id).cloned(),
-                id_token_granted: tx
-                    .id_token_grants
-                    .get(&(record.run_id, record.job_id.clone()))
-                    .copied()
-                    .unwrap_or(false),
-                repository: run.submission.repository.clone(),
-                trust_tier: run.submission.trust_tier.clone(),
-            })
-        })
-        .await
+        // Read-only point lookup on the reader pool — one joined statement
+        // instead of loading the run's working set.
+        self.acquire_impl(request_id, None).await
+    }
+
+    async fn acquire_for_runner(
+        &self,
+        request_id: i64,
+        runner_id: i64,
+    ) -> Result<AcquireContext, ControlError> {
+        self.acquire_impl(request_id, Some(runner_id)).await
+    }
+
+    async fn store_request_message(
+        &self,
+        run_id: RunId,
+        request_id: i64,
+        message: Option<&preloop_gha_protocol::azdo::AgentJobRequestMessage>,
+        token_request: Option<&crate::models::GitHubTokenRequest>,
+    ) -> Result<(), ControlError> {
+        let message_blob = message.map(|m| unblob(&self.cipher, m)).transpose()?;
+        let job_timeout = message.and_then(|m| m.job_timeout);
+        let token_blob = token_request.map(|t| unblob(&self.cipher, t)).transpose()?;
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            // Serializes against any scoped write-back on the request's run.
+            lock_runs(&tx, std::iter::once(&run_id)).await?;
+            if let Some(message_blob) = message_blob {
+                tx.execute(
+                    "UPDATE job_requests SET request_blob = $1, \
+                     job_timeout_s = COALESCE($2, job_timeout_s) \
+                     WHERE request_id = $3",
+                    &[&message_blob, &job_timeout, &request_id],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            }
+            if let Some(blob) = token_blob {
+                tx.execute(
+                    "INSERT INTO github_token_requests (request_id, request_blob) \
+                     VALUES ($1,$2) ON CONFLICT(request_id) \
+                     DO UPDATE SET request_blob = excluded.request_blob",
+                    &[&request_id, &blob],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            }
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
     }
 
     async fn complete_job(

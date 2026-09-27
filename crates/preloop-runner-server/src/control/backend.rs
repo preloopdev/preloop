@@ -21,6 +21,7 @@ use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
     WebhookRedeliveryRecord, WebhookWatchdogCursor,
 };
+use preloop_gha_protocol::azdo;
 use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
 use std::collections::BTreeMap;
 
@@ -139,6 +140,29 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Everything `acquirejob` needs in one read: the request record, its
     /// job message, the id-token grant and the deferred token-mint request.
     async fn acquire_context(&self, request_id: i64) -> Result<AcquireContext, ControlError>;
+
+    /// `acquire_context` plus the broker checks: the runner must own the
+    /// request (immutable owner, or the owner session's runner — an
+    /// assigned-but-unowned request still acquires, for session-less replay)
+    /// and the attempt must not be settled.
+    async fn acquire_for_runner(
+        &self,
+        request_id: i64,
+        runner_id: i64,
+    ) -> Result<AcquireContext, ControlError>;
+
+    /// Persist the agent-job message minted at claim for `request_id`
+    /// (`None` leaves `request_blob`/`job_timeout_s` untouched), and upsert
+    /// `token_request` when supplied. Runs under the run's advisory lock — a
+    /// concurrent scoped write-back that snapshots the same `request_id`
+    /// would otherwise clobber the row.
+    async fn store_request_message(
+        &self,
+        run_id: RunId,
+        request_id: i64,
+        message: Option<&azdo::AgentJobRequestMessage>,
+        token_request: Option<&crate::models::GitHubTokenRequest>,
+    ) -> Result<(), ControlError>;
 
     /// Record a runner's job completion: flip the job (and run) status,
     /// settle the request, release concurrency, promote newly-unblocked
@@ -834,6 +858,34 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.acquire_context(request_id).await,
             Self::Postgres(b) => b.acquire_context(request_id).await,
+        }
+    }
+    async fn acquire_for_runner(
+        &self,
+        request_id: i64,
+        runner_id: i64,
+    ) -> Result<AcquireContext, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.acquire_for_runner(request_id, runner_id).await,
+            Self::Postgres(b) => b.acquire_for_runner(request_id, runner_id).await,
+        }
+    }
+    async fn store_request_message(
+        &self,
+        run_id: RunId,
+        request_id: i64,
+        message: Option<&azdo::AgentJobRequestMessage>,
+        token_request: Option<&crate::models::GitHubTokenRequest>,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.store_request_message(run_id, request_id, message, token_request)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.store_request_message(run_id, request_id, message, token_request)
+                    .await
+            }
         }
     }
     async fn complete_job(

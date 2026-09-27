@@ -893,70 +893,26 @@ pub async fn broker_acquire_job(
         );
     }
     let job_message_id = request.job_message_id;
-    let run_id = shared
+    // One indexed join resolves the attempt plus its message, mint request,
+    // grant and owner — the whole acquire read, no working set.
+    let Some((request_id, run_id)) = shared
         .state
         .backend
-        .run_for_attempt(job_message_id)
+        .find_request_by_agent_job_id(job_message_id)
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
-    let run_scope = crate::control::txstate::TxScope::run(run_id);
-    let (request_id, mut message, github_token_request, id_token_granted) = {
-        shared
-            .state
-            .backend
-            .read_scoped(&run_scope, move |tx| {
-                let request_id = tx
-                    .agent_job_requests
-                    .get(&job_message_id)
-                    .copied()
-                    .ok_or_else(|| {
-                        ControlError::NotFound("broker job message not found".to_owned())
-                    })?;
-                ensure_broker_request_owner(tx, request_id, runner_id)?;
-                // A settled attempt is never acquirable. `renewjob` already
-                // 409s and `completejob` ignores such a record, so without
-                // this a late runner acquires a terminal job: the engine
-                // mints a fresh installation token and the runner executes
-                // side effects a second time, then cannot report the result.
-                // Requeue paths keep `result` unset (see
-                // `release_request_for_retry`), so a genuine retry still
-                // acquires.
-                if tx
-                    .job_requests
-                    .get(&request_id)
-                    .is_some_and(|record| record.result.is_some())
-                {
-                    return Err(ControlError::Conflict(
-                        "broker request already completed".to_owned(),
-                    ));
-                }
-                let message = tx
-                    .broker_messages
-                    .get(&request_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ControlError::NotFound("broker job payload not found".to_owned())
-                    })?;
-                let id_token_granted = tx
-                    .job_requests
-                    .get(&request_id)
-                    .and_then(|record| {
-                        tx.id_token_grants
-                            .get(&(record.run_id, record.job_id.clone()))
-                            .copied()
-                    })
-                    .unwrap_or(false);
-                Ok((
-                    request_id,
-                    message,
-                    tx.github_token_requests.get(&request_id).cloned(),
-                    id_token_granted,
-                ))
-            })
-            .await
-            .map_err(ApiError::from)?
+    else {
+        return Err(ApiError::not_found("broker job message not found"));
     };
+    let ctx = shared
+        .state
+        .backend
+        .acquire_for_runner(request_id, runner_id)
+        .await
+        .map_err(ApiError::from)?;
+    let mut message = ctx.message;
+    let github_token_request = ctx.token_request;
+    let id_token_granted = ctx.id_token_granted;
     // *same* conditions the job was built with — the original permission set
     // (fork profile included) and its fallback restrictions. Rebuilding from
     // the message would lose both: the default permission set is wider than
@@ -995,14 +951,10 @@ pub async fn broker_acquire_job(
         // `complete_job_inner` (claimed-job completion paths funnel there)
         // and `retire_node_requests` remove it once the job is terminal;
         // see the `distributed_task.rs` completion path for the known gap.
-        let msg = message.clone();
         shared
             .state
             .backend
-            .transact_scoped(&run_scope, move |tx| {
-                tx.broker_messages.insert(request_id, msg);
-                Ok(())
-            })
+            .store_request_message(run_id, request_id, Some(&message), None)
             .await
             .map_err(ApiError::from)?;
     } else {
@@ -1017,118 +969,78 @@ pub async fn broker_acquire_job(
         let derived = if shared.state.github_app.is_none() {
             None
         } else {
-            let msg = message.clone();
+            // The submission stores the tier as a plain kebab-case string
+            // (e.g. "untrusted-fork-pull-request"), not JSON. `from_str`
+            // expects JSON and would reject the bare string, yielding `None`
+            // — which `job_authorization` treats as trusted, silently
+            // un-restricting a fork job's token. Parse via a JSON string
+            // value so the kebab-case variant decodes.
+            let tier = ctx.trust_tier.as_deref().and_then(|tier| {
+                serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
+            });
+            // The job's resolved permission set lives in the persisted
+            // message's `system.github.token.permissions` variable
+            // (PascalCase wire spelling) — the same variable the build path
+            // wrote from `JobPlan` permissions. The event payload's
+            // `workflow_job` key is absent for push/PR/dispatch events, so
+            // reading it there would fall back to the broad default and
+            // grant scopes the workflow withheld. Recover from the message
+            // instead, converting the wire spelling back to kebab-case for
+            // the token request.
+            let wire_permissions = message
+                .variables
+                .get("system.github.token.permissions")
+                .and_then(|variable| variable.value.as_deref())
+                .and_then(|json| serde_json::from_str::<BTreeMap<String, String>>(json).ok());
+            // The wire variable spells scopes PascalCase ("PullRequests");
+            // the installation-token request and `job_authorization` expect
+            // the workflow's kebab-case identities ("pull-requests").
+            // Minting with PascalCase keys fails (or falls back to the broad
+            // PAT), so convert every key before building the request.
+            let wire_permissions = wire_permissions.map(|permissions| {
+                permissions
+                    .into_iter()
+                    .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
+                    .collect::<BTreeMap<_, _>>()
+            });
+            // The wire variable carries repository-token scopes only; the
+            // OIDC grant is persisted per job. Fall back to the old wire
+            // marker so jobs queued before this renderer change can still
+            // recover.
+            let id_token_granted = ctx.id_token_granted.unwrap_or_else(|| {
+                wire_permissions
+                    .as_ref()
+                    .and_then(|permissions| permissions.get("id-token"))
+                    .is_some_and(|level| level == "write")
+                    || message.resources.endpoints.iter().any(|endpoint| {
+                        endpoint
+                            .data
+                            .get("GenerateIdTokenUrl")
+                            .is_some_and(|url| !url.is_empty())
+                    })
+            });
+            let declared = wire_permissions.clone();
+            let policy = crate::events::trust_tier::job_authorization(
+                tier,
+                declared.as_ref(),
+                id_token_granted,
+            );
+            Some(crate::models::GitHubTokenRequest {
+                repository: ctx.repository.clone(),
+                permissions: policy.app_permissions,
+                declared: declared.is_some(),
+                untrusted: policy.fork_restricted,
+            })
+        };
+        if let Some(token_request) = derived {
+            // Register the derived request so a re-claim after a disconnect
+            // re-mints under the same derived policy, then mint.
             shared
                 .state
                 .backend
-                .read_scoped(&run_scope, move |tx| {
-                    let record = tx.job_requests.get(&request_id);
-                    let run = record.and_then(|record| tx.runs.get(&record.run_id));
-                    Ok(match (record, run) {
-                        (Some(record), Some(run)) => {
-                            // The submission stores the tier as a plain
-                            // kebab-case string (e.g.
-                            // "untrusted-fork-pull-request"), not JSON.
-                            // `from_str` expects JSON and would reject the
-                            // bare string, yielding `None` — which
-                            // `job_authorization` treats as trusted,
-                            // silently un-restricting a fork job's token.
-                            // Parse via a JSON string value so the kebab-case
-                            // variant decodes.
-                            let tier = run.submission.trust_tier.as_deref().and_then(|tier| {
-                                serde_json::from_value(serde_json::Value::String(tier.to_owned()))
-                                    .ok()
-                            });
-                            // The job's resolved permission set lives in the
-                            // persisted message's
-                            // `system.github.token.permissions` variable
-                            // (PascalCase wire spelling) — the same variable
-                            // the build path wrote from `JobPlan`
-                            // permissions. The event payload's `workflow_job`
-                            // key is absent for push/PR/dispatch events, so
-                            // reading it there would fall back to the broad
-                            // default and grant scopes the workflow
-                            // withheld. Recover from the message instead,
-                            // converting the wire spelling back to kebab-case
-                            // for the token request.
-                            let wire_permissions = msg
-                                .variables
-                                .get("system.github.token.permissions")
-                                .and_then(|variable| variable.value.as_deref())
-                                .and_then(|json| {
-                                    serde_json::from_str::<BTreeMap<String, String>>(json).ok()
-                                });
-                            // The wire variable spells scopes PascalCase
-                            // ("PullRequests"); the installation-token
-                            // request and `job_authorization` expect the
-                            // workflow's kebab-case identities
-                            // ("pull-requests"). Minting with PascalCase keys
-                            // fails (or falls back to the broad PAT), so
-                            // convert every key before building the request.
-                            let wire_permissions = wire_permissions.map(|permissions| {
-                                permissions
-                                    .into_iter()
-                                    .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
-                                    .collect::<BTreeMap<_, _>>()
-                            });
-                            // The wire variable carries repository-token
-                            // scopes only; the OIDC grant is persisted in the
-                            // job's endpoint metadata. Fall back to the old
-                            // wire marker so jobs queued before this renderer
-                            // change can still recover.
-                            let id_token_granted = tx
-                                .id_token_grants
-                                .get(&(record.run_id, record.job_id.clone()))
-                                .copied()
-                                .unwrap_or_else(|| {
-                                    wire_permissions
-                                        .as_ref()
-                                        .and_then(|permissions| permissions.get("id-token"))
-                                        .is_some_and(|level| level == "write")
-                                        || msg.resources.endpoints.iter().any(|endpoint| {
-                                            endpoint
-                                                .data
-                                                .get("GenerateIdTokenUrl")
-                                                .is_some_and(|url| !url.is_empty())
-                                        })
-                                });
-                            let declared = wire_permissions.clone();
-                            let policy = crate::events::trust_tier::job_authorization(
-                                tier,
-                                declared.as_ref(),
-                                id_token_granted,
-                            );
-                            Some((
-                                crate::models::GitHubTokenRequest {
-                                    repository: run.submission.repository.clone(),
-                                    permissions: policy.app_permissions,
-                                    declared: declared.is_some(),
-                                    untrusted: policy.fork_restricted,
-                                },
-                                record.request_id,
-                            ))
-                        }
-                        _ => None,
-                    })
-                })
+                .store_request_message(run_id, request_id, None, Some(&token_request))
                 .await
-                .map_err(ApiError::from)?
-        };
-        if let Some((token_request, derived_request_id)) = derived {
-            // Register the derived request so a re-claim after a disconnect
-            // re-mints under the same derived policy, then mint.
-            {
-                let tr = token_request.clone();
-                shared
-                    .state
-                    .backend
-                    .transact_scoped(&run_scope, move |tx| {
-                        tx.github_token_requests.insert(derived_request_id, tr);
-                        Ok(())
-                    })
-                    .await
-                    .map_err(ApiError::from)?;
-            }
+                .map_err(ApiError::from)?;
             tracing::info!(
                 request_id,
                 repository = %token_request.repository,
@@ -1147,14 +1059,10 @@ pub async fn broker_acquire_job(
                     "minted re-derived dispatch GitHub token at claim"
                 );
                 apply_minted_token_to_message(&mut message, &minted, true);
-                let msg = message.clone();
                 shared
                     .state
                     .backend
-                    .transact_scoped(&run_scope, move |tx| {
-                        tx.broker_messages.insert(request_id, msg);
-                        Ok(())
-                    })
+                    .store_request_message(run_id, request_id, Some(&message), None)
                     .await
                     .map_err(ApiError::from)?;
             }
@@ -1215,7 +1123,7 @@ pub async fn broker_acquire_job(
             // without an `id-token: write` grant (fork-restricted jobs
             // never have one) would invite a token request the endpoint then
             // refuses. Match the build-time message: URL only when granted.
-            if id_token_granted {
+            if id_token_granted.unwrap_or(false) {
                 endpoint.data.insert(
                     "GenerateIdTokenUrl".to_owned(),
                     format!(

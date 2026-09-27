@@ -192,7 +192,9 @@ pub(crate) struct AcquireContext {
     pub(crate) request: TaskAgentJobRequestRecord,
     pub(crate) message: azdo::AgentJobRequestMessage,
     pub(crate) token_request: Option<crate::models::GitHubTokenRequest>,
-    pub(crate) id_token_granted: bool,
+    /// `id_token_grants` row for the attempt's job: `Some` = recorded grant,
+    /// `None` = no row (the caller falls back to wire markers).
+    pub(crate) id_token_granted: Option<bool>,
     /// Run submission fields the token re-derivation path needs when the
     /// build-time request was lost: `(repository, trust_tier)`.
     pub(crate) repository: String,
@@ -433,6 +435,36 @@ pub(crate) fn renew_miss(
         // Owner matches and still in flight: raced a concurrent writer; the
         // caller retries through the transactional path.
         Some((None, Some(_))) => Ok(false),
+    }
+}
+/// Broker-acquire ownership check. Prefers the immutable owner recorded at
+/// claim; otherwise falls back to the owner session's runner. An assigned
+/// request whose session carries no runner still acquires, for session-less
+/// replay flows (golden session ids).
+pub(crate) fn ensure_request_owner(
+    owner_runner_id: Option<i64>,
+    session_runner: Option<i64>,
+    has_session: bool,
+    runner_id: i64,
+) -> Result<(), ControlError> {
+    if let Some(owner) = owner_runner_id {
+        return if owner == runner_id {
+            Ok(())
+        } else {
+            Err(ControlError::Forbidden(
+                "broker request belongs to another runner".to_owned(),
+            ))
+        };
+    }
+    match (has_session, session_runner) {
+        (_, Some(owner)) if owner == runner_id => Ok(()),
+        (_, Some(_)) => Err(ControlError::Forbidden(
+            "broker request belongs to another runner".to_owned(),
+        )),
+        (true, None) => Ok(()),
+        (false, None) => Err(ControlError::NotFound(
+            "broker request is not assigned to a session".to_owned(),
+        )),
     }
 }
 
