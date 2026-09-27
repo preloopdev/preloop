@@ -17,6 +17,8 @@ pub async fn next_message(
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(50);
+    // One window per request (see `broker::next_message_broker_ref`).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
 
     enum NextPoll {
         Forbidden,
@@ -198,12 +200,9 @@ pub async fn next_message(
                 if wait_seconds == 0 {
                     return (StatusCode::OK, Json(None));
                 }
-                if tokio::time::timeout(
-                    Duration::from_secs(wait_seconds),
-                    shared.state.message_notify.notified(),
-                )
-                .await
-                .is_err()
+                if tokio::time::timeout_at(deadline, shared.state.message_notify.notified())
+                    .await
+                    .is_err()
                 {
                     return (StatusCode::OK, Json(None));
                 }

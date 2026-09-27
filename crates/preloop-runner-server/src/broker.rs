@@ -330,6 +330,9 @@ pub async fn next_message_broker_ref(
         identity.as_ref().map(|axum::Extension(id)| id),
         Some(runner_id),
     );
+    // One window per request: a wake that loses the claim race must not
+    // restart it, or a busy queue holds a poll open indefinitely.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
 
     loop {
         let outcome = shared
@@ -403,12 +406,9 @@ pub async fn next_message_broker_ref(
             };
             return Ok((status, Json(body)).into_response());
         }
-        if tokio::time::timeout(
-            Duration::from_secs(wait_seconds),
-            shared.state.message_notify.notified(),
-        )
-        .await
-        .is_err()
+        if tokio::time::timeout_at(deadline, shared.state.message_notify.notified())
+            .await
+            .is_err()
         {
             let status = if runner_busy {
                 StatusCode::ACCEPTED
@@ -657,11 +657,18 @@ pub async fn authenticated_runner_id_for_job(
             "job runtime token does not match broker job",
         ));
     }
+    let run_id = shared
+        .state
+        .backend
+        .run_for_attempt(job_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("broker job request not found"))?;
     let request =
         shared
             .state
             .backend
-            .read(move |tx| {
+            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                 if !tx.runners.contains_key(&expected_runner_id) {
                     return Err(ControlError::Forbidden(
                         "runner registration no longer exists".to_owned(),
@@ -885,12 +892,20 @@ pub async fn broker_acquire_job(
             "broker.acquirejob",
         );
     }
+    let job_message_id = request.job_message_id;
+    let run_id = shared
+        .state
+        .backend
+        .run_for_attempt(job_message_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("broker job message not found"))?;
+    let run_scope = crate::control::txstate::TxScope::run(run_id);
     let (request_id, mut message, github_token_request, id_token_granted) = {
-        let job_message_id = request.job_message_id;
         shared
             .state
             .backend
-            .read(move |tx| {
+            .read_scoped(&run_scope, move |tx| {
                 let request_id = tx
                     .agent_job_requests
                     .get(&job_message_id)
@@ -984,7 +999,7 @@ pub async fn broker_acquire_job(
         shared
             .state
             .backend
-            .transact(move |tx| {
+            .transact_scoped(&run_scope, move |tx| {
                 tx.broker_messages.insert(request_id, msg);
                 Ok(())
             })
@@ -1006,7 +1021,7 @@ pub async fn broker_acquire_job(
             shared
                 .state
                 .backend
-                .read(move |tx| {
+                .read_scoped(&run_scope, move |tx| {
                     let record = tx.job_requests.get(&request_id);
                     let run = record.and_then(|record| tx.runs.get(&record.run_id));
                     Ok(match (record, run) {
@@ -1107,7 +1122,7 @@ pub async fn broker_acquire_job(
                 shared
                     .state
                     .backend
-                    .transact(move |tx| {
+                    .transact_scoped(&run_scope, move |tx| {
                         tx.github_token_requests.insert(derived_request_id, tr);
                         Ok(())
                     })
@@ -1136,7 +1151,7 @@ pub async fn broker_acquire_job(
                 shared
                     .state
                     .backend
-                    .transact(move |tx| {
+                    .transact_scoped(&run_scope, move |tx| {
                         tx.broker_messages.insert(request_id, msg);
                         Ok(())
                     })

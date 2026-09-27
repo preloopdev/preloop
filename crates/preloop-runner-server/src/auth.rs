@@ -548,7 +548,7 @@ pub async fn registered_runner_id(shared: &Arc<SharedState>, token: &str) -> Opt
         shared
             .state
             .backend
-            .read(move |tx| Ok(tx.runner_client_ids.get(&client_id).copied()))
+            .runner_for_client(&client_id)
             .await
             .ok()
             .flatten()
@@ -580,7 +580,7 @@ async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
     shared
         .state
         .backend
-        .read(move |tx| Ok(tx.runners.contains_key(&runner_id)))
+        .runner_exists(runner_id)
         .await
         .unwrap_or(false)
 }
@@ -974,21 +974,25 @@ pub async fn job_repository_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let repository = state
+    let run_id = state
         .backend
-        .read(move |tx| {
-            Ok(tx
-                .agent_job_requests
-                .get(&job_id)
-                .and_then(|request_id| tx.job_requests.get(request_id))
-                .and_then(|record| tx.runs.get(&record.run_id))
-                .map(|run| run.submission.repository.clone()))
-        })
+        .run_for_attempt(job_id)
         .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| {
-            ApiError::forbidden("job runtime token is not bound to a live workflow run")
-        })?;
+        .map_err(ApiError::from)?;
+    let repository = match run_id {
+        Some(run_id) => state
+            .backend
+            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+                Ok(tx
+                    .runs
+                    .get(&run_id)
+                    .map(|run| run.submission.repository.clone()))
+            })
+            .await
+            .map_err(ApiError::from)?,
+        None => None,
+    }
+    .ok_or_else(|| ApiError::forbidden("job runtime token is not bound to a live workflow run"))?;
     Ok(Some(repository))
 }
 

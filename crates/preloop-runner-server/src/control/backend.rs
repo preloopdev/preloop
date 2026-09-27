@@ -301,6 +301,18 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Drop timelines not patched since `before_us`. Returns timelines removed.
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
 
+    /// Whether `runner_id` is registered (indexed point read).
+    async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError>;
+
+    /// The runner registered under OAuth `client_id`, if any.
+    async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError>;
+
+    /// The run an execution attempt belongs to.
+    async fn run_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<RunId>, ControlError>;
+
     /// Whether `run_id` takes part in any concurrency group (run- or
     /// job-level, holding or waiting). A run that doesn't can settle a job
     /// under its own run lock: nothing it releases can wake another run.
@@ -951,6 +963,30 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.prune_timelines(before_us).await,
         }
     }
+    async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.runner_exists(runner_id).await,
+            Self::Postgres(b) => b.runner_exists(runner_id).await,
+        }
+    }
+
+    async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.runner_for_client(client_id).await,
+            Self::Postgres(b) => b.runner_for_client(client_id).await,
+        }
+    }
+
+    async fn run_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<RunId>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_for_attempt(agent_job_id).await,
+            Self::Postgres(b) => b.run_for_attempt(agent_job_id).await,
+        }
+    }
+
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         match self {
             Self::Sqlite(b) => b.run_in_concurrency(run_id).await,

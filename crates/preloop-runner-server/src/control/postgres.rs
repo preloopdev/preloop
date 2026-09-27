@@ -1620,7 +1620,7 @@ async fn load_txstate(
         let mut runs: BTreeSet<RunId> = match scope.runs.as_ref() {
             Some(runs) => runs.clone(),
             None => conn
-                .query("SELECT run_id FROM runs", &[])
+                .query("SELECT run_id FROM runs WHERE archived_at_us IS NULL", &[])
                 .await
                 .map_err(ControlError::backend)?
                 .iter()
@@ -1671,7 +1671,10 @@ async fn load_txstate(
     let loaded_runs = match scope.runs.as_ref() {
         Some(runs) if runs.is_empty() => Vec::new(),
         Some(_) => load_runs(conn, cipher, " WHERE run_id = ANY($1)", &[&run_ids]).await?,
-        None => load_runs(conn, cipher, "", &[]).await?,
+        // The live working set is the unarchived runs; an archived run's
+        // rows live in the history tables and only a history scope reads it.
+        None if scope.include_archived => load_runs(conn, cipher, "", &[]).await?,
+        None => load_runs(conn, cipher, " WHERE archived_at_us IS NULL", &[]).await?,
     };
     for (run_id, namespace, run, parts) in loaded_runs {
         tx.run_namespaces.insert(run_id, namespace);
@@ -4191,8 +4194,25 @@ impl ControlBackend for PostgresBackend {
                 )
                 .await
                 .map_err(ControlError::backend)?;
+            let mut archived = 0;
             for row in &rows {
                 let run_id: String = row.get(0);
+                // Archive only a run no writer holds: a late run-scoped
+                // command (check-run report, timeline flush) would otherwise
+                // race these deletes. Never waits; a busy run is archived on
+                // a later pass.
+                let free: bool = tx
+                    .query_one(
+                        "SELECT pg_try_advisory_xact_lock($1)",
+                        &[&run_lock_key(&parse_run_id(&run_id))],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?
+                    .get(0);
+                if !free {
+                    continue;
+                }
+                archived += 1;
                 tx.execute(
                     "INSERT INTO job_history(namespace_id,run_id,run_attempt,run_created_at_us,
                     job_id,status,base_id,pool_key,priority,run_order,job_order)
@@ -4256,7 +4276,10 @@ impl ControlBackend for PostgresBackend {
                 .map_err(ControlError::backend)?;
             }
             tx.commit().await.map_err(ControlError::backend)?;
-            Ok(rows.len())
+            // Runs archived, not candidates: a batch with busy runs skipped
+            // ends the caller's drain loop until the next tick instead of
+            // re-fetching the same held runs.
+            Ok(archived)
         }
         .await;
         self.return_writer(client).await;
@@ -4410,6 +4433,48 @@ impl ControlBackend for PostgresBackend {
                     )
                 })
             });
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt("SELECT 1 FROM runners WHERE runner_id=$1", &[&runner_id])
+            .await
+            .map(|row| row.is_some())
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT runner_id FROM runners WHERE client_id=$1",
+                &[&client_id],
+            )
+            .await
+            .map(|row| row.map(|row| row.get(0)))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn run_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<RunId>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT run_id FROM job_requests WHERE agent_job_id=$1",
+                &[&agent_job_id.to_string()],
+            )
+            .await
+            .map(|row| row.map(|row| parse_run_id(&row.get::<_, String>(0))))
+            .map_err(ControlError::backend);
         self.return_reader(client).await;
         result
     }

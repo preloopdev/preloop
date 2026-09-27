@@ -153,7 +153,10 @@ impl Runner {
         Ok(Identity {
             runner_id,
             listen_token,
-            session_id: session["sessionId"].as_str().context("sessionId")?.to_owned(),
+            session_id: session["sessionId"]
+                .as_str()
+                .context("sessionId")?
+                .to_owned(),
         })
     }
 
@@ -197,11 +200,15 @@ impl Runner {
             .http
             .post(format!("{}/broker/{}/acquirejob", self.base, id.runner_id))
             .bearer_auth(&id.listen_token)
-            .json(&json!({"jobMessageId": request_id, "billingOwnerId": "load", "runnerOS": "Linux"}))
+            .json(
+                &json!({"jobMessageId": request_id, "billingOwnerId": "load", "runnerOS": "Linux"}),
+            )
             .send()
             .await?;
         if !response.status().is_success() {
             self.metrics.incr("job.acquire_error");
+            self.metrics
+                .incr(&format!("job.acquire_error.{}", response.status().as_u16()));
             return Ok(());
         }
         let job: Value = response.json().await?;
@@ -209,7 +216,10 @@ impl Runner {
         self.metrics.incr("job.acquired");
         let agent_job_id = job["jobId"].as_str().context("jobId")?.to_owned();
         let plan_id = job["plan"]["planId"].as_str().context("planId")?.to_owned();
-        let timeline_id = job["timeline"]["id"].as_str().context("timeline id")?.to_owned();
+        let timeline_id = job["timeline"]["id"]
+            .as_str()
+            .context("timeline id")?
+            .to_owned();
         let runtime = job["resources"]["endpoints"][0]["authorization"]["parameters"]
             ["AccessToken"]
             .as_str()
@@ -254,7 +264,15 @@ impl Runner {
                     self.metrics.latency("timeline_patch", patched);
                     self.metrics.incr("job.timeline_patch");
                 }
-                _ => self.metrics.incr("job.timeline_error"),
+                Ok(r) => {
+                    self.metrics.incr("job.timeline_error");
+                    self.metrics
+                        .incr(&format!("job.timeline_error.{}", r.status().as_u16()));
+                }
+                Err(_) => {
+                    self.metrics.incr("job.timeline_error");
+                    self.metrics.incr("job.timeline_error.transport");
+                }
             }
             if last_renew.elapsed() >= self.model.renew_every {
                 last_renew = Instant::now();
@@ -293,6 +311,10 @@ impl Runner {
             self.metrics.incr("job.completed");
         } else {
             self.metrics.incr("job.complete_error");
+            self.metrics.incr(&format!(
+                "job.complete_error.{}",
+                response.status().as_u16()
+            ));
         }
         self.metrics.latency("job_wall", started);
         Ok(())

@@ -264,7 +264,7 @@ pub async fn report_check_run_queued(
     let existing_check_run_id = shared
         .state
         .backend
-        .read(move |tx| {
+        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
             Ok(tx
                 .runs
                 .get(&run_id)
@@ -290,7 +290,7 @@ pub async fn report_check_run_queued(
                 shared
                     .state
                     .backend
-                    .transact(move |tx| {
+                    .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                         if let Some(run) = tx.runs.get_mut(&run_id) {
                             if run.job_check_run_ids.get(&jid) == Some(&check_run_id) {
                                 run.job_check_run_ids.remove(&jid);
@@ -401,7 +401,7 @@ async fn mint_check_run(
         let job_name = shared
             .state
             .backend
-            .read(move |tx| {
+            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                 Ok(tx
                     .runs
                     .get(&run_id)
@@ -472,7 +472,7 @@ async fn mint_check_run(
     let mapping_changed = shared
         .state
         .backend
-        .transact(move |tx| {
+        .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
             Ok(tx.runs.get_mut(&run_id).map(|run| {
                 run.job_check_run_ids
                     .insert(jid.clone(), check_run_id)
@@ -634,7 +634,7 @@ pub async fn report_check_runs_for_run(
         let outcome = shared
             .state
             .backend
-            .read(move |tx| {
+            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                 Ok(tx.runs.get(&run_id).map(|run| {
                     (
                         run.submission.repository.clone(),
@@ -683,7 +683,7 @@ pub async fn report_check_runs_for_run(
             shared
                 .state
                 .backend
-                .read(move |tx| {
+                .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                     Ok(tx
                         .runs
                         .get(&run_id)
@@ -709,7 +709,7 @@ pub async fn report_check_run_in_progress(
         let outcome = shared
             .state
             .backend
-            .read(move |tx| {
+            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                 Ok(tx.runs.get(&run_id).and_then(|run| {
                     run.job_check_run_ids
                         .get(job_id)
@@ -2906,7 +2906,7 @@ async fn process_delivery_payload_with_lease(
                     let jobs = shared
                         .state
                         .backend
-                        .read(move |tx| {
+                        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                             Ok(tx
                                 .runs
                                 .get(&run_id)
@@ -2940,7 +2940,7 @@ async fn process_delivery_payload_with_lease(
                                     shared
                                         .state
                                         .backend
-                                        .read(move |tx| {
+                                        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
                                             Ok(tx
                                                 .runs
                                                 .get(&run_id)

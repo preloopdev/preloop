@@ -811,6 +811,8 @@ CREATE TABLE IF NOT EXISTS runners (
     pool_proven         BIGINT NOT NULL DEFAULT 0,
     registered_at_us    BIGINT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS runners_client ON runners(client_id)
+    WHERE client_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS runner_sessions (
     session_id          TEXT PRIMARY KEY,
     -- NULL for compatibility sessions (e.g. the implicit `default` session)

@@ -50,7 +50,7 @@ enum Command {
         faults: Vec<chaos::Fault>,
     },
     /// One load round.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
 }
 
 #[derive(clap::Args, Clone)]
@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
             let metrics = Arc::new(Metrics::new());
             chaos::run_proxy(listen, upstream, faults, metrics, Instant::now()).await
         }
-        Command::Run(args) => run(args).await,
+        Command::Run(args) => run(*args).await,
     }
 }
 
@@ -144,8 +144,12 @@ async fn run(args: RunArgs) -> Result<()> {
         .bursts
         .iter()
         .map(|b| -> Result<_> {
-            let (window, m) = b.split_once(':').ok_or_else(|| anyhow::anyhow!("burst {b}"))?;
-            let (s, d) = window.split_once('+').ok_or_else(|| anyhow::anyhow!("burst {b}"))?;
+            let (window, m) = b
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("burst {b}"))?;
+            let (s, d) = window
+                .split_once('+')
+                .ok_or_else(|| anyhow::anyhow!("burst {b}"))?;
             Ok((s.parse()?, d.parse()?, m.parse()?))
         })
         .collect::<Result<_>>()?;
@@ -203,7 +207,11 @@ async fn run(args: RunArgs) -> Result<()> {
         }
         let intended = next;
         sequence += 1;
-        let repo = format!("load-org-{}/repo-{}", sequence % 37, rng.gen_range(0..args.repos));
+        let repo = format!(
+            "load-org-{}/repo-{}",
+            sequence % 37,
+            rng.gen_range(0..args.repos)
+        );
         let webhook = args.webhook_sha.is_some() && rng.gen_bool(args.webhook_fraction);
         let base = args.servers[sequence as usize % args.servers.len()].clone();
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
@@ -308,7 +316,10 @@ async fn run(args: RunArgs) -> Result<()> {
     summary["top_statements"] = statements;
     let dir = args.out.join(&args.label);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
+    std::fs::write(
+        dir.join("summary.json"),
+        serde_json::to_string_pretty(&summary)?,
+    )?;
     std::fs::write(dir.join("timeline.csv"), metrics.timeline_csv())?;
     println!("{}", serde_json::to_string_pretty(&summary["totals"])?);
     println!("rates: {}", summary["rate_per_sec"]);

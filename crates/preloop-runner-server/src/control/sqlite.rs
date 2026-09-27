@@ -4145,6 +4145,48 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM runners WHERE runner_id=?1",
+                params![runner_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError> {
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT runner_id FROM runners WHERE client_id=?1",
+                params![client_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn run_for_attempt(
+        &self,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<Option<RunId>, ControlError> {
+        let agent = agent_job_id.to_string();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT run_id FROM job_requests WHERE agent_job_id=?1",
+                params![agent],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map(|run| run.map(|run| parse_run_id(&run)))
+            .map_err(ControlError::backend)
+        })
+    }
+
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         let run_id = run_id.0.to_string();
         self.with_reader(|conn| {
