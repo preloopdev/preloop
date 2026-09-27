@@ -64,13 +64,6 @@ pub struct JobContext {
     pub dap_debugger: Option<Arc<dyn preloop_dap::IDapDebugger>>,
     /// Debugger connection telemetry entries for completejob.
     pub debugger_telemetry: Vec<String>,
-    /// Actions upgraded from node20 to node24 by migration policy.
-    pub upgraded_node24_actions: Vec<String>,
-    /// Actions still using deprecated node20 (for warning).
-    pub deprecated_node20_actions: Vec<String>,
-    /// Whether the Node 20 deprecation warning has already been emitted for this job.
-    /// Guard for one-time per-job warning via the node handler; not per step.
-    pub node20_warning_emitted: bool,
     /// v2.336.0 (#4527): Job-scoped artifact subjects from $GITHUB_ARTIFACTS.
     /// Keyed by canonical subject name; value is (digest, kind).
     pub artifact_subjects: IndexMap<String, ArtifactSubject>,
@@ -188,35 +181,8 @@ impl JobContext {
             declared_step_ids: std::collections::HashSet::new(),
             dap_debugger: None,
             debugger_telemetry: Vec::new(),
-            upgraded_node24_actions: Vec::new(),
-            deprecated_node20_actions: Vec::new(),
-            node20_warning_emitted: false,
             artifact_subjects: IndexMap::new(),
         }
-    }
-
-    /// Record an action that was upgraded from node20 to node24 by migration policy.
-    pub fn record_upgraded_node24_action(&mut self, name: &str) {
-        if !self.upgraded_node24_actions.iter().any(|n| n == name) {
-            self.upgraded_node24_actions.push(name.to_string());
-        }
-    }
-
-    /// Record an action still using deprecated node20.
-    pub fn record_deprecated_node20_action(&mut self, name: &str) {
-        if !self.deprecated_node20_actions.iter().any(|n| n == name) {
-            self.deprecated_node20_actions.push(name.to_string());
-        }
-    }
-
-    /// Emit the one-time per-job Node 20 deprecation warning if not already emitted.
-    /// Returns true if a warning was emitted.
-    pub fn emit_node20_deprecation_warning(&mut self) -> bool {
-        if self.node20_warning_emitted {
-            return false;
-        }
-        self.node20_warning_emitted = true;
-        true
     }
 
     /// Get the value of a variable by key. Supports case-insensitive lookup.
