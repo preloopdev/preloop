@@ -55,23 +55,20 @@ pub fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
 /// (the job builder defaults `plan.plan_id` to the job's own id). A build job
 /// and a consumer job of the same run therefore present different plan ids —
 /// scoping the registry by the raw request value would make the build job's
-/// uploads invisible to the consumer (found via scenario 206). Map the plan id
-/// to the recorded run id when it is known; fall back to the request value for
-/// unknown plans (control-plane callers, tests).
+/// uploads invisible to the consumer (found via scenario 206). `scopes` maps
+/// plan ids to their latest attempt's run; unknown plan ids fall back to the
+/// request value (control-plane callers, tests).
 pub fn canonical_artifact_scope(
-    tx: &crate::control::txstate::TxState,
-    plan_id: &str,
-    fallback: &str,
+    scopes: &std::collections::BTreeMap<String, RunId>,
+    backend_id: &str,
 ) -> String {
-    if let Some(request_id) = tx.plan_requests.get(plan_id) {
-        if let Some(record) = tx.job_requests.get(request_id) {
-            return record.run_id.to_string();
-        }
-    }
-    fallback.to_owned()
+    scopes
+        .get(backend_id)
+        .map(|run_id| run_id.to_string())
+        .unwrap_or_else(|| backend_id.to_owned())
 }
 
-/// Resolve *and authorize* the run-scoped artifact namespace for an
+/// Authorize *and resolve* the run-scoped artifact namespace for an
 /// artifact-v2 request.
 ///
 /// Every artifact-v2 request type carries `workflow_run_backend_id` and
@@ -91,28 +88,39 @@ pub fn canonical_artifact_scope(
 /// blob URLs, which really are per-job — would break artifact hand-off
 /// jobs. `workflow_job_run_backend_id` is consequently *not* an authorization
 /// input here; it is recorded as attribution only.
-fn artifact_v2_canonical_run_scope(
-    tx: &crate::control::txstate::TxState,
-    workflow_run_backend_id: &str,
+async fn artifact_v2_authorized_run_scope(
+    backend: &crate::control::Backend,
+    canonical_run: &str,
     job: Option<uuid::Uuid>,
 ) -> Result<String, ApiError> {
-    let canonical_run =
-        canonical_artifact_scope(tx, workflow_run_backend_id, workflow_run_backend_id);
     let Some(job) = job else {
-        return Ok(canonical_run);
+        return Ok(canonical_run.to_owned());
     };
     let forbidden =
         || ApiError::forbidden("artifact access requires a token for that workflow run");
-    let request_id = tx
-        .agent_job_requests
-        .get(&job)
-        .copied()
-        .ok_or_else(forbidden)?;
-    let record = tx.job_requests.get(&request_id).ok_or_else(forbidden)?;
+    let record = backend
+        .request(crate::control::backend::RequestKey::AgentJobId(job))
+        .await
+        .map_err(|_| forbidden())?;
     if record.run_id.to_string() != canonical_run {
         return Err(forbidden());
     }
-    Ok(canonical_run)
+    Ok(canonical_run.to_owned())
+}
+
+/// Resolve the caller's body plan id to its run and authorize the token
+/// against it.
+async fn artifact_v2_run_scope(
+    backend: &crate::control::Backend,
+    backend_id: &str,
+    job: Option<uuid::Uuid>,
+) -> Result<String, ApiError> {
+    let scopes = backend
+        .artifact_scopes(&[backend_id.to_owned()])
+        .await
+        .map_err(ApiError::from)?;
+    let canonical = canonical_artifact_scope(&scopes, backend_id);
+    artifact_v2_authorized_run_scope(backend, &canonical, job).await
 }
 
 fn artifact_v2_job_from_headers(
@@ -159,15 +167,8 @@ pub async fn twirp_artifact_v2_create(
         }),
     };
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
-    let canonical_run = {
-        let backend_id = request.workflow_run_backend_id.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
-            .await
-            .map_err(ApiError::from)??
-    };
+    let canonical_run =
+        artifact_v2_run_scope(&shared.state.backend, &request.workflow_run_backend_id, job).await?;
     validate_artifact_name(&request.name)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     // The upload token is a server-signed blob JWT; `jti` names the staging
@@ -282,15 +283,8 @@ pub async fn twirp_artifact_v2_finalize(
         }),
     };
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
-    let canonical_run = {
-        let backend_id = request.workflow_run_backend_id.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
-            .await
-            .map_err(ApiError::from)??
-    };
+    let canonical_run =
+        artifact_v2_run_scope(&shared.state.backend, &request.workflow_run_backend_id, job).await?;
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let token = {
         let caller_job_str = job.map(|j| j.to_string());
@@ -382,39 +376,37 @@ pub async fn twirp_artifact_v2_list(
     Json(request): Json<ArtifactV2ListRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
-    // Node-local registry snapshot (entries + their raw backend ids), then a
-    // backend read to canonicalize the request scope and each entry's scope.
+    // Node-local registry snapshot (entries + their raw backend ids), then one
+    // batched indexed lookup to canonicalize the request scope and each
+    // entry's scope.
     let entries: Vec<crate::models::ArtifactV2Entry> = {
         let inner = shared.state.inner.lock().await;
         inner.artifact_v2_registry.values().cloned().collect()
     };
     let backend_id = request.workflow_run_backend_id.clone();
-    let (canonical_run, entry_scopes) = {
-        let entries_for_scope = entries.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| {
-                let canonical_run = artifact_v2_canonical_run_scope(tx, &backend_id, job);
-                let entry_scopes = entries_for_scope
-                    .iter()
-                    .map(|e| {
-                        (
-                            e.workflow_run_backend_id.clone(),
-                            canonical_artifact_scope(
-                                tx,
-                                &e.workflow_run_backend_id,
-                                &e.workflow_run_backend_id,
-                            ),
-                        )
-                    })
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                Ok((canonical_run, entry_scopes))
-            })
-            .await
-            .map_err(ApiError::from)?
-    };
-    let canonical_run = canonical_run?;
+    let mut plan_ids: Vec<String> = entries
+        .iter()
+        .map(|e| e.workflow_run_backend_id.clone())
+        .collect();
+    plan_ids.push(backend_id.clone());
+    let scopes = shared
+        .state
+        .backend
+        .artifact_scopes(&plan_ids)
+        .await
+        .map_err(ApiError::from)?;
+    let canonical_run = canonical_artifact_scope(&scopes, &backend_id);
+    let canonical_run =
+        artifact_v2_authorized_run_scope(&shared.state.backend, &canonical_run, job).await?;
+    let entry_scopes: std::collections::BTreeMap<String, String> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.workflow_run_backend_id.clone(),
+                canonical_artifact_scope(&scopes, &e.workflow_run_backend_id),
+            )
+        })
+        .collect();
 
     let name_filter: Option<String> = request.name_filter.and_then(|v| match v {
         serde_json::Value::String(s) => Some(s),
@@ -465,15 +457,8 @@ pub async fn twirp_artifact_v2_get_signed_url(
     Json(request): Json<ArtifactV2GetSignedUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
-    let canonical_run = {
-        let backend_id = request.workflow_run_backend_id.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
-            .await
-            .map_err(ApiError::from)??
-    };
+    let canonical_run =
+        artifact_v2_run_scope(&shared.state.backend, &request.workflow_run_backend_id, job).await?;
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let blob_jti = {
         let inner = shared.state.inner.lock().await;
@@ -515,15 +500,8 @@ pub async fn twirp_artifact_v2_delete(
         }),
     };
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
-    let canonical_run = {
-        let backend_id = request.workflow_run_backend_id.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| Ok(artifact_v2_canonical_run_scope(tx, &backend_id, job)))
-            .await
-            .map_err(ApiError::from)??
-    };
+    let canonical_run =
+        artifact_v2_run_scope(&shared.state.backend, &request.workflow_run_backend_id, job).await?;
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
     let removed = {
         let mut inner = shared.state.inner.lock().await;

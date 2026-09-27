@@ -37,6 +37,7 @@ use parking_lot::Mutex;
 use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, SessionId};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::BTreeMap;
 
 use std::collections::BTreeSet;
 
@@ -4076,6 +4077,41 @@ impl ControlBackend for SqliteBackend {
             .ok_or_else(|| ControlError::NotFound("request".to_owned()))
         })
     }
+    async fn artifact_scopes(
+        &self,
+        plan_ids: &[String],
+    ) -> Result<BTreeMap<String, RunId>, ControlError> {
+        if plan_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", plan_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT plan_id, run_id FROM job_requests \
+             WHERE plan_id IN ({placeholders}) ORDER BY request_id DESC"
+        );
+        let plan_ids = plan_ids.to_vec();
+        self.with_reader(move |conn| {
+            let mut stmt = conn.prepare(&sql).map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(plan_ids.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(ControlError::backend)?;
+            let mut scopes = BTreeMap::new();
+            for row in rows {
+                let (plan_id, run_id) = row.map_err(ControlError::backend)?;
+                // Ordered by request_id DESC: the first row per plan id is the
+                // latest attempt.
+                scopes
+                    .entry(plan_id)
+                    .or_insert_with(|| parse_run_id(&run_id));
+            }
+            Ok(scopes)
+        })
+    }
+
     async fn create_log(&self, _plan_id: &str) -> Result<i64, ControlError> {
         run_blocking(|| {
             let mut conn = self.conn.lock();

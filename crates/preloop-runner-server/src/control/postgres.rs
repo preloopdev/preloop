@@ -34,7 +34,7 @@ use crate::store;
 use crate::store::Store as _;
 use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, SessionId};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tokio_postgres::{Client, NoTls};
 
 /// The Postgres control backend. `client` is the single writer behind a
@@ -4625,6 +4625,37 @@ impl ControlBackend for PostgresBackend {
                 timeout_triggered: row.get::<_, i64>(13) != 0,
                 debug_token_issued: row.get::<_, i64>(14) != 0,
             })
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+    async fn artifact_scopes(
+        &self,
+        plan_ids: &[String],
+    ) -> Result<BTreeMap<String, RunId>, ControlError> {
+        if plan_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let client = self.checkout_reader().await?;
+        let result = async {
+            let rows = client
+                .query(
+                    "SELECT plan_id, run_id FROM job_requests \
+                     WHERE plan_id = ANY($1) ORDER BY request_id DESC",
+                    &[&plan_ids],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let mut scopes = BTreeMap::new();
+            for row in rows {
+                let plan_id: String = row.get(0);
+                let run_id: String = row.get(1);
+                scopes
+                    .entry(plan_id)
+                    .or_insert_with(|| parse_run_id(&run_id));
+            }
+            Ok(scopes)
         }
         .await;
         self.return_reader(client).await;

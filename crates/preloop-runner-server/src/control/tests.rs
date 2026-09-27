@@ -543,6 +543,28 @@ pub(crate) mod suite {
         assert_eq!(run.jobs[&JobId("build".into())], ExecutionStatus::Queued);
     }
 
+    /// Artifact scope resolution: plan ids map to their latest attempt's run;
+    /// unknown ids are omitted so callers keep the raw backend id.
+    pub(crate) async fn artifact_scopes_map_plan_ids_to_latest_run(backend: &dyn ControlBackend) {
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        backend
+            .submit_run(submit_run(run_a, vec![submit_job(run_a, "build", 1)]))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_b, vec![submit_job(run_b, "build", 2)]))
+            .await
+            .unwrap();
+        let scopes = backend
+            .artifact_scopes(&["plan".to_owned(), "unknown".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(scopes.get("plan"), Some(&run_b));
+        assert!(!scopes.contains_key("unknown"));
+        assert!(backend.artifact_scopes(&[]).await.unwrap().is_empty());
+    }
+
     pub(crate) async fn cancel_run_queues_cancellation(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -1032,6 +1054,12 @@ mod sqlite {
     #[tokio::test]
     async fn cancel_run_queues_cancellation() {
         suite::cancel_run_queues_cancellation(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_scopes_map_plan_ids_to_latest_run() {
+        suite::artifact_scopes_map_plan_ids_to_latest_run(&SqliteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]
@@ -2722,6 +2750,12 @@ mod postgres {
     async fn cancel_run_queues_cancellation() {
         let (_pg, backend) = backend().await;
         suite::cancel_run_queues_cancellation(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_scopes_map_plan_ids_to_latest_run() {
+        let (_pg, backend) = backend().await;
+        suite::artifact_scopes_map_plan_ids_to_latest_run(&backend).await;
     }
 
     #[tokio::test]

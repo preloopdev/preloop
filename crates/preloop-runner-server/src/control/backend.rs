@@ -246,6 +246,12 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Change only a run's push-sync state. The run advisory lock serializes
     /// this with scheduling transactions that may also rewrite run scalars.
     async fn set_push_state(&self, run_id: RunId, state: PushState) -> Result<(), ControlError>;
+    /// Latest live attempt's run for each plan id. Unknown plan ids are
+    /// omitted; callers preserve their existing fallback semantics.
+    async fn artifact_scopes(
+        &self,
+        plan_ids: &[String],
+    ) -> Result<BTreeMap<String, RunId>, ControlError>;
 
     /// Queue pressure snapshot for status/metrics.
     async fn queue_stats(&self) -> Result<QueueStats, ControlError>;
@@ -832,6 +838,15 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.request(key).await,
             Self::Postgres(b) => b.request(key).await,
+        }
+    }
+    async fn artifact_scopes(
+        &self,
+        plan_ids: &[String],
+    ) -> Result<BTreeMap<String, RunId>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.artifact_scopes(plan_ids).await,
+            Self::Postgres(b) => b.artifact_scopes(plan_ids).await,
         }
     }
     async fn set_push_state(&self, run_id: RunId, state: PushState) -> Result<(), ControlError> {
