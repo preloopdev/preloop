@@ -280,6 +280,8 @@ pub(crate) struct LoadedRows {
     /// loaded keys that are gone. (A scoped delete + reinsert races any
     /// concurrent writer of the same scope: its insert collides with rows
     /// the other committed after this delete began.)
+    pub(crate) session_sigs: BTreeMap<String, u64>,
+    pub(crate) message_sigs: BTreeMap<(String, i64), u64>,
     pub(crate) token_sigs: BTreeMap<i64, u64>,
     pub(crate) grant_sigs: BTreeMap<(RunId, JobId), u64>,
     pub(crate) oidc_sigs: BTreeMap<(RunId, JobId), u64>,
@@ -746,8 +748,49 @@ fn sigs<K: Ord + Clone, V: std::fmt::Debug>(map: &BTreeMap<K, V>) -> BTreeMap<K,
     map.iter().map(|(k, v)| (k.clone(), value_sig(v))).collect()
 }
 
+/// Every session id with a `runner_sessions` row in the working set.
+pub(crate) fn session_ids(tx: &TxState) -> BTreeSet<String> {
+    tx.broker_session_runners
+        .keys()
+        .chain(tx.sessions.keys())
+        .chain(tx.session_active_requests.keys())
+        .chain(tx.session_last_seen.keys())
+        .chain(tx.inflight_messages.keys())
+        .chain(tx.session_keys.keys())
+        .cloned()
+        .collect()
+}
+
+/// Everything the `runner_sessions` row of `session_id` is written from.
+pub(crate) fn session_sig(tx: &TxState, session_id: &str) -> u64 {
+    sig_of(&[
+        &tx.broker_session_runners.get(session_id),
+        &tx.sessions.get(session_id),
+        &tx.session_keys.get(session_id).map(|k| &k.key),
+        &tx.session_active_requests.get(session_id),
+        &tx.session_last_seen.get(session_id),
+        &tx.verified_sessions.contains(session_id),
+    ])
+}
+
 /// Record load-time signatures (call once, at the end of a load).
 pub(crate) fn snapshot_row_sigs(tx: &mut TxState) {
+    tx.loaded.session_sigs = session_ids(tx)
+        .into_iter()
+        .map(|id| {
+            let sig = session_sig(tx, &id);
+            (id, sig)
+        })
+        .collect();
+    tx.loaded.message_sigs = tx
+        .inflight_messages
+        .iter()
+        .flat_map(|(session_id, messages)| {
+            messages
+                .iter()
+                .map(move |(id, m)| ((session_id.clone(), *id), value_sig(m)))
+        })
+        .collect();
     tx.loaded.token_sigs = sigs(&tx.github_token_requests);
     tx.loaded.grant_sigs = sigs(&tx.id_token_grants);
     tx.loaded.oidc_sigs = sigs(&tx.oidc_job_contexts);

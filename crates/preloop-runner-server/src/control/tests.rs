@@ -3250,6 +3250,55 @@ mod postgres {
         );
     }
 
+    /// A global transaction locks every run it loads, so it never reads a
+    /// run while a run-scoped writer holds it (and so never writes a stale
+    /// copy back over that writer's commit).
+    #[tokio::test]
+    async fn global_transaction_waits_for_run_writer() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        let run_id = RunId::new();
+        node_a
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                node_b
+                    .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+                        let _ = loaded_tx.send(());
+                        let _ = release_rx.recv();
+                        tx.runs.get_mut(&run_id).unwrap().status = ExecutionStatus::Cancelled;
+                        Ok(())
+                    })
+                    .await
+            })
+        });
+        loaded_rx.await.unwrap();
+        let global = tokio::spawn(async move {
+            node_a
+                .transact(move |tx| Ok(tx.runs.get(&run_id).map(|run| run.status)))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !global.is_finished(),
+            "global transaction ran under a run writer"
+        );
+        release_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        assert_eq!(
+            global.await.unwrap().unwrap(),
+            Some(ExecutionStatus::Cancelled),
+            "global transaction must load the run after the writer commits"
+        );
+    }
+
     /// Polls no longer serialize on the global lock: many runners on two
     /// nodes poll one fan-out run at once. Every job is claimed exactly once,
     /// and same-run polls coexist (a shared run lock), so the run drains in

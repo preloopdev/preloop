@@ -4006,7 +4006,7 @@ impl ControlBackend for SqliteBackend {
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
-        self.transact(|tx| {
+        self.read_scoped(&TxScope::requests_only(), |tx| {
             let record = match &key {
                 RequestKey::Id(id) => tx.job_requests.get(id),
                 RequestKey::PlanId(plan) => tx

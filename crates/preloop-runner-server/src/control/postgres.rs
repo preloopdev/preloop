@@ -334,15 +334,7 @@ impl PostgresBackend {
             let want = if assignments { 4 } else { 1 };
             poll_keys = Some(lock_poll_candidates(&txn, runner, want).await?);
         } else if is_run_scoped {
-            let runs = scope.runs.as_ref().unwrap();
-            let mut sorted: Vec<&RunId> = runs.iter().collect();
-            sorted.sort();
-            for run_id in sorted {
-                let key = run_lock_key(run_id);
-                txn.batch_execute(&format!("SELECT pg_advisory_xact_lock({key})"))
-                    .await
-                    .map_err(ControlError::backend)?;
-            }
+            lock_runs(&txn, scope.runs.as_ref().unwrap().iter()).await?;
         } else {
             txn.batch_execute(&format!(
                 "SELECT pg_advisory_xact_lock({POSTGRES_WRITER_LOCK_KEY})"
@@ -351,8 +343,17 @@ impl PostgresBackend {
             .map_err(ControlError::backend)?;
         }
         let locked = started.elapsed();
-        let (tx, effective_scope) =
-            load_txstate(&txn, scope, &self.cipher, poll_keys.as_deref()).await?;
+        // A global transaction also locks every run it loads (see
+        // `load_txstate`), so it never writes a run a run-scoped writer holds.
+        let lock_loaded_runs = poll_runner.is_none() && !is_run_scoped;
+        let (tx, effective_scope) = load_txstate(
+            &txn,
+            scope,
+            &self.cipher,
+            poll_keys.as_deref(),
+            lock_loaded_runs,
+        )
+        .await?;
         let loaded = started.elapsed();
         let mut tx = tx.with_config(self.config());
         let result = run_blocking(|| f(&mut tx))?;
@@ -483,7 +484,7 @@ impl PostgresBackend {
         f: impl FnOnce(&TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
         let txn = client.transaction().await.map_err(ControlError::backend)?;
-        let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher, None).await?;
+        let (tx, _effective_scope) = load_txstate(&txn, scope, &self.cipher, None, false).await?;
         let tx = tx.with_config(self.config());
         let result = run_blocking(|| f(&tx))?;
         txn.rollback().await.map_err(ControlError::backend)?;
@@ -980,9 +981,12 @@ async fn write_step_delta(
     }
     for row in &delta.upserts {
         conn.execute(
+            // Only while the attempt exists: `FOR KEY SHARE` waits out a
+            // concurrent delete of the attempt and then inserts nothing.
             "INSERT INTO job_steps (agent_job_id, step_id, position, kind, workflow_index, \
              runner_number, context_name, name, conclusion, started_at_us, finished_at_us) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             SELECT $1::text, $2::text, $3::bigint, $4::text, $5::bigint, $6::bigint, $7::text, $8::text, $9::text, $10::bigint, $11::bigint \
+             WHERE EXISTS (SELECT 1 FROM job_requests WHERE agent_job_id=$1 FOR KEY SHARE) \
              ON CONFLICT(agent_job_id, step_id) DO UPDATE SET position=excluded.position, \
              kind=excluded.kind, workflow_index=excluded.workflow_index, \
              runner_number=excluded.runner_number, context_name=excluded.context_name, \
@@ -1482,11 +1486,40 @@ async fn lock_poll_candidates(
     Ok(locked)
 }
 
+/// Take the exclusive advisory locks of `runs`, in lock-key order. Every
+/// multi-run locker uses this one order, so run locks never form a cycle.
+async fn lock_runs<'a>(
+    conn: &Tx<'_>,
+    runs: impl Iterator<Item = &'a RunId>,
+) -> Result<(), ControlError> {
+    let mut keys: Vec<i64> = runs.map(run_lock_key).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    match keys.as_slice() {
+        [] => Ok(()),
+        [key] => conn
+            .execute("SELECT pg_advisory_xact_lock($1)", &[key])
+            .await
+            .map(drop)
+            .map_err(ControlError::backend),
+        // `unnest` streams in array order, so the locks are taken in order.
+        _ => conn
+            .execute(
+                "SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS k",
+                &[&keys],
+            )
+            .await
+            .map(drop)
+            .map_err(ControlError::backend),
+    }
+}
+
 async fn load_txstate(
     conn: &Tx<'_>,
     scope: &TxScope,
     cipher: &store::Envelope,
     poll_keys: Option<&[(String, String)]>,
+    lock_loaded_runs: bool,
 ) -> Result<(TxState, TxScope), ControlError> {
     // Widen `scope.runs` with every run a concurrency holder references.
     // `try_acquire_concurrency`/`release_concurrency_for_*` can cancel or
@@ -1580,6 +1613,44 @@ async fn load_txstate(
         }
     }
     let scope = &effective_scope;
+
+    if lock_loaded_runs {
+        // Every run whose rows this load can return: the scope's runs (all
+        // runs when unscoped) plus the runs of any queue kind it widens in.
+        let mut runs: BTreeSet<RunId> = match scope.runs.as_ref() {
+            Some(runs) => runs.clone(),
+            None => conn
+                .query("SELECT run_id FROM runs", &[])
+                .await
+                .map_err(ControlError::backend)?
+                .iter()
+                .map(|row| parse_run_id(&row.get::<_, String>(0)))
+                .collect(),
+        };
+        let mut kinds: Vec<&'static str> = Vec::new();
+        if scope.ready_queue {
+            kinds.push("ready");
+        }
+        if scope.blocked_jobs {
+            kinds.push("blocked");
+        }
+        if scope.pending_expansions {
+            kinds.push("expand");
+        }
+        if scope.runs.is_some() && !kinds.is_empty() {
+            for row in conn
+                .query(
+                    "SELECT DISTINCT run_id FROM jobs WHERE queue_kind = ANY($1)",
+                    &[&kinds],
+                )
+                .await
+                .map_err(ControlError::backend)?
+            {
+                runs.insert(parse_run_id(&row.get::<_, String>(0)));
+            }
+        }
+        lock_runs(conn, runs.iter()).await?;
+    }
 
     let mut tx = TxState {
         ready_queue_loaded: scope.runs.is_none() || scope.ready_queue,
@@ -3196,25 +3267,43 @@ async fn write_txstate(
         }
     }
 
-    // Sessions: rebuild from the unified maps, scoped to loaded sessions.
-    delete_scoped(
-        conn,
-        "runner_sessions",
-        "session_id",
-        &tx.loaded.sessions,
-        |s| s.clone(),
-        scope.sessions.is_none(),
-    )
-    .await?;
-    async fn write_session(
-        conn: &Tx<'_>,
-        session_id: &str,
-        runner_id: Option<i64>,
-        protocol: SessionProtocol,
-        tx: &TxState,
-        now_us: i64,
-        cipher: &store::Envelope,
-    ) -> Result<(), ControlError> {
+    // Sessions: keyed diff. A loaded session that is gone is deleted (its
+    // messages cascade); a new or changed one is upserted, keeping its
+    // original `created_at_us`; an unchanged one is not touched.
+    let live_sessions = super::txstate::session_ids(tx);
+    for session_id in tx
+        .loaded
+        .session_sigs
+        .keys()
+        .chain(tx.loaded.sessions.iter())
+    {
+        if !live_sessions.contains(session_id) {
+            conn.execute(
+                "DELETE FROM runner_sessions WHERE session_id=$1",
+                &[session_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+    }
+    for session_id in &live_sessions {
+        if tx.loaded.session_sigs.get(session_id)
+            == Some(&super::txstate::session_sig(tx, session_id))
+        {
+            continue;
+        }
+        let (runner_id, protocol) =
+            if let Some(runner_id) = tx.broker_session_runners.get(session_id) {
+                (Some(*runner_id), SessionProtocol::Broker)
+            } else if let Some(session) = tx.sessions.get(session_id) {
+                (Some(session.runner_id), SessionProtocol::Azdo)
+            } else {
+                // Compatibility sessions (e.g. the implicit `default` session)
+                // own no registered runner. They still need a row — with NULL
+                // `runner_id` — so `broker_messages` and `active_request_id`
+                // foreign keys resolve.
+                (None, SessionProtocol::Compat)
+            };
         // Seal the session AES key (see the SQLite backend's write_session).
         let encryption = tx
             .session_keys
@@ -3222,99 +3311,60 @@ async fn write_txstate(
             .map(|e| cipher.seal(&e.key))
             .transpose()
             .map_err(ControlError::backend)?;
-        let active_request_id = tx.session_active_requests.get(session_id).copied();
-        let last_seen_us = tx
-            .session_last_seen
-            .get(session_id)
-            .map(|t| system_to_us(*t));
-        let created_us = now_us;
-        let verified = tx.verified_sessions.contains(session_id) as i64;
         conn.execute(
             "INSERT INTO runner_sessions (session_id, runner_id, protocol, encryption_blob, \
              active_request_id, last_seen_at_us, verified, created_at_us) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             ON CONFLICT(session_id) DO UPDATE SET runner_id=excluded.runner_id, \
+             protocol=excluded.protocol, encryption_blob=excluded.encryption_blob, \
+             active_request_id=excluded.active_request_id, \
+             last_seen_at_us=excluded.last_seen_at_us, verified=excluded.verified",
             &[
-                &session_id,
+                session_id,
                 &runner_id,
                 &protocol.as_str(),
                 &encryption,
-                &active_request_id,
-                &last_seen_us,
-                &verified,
-                &created_us,
+                &tx.session_active_requests.get(session_id).copied(),
+                &tx.session_last_seen
+                    .get(session_id)
+                    .map(|t| system_to_us(*t)),
+                &(tx.verified_sessions.contains(session_id) as i64),
+                &now_us,
             ],
         )
         .await
         .map_err(ControlError::backend)?;
-        Ok(())
-    }
-    for (session_id, runner_id) in &tx.broker_session_runners {
-        write_session(
-            conn,
-            session_id,
-            Some(*runner_id),
-            SessionProtocol::Broker,
-            tx,
-            now_us,
-            cipher,
-        )
-        .await?;
-    }
-    for (session_id, session) in &tx.sessions {
-        write_session(
-            conn,
-            session_id,
-            Some(session.runner_id),
-            SessionProtocol::Azdo,
-            tx,
-            now_us,
-            cipher,
-        )
-        .await?;
-    }
-    // Compatibility sessions (e.g. the implicit `default` session) own no
-    // registered runner, so they are absent from `broker_session_runners` and
-    // `sessions`. They still need a `runner_sessions` row — with NULL
-    // `runner_id` — so that `broker_messages` and `active_request_id` foreign
-    // keys resolve and the active-request mapping survives the commit.
-    let compat_session_ids: std::collections::BTreeSet<&String> = tx
-        .session_active_requests
-        .keys()
-        .chain(tx.session_last_seen.keys())
-        .chain(tx.inflight_messages.keys())
-        .chain(tx.session_keys.keys())
-        .filter(|sid| {
-            !tx.broker_session_runners.contains_key(*sid) && !tx.sessions.contains_key(*sid)
-        })
-        .collect();
-    for session_id in compat_session_ids {
-        write_session(
-            conn,
-            session_id,
-            None,
-            SessionProtocol::Compat,
-            tx,
-            now_us,
-            cipher,
-        )
-        .await?;
     }
 
-    // Inflight messages — session-scoped.
-    delete_scoped(
-        conn,
-        "broker_messages",
-        "session_id",
-        &tx.loaded.sessions,
-        |s| s.clone(),
-        scope.sessions.is_none(),
-    )
-    .await?;
+    // Inflight messages — keyed diff.
+    for (session_id, message_id) in tx.loaded.message_sigs.keys() {
+        let live = tx
+            .inflight_messages
+            .get(session_id)
+            .is_some_and(|messages| messages.contains_key(message_id));
+        if !live && live_sessions.contains(session_id) {
+            conn.execute(
+                "DELETE FROM broker_messages WHERE session_id=$1 AND message_id=$2",
+                &[session_id, message_id],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+        }
+    }
     for (session_id, messages) in &tx.inflight_messages {
         for (message_id, msg) in messages {
+            if tx
+                .loaded
+                .message_sigs
+                .get(&(session_id.clone(), *message_id))
+                == Some(&super::txstate::value_sig(msg))
+            {
+                continue;
+            }
             conn.execute(
                 "INSERT INTO broker_messages (session_id, message_id, message_blob, \
-                 created_at_us) VALUES ($1,$2,$3,$4)",
+                 created_at_us) VALUES ($1,$2,$3,$4) ON CONFLICT(session_id, message_id) \
+                 DO UPDATE SET message_blob=excluded.message_blob",
                 &[session_id, message_id, &unblob(cipher, msg)?, &now_us],
             )
             .await
@@ -4214,7 +4264,8 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
-        self.transact(|tx| {
+        // A lookup: a lock-free read of the request families only.
+        self.read_scoped(&TxScope::requests_only(), |tx| {
             let record = match &key {
                 RequestKey::Id(id) => tx.job_requests.get(id),
                 RequestKey::PlanId(plan) => tx
