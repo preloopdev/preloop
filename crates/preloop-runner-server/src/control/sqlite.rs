@@ -4170,6 +4170,62 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn patch_steps(
+        &self,
+        agent_job_id: uuid::Uuid,
+        patches: Vec<StepPatch>,
+    ) -> Result<(), ControlError> {
+        let agent = agent_job_id.to_string();
+        run_blocking(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            for p in &patches {
+                tx.execute(
+                    "INSERT INTO job_steps (agent_job_id, step_id, position, kind, workflow_index, \
+                 runner_number, context_name, name, conclusion, started_at_us, finished_at_us) \
+                 SELECT ?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM job_steps \
+                 WHERE agent_job_id = ?1), 0), 'synthetic', NULL, NULL, NULL, ?3, ?4, \
+                 COALESCE(?5, ?7), ?6 \
+                 WHERE EXISTS (SELECT 1 FROM job_requests WHERE agent_job_id = ?1) \
+                 ON CONFLICT(agent_job_id, step_id) DO UPDATE SET name = excluded.name, \
+                 conclusion = excluded.conclusion, \
+                 started_at_us = COALESCE(?5, job_steps.started_at_us), \
+                 finished_at_us = COALESCE(?6, job_steps.finished_at_us)",
+                    params![
+                        agent,
+                        p.id,
+                        p.name,
+                        p.conclusion,
+                        p.started_at_us,
+                        p.finished_at_us,
+                        p.observed_us
+                    ],
+                )
+                .map_err(ControlError::backend)?;
+            }
+            tx.commit().map_err(ControlError::backend)
+        })
+    }
+
+    async fn job_detail_missing(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT detail_json IS NULL FROM run_jobs WHERE run_id = ?1 AND job_id = ?2",
+                params![run, job],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|missing| missing.unwrap_or(true))
+            .map_err(ControlError::backend)
+        })
+    }
+
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         let run_id = run_id.0.to_string();
         self.with_reader(|conn| {

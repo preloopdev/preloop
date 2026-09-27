@@ -301,6 +301,17 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Drop timelines not patched since `before_us`. Returns timelines removed.
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
 
+    /// Upsert an attempt's runner-reported steps directly (no run lock).
+    async fn patch_steps(
+        &self,
+        agent_job_id: uuid::Uuid,
+        patches: Vec<StepPatch>,
+    ) -> Result<(), ControlError>;
+
+    /// Whether the run's `jobs_list` has no detail entry for `job_id` yet.
+    async fn job_detail_missing(&self, run_id: RunId, job_id: &JobId)
+        -> Result<bool, ControlError>;
+
     /// Whether `runner_id` is registered (indexed point read).
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError>;
 
@@ -984,6 +995,28 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.run_for_attempt(agent_job_id).await,
             Self::Postgres(b) => b.run_for_attempt(agent_job_id).await,
+        }
+    }
+
+    async fn patch_steps(
+        &self,
+        agent_job_id: uuid::Uuid,
+        patches: Vec<StepPatch>,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.patch_steps(agent_job_id, patches).await,
+            Self::Postgres(b) => b.patch_steps(agent_job_id, patches).await,
+        }
+    }
+
+    async fn job_detail_missing(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_detail_missing(run_id, job_id).await,
+            Self::Postgres(b) => b.job_detail_missing(run_id, job_id).await,
         }
     }
 

@@ -122,123 +122,76 @@ pub async fn patch_timeline_records(
         );
     }
 
-    // Backend: reconcile the run's `jobs_list` detail and the attempt's step
-    // manifest (`job_steps` is durable TxState — the commit persists the
-    // changed step rows, so no separate `store_job_steps` write).
+    // Backend: reconcile the attempt's step rows and, when needed, the run's
+    // `jobs_list` detail. Steps are direct keyed upserts (no run lock); the
+    // run transaction runs only to create the job's detail entry or record a
+    // non-running conclusion on it.
     if let (Some(run_id), Some(job_id)) = (run_id, logical_job_id.clone()) {
-        let records_for_tx = records.clone();
         let job_status = job_status_for_run;
-        shared
-            .state
-            .backend
-            .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                if let Some(run) = tx.runs.get_mut(&run_id) {
-                    let detail = match JobDetail::find(&mut run.jobs_list, &job_id.0) {
-                        Some(detail) => detail,
-                        None => {
-                            run.jobs_list.push(JobDetail {
-                                job_id: job_id.0.clone(),
-                                name: job_id.0.clone(),
-                                // A timeline update means the job started; the
-                                // run record's final conclusion comes from the
-                                // job status map (projected in the runs GET).
-                                // Default to the truthful in-flight state,
-                                // never "success".
-                                conclusion: "in_progress".to_owned(),
-                                steps: Vec::new(),
-                                annotations: Vec::new(),
-                            });
-                            run.jobs_list.last_mut().expect("just pushed")
-                        }
-                    };
-                    // The status map is authoritative for terminal states
-                    // only. Its in-flight projection ("inprogress" from the
-                    // raw Debug spelling, or "success" from the run-level
-                    // status_string) lies about a job that is still running —
-                    // keep the truthful "in_progress" default set above.
-                    if let Some(status) = job_status {
-                        if status != ExecutionStatus::InProgress {
-                            detail.conclusion = format!("{:?}", status).to_lowercase();
+        let observed_us = chrono::Utc::now().timestamp_micros();
+        let patches: Vec<crate::control::types::StepPatch> = records
+            .iter()
+            .filter_map(|record| step_patch(record, job_status, observed_us))
+            .collect();
+        let needs_detail = job_status.is_some_and(|s| s != ExecutionStatus::InProgress)
+            || shared
+                .state
+                .backend
+                .job_detail_missing(run_id, &job_id)
+                .await
+                .unwrap_or(true);
+        if needs_detail {
+            shared
+                .state
+                .backend
+                .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
+                    if let Some(run) = tx.runs.get_mut(&run_id) {
+                        let detail = match JobDetail::find(&mut run.jobs_list, &job_id.0) {
+                            Some(detail) => detail,
+                            None => {
+                                run.jobs_list.push(JobDetail {
+                                    job_id: job_id.0.clone(),
+                                    name: job_id.0.clone(),
+                                    // A timeline update means the job started;
+                                    // the run record's final conclusion comes
+                                    // from the job status map. Default to the
+                                    // truthful in-flight state.
+                                    conclusion: "in_progress".to_owned(),
+                                    steps: Vec::new(),
+                                    annotations: Vec::new(),
+                                });
+                                run.jobs_list.last_mut().expect("just pushed")
+                            }
+                        };
+                        // The status map is authoritative for terminal states
+                        // only; an in-flight projection would lie.
+                        if let Some(status) = job_status {
+                            if status != ExecutionStatus::InProgress {
+                                detail.conclusion = format!("{:?}", status).to_lowercase();
+                            }
                         }
                     }
-                }
-
-                if let Some(agent_job_id) = agent_job_id {
-                    let observed = chrono::Utc::now();
-                    let manifest = tx.job_steps.entry(agent_job_id).or_default();
-                    for record in &records_for_tx {
-                        let Some(name) = &record.display_name else {
-                            continue;
-                        };
-                        if !is_step_record(record) {
-                            continue;
-                        }
-
-                        let conclusion_str = match record.result {
-                            Some(
-                                azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
-                            ) => "success",
-                            Some(azdo::TaskResult::Failed) => {
-                                if job_status == Some(ExecutionStatus::Cancelled) {
-                                    "cancelled"
-                                } else {
-                                    "failure"
-                                }
-                            }
-                            Some(azdo::TaskResult::Cancelled) => "cancelled",
-                            Some(azdo::TaskResult::Skipped) => "skipped",
-                            Some(azdo::TaskResult::Abandoned) => "failed",
-                            None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
-                                "in_progress"
-                            }
-                            _ => "success",
-                        };
-                        let started_at = record
-                            .start_time
-                            .as_deref()
-                            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                            .map(|t| t.with_timezone(&chrono::Utc));
-                        let finished_at = record
-                            .finish_time
-                            .as_deref()
-                            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                            .map(|t| t.with_timezone(&chrono::Utc));
-                        let record_id = record.id.to_string();
-
-                        match StepRecord::find_by_id(manifest, &record_id) {
-                            Some(pos) => {
-                                manifest[pos].conclusion = conclusion_str.to_owned();
-                                if let Some(started_at) = started_at {
-                                    manifest[pos].started_at = Some(started_at);
-                                }
-                                if let Some(finished_at) = finished_at {
-                                    manifest[pos].finished_at = Some(finished_at);
-                                }
-                                manifest[pos].name = name.clone();
-                            }
-                            // A timeline record with no manifest entry is
-                            // runner bookkeeping, not a workflow step.
-                            // `TimelineRecord` carries no ordinal, so
-                            // `runner_number` stays unset on this path.
-                            None => manifest.push(StepRecord {
-                                id: record_id,
-                                kind: StepKind::Synthetic,
-                                workflow_index: None,
-                                runner_number: None,
-                                context_name: None,
-                                name: name.clone(),
-                                conclusion: conclusion_str.to_owned(),
-                                started_at: started_at.or(Some(observed)),
-                                finished_at,
-                            }),
+                    if let Some(agent_job_id) = agent_job_id {
+                        let manifest = tx.job_steps.entry(agent_job_id).or_default();
+                        for patch in &patches {
+                            apply_step_patch(manifest, patch);
                         }
                     }
-                }
-                Ok(())
-            })
-            .await
-            .map_err(crate::ApiError::from)
-            .unwrap_or(());
+                    Ok(())
+                })
+                .await
+                .map_err(crate::ApiError::from)
+                .unwrap_or(());
+        } else if let Some(agent_job_id) = agent_job_id {
+            if let Err(error) = shared
+                .state
+                .backend
+                .patch_steps(agent_job_id, patches)
+                .await
+            {
+                warn!(?error, "failed to persist timeline steps");
+            }
+        }
     }
     for event in projected {
         shared.state.emit(event).await;
@@ -949,6 +902,78 @@ pub async fn append_log_plan_authenticated(
 ) -> Result<StatusCode, ApiError> {
     authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
     Ok(append_log_plan(State(shared), Path((plan_id, log_id)), body).await)
+}
+
+/// The step update a timeline record carries, or `None` for records that are
+/// not steps (runner bookkeeping, unnamed records).
+fn step_patch(
+    record: &azdo::TimelineRecord,
+    job_status: Option<ExecutionStatus>,
+    observed_us: i64,
+) -> Option<crate::control::types::StepPatch> {
+    let name = record.display_name.clone()?;
+    if !is_step_record(record) {
+        return None;
+    }
+    let conclusion = match record.result {
+        Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => "success",
+        Some(azdo::TaskResult::Failed) => {
+            if job_status == Some(ExecutionStatus::Cancelled) {
+                "cancelled"
+            } else {
+                "failure"
+            }
+        }
+        Some(azdo::TaskResult::Cancelled) => "cancelled",
+        Some(azdo::TaskResult::Skipped) => "skipped",
+        Some(azdo::TaskResult::Abandoned) => "failed",
+        None if record.state == Some(azdo::TimelineRecordState::InProgress) => "in_progress",
+        _ => "success",
+    };
+    let micros = |time: Option<&str>| {
+        time.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.timestamp_micros())
+    };
+    Some(crate::control::types::StepPatch {
+        id: record.id.to_string(),
+        name,
+        conclusion: conclusion.to_owned(),
+        started_at_us: micros(record.start_time.as_deref()),
+        finished_at_us: micros(record.finish_time.as_deref()),
+        observed_us,
+    })
+}
+
+/// Apply a step patch to an in-memory manifest with the same rules the
+/// direct upsert uses.
+fn apply_step_patch(manifest: &mut Vec<StepRecord>, patch: &crate::control::types::StepPatch) {
+    let time = |us: Option<i64>| us.and_then(chrono::DateTime::from_timestamp_micros);
+    match StepRecord::find_by_id(manifest, &patch.id) {
+        Some(pos) => {
+            let step = &mut manifest[pos];
+            step.conclusion = patch.conclusion.clone();
+            if let Some(started) = time(patch.started_at_us) {
+                step.started_at = Some(started);
+            }
+            if let Some(finished) = time(patch.finished_at_us) {
+                step.finished_at = Some(finished);
+            }
+            step.name = patch.name.clone();
+        }
+        // A timeline record with no manifest entry is runner bookkeeping,
+        // not a workflow step; `runner_number` stays unset on this path.
+        None => manifest.push(StepRecord {
+            id: patch.id.clone(),
+            kind: StepKind::Synthetic,
+            workflow_index: None,
+            runner_number: None,
+            context_name: None,
+            name: patch.name.clone(),
+            conclusion: patch.conclusion.clone(),
+            started_at: time(patch.started_at_us).or(time(Some(patch.observed_us))),
+            finished_at: time(patch.finished_at_us),
+        }),
+    }
 }
 
 #[cfg(test)]

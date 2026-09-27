@@ -4463,6 +4463,68 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn patch_steps(
+        &self,
+        agent_job_id: uuid::Uuid,
+        patches: Vec<StepPatch>,
+    ) -> Result<(), ControlError> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        let agent = agent_job_id.to_string();
+        let mut client = self.checkout_reader().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            for p in &patches {
+                tx.execute(
+                    "INSERT INTO job_steps (agent_job_id, step_id, position, kind, workflow_index, \
+                 runner_number, context_name, name, conclusion, started_at_us, finished_at_us) \
+                 SELECT $1::text, $2::text, COALESCE((SELECT MAX(position) + 1 FROM job_steps \
+                 WHERE agent_job_id = $1::text), 0), 'synthetic', NULL, NULL, NULL, $3::text, $4::text, \
+                 COALESCE($5::bigint, $7::bigint), $6::bigint \
+                 WHERE EXISTS (SELECT 1 FROM job_requests WHERE agent_job_id = $1::text FOR KEY SHARE) \
+                 ON CONFLICT(agent_job_id, step_id) DO UPDATE SET name = excluded.name, \
+                 conclusion = excluded.conclusion, \
+                 started_at_us = COALESCE($5::bigint, job_steps.started_at_us), \
+                 finished_at_us = COALESCE($6::bigint, job_steps.finished_at_us)",
+                    &[
+                        &agent,
+                        &p.id,
+                        &p.name,
+                        &p.conclusion,
+                        &p.started_at_us,
+                        &p.finished_at_us,
+                        &p.observed_us,
+                    ],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            }
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn job_detail_missing(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT detail_json IS NULL FROM run_jobs WHERE run_id = $1 AND job_id = $2",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map(|row| row.is_none_or(|row| row.get::<_, bool>(0)))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
     async fn run_in_concurrency(&self, run_id: RunId) -> Result<bool, ControlError> {
         let client = self.checkout_reader().await?;
         let result = client

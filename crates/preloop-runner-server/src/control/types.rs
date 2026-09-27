@@ -446,3 +446,16 @@ pub(crate) struct CallbackJob {
     /// The logical job's current status (`None` if its row is gone).
     pub(crate) job_status: Option<ExecutionStatus>,
 }
+
+/// One runner-reported step update: upsert by `(attempt, step id)`. A new
+/// step is appended as synthetic; timestamps only ever fill in.
+#[derive(Debug, Clone)]
+pub(crate) struct StepPatch {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) conclusion: String,
+    pub(crate) started_at_us: Option<i64>,
+    pub(crate) finished_at_us: Option<i64>,
+    /// Server observation time: a new step's start when the runner sent none.
+    pub(crate) observed_us: i64,
+}
