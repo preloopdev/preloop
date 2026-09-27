@@ -4416,6 +4416,86 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn set_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        check_run_id: u64,
+    ) -> Result<bool, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            // `BEGIN` already serialized writers; no extra lock needed.
+            let changed = tx
+                .execute(
+                    "INSERT INTO run_jobs (run_id, job_id, check_run_id) \
+                     SELECT ?1, ?2, ?3 \
+                     WHERE EXISTS (SELECT 1 FROM jobs WHERE run_id = ?1 AND job_id = ?2) \
+                     ON CONFLICT(run_id, job_id) DO UPDATE SET \
+                     check_run_id = excluded.check_run_id \
+                     WHERE run_jobs.check_run_id IS NOT ?3",
+                    params![run, job, check_run_id as i64],
+                )
+                .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)?;
+            Ok(changed > 0)
+        })
+    }
+
+    async fn clear_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        run_blocking(move || {
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE run_jobs SET check_run_id = NULL \
+                 WHERE run_id = ?1 AND job_id = ?2 AND check_run_id = ?3",
+                params![run, job, expected as i64],
+            )
+            .map_err(ControlError::backend)?;
+            Ok(())
+        })
+    }
+
+    async fn job_exists(&self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id = ?1 AND job_id = ?2)",
+                params![run, job],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(ControlError::backend)
+        })
+    }
+
+    async fn job_display_name(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<String>, ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        self.with_reader(|conn| {
+            conn.query_row(
+                "SELECT display_name FROM run_jobs WHERE run_id = ?1 AND job_id = ?2",
+                params![run, job],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|name| name.flatten())
+            .map_err(ControlError::backend)
+        })
+    }
+
     async fn reap_inputs(&self) -> Result<ReapInputs, ControlError> {
         let timeout = std::time::Duration::from_nanos(
             self.runner_liveness_timeout

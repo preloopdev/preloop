@@ -3465,29 +3465,19 @@ pub async fn rerun_run_inner(
     let submission = shared
         .state
         .backend
-        .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx.runs.get(&run_id).map(|run| (*run.submission).clone()))
-        })
+        .run_record(run_id)
         .await
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+        .map(|run| (*run.submission).clone())
+        .map_err(ApiError::from)?;
     let accepted = submit_run_inner(shared, submission).await?;
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
         let new_run = accepted.run_id;
-        let jid = job_id.clone();
-        let check_run_id = *check_run_id;
+        // Guarded by the setter itself: a missing `jobs` row writes nothing.
         shared
             .state
             .backend
-            .transact_scoped(&crate::control::txstate::TxScope::run(new_run), move |tx| {
-                if let Some(run) = tx.runs.get_mut(&new_run) {
-                    if run.jobs.contains_key(&jid) {
-                        run.job_check_run_ids.insert(jid.clone(), check_run_id);
-                    }
-                }
-                Ok(())
-            })
+            .set_job_check_run(new_run, job_id, *check_run_id)
             .await
             .map_err(ApiError::from)?;
         // Same persistence obligation as `report_check_run_queued`: the

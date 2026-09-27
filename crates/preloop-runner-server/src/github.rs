@@ -286,18 +286,10 @@ pub async fn report_check_run_queued(
                     %error,
                     "persisted GitHub check run is stale; reconciling it"
                 );
-                let jid = job_id.clone();
                 shared
                     .state
                     .backend
-                    .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                        if let Some(run) = tx.runs.get_mut(&run_id) {
-                            if run.job_check_run_ids.get(&jid) == Some(&check_run_id) {
-                                run.job_check_run_ids.remove(&jid);
-                            }
-                        }
-                        Ok(())
-                    })
+                    .clear_job_check_run(run_id, job_id, check_run_id)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             }
@@ -401,16 +393,10 @@ async fn mint_check_run(
         let job_name = shared
             .state
             .backend
-            .read_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                Ok(tx
-                    .runs
-                    .get(&run_id)
-                    .and_then(|run| run.job_names.get(job_id))
-                    .cloned()
-                    .unwrap_or_else(|| job_id.0.clone()))
-            })
+            .job_display_name(run_id, job_id)
             .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .unwrap_or_else(|| job_id.0.clone());
         let mut body = serde_json::json!({
             "name": job_name,
             "head_sha": sha,
@@ -468,20 +454,13 @@ async fn mint_check_run(
         rand::random::<u32>() as u64
     };
 
-    let jid = job_id.clone();
     let mapping_changed = shared
         .state
         .backend
-        .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-            Ok(tx.runs.get_mut(&run_id).map(|run| {
-                run.job_check_run_ids
-                    .insert(jid.clone(), check_run_id)
-                    .is_none_or(|previous| previous != check_run_id)
-            }))
-        })
+        .set_job_check_run(run_id, job_id, check_run_id)
         .await
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    if mapping_changed == Some(true) {
+    if mapping_changed {
         // The mapping is meaningful while the run lives, and the next status
         // event may be hours away. Persist it before returning to the caller.
         shared

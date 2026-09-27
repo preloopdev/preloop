@@ -4970,6 +4970,92 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn set_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        check_run_id: u64,
+    ) -> Result<bool, ControlError> {
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            lock_runs(&tx, std::iter::once(&run_id)).await?;
+            let changed = tx
+                .execute(
+                    "INSERT INTO run_jobs (run_id, job_id, check_run_id) \
+                     SELECT $1, $2, $3 \
+                     WHERE EXISTS (SELECT 1 FROM jobs WHERE run_id = $1 AND job_id = $2) \
+                     ON CONFLICT(run_id, job_id) DO UPDATE SET \
+                     check_run_id = excluded.check_run_id \
+                     WHERE run_jobs.check_run_id IS NOT $3",
+                    &[&run_id.0.to_string(), &job_id.0, &(check_run_id as i64)],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)?;
+            Ok(changed > 0)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn clear_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError> {
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            lock_runs(&tx, std::iter::once(&run_id)).await?;
+            tx.execute(
+                "UPDATE run_jobs SET check_run_id = NULL \
+                 WHERE run_id = $1 AND job_id = $2 AND check_run_id = $3",
+                &[&run_id.0.to_string(), &job_id.0, &(expected as i64)],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
+    async fn job_exists(&self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE run_id = $1 AND job_id = $2)",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map(|row| row.get::<_, bool>(0))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
+    async fn job_display_name(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<String>, ControlError> {
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query_opt(
+                "SELECT display_name FROM run_jobs WHERE run_id = $1 AND job_id = $2",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map(|row| row.and_then(|row| row.get::<_, Option<String>>(0)))
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
+    }
+
     async fn attempt_job(
         &self,
         agent_job_id: uuid::Uuid,

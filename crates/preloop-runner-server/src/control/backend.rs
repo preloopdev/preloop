@@ -341,6 +341,36 @@ pub(crate) trait ControlBackend: Send + Sync {
         conclusion: Option<&str>,
     ) -> Result<(), ControlError>;
 
+    /// Record the GitHub check-run id for a job that is part of the run.
+    /// Writes nothing when the job has no `jobs` row (the check mapping is
+    /// only meaningful for real jobs). Returns whether the mapping changed.
+    /// Serialized on the run advisory lock.
+    async fn set_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        check_run_id: u64,
+    ) -> Result<bool, ControlError>;
+
+    /// Clear the check-run mapping only while it still points at
+    /// `expected`. Used when GitHub reports the recorded id stale.
+    async fn clear_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError>;
+
+    /// Whether the run has a `jobs` row for `job_id` (indexed point read).
+    async fn job_exists(&self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError>;
+
+    /// The job's evaluated display name (`job_names`), if recorded.
+    async fn job_display_name(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<String>, ControlError>;
+
     /// Whether `runner_id` is registered (indexed point read).
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError>;
 
@@ -1050,6 +1080,48 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.patch_steps(agent_job_id, patches).await,
             Self::Postgres(b) => b.patch_steps(agent_job_id, patches).await,
+        }
+    }
+
+    async fn set_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        check_run_id: u64,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_job_check_run(run_id, job_id, check_run_id).await,
+            Self::Postgres(b) => b.set_job_check_run(run_id, job_id, check_run_id).await,
+        }
+    }
+
+    async fn clear_job_check_run(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        expected: u64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.clear_job_check_run(run_id, job_id, expected).await,
+            Self::Postgres(b) => b.clear_job_check_run(run_id, job_id, expected).await,
+        }
+    }
+
+    async fn job_exists(&self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_exists(run_id, job_id).await,
+            Self::Postgres(b) => b.job_exists(run_id, job_id).await,
+        }
+    }
+
+    async fn job_display_name(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<String>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.job_display_name(run_id, job_id).await,
+            Self::Postgres(b) => b.job_display_name(run_id, job_id).await,
         }
     }
 
