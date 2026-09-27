@@ -562,6 +562,45 @@ pub fn build_app(
                     require_native_bearer,
                 )),
         )
+        // Workflow execution protections: operator rule management. Rules
+        // are server-config-owned (the config file is the policy store), so
+        // these routes read and persist `[execution_protection]` in the
+        // operator's config file; changes take effect on engine restart.
+        // System token only: workflow authors must never reach policy
+        // management.
+        .route(
+            "/api/v1/execution-protection",
+            get(get_execution_protection_policy).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_system_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/execution-protection/mode",
+            put(set_execution_protection_mode).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_system_bearer,
+            )),
+        )
+        .route(
+            "/api/v1/execution-protection/rules",
+            get(list_execution_protection_rules)
+                .post(create_execution_protection_rule)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_system_bearer,
+                )),
+        )
+        .route(
+            "/api/v1/execution-protection/rules/:id",
+            get(get_execution_protection_rule)
+                .put(update_execution_protection_rule)
+                .delete(delete_execution_protection_rule)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_system_bearer,
+                )),
+        )
         .route("/api/v1/scheduler/history", get(get_scheduler_history))
         .route(
             "/api/v1/github/webhooks",

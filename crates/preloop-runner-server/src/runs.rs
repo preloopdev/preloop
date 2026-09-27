@@ -4566,4 +4566,40 @@ mod tests {
         let inner = shared.state.inner.lock().await;
         assert!(inner.runs.contains_key(&accepted.run_id));
     }
+
+    /// The shipped default — an unscoped `pull_request_target` event deny in
+    /// evaluate mode — must log what it would deny and let the trigger
+    /// through: a `pull_request_target` submission continues to a run.
+    #[tokio::test]
+    async fn submit_run_inner_logs_but_does_not_block_default_prt_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.execution_protection = crate::config::ExecutionProtectionConfig::default();
+        assert_eq!(
+            state.execution_protection.mode,
+            crate::config::ProtectionMode::Evaluate
+        );
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: pull_request_target\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                .to_owned(),
+            event: "pull_request_target".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            workflow_file: Some("ci.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner(&shared, submission)
+            .await
+            .expect("the default pull_request_target rule is evaluate-only and must not block");
+        let inner = shared.state.inner.lock().await;
+        assert!(
+            inner.runs.contains_key(&accepted.run_id),
+            "a logged-not-blocked submission must still create a run"
+        );
+    }
 }

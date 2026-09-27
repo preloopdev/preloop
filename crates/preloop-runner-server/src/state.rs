@@ -593,10 +593,17 @@ pub struct AppState {
     /// operator writes `[fork_policy]` rules. A config change takes effect
     /// on restart, like the other policy tables in the config file.
     pub fork_policy: crate::config::ForkPolicyConfig,
+    /// Serializes load → mutate → persist cycles on the operator config file
+    /// for the execution-protection rule management API, mirroring
+    /// `secret_mutation` for the secrets API: two concurrent writes that
+    /// both loaded the same base config would otherwise drop each other's
+    /// rules from the file.
+    pub policy_mutation: Arc<Mutex<()>>,
     /// Workflow execution protections loaded from the config file at
-    /// startup. Empty by default: no triggers are denied until the operator
-    /// writes `[execution_protection]` rules. A config change takes effect
-    /// on restart, like the other policy tables in the config file.
+    /// startup. Carries GitHub's default `pull_request_target` rule in
+    /// evaluate (log-only) mode unless the operator removed it. A config
+    /// change takes effect on restart, like the other policy tables in the
+    /// config file.
     pub execution_protection: crate::config::ExecutionProtectionConfig,
     /// One-time provision tokens issued by the embedded runner pool, one per
     /// machine provisioning event, forwarded by the runner's `configure`
@@ -1166,6 +1173,7 @@ impl AppState {
             scheduler: None,
             secrets,
             secret_mutation: Arc::new(Mutex::new(())),
+            policy_mutation: Arc::new(Mutex::new(())),
             store_mutation: Arc::new(Mutex::new(())),
             github_app,
             github_apps,

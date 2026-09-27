@@ -50,6 +50,10 @@ pub use preloop_runner_server::errors::*;
 
 pub use preloop_runner_server::events::*;
 
+pub use preloop_runner_server::execution_protection::*;
+
+pub use preloop_runner_server::execution_protection_api::*;
+
 pub use preloop_runner_server::github::*;
 
 pub use preloop_runner_server::github_app::*;

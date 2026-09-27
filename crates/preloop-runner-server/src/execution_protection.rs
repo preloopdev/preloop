@@ -15,6 +15,13 @@
 //!
 //! The [`ProtectionMode`](crate::config::ProtectionMode) is applied by the
 //! caller: `enforce` skips the event/workflow, `evaluate` logs and continues.
+//!
+//! Every fresh config carries GitHub's default `pull_request_target` rule in
+//! evaluate mode (see
+//! [`ExecutionProtectionConfig::default_pull_request_target_rule`](crate::config::ExecutionProtectionConfig::default_pull_request_target_rule)).
+//! Operators manage rules through `DELETE`/`POST`/etc. on
+//! `/api/v1/execution-protection/rules` (see
+//! [`crate::execution_protection_api`]) or by editing the config file.
 
 use crate::config::ExecutionProtectionConfig;
 
@@ -286,7 +293,13 @@ mod tests {
 
     #[test]
     fn empty_policy_denies_nothing() {
-        let policy = ExecutionProtectionConfig::default();
+        // Explicitly empty: `Default` now carries the pull_request_target
+        // rule (see `default_config_carries_prt_rule_in_evaluate_mode`).
+        let policy = ExecutionProtectionConfig {
+            mode: crate::config::ProtectionMode::Evaluate,
+            event_rules: Vec::new(),
+            actor_rules: Vec::new(),
+        };
         assert!(denies_event(&policy, "pull_request_target", Some("mallory")).is_none());
         assert!(denies_workflow(
             &policy,
@@ -347,15 +360,56 @@ workflows = ["deploy.yml"]
     }
 
     #[test]
-    fn config_defaults_to_evaluate_with_no_rules() {
+    fn default_config_carries_prt_rule_in_evaluate_mode() {
+        // Mirrors GitHub's default rule: pull_request_target is flagged in
+        // evaluate (log-only) mode, so nothing is blocked out of the box.
         let config: crate::config::ConfigFile =
             toml::from_str("").expect("empty config must parse");
         assert_eq!(
             config.execution_protection.mode,
             crate::config::ProtectionMode::Evaluate
         );
-        assert!(config.execution_protection.event_rules.is_empty());
+        let rules = &config.execution_protection.event_rules;
+        assert_eq!(rules.len(), 1, "default config must carry the PRT rule");
+        let rule = &rules[0];
+        assert_eq!(rule.event, "pull_request_target");
+        assert!(rule.workflows.is_none());
+        assert_eq!(rule.action, crate::config::PolicyRuleAction::Deny);
         assert!(config.execution_protection.actor_rules.is_empty());
+    }
+
+    #[test]
+    fn default_prt_rule_is_logged_not_blocked() {
+        // The default config matches pull_request_target, but the mode is
+        // evaluate: every enforcement call site logs the hit and continues
+        // instead of denying the trigger.
+        let policy = ExecutionProtectionConfig::default();
+        let hit = denies_event(&policy, "pull_request_target", Some("alice"))
+            .expect("default PRT rule must match a pull_request_target trigger");
+        assert_eq!(hit.kind, "event");
+        assert_eq!(
+            hit.describe(),
+            "event-rule event=\"pull_request_target\" (all workflows)"
+        );
+        assert_eq!(policy.mode, crate::config::ProtectionMode::Evaluate);
+        // Unrelated triggers are untouched by the default rule.
+        assert!(denies_event(&policy, "push", Some("alice")).is_none());
+    }
+
+    #[test]
+    fn explicit_empty_event_rules_remove_the_default() {
+        // The operator removes the default rule with an explicit empty list;
+        // the default must not reappear on the next load.
+        let config: crate::config::ConfigFile =
+            toml::from_str("[execution_protection]\nevent_rules = []\n")
+                .expect("config must parse");
+        assert!(config.execution_protection.event_rules.is_empty());
+        assert!(denies_event(
+            &config.execution_protection,
+            "pull_request_target",
+            Some("alice")
+        )
+        .is_none());
     }
 
     #[test]
