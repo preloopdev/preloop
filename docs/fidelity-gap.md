@@ -480,11 +480,12 @@ under `qemu-system-x86_64`; uv's freebsd cell wants docker-in-docker plus
 - **Third-party runner fleets.** uv targets `depot-ubuntu-24.04`,
 `github-ubuntu-24.04-x86_64-8` and `namespace-profile-macos-15`; those labels
 only match here because a self-hosted runner stands in for unknown labels.
-- **Job variables leak into the step environment.** `system.*`,
-`DistributedTask.*` and `actions_*` job-message variables are exported to
-steps; GitHub exports only the step's own `env:` block. Harmless so far —
-`install-action`'s `BASH_FUNC_` guard does not trip on them — but it is a
-divergence a workflow could observe.
+- ✅ **Resolved: job variables no longer leak into the step environment.**
+`system.*`, `DistributedTask.*` and `actions_*` job-message variables are
+filtered before entering the job environment, and host step processes are
+spawned with the inherited environment filtered of the same families, so a
+workflow cannot observe them. (Live during the campaign: they were exported
+to steps; GitHub exports only the step's own `env:` block.)
 
 ### 1b.5 Pool reliability findings (2026-08-13)
 

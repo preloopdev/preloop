@@ -92,6 +92,20 @@ pub type ChunkCallback<'a> = Box<dyn FnMut(&[u8]) + Send + 'a>;
 
 // ── invoke ──────────────────────────────────────────────────────────────
 
+/// Job-message bookkeeping families that must never reach a step process.
+///
+/// `system.*` and `DistributedTask.*` match case-insensitively. `actions_*`
+/// matches lower-case only: the job-message family (`actions_cache_mode`,
+/// `actions_runner_…`) is lower-case, while the runner's legitimate
+/// `ACTIONS_*` plumbing (`ACTIONS_RUNTIME_URL`, `ACTIONS_STEP_DEBUG`, …) is
+/// something steps are entitled to see, matching GitHub.
+pub(crate) fn is_internal_step_env(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.starts_with("system.")
+        || lower.starts_with("distributedtask.")
+        || key.starts_with("actions_")
+}
+
 /// Invoke a process with the given environment.
 ///
 /// In production mode (`keep_lines = false`), raw byte chunks are delivered
@@ -112,9 +126,17 @@ pub async fn invoke<'a>(
     mut cancel_rx: Option<watch::Receiver<bool>>,
     keep_lines: bool,
 ) -> Result<ProcessOutput> {
+    // Steps inherit the worker's machine environment (HOME, LANG, …) but must
+    // not see job-message bookkeeping families that could ride along in it:
+    // a workflow can observe any inherited key by running `env`. Explicit
+    // job/step variables are applied afterwards and take precedence.
+    let inherited = std::env::vars_os()
+        .filter(|(key, _)| key.to_str().is_none_or(|key| !is_internal_step_env(key)));
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
+        .env_clear()
+        .envs(inherited)
         .envs(env)
         // A step never gets interactive input. The official runner leaves
         // stdin unredirected, so on a hosted runner a step inherits the
@@ -1050,6 +1072,77 @@ mod tests {
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.lines, vec!["visible"]);
+    }
+
+    /// Inherited job-message bookkeeping (`system.*`, `DistributedTask.*`,
+    /// `actions_*`) must not reach a step, while ordinary machine env and the
+    /// runner's uppercase `ACTIONS_*` plumbing still do.
+    ///
+    /// The assertions run in a dedicated subprocess: seeding the families
+    /// requires adding variables to a process environment, and doing that in
+    /// the shared test binary would race other tests that read the
+    /// environment concurrently. The child is this same test binary, filtered
+    /// to this test and seeded through its own environment.
+    #[tokio::test]
+    async fn invoke_filters_inherited_job_bookkeeping() {
+        const CHILD_MARKER: &str = "PRELOOP_STEP_ENV_FILTER_CHILD";
+        const SEEDED: [(&str, &str); 5] = [
+            ("system.leak.test", "1"),
+            ("DistributedTask.LeakTest", "1"),
+            ("actions_leak_test", "1"),
+            ("ACTIONS_PLUMBING_KEEP", "1"),
+            ("PRELOOP_HOST_ENV_KEEP", "1"),
+        ];
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let exe = std::env::current_exe().expect("test binary path");
+            let status = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "process::tests::invoke_filters_inherited_job_bookkeeping",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .envs(SEEDED)
+                .status()
+                .expect("spawning the seeded test subprocess");
+            assert!(
+                status.success(),
+                "seeded subprocess failed ({status}); the step environment checks run there"
+            );
+            return;
+        }
+
+        // Invoke `env` directly, not through `sh -c env`: dash drops variable
+        // names that are not valid shell identifiers when it execs a child,
+        // which would mask a leak of the dotted families on distros whose
+        // `/bin/sh` is dash.
+        let result = invoke(
+            "env",
+            &[],
+            Path::new("."),
+            &HashMap::new(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        let output = result.lines.join("\n");
+        for (leaked, _) in &SEEDED[..3] {
+            assert!(
+                !output.contains(&format!("{leaked}=")),
+                "inherited job bookkeeping {leaked} leaked into the step environment"
+            );
+        }
+        for (kept, _) in &SEEDED[3..] {
+            assert!(
+                output.contains(&format!("{kept}=1")),
+                "ordinary inherited env {kept} was dropped"
+            );
+        }
     }
 
     #[tokio::test]
