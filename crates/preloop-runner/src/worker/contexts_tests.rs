@@ -348,6 +348,46 @@ fn job_status_failure_reflects_in_context() {
 }
 
 #[test]
+fn job_workflow_source_identity_is_surfaced_in_context() {
+    // The server sends the four `job.workflow_*` properties in the Azure
+    // DevOps typed-dict wire format; the runner must surface all four —
+    // including `workflow_file_path`, which the job context used to drop.
+    let ctx = JobContext::new(
+        "job1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({
+            "job": {
+                "t": 2,
+                "d": [
+                    {"k": "workflow_ref", "v": {"t": 1, "d": "octo-org/octo-repo/.github/workflows/callee.yml@main"}},
+                    {"k": "workflow_sha", "v": {"t": 1, "d": "abc123"}},
+                    {"k": "workflow_repository", "v": {"t": 1, "d": "octo-org/octo-repo"}},
+                    {"k": "workflow_file_path", "v": {"t": 1, "d": ".github/workflows/callee.yml"}}
+                ]
+            }
+        }),
+    );
+
+    let expr_ctx = ctx.build_expression_context();
+    let file_path =
+        preloop_gha_expressions::eval_expression("job.workflow_file_path", &expr_ctx).unwrap();
+    assert_eq!(file_path.as_str(), Some(".github/workflows/callee.yml"));
+    let workflow_ref =
+        preloop_gha_expressions::eval_expression("job.workflow_ref", &expr_ctx).unwrap();
+    assert_eq!(
+        workflow_ref.as_str(),
+        Some("octo-org/octo-repo/.github/workflows/callee.yml@main")
+    );
+    let workflow_sha =
+        preloop_gha_expressions::eval_expression("job.workflow_sha", &expr_ctx).unwrap();
+    assert_eq!(workflow_sha.as_str(), Some("abc123"));
+    let workflow_repository =
+        preloop_gha_expressions::eval_expression("job.workflow_repository", &expr_ctx).unwrap();
+    assert_eq!(workflow_repository.as_str(), Some("octo-org/octo-repo"));
+}
+
+#[test]
 fn set_github_context_value_updates_context_and_env() {
     let mut job = JobContext::new(
         "j1".into(),

@@ -494,6 +494,9 @@ impl JobContext {
             if let Some(wrepo) = job_decoded.get("workflow_repository").cloned() {
                 obj.insert("workflow_repository".to_string(), wrepo);
             }
+            if let Some(wpath) = job_decoded.get("workflow_file_path").cloned() {
+                obj.insert("workflow_file_path".to_string(), wpath);
+            }
         }
         ctx.insert("job", job_ctx_obj);
 

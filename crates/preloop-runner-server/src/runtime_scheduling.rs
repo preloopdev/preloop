@@ -2538,6 +2538,14 @@ struct MatrixExpansionInputs {
     /// reusable callee, so the build phase parses the callee YAML rather than
     /// the root workflow.
     workflow_file: Option<String>,
+    /// Callee identity of the deferred node (`workflow_ref`, `workflow_sha`,
+    /// `workflow_repository` of the workflow defining it): set together with
+    /// `workflow_file` when the node lives inside a reusable callee, so the
+    /// fan-out cells report the callee in their `job.workflow_*` context
+    /// values rather than the root workflow.
+    workflow_ref: Option<String>,
+    workflow_sha: Option<String>,
+    workflow_repository: Option<String>,
     /// The deferred node's own `inputs` context. For a top-level node this is
     /// the run's dispatch inputs (stamped on the plan at submit time); for a
     /// node inside a reusable workflow it is the caller's `with` values that
@@ -2605,8 +2613,14 @@ fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> 
     // A deferred matrix inside a reusable workflow carries its home workflow
     // on the plan (`register_expanded_jobs` stores it alongside the node), so
     // the build phase can parse the callee YAML instead of the root workflow.
+    // The node's callee identity travels with it for the same reason: the
+    // fan-out cells are jobs of the callee, so their `job.workflow_*`
+    // context values must name it, not the root workflow.
     let stored_plan = run.caller_plans.get(&job.job_id);
     let workflow_file = stored_plan.and_then(|plan| plan.workflow_file.clone());
+    let workflow_ref = stored_plan.and_then(|plan| plan.workflow_ref.clone());
+    let workflow_sha = stored_plan.and_then(|plan| plan.workflow_sha.clone());
+    let workflow_repository = stored_plan.and_then(|plan| plan.workflow_repository.clone());
     // The fan-out cells inherit the deferred node's own `inputs` context:
     // the root run's dispatch inputs for a top-level node (stamped on the
     // plan at submit time), or the caller's `with` values for a node inside a
@@ -2625,6 +2639,9 @@ fn plan_expansion(inner: &InnerState, job: &QueuedJob) -> Option<ExpansionPlan> 
         // rather than in the build phase, which no longer sees the run record.
         needs_outputs: collect_needs_outputs(run, job),
         workflow_file,
+        workflow_ref,
+        workflow_sha,
+        workflow_repository,
         scoped_inputs,
     })))
 }
@@ -2894,6 +2911,9 @@ fn build_matrix_expansion(
         expression,
         needs_outputs,
         workflow_file,
+        workflow_ref,
+        workflow_sha,
+        workflow_repository,
         scoped_inputs,
     } = inputs;
     let run_id = ctx.run_id;
@@ -2911,7 +2931,7 @@ fn build_matrix_expansion(
         tracing::warn!(%run_id, job = %node_id, %error, "workflow re-parse failed for dynamic matrix");
         ExecutionStatus::Failure
     })?;
-    let plans = preloop_gha_parser::expand_deferred_matrix_job(
+    let mut plans = preloop_gha_parser::expand_deferred_matrix_job(
         &workflow,
         &base_id,
         &expression,
@@ -2928,6 +2948,25 @@ fn build_matrix_expansion(
         tracing::warn!(%run_id, job = %node_id, %error, "dynamic matrix expansion failed");
         ExecutionStatus::Failure
     })?;
+    // The fan-out cells are jobs of the workflow that defines the deferred
+    // node: stamp the node's callee identity onto them so their
+    // `job.workflow_*` context values name the callee, not the root
+    // workflow. A top-level node carries no identity and the cells keep the
+    // run's workflow, as before.
+    for plan in &mut plans {
+        if let Some(file) = &workflow_file {
+            plan.workflow_file = Some(file.clone());
+        }
+        if let Some(reference) = &workflow_ref {
+            plan.workflow_ref = Some(reference.clone());
+        }
+        if let Some(sha) = &workflow_sha {
+            plan.workflow_sha = Some(sha.clone());
+        }
+        if let Some(repository) = &workflow_repository {
+            plan.workflow_repository = Some(repository.clone());
+        }
+    }
 
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
