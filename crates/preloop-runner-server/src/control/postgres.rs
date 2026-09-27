@@ -4880,6 +4880,96 @@ impl ControlBackend for PostgresBackend {
         result
     }
 
+    async fn ensure_job_detail(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        conclusion: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let conclusion = conclusion.map(str::to_owned);
+        let mut client = self.checkout_writer().await?;
+        let result = async {
+            let tx = client.transaction().await.map_err(ControlError::backend)?;
+            lock_runs(&tx, std::iter::once(&run_id)).await?;
+            let run = run_id.0.to_string();
+            let job = job_id.0.clone();
+            // `JobDetail::find` semantics: match on the stable job key, with a
+            // name fallback for details restored without one.
+            let rows = tx
+                .query(
+                    "SELECT job_id, detail_json, detail_position FROM run_jobs \
+                     WHERE run_id = $1 AND detail_json IS NOT NULL",
+                    &[&run],
+                )
+                .await
+                .map_err(ControlError::backend)?;
+            let mut found: Option<(String, crate::models::JobDetail, Option<i64>)> = None;
+            for row in &rows {
+                let detail: crate::models::JobDetail =
+                    serde_json::from_str(row.get::<_, &str>(1)).map_err(ControlError::backend)?;
+                if detail.job_id == job || (detail.job_id.is_empty() && detail.name == job) {
+                    found = Some((
+                        row.get::<_, String>(0),
+                        detail,
+                        row.get::<_, Option<i64>>(2),
+                    ));
+                    break;
+                }
+            }
+            let (row_job, mut detail, position) = match found {
+                Some(v) => v,
+                None => (
+                    job.clone(),
+                    crate::models::JobDetail {
+                        job_id: job.clone(),
+                        name: job.clone(),
+                        conclusion: "in_progress".to_owned(),
+                        steps: Vec::new(),
+                        annotations: Vec::new(),
+                    },
+                    None,
+                ),
+            };
+            let mut changed = position.is_none();
+            if let Some(conclusion) = &conclusion {
+                if detail.conclusion != *conclusion {
+                    detail.conclusion = conclusion.clone();
+                    changed = true;
+                }
+            }
+            if !changed {
+                return tx.rollback().await.map_err(ControlError::backend);
+            }
+            let position = match position {
+                Some(p) => p,
+                None => tx
+                    .query_one(
+                        "SELECT COALESCE(MAX(detail_position) + 1, 0) FROM run_jobs \
+                         WHERE run_id = $1",
+                        &[&run],
+                    )
+                    .await
+                    .map_err(ControlError::backend)?
+                    .get(0),
+            };
+            let json = serde_json::to_string(&detail).map_err(ControlError::backend)?;
+            tx.execute(
+                "INSERT INTO run_jobs (run_id, job_id, detail_json, detail_position) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT(run_id, job_id) DO UPDATE SET \
+                 detail_json = excluded.detail_json, \
+                 detail_position = excluded.detail_position",
+                &[&run, &row_job, &json, &position],
+            )
+            .await
+            .map_err(ControlError::backend)?;
+            tx.commit().await.map_err(ControlError::backend)
+        }
+        .await;
+        self.return_writer(client).await;
+        result
+    }
+
     async fn attempt_job(
         &self,
         agent_job_id: uuid::Uuid,

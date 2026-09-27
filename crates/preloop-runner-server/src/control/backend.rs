@@ -330,6 +330,17 @@ pub(crate) trait ControlBackend: Send + Sync {
     async fn job_detail_missing(&self, run_id: RunId, job_id: &JobId)
         -> Result<bool, ControlError>;
 
+    /// Create `job_id`'s `jobs_list` detail when missing (defaulting to
+    /// `in_progress`) and stamp `conclusion` when it is a terminal string.
+    /// Serialized on the run advisory lock; the timeline PATCH calls this
+    /// instead of loading the run's working set.
+    async fn ensure_job_detail(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        conclusion: Option<&str>,
+    ) -> Result<(), ControlError>;
+
     /// Whether `runner_id` is registered (indexed point read).
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError>;
 
@@ -1050,6 +1061,18 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.job_detail_missing(run_id, job_id).await,
             Self::Postgres(b) => b.job_detail_missing(run_id, job_id).await,
+        }
+    }
+
+    async fn ensure_job_detail(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        conclusion: Option<&str>,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.ensure_job_detail(run_id, job_id, conclusion).await,
+            Self::Postgres(b) => b.ensure_job_detail(run_id, job_id, conclusion).await,
         }
     }
 

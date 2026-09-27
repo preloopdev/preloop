@@ -4310,6 +4310,95 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
+    async fn ensure_job_detail(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        conclusion: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let run = run_id.0.to_string();
+        let job = job_id.0.clone();
+        let conclusion = conclusion.map(str::to_owned);
+        run_blocking(move || {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(ControlError::backend)?;
+            // `JobDetail::find` semantics: match on the stable job key, with a
+            // name fallback for details restored without one.
+            let mut rows = tx
+                .prepare(
+                    "SELECT job_id, detail_json, detail_position FROM run_jobs \
+                     WHERE run_id = ?1 AND detail_json IS NOT NULL",
+                )
+                .map_err(ControlError::backend)?;
+            let details: Vec<(String, String, Option<i64>)> = rows
+                .query_map(params![run], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(ControlError::backend)?
+                .collect::<Result<_, _>>()
+                .map_err(ControlError::backend)?;
+            drop(rows);
+            let mut found: Option<(String, crate::models::JobDetail, Option<i64>)> = None;
+            for (row_job, json, pos) in &details {
+                let detail: crate::models::JobDetail =
+                    serde_json::from_str(json).map_err(ControlError::backend)?;
+                if detail.job_id == job || (detail.job_id.is_empty() && detail.name == job) {
+                    found = Some((row_job.clone(), detail, *pos));
+                    break;
+                }
+            }
+            let (row_job, mut detail, position) = match found {
+                Some(v) => v,
+                None => (
+                    job.clone(),
+                    crate::models::JobDetail {
+                        job_id: job.clone(),
+                        name: job.clone(),
+                        // A timeline update means the job started; the run
+                        // record's final conclusion comes from the job status
+                        // map. Default to the truthful in-flight state.
+                        conclusion: "in_progress".to_owned(),
+                        steps: Vec::new(),
+                        annotations: Vec::new(),
+                    },
+                    None,
+                ),
+            };
+            let mut changed = position.is_none();
+            if let Some(conclusion) = &conclusion {
+                if detail.conclusion != *conclusion {
+                    detail.conclusion = conclusion.clone();
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            let position = match position {
+                Some(p) => p,
+                None => tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(detail_position) + 1, 0) FROM run_jobs \
+                         WHERE run_id = ?1",
+                        params![run],
+                        |row| row.get(0),
+                    )
+                    .map_err(ControlError::backend)?,
+            };
+            let json = serde_json::to_string(&detail).map_err(ControlError::backend)?;
+            tx.execute(
+                "INSERT INTO run_jobs (run_id, job_id, detail_json, detail_position) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(run_id, job_id) DO UPDATE SET \
+                 detail_json = excluded.detail_json, \
+                 detail_position = excluded.detail_position",
+                params![run, row_job, json, position],
+            )
+            .map_err(ControlError::backend)?;
+            tx.commit().map_err(ControlError::backend)
+        })
+    }
+
     async fn attempt_job(
         &self,
         agent_job_id: uuid::Uuid,

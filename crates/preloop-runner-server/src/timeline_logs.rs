@@ -141,48 +141,16 @@ pub async fn patch_timeline_records(
                 .await
                 .unwrap_or(true);
         if needs_detail {
-            shared
+            let conclusion = job_status
+                .filter(|s| *s != ExecutionStatus::InProgress)
+                .map(|s| format!("{s:?}").to_lowercase());
+            let _ = shared
                 .state
                 .backend
-                .transact_scoped(&crate::control::txstate::TxScope::run(run_id), move |tx| {
-                    if let Some(run) = tx.runs.get_mut(&run_id) {
-                        let detail = match JobDetail::find(&mut run.jobs_list, &job_id.0) {
-                            Some(detail) => detail,
-                            None => {
-                                run.jobs_list.push(JobDetail {
-                                    job_id: job_id.0.clone(),
-                                    name: job_id.0.clone(),
-                                    // A timeline update means the job started;
-                                    // the run record's final conclusion comes
-                                    // from the job status map. Default to the
-                                    // truthful in-flight state.
-                                    conclusion: "in_progress".to_owned(),
-                                    steps: Vec::new(),
-                                    annotations: Vec::new(),
-                                });
-                                run.jobs_list.last_mut().expect("just pushed")
-                            }
-                        };
-                        // The status map is authoritative for terminal states
-                        // only; an in-flight projection would lie.
-                        if let Some(status) = job_status {
-                            if status != ExecutionStatus::InProgress {
-                                detail.conclusion = format!("{:?}", status).to_lowercase();
-                            }
-                        }
-                    }
-                    if let Some(agent_job_id) = agent_job_id {
-                        let manifest = tx.job_steps.entry(agent_job_id).or_default();
-                        for patch in &patches {
-                            apply_step_patch(manifest, patch);
-                        }
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(crate::ApiError::from)
-                .unwrap_or(());
-        } else if let Some(agent_job_id) = agent_job_id {
+                .ensure_job_detail(run_id, &job_id, conclusion.as_deref())
+                .await;
+        }
+        if let Some(agent_job_id) = agent_job_id {
             if let Err(error) = shared
                 .state
                 .backend
@@ -943,38 +911,6 @@ fn step_patch(
         finished_at_us: micros(record.finish_time.as_deref()),
         observed_us,
     })
-}
-
-/// Apply a step patch to an in-memory manifest with the same rules the
-/// direct upsert uses.
-fn apply_step_patch(manifest: &mut Vec<StepRecord>, patch: &crate::control::types::StepPatch) {
-    let time = |us: Option<i64>| us.and_then(chrono::DateTime::from_timestamp_micros);
-    match StepRecord::find_by_id(manifest, &patch.id) {
-        Some(pos) => {
-            let step = &mut manifest[pos];
-            step.conclusion = patch.conclusion.clone();
-            if let Some(started) = time(patch.started_at_us) {
-                step.started_at = Some(started);
-            }
-            if let Some(finished) = time(patch.finished_at_us) {
-                step.finished_at = Some(finished);
-            }
-            step.name = patch.name.clone();
-        }
-        // A timeline record with no manifest entry is runner bookkeeping,
-        // not a workflow step; `runner_number` stays unset on this path.
-        None => manifest.push(StepRecord {
-            id: patch.id.clone(),
-            kind: StepKind::Synthetic,
-            workflow_index: None,
-            runner_number: None,
-            context_name: None,
-            name: patch.name.clone(),
-            conclusion: patch.conclusion.clone(),
-            started_at: time(patch.started_at_us).or(time(Some(patch.observed_us))),
-            finished_at: time(patch.finished_at_us),
-        }),
-    }
 }
 
 #[cfg(test)]
