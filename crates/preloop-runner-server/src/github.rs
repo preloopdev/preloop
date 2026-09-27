@@ -4774,4 +4774,60 @@ mod tests {
             "the stale push is the one superseded, as it would have been in GitHub's order"
         );
     }
+
+    /// ChatOps shape: a per-PR `cancel-in-progress` group fed by comments.
+    /// A comment delivered late must not cancel the run of a newer comment.
+    #[tokio::test]
+    async fn late_older_pr_comment_does_not_cancel_newer_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/chatops.yml"),
+            "on: issue_comment\nconcurrency:\n  group: pr-${{ github.event.issue.number }}\n  \
+             cancel-in-progress: true\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    \
+             steps:\n      - run: echo deploy\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        let comment = |id: u64, created_at: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "action": "created",
+                "issue": {"number": 42, "pull_request": {"url": "https://example.invalid/pr/42"}},
+                "comment": {"id": id, "body": "/deploy", "created_at": created_at},
+                "repository": {"full_name": "owner/repo", "default_branch": "main"},
+                "sender": {"login": "octocat"},
+            }))
+            .unwrap()
+        };
+
+        // The newer comment is processed first, the older one arrives late.
+        for (delivery, id, created_at) in [
+            ("delivery-comment-newer", 2, "2026-01-01T00:05:00Z"),
+            ("delivery-comment-older", 1, "2026-01-01T00:00:00Z"),
+        ] {
+            let status = fixture
+                .post_body(delivery, Some("issue_comment"), &comment(id, created_at))
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            fixture.drain().await;
+        }
+
+        let inner = fixture.state.test_tx().await;
+        let status_for = |id: u64| {
+            inner
+                .runs
+                .values()
+                .find(|run| run.submission.payload["comment"]["id"] == id)
+                .map(|run| run.status)
+        };
+        let newer = status_for(2).expect("the newer comment must have a run");
+        assert_ne!(
+            newer,
+            ExecutionStatus::Cancelled,
+            "a late comment cancelled the newer comment's run"
+        );
+        assert_eq!(status_for(1), Some(ExecutionStatus::Cancelled));
+    }
 }

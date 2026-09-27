@@ -366,9 +366,14 @@ impl EventOrder {
     }
 }
 
-/// The ordering GitHub recorded for `event`'s payload, when it carries one:
-/// `repository.pushed_at` for pushes (repository-wide), `pull_request.
-/// updated_at` for pull request events (per pull request).
+/// The ordering GitHub recorded for `event`'s payload, when it carries one.
+///
+/// Each event maps to a subject (what "newer" is about) and the timestamp
+/// GitHub stamped on it. Events about the same pull request — the PR itself,
+/// its reviews, review comments, and conversation comments — share one
+/// subject so any of them can supersede another. Events without GitHub
+/// ordering data (dispatches, schedules, create/delete, …) return `None` and
+/// keep arrival order.
 pub(crate) fn event_order(event: &str, repository: &str, payload: &Value) -> Option<EventOrder> {
     fn unix_seconds(value: &Value) -> Option<i64> {
         value.as_i64().or_else(|| {
@@ -377,22 +382,129 @@ pub(crate) fn event_order(event: &str, repository: &str, payload: &Value) -> Opt
                 .map(|at| at.timestamp())
         })
     }
+    /// First timestamp present among `fields` of `object`.
+    fn first_at(object: &Value, fields: &[&str]) -> Option<i64> {
+        fields
+            .iter()
+            .find_map(|field| object.get(*field).and_then(unix_seconds))
+    }
+    fn number(object: &Value) -> Option<u64> {
+        object.get("number")?.as_u64()
+    }
+    let pull_request_scope = |number: u64| format!("pull_request:{repository}#{number}");
+    let order = |scope: String, at: i64| Some(EventOrder { scope, at });
+
     match event {
-        "push" => Some(EventOrder {
-            scope: format!("push:{repository}"),
-            at: unix_seconds(payload.get("repository")?.get("pushed_at")?)?,
-        }),
+        "push" => order(
+            format!("push:{repository}"),
+            unix_seconds(payload.get("repository")?.get("pushed_at")?)?,
+        ),
         "pull_request" | "pull_request_target" => {
             let pull_request = payload.get("pull_request")?;
-            let number = payload
-                .get("number")
-                .or_else(|| pull_request.get("number"))?
-                .as_u64()?;
-            Some(EventOrder {
-                scope: format!("pull_request:{repository}#{number}"),
-                at: unix_seconds(pull_request.get("updated_at")?)?,
-            })
+            order(
+                pull_request_scope(number(payload).or_else(|| number(pull_request))?),
+                first_at(pull_request, &["updated_at"])?,
+            )
         }
+        // The review or comment's own time, falling back to the PR's.
+        "pull_request_review" | "pull_request_review_comment" => {
+            let pull_request = payload.get("pull_request")?;
+            let own = payload
+                .get("review")
+                .and_then(|review| first_at(review, &["submitted_at", "updated_at"]))
+                .or_else(|| {
+                    payload
+                        .get("comment")
+                        .and_then(|comment| first_at(comment, &["updated_at", "created_at"]))
+                });
+            order(
+                pull_request_scope(number(pull_request)?),
+                own.or_else(|| first_at(pull_request, &["updated_at"]))?,
+            )
+        }
+        // A comment on a pull request is about that pull request.
+        "issue_comment" => {
+            let issue = payload.get("issue")?;
+            let n = number(issue)?;
+            let scope = if issue.get("pull_request").is_some() {
+                pull_request_scope(n)
+            } else {
+                format!("issue:{repository}#{n}")
+            };
+            order(
+                scope,
+                first_at(payload.get("comment")?, &["updated_at", "created_at"])?,
+            )
+        }
+        "issues" => {
+            let issue = payload.get("issue")?;
+            order(
+                format!("issue:{repository}#{}", number(issue)?),
+                first_at(issue, &["updated_at", "created_at"])?,
+            )
+        }
+        "discussion" | "discussion_comment" => {
+            let discussion = payload.get("discussion")?;
+            let own = payload
+                .get("comment")
+                .and_then(|comment| first_at(comment, &["updated_at", "created_at"]));
+            order(
+                format!("discussion:{repository}#{}", number(discussion)?),
+                own.or_else(|| first_at(discussion, &["updated_at", "created_at"]))?,
+            )
+        }
+        "milestone" => {
+            let milestone = payload.get("milestone")?;
+            order(
+                format!("milestone:{repository}#{}", number(milestone)?),
+                first_at(milestone, &["updated_at", "created_at"])?,
+            )
+        }
+        // Deploy groups are per environment: the latest deployment event for
+        // an environment wins, across deployments.
+        "deployment" | "deployment_status" => {
+            let deployment = payload.get("deployment")?;
+            let environment = payload
+                .get("deployment_status")
+                .and_then(|status| status.get("environment"))
+                .or_else(|| deployment.get("environment"))?
+                .as_str()?;
+            let at = match payload.get("deployment_status") {
+                Some(status) => first_at(status, &["updated_at", "created_at"])?,
+                None => first_at(deployment, &["updated_at", "created_at"])?,
+            };
+            order(format!("deployment:{repository}:{environment}"), at)
+        }
+        // Downstream pipelines group per branch.
+        "workflow_run" => {
+            let run = payload.get("workflow_run")?;
+            order(
+                format!("branch:{repository}:{}", run.get("head_branch")?.as_str()?),
+                first_at(run, &["updated_at", "created_at"])?,
+            )
+        }
+        "check_suite" => {
+            let suite = payload.get("check_suite")?;
+            order(
+                format!(
+                    "branch:{repository}:{}",
+                    suite.get("head_branch")?.as_str()?
+                ),
+                first_at(suite, &["updated_at", "created_at"])?,
+            )
+        }
+        "check_run" => {
+            let run = payload.get("check_run")?;
+            let branch = run.get("check_suite")?.get("head_branch")?.as_str()?;
+            order(
+                format!("branch:{repository}:{branch}"),
+                first_at(run, &["completed_at", "started_at"])?,
+            )
+        }
+        "release" => order(
+            format!("release:{repository}"),
+            first_at(payload.get("release")?, &["published_at", "created_at"])?,
+        ),
         _ => None,
     }
 }
@@ -976,5 +1088,111 @@ mod event_order_tests {
         // No GitHub ordering data → arrival order stands.
         assert!(event_order("push", "o/r", &json!({"repository": {}})).is_none());
         assert!(event_order("workflow_dispatch", "o/r", &json!({})).is_none());
+    }
+
+    /// Two payloads of the same event, `early` before `late`.
+    fn assert_ordered(event: &str, early: Value, late: Value) {
+        let early = event_order(event, "o/r", &early).unwrap_or_else(|| panic!("{event}: no key"));
+        let late = event_order(event, "o/r", &late).unwrap();
+        assert!(early.is_older_than(&late), "{event}: early must be older");
+        assert!(
+            !late.is_older_than(&early),
+            "{event}: late must not be older"
+        );
+    }
+
+    const T1: &str = "2026-01-01T00:00:00Z";
+    const T2: &str = "2026-01-01T00:05:00Z";
+
+    #[test]
+    fn every_timestamped_event_orders_within_its_subject() {
+        assert_ordered(
+            "pull_request_review",
+            json!({"pull_request": {"number": 7}, "review": {"submitted_at": T1}}),
+            json!({"pull_request": {"number": 7}, "review": {"submitted_at": T2}}),
+        );
+        assert_ordered(
+            "pull_request_review_comment",
+            json!({"pull_request": {"number": 7}, "comment": {"updated_at": T1}}),
+            json!({"pull_request": {"number": 7}, "comment": {"updated_at": T2}}),
+        );
+        assert_ordered(
+            "issue_comment",
+            json!({"issue": {"number": 3}, "comment": {"created_at": T1}}),
+            json!({"issue": {"number": 3}, "comment": {"created_at": T2}}),
+        );
+        assert_ordered(
+            "issues",
+            json!({"issue": {"number": 3, "updated_at": T1}}),
+            json!({"issue": {"number": 3, "updated_at": T2}}),
+        );
+        assert_ordered(
+            "discussion_comment",
+            json!({"discussion": {"number": 4}, "comment": {"updated_at": T1}}),
+            json!({"discussion": {"number": 4}, "comment": {"updated_at": T2}}),
+        );
+        assert_ordered(
+            "milestone",
+            json!({"milestone": {"number": 2, "updated_at": T1}}),
+            json!({"milestone": {"number": 2, "updated_at": T2}}),
+        );
+        // Different deployments to one environment are ordered.
+        assert_ordered(
+            "deployment_status",
+            json!({"deployment": {"id": 1, "environment": "prod"},
+                   "deployment_status": {"environment": "prod", "created_at": T1}}),
+            json!({"deployment": {"id": 2, "environment": "prod"},
+                   "deployment_status": {"environment": "prod", "created_at": T2}}),
+        );
+        assert_ordered(
+            "workflow_run",
+            json!({"workflow_run": {"head_branch": "main", "updated_at": T1}}),
+            json!({"workflow_run": {"head_branch": "main", "updated_at": T2}}),
+        );
+        assert_ordered(
+            "check_suite",
+            json!({"check_suite": {"head_branch": "main", "updated_at": T1}}),
+            json!({"check_suite": {"head_branch": "main", "updated_at": T2}}),
+        );
+        assert_ordered(
+            "check_run",
+            json!({"check_run": {"check_suite": {"head_branch": "main"}, "completed_at": T1}}),
+            json!({"check_run": {"check_suite": {"head_branch": "main"}, "completed_at": T2}}),
+        );
+        assert_ordered(
+            "release",
+            json!({"release": {"published_at": T1}}),
+            json!({"release": {"published_at": T2}}),
+        );
+    }
+
+    #[test]
+    fn pull_request_activity_shares_one_subject_and_other_subjects_never_compare() {
+        let order = |event, payload: Value| event_order(event, "o/r", &payload).unwrap();
+        // A comment on a PR supersedes, and is superseded by, the PR's own events.
+        let comment = order(
+            "issue_comment",
+            json!({"issue": {"number": 7, "pull_request": {}}, "comment": {"created_at": T1}}),
+        );
+        let sync = order("pull_request", pull_request(7, T2));
+        assert!(comment.is_older_than(&sync));
+
+        // A plain issue with the same number is a different subject.
+        let issue_comment = order(
+            "issue_comment",
+            json!({"issue": {"number": 7}, "comment": {"created_at": T1}}),
+        );
+        assert!(!issue_comment.is_older_than(&sync));
+
+        // Other environments and branches are different subjects.
+        let staging = order(
+            "deployment",
+            json!({"deployment": {"environment": "staging", "created_at": T1}}),
+        );
+        let prod = order(
+            "deployment",
+            json!({"deployment": {"environment": "prod", "created_at": T2}}),
+        );
+        assert!(!staging.is_older_than(&prod));
     }
 }
