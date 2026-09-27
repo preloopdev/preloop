@@ -242,6 +242,14 @@
     },
     {
       "schema": "control",
+      "table": "consumer_offsets",
+      "rows": -1,
+      "type": "table",
+      "engine": "",
+      "collation": ""
+    },
+    {
+      "schema": "control",
       "table": "webhook_deliveries",
       "rows": -1,
       "type": "table",
@@ -970,6 +978,84 @@
       "name": "queued_at",
       "type": "timestamp with time zone",
       "ordinal_position": 9,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "now()",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "consumer_offsets",
+      "name": "consumer_name",
+      "type": "text",
+      "ordinal_position": 1,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "consumer_offsets",
+      "name": "last_txid",
+      "type": "xid8",
+      "ordinal_position": 2,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "'0'::xid8",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "consumer_offsets",
+      "name": "last_event_id",
+      "type": "bigint",
+      "ordinal_position": 3,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "0",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "consumer_offsets",
+      "name": "lease_owner",
+      "type": "text",
+      "ordinal_position": 4,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "consumer_offsets",
+      "name": "lease_until",
+      "type": "timestamp with time zone",
+      "ordinal_position": 5,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "consumer_offsets",
+      "name": "updated_at",
+      "type": "timestamp with time zone",
+      "ordinal_position": 6,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3086,9 +3172,22 @@
     {
       "schema": "control",
       "table": "outbox_events",
+      "name": "txid",
+      "type": "xid8",
+      "ordinal_position": 2,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "pg_current_xact_id()",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events",
       "name": "namespace_id",
       "type": "text",
-      "ordinal_position": 2,
+      "ordinal_position": 3,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3101,7 +3200,20 @@
       "table": "outbox_events",
       "name": "run_id",
       "type": "uuid",
-      "ordinal_position": 3,
+      "ordinal_position": 4,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events",
+      "name": "run_seq",
+      "type": "bigint",
+      "ordinal_position": 5,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -3114,7 +3226,7 @@
       "table": "outbox_events",
       "name": "topic",
       "type": "text",
-      "ordinal_position": 4,
+      "ordinal_position": 6,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3127,7 +3239,7 @@
       "table": "outbox_events",
       "name": "payload",
       "type": "jsonb",
-      "ordinal_position": 5,
+      "ordinal_position": 7,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3140,25 +3252,12 @@
       "table": "outbox_events",
       "name": "created_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 6,
+      "ordinal_position": 8,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
       "precision": null,
       "default": "now()",
-      "is_identity": false
-    },
-    {
-      "schema": "control",
-      "table": "outbox_events",
-      "name": "published_at",
-      "type": "timestamp with time zone",
-      "ordinal_position": 7,
-      "nullable": true,
-      "collation": "",
-      "character_maximum_length": "null",
-      "precision": null,
-      "default": "",
       "is_identity": false
     },
     {
@@ -4217,9 +4316,22 @@
     {
       "schema": "control",
       "table": "runs",
+      "name": "event_seq",
+      "type": "bigint",
+      "ordinal_position": 23,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "0",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "runs",
       "name": "created_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 23,
+      "ordinal_position": 24,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -4232,7 +4344,7 @@
       "table": "runs",
       "name": "started_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 24,
+      "ordinal_position": 25,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -4245,7 +4357,7 @@
       "table": "runs",
       "name": "completed_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 25,
+      "ordinal_position": 26,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -5499,6 +5611,13 @@
     },
     {
       "schema": "control",
+      "table": "webhook_deliveries",
+      "field_count": 1,
+      "column": "delivery_id",
+      "pk_def": "PRIMARY KEY (delivery_id)"
+    },
+    {
+      "schema": "control",
       "table": "job_steps",
       "field_count": 2,
       "column": "agent_job_id,step_id",
@@ -5531,6 +5650,13 @@
       "field_count": 1,
       "column": "runner_id",
       "pk_def": "PRIMARY KEY (runner_id)"
+    },
+    {
+      "schema": "control",
+      "table": "webhook_watchdog",
+      "field_count": 1,
+      "column": "scope",
+      "pk_def": "PRIMARY KEY (scope)"
     },
     {
       "schema": "control",
@@ -5569,6 +5695,13 @@
     },
     {
       "schema": "control",
+      "table": "run_history",
+      "field_count": 2,
+      "column": "run_id,created_at",
+      "pk_def": "PRIMARY KEY (run_id, created_at)"
+    },
+    {
+      "schema": "control",
       "table": "concurrency_holds",
       "field_count": 3,
       "column": "namespace_id,repository,group_name",
@@ -5604,17 +5737,10 @@
     },
     {
       "schema": "control",
-      "table": "webhook_deliveries",
+      "table": "consumer_offsets",
       "field_count": 1,
-      "column": "delivery_id",
-      "pk_def": "PRIMARY KEY (delivery_id)"
-    },
-    {
-      "schema": "control",
-      "table": "webhook_watchdog",
-      "field_count": 1,
-      "column": "scope",
-      "pk_def": "PRIMARY KEY (scope)"
+      "column": "consumer_name",
+      "pk_def": "PRIMARY KEY (consumer_name)"
     },
     {
       "schema": "control",
@@ -5636,13 +5762,6 @@
       "field_count": 1,
       "column": "artifact_id",
       "pk_def": "PRIMARY KEY (artifact_id)"
-    },
-    {
-      "schema": "control",
-      "table": "run_history",
-      "field_count": 2,
-      "column": "run_id,created_at",
-      "pk_def": "PRIMARY KEY (run_id, created_at)"
     },
     {
       "schema": "control",
@@ -6186,14 +6305,26 @@
     {
       "schema": "control",
       "table": "outbox_events",
-      "name": "outbox_events_unpublished",
-      "column": "event_id",
+      "name": "outbox_events_read",
+      "column": "txid",
       "index_type": "BTREE",
       "cardinality": null,
       "size": null,
       "unique": false,
       "direction": "asc",
       "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events",
+      "name": "outbox_events_read",
+      "column": "event_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 2
     },
     {
       "schema": "control",

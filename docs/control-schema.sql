@@ -111,6 +111,7 @@ CREATE TABLE runs (
     -- workflow-level `concurrency:` (was run_concurrency.concurrency_blob)
     concurrency_group       text,
     concurrency_cancel_in_progress boolean NOT NULL DEFAULT false,
+    event_seq               bigint NOT NULL DEFAULT 0,   -- bumped per outbox event (run_seq)
     created_at              timestamptz NOT NULL DEFAULT now(),
     started_at              timestamptz,
     completed_at            timestamptz
@@ -483,20 +484,37 @@ CREATE TABLE jobset_gates (
 );
 
 -- ── Events (transactional outbox) ────────────────────────────────────
--- Written in the command's transaction; a relay publishes to the EventSink
--- (in-process / LISTEN-NOTIFY / NATS). Dropped by partition.
+-- Written in the command's transaction; insert-only (never updated).
+-- Readers track position in consumer_offsets and read only below the
+-- safe point: rows with txid < pg_snapshot_xmin(pg_current_snapshot())
+-- belong to finished transactions, so nothing new can appear below it.
+-- Bookmark and order by (txid, event_id). Dropped by partition once
+-- every consumer is past it.
 CREATE TABLE outbox_events (
     event_id                bigint GENERATED ALWAYS AS IDENTITY,
+    txid                    xid8 NOT NULL DEFAULT pg_current_xact_id(),
     namespace_id            text NOT NULL,
     run_id                  uuid,
-    topic                   text NOT NULL,
-    payload                 jsonb NOT NULL,
+    run_seq                 bigint,             -- per-run order; consumers drop stale
+    topic                   text NOT NULL,      -- versioned, e.g. job.completed.v1
+    payload                 jsonb NOT NULL,     -- ids and states only, never secrets
     created_at              timestamptz NOT NULL DEFAULT now(),
-    published_at            timestamptz,
     PRIMARY KEY (event_id, created_at)
 ) PARTITION BY RANGE (created_at);
 CREATE TABLE outbox_events_default PARTITION OF outbox_events DEFAULT;
-CREATE INDEX outbox_events_unpublished ON outbox_events(event_id) WHERE published_at IS NULL;
+CREATE INDEX outbox_events_read ON outbox_events(txid, event_id);
+
+-- One row per registered consumer (or consumer shard): its bookmark.
+-- Advanced once per batch, in the same transaction as the consumer's
+-- own writes when it has any.
+CREATE TABLE consumer_offsets (
+    consumer_name           text PRIMARY KEY,   -- e.g. usage-meter, runner-wakeup/shard-3
+    last_txid               xid8 NOT NULL DEFAULT '0',
+    last_event_id           bigint NOT NULL DEFAULT 0,
+    lease_owner             text,               -- node currently reading
+    lease_until             timestamptz,
+    updated_at              timestamptz NOT NULL DEFAULT now()
+);
 
 -- ── GitHub integration ───────────────────────────────────────────────
 CREATE TABLE webhook_deliveries (
