@@ -2968,15 +2968,15 @@ fn write_txstate(
             "INSERT INTO job_requests (request_id, run_id, job_id, agent_job_id, plan_id, \
              plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id, \
              started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued, \
-             request_blob) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+             request_blob, job_timeout_s) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
              ON CONFLICT(request_id) DO UPDATE SET result=excluded.result, \
              locked_until=excluded.locked_until, claimed_at_us=excluded.claimed_at_us, \
              owner_runner_id=excluded.owner_runner_id, started_at_us=excluded.started_at_us, \
              last_renewed_at_us=excluded.last_renewed_at_us, \
              timeout_triggered=excluded.timeout_triggered, \
              debug_token_issued=excluded.debug_token_issued, \
-             request_blob=excluded.request_blob",
+             request_blob=excluded.request_blob, job_timeout_s=excluded.job_timeout_s",
             params![
                 request_id,
                 r.run_id.0.to_string(),
@@ -2994,6 +2994,9 @@ fn write_txstate(
                 r.timeout_triggered as i64,
                 r.debug_token_issued as i64,
                 request_blob,
+                tx.broker_messages
+                    .get(request_id)
+                    .and_then(|message| message.job_timeout),
             ],
         )
         .map_err(ControlError::backend)?;
@@ -4240,6 +4243,85 @@ impl ControlBackend for SqliteBackend {
             .optional()
             .map(|row| row.map(|(run, job)| (parse_run_id(&run), JobId(job))))
             .map_err(ControlError::backend)
+        })
+    }
+
+    async fn reap_inputs(&self) -> Result<ReapInputs, ControlError> {
+        let timeout = std::time::Duration::from_nanos(
+            self.runner_liveness_timeout
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let cutoff = system_to_us(std::time::SystemTime::now()) - timeout.as_micros() as i64;
+        self.with_reader(|conn| {
+            let mut inputs = ReapInputs::default();
+            let mut stmt = conn
+                .prepare("SELECT request_id, run_id, job_id, started_at_us, last_renewed_at_us, \
+             timeout_triggered, job_timeout_s FROM job_requests WHERE result IS NULL")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ActiveRequest {
+                        request_id: row.get(0)?,
+                        run_id: parse_run_id(&row.get::<_, String>(1)?),
+                        job_id: JobId(row.get(2)?),
+                        started_at: row.get::<_, Option<i64>>(3)?.map(us_to_system),
+                        last_renewed_at: row.get::<_, Option<i64>>(4)?.map(us_to_system),
+                        timeout_triggered: row.get::<_, i64>(5)? != 0,
+                        job_timeout_s: row.get(6)?,
+                    })
+                })
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                inputs.active.push(row.map_err(ControlError::backend)?);
+            }
+            let mut stmt = conn
+                .prepare("SELECT run_id, job_id, runs_on, enqueued_at_us, reaper_first_seen_us IS NOT NULL FROM jobs WHERE queue_kind = 'ready' \
+             ORDER BY priority DESC, run_order, job_order, seq, run_id, job_id")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ReadyRow {
+                        run_id: parse_run_id(&row.get::<_, String>(0)?),
+                        job_id: JobId(row.get(1)?),
+                        runs_on: serde_json::from_str(&row.get::<_, String>(2)?)
+                            .unwrap_or_default(),
+                        enqueued_at_unix_nanos: row.get::<_, Option<i64>>(3)?.unwrap_or(0) * 1000,
+                        observed: row.get(4)?,
+                    })
+                })
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                inputs.ready.push(row.map_err(ControlError::backend)?);
+            }
+            let mut stmt = conn
+                .prepare("SELECT labels FROM runners")
+                .map_err(ControlError::backend)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(ControlError::backend)?;
+            for row in rows {
+                inputs.runner_labels.push(
+                    serde_json::from_str(&row.map_err(ControlError::backend)?).unwrap_or_default(),
+                );
+            }
+            inputs.has_bindings = conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM job_assignments) OR EXISTS(SELECT 1 FROM pool_pending)", [], |row| row.get(0))
+                .map_err(ControlError::backend)?;
+            for (sql, set) in [
+                ("SELECT DISTINCT runner_id FROM runner_sessions \
+             WHERE runner_id IS NOT NULL AND last_seen_at_us < ?1", &mut inputs.stale_runners),
+                ("SELECT r.runner_id FROM runners r WHERE r.registered_at_us < ?1 \
+             AND NOT EXISTS (SELECT 1 FROM runner_sessions s WHERE s.runner_id = r.runner_id)", &mut inputs.phantom_runners),
+            ] {
+                let mut stmt = conn.prepare(sql).map_err(ControlError::backend)?;
+                let rows = stmt
+                    .query_map(params![cutoff], |row| row.get::<_, i64>(0))
+                    .map_err(ControlError::backend)?;
+                for row in rows {
+                    set.insert(row.map_err(ControlError::backend)?);
+                }
+            }
+            Ok(inputs)
         })
     }
 

@@ -254,6 +254,7 @@ CREATE TABLE IF NOT EXISTS job_requests (
     last_renewed_at_us  INTEGER,
     timeout_triggered   INTEGER NOT NULL DEFAULT 0,
     debug_token_issued  INTEGER NOT NULL DEFAULT 0,
+    job_timeout_s       INTEGER,                    -- message timeout, for the reaper
     request_blob        BLOB,                       -- AgentJobRequestMessage
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
@@ -760,6 +761,7 @@ CREATE TABLE IF NOT EXISTS job_requests (
     last_renewed_at_us  BIGINT,
     timeout_triggered   BIGINT NOT NULL DEFAULT 0,
     debug_token_issued  BIGINT NOT NULL DEFAULT 0,
+    job_timeout_s       BIGINT,
     request_blob        BYTEA,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );

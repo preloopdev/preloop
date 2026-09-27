@@ -459,3 +459,43 @@ pub(crate) struct StepPatch {
     /// Server observation time: a new step's start when the runner sent none.
     pub(crate) observed_us: i64,
 }
+
+/// An unfinished execution attempt, as the reaper sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveRequest {
+    pub(crate) request_id: i64,
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) started_at: Option<std::time::SystemTime>,
+    pub(crate) last_renewed_at: Option<std::time::SystemTime>,
+    pub(crate) timeout_triggered: bool,
+    /// The job's `timeout-minutes` in seconds, when its message set one.
+    pub(crate) job_timeout_s: Option<i64>,
+}
+
+/// A ready-queue job, as the starvation sweep sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadyRow {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) runs_on: Vec<String>,
+    pub(crate) enqueued_at_unix_nanos: i64,
+    /// The reaper has a first-seen mark on the row (cleared once a runner
+    /// can take the job).
+    pub(crate) observed: bool,
+}
+
+/// Everything one reaper tick decides from, read without a lock.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReapInputs {
+    pub(crate) active: Vec<ActiveRequest>,
+    pub(crate) ready: Vec<ReadyRow>,
+    /// Label sets of every registered runner.
+    pub(crate) runner_labels: Vec<Vec<String>>,
+    /// Whether any assignment binding or pool-pending mark exists.
+    pub(crate) has_bindings: bool,
+    /// Runners whose session has not polled within the liveness timeout.
+    pub(crate) stale_runners: std::collections::BTreeSet<i64>,
+    /// Registrations older than the liveness timeout with no session.
+    pub(crate) phantom_runners: std::collections::BTreeSet<i64>,
+}

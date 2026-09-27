@@ -301,6 +301,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Drop timelines not patched since `before_us`. Returns timelines removed.
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
 
+    /// One reaper tick's inputs, read directly (no working-set load, no lock).
+    async fn reap_inputs(&self) -> Result<ReapInputs, ControlError>;
+
     /// The logical job an execution attempt belongs to.
     async fn attempt_job(
         &self,
@@ -1033,6 +1036,13 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.attempt_job(agent_job_id).await,
             Self::Postgres(b) => b.attempt_job(agent_job_id).await,
+        }
+    }
+
+    async fn reap_inputs(&self) -> Result<ReapInputs, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.reap_inputs().await,
+            Self::Postgres(b) => b.reap_inputs().await,
         }
     }
 

@@ -195,22 +195,32 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .join(token);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
-    // Stale-binding sweep runs on the authoritative backend — the claim/pair
-    // path writes `tx.job_assignments`/`tx.pool_pending`, so sweeping the
-    // node-local `inner` maps would reap nothing and leak bindings (the
-    // "leaked job bindings" failure mode). Full scope: it sweeps the global
-    // ready queue and every run's assignments.
+    // Everything this tick decides from, read directly: no working-set
+    // load and no lock. Transactions below run only when something is due,
+    // and only over the runs involved.
+    let inputs = match shared.state.backend.reap_inputs().await {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            warn!(?error, "reaper input read failed");
+            return;
+        }
+    };
+    // Stale-binding sweep: the claim/pair path writes
+    // `job_assignments`/`pool_pending`; with none present there is nothing
+    // to reap (the "leaked job bindings" failure mode needs a binding).
     let now = SystemTime::now();
-    if let Err(error) = shared
-        .state
-        .backend
-        .transact(move |tx| {
-            crate::control::sched::sweep_stale_bindings(tx, now);
-            Ok(())
-        })
-        .await
-    {
-        warn!(?error, "stale-binding sweep failed");
+    if inputs.has_bindings {
+        if let Err(error) = shared
+            .state
+            .backend
+            .transact(move |tx| {
+                crate::control::sched::sweep_stale_bindings(tx, now);
+                Ok(())
+            })
+            .await
+        {
+            warn!(?error, "stale-binding sweep failed");
+        }
     }
     // ── Node-local inputs: pool flags + start time ──────────────────────
     let now = SystemTime::now();
@@ -228,30 +238,52 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         || pool_status.provisioning > 0;
     let started_at = shared.state.started_at;
 
-    // ── Authoritative read: active job requests + the ready queue ───────
-    let (active_reqs, queued_jobs) = shared
-        .state
-        .backend
-        .read(move |tx| {
-            let mut active_reqs = Vec::new();
-            for (request_id, request) in &tx.job_requests {
-                if request.result.is_none() {
-                    active_reqs.push((
-                        *request_id,
-                        request.run_id,
-                        request.job_id.clone(),
-                        request.started_at,
-                        request.last_renewed_at,
-                        request.timeout_triggered,
-                    ));
-                }
-            }
-            let queued_jobs: Vec<_> = crate::control::sched::ready_jobs(tx).cloned().collect();
-            Ok((active_reqs, queued_jobs))
+    // ── Active attempts + the ready queue (from `inputs`) ────────────────
+    let active_reqs: Vec<_> = inputs
+        .active
+        .iter()
+        .map(|request| {
+            (
+                request.request_id,
+                request.run_id,
+                request.job_id.clone(),
+                request.started_at,
+                request.last_renewed_at,
+                request.timeout_triggered,
+            )
         })
-        .await
-        .unwrap_or_default();
-
+        .collect();
+    let queued_jobs = inputs.ready.clone();
+    // Runs with something due: a timeout or lease past its limit (a
+    // superset: paused debug time only shortens the elapsed time), or a
+    // ready job no runner can take (or one whose first-seen mark must clear).
+    let mut due_runs: std::collections::BTreeSet<RunId> = std::collections::BTreeSet::new();
+    for request in &inputs.active {
+        let elapsed = |at: Option<SystemTime>| {
+            at.and_then(|at| now.duration_since(at).ok())
+                .unwrap_or_default()
+        };
+        let timed_out = request.started_at.is_some()
+            && !request.timeout_triggered
+            && elapsed(request.started_at)
+                >= Duration::from_secs(request.job_timeout_s.unwrap_or(21600).max(0) as u64);
+        let lease_expired = request.last_renewed_at.is_some()
+            && elapsed(request.last_renewed_at) >= Duration::from_secs(JOB_LEASE_SECONDS);
+        if timed_out || lease_expired {
+            due_runs.insert(request.run_id);
+        }
+    }
+    for job in &inputs.ready {
+        let matched = inputs
+            .runner_labels
+            .iter()
+            .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
+        // Unmatched: stamp its first-seen mark or starve it. Matched but
+        // marked: the mark clears.
+        if !matched || job.observed {
+            due_runs.insert(job.run_id);
+        }
+    }
     // ── Node-local: debug-session sweep + pause credits ─────────────────
     // Drop sessions whose worker stopped polling before reading pause credit,
     // and sessions whose job has since ended. Either way a crashed or finished
@@ -298,10 +330,16 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // forever from masking an unschedulable job (bad `runs-on`, or a
     // persistently broken provision) indefinitely.
     const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
-    let sweep = shared
+    let mut sweep_scope = crate::control::txstate::TxScope::runs(due_runs.clone());
+    // Settling an expired lease frees its owner session.
+    sweep_scope.sessions = None;
+    let sweep = if due_runs.is_empty() {
+        Default::default()
+    } else {
+        shared
         .state
         .backend
-        .transact(move |tx| {
+        .transact_scoped(&sweep_scope, move |tx| {
             let mut cancellations = Vec::new();
             let mut disconnected_completions = Vec::new();
             let mut starved: Vec<(RunId, JobId, String)> = Vec::new();
@@ -510,7 +548,8 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             Ok((cancellation_count, disconnected_completions, starved))
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_default()
+    };
     let (cancellation_count, disconnected_completions, starved) = sweep;
 
     // Liveness sweep: a session that stops polling is a deaf runner — its
@@ -526,42 +565,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // and `runner_liveness_timeout` are all TxState. Reading the dead
     // node-local maps here would mark every restored runner "phantom" (both
     // session negations unconditionally true) and purge live identities.
-    let (stale_runners, phantom_runners) = shared
-        .state
-        .backend
-        .read(move |tx| {
-            let now = std::time::SystemTime::now();
-            let stale: std::collections::BTreeSet<i64> = tx
-                .session_last_seen
-                .iter()
-                .filter(|(_, seen)| {
-                    now.duration_since(**seen)
-                        .map(|elapsed| elapsed > tx.runner_liveness_timeout)
-                        .unwrap_or(false)
-                })
-                .filter_map(|(session_id, _)| tx.runner_id_for_session(session_id))
-                .collect();
-            // Reap registrations with no active AzDO or broker session and no
-            // successful poll within the liveness timeout.
-            let phantom: std::collections::BTreeSet<i64> = tx
-                .runner_registered_at
-                .iter()
-                .filter(|(runner_id, registered_at)| {
-                    now.duration_since(**registered_at)
-                        .map(|elapsed| elapsed > tx.runner_liveness_timeout)
-                        .unwrap_or(false)
-                        && !tx.sessions.values().any(|s| s.runner_id == **runner_id)
-                        && !tx
-                            .broker_session_runners
-                            .values()
-                            .any(|session_runner_id| *session_runner_id == **runner_id)
-                })
-                .map(|(runner_id, _)| *runner_id)
-                .collect();
-            Ok((stale, phantom))
-        })
-        .await
-        .unwrap_or_default();
+    let (stale_runners, phantom_runners) = (inputs.stale_runners, inputs.phantom_runners);
     for runner_id in stale_runners {
         warn!(
             runner_id,
