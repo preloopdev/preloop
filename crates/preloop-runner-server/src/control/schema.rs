@@ -497,7 +497,7 @@ CREATE TABLE IF NOT EXISTS timeline_records (
     FOREIGN KEY (timeline_key) REFERENCES timelines(timeline_key) ON DELETE CASCADE
 );
 
--- ── Counters, run counters, meta ─────────────────────────────────────
+-- ── Counters and run counters ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
     name                TEXT PRIMARY KEY NOT NULL,
     value               INTEGER NOT NULL DEFAULT 0
@@ -506,9 +506,16 @@ CREATE TABLE IF NOT EXISTS workflow_run_counters (
     key                 TEXT PRIMARY KEY NOT NULL,  -- repo+workflow dedup
     value               INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS meta (
-    key                 TEXT PRIMARY KEY NOT NULL,
-    value               BLOB NOT NULL
+CREATE TABLE IF NOT EXISTS control_key_fingerprint (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint         BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_snapshots (
+    snapshot_id         INTEGER PRIMARY KEY CHECK (snapshot_id = 1),
+    format_version      INTEGER NOT NULL,
+    meta_blob           BLOB NOT NULL,
+    written_at_us       INTEGER NOT NULL,
+    revision            INTEGER NOT NULL DEFAULT 0
 );
 
 "#;
@@ -976,7 +983,7 @@ CREATE TABLE IF NOT EXISTS timeline_records (
     FOREIGN KEY (timeline_key) REFERENCES timelines(timeline_key) ON DELETE CASCADE
 );
 
--- ── Counters, run counters, meta ─────────────────────────────────────
+-- ── Counters and run counters ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS counters (
     name                TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0
@@ -989,9 +996,16 @@ CREATE TABLE IF NOT EXISTS workflow_run_counters (
     key                 TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS meta (
-    key                 TEXT PRIMARY KEY,
-    value               BYTEA NOT NULL
+CREATE TABLE IF NOT EXISTS runtime_snapshots (
+    snapshot_id         BIGINT PRIMARY KEY CHECK (snapshot_id = 1),
+    format_version      BIGINT NOT NULL,
+    meta_blob           BYTEA NOT NULL,
+    written_at_us       BIGINT NOT NULL,
+    revision            BIGINT NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS control_key_fingerprint (
+    id                  BIGINT PRIMARY KEY CHECK (id = 1),
+    fingerprint         BYTEA NOT NULL
 );
 
 "#;

@@ -4329,30 +4329,15 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
-        let value = unblob(&self.cipher, meta)?;
-        let client = self.checkout_writer().await?;
-        let result = client
-            .execute(
-                "INSERT INTO meta(key, value) VALUES ('local_state', $1) \
-                 ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
-                &[&value],
-            )
+        crate::store::Store::store_meta_only(&self.aux, meta)
             .await
-            .map_err(ControlError::backend);
-        self.return_writer(client).await;
-        result.map(|_| ())
+            .map_err(ControlError::backend)
     }
 
     async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
-        let client = self.checkout_reader().await?;
-        let result = client
-            .query_opt("SELECT value FROM meta WHERE key = 'local_state'", &[])
+        crate::store::Store::load_meta_only(&self.aux)
             .await
-            .map_err(ControlError::backend)?
-            .map(|row| blob(&self.cipher, &row.get::<_, Vec<u8>>(0)))
-            .transpose();
-        self.return_reader(client).await;
-        result
+            .map_err(ControlError::backend)
     }
 
     async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
@@ -4360,14 +4345,17 @@ impl ControlBackend for PostgresBackend {
         let result = async {
             client
                 .execute(
-                    "INSERT INTO meta(key, value) VALUES ('key_fingerprint', $1) \
-                     ON CONFLICT(key) DO NOTHING",
+                    "INSERT INTO control_key_fingerprint(id, fingerprint) VALUES (1, $1) \
+                     ON CONFLICT(id) DO NOTHING",
                     &[&fingerprint.as_bytes()],
                 )
                 .await
                 .map_err(ControlError::backend)?;
             let stored: Vec<u8> = client
-                .query_one("SELECT value FROM meta WHERE key = 'key_fingerprint'", &[])
+                .query_one(
+                    "SELECT fingerprint FROM control_key_fingerprint WHERE id = 1",
+                    &[],
+                )
                 .await
                 .map_err(ControlError::backend)?
                 .get(0);

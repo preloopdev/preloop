@@ -50,6 +50,8 @@ pub trait Store: Send + Sync {
     async fn store_inner(&self, snapshot: &StoreSnapshot) -> anyhow::Result<()>;
     /// Persist only the runtime metadata snapshot (hot path).
     async fn store_meta_only(&self, meta: &MetaSnapshot) -> anyhow::Result<()>;
+    /// Restore only the node-local runtime metadata snapshot.
+    async fn load_meta_only(&self) -> anyhow::Result<Option<MetaSnapshot>>;
     /// Persist one attempt's step records.
     ///
     /// Separate from [`Store::store_run_event`] on purpose. Steps change far
@@ -283,6 +285,10 @@ impl Store for InstrumentedStore {
             start,
             self.inner.store_meta_only(meta).await,
         )
+    }
+    async fn load_meta_only(&self) -> anyhow::Result<Option<MetaSnapshot>> {
+        let start = Instant::now();
+        self.record("load_meta_only", start, self.inner.load_meta_only().await)
     }
 
     async fn store_job_steps(
@@ -2592,6 +2598,18 @@ impl SqliteStore {
         self.maybe_checkpoint_wal(&connection)?;
         Ok(())
     }
+    pub(crate) fn load_meta_only(&self) -> anyhow::Result<Option<MetaSnapshot>> {
+        let connection = self.connection.lock().expect("store mutex poisoned");
+        let blob = connection
+            .query_row(
+                "SELECT meta_blob FROM runtime_snapshots WHERE snapshot_id = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        blob.map(|blob| Ok(serde_json::from_slice(&self.cipher.unseal(&blob)?)?))
+            .transpose()
+    }
 
     fn store_run_tx(&self, tx: &Transaction<'_>, run: &RunRecord) -> anyhow::Result<()> {
         let value = run_record_value(run)?;
@@ -3593,6 +3611,12 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || store.store_meta_only(&meta))
             .await
             .map_err(|error| anyhow::anyhow!("store metadata task panicked: {error}"))?
+    }
+    async fn load_meta_only(&self) -> anyhow::Result<Option<MetaSnapshot>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.load_meta_only())
+            .await
+            .map_err(|error| anyhow::anyhow!("load metadata task panicked: {error}"))?
     }
 
     async fn store_job_steps(

@@ -443,6 +443,20 @@ impl PgStore {
         .await?;
         Ok(())
     }
+    pub(crate) async fn load_meta_only(&self) -> anyhow::Result<Option<MetaSnapshot>> {
+        let client = self.connection.lock().await;
+        let Some(row) = client
+            .query_opt(
+                "SELECT meta_blob FROM runtime_snapshots WHERE snapshot_id = 1",
+                &[],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let blob: Vec<u8> = row.get(0);
+        Ok(Some(serde_json::from_slice(&self.cipher.unseal(&blob)?)?))
+    }
 
     /// Upsert one attempt's step rows (see the SQLite twin: keyed upsert, no
     /// per-run delete, so a step transition writes only the changed rows).
@@ -1189,6 +1203,9 @@ impl Store for PgStore {
             .await
             .map_err(|error| anyhow::anyhow!("committing metadata: {error}"))?;
         Ok(())
+    }
+    async fn load_meta_only(&self) -> anyhow::Result<Option<MetaSnapshot>> {
+        PgStore::load_meta_only(self).await
     }
 
     async fn store_workflow_run_counter(

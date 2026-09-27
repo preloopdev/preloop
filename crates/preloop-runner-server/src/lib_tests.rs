@@ -24281,7 +24281,7 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
     let connection = rusqlite::Connection::open(&db).unwrap();
     let blob_len: i64 = connection
         .query_row(
-            "SELECT length(value) FROM meta WHERE key = 'local_state'",
+            "SELECT length(meta_blob) FROM runtime_snapshots WHERE snapshot_id = 1",
             [],
             |row| row.get(0),
         )

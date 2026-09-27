@@ -4047,46 +4047,29 @@ impl ControlBackend for SqliteBackend {
     }
 
     async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
-        let value = unblob(&self.cipher, meta)?;
-        run_blocking(|| {
-            self.conn
-                .lock()
-                .execute(
-                    "INSERT INTO meta(key, value) VALUES ('local_state', ?1) \
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    params![value],
-                )
-                .map_err(ControlError::backend)?;
-            Ok(())
-        })
+        crate::store::Store::store_meta_only(self.auxiliary()?, meta)
+            .await
+            .map_err(ControlError::backend)
     }
 
     async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
-        self.with_reader(|conn| {
-            let value = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key = 'local_state'",
-                    [],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-                .map_err(ControlError::backend)?;
-            value.map(|value| blob(&self.cipher, &value)).transpose()
-        })
+        crate::store::Store::load_meta_only(self.auxiliary()?)
+            .await
+            .map_err(ControlError::backend)
     }
 
     async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
         run_blocking(|| {
             let conn = self.conn.lock();
             conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('key_fingerprint', ?1) \
-                 ON CONFLICT(key) DO NOTHING",
+                "INSERT INTO control_key_fingerprint(id, fingerprint) VALUES (1, ?1) \
+                 ON CONFLICT(id) DO NOTHING",
                 params![fingerprint.as_bytes()],
             )
             .map_err(ControlError::backend)?;
             let stored: Vec<u8> = conn
                 .query_row(
-                    "SELECT value FROM meta WHERE key = 'key_fingerprint'",
+                    "SELECT fingerprint FROM control_key_fingerprint WHERE id = 1",
                     [],
                     |row| row.get(0),
                 )
