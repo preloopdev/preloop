@@ -115,6 +115,10 @@ pub(crate) fn submit_run_tx(
 
     // Workflow-level concurrency gate.
     let mut held = false;
+    // The gate compares the arrival's triggering event against existing
+    // holders' runs, so the arriving run must be visible to it. A rejected
+    // submit aborts the transaction, so this never persists on error.
+    tx.runs.insert(run_id, record.clone());
     if let Some(wf) = &submit.workflow_concurrency {
         let key = concurrency::concurrency_key(&record.submission.repository, &wf.group);
         let holder = concurrency::Holder::Run(run_id);
@@ -128,7 +132,7 @@ pub(crate) fn submit_run_tx(
         ) {
             Ok(true) => {}
             Ok(false) => held = true,
-            Err(e) if e == "concurrency_queue_overflow" => {
+            Err(e) if e == concurrency::ARRIVAL_CANCELLED => {
                 // The run died on arrival: every job is Cancelled and the
                 // expandable nodes' minted request correlation is settled
                 // here, exactly like a cancellation (MC-3). `pending_jobs`

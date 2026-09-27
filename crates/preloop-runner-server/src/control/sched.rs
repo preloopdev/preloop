@@ -593,7 +593,7 @@ pub(crate) fn try_acquire_job_gate(
     match try_acquire_concurrency(tx, key, group, holder, cancel, queue) {
         Ok(true) => JobGateOutcome::Proceed,
         Ok(false) => JobGateOutcome::Parked,
-        Err(e) if e == "concurrency_queue_overflow" => {
+        Err(e) if e == concurrency::ARRIVAL_CANCELLED => {
             JobGateOutcome::Failed(ExecutionStatus::Cancelled)
         }
         Err(_) => JobGateOutcome::Failed(ExecutionStatus::Failure),
@@ -1169,7 +1169,10 @@ pub(crate) fn promote_next_from_group(
     }
 }
 
-/// Try to acquire a concurrency slot for a holder (ported verbatim).
+/// Try to acquire a concurrency slot for a holder.
+///
+/// `Err(ARRIVAL_CANCELLED)` means the arrival is cancelled on arrival: the
+/// queue overflowed, or a newer holder already supersedes it (see below).
 pub(crate) fn try_acquire_concurrency(
     tx: &mut TxState,
     key: (String, String),
@@ -1183,6 +1186,28 @@ pub(crate) fn try_acquire_concurrency(
         .get(&key)
         .and_then(|group| group.running.as_ref())
         .is_some_and(|running| run_stuck_on_external_hosts(tx, &running.run_id()));
+    // A late delivery (GitHub reorders webhooks; retries and watchdog
+    // redeliveries arrive late by design) must not pre-empt a newer holder.
+    // In the modes where an arrival displaces others — cancel-in-progress and
+    // the single pending slot — GitHub would already have cancelled the older
+    // run when the newer one arrived, so cancel the stale arrival instead of
+    // letting arrival order decide.
+    if cancel_in_progress || queue == preloop_gha_parser::ConcurrencyQueue::Single {
+        if let Some(arrival) = holder_event_order(tx, &holder) {
+            let superseded = tx.concurrency_groups.get(&key).is_some_and(|group| {
+                group
+                    .running
+                    .iter()
+                    .chain(group.pending.iter())
+                    .filter(|existing| existing.run_id() != holder.run_id())
+                    .filter_map(|existing| holder_event_order(tx, existing))
+                    .any(|existing| arrival.is_older_than(&existing))
+            });
+            if superseded {
+                return Err(concurrency::ARRIVAL_CANCELLED.to_owned());
+            }
+        }
+    }
     let group =
         tx.concurrency_groups
             .entry(key.clone())
@@ -1248,7 +1273,7 @@ pub(crate) fn try_acquire_concurrency(
     }
 
     if join.cancel_arrival {
-        return Err("concurrency_queue_overflow".to_owned());
+        return Err(concurrency::ARRIVAL_CANCELLED.to_owned());
     }
 
     if join.park_arrival {
@@ -1260,6 +1285,19 @@ pub(crate) fn try_acquire_concurrency(
     }
 
     Ok(true)
+}
+
+/// GitHub's ordering for the event that triggered `holder`'s run.
+fn holder_event_order(
+    tx: &TxState,
+    holder: &concurrency::Holder,
+) -> Option<concurrency::EventOrder> {
+    let submission = &tx.runs.get(&holder.run_id())?.submission;
+    concurrency::event_order(
+        &submission.event,
+        &submission.repository,
+        &submission.payload,
+    )
 }
 
 pub(crate) fn track_holder_key(
@@ -1465,7 +1503,7 @@ pub(crate) fn promote_ready_jobs(tx: &mut TxState) -> SchedulingOutcome {
                                         continue;
                                     }
                                     Err(error) => {
-                                        let status = if error == "concurrency_queue_overflow" {
+                                        let status = if error == concurrency::ARRIVAL_CANCELLED {
                                             ExecutionStatus::Cancelled
                                         } else {
                                             ExecutionStatus::Failure

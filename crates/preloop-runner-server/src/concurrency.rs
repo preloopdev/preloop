@@ -341,6 +341,62 @@ pub fn cancelled_reason() -> Option<String> {
     Some("concurrency_cancelled".to_owned())
 }
 
+/// `try_acquire_concurrency` error: the arriving holder is cancelled on
+/// arrival (queue overflow, or a stale event a newer holder supersedes).
+pub(crate) const ARRIVAL_CANCELLED: &str = "concurrency_arrival_cancelled";
+
+/// GitHub's own ordering for the event that triggered a run.
+///
+/// Webhooks arrive out of order, and retries and watchdog redeliveries land
+/// late by design, so arrival order cannot decide which of two runs is newer.
+/// Two orders are comparable only within the same `scope`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventOrder {
+    scope: String,
+    /// Unix seconds, from GitHub's payload.
+    at: i64,
+}
+
+impl EventOrder {
+    /// Whether `self` is strictly older than `other` for the same subject.
+    /// Same-second ties are not ordered: GitHub's timestamps cannot tell them
+    /// apart, so arrival order stands.
+    pub(crate) fn is_older_than(&self, other: &Self) -> bool {
+        self.scope == other.scope && self.at < other.at
+    }
+}
+
+/// The ordering GitHub recorded for `event`'s payload, when it carries one:
+/// `repository.pushed_at` for pushes (repository-wide), `pull_request.
+/// updated_at` for pull request events (per pull request).
+pub(crate) fn event_order(event: &str, repository: &str, payload: &Value) -> Option<EventOrder> {
+    fn unix_seconds(value: &Value) -> Option<i64> {
+        value.as_i64().or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(value.as_str()?)
+                .ok()
+                .map(|at| at.timestamp())
+        })
+    }
+    match event {
+        "push" => Some(EventOrder {
+            scope: format!("push:{repository}"),
+            at: unix_seconds(payload.get("repository")?.get("pushed_at")?)?,
+        }),
+        "pull_request" | "pull_request_target" => {
+            let pull_request = payload.get("pull_request")?;
+            let number = payload
+                .get("number")
+                .or_else(|| pull_request.get("number"))?
+                .as_u64()?;
+            Some(EventOrder {
+                scope: format!("pull_request:{repository}#{number}"),
+                at: unix_seconds(pull_request.get("updated_at")?)?,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Whether a job status is still awaiting assignment (queued or concurrency-pending).
 pub fn is_awaiting_execution(status: ExecutionStatus) -> bool {
     matches!(status, ExecutionStatus::Queued | ExecutionStatus::Pending)
@@ -883,5 +939,42 @@ mod properties {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod event_order_tests {
+    use super::*;
+
+    fn pull_request(number: u64, updated_at: &str) -> Value {
+        json!({"number": number, "pull_request": {"number": number, "updated_at": updated_at}})
+    }
+
+    #[test]
+    fn pull_request_events_order_by_updated_at_within_one_pull_request() {
+        let order = |event, payload: &Value| event_order(event, "o/r", payload).unwrap();
+        let early = order("pull_request", &pull_request(7, "2026-01-01T00:00:00Z"));
+        let late = order(
+            "pull_request_target",
+            &pull_request(7, "2026-01-01T00:05:00Z"),
+        );
+        assert!(early.is_older_than(&late));
+        assert!(!late.is_older_than(&early));
+
+        // Another pull request is a different subject: never ordered.
+        let other = order("pull_request", &pull_request(8, "2026-01-01T00:05:00Z"));
+        assert!(!early.is_older_than(&other));
+    }
+
+    #[test]
+    fn same_second_is_not_ordered_and_unordered_events_have_no_key() {
+        let push = |at: i64| {
+            event_order("push", "o/r", &json!({"repository": {"pushed_at": at}})).unwrap()
+        };
+        assert!(!push(100).is_older_than(&push(100)));
+        assert!(push(99).is_older_than(&push(100)));
+        // No GitHub ordering data → arrival order stands.
+        assert!(event_order("push", "o/r", &json!({"repository": {}})).is_none());
+        assert!(event_order("workflow_dispatch", "o/r", &json!({})).is_none());
     }
 }

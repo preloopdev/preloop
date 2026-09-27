@@ -1289,21 +1289,34 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 .split_once('/')
                 .map(|(owner, name)| (owner.to_owned(), name.to_owned()))
                 .unwrap_or_else(|| ("local".to_owned(), submission.repository.clone()));
-            payload.insert(
-                "repository".to_owned(),
-                serde_json::json!({
-                    "name": name,
-                    "full_name": submission.repository,
-                    "owner": { "login": owner },
-                    "default_branch": snapshot.default_branch.clone().unwrap_or_else(|| {
-                        submission
-                            .git_ref
-                            .strip_prefix("refs/heads/")
-                            .unwrap_or("main")
-                            .to_owned()
-                    }),
-                }),
-            );
+            // Set the fields actions read, but keep the rest of a real
+            // payload's `repository` (e.g. GitHub's `pushed_at`, which orders
+            // late deliveries for concurrency).
+            let default_branch = snapshot.default_branch.clone().unwrap_or_else(|| {
+                submission
+                    .git_ref
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or("main")
+                    .to_owned()
+            });
+            let repository = payload
+                .entry("repository")
+                .or_insert_with(|| serde_json::json!({}));
+            if !repository.is_object() {
+                *repository = serde_json::json!({});
+            }
+            if let Some(repository) = repository.as_object_mut() {
+                repository.insert("name".to_owned(), serde_json::json!(name));
+                repository.insert(
+                    "full_name".to_owned(),
+                    serde_json::json!(submission.repository),
+                );
+                repository.insert("owner".to_owned(), serde_json::json!({ "login": owner }));
+                repository.insert(
+                    "default_branch".to_owned(),
+                    serde_json::json!(default_branch),
+                );
+            }
             if submission.event == "push" {
                 // `after` is the snapshot commit the runner checks out;
                 // `before` is the base its changes are measured against (the

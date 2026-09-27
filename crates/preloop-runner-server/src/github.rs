@@ -4689,4 +4689,89 @@ mod tests {
         quiet.reports_check_runs = false;
         assert_eq!(check_run_report_coords(&quiet), None);
     }
+
+    /// GitHub does not deliver webhooks in order, and retries/watchdog
+    /// redeliveries land late by design. A push for an OLDER commit processed
+    /// after a newer one must not use `cancel-in-progress` to cancel the newer
+    /// commit's run: the ref's newest head is what the group should keep.
+    #[tokio::test]
+    async fn late_older_push_does_not_cancel_newer_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+        // The fixture commits the workspace: that is the older commit.
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let older = git_output(&ws_dir, &["rev-parse", "HEAD"]);
+        std::fs::write(ws_dir.join("change.txt"), "newer").unwrap();
+        git_output(&ws_dir, &["add", "-A"]);
+        git_output(&ws_dir, &["commit", "-qm", "newer"]);
+        let newer = git_output(&ws_dir, &["rev-parse", "HEAD"]);
+
+        // `repository.pushed_at` is GitHub's record of when each push happened.
+        let push = |before: &str, after: &str, pushed_at: i64| {
+            serde_json::to_vec(&serde_json::json!({
+                "ref": "refs/heads/main",
+                "before": before,
+                "after": after,
+                "repository": {
+                    "full_name": "owner/repo",
+                    "default_branch": "main",
+                    "pushed_at": pushed_at
+                },
+                "commits": [{"id": after, "added": [], "modified": ["change.txt"], "removed": []}],
+            }))
+            .unwrap()
+        };
+
+        // Newer push arrives (and is processed) first…
+        let status = fixture
+            .post_body(
+                "delivery-newer",
+                Some("push"),
+                &push(&older, &newer, 1_700_000_200),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        fixture.drain().await;
+        // …then the older push shows up late.
+        let status = fixture
+            .post_body(
+                "delivery-older",
+                Some("push"),
+                &push(
+                    "0000000000000000000000000000000000000000",
+                    &older,
+                    1_700_000_100,
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        let status_for = |sha: &str| {
+            inner
+                .runs
+                .values()
+                .find(|run| run.submission.sha == sha)
+                .map(|run| run.status)
+        };
+        let newer_status = status_for(&newer).expect("the newer push must have a run");
+        assert_ne!(
+            newer_status,
+            ExecutionStatus::Cancelled,
+            "a late push for an older commit cancelled the newer commit's run"
+        );
+        assert_eq!(
+            status_for(&older),
+            Some(ExecutionStatus::Cancelled),
+            "the stale push is the one superseded, as it would have been in GitHub's order"
+        );
+    }
 }
