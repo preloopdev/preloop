@@ -113,24 +113,19 @@ impl PostgresBackend {
             )
             .await
             .map_err(ControlError::backend)?;
-        // Apply pending migrations (see `schema::POSTGRES_MIGRATIONS`) before
-        // the idempotent DDL. `schema_migrations` doubles as the version
-        // pointer (Postgres has no `PRAGMA user_version`).
-        let max_version: Option<i64> = client
-            .query_opt("SELECT MAX(version) FROM control.schema_migrations", &[])
+
+        let versions: Vec<i64> = client
+            .query("SELECT version FROM control.schema_migrations", &[])
             .await
             .map_err(ControlError::backend)?
-            .and_then(|row| row.get(0));
-        if let Some(version) = max_version {
-            for (migration, sql) in super::schema::POSTGRES_MIGRATIONS {
-                if *migration <= version {
-                    continue;
-                }
-                client
-                    .batch_execute(sql)
-                    .await
-                    .map_err(ControlError::backend)?;
-            }
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if let Some(other) = versions.iter().find(|v| **v != POSTGRES_SCHEMA_VERSION) {
+            return Err(ControlError::backend(anyhow::anyhow!(
+                "control schema has version {other}; this build supports only \
+                 {POSTGRES_SCHEMA_VERSION}. Recreate the database."
+            )));
         }
         client
             .batch_execute(POSTGRES_DDL)
@@ -144,29 +139,6 @@ impl PostgresBackend {
             )
             .await
             .map_err(ControlError::backend)?;
-        let missing_pool_keys = client
-            .query(
-                "SELECT run_id, job_id, runs_on, runner_group FROM jobs WHERE pool_key=''",
-                &[],
-            )
-            .await
-            .map_err(ControlError::backend)?;
-        for row in missing_pool_keys {
-            let run_id: String = row.get(0);
-            let job_id: String = row.get(1);
-            let labels_json: String = row.get(2);
-            let group: Option<String> = row.get(3);
-            let labels: Vec<String> =
-                serde_json::from_str(&labels_json).map_err(ControlError::backend)?;
-            let key = compute_pool_key(&labels, group.as_deref());
-            client
-                .execute(
-                    "UPDATE jobs SET pool_key=$1 WHERE run_id=$2 AND job_id=$3",
-                    &[&key, &run_id, &job_id],
-                )
-                .await
-                .map_err(ControlError::backend)?;
-        }
         // A pool of writer connections replacing the single Mutex<Client>.
         let (writers_tx, writers_rx) = tokio::sync::mpsc::channel(4);
         writers_tx

@@ -111,84 +111,27 @@ impl SqliteBackend {
                 .map_err(ControlError::backend)?;
         }
         let conn = Connection::open(path).map_err(ControlError::backend)?;
-        // Apply pending migrations (see `schema::SQLITE_MIGRATIONS`) before
-        // the idempotent DDL. Foreign-key enforcement is disabled for the
-        // whole pass: table rebuilds need it, and FK-off is correct for any
-        // schema rewrite. Each migration and its version stamp commit
-        // atomically so a failed rebuild can be retried without inheriting a
-        // half-replaced table. Foreign keys are re-enabled after the pass (a
-        // no-op inside a transaction, hence set before the batches).
+        // Greenfield schema: a fresh database (version 0) gets the DDL; a
+        // database stamped with any other version predates it and is
+        // refused rather than half-read.
         let existing_version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(ControlError::backend)?;
-        if (1..SQLITE_SCHEMA_VERSION).contains(&existing_version) {
-            conn.pragma_update(None, "foreign_keys", false)
-                .map_err(ControlError::backend)?;
-            for (version, sql) in super::schema::SQLITE_MIGRATIONS {
-                if *version <= existing_version {
-                    continue;
-                }
-                let transaction = conn
-                    .unchecked_transaction()
-                    .map_err(ControlError::backend)?;
-                transaction
-                    .execute_batch(sql)
-                    .map_err(ControlError::backend)?;
-                transaction
-                    .pragma_update(None, "user_version", *version)
-                    .map_err(ControlError::backend)?;
-                transaction.commit().map_err(ControlError::backend)?;
-            }
-            conn.pragma_update(None, "foreign_keys", true)
-                .map_err(ControlError::backend)?;
+        if existing_version != 0 && existing_version != SQLITE_SCHEMA_VERSION {
+            return Err(ControlError::backend(anyhow::anyhow!(
+                "control database {} has schema version {existing_version}; this build \
+                 supports only {SQLITE_SCHEMA_VERSION}. Recreate the database.",
+                path.display()
+            )));
         }
         conn.execute_batch(SQLITE_DDL)
             .map_err(ControlError::backend)?;
         conn.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)
             .map_err(ControlError::backend)?;
         // Foreign keys default OFF per connection; enable so the schema's
-        // ON DELETE CASCADE clauses (broker_messages→sessions, holder_keys→runs,
-        // jobset_admissions→runs) actually fire under targeted deletes.
+        // ON DELETE CASCADE clauses fire under targeted deletes.
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(ControlError::backend)?;
-
-        // v11 created a queryable pool key. Backfill legacy rows from their
-        // actual labels; a default empty key would make migrated jobs
-        // invisible to indexed claimers after restart.
-        let missing_pool_keys = {
-            let mut stmt = conn
-                .prepare("SELECT run_id, job_id, runs_on, runner_group FROM jobs WHERE pool_key=''")
-                .map_err(ControlError::backend)?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
-                    ))
-                })
-                .map_err(ControlError::backend)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ControlError::backend)?;
-            rows
-        };
-        if !missing_pool_keys.is_empty() {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(ControlError::backend)?;
-            for (run_id, job_id, labels_json, group) in missing_pool_keys {
-                let labels: Vec<String> =
-                    serde_json::from_str(&labels_json).map_err(ControlError::backend)?;
-                let key = compute_pool_key(&labels, group.as_deref());
-                tx.execute(
-                    "UPDATE jobs SET pool_key=?1 WHERE run_id=?2 AND job_id=?3",
-                    params![key, run_id, job_id],
-                )
-                .map_err(ControlError::backend)?;
-            }
-            tx.commit().map_err(ControlError::backend)?;
-        }
         // A small pool of read-only connections. WAL lets readers run
         // concurrently with the single writer; `query_only` makes a write
         // through a reader a hard error rather than silent corruption.

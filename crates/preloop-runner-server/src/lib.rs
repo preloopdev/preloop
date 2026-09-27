@@ -37,6 +37,8 @@ pub mod execution_protection_api;
 use execution_protection_api::*;
 pub mod reusable_workflows;
 pub mod secret_provider;
+#[cfg(test)]
+mod test_pg;
 use reusable_workflows::*;
 pub mod remote_workflows;
 pub mod runs;

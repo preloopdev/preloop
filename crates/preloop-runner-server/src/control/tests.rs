@@ -1071,236 +1071,42 @@ mod sqlite {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Pre-v15/v16 table shapes. Historical migrations (v8, v11) rebuild the
-    /// blob-shaped `job_steps` and copy `jobs.payload_blob`, so an old
-    /// database built from the current DDL must swap these back in before
-    /// stamping an old `user_version`.
-    const PRE_V15_JOB_STEPS: &str = "DROP TABLE job_steps;
-         CREATE TABLE job_steps (
-             agent_job_id TEXT PRIMARY KEY,
-             steps_blob   BLOB NOT NULL,
-             revision     INTEGER NOT NULL DEFAULT 0
-         );
-         ALTER TABLE jobs ADD COLUMN payload_blob BLOB;
-         ALTER TABLE runs ADD COLUMN record_blob BLOB;";
-
-    /// v5 → v6 migration: a database created with `jobs.claim_generation`
-    /// must open cleanly — the dead column is dropped and existing job rows
-    /// survive. Builds a v5-shaped `jobs` table by applying the current DDL
-    /// then re-adding the column, pins `user_version=5`, and lets
-    /// `SqliteBackend::open` run the real migration.
-    #[tokio::test]
-    async fn v5_jobs_migrate_to_v6() {
-        let dir = std::env::temp_dir().join(format!("preloop-control-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("control.db");
-
-        // Build a v5 database: current schema + the dropped column, version 5.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(crate::control::schema::SQLITE_DDL)
-                .unwrap();
-            conn.execute_batch(PRE_V15_JOB_STEPS).unwrap();
-            conn.execute_batch(
-                "ALTER TABLE jobs ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0; \
-                 PRAGMA user_version = 5;",
-            )
-            .unwrap();
-            // A real job row that must survive the column drop.
-            conn.execute(
-                "INSERT INTO runs (run_id, status, run_number, record_blob, created_at_us) \
-                 VALUES ('r1', 'queued', 1, X'02', 0)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO jobs (run_id, job_id, status, queue_kind, claim_generation) \
-                 VALUES ('r1', 'build', 'queued', 'ready', 7)",
-                [],
-            )
-            .unwrap();
-        }
-
-        let backend = SqliteBackend::open(
-            &path,
-            super::test_cipher(),
-            false,
-            false,
-            std::time::Duration::from_secs(300),
-        )
-        .unwrap();
-
-        // The column is gone: a SELECT of it must fail, and the row survives.
-        let dump = backend.dump_tables();
-        let jobs = dump.get("jobs").expect("jobs table present");
-        assert_eq!(jobs.len(), 1, "the seeded job row must survive migration");
-        assert!(
-            !jobs[0].contains("claim_generation"),
-            "claim_generation must be dropped, got: {}",
-            jobs[0]
-        );
-        assert!(jobs[0].contains("job_id=Text(\"build\")"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// v7 → v8 migration: SQLite's historical `TEXT PRIMARY KEY` columns
-    /// accepted NULL despite being identities. Existing rows must survive the
-    /// table rebuilds, and the migrated schema must reject NULL keys.
+    /// Greenfield schema: a database stamped with any other version is
+    /// refused at open instead of being read with the wrong table shapes.
     #[test]
-    fn v7_text_primary_keys_migrate_to_not_null() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("control.db");
-        {
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            let v7_ddl = crate::control::schema::SQLITE_DDL
-                .replace("TEXT PRIMARY KEY NOT NULL", "TEXT PRIMARY KEY");
-            connection.execute_batch(&v7_ddl).unwrap();
-            connection.execute_batch(PRE_V15_JOB_STEPS).unwrap();
-            connection
-                .execute_batch(
-                    "PRAGMA user_version = 7;
-                     INSERT INTO runs
-                         (run_id, status, run_number, record_blob, created_at_us)
-                     VALUES ('run-1', 'queued', 1, X'01', 10);
-                     INSERT INTO job_steps (agent_job_id, steps_blob, revision)
-                     VALUES ('agent-1', X'02', 2);
-                     INSERT INTO runner_sessions
-                         (session_id, protocol, verified, created_at_us)
-                     VALUES ('session-1', 'broker', 1, 20);
-                     INSERT INTO run_concurrency (run_id, concurrency_blob)
-                     VALUES ('run-1', X'03');
-                     INSERT INTO counters (name, value) VALUES ('request', 4);
-                     INSERT INTO workflow_run_counters (key, value)
-                     VALUES ('repo/workflow', 5);
-                     INSERT INTO meta (key, value) VALUES ('namespace', X'06');",
-                )
-                .unwrap();
-        }
-
-        let backend = SqliteBackend::open(
+    fn opening_an_older_schema_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 17_i64)
+            .unwrap();
+        let error = SqliteBackend::open(
             &path,
             super::test_cipher(),
             false,
             false,
             std::time::Duration::from_secs(300),
         )
-        .unwrap();
-        drop(backend);
+        .err()
+        .expect("an older schema version must be refused");
+        assert!(error.to_string().contains("schema version 17"), "{error}");
 
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        let version: i64 = connection
+        // A fresh file opens and is stamped with the current version.
+        let fresh = dir.path().join("fresh.db");
+        SqliteBackend::open(
+            &fresh,
+            super::test_cipher(),
+            false,
+            false,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        let version: i64 = rusqlite::Connection::open(&fresh)
+            .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, crate::control::schema::SQLITE_SCHEMA_VERSION);
-
-        for (table, column) in [
-            ("runs", "run_id"),
-            ("job_steps", "agent_job_id"),
-            ("runner_sessions", "session_id"),
-            ("run_concurrency", "run_id"),
-            ("counters", "name"),
-            ("workflow_run_counters", "key"),
-            ("meta", "key"),
-        ] {
-            let not_null: i64 = connection
-                .query_row(
-                    "SELECT \"notnull\" FROM pragma_table_info(?1) WHERE name = ?2",
-                    rusqlite::params![table, column],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(not_null, 1, "{table}.{column} must be NOT NULL");
-
-            if table == "counters" {
-                let original: i64 = connection
-                    .query_row(
-                        "SELECT value FROM counters WHERE name='request'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(original, 4, "original counter must survive migration");
-            } else if table == "job_steps" {
-                // v15 replaces blob manifests with step rows and does not
-                // carry legacy blobs forward (no backward compatibility).
-                let count: i64 = connection
-                    .query_row("SELECT count(*) FROM job_steps", [], |row| row.get(0))
-                    .unwrap();
-                assert_eq!(count, 0, "legacy step blobs are dropped at v15");
-            } else {
-                let count: i64 = connection
-                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
-                assert_eq!(count, 1, "{table} row must survive migration");
-            }
-        }
-
-        let error = connection
-            .execute("INSERT INTO counters (name, value) VALUES (NULL, 0)", [])
-            .expect_err("NULL primary key must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("NOT NULL constraint failed: counters.name"),
-            "unexpected NULL-key error: {error}"
-        );
-    }
-
-    #[test]
-    fn v11_ready_jobs_keep_identity_order_and_labels_after_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("control.db");
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(crate::control::schema::SQLITE_DDL)
-                .unwrap();
-            conn.execute_batch(PRE_V15_JOB_STEPS).unwrap();
-            conn.execute_batch(
-                "DROP INDEX runs_archive_pending;
-                 ALTER TABLE runs DROP COLUMN archived_at_us;
-                 PRAGMA user_version=11;
-                 INSERT INTO runs(run_id,namespace,status,run_number,record_blob,created_at_us)
-                   VALUES ('run-1','tenant-a','queued',3,X'02',42);
-                 INSERT INTO jobs(run_id,job_id,status,queue_kind,queue_position,seq,runs_on)
-                   VALUES ('run-1','build','queued','ready',900,700,
-                           '[\"self-hosted\",\"linux\"]');",
-            )
-            .unwrap();
-        }
-        let backend = SqliteBackend::open(
-            &path,
-            super::test_cipher(),
-            false,
-            false,
-            std::time::Duration::from_secs(300),
-        )
-        .unwrap();
-        drop(backend);
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let (namespace, run_order, job_order, pool_key): (String, i64, i64, String) = conn
-            .query_row(
-                "SELECT namespace_id,run_order,job_order,pool_key FROM jobs WHERE job_id='build'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(namespace, "tenant-a");
-        assert_eq!((run_order, job_order), (42, 900));
-        assert_eq!(
-            pool_key,
-            crate::control::types::compute_pool_key(&["self-hosted".into(), "linux".into()], None)
-        );
-        let next: i64 = conn
-            .query_row(
-                "SELECT value FROM counters WHERE name='next_queue_position'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(next, 901);
     }
 
     #[tokio::test]
@@ -2494,66 +2300,24 @@ mod postgres {
             .port()
     }
 
-    /// Isolation guard for one test's database: a disposable local cluster,
-    /// or a fresh database created on the shared server named by
-    /// `PRELOOP_TEST_POSTGRES_URL` (the smolvm Postgres locally, a service
-    /// container in CI) and dropped when the guard goes out of scope.
+    /// Isolation guard for one test's database: a fresh database on the
+    /// shared server (`PRELOOP_TEST_POSTGRES_URL`), or a disposable local
+    /// cluster when no server is configured.
     enum PgGuard {
+        Database(#[allow(dead_code)] crate::test_pg::TestDatabase),
         Cluster(#[allow(dead_code)] DisposablePg),
-        Database { admin_url: String, name: String },
-    }
-
-    impl Drop for PgGuard {
-        fn drop(&mut self) {
-            let Self::Database { admin_url, name } = self else {
-                return;
-            };
-            // `Drop` is sync and may run inside a tokio runtime: drop the
-            // database from a plain thread with its own runtime.
-            let (admin_url, name) = (admin_url.clone(), name.clone());
-            let _ = std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        if let Ok((client, conn)) =
-                            tokio_postgres::connect(&admin_url, tokio_postgres::NoTls).await
-                        {
-                            tokio::spawn(conn);
-                            let _ = client
-                                .batch_execute(&format!(
-                                    "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-                                ))
-                                .await;
-                        }
-                    })
-            })
-            .join();
-        }
     }
 
     /// A URL to a database nobody else uses, plus its cleanup guard.
     async fn fresh_database() -> (PgGuard, String) {
-        let Ok(admin_url) = std::env::var("PRELOOP_TEST_POSTGRES_URL") else {
-            let pg = DisposablePg::start();
-            let url = pg.url();
-            return (PgGuard::Cluster(pg), url);
-        };
-        let name = format!("preloop_t_{}", uuid::Uuid::new_v4().simple());
-        let (client, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
-            .await
-            .expect("PRELOOP_TEST_POSTGRES_URL set but connection failed");
-        tokio::spawn(conn);
-        client
-            .batch_execute(&format!("CREATE DATABASE {name}"))
-            .await
-            .expect("create per-test database");
-        let url = match admin_url.rsplit_once('/') {
-            Some((server, _)) => format!("{server}/{name}"),
-            None => panic!("PRELOOP_TEST_POSTGRES_URL must name a database"),
-        };
-        (PgGuard::Database { admin_url, name }, url)
+        match crate::test_pg::fresh_database().await {
+            Some((db, url)) => (PgGuard::Database(db), url),
+            None => {
+                let pg = DisposablePg::start();
+                let url = pg.url();
+                (PgGuard::Cluster(pg), url)
+            }
+        }
     }
 
     async fn connect(url: &str) -> PostgresBackend {
@@ -2589,6 +2353,33 @@ mod postgres {
     async fn submit_poll_complete_lifecycle() {
         let (_pg, backend) = backend().await;
         suite::submit_poll_complete_lifecycle(&backend).await;
+    }
+
+    /// Greenfield schema: a database recording another schema version is
+    /// refused at connect.
+    #[tokio::test]
+    async fn connecting_to_an_older_schema_version_is_refused() {
+        let (_pg, url) = fresh_database().await;
+        drop(connect(&url).await);
+        let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        client
+            .batch_execute("INSERT INTO control.schema_migrations (version) VALUES (16)")
+            .await
+            .unwrap();
+        let error = PostgresBackend::connect(
+            &url,
+            super::test_cipher(),
+            false,
+            false,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .err()
+        .expect("an older schema version must be refused");
+        assert!(error.to_string().contains("version 16"), "{error}");
     }
 
     #[tokio::test]

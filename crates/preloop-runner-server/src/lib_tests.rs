@@ -363,81 +363,19 @@ async fn sqlite_recovery_restores_post_restart_state() {
     .await;
 }
 
-/// Postgres twin of `sqlite_recovery_restores_post_restart_state`: proves
-/// the translated SQL (dialect, upserts, sealed blobs) round-trips the same
-/// state a restart must restore. Skipped unless `PRELOOP_TEST_PG_URL` points at
-/// a disposable Postgres (the repo gate does not assume one is running).
-/// TLS URLs (`?sslmode=require|verify-full`) additionally need
-/// `PRELOOP_TEST_PG_CA` set to a PEM trust anchor for the test database.
+/// Postgres twin of `sqlite_recovery_restores_post_restart_state`: the same
+/// state a restart must restore. Runs on its own database when
+/// `PRELOOP_TEST_POSTGRES_URL` names a Postgres server; skipped otherwise.
 #[tokio::test]
 async fn postgres_recovery_restores_post_restart_state() {
-    let pg_url = match std::env::var("PRELOOP_TEST_PG_URL") {
-        Ok(url) if !url.trim().is_empty() => url,
-        _ => {
-            eprintln!(
-                "skipping postgres_recovery_restores_post_restart_state: \
-                 set PRELOOP_TEST_PG_URL to a disposable Postgres URL"
-            );
-            return;
-        }
+    let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
+        return;
     };
     let temp = tempfile::tempdir().unwrap();
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
     let config_path = crate::config::config_path();
-
-    // For TLS URLs, trust the operator-supplied CA (PEM) — the store's
-    // connector loads it via SSL_CERT_FILE. Nothing else in the crate reads
-    // this variable, so setting it process-wide cannot affect other tests.
-    if let Ok(ca) = std::env::var("PRELOOP_TEST_PG_CA") {
-        if !ca.is_empty() {
-            std::env::set_var("SSL_CERT_FILE", ca);
-        }
-    }
-
-    // The URL may point at a reused database; clear the store tables so the
-    // round-trip starts from a known state (migrations stay behind).
-    let connect_url = crate::store_pg::connect_url(&pg_url);
-    let client = match crate::store_pg::tls_connector(&pg_url).unwrap() {
-        Some(tls) => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tls).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        }
-        None => {
-            let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
-                .await
-                .unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-        }
-    };
-    // A brand-new database has no tables yet (the store's migration creates
-    // them on first open); only clean a schema that already exists.
-    let has_schema: bool = client
-        .query_one(
-            "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    if has_schema {
-        client
-            .batch_execute(
-                "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
-                         runner_sessions, jobs, job_dependencies, job_requests, control_events,
-                         session_active_requests, broker_messages, job_request_messages,
-                         log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
-            )
-            .await
-            .unwrap();
-    }
-    drop(client);
 
     let (run_id_str, runner_id, session_id, public_xml, first_number) = {
         let state = AppState::new_with_store(
@@ -569,7 +507,11 @@ async fn postgres_recovery_restores_post_restart_state() {
         // Runner + sealed session survive (authoritative); RSA key + sealed
         // session key + log bytes are node-local.
         assert!(tx.runners.contains_key(&runner_id));
-        assert!(tx.sessions.contains_key(&session_id));
+        assert_eq!(
+            tx.broker_session_runners.get(&session_id),
+            Some(&runner_id),
+            "the session must survive restart bound to its runner"
+        );
         let tx = recovered.test_tx().await;
         assert_eq!(
             tx.runner_rsa_public_keys
@@ -24358,31 +24300,10 @@ async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
 /// the loser fail with a `pg_type_typname_nsp_index` unique violation.
 #[tokio::test]
 async fn postgres_concurrent_open_serializes_migrations() {
-    let Ok(base) = std::env::var("PRELOOP_TEST_PG_URL") else {
-        eprintln!("skipping: set PRELOOP_TEST_PG_URL to a disposable Postgres URL");
+    let Some((_db, fresh)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
         return;
     };
-    if base.trim().is_empty() {
-        return;
-    }
-    let dbname = format!("preloop_race_{}", uuid::Uuid::new_v4().simple());
-    {
-        let connect_url = crate::store_pg::connect_url(&base);
-        let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .execute(&format!("CREATE DATABASE {dbname}"), &[])
-            .await
-            .unwrap();
-    }
-    let fresh = base
-        .rsplit_once('/')
-        .map(|(host, _)| format!("{host}/{dbname}"))
-        .unwrap();
 
     let key = b"concurrent-open-root-key";
     let dir = std::path::Path::new("/tmp");
@@ -24398,46 +24319,12 @@ async fn postgres_concurrent_open_serializes_migrations() {
 /// lived in the shared serialization path, so both backends have to prove it.
 #[tokio::test]
 async fn postgres_recovery_preserves_run_secrets() {
-    let Ok(pg_url) = std::env::var("PRELOOP_TEST_PG_URL") else {
-        eprintln!("skipping: set PRELOOP_TEST_PG_URL to a disposable Postgres URL");
+    let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
         return;
     };
-    if pg_url.trim().is_empty() {
-        return;
-    }
     let temp = tempfile::tempdir().unwrap();
     let config_path = crate::config::config_path();
-    // Start from a known state: the shared test database may hold rows left by
-    // earlier Postgres tests (they restore into the queue on load). A
-    // brand-new database has no tables yet; only clean a schema that exists.
-    {
-        let connect_url = crate::store_pg::connect_url(&pg_url);
-        let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let has_schema: bool = client
-            .query_one(
-                "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        if has_schema {
-            client
-                .batch_execute(
-                    "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
-                             runner_sessions, jobs, job_dependencies, job_requests, control_events,
-                             session_active_requests, broker_messages, job_request_messages,
-                             log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
-                )
-                .await
-                .unwrap();
-        }
-    }
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
     let run_id = {
@@ -24832,45 +24719,12 @@ fn server_config_debug_redacts_store_url_password() {
 /// proven against a live database too.
 #[tokio::test]
 async fn postgres_recovery_preserves_claim_state_across_run_events() {
-    let Ok(pg_url) = std::env::var("PRELOOP_TEST_PG_URL") else {
-        eprintln!("skipping: set PRELOOP_TEST_PG_URL to a disposable Postgres URL");
+    let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
         return;
     };
-    if pg_url.trim().is_empty() {
-        return;
-    }
     let temp = tempfile::tempdir().unwrap();
     let config_path = crate::config::config_path();
-    // Isolate from earlier Postgres tests sharing this database: their rows
-    // restore into the queue on load. Only clean a schema that already exists.
-    {
-        let connect_url = crate::store_pg::connect_url(&pg_url);
-        let (client, connection) = tokio_postgres::connect(&connect_url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let has_schema: bool = client
-            .query_one(
-                "SELECT to_regclass('public.workflow_run_counters') IS NOT NULL",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        if has_schema {
-            client
-                .batch_execute(
-                    "TRUNCATE workflow_run_counters, runs, runners, runner_labels,
-                             runner_sessions, jobs, job_dependencies, job_requests, control_events,
-                             session_active_requests, broker_messages, job_request_messages,
-                             log_files, log_chunks, runtime_snapshots RESTART IDENTITY CASCADE",
-                )
-                .await
-                .unwrap();
-        }
-    }
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let (claimed_job, other_job, request_id) = {
