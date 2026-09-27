@@ -87,10 +87,10 @@ Every step is idempotent (`preloop push <run_id>` replays freely):
 
 `contrib/pre-push` (or let `preloop run` install it) is a **soft, advisory
 gate**: on `git push` of the checked-out branch's current commit it holds the
-push open while CI runs and aborts the push when CI fails. Other refs
-(non-`HEAD` branches, tags, deletions) pass with a warning — the tree CI
-would test is not the tree being pushed. The hook never pushes anything
-itself.
+push open while CI runs and aborts the push when CI fails. Tags and
+deletions pass silently; pushes of a non-`HEAD` branch pass with a warning —
+the tree CI would test is not the tree being pushed. The hook never pushes
+anything itself.
 
 - `[skip ci]` in any pushed commit bypasses the gate (all-zero remote SHAs on
   new branches are handled so the check works there too).

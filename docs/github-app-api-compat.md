@@ -1,8 +1,8 @@
 # GitHub App API Compatibility — Implementation Plan
 
-Status: Implemented (M1–M4 per Implementation Log; M5 pending)
+Status: Implemented (M1–M5); see §11.
 Author: design session — see §11 for the implementation record
-Branch: `Bnjoroge/gh-app-api-compat`
+Branch: `Bnjoroge/gh-app-api-compat` (historical, merged)
 
 ## 1. Problem Statement
 
@@ -50,7 +50,7 @@ extends that to the *dispatch* contract.
 - Changing the runner protocol, OIDC, or the broker path
 - The pullfrog fork itself (external work that consumes this API)
 
-## 3. Current State (verified)
+## 3. Pre-implementation state (historical)
 
 | Area | Where | State |
 |---|---|---|
@@ -401,14 +401,15 @@ Milestone status and open-question decisions, updated as the work lands.
 - `src/routes.rs` / `src/auth.rs`: dispatch routes registered in the protected
   router; `/repos/...` denied on the runner control-socket surface.
 - 30 router/auth/fidelity tests in `src/dispatch_tests.rs`; full server crate
-  suite green (533 tests).
+  suite green (533 tests) — counts as of the M2 date.
 
 **Open-question decisions:**
 - Q1 (actor/tier override): no new plumbing — `WorkflowSubmission.actor` and
   `.trust_tier` already exist; the handler sets them from the identity.
 - Q2 (numeric workflow ids): preloop tracks neither github.com workflow ids
   nor numeric run ids. `workflow_id` is filename-only (documented); the read
-  endpoints expose a deterministic `DefaultHasher` id for shape compat.
+  endpoints expose a SHA-256-derived stable id (`stable_id`, `dispatch.rs`) for
+  shape compat.
 - Q3 (ledger migration): nothing to migrate — the ledger is in-memory and
   populated at mint time going forward; tokens minted before the feature
   expire under GitHub's 1-hour lifetime.

@@ -16,7 +16,7 @@ preloop is a local, self-hosted equivalent of GitHub Actions. The engine (`prelo
 
 It speaks the official `actions/runner` protocol, so you can use the official runner to register, poll, execute, and report against it without GitHub-hosted minutes. You can also use our Rust-equivalent runner — 36× smaller install, 19× lower peak memory (see benchmarks below).
 
-Preloop doesnt rely only on Github Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the Gtihub API. You can run your committed changes and run workflows locally and pass a `-push` or `create-pr` that would create a draft PR with the checks correctly updated. This can be useful if/when Github's webhook service is down.
+Preloop doesnt rely only on Github Webhooks to update the status of the CI. We run a Webhook watchdog that detects drift, and reconciles your commits with received webhooks against the Gtihub API. You can run your committed changes and run workflows locally and pass `--push` or `--create-pr` to open a PR with the checks correctly updated (new PRs open as drafts by default, see `--pr-draft`). This can be useful if/when Github's webhook service is down.
 
 ## Quick start
 
@@ -32,7 +32,7 @@ preloop serve            # engine on 127.0.0.1:9090
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
-This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI (image)[https://github.com/preloopdev/runner-image-blobs] and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so atleast 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
+This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so atleast 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
 
 
 On Apple Silicon, x86_64 goldens also run through Rosetta 2 translation (enabled automatically for every VM). Performance is slightly slower than arm64 native, so prefer arm64 goldens on Apple Silicon when you can. Docker actions are not supported yet on this path: amd64 images inside the VM's Docker lack the Rosetta mount, so they fail with a cryptic `rosetta-wrapper` error. Fixing soon.
@@ -58,6 +58,17 @@ preloop-runner configure --url https://github.com/owner/repo --token <registrati
 preloop-runner run
 ```
 
+Every release also publishes standalone binaries for Linux (x86_64/aarch64),
+macOS (x86_64/arm64), and Windows (x86_64), each with a CycloneDX SBOM
+(`preloop-runner_<triple>.cdx.json`) and a sha256 checksum:
+
+```sh
+curl -fsSLO https://github.com/preloopdev/preloop/releases/latest/download/preloop-runner-<triple>
+chmod +x preloop-runner-<triple>
+./preloop-runner-<triple> configure --url https://github.com/owner/repo --token <registration-token>
+./preloop-runner-<triple> run
+```
+
 Or use the container image with a persistent volume:
 
 ```sh
@@ -69,7 +80,7 @@ docker run --rm -v preloop-runner-data:/runner \
   --runner-root /runner run
 ```
 
-Details: [docs/setup.md](docs/setup.md#just-the-runner).
+Details: [docs/setup.md](docs/setup.md#just-the-runner-standalone-github-actions-runner).
 
 ## What makes it different vs others.
 
@@ -106,7 +117,7 @@ server, same job, measured on the same machine (M1 Pro, macOS, median of 3):
 
 | Metric | actions/runner 2.336.0 | preloop-runner | |
 |---|---|---|---|
-| Install footprint | 434 MB · 9,301 files | 11.9 MB · 1 binary | 36× |
+| Install footprint | 434 MB · 9,301 files | 11.9 MB · 4 files | 36× |
 | Runner code only | 85 MB | 11.9 MB | 7× |
 | Cold start | 97 ms | 29 ms | 3.3× |
 | Time to listening | 456 ms | 32 ms | 14× |
@@ -125,30 +136,6 @@ Reproduce: `scripts/bench-runner-compare.sh` (set `BENCH_RUNS=N`; needs
 `target/release/preloop-runner` and the official runner in
 `~/.cache/actions-runner/current`). Interactive chart:
 `benchmarks/runner-compare.html`.
-
-## Just the runner
-
-If you only want `preloop-runner` — the drop-in Rust replacement for
-`actions/runner` — every release publishes standalone binaries for Linux
-(x86_64/aarch64), macOS (x86_64/arm64), and Windows (x86_64):
-
-```sh
-curl -fsSLO https://github.com/preloopdev/preloop/releases/latest/download/preloop-runner-<triple>
-chmod +x preloop-runner-<triple>
-./preloop-runner-<triple> configure --url https://github.com/owner/repo --token <registration-token>
-./preloop-runner-<triple> run
-```
-
-Or the container image:
-
-```sh
-docker run ghcr.io/preloopdev/preloop-runner:latest \
-  configure --url https://github.com/owner/repo --token <registration-token>
-```
-
-Each binary ships with a CycloneDX SBOM (`preloop-runner-<triple>.cdx.json`)
-and a sha256 checksum.
-
 
 ## Documentation on where to go to find info.
 

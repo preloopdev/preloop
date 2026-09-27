@@ -94,7 +94,7 @@ it only if you want the feature (the setup notes say exactly this).
 | Situation                          | What happens                                                                                                                                                                                         |
 | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Local engine, same machine**     | Workspace path is shared; snapshot is instant; push runs from your checkout                                                                                                                          |
-| **Remote server** (`PRELOOP_URL`)     | Same commands; the server runs against its own configured workspace (the local-workspace header is loopback-only so the server never reads your disk), and the push still happens from your checkout |
+| **Remote server** (`PRELOOP_URL`)     | Same commands; the CLI only sends the local-workspace header to loopback servers, so a remote server runs against its own configured workspace, and the push still happens from your checkout |
 | **Branch not on GitHub yet**       | The push creates it at the tested commit; the PR is created against the repo's default branch                                                                                                        |
 | **PR already open for the branch** | The push updates the branch; the PR follows; checks report on the new head                                                                                                                           |
 | **GitHub down at completion**      | Run already finished (results local). Push-back retries 1m → 5m → 15m, then tells you: `preloop push <run_id>` later                                                                                 |
@@ -138,4 +138,4 @@ gh pr list --head <branch>                   # draft PR open
 The no-webhook guarantee: a plain `preloop run` completes with **zero**
 GitHub API calls and nothing pushed — verify by watching the server logs
 and `git ls-remote`. Design details and the reconciliation backstop are in
-`docs/submit-driven-ci.md`.
+`docs/ci-gate-auto-pr.md`.

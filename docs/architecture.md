@@ -9,28 +9,42 @@ DTOs, `SecretString`, NDJSON events, and session crypto.
 construction, matrix expansion, and expression evaluation.
 - `preloop-gha-expressions` owns expression parsing and evaluation (the core
 `${{ }}` engine).
-- `preloop-server` owns HTTP routes, queueing, cancellation, reruns, and
+- `preloop-runner-server` owns HTTP routes, queueing, cancellation, reruns, and
 runner sessions. Exposes two protocol surfaces:
   - `_apis/...` — the AzDO protocol the official runner speaks (source of truth)
   - `/api/v1/...` — native REST + NDJSON for agents and tools (read projection)
-- `preloop-runner-client` is the local submission/inspection CLI.
+- `preloop-cli` is the shipping CLI (submit, status, webhooks, debug);
+`preloop-runner-client` is the lighter submission/inspection client.
 - `preloop-cache` and `preloop-artifacts` own file-backed protocol storage.
+- `preloop-dap` owns the Debug Adapter Protocol bridge (DAP server, session
+state machine, debugger attachment for paused jobs).
 - `preloop-conformance` owns comparisons against the pinned
 `ChristopherHX/runner.server` reference.
 - `preloop-runner` is the Rust reimplementation of the GitHub Actions runner
 (Listener + Worker). Single binary with `configure`/`run`/`worker` subcommands;
 the listener spawns a worker child process per job via stdin NDJSON IPC.
-See `docs/runner/00-architecture.md` for the full module map.
+- `preloop-vm` defines the `VmProvider` trait (crates/preloop-vm/src/lib.rs:349)
+abstracting runner-host substrates — SmolVM (libkrun, the default) and AgentENV
+(Firecracker).
+- `preloop-orchestrator` owns job scheduling and VM lifecycle orchestration on
+top of `preloop-vm`.
+- `preloop-observability` owns metrics, logs, traces, and status snapshots.
+- `preloop-socket-activation` owns systemd-style socket activation support.
+- `runner-watch` tracks upstream `actions/runner` releases, diffs source, emits
+TOML specs, and replays golden wire captures for protocol conformance.
 
 ## Pluggable backends
 
 preloop is execution-agnostic. The only thing that differs between runner hosts
 is how a runner instance is created and destroyed. This is modeled as the
-`RunnerProvider` trait in the orchestrator layer:
+`preloop_vm::VmProvider` trait (crates/preloop-vm/src/lib.rs:349); the `Store`
+trait (store.rs) covers durable state. (The `RunnerProvider`/`AuthProvider`
+design in fidelity-gap §4 is aspirational.)
 
 - `**Store**` — durable control-plane state: SQLite (default) or Postgres.
   See [State Model](#state-model).
-- `**AuthProvider**` — loopback-trust (local) or OAuth + mTLS (server).
+- `**AuthProvider**` — loopback-trust (local) or OAuth plus bearer tokens
+  (system token or minted job JWTs).
 - `**RunnerProvider**` — creates/destroys runners (process, container, libkrun,
 cloud VM, k8s pod, bare BYO). Optional — preloop works with external runners.
 
@@ -60,8 +74,7 @@ still broadcast (`state.rs::emit`). Cache and artifact payloads stay in
 file-backed stores under `.preloop/`; only control-plane state goes to the
 database.
 
-Known gaps and their tradeoffs are tracked in
-[store-known-issues.md](store-known-issues.md).
+Known gaps and their tradeoffs are tracked in the repository issue tracker.
 
 ## Secrets
 
@@ -74,13 +87,13 @@ Secrets use `SecretString` in `preloop-gha-protocol`. It redacts `Debug`,
 As of 2026-06-26, preloop is a proven working control plane for the official `actions/runner`.
 The runner completes the full lifecycle: configure → session → message → execute → complete.
 
-Implemented and verified with the real `Runner.Listener` v2.322.0:
+Implemented and verified with the real `Runner.Listener` v2.336.0:
 
 - Full AzDO lifecycle routes (connectionData, AgentPools, Agent, AgentSession, Message,
 AgentRequest, Timeline, Logfiles, FinishJob, ActionDownloadInfo)
 - GitHub-compatible registration (`/api/v3/actions/runner-registration` with `RemoteAuth`)
 - GHES org-prefix routing (`/:org/_apis/...` for all lifecycle endpoints)
-- AES session key exchange (unencrypted mode — RSA wrapping planned)
+- AES session key exchange with RSA-OAEP wrapping of the runner's registered public key (SHA-1 default, SHA-256 in FIPS mode)
 - Encrypted `TaskAgentMessage` delivery with message ack
 - Full `AgentJobRequestMessage` with plan, requestId, system context, steps
 - `needs` DAG scheduling with dependency-gated dispatch and outputs propagation
@@ -88,14 +101,11 @@ AgentRequest, Timeline, Logfiles, FinishJob, ActionDownloadInfo)
 - Matrix expansion with IndexMap order preservation and GitHub name format
 - Expression evaluation wired into job builder
 - `fail-fast` / `max-parallel` matrix strategy support
+- Cache/artifact v1 + v2 (Twirp + protobuf) served from file-backed `preloop-cache`/`preloop-artifacts` stores
 
 Known limitations:
 
-- Worker reports job as "Failed" (timeline/log endpoint fidelity gap)
-- Session AES key sent unencrypted (RSA-OAEP wrapping of runner's public key TODO)
-- Cache/artifact endpoints are in-memory stubs; v2 blob protocols not implemented
-- Conformance harness needs golden tests, fuzz targets, wire capture/replay
-- Expression engine lacks bracket access, object-filter, format escaping
+- Fuzz targets for the YAML/expression parsers remain to be added
 
 ## Module Map (post-Plans 012–017)
 

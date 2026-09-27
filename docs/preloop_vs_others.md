@@ -81,7 +81,7 @@ different approaches to the problem.
 ```
 
 - **Language**: Rust (edition 2021, MSRV 1.97)
-- **Codebase**: 15 workspace crates, ~130,000+ lines of Rust
+- **Codebase**: 16 workspace crates, ~220,000 lines of Rust
 - **Execution**: Client–server — the server speaks the AzDO wire protocol; runners connect over HTTP/WebSocket
 - **Runner**: `preloop-runner` — faithful Rust port of `actions/runner` v2.336.0 (Listener + Worker architecture)
 - **Execution backends**: SmolVM/libkrun microVM (primary, Linux + macOS), Docker/Podman, or process. Planned (not yet shipped): `somac` (ephemeral macOS VMs via Virtualization.framework) and `vowin` (ephemeral Windows VMs via QEMU)
@@ -103,7 +103,7 @@ different approaches to the problem.
 | `uses:` Docker actions                   | ✅   | ❌        | ✅       | ✅             |                                                        |
 | `uses: $/` self-repo syntax              | ❌   | ❌        | ✅       | ❌             | v2.336.0 feature                                       |
 | Composite actions                        | ✅   | ✅        | ✅       | ✅             | preloop supports 10-deep nesting with pre/post         |
-| Reusable workflows (`workflow_call`)     | ✅   | ✅        | ✅       | ✅             | preloop: `secrets: inherit`, input validation, depth=4 |
+| Reusable workflows (`workflow_call`)     | ✅   | ✅        | ✅       | ✅             | preloop: `secrets: inherit`, input validation, depth=10 (`MAX_WORKFLOW_DEPTH`) |
 | Matrix strategy                          | ✅   | ✅        | ✅       | ✅             | preloop: IndexMap order preservation                   |
 | `include` / `exclude` in matrix          | ✅   | ❌        | ✅       | ✅             |                                                        |
 | `needs` DAG                              | ✅   | ✅        | ✅       | ✅             |                                                        |
@@ -193,11 +193,11 @@ different approaches to the problem.
 | Runner self-update                     | N/A | —        | ❌ intentional | —             | preloop acknowledges but doesn't update                                                                                                                                                                                                                                                                                           |
 | Runner groups                          | N/A | —        | ✅             | ✅             | Server-side group routing                                                                                                                                                                                                                                                                                                         |
 | Ephemeral runners                      | N/A | ✅        | ✅             | ✅             | Exit-on-ack, session invalidation                                                                                                                                                                                                                                                                                                 |
-| Results-service (Twirp)                | ❌   | ⚠️       | ✅             | ❌             | 5 Twirp routes, signed blob URLs                                                                                                                                                                                                                                                                                                  |
+| Results-service (Twirp)                | ❌   | ⚠️       | ✅             | ❌             | 8 Twirp results-service routes (steps update, 4 signed-blob-URL, 3 metadata)                                                                                                                                                                                                                                                                                                  |
 | Timeline / live logs                   | ❌   | ⚠️       | ✅             | ⚠️            | WebSocket live-feed + PATCH timeline                                                                                                                                                                                                                                                                                              |
 | Job annotations                        | ❌   | ❌        | ✅             | ⚠️            | Feature-gated aggregation                                                                                                                                                                                                                                                                                                         |
-| `connectionData` / location services   | N/A | ❌        | ✅             | ❌             | 28 service definitions                                                                                                                                                                                                                                                                                                            |
-| Background steps (v2.336.0)            | ❌   | ❌        | ⚠️ partial    | ❌             | DTO + flag implemented; full coordinator missing                                                                                                                                                                                                                                                                                  |
+| `connectionData` / location services   | N/A | ❌        | ✅             | ❌             | 30 service definitions                                                                                                                                                                                                                                                                                                            |
+| Background steps (v2.336.0)            | ❌   | ❌        | ⚠️ partial    | ❌             | Coordinator runs background steps; cancel-control steps unimplemented                                                                                                                                                                                                                                                                                  |
 | Locked dependencies announcement       | ❌   | ❌        | ✅             | ❌             | v2.336.0 feature                                                                                                                                                                                                                                                                                                                  |
 
 
@@ -280,7 +280,8 @@ ported to Go.
 **Key consequence**: preloop controls both sides of the wire protocol. When GitHub
 ships a runner update, preloop ports the changes to its own Rust runner. Having the
 full stack in Rust means both server and runner are tested together — conformance
-is verified against 24 golden wire captures from the official runner v2.336.0.
+is verified against 36 gated golden scenarios replayed from official runner
+v2.336.0 wire captures (39 captured, 3 quarantined).
 
 ---
 
@@ -301,14 +302,14 @@ preloop implements the complete Azure DevOps runner protocol:
 - **Registration**: RSA key exchange, runner capabilities, labels
 - **Session**: AES-encrypted message queue, session renewal, conflict resolution
 - **Broker**: `acquirejob` → `renewjob` → `completejob` lifecycle
-- **Results service**: 5 Twirp routes (`CreateStepLogsMetadata`, `CreateJobLogsMetadata`, `CreateStepSummaryMetadata`, `WorkflowStepsUpdate`, signed blob URLs)
+- **Results service**: 8 Twirp results-service routes (`WorkflowStepsUpdate`, `CreateStepLogsMetadata`, `CreateJobLogsMetadata`, `CreateStepSummaryMetadata`, and 4 signed blob URL routes)
 - **Timeline**: PATCH updates with `lastModified` stamps, GET for full history
 - **OIDC**: RS256-signed JWTs with X.509 certificate chain, JWKS endpoint, OpenID discovery
 - **Cancellation**: `JobCancelMessage` with GUID jobId + TimeSpan timeout, graceful+hard-kill phases
-- **Location services**: 28 service definitions matching the hosted topology
+- **Location services**: 30 service definitions matching the hosted topology
 
-This is verified by 24 golden conformance scenarios replayed from official
-runner v2.336.0 wire captures. All 24 pass on status codes, request body schemas,
+This is verified by 36 gated golden scenarios replayed from official
+runner v2.336.0 wire captures (39 captured, 3 quarantined). All 36 pass on status codes, request body schemas,
 and acquirejob response schemas.
 
 ---
@@ -317,7 +318,7 @@ and acquirejob response schemas.
 
 ### 6.1 Scenario Benchmark Comparison (39 Golden Scenarios)
 
-All three tools measured on the same Apple M4 Max host against the 39 scenario workflow YAML files (`experiments/mitm/scenarios/`).
+All three tools measured on the same Apple M4 Max host against the 39 golden scenario workflow YAML files (plus 27 reconstructed edge cases) under `experiments/mitm/scenarios/`.
 Each Preloop job ran in its own isolated SmolVM microVM forked from the warm runner base image.
 
 **Behavioral Fidelity Summary** (Correct local outcome matching GitHub Actions intent):
@@ -399,7 +400,7 @@ Each Preloop job ran in its own isolated SmolVM microVM forked from the warm run
 ### preloop
 
 - **runner-watch**: Automated pipeline that watches `actions/runner` releases, diffs source, emits TOML specs, and replays golden captures
-- **24 golden scenarios**: Captured from official runner v2.336.0, covering registration, job lifecycle, cancellation, matrix, cache, artifacts, OIDC, containers, services, composite actions, and Docker actions
+- **39 golden captures (36 gated)**: Captured from official runner v2.336.0, covering registration, job lifecycle, cancellation, matrix, cache, artifacts, OIDC, containers, services, composite actions, and Docker actions
 - **Conformance gate**: Status codes, request body schemas, and acquirejob response schemas must match exactly
 - **Differential testing**: Same workflow run against both GitHub Actions and preloop; 11/12 job-level match (92%), 6/12 full match including step details (50%)
 - **Property tests**: 87 tests for concurrency groups alone
@@ -431,11 +432,11 @@ Each Preloop job ran in its own isolated SmolVM microVM forked from the warm run
 
 | Feature                                      | Status                                                           |
 | -------------------------------------------- | ---------------------------------------------------------------- |
-| `BackgroundStepCoordinator` + cancel-control | ⚠️ Partial — DTO and flag implemented, async coordinator missing |
+| `BackgroundStepCoordinator` + cancel-control | ⚠️ Partial — coordinator runs background steps; cancel-control steps unimplemented |
 | Runner self-update                           | ❌ Intentional — preloop-runner does not self-update              |
-| Runner config refresh                        | ❌ Missing                                                        |
+| Runner config refresh                        | ✅ Implemented (`RunnerRefreshConfig` → `configRefreshURL` round-trip, atomic settings persistence)                                                        |
 | Action download telemetry                    | ⚠️ Info logs only, not structured telemetry payloads             |
-| Full hosted-service location parity          | ⚠️ 28 services defined, but not full GitHub/Azure topology       |
+| Full hosted-service location parity          | ⚠️ 30 services defined, but not full GitHub/Azure topology       |
 | Workflow graph visualization                 | ❌ Not implemented                                                |
 | Dry run mode                                 | ❌ Not implemented                                                |
 

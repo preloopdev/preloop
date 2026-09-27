@@ -102,19 +102,18 @@ flowchart LR
 States:
 
 ```
-running
-  → paused_failure        step failed, worker alive, VM held
+paused
   → attached              a controller holds the lease
-  → repairing             controller is mutating VM or repair workspace
-  → retrying              an attempt is executing
-      → paused_failure    attempt failed again
-      → resumed           attempt passed; job continues
-  → completed_repaired
-  → verifying
-  → verified
+  → retrying              a verdict was issued; the worker is acting on it
+      → paused            the attempt failed again
+      → resumed           the attempt passed; the job continues
+  → aborted               the job was aborted
+  → abandoned             the worker vanished without completing the session
 ```
 
-Terminal: `aborted`, `cancelled`, `expired_while_detached`, `worker_crashed`.
+Terminal: `resumed`, `aborted`, `abandoned`. The repair/verification states
+(`repairing`, `completed_repaired`, `verifying`, `verified`) are planned, not
+part of the wire enum.
 
 **Single controller.** Exactly one client may mutate and resume. Others attach
 as read-only observers. Control transfer pauses the outgoing controller first.
@@ -137,7 +136,7 @@ processes, or called an external API. The contract is stated plainly:
 | `:retry` | repeat the failed step in the current VM |
 | `:retry --sync` | pull host source changes first, then repeat |
 | `:retry --from <step>` | sync, then re-execute from an earlier step |
-| `:verify` | fresh microVM, whole job, repaired source + persisted setup |
+| `:verify` *(planned)* | fresh microVM, whole job, repaired source + persisted setup |
 
 `--from` exists because the failed step may consume an earlier step's output.
 Step 3 compiles a binary, step 4 executes it: changing source and retrying only
@@ -181,7 +180,7 @@ that never fail, and it is lossy for writes that preserve mtime (`cp -p`, tar
 extraction, ccache).
 
 **The pristine workspace snapshot is already a complete undo log for everything
-worth undoing.** `create_workspace_snapshot` in `runs.rs` produces a git-backed
+worth undoing.** `create_workspace_snapshot` in `snapshots.rs` produces a git-backed
 immutable snapshot with a known `commit_sha`, and `redirect_primary_checkout`
 points the job's checkout at it. So the pristine tree is a known ref.
 
@@ -501,6 +500,8 @@ step: the attempt journal is cloned into every pause and retained server-side,
 so an unbounded loop grows both sides without converging. Past the cap the step
 fails and the session ends.
 
+Illustrative attach/detach transcript (not literal output):
+
 ```
 attached:  Session attached · no idle timeout · 3h41m of pause credit left
 detached:  preloop debug 21bb9d8e --job test
@@ -563,7 +564,8 @@ the real error scrolled past.
 │                                                                    │
 │ Job and microVM paused. Services and build caches remain.          │
 ├────────────────────────────────────────────────────────────────────┤
-│ :log :errors :changes :sync :retry :retry --from :verify :abort    │
+│ :retry [--from N|name] [--from-start] :continue :steps :abort      │
+│ :status :sync :export                                              │
 │ Ctrl-D  detach — VM stays paused                                   │
 ╰────────────────────────────────────────────────────────────────────╯
 ```
@@ -591,19 +593,30 @@ terminal output and not the full environment:
 
 ```json
 {
+  "event_id": 7,
   "event": "step_failed",
   "session_id": "dbg_21bb9d8e_test",
   "session_version": 4,
-  "job": { "id": "test", "matrix": { "rust": "stable" } },
-  "step": { "index": 2, "attempt": 1, "command": "cargo test --workspace",
-            "cwd": "/work/rust-runner-server", "exit_code": 101 },
-  "diagnostics": [ { "level": "error", "file": "crates/parser/src/lib.rs",
-                     "line": 42, "message": "expected `Completed`, found `Pending`" } ],
+  "run_id": "21bb9d8e",
+  "job_id": "test",
+  "job_name": "test",
+  "step": {
+    "index": 2, "total": 3, "context_name": "__run_2",
+    "display_name": "Run cargo test --workspace",
+    "command": "cargo test --workspace",
+    "working_directory": "/work/rust-runner-server",
+    "exit_code": 101, "elapsed_ms": 18400,
+    "diagnostics": [ { "level": "error", "file": "crates/parser/src/lib.rs",
+                       "line": 42, "message": "expected `Completed`, found `Pending`" } ]
+  },
   "log_reference": "preloop://runs/21bb9d8e/jobs/test/steps/2/attempts/1",
-  "source": { "original_revision": "sha256:…", "repair_revision": "sha256:…" },
+  "message": "step failed on attempt 1",
   "capabilities": ["step.retry", "job.retry_from", "job.abort"]
 }
 ```
+
+Source revisions are recorded per attempt in the attempt journal as
+`source_revision` strings (`original`, `repair-1`, …), not on the event.
 
 **Implemented operations:** `step.retry`, `job.retry_from`, and `job.abort`.
 Every mutation carries a client-supplied request ID and expected session
@@ -617,8 +630,10 @@ and `verification.start`.
 Responses return `{prev_version, new_version, status, session}`. A reconnecting
 agent replaying a request must not execute the same retry or abort twice.
 
-**Outcomes:** `fixed`, `verified`, `environment_change_proposed`,
-`approval_required`, `blocked`, `attempt_limit_reached`, `aborted`.
+**Outcomes:** `AgentOperationResponse.status` reports `retrying` or
+`aborting` today. A richer outcome vocabulary — `fixed`, `verified`,
+`environment_change_proposed`, `approval_required`, `blocked`,
+`attempt_limit_reached` — is planned.
 
 ### Security
 
@@ -722,11 +737,11 @@ transferring the lease.
 
 | Concern | Location |
 |---|---|
-| Pause hook (before step) | `on_step_starting`, `steps_runner.rs` ~435 |
+| Pause hook (before step) | `on_step_starting`, `steps_runner.rs` ~752 |
 | **New:** pause hook (on failure) | same loop, post-execution branch |
 | DAP trait | `Debugger` in `preloop-dap/src/debugger.rs` ~134 |
 | Step verdict / retry loop | step loop in `steps_runner.rs` |
-| Workspace snapshot | `create_workspace_snapshot`, `redirect_primary_checkout` in `runs.rs` |
+| Workspace snapshot | `create_workspace_snapshot`, `redirect_primary_checkout` in `snapshots.rs` |
 | Wire flag | `preserve_on_failure` → `preloop_preserve_on_failure`, `azdo/job.rs` ~170 |
 | Session registry / HTTP surface | `debug_sessions.rs`, `preloop-runner-server` |
 | Worker authorization | `require_worker_bearer` + `WorkerJob`, `auth.rs`; `job_uuid_from_debug_token`, `state.rs` |
@@ -740,8 +755,8 @@ transferring the lease.
 
 The existing debug marker is 9 bytes (`"preserved"`). It carries no run ID, job
 name, failed step, exit code, or workspace path, which is why the current
-`preloop shell` flow cannot orient the user. It is replaced by a JSON session
-descriptor.
+`preloop shell` flow cannot orient the user. It remains a plain marker today;
+replacing it with a JSON session descriptor is planned.
 
 `next` / `stepIn` / `stepOut` are currently aliased to `continue` in the DAP
 debugger. Failure-pause and retry are the two missing primitives — "break on
@@ -764,8 +779,8 @@ only while a session is attached.
    `:steps`, guest shell passthrough, safe detach
 4. ✅ Change detection and revert via git-vs-snapshot
 5. ✅ Attempt journaling and runner-context restore
-6. ⬜ `:retry --sync` — revision-aware host→VM delta (detection landed; the
-   sync-then-retry path has not)
+6. ✅ `:retry --sync` — revision-aware host→VM delta (detection and the
+   sync-then-retry path)
 
 Verified scenario: a three-step job fails at step 2, pauses with the VM live,
 is fixed inside that VM, and is retried through `preloop debug --verdict retry`.
@@ -803,9 +818,6 @@ leaving every worker-side decision invisible from the host.
 12. VS Code DAP client
 13. fanotify per-step attribution
 14. Pre-step CoW checkpoints (see below)
-15. `:continue` after failure — deliberately deferred; the step already ran, so
-    the honest verb is "accept this failure and continue," which is closer to
-    runtime `continue-on-error` and can mask broken downstream state
 
 **`:abort` vs `:kill`.** `abort` keeps the step's failure and lets the job
 unwind normally, so `post`/`always()` cleanup still runs — checkout credential

@@ -11,7 +11,7 @@ match to the official GitHub runner image to avoid drift.
 | Mode                 | How jobs run                                                                                                                 | Enabled by                                                        |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | **MicroVM**          | A libkrun guest (Hypervisor.framework on macOS, KVM on Linux) boots the packed golden image and runs the job inside it       | `preloop serve`; packed golden use is the default                 |
-| **Fork pool**        | The runner runs as a host process tree, no VM, same job semantics, much faster warm start                                    | `PRELOOP_USE_FORK=true` (default when a packed golden is present) |
+| **Fork pool**        | CoW clones (`machine fork`) of a prepared golden microVM — same guest, no boot/provision                                    | `PRELOOP_USE_FORK=true` (default when a packed golden is present) |
 | **External runners** | Any runner that registers against the server: the official `actions/runner`, `preloop-runner` on another machine, containers | `preloop-runner configure` + `run`                                |
 
 
@@ -38,8 +38,8 @@ Four different kinds of image appear in the execution path:
 A stock golden is a pre-provisioned microVM image: the OCI base,
 `preloop-runner`, and the curated toolchain baseline, provisioned once and packed by smolvm
 into a single bootable, architecture-specific file. The pool boots it
-directly, and the fork pool runs the same artifact as host processes without
-starting a VM at all.
+directly, and the fork pool runs CoW clones (`machine fork`) of the same
+golden — the same guest, no boot or provision.
 
 Why pack one: provisioning (pulling the base, installing packages, baking toolchains) is the expensive part, and a golden does it exactly once. A runner then starts in one or two seconds from a local artifact instead of re-pulling and re-baking the base for every new VM. Because a golden is one checksummed  
 file, it is also reproducible: the same artifact produces the same runner on any host, and a stale build is caught by the checksum.
@@ -88,7 +88,7 @@ base:
 just build-preloop
 
 preloop build-golden \
-  --runner-bundle target/aarch64-unknown-linux-gnu/release \
+  --runner-bundle target/aarch64-unknown-linux-gnu/debug \
   --output dist/preloop-ubuntu-24.04-aarch64
 ```
 
@@ -104,13 +104,14 @@ toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
 - Release publication first seeds both architecture assets from the newest
   complete release, so a newly tagged engine never points at missing goldens.
   Every GitHub release then triggers `release-golden.yml`; release notes do not
-  carry an opt-in marker. The x86_64 refresh runs on the dedicated
-  `preloop-cpane-host`, while the aarch64 refresh is pinned to GitHub's
-  `macos-14` image. Successful refreshes replace the seeded
-  `preloop-ubuntu-24.04-<arch>` assets; failed refreshes stay visible without
+  carry an opt-in marker. The x86_64 refresh runs on GitHub-hosted
+  `ubuntu-latest` (KVM-enabled) in `release-golden.yml`; the aarch64 golden is
+  baked out-of-band on the `macstudio` host and published to GHCR for
+  `PRELOOP_GOLDEN_OCI_REF`. Successful refreshes replace the seeded
+  `preloop-ubuntu-24.04-x86_64` asset; failed refreshes stay visible without
   removing the valid seeded pair. The pool stores the downloaded artifact at
   a base-image-specific path below `<preloop_home>/vms/` (`preloop_home` is
-  `~/.config/preloop` unless `PRELOOP_HOME` says otherwise).
+  `~/.preloop` unless `PRELOOP_HOME` says otherwise).
 - When the pool warms a golden, it also pre-pulls the `container:` /
 `services:` images declared by the current workspace's workflows.
 
@@ -213,9 +214,9 @@ preloop build-golden --base-image 'ghcr.io/acme/runner-images@sha256:<digest>' .
 ```
 
 `cosign` must be installed on the build host. The signature identity
-is pinned to the publishing repository's `dump.yml` workflow on the default
-branch; override with `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` if the publishing
-workflow differs. A mirror that signs with a long-lived key instead of
+is pinned to the publishing repository's `dump.yml`/`attest-local.yml`
+workflows; override with `PRELOOP_BASE_IMAGE_IDENTITY_REGEXP` if the
+publishing workflow differs. A mirror that signs with a long-lived key instead of
 keyless OIDC can set `PRELOOP_BASE_IMAGE_PUBKEY` to the public key file;
 verification then uses `cosign verify --key` rather than the identity check.
 
@@ -351,8 +352,9 @@ in order:
 3. `target/<triple>/{debug,release}` under a development build.
 
 On Linux hosts the installed `preloop-runner` is already a Linux binary, so no
-bundle is needed. Missing on macOS, the engine logs a startup warning and
-submitted jobs queue until a runner exists.
+bundle is needed. Missing on macOS, the engine logs a startup warning and jobs
+fail after the queue grace window; install the bundle with `preloop update` or
+set `PRELOOP_RUNNER_BUNDLE`.
 
  ## Version tracking (`versions.toml`, `official-image.toml`)
 
@@ -362,6 +364,7 @@ submitted jobs queue until a runner exists.
  separately) — and is consumed by the build:
 
  | Key                                                     | What it pins                                                                     | Bump when                                                               |
+ | ------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `runner_version`                                        | Official `actions/runner` protocol target (currently `2.336.0`)                  | Upstream runner changes protocol surface                                |
 | `smolvm_min_version`                                    | SmolVM runtime floor `preloop update --ensure-runtime` accepts and upgrades from | A future SmolVM drops a capability preloop needs (rare, human-driven)   |
 | `smolvm_golden_version`                                 | SmolVM release the golden workflow builds with                                    | Upstream ships a newer stable (Renovate opens a bump PR, `smolvm-release-verify` gates it) |
@@ -370,8 +373,8 @@ submitted jobs queue until a runner exists.
 | `ubuntu_22_04_base`                                     | Second pinned base                                                               | Same                                                                    |
 | `official_runner_image_base_amd64` (`official-image.toml`) | Official GitHub-hosted runner image OCI reference for the x86_64 golden | Bump the digest after re-running `runner-image-blobs` attestation and verifying the new digest |
 | `official_runner_image_base_arm64` (`official-image.toml`) | Official GitHub-hosted runner image OCI reference for the aarch64 golden | Same as above |
-| `node_version`                                          | Node baked as the runner's externals                                             | A workflow needs a newer default Node                                   |
-| `node20_externals_version` / `node24_externals_version` | Additional Node externals                                                        | Same                                                                    |
+| `node_version`                                          | System node baked into the golden                                                | A workflow needs a newer default Node                                   |
+| `node20_externals_version` / `node24_externals_version` | Node runtimes baked as the runner's externals                                    | Same                                                                    |
 | `rustup_version`                                        | Rustup used to install baked Rust toolchains                                     | Toolchain bootstrap changes                                             |
 | `cargo_shear_version`                                   | Auxiliary cargo tooling                                                          | Same                                                                    |
 
@@ -438,7 +441,7 @@ parity targets to bake (or pin) so CI results on Preloop match GitHub:
 | Docker stack         | **client 28.0.4, server 28.0.4, buildx 0.35.0, compose 2.38.2** | Container/service jobs are a whole workflow category; apt's older docker + missing buildx/compose changes `docker buildx` / `docker compose` behavior                                                  |
 | Clang family         | **clang/format/tidy 16.0.6, 17.0.6, 18.1.3**                    | There is no standard GitHub setup action; C/C++ workflows commonly invoke versioned binaries directly                                                                                                  |
 | GNU compiler family  | **gcc/g++/gfortran 12.4.0, 13.3.0, 14.2.0**                     | Same implicit system-tool contract; `build-essential` supplies only the default compiler                                                                                                               |
-| Runner user contract | **`runner` (uid 1001), `HOME=/home/runner`, `/run/user/1001`**  | Every `id -u` / `env_var('USER')` / `runtime_directory()` check drifts without it (implemented — see `docs/push.md`'s runner-user section)                                                             |
+| Runner user contract | **`runner` (uid 1001), `HOME=/home/runner`, `/run/user/1001`**  | Every `id -u` / `env_var('USER')` / `runtime_directory()` check drifts without it (implemented — see `PRELOOP_RUNNER_USER`/`PRELOOP_RUNNER_UID` in self-hosting.md §4)                                 |
 
 
 ### Tier 2 — behavior parity (bake when size allows)
@@ -497,7 +500,7 @@ naming the official image version they were taken from.
 | `PRELOOP_GOLDEN_URL`                         | Override the packed golden URL; its optional checksum is fetched from the same URL plus `.sha256`                  |
 | `PRELOOP_USE_FORK`                           | Run the pool as host forks instead of booting microVMs (default true with a golden)                                |
 | `PRELOOP_RUNNER_POOL_SIZE`                   | Pool size (warm forks / VMs)                                                                                       |
-| `PRELOOP_RUNNER_CPUS`                        | vCPUs allocated to each runner VM (default 4)                                                                      |
+| `PRELOOP_RUNNER_CPUS`                        | vCPUs allocated to each runner VM (default 8)                                                                      |
 | `PRELOOP_WORKSPACE`                          | Workspace context for daemon deployments; it does not install packages or derive toolchains for a packed golden    |
 | `PRELOOP_RUNNER_BASE_IMAGE`                  | Override the base image at serve time (default: digest-pinned Ubuntu 24.04)                                        |
 | `PRELOOP_RUNNER_LABELS`                      | Extra `runs-on` labels the pool's runners declare (comma-separated)                                                |
@@ -517,9 +520,10 @@ bake in `base_install_script`.
 the digest-pinned Ubuntu 24.04.
 - **A job VM pulls the OCI base instead of using a packed golden**:
 `PRELOOP_USE_PACKED_GOLDEN` defaults to `true` in current builds. At startup,
-an enabled packed path logs `Attempting to download pre-baked golden microVM image`. If the download is unavailable, Preloop pulls the OCI base
-once in a machine named `<prefix>-builder`, provisions it, and packs a local
-artifact. That one-time builder pull is expected.
+an enabled packed path logs `Downloading pre-baked golden from release asset
+(this may take several minutes)`. If the download is unavailable, Preloop
+pulls the OCI base once in a machine named `<prefix>-builder`, provisions it,
+and packs a local artifact. That one-time builder pull is expected.
 
   A pull from a job machine such as `preloop-runner-0-1`, with no preceding
   golden download attempt, means the running process has packed golden use

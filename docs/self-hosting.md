@@ -38,11 +38,12 @@ access at all** — see option A.
 - **Memory**: `PRELOOP_RUNNER_POOL_SIZE × PRELOOP_RUNNER_MEMORY_MIB`, plus a few
   GB for the control plane. Ceilings are ballooned, so idle runners hold far
   less than their ceiling — but concurrent heavy builds really do use it.
-- **CPU**: each runner VM gets `PRELOOP_RUNNER_CPUS` vCPUs (default 4).
+- **CPU**: each runner VM gets `PRELOOP_RUNNER_CPUS` vCPUs (default 8).
   `pool_size × PRELOOP_RUNNER_CPUS` well above your core count means jobs
   contend and wall-clock-sensitive tests turn flaky.
-- **Disk**: golden images (roughly 0.7–6 GB each, and superseded ones
-  accumulate) plus the cache directory, which grows with every distinct key.
+- **Disk**: golden images (roughly 1–10 GB each; the packed official-image
+  golden is ~9.6 GB compressed, and superseded ones accumulate) plus the cache
+  directory, which grows with every distinct key.
 - **GitHub App**: app id, private key PEM, installation id, and a webhook secret
   if you use webhooks. A GitHub App — not a PAT — is required to report check
   runs; GitHub rejects PAT-authored check runs.
@@ -106,7 +107,7 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_PUBLIC_URL` | `http://127.0.0.1:<port>` | Externally reachable base URL. Used for `details_url` on check runs |
 | `PRELOOP_HOME` | `$HOME/.preloop` | State directory (database, blobs, cache, credentials) |
 | `PRELOOP_STORE_URL` | SQLite in the state dir | `sqlite://<path>`, a bare path, or `postgres://…?sslmode=require\|verify-full` |
-| `PRELOOP_UNIX_SOCKET` | — | Control socket path; mounted into runner VMs, serves the runner surface only |
+| `PRELOOP_UNIX_SOCKET` | — | Control socket path (`preloop-server` only — `preloop serve` pins the socket at `$PRELOOP_HOME/preloop.sock`); mounted into runner VMs, serves the runner surface only |
 | `PRELOOP_SYSTEM_TOKEN` | generated and stored in the OS credential store; private `$PRELOOP_HOME/engine.token` fallback | Admin credential for `/api/v1/*`. Treat it as root for the control plane; strict external runner registration also uses this credential |
 | `PRELOOP_TOKEN_TTL_SECS` | `2999` | Issued runner token lifetime |
 | `PRELOOP_REGISTRATION_POLICY` | `strict` | Registration policy. `strict` requires the system credential (or a fresh pool provision token on legacy registration); `permissive` accepts any non-empty upstream token on TCP for conformance replay only, while the mounted socket remains strict — never use it on an exposed listener |
@@ -199,7 +200,7 @@ a restart cannot resurrect them. Workflows see the effective value as
 |---|---|---|
 | `PRELOOP_RUNNER_POOL_ENABLED` | off | Master switch for the microVM pool |
 | `PRELOOP_RUNNER_POOL_SIZE` | derived from host CPU/RAM | Warm machines; `0` forks on demand |
-| `PRELOOP_RUNNER_CPUS` | `4` | vCPUs allocated to each runner VM |
+| `PRELOOP_RUNNER_CPUS` | `8` | vCPUs allocated to each runner VM |
 | `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per VM. Raise it for LTO release builds — rustc is `SIGKILL`ed at 4 GiB on large workspaces |
 | `PRELOOP_RUNNER_STORAGE_GB` | `80` | Writable guest disk ceiling (sparse — not allocated until written). The packed OCI golden needs ~80 GiB uncompressed |
 | `PRELOOP_RUNNER_OVERLAY_GB` | — | Per-VM writable overlay size |
@@ -209,7 +210,7 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
 | `PRELOOP_GOLDEN_OCI_REF` | official arm64 GHCR artifact | OCI packed golden reference downloaded automatically on arm64 hosts |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
-| `PRELOOP_RUNNER_EXTERNALS` | temp dir | Host-side Node externals directory |
+| `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` | Host-side Node externals directory |
 | `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
 | `PRELOOP_RUNNER_LABELS` | — | Extra labels on every pool runner. **Jobs only dispatch to runners whose labels match `runs-on`** |
 | `PRELOOP_RUNNER_NAME_PREFIX` | `preloop-runner` | Machine naming prefix |
@@ -249,10 +250,10 @@ require_approval = false    # true = run is created but all jobs hold until the 
   `false` is a kill switch. Dropped events are logged and never create runs.
 - `require_approval` defaults to `false`. When `true`, a fork-PR run is created
   and queued normally, but every job holds in `Pending` until the operator
-  releases it with `preloop approve-fork <run-id> [--note ...]` or
-  `POST /api/v1/runs/:run_id/approve-fork` (system bearer). A run not approved
-  within 24 hours fails closed. Timers hold jobs visibly in `Pending` and stay
-  cancellable.
+  releases it with `POST /api/v1/runs/:run_id/approve-fork` (system bearer),
+  e.g. via `preloop-runner-client approve-fork <run-id> [--note ...]`. A run
+  not approved within 24 hours fails closed. Timers hold jobs visibly in
+  `Pending` and stay cancellable.
 - Only the fork pull-request trust tier (`pull_request` from a fork) is
   affected. `pull_request_target` always runs with base-repository trust and
   is never treated as a fork-PR workflow by this policy, regardless of the
@@ -640,9 +641,10 @@ runner:
 - **Required reviewers.** The job waits in a pending-approval state until
   the configured number of approvals is recorded. Approvals are explicit and
   human-driven: `POST /api/v1/runs/:run_id/jobs/:job_id/approve` (system
-  bearer token; optional `{"note": "..."}` for the audit trail) or
-  `preloop approve <run-id> <job-id> [--note ...]`. Preloop has no user
-  identities — the approver is whoever holds the operator credential — so
+  bearer token; optional `{"note": "..."}` for the audit trail), e.g. via
+  `preloop-runner-client approve <run-id> <job-id> [--note ...]`. Preloop
+  has no user identities — the approver is whoever holds the operator
+  credential — so
   for a single-operator server this is a deliberate confirmation step, not
   a second human. Because one token holder could satisfy any quorum alone
   by calling the approval endpoint repeatedly, `required_reviewers` is

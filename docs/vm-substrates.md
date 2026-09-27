@@ -161,9 +161,10 @@ under-provisioning or failing a spec that is merely smaller than the base.
    `/var/lib/aenv/secrets/api-key`. For a systemd-managed engine, write that
    file into the service user's home.
 4. **The guest must be able to reach the engine.** This is not optional
-   plumbing — without it every job is failed by the starvation sweep after
-   600 s with "no matching runner", because the runner inside the sandbox
-   never registers. AgentENV is hardened against exactly this: each sandbox
+   plumbing — without it every job is failed by the starvation sweep
+   (120 s unsatisfiable / 3600 s backstop) with "no matching runner",
+   because the runner inside the sandbox never registers. AgentENV is
+   hardened against exactly this: each sandbox
    netns carries an `AGENTENV-EGRESS` floor that REJECTs every
    RFC1918/CGNAT/loopback/link-local destination (so an agent can reach the
    internet but never a host service), and the host's own `INPUT` chain gets
