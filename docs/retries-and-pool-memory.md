@@ -19,8 +19,7 @@ concurrency was sized by CPU only.
 > by design (the guest is expected to recover).
 > **Pool: retry-forever with exponential damping** — slot respawns back off
 > 500 ms → 30 s cap with success reset, golden re-arm exponential (10 s → 60 s,
-> ≤ 5 min budget) before fallback
-> before fallback.
+> ≤ 5 min budget) before fallback.
 
 ## Control plane (`preloop-runner-server`)
 
@@ -41,7 +40,8 @@ GitHub webhooks are **durable and retried in-process** after a successful
 enqueue: the handler verifies the signature, commits the raw delivery to the
 `webhook_deliveries` store table within a bounded acknowledgement budget, and
 acks 202. Background workers drain the queue; transient failures retry
-internally with exponential backoff (1s → 5s → 15s → 30s), renew their
+internally with a tiered ladder (1s → 1s → 5s → 15s → 30s, capped attempts),
+renew their
 processing lease, and retain terminal delivery IDs for a bounded deduplication
 window. If the enqueue itself fails, GitHub does not redeliver automatically;
 use GitHub's delivery redelivery action or API after the store recovers.
@@ -129,8 +129,9 @@ max_concurrent = min(cpu_term, by_memory)
   without it the host OOMs *after* the forks are up.
 - Applied in **both** pool modes:
   - size=0 on-demand: `max_concurrent = min(by_cpu, by_memory)`
-  - warm mode: `warm_size = min(configured size, by_memory)`, logged when
-    reduced. `PRELOOP_RUNNER_POOL_SIZE` still wins as an explicit override
+  - warm mode: `warm_size = min(configured size, max(by_memory / 2, 1))`
+    (logged when reduced). `PRELOOP_RUNNER_POOL_SIZE` still wins as an explicit
+    override
     only up to the memory cap — the cap is a safety floor, not a knob.
 - A host whose memory can't be read (`/proc/meminfo` unavailable, non-Unix)
   falls back to CPU-only sizing rather than refusing to run.

@@ -41,9 +41,10 @@ worktree as an immutable synthetic commit and rewrites the default
 That endpoint only accepts a local job JWT, so the server pins the local JWT
 directly onto the step's `token` input rather than letting it default to
 `${{ github.token }}`. Local checkout therefore always works, whatever
-`GITHUB_TOKEN` happens to hold. The rewrite is skipped entirely if the step
-already sets any of `repository`, `ref`, `token`, or `github-server-url`, so
-explicit user intent is never overridden.
+`GITHUB_TOKEN` happens to hold. The rewrite is skipped if the step sets
+`repository`, `ref`, or `github-server-url` (or non-default
+`fetch-depth`/`fetch-tags`); a user `token` input is replaced by the pinned
+local JWT.
 
 When no App and no PAT are configured, `GITHUB_TOKEN` is also a local HMAC JWT.
 It is a placeholder in that case: nothing in a job needs it, and any call it
@@ -64,9 +65,9 @@ credential.
 | All `run:` steps | Shell execution is entirely runner-local. |
 | Container jobs and service containers | `container:` and `services:` are resolved from the job plan; images are pulled by the runner. |
 | Matrix, `needs`, `if:` conditions, expressions | Evaluated by Preloop's own planner. |
-| OIDC id-tokens | Needs `permissions: id-token: write`. Signed RS256 with the server's own keypair; the issuer defaults to `<public-base-url>/oidc` and is overridable with `--oidc-issuer`. Usable only if your cloud provider is configured to trust that issuer and its JWKS. |
+| OIDC id-tokens | Needs `permissions: id-token: write`. Signed RS256 with the server's own keypair; the issuer defaults to `<runner-base-url>/oidc` (`PRELOOP_RUNNER_URL`, falling back to `PRELOOP_PUBLIC_URL`) and is overridable with `--oidc-issuer`. Usable only if your cloud provider is configured to trust that issuer and its JWKS. |
 | Problem matchers, annotations, step summaries | Matchers run inside the runner, annotations travel as timeline issues, summaries upload to Preloop's blob store. |
-| Public actions in `uses:` | The server fetches action tarballs from `https://api.github.com/repos/{owner}/{repo}/tarball/{ref}` **unauthenticated** and caches them under `<state-dir>/actions/`. This path is hardcoded and does not honor `PRELOOP_GITHUB_API_URL`. Private actions will not download, and you share the anonymous API rate limit. |
+| Public actions in `uses:` | The server fetches action tarballs from `<github-api-url>/repos/{owner}/{repo}/tarball/{ref}` (honors `PRELOOP_GITHUB_API_URL`), authenticating with `PRELOOP_GITHUB_TOKEN` when set to avoid the 60/hour anonymous limit, and caches them under `<state-dir>/actions/`. Private actions will not download without a credential. |
 
 ---
 
@@ -178,8 +179,8 @@ so a typo cannot quietly select a different policy.
   skew and expires 10 minutes out, regenerated for each mint.
 - Tokens expire after **1 hour** and are not refreshed in place. A job running
   longer than an hour may see `$GITHUB_TOKEN` expire mid-run.
-- Minting happens for every job in a run before the dispatch lock is taken, so a
-  slow GitHub round-trip cannot stall other runs.
+- Installation tokens are minted per job when the broker dispatches it — not
+  at submission — so downstream jobs never wait on a short-lived token.
 
 ### When minting fails
 
@@ -195,7 +196,7 @@ choice explicit:
 | Value | Behavior |
 |---|---|
 | `local` (default) | The job keeps the local HMAC JWT. It runs normally but cannot reach `api.github.com`. Scope can never widen. |
-| `error` | The submission is rejected with `502 Bad Gateway` before any state is mutated, so a misconfiguration is loud instead of silent. |
+| `error` | The mint failure is terminal: the job claim fails with `502 Bad Gateway` and the job fails instead of running with fallback authority. |
 | `pat` | The job receives `PRELOOP_GITHUB_TOKEN`, accepting that the PAT ignores `permissions:` and is not repository-scoped. |
 
 ### How `permissions:` maps to token scopes
@@ -258,14 +259,15 @@ Set a Personal Access Token when starting the server:
 export PRELOOP_GITHUB_TOKEN="github_pat_..."
 ```
 
-- The PAT is injected verbatim as `GITHUB_TOKEN` for **all** jobs. It is not
-  scoped per repository and it **ignores `permissions:`** entirely — a workflow
-  declaring `permissions: contents: read` still receives the PAT's full rights.
-  `permissions:` is only enforced on the GitHub App path. This is exactly why a
+- The PAT is embedded as `GITHUB_TOKEN` only when its classic OAuth scopes
+  are introspected and don't exceed declared `permissions:`; broader PATs
+  refuse the run, and unverifiable bounds withhold the PAT (jobs keep the
+  runtime token). It is not scoped per repository. This is exactly why a
   failed App mint does not reach for the PAT unless
   `PRELOOP_GITHUB_APP_MINT_FAILURE=pat` says so.
-- Fine-grained PATs are strongly preferred over classic tokens; scope them to
-  the specific repositories and permissions your workflows need.
+- Classic PATs are the only kind whose bounds can be introspected
+  (`X-OAuth-Scopes`); a fine-grained PAT's bounds are unverifiable, so it is
+  withheld from jobs — use a GitHub App instead.
 - The same `PRELOOP_GITHUB_TOKEN` is also used server-side for Check Run
   create/update, remote workflow fetching, and pull-request changed-file
   lookups. With it unset, check runs are simulated in-memory and logged instead.
@@ -278,7 +280,7 @@ export PRELOOP_GITHUB_TOKEN="github_pat_..."
 GitHub App installation token
   (scoped to one repository and to `permissions:`, fresh per job, 1h TTL)
   ↓ configured? no App at all
-PRELOOP_GITHUB_TOKEN PAT (static, operator-provided, unscoped, ignores permissions:)
+PRELOOP_GITHUB_TOKEN PAT (static, scope-checked against `permissions:` at submission; unscoped per-repository)
   ↓ falls back to
 Local HMAC JWT (only works against the Preloop server)
 ```

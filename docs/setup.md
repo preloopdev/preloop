@@ -7,8 +7,8 @@ secrets.
 ### Windows
 
 Windows is supported **via WSL2** for now tho native Windows support is coming
-(the Windows binaries and the WHP-backed VM backend already exist in the
-pipeline). Inside WSL2, everything works like Linux:
+(the standalone Windows runner binaries already ship; a WHP-backed VM backend
+is planned). Inside WSL2, everything works like Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh 
 
 - For the full microVM runner pool, enable nested virtualization in
   `.wslconfig` (`[wsl2] nestedVirtualization=true`) so `/dev/kvm` is exposed.
-- Without it, `preloop runner` still works (jobs run as WSL processes); only the VM pool needs KVM.
+- Without it, `preloop-runner run` still works (jobs run as WSL processes); only the VM pool needs KVM.
 
 ## Just the runner (Standalone GitHub Actions Runner)
 
@@ -47,7 +47,7 @@ and installs it into `~/.local/bin/preloop-runner` (or pass `--prefix <dir>`):
 - **Windows**: `x86_64` (standalone `.exe` via release downloads)
 
 Alternatively, download standalone platform binaries (`preloop-runner-<triple>`) and
-CycloneDX SBOMs (`preloop-runner-<triple>.cdx.json`) from the
+CycloneDX SBOMs (`preloop-runner_<triple>.cdx.json`) from the
 [latest release](https://github.com/preloopdev/preloop/releases/latest).
 The container image is available at `ghcr.io/preloopdev/preloop-runner:latest`.
 
@@ -260,6 +260,7 @@ Point the webhook at the stable hostname once:
 preloop setup github --via app --public-url https://ci.example.com
 ```
 
+On an already-configured App, `--public-url` updates the webhook
 (`PATCH /app/hook/config`) instead of creating a second App, and stores the
 secret in the operating-system credential store so deliveries verify. GitHub
 exposes no API for the webhook **Active**
@@ -375,8 +376,9 @@ By default stored secrets persist in the config file (`[secrets]`,
 `[repo_secrets…]`, `[env_secrets…]`, mode 0600). For deployments that must
 not hold plaintext at rest, two options:
 
-- **Memory-only store** — set `secrets_store = "memory"` in the config file
-  (or `PRELOOP_SECRETS_STORE=memory`): the live secrets API keeps values in
+- **Memory-only store** — set the top-level `secrets_store = "memory"` in the
+  config file (or `PRELOOP_SECRETS_STORE=memory`): the live secrets API keeps
+  values in
   engine memory for the process lifetime and never writes them to the file.
   `preloop secret set` then requires a running engine; after a restart you
   re-seed. Combine with the systemd credential below for a durable base set.
@@ -420,6 +422,8 @@ exactly as written.
 Fields:
 
 ```toml
+secrets_store = "file"      # "file" (default) | "memory" (see above)
+
 [github]
 app_id = "123456"
 app_pem_ref = "github-app-pem-123456"   # written by setup; key lives in the OS store
@@ -429,8 +433,6 @@ webhook_secret_ref = "github-app-webhook-123456"  # written by `setup github --v
 server_url = "https://github.com"          # GHES: point at your host
 api_url = "https://api.github.com"         # GHES: REST base
 graphql_url = "https://api.github.com/graphql"
-
-secrets_store = "file"      # "file" (default) | "memory" (see above)
 
 [secrets]
 DOCKERHUB_TOKEN = "…"
@@ -444,7 +446,7 @@ DB_PASSWORD = "…"
 
 Every field is overridable by its environment variable
 (`PRELOOP_GITHUB_APP_ID`, `PRELOOP_GITHUB_APP_PEM`,
-`PRELOOP_GITHUB_APP_MINT_FAILURE`, `PRELOOP_GITHUB_PAT`,
+`PRELOOP_GITHUB_APP_MINT_FAILURE`, `PRELOOP_GITHUB_TOKEN`,
 `PRELOOP_WEBHOOK_SECRET`, `PRELOOP_GITHUB_SERVER_URL`,
 `PRELOOP_GITHUB_API_URL`, `PRELOOP_GITHUB_GRAPHQL_URL`,
 `PRELOOP_SECRETS_STORE`) — the file is the durable store, env vars are the
@@ -593,7 +595,7 @@ webhook secret the engine rejects every GitHub webhook delivery, and without
 an App key it cannot mint `GITHUB_TOKEN`. They land in the mode-0600
 environment file (never in the world-readable units); alternatively install
 first, then configure credentials with
-`sudo -u preloop env PRELOOP_HOME=/var/lib/preloop preloop setup github --save`
+`sudo -u preloop env PRELOOP_HOME=/var/lib/preloop preloop setup github`
 (writes the mode-0600 `config.toml` owned by the service account — see
 above; running it as root instead would write a file the service cannot
 read). `preloop server install --dry-run` prints the full plan without

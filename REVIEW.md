@@ -144,8 +144,9 @@ Treat workflow YAML, action metadata, and runner payloads as attacker-influenced
 input, which means bounding allocation, preventing path traversal in the cache,
 artifact, and action-download paths, and preventing command injection into step
 execution. Finally, keep the authentication and authorization boundaries intact,
-since the server relies on OAuth plus mTLS while the local path relies on
-loopback trust, and any change that widens that trust is a blocker.
+since the server relies on OAuth plus bearer tokens (system token or minted
+job JWTs) while the local path relies on loopback trust, and any change that
+widens that trust is a blocker.
 
 ---
 
@@ -159,7 +160,7 @@ Confirm that lock scope stays minimal and that a lock is never held across an
 `Notify` and broadcast changes preserve the publish-after-mutate ordering so that
 a new subscriber cannot miss an event. Verify that cancellation is honored
 promptly and leaves behind no zombie leases or sessions. Any change to durable
-state should go behind the repository trait rather than reaching for `sqlx`
+state should go behind the `Store` trait rather than reaching for `sqlx`
 directly, as described in the State Model section of `docs/architecture.md`.
 
 ---
@@ -167,7 +168,7 @@ directly, as described in the State Model section of `docs/architecture.md`.
 ## 4. Performance
 
 Fast local feedback is a product feature, and cold-start remains the tracked
-blocker documented in `docs/preloop-performance-engineering.md`, so review with a
+blocker measured by the harness in `benchmarks/preloop-perf/`, so review with a
 sense of what the code compiles to.
 
 Look for avoidable allocation or copying on the hot paths, which include message
@@ -194,9 +195,10 @@ of the correctness priorities in section 1.
 Push for the smallest change that accomplishes the goal, and reject scope creep
 such as retries, validation, telemetry, or abstraction added "while we're here"
 unless the task actually asked for it. Resist speculative abstraction, since one
-concrete caller does not justify a trait, and lean on the existing
-`RunStore`, `AuthProvider`, and `RunnerProvider` patterns when a real seam
-exists rather than inventing new ones.
+concrete caller does not justify a trait, and lean on the existing `Store` and
+`VmProvider` seams (and the planned `RunStore`/`AuthProvider`/`RunnerProvider`
+seams in `docs/fidelity-gap.md` §4) when a real seam exists rather than
+inventing new ones.
 
 Keep one way to do each thing, because a second convention living beside an
 existing one is a defect, so a new masking helper sitting next to `mask_secrets`
@@ -226,7 +228,7 @@ reintroducing a bug, and it helps to link the upstream source or golden capture.
 
 Make sure the docs move with the behavior, including the `docs/architecture.md`
 module map, `docs/fidelity-gap.md` for protocol status, and any relevant files
-under `plans/`. Finally, expect tests to defend observable contracts, since a
+under `docs/roadmap.md`. Finally, expect tests to defend observable contracts, since a
 good test fails on a plausible bug while asserting struct field defaults or
 source text is just noise. Tests should follow the existing conventions and stay
 deterministic and safe to run in the full suite, which includes respecting
@@ -239,8 +241,8 @@ deterministic and safe to run in the full suite, which includes respecting
 These checks are table stakes that the author runs and the reviewer confirms, and
 a PR that has not cleared them is not ready for human review yet.
 
-- [ ] `just test-ci` passes, covering `fmt-check`, `clippy -D warnings`, and the
-  workspace tests.
+- [ ] `just test-ci` passes, covering `fmt-check`, `clippy -D warnings`, `zizmor`,
+  the workspace tests, and the conform replay.
 - [ ] `just sg-scan-strict` passes, covering the secret-handling structural rules.
 - [ ] For a bug fix, a failing reproduction is shown on `main` and passes with the
   change, as described in section 1a.

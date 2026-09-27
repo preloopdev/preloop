@@ -25,9 +25,10 @@ Use the right template. Each one collects exactly the evidence a maintainer need
 
 ## Before you open a PR
 
-1. **`just test-ci`** must pass locally (fmt-check + clippy `-D` + full test suite).
+1. **`just test-ci`** must pass locally (fmt-check + clippy `-D warnings` + zizmor + workspace tests + conform replay).
 2. **Protocol changes** (anything under `/_apis/`, `/broker/`, `/twirp/`, or runner-facing JSON shapes) must be validated against the **official `actions/runner`**, not only unit tests. Use the conformance suite:
-   - `just conform` — committed official-runner flow replay
+   - `just conform` — committed official-runner flow replay (`conform` and
+     `conform-server-light` are currently the same replay gate)
    - `just conform-server-light` / `just conform-server-deep` — server fidelity gates
    - `just conform-runner-light` / `just conform-runner-deep` — Rust runner fidelity gates
    - `just dogfood` — live E2E with the real runner
