@@ -473,9 +473,13 @@ deliberately outside workflow files: whoever writes a workflow must not be
 able to weaken the policy that constrains it. Preloop mirrors that split by
 putting the equivalent controls in the operator's server config
 (`$PRELOOP_CONFIG`, default `~/.preloop/config.toml`), never in workflow
-repos. All of the tables below are optional and empty by default; an empty
-table preserves today's behavior exactly. Policy is read at startup — edit
-the file and restart the server to apply changes.
+repos. All of the tables below are optional; every table except
+`[execution_protection]` is empty by default, and an empty table preserves
+today's behavior exactly. `[execution_protection]` ships with one default
+rule — an unscoped `pull_request_target` event deny in `evaluate` mode
+(logged, never blocked) — which an explicit empty `event_rules = []` list
+removes. Policy is read at startup — edit the file and restart the server
+to apply changes.
 
 ### 8.1 Workflow execution protections
 
@@ -519,6 +523,39 @@ Semantics:
   roll policy out in `evaluate`, watch the logs, then flip to `enforce`.
 - `enforce` mode skips the denied event/workflow and logs
   `execution protection denied …` naming the rule that fired.
+
+**Default rule.** Every config carries GitHub's default rule — an unscoped
+`pull_request_target` event rule in evaluate (log-only) mode, mirroring
+GitHub's rollout stage (evaluate first, enforced later). It logs what it
+would deny without changing what runs. Remove
+it with an explicit `event_rules = []` in the config file, or through the
+API below. Preloop does not flip it to enforce automatically — flip the
+table to `enforce` when you are ready.
+
+**Rule management API.** The rules above can also be managed over REST, all
+under `/api/v1/execution-protection` and all requiring the system token
+(`Authorization: Bearer <system token>`); a job token or no token gets a
+401. The API is a management surface over the config file, not a database:
+rules are read from and persisted back to `[execution_protection]` in the
+operator's config file, so they survive restarts, and — like hand-editing
+the file — changes take effect on engine restart.
+
+- `GET /api/v1/execution-protection` — whole policy: `{ "mode": "evaluate", "rules": [...] }`
+- `PUT /api/v1/execution-protection/mode` — `{ "mode": "enforce" }` flips the table mode
+- `GET /api/v1/execution-protection/rules` — `{ "rules": [...] }`
+- `POST /api/v1/execution-protection/rules` — create; body
+  `{ "kind": "event", "event": "push", "workflows": ["deploy.yml"] }`
+  (or `{ "kind": "actor", "actor": "mallory" }`); `"action"` defaults to and
+  only supports `"deny"`
+- `GET / PUT / DELETE /api/v1/execution-protection/rules/:id` — read,
+  replace, or delete one rule
+
+Rule ids are positional (`event-0`, `actor-1`, …): the rule's index inside
+its kind list. They shift when an earlier rule of the same kind is deleted,
+so re-list after a delete if you cache them. `DELETE
+/api/v1/execution-protection/rules/event-0` removes the default
+`pull_request_target` rule and writes an explicit empty `event_rules` list
+back, so the default does not reappear on the next load.
 ### 8.2 Token permissions ceiling
 
 A hard operator cap on `GITHUB_TOKEN` permissions, mirroring GitHub's

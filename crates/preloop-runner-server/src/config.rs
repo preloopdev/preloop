@@ -531,16 +531,61 @@ pub struct ActorRule {
 /// A `pull_request_target` kill is an event rule with
 /// `event = "pull_request_target"`.
 ///
+/// Every fresh config carries one rule by default: GitHub's default
+/// `pull_request_target` rule, in evaluate (log-only) mode — see
+/// [`ExecutionProtectionConfig::default_pull_request_target_rule`]. The
+/// operator removes it with an explicit `event_rules = []`, or through the
+/// `DELETE /api/v1/execution-protection/rules/event-0` management endpoint.
+///
 /// Unknown fields are rejected at parse time, as in [`EventRule`].
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionProtectionConfig {
     #[serde(default)]
     pub mode: ProtectionMode,
-    #[serde(default)]
+    #[serde(default = "ExecutionProtectionConfig::default_event_rules")]
     pub event_rules: Vec<EventRule>,
     #[serde(default)]
     pub actor_rules: Vec<ActorRule>,
+}
+
+impl ExecutionProtectionConfig {
+    /// GitHub's default execution-protection rule: `pull_request_target`
+    /// denied on public repos — evaluate (log-only) mode first, enforced
+    /// later. Preloop has no public/private repo distinction, so
+    /// the default applies server-wide in evaluate mode: it logs what it
+    /// would deny without changing what runs.
+    ///
+    /// This is a real rule in the operator's config, visible through the
+    /// management API as `event-0` and removable with
+    /// `DELETE /api/v1/execution-protection/rules/event-0` (the API writes
+    /// an explicit empty `event_rules` list back, so the default does not
+    /// reappear on the next load) or with `event_rules = []` in the config
+    /// file.
+    ///
+    /// Preloop does not auto-flip this rule to enforce — the
+    /// operator flips the whole table to `enforce` mode when they are ready.
+    pub fn default_pull_request_target_rule() -> EventRule {
+        EventRule {
+            event: "pull_request_target".to_owned(),
+            workflows: None,
+            action: PolicyRuleAction::Deny,
+        }
+    }
+
+    fn default_event_rules() -> Vec<EventRule> {
+        vec![Self::default_pull_request_target_rule()]
+    }
+}
+
+impl Default for ExecutionProtectionConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProtectionMode::Evaluate,
+            event_rules: Self::default_event_rules(),
+            actor_rules: Vec::new(),
+        }
+    }
 }
 
 /// Fork pull-request workflow policy, mirroring GitHub's "Fork pull request
@@ -638,8 +683,11 @@ pub struct ConfigFile {
     #[serde(default)]
     pub fork_policy: ForkPolicyConfig,
     /// Workflow execution protections (`[execution_protection]`), mirroring
-    /// GitHub's admin-level event/actor rules. Empty by default: no triggers
-    /// are denied until the operator writes rules.
+    /// GitHub's admin-level event/actor rules. Carries GitHub's default
+    /// `pull_request_target` rule in evaluate (log-only) mode unless the
+    /// operator removes it (explicit `event_rules = []`, or the rule
+    /// management API). A config change takes effect on restart, like the
+    /// other policy tables in the config file.
     #[serde(default)]
     pub execution_protection: ExecutionProtectionConfig,
     /// Secrets-store mode: `file` (default; values persist in this file,
@@ -1350,7 +1398,21 @@ fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
 /// like `deploy-[0-9].yml` would parse but match literally, silently missing
 /// the intended workflow — so fail the config load closed instead.
 fn validate_execution_protection(config: &ConfigFile) -> anyhow::Result<()> {
-    let policy = &config.execution_protection;
+    validate_execution_protection_rules(&config.execution_protection)
+}
+
+/// Reject execution-protection rules the matcher cannot honor.
+///
+/// `workflows` patterns are matched with [`preloop_gha_parser::glob_match`],
+/// which implements `*`, `**`, and `?` only. A GitHub-style character class
+/// like `deploy-[0-9].yml` would parse but match literally, silently missing
+/// the intended workflow — so fail the config load closed instead.
+///
+/// Shared by config load and the rule-management API: a rule the API accepts
+/// must also survive a restart, so both run the same check.
+pub(crate) fn validate_execution_protection_rules(
+    policy: &ExecutionProtectionConfig,
+) -> anyhow::Result<()> {
     let mut rules: Vec<(&str, &str, &Option<Vec<String>>)> = Vec::new();
     for rule in &policy.event_rules {
         rules.push(("event rule", rule.event.as_str(), &rule.workflows));
