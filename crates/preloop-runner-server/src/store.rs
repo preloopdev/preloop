@@ -1586,6 +1586,38 @@ pub fn apply_meta_snapshot(
         .map(|(run_id, job_id, granted)| ((run_id, job_id), granted))
         .collect();
     inner.concurrency_groups = rekey_restored_concurrency_groups(inner, meta.concurrency_groups);
+    // Rekey JobSet admissions BEFORE reconcile/promote: a promoted JobSet gate
+    // inserts its key into acquired_keys and creates live group entries, so
+    // advancing admissions on stale keys would split the JobSet's identity
+    // across old and new namespaces (the JobSet ends up queued behind itself).
+    inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
+    for (id, admission) in &mut inner.jobset_admissions {
+        let tier = inner
+            .runs
+            .get(&id.run_id)
+            .and_then(|run| crate::events::trust_tier::tier_of(&run.submission));
+        // Persisted acquired keys are canonical keys, not display names:
+        // re-deriving them from (repo, group) would stack a second namespace
+        // on keys written by this build and break identity with the gate they
+        // belong to. Translate each through its gate's old→new key instead.
+        let mut key_map = std::collections::BTreeMap::new();
+        for gate in &mut admission.gates {
+            let old_key = gate.key.clone();
+            let repo = gate.key.0.clone();
+            gate.key = concurrency::concurrency_key_for_tier(&repo, &gate.display_name, tier);
+            key_map.insert(old_key, gate.key.clone());
+        }
+        let acquired = std::mem::take(&mut admission.acquired_keys);
+        admission.acquired_keys = acquired
+            .into_iter()
+            .map(|key| {
+                key_map
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| concurrency::concurrency_key_for_tier(&key.0, &key.1, tier))
+            })
+            .collect();
+    }
     // A restored group may name a holder whose run is already terminal (the
     // snapshot predates the completion) or missing entirely; leaving it in
     // place parks every later submission in that group forever. Reconcile
@@ -1593,22 +1625,6 @@ pub fn apply_meta_snapshot(
     // unblock.
     crate::runtime_scheduling::reconcile_concurrency_groups(inner);
     crate::runtime_scheduling::promote_ready_jobs(inner, environment_rules, &[]);
-    inner.jobset_admissions = meta.jobset_admissions.into_iter().collect();
-    for (id, admission) in &mut inner.jobset_admissions {
-        let tier = inner
-            .runs
-            .get(&id.run_id)
-            .and_then(|run| crate::events::trust_tier::tier_of(&run.submission));
-        for gate in &mut admission.gates {
-            let repo = gate.key.0.clone();
-            gate.key = concurrency::concurrency_key_for_tier(&repo, &gate.display_name, tier);
-        }
-        let acquired = std::mem::take(&mut admission.acquired_keys);
-        admission.acquired_keys = acquired
-            .into_iter()
-            .map(|(repo, group)| concurrency::concurrency_key_for_tier(&repo, &group, tier))
-            .collect();
-    }
     inner.run_concurrency = meta.run_concurrency.into_iter().collect();
     inner.holder_keys = meta.holder_keys.into_iter().collect();
     rebuild_holder_keys(inner);
