@@ -4981,9 +4981,7 @@ impl ControlBackend for SqliteBackend {
                     .ok()
                     .and_then(|v| v["repository"].as_str().map(str::to_owned))
                     .ok_or_else(|| {
-                        ControlError::backend(anyhow::anyhow!(
-                            "submission_json missing repository"
-                        ))
+                        ControlError::backend(anyhow::anyhow!("submission_json missing repository"))
                     })
             })
             .transpose()

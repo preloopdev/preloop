@@ -274,13 +274,27 @@ impl PostgresBackend {
         scope: &TxScope,
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
+        self.transact_reserving(scope, 0, f).await
+    }
+
+    /// `transact_scoped` for a command that mints up to `request_ids` new
+    /// `job_requests` rows. The ids are drawn from `request_id_seq` up front
+    /// so concurrent writers on different runs never share a primary key.
+    async fn transact_reserving<T>(
+        &self,
+        scope: &TxScope,
+        request_ids: usize,
+        f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
+    ) -> Result<T, ControlError> {
         if scope.include_archived {
             return Err(ControlError::BadRequest(
                 "history scope is read-only".into(),
             ));
         }
         let mut client = self.checkout_writer().await?;
-        let result = self.transact_on(&mut client, scope, None, f).await;
+        let result = self
+            .transact_on(&mut client, scope, None, request_ids, f)
+            .await;
         self.return_writer(client).await;
         result
     }
@@ -294,7 +308,9 @@ impl PostgresBackend {
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
         let mut client = self.checkout_writer().await?;
-        let result = self.transact_on(&mut client, scope, Some(runner), f).await;
+        let result = self
+            .transact_on(&mut client, scope, Some(runner), 0, f)
+            .await;
         self.return_writer(client).await;
         result
     }
@@ -490,6 +506,7 @@ impl PostgresBackend {
         client: &mut Client,
         scope: &TxScope,
         poll_runner: Option<&crate::models::RunnerCapabilities>,
+        request_ids: usize,
         f: impl FnOnce(&mut TxState) -> Result<T, ControlError>,
     ) -> Result<T, ControlError> {
         let started = std::time::Instant::now();
@@ -538,7 +555,29 @@ impl PostgresBackend {
         .await?;
         let loaded = started.elapsed();
         let mut tx = tx.with_config(self.config());
+        // Every Postgres transaction allocates from a reserved pool — empty
+        // unless the command declared how many attempts it may mint — so an
+        // undeclared allocation fails closed instead of racing a peer.
+        let reserved = if request_ids == 0 {
+            std::collections::VecDeque::new()
+        } else {
+            txn.query(
+                "SELECT nextval('request_id_seq') FROM generate_series(1, $1::bigint)",
+                &[&(request_ids as i64)],
+            )
+            .await
+            .map_err(ControlError::backend)?
+            .iter()
+            .map(|row| row.get::<_, i64>(0))
+            .collect()
+        };
+        tx.reserved_request_ids = Some(reserved);
         let result = run_blocking(|| f(&mut tx))?;
+        if tx.request_id_shortfall {
+            return Err(ControlError::backend(anyhow::anyhow!(
+                "command minted more job requests than it reserved ({request_ids})"
+            )));
+        }
         let decided = started.elapsed();
         write_txstate(&txn, &tx, &effective_scope, &self.cipher).await?;
         // Cross-node wake-up: delivered to every node's listener only if this
@@ -2805,23 +2844,11 @@ async fn load_txstate(
         match name.as_str() {
             "next_message_id" => tx.next_message_id = value,
             "next_runner_id" => tx.next_runner_id = value,
-            "next_request_id" => tx.next_request_id = value,
             _ => {}
         }
         tx.loaded.counters.insert(name, value);
     }
-    // `next_request_id` must never re-issue an existing `job_requests`
-    // primary key — including ids written before the counter row existed or
-    // by a peer that has not yet committed its counter bump. Seed from the
-    // table max so the first in-transaction allocation is `max + 1`.
-    {
-        let max_request: i64 = conn
-            .query_one("SELECT COALESCE(MAX(request_id), 0) FROM job_requests", &[])
-            .await
-            .map_err(ControlError::backend)?
-            .get(0);
-        tx.next_request_id = tx.next_request_id.max(max_request);
-    }
+    // Request ids come from `request_id_seq` (see `transact_reserving`).
     for row in conn
         .query("SELECT key, value FROM workflow_run_counters", &[])
         .await
@@ -4030,8 +4057,15 @@ impl ControlBackend for PostgresBackend {
             pending_expansions: false,
             runs_via_requests: false,
         };
-        self.transact_scoped(&scope, |tx| commands::submit_run_tx(tx, submit))
-            .await
+        let request_ids = submit
+            .jobs
+            .iter()
+            .filter(|job| job.request.is_some())
+            .count();
+        self.transact_reserving(&scope, request_ids, |tx| {
+            commands::submit_run_tx(tx, submit)
+        })
+        .await
     }
 
     async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
@@ -4384,7 +4418,11 @@ impl ControlBackend for PostgresBackend {
             pending_expansions: false,
             runs_via_requests: false,
         };
-        self.transact_scoped(&scope, |tx| {
+        let request_ids = claim
+            .built
+            .as_ref()
+            .map_or(0, sched::BuiltExpansion::job_count);
+        self.transact_reserving(&scope, request_ids, |tx| {
             let mut outcome = crate::runtime_scheduling::SchedulingOutcome::default();
             let current = tx
                 .expand_generations
@@ -5553,9 +5591,7 @@ impl ControlBackend for PostgresBackend {
                     .ok()
                     .and_then(|v| v["repository"].as_str().map(str::to_owned))
                     .ok_or_else(|| {
-                        ControlError::backend(anyhow::anyhow!(
-                            "submission_json missing repository"
-                        ))
+                        ControlError::backend(anyhow::anyhow!("submission_json missing repository"))
                     })
             })
             .transpose();
@@ -5762,10 +5798,7 @@ impl ControlBackend for PostgresBackend {
         let client = self.checkout_reader().await?;
         let result = async {
             let exists: bool = client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=$1)",
-                    &[&run],
-                )
+                .query_one("SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=$1)", &[&run])
                 .await
                 .map_err(ControlError::backend)?
                 .get(0);
@@ -5892,11 +5925,11 @@ impl ControlBackend for PostgresBackend {
             let changed = tx
                 .execute(
                     "INSERT INTO run_jobs (run_id, job_id, check_run_id) \
-                     SELECT $1, $2, $3 \
+                     SELECT $1::text, $2::text, $3::bigint \
                      WHERE EXISTS (SELECT 1 FROM jobs WHERE run_id = $1 AND job_id = $2) \
                      ON CONFLICT(run_id, job_id) DO UPDATE SET \
                      check_run_id = excluded.check_run_id \
-                     WHERE run_jobs.check_run_id IS NOT $3",
+                     WHERE run_jobs.check_run_id IS DISTINCT FROM $3",
                     &[&run_id.0.to_string(), &job_id.0, &(check_run_id as i64)],
                 )
                 .await

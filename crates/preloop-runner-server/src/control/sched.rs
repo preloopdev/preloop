@@ -2108,6 +2108,15 @@ pub(crate) enum BuiltExpansion {
     },
 }
 
+impl BuiltExpansion {
+    /// Jobs this expansion registers — each mints one `job_requests` row.
+    pub(crate) fn job_count(&self) -> usize {
+        match self {
+            Self::Reusable { jobs, .. } | Self::Matrix { jobs } => jobs.len(),
+        }
+    }
+}
+
 /// Snapshot the inputs a deferred node needs, inside the claim transaction
 /// (ported verbatim).
 pub(crate) fn plan_expansion(tx: &TxState, job: &QueuedJob) -> Option<ExpansionPlan> {

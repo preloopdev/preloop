@@ -52,7 +52,7 @@ if [ -n "$FAULTS" ]; then
   proxy_args=()
   for f in $FAULTS; do proxy_args+=(--fault "$f"); done
   "$bindir/preloop-control-load" proxy --listen 127.0.0.1:55499 --upstream "$upstream" \
-    "${proxy_args[@]}" >"$out/proxy.log" 2>&1 &
+    ${proxy_args[@]+"${proxy_args[@]}"} >"$out/proxy.log" 2>&1 &
   pids+=($!)
   engine_db_url=$(echo "$db_url" | sed -E 's#@[^/]+/#@127.0.0.1:55499/#')
   sleep 1
@@ -111,7 +111,7 @@ servers_csv=$(IFS=,; echo "${servers[*]}")
   --servers "$servers_csv" --label "$LABEL" --out "$root/load-results" \
   --runs-per-sec "$RUNS_PER_SEC" --duration-secs "$DURATION" --drain-secs "$DRAIN" \
   --runners "$RUNNERS" --webhook-sha "$sha" --webhook-fraction "$WEBHOOK_FRACTION" \
-  --job-median-ms "$JOB_MEDIAN_MS" --pg-url "$db_url" "${burst_args[@]}" \
+  --job-median-ms "$JOB_MEDIAN_MS" --pg-url "$db_url" ${burst_args[@]+"${burst_args[@]}"} \
   2>"$out/harness.log" | tee "$out/stdout.txt"
 
 # Per-node transaction phase timing, captured before the nodes stop.
@@ -128,7 +128,7 @@ SELECT 'jobs_by_status', status, count(*) FROM jobs GROUP BY status ORDER BY 2;
 SELECT 'inflight_requests', count(*) FROM job_requests WHERE result IS NULL;
 SELECT 'duplicate_inflight', count(*) FROM (SELECT run_id, job_id FROM job_requests WHERE result IS NULL GROUP BY 1,2 HAVING count(*) > 1) d;
 SELECT 'duplicate_runners', count(*) FROM (SELECT name FROM runners GROUP BY name HAVING count(*) > 1) d;
-SELECT 'webhook_states', state, count(*) FROM public.webhook_deliveries GROUP BY state;
+SELECT 'webhook_states', state, count(*) FROM webhook_deliveries GROUP BY state;
 SELECT 'db_size_mb', pg_database_size(current_database()) / 1048576;
 SQL
 cat "$out/integrity.txt"

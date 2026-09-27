@@ -188,40 +188,34 @@ pub async fn live_run_logs_sse(
     Path(run_id): Path<RunId>,
     Query(query): Query<LiveLogsQuery>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    let job_id = match query.job {
-        Some(job) => job,
-        None => {
-            // Indexed point read: `run.jobs` ∪ the run's request job ids.
-            let jobs = shared
-                .state
-                .backend
-                .run_job_ids(run_id)
-                .await
-                .map_err(|error| match error {
-                    crate::control::ControlError::NotFound(_) => {
-                        ApiError::not_found("run not found")
+    let job_id =
+        match query.job {
+            Some(job) => job,
+            None => {
+                // Indexed point read: `run.jobs` ∪ the run's request job ids.
+                let jobs =
+                    shared.state.backend.run_job_ids(run_id).await.map_err(
+                        |error| match error {
+                            crate::control::ControlError::NotFound(_) => {
+                                ApiError::not_found("run not found")
+                            }
+                            other => ApiError::from(other),
+                        },
+                    )?;
+                match jobs.len() {
+                    0 => return Err(ApiError::not_found("run has no jobs to follow")),
+                    1 => jobs.into_iter().next().expect("one job was counted"),
+                    _ => {
+                        return Err(ApiError::bad_request(format!(
+                            "`job` needs a value when a run has {} jobs: {}",
+                            jobs.len(),
+                            jobs.join(", ")
+                        )));
                     }
-                    other => ApiError::from(other),
-                })?;
-            match jobs.len() {
-                0 => return Err(ApiError::not_found("run has no jobs to follow")),
-                1 => jobs.into_iter().next().expect("one job was counted"),
-                _ => {
-                    return Err(ApiError::bad_request(format!(
-                        "`job` needs a value when a run has {} jobs: {}",
-                        jobs.len(),
-                        jobs.join(", ")
-                    )));
                 }
             }
-        }
-    };
-    let key = {
-        let inner = shared.state.inner.lock().await;
-        live_log_key_for_job(&inner, run_id, &job_id)
-    }
-    .ok_or_else(|| ApiError::not_found("job not found"))?;
-    live_log_stream(&shared, run_id, &job_id, &key).await
+        };
+    live_log_stream(&shared, run_id, &job_id).await
 }
 
 /// `key` is the concrete live-log key the caller was authorized for; the

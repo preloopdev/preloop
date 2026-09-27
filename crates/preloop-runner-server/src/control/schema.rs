@@ -994,6 +994,10 @@ CREATE TABLE IF NOT EXISTS counters (
 -- counter row stays locked until commit and would serialize every writer.
 CREATE SEQUENCE IF NOT EXISTS job_seq;
 CREATE SEQUENCE IF NOT EXISTS queue_position_seq;
+-- `job_requests.request_id` allocator. Writers on different runs hold
+-- different run locks, so an in-memory `MAX(request_id) + 1` would hand two
+-- concurrent submits the same id. `nextval` never blocks and never repeats.
+CREATE SEQUENCE IF NOT EXISTS request_id_seq;
 CREATE TABLE IF NOT EXISTS workflow_run_counters (
     key                 TEXT PRIMARY KEY,
     value               BIGINT NOT NULL DEFAULT 0

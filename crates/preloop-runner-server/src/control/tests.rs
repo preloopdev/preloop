@@ -893,6 +893,52 @@ pub(crate) mod suite {
         }
     }
 
+    /// The job → check-run mapping: set reports whether it changed, a
+    /// re-report of the same id is a no-op, clear is conditional on the id
+    /// still recorded, and jobs outside the run are never mapped. Every
+    /// webhook delivery goes through `set_job_check_run`.
+    pub(crate) async fn check_run_mapping(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let build = JobId("build".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+
+        assert!(backend.set_job_check_run(run_id, &build, 11).await.unwrap());
+        assert!(!backend.set_job_check_run(run_id, &build, 11).await.unwrap());
+        assert!(backend.set_job_check_run(run_id, &build, 12).await.unwrap());
+        assert_eq!(
+            backend.job_check_run_id(run_id, &build).await.unwrap(),
+            Some(12)
+        );
+
+        backend
+            .clear_job_check_run(run_id, &build, 11)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.job_check_run_id(run_id, &build).await.unwrap(),
+            Some(12),
+            "a stale clear must not drop the current mapping"
+        );
+        backend
+            .clear_job_check_run(run_id, &build, 12)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.job_check_run_id(run_id, &build).await.unwrap(),
+            None
+        );
+
+        let ghost = JobId("ghost".to_owned());
+        assert!(!backend.set_job_check_run(run_id, &ghost, 13).await.unwrap());
+        assert_eq!(
+            backend.job_check_run_id(run_id, &ghost).await.unwrap(),
+            None
+        );
+    }
+
     /// Purge recovery for an OWNERLESS claim: `verified_runner_id: None` leaves
     /// `job_requests.owner_runner_id = None`, so the only ownership evidence is
     /// the doomed session's `session_active_requests` mapping. The purge must
@@ -1246,6 +1292,11 @@ mod sqlite {
     #[tokio::test]
     async fn purge_requeues_ownerless_claim() {
         suite::purge_requeues_ownerless_claim(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn check_run_mapping() {
+        suite::check_run_mapping(&SqliteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2935,6 +2986,12 @@ mod postgres {
     }
 
     #[tokio::test]
+    async fn check_run_mapping() {
+        let (_pg, backend) = backend().await;
+        suite::check_run_mapping(&backend).await;
+    }
+
+    #[tokio::test]
     async fn submit_unhostable_job_persists_failure() {
         let (_pg, backend) = backend().await;
         suite::submit_unhostable_job_persists_failure(&backend).await;
@@ -3115,6 +3172,54 @@ mod postgres {
             REGISTRATIONS,
             "runner ids were handed out twice: {ids:?}"
         );
+    }
+
+    async fn submit_many(node: &PostgresBackend, count: usize) -> Vec<uuid::Uuid> {
+        let submits: Vec<_> = (0..count)
+            .map(|_| {
+                let run_id = RunId::new();
+                super::submit_run(run_id, vec![super::submit_job(run_id, "build", 0)])
+            })
+            .collect();
+        let agents = submits
+            .iter()
+            .map(|s| s.jobs[0].request.as_ref().unwrap().agent_job_id)
+            .collect();
+        let results =
+            futures::future::join_all(submits.into_iter().map(|s| node.submit_run(s))).await;
+        for result in results {
+            result.unwrap();
+        }
+        agents
+    }
+
+    /// Submits on different runs hold different run locks and overlap. The
+    /// request id each one mints must still be unique: a shared id made the
+    /// write-back upsert keep the first attempt's identity columns while
+    /// storing the second attempt's message, so the second runner's timeline
+    /// and completion callbacks resolved to no request (403/404 under load).
+    #[tokio::test]
+    async fn concurrent_submits_mint_distinct_request_ids() {
+        let (_pg, node_a, node_b) = backend_pair().await;
+        const PER_NODE: usize = 24;
+        let (agents_a, agents_b) = tokio::join!(
+            submit_many(&node_a, PER_NODE),
+            submit_many(&node_b, PER_NODE)
+        );
+
+        let mut request_ids = std::collections::BTreeSet::new();
+        for agent in agents_a.into_iter().chain(agents_b) {
+            let request = node_a
+                .request(crate::control::backend::RequestKey::AgentJobId(agent))
+                .await
+                .unwrap_or_else(|e| panic!("attempt {agent} lost its request row: {e:?}"));
+            assert!(
+                request_ids.insert(request.request_id),
+                "request id {} was minted twice",
+                request.request_id
+            );
+        }
+        assert_eq!(request_ids.len(), PER_NODE * 2);
     }
 
     /// ready→claimed (poll): claimed row clears `queue_position`, takes a

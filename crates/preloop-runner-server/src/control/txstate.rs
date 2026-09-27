@@ -128,11 +128,17 @@ pub(crate) struct TxState {
     pub(crate) timeline_requests: BTreeMap<uuid::Uuid, i64>,
     pub(crate) next_message_id: i64,
     pub(crate) next_runner_id: i64,
-    /// Next job-request correlation id. Persisted in `counters` and minted
-    /// only inside the serialized writer transaction, so two engines sharing
-    /// one database cannot allocate the same `job_requests` primary key the
-    /// way a process-local atomic would.
+    /// Next job-request correlation id on SQLite, where the single writer
+    /// serializes every allocation.
     pub(crate) next_request_id: i64,
+    /// Request ids reserved from Postgres `request_id_seq` before this
+    /// transaction loaded. `Some` means allocation must come from the pool:
+    /// run-scoped writers on different runs run concurrently, so an
+    /// in-memory `max + 1` would hand two of them the same primary key.
+    pub(crate) reserved_request_ids: Option<VecDeque<i64>>,
+    /// Set when a command allocated more request ids than were reserved.
+    /// Write-back refuses to commit such a transaction.
+    pub(crate) request_id_shortfall: bool,
 
     // ── Steps ─────────────────────────────────────────────────────────
     /// Step manifest per execution attempt (`agent_job_id`), in manifest
@@ -662,11 +668,19 @@ impl TxState {
         self.next_message_id
     }
 
-    /// Allocate the next job-request correlation id (counters table on
-    /// write-back). Called only inside the writer transaction; the loaded
-    /// value is `max(counters.next_request_id, max(job_requests.request_id))`
-    /// so a fresh counter row can never re-issue an existing id.
+    /// Allocate the next job-request correlation id. Postgres transactions
+    /// consume ids reserved from `request_id_seq` before load; running dry
+    /// marks the transaction so write-back refuses it (and returns a
+    /// placeholder that is never persisted). SQLite's single writer
+    /// serializes allocation, so it advances the loaded counter.
     pub(crate) fn alloc_request_id(&mut self) -> i64 {
+        if let Some(pool) = &mut self.reserved_request_ids {
+            if let Some(id) = pool.pop_front() {
+                return id;
+            }
+            self.request_id_shortfall = true;
+            return 0;
+        }
         self.next_request_id += 1;
         self.next_request_id
     }
