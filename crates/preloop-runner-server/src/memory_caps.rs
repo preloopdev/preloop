@@ -519,6 +519,129 @@ fn purge_evicted_run(inner: &mut InnerState, run_id: RunId) {
     inner.oidc_job_contexts.retain(|(rid, _), _| *rid != run_id);
 }
 
+/// Everything the retention sweep must delete outside process memory when
+/// it deletes a run. The durable rows go through the [`Store`], but these
+/// are collected here — while the state lock is held — so the sweep can
+/// delete them right after releasing it.
+pub struct RunRemoval {
+    /// In-memory log keys (`{plan_id}/{log_id}`) that belonged to the run.
+    /// The sweep deletes each from the durable log tables as well.
+    pub log_keys: Vec<String>,
+    /// On-disk paths of the run's v1 artifacts.
+    pub artifact_paths: Vec<std::path::PathBuf>,
+    /// `blob_token`s of the run's finalized artifact-v2 entries; the sweep
+    /// deletes `blobs/artifact/<token>` for each.
+    pub artifact_v2_blob_tokens: Vec<String>,
+}
+
+/// Delete a run from every in-memory structure and collect what the caller
+/// must also delete from the durable store and the filesystem.
+///
+/// This is the full teardown used by the retention sweep: the run record
+/// itself, every dispatch-queue / request / session reference (the same set
+/// [`purge_evicted_run`] drops for memory-pressure eviction), the heavy
+/// per-job runtime state, retained logs, and both artifact registries.
+/// Unlike memory-pressure eviction — which keeps the durable rows so a
+/// restart restores the run — the caller is expected to delete the durable
+/// rows ([`Store::delete_run`], [`Store::delete_log`], a meta-snapshot
+/// rewrite) and the returned files, so the run cannot be resurrected.
+pub fn remove_run_everywhere(inner: &mut InnerState, run_id: RunId) -> RunRemoval {
+    // Plan ids first: log keys, timeline records, and artifact scopes are
+    // keyed by plan, and the plan -> run mapping lives in the job requests
+    // we are about to purge.
+    let plan_ids: Vec<String> = inner
+        .job_requests
+        .values()
+        .filter(|record| record.run_id == run_id)
+        .map(|record| record.plan_id.clone())
+        .collect();
+    let agent_ids: std::collections::BTreeSet<String> = inner
+        .job_requests
+        .values()
+        .filter(|record| record.run_id == run_id)
+        .map(|record| record.agent_job_id.to_string())
+        .collect();
+
+    drop_run_runtime_state(inner, run_id);
+
+    // Retained console logs: keys are `{plan_id}/{log_id}`.
+    let mut log_keys = Vec::new();
+    for plan_id in &plan_ids {
+        let prefix = format!("{plan_id}/");
+        let keys: Vec<String> = inner
+            .logs
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(bytes) = inner.logs.remove(&key) {
+                inner.log_bytes_total = inner.log_bytes_total.saturating_sub(bytes.len());
+            }
+            inner.log_metadata.remove(&key);
+            inner.log_order.retain(|ordered| ordered != &key);
+            log_keys.push(key);
+        }
+    }
+
+    // v1 artifacts, keyed by artifact id with the run on the record.
+    let mut artifact_paths = Vec::new();
+    let artifact_ids: Vec<String> = inner
+        .artifacts
+        .iter()
+        .filter(|(_, record)| record.run_id == run_id)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in artifact_ids {
+        if let Some(record) = inner.artifacts.remove(&id) {
+            artifact_paths.push(std::path::PathBuf::from(record.path));
+        }
+    }
+
+    // Artifact-v2 registry: keys are `{run_id}/{name}`.
+    let prefix = format!("{run_id}/");
+    let mut artifact_v2_blob_tokens = Vec::new();
+    let registry_keys: Vec<String> = inner
+        .artifact_v2_registry
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for key in registry_keys {
+        if let Some(entry) = inner.artifact_v2_registry.remove(&key) {
+            artifact_v2_blob_tokens.push(entry.blob_token);
+        }
+        inner
+            .artifact_registry_order
+            .retain(|ordered| ordered != &key);
+    }
+
+    // Debug sessions close with their jobs; drop any stray. Diag upload
+    // tokens are minted per job attempt and would otherwise linger.
+    inner.debug_sessions.remove_for_run(run_id);
+    inner
+        .diag_upload_tokens
+        .retain(|_, token| !agent_ids.contains(&token.job_id));
+
+    // Run-keyed singletons the eviction path leaves alone because an
+    // evicted run's record is restorable; a retention-deleted run is not.
+    inner.dap_ports.remove(&run_id);
+    inner.run_concurrency.remove(&run_id);
+    inner.holder_keys.remove(&run_id);
+    inner.claimed_jobs.retain(|(rid, _), _| *rid != run_id);
+    inner.expanding.retain(|(rid, _)| *rid != run_id);
+    inner.pending_expansions.retain(|job| job.run_id != run_id);
+
+    purge_evicted_run(inner, run_id);
+    inner.runs.remove(&run_id);
+
+    RunRemoval {
+        log_keys,
+        artifact_paths,
+        artifact_v2_blob_tokens,
+    }
+}
+
 /// Drop the heavy per-job runtime state of a run: retained live-log buffers
 /// (up to 64 MiB each), step records, and timeline projections. The durable
 /// store keeps the authoritative copies; this only frees the in-memory

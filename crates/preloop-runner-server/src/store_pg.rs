@@ -1304,6 +1304,21 @@ impl Store for PgStore {
             .await?;
         Ok(())
     }
+    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        let run_id = run_id.to_string();
+        let client = self.connection.lock().await;
+        // The FK-bearing tables cascade from `runs`; `control_events`
+        // carries no FK and is deleted explicitly. (Postgres has no
+        // `runner_commands` table; SQLite deletes it separately.)
+        // Idempotent: deleting an absent run deletes nothing.
+        client
+            .execute("DELETE FROM control_events WHERE run_id = $1", &[&run_id])
+            .await?;
+        client
+            .execute("DELETE FROM runs WHERE run_id = $1", &[&run_id])
+            .await?;
+        Ok(())
+    }
 
     async fn append_event(&self, event: &NdjsonEvent) -> anyhow::Result<()> {
         let mut client = self.connection.lock().await;

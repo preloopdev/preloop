@@ -630,7 +630,7 @@ impl Default for ForkPolicyConfig {
 }
 
 /// The engine configuration file.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
     pub github: GitHubConfig,
@@ -690,6 +690,14 @@ pub struct ConfigFile {
     /// other policy tables in the config file.
     #[serde(default)]
     pub execution_protection: ExecutionProtectionConfig,
+    /// Run/check/status retention, in days, mirroring GitHub's Actions
+    /// retention setting. A background sweep deletes terminal runs — and
+    /// their check-run records, commit statuses, artifacts, and logs —
+    /// once they are older than this. Default 90 follows GitHub. `0`
+    /// disables the sweep: runs accumulate indefinitely, as before.
+    /// Env: `PRELOOP_RETENTION_DAYS` wins over this key.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
     /// Secrets-store mode: `file` (default; values persist in this file,
     /// mode 0600) or `memory` (values exist only in engine memory for the
     /// current process lifetime — nothing is ever written to the config
@@ -699,6 +707,17 @@ pub struct ConfigFile {
     pub secrets_store: Option<String>,
 }
 
+impl Default for ConfigFile {
+    fn default() -> Self {
+        // Every field carries a serde default, so parsing an empty document
+        // is the canonical default config. This keeps `Default` in sync
+        // with the documented `#[serde(default = ...)]` values (notably the
+        // 90-day retention) instead of Rust's zero default, which would
+        // silently disable the retention sweep for a missing config file.
+        toml::from_str("").expect("empty TOML parses; every field has a serde default")
+    }
+}
+
 /// Env override for the secrets-store mode; see [`ConfigFile::secrets_store`].
 pub const SECRETS_STORE_ENV: &str = "PRELOOP_SECRETS_STORE";
 pub const CHECKOUT_CACHE_MODE_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MODE";
@@ -706,6 +725,29 @@ pub const CHECKOUT_CACHE_RUN_RETENTION_ENV: &str = "PRELOOP_CHECKOUT_CACHE_RUN_R
 pub const CHECKOUT_CACHE_REPOSITORY_RETENTION_ENV: &str =
     "PRELOOP_CHECKOUT_CACHE_REPOSITORY_RETENTION_SECONDS";
 pub const CHECKOUT_CACHE_MAX_BYTES_ENV: &str = "PRELOOP_CHECKOUT_CACHE_MAX_BYTES";
+/// Env override for run/check/status retention; see [`ConfigFile::retention_days`].
+pub const RETENTION_DAYS_ENV: &str = "PRELOOP_RETENTION_DAYS";
+/// Default run retention, in days, following GitHub's Actions retention setting.
+pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+
+fn default_retention_days() -> u64 {
+    DEFAULT_RETENTION_DAYS
+}
+
+/// Resolve the effective run retention: `PRELOOP_RETENTION_DAYS` wins over
+/// the config file key. An unparseable value is an error — a typo must fail
+/// closed rather than silently keep (or drop) years of run history.
+pub fn retention_days(config: &ConfigFile) -> anyhow::Result<u64> {
+    if let Some(raw) = std::env::var(RETENTION_DAYS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return raw.trim().parse().with_context(|| {
+            format!("invalid unsigned integer in {RETENTION_DAYS_ENV} (`{raw}`)")
+        });
+    }
+    Ok(config.retention_days)
+}
 
 /// Parse a checkout-cache mode. Unknown values are an error from the parser;
 /// every caller warns and falls back to `off`, so a typo never silently
@@ -823,9 +865,62 @@ run_retention_seconds = 60
     }
 }
 
+#[cfg(test)]
+mod retention_config_tests {
+    use super::*;
+
+    /// Absent key keeps the GitHub-matching default of 90 days. This test
+    /// never touches the process env; see `retention_days_env_handling`.
+    #[test]
+    fn retention_days_defaults_to_90() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(config.retention_days, 90);
+        assert_eq!(config.retention_days, DEFAULT_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn retention_days_custom_value_honored() {
+        // Field-level only: the resolver's env handling lives in
+        // `retention_days_env_handling`, the one test that mutates the var.
+        let config: ConfigFile = toml::from_str("retention_days = 30").unwrap();
+        assert_eq!(config.retention_days, 30);
+        // 0 is the documented escape hatch: the sweep stays off.
+        let disabled: ConfigFile = toml::from_str("retention_days = 0").unwrap();
+        assert_eq!(disabled.retention_days, 0);
+    }
+
+    /// Env wins over the file; a blank value counts as unset; an unparseable
+    /// value is an error rather than silently keeping or dropping run
+    /// history; with the var unset the file value is used. These cases live
+    /// in one test so the process-wide env var is never mutated by two
+    /// tests at once.
+    #[test]
+    fn retention_days_env_handling() {
+        let prior = std::env::var(RETENTION_DAYS_ENV).ok();
+        let config: ConfigFile = toml::from_str("retention_days = 30").unwrap();
+        std::env::remove_var(RETENTION_DAYS_ENV);
+        assert_eq!(retention_days(&config).unwrap(), 30);
+        std::env::set_var(RETENTION_DAYS_ENV, "7");
+        assert_eq!(retention_days(&config).unwrap(), 7);
+        std::env::set_var(RETENTION_DAYS_ENV, "   ");
+        assert_eq!(retention_days(&config).unwrap(), 30);
+        std::env::set_var(RETENTION_DAYS_ENV, "ninety");
+        assert!(retention_days(&config).is_err());
+        match prior {
+            Some(value) => std::env::set_var(RETENTION_DAYS_ENV, value),
+            None => std::env::remove_var(RETENTION_DAYS_ENV),
+        }
+    }
+
+    /// A missing config file still gets the GitHub-matching default.
+    #[test]
+    fn retention_days_default_impl_is_90() {
+        assert_eq!(ConfigFile::default().retention_days, 90);
+    }
+}
+
 /// Systemd sets this when the unit mounts any `LoadCredential=`.
 pub const CREDENTIALS_ENV: &str = "CREDENTIALS_DIRECTORY";
-
 /// Credential name `preloop server install --systemd-credential` mounts.
 pub const CREDENTIAL_NAME: &str = "preloop-secrets";
 
@@ -1549,6 +1644,7 @@ mod tests {
             execution_protection: ExecutionProtectionConfig::default(),
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
+            retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 

@@ -727,6 +727,24 @@ impl DebugSessionRegistry {
         out
     }
 
+    /// Drop every session (and its archived history) belonging to `run_id`.
+    /// Sessions close with their jobs, so a terminal run should never have
+    /// one — this is the retention sweep's backstop, not the normal path.
+    pub fn remove_for_run(&mut self, run_id: preloop_gha_protocol::RunId) {
+        let stale: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, record)| record.session.run_id == run_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.sessions.remove(&id);
+            self.agent_event_archive.remove(&id);
+            self.agent_audit_archive.remove(&id);
+            self.archive_order.retain(|archived| archived != &id);
+        }
+    }
+
     /// Drop sessions whose worker stopped polling, or whose job is over.
     ///
     /// A worker that dies mid-pause must not pin timeout suspension forever;

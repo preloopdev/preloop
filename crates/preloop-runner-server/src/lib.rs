@@ -98,6 +98,8 @@ pub mod connection;
 use connection::*;
 pub mod memory_caps;
 use memory_caps::*;
+/// Run/check/status retention sweep (GitHub Actions retention setting).
+pub mod retention;
 
 /// Pure job-graph scheduler model and property tests.
 pub mod scheduling;
