@@ -314,15 +314,11 @@ impl PostgresBackend {
         });
         let mut poll_keys = None;
         if let Some(runner) = poll_runner {
-            // Polls run concurrently with each other (shared) and never with a
-            // global transaction (exclusive). Each claims under the run lock of
-            // its candidates, taken without waiting, so a poll never blocks
-            // while holding a lock another transaction needs.
-            txn.batch_execute(&format!(
-                "SELECT pg_advisory_xact_lock_shared({POSTGRES_WRITER_LOCK_KEY})"
-            ))
-            .await
-            .map_err(ControlError::backend)?;
+            // Polls do not take the global advisory lock. They take shared
+            // locks for candidate runs below; global writers take exclusive
+            // run locks before loading those same rows. This keeps unrelated
+            // global work from delaying every runner poll while preserving
+            // mutual exclusion on the rows a poll may claim.
             // Assignment modes may still refuse the head match
             // (`claim_permitted`), so they hold a few spare candidates.
             let assignments = self
