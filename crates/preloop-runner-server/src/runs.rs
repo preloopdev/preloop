@@ -2579,6 +2579,65 @@ fn strip_repo_prefix<'a>(file: &'a str, repository: &str) -> &'a str {
         .unwrap_or(file)
 }
 
+/// The four `job.workflow_*` context properties for one job: ref, sha,
+/// repository, file path, in that order.
+///
+/// GitHub's `job.workflow_ref`, `job.workflow_sha`,
+/// `job.workflow_repository` and `job.workflow_file_path` describe the
+/// workflow that *defines* the job — which differs from the run's own
+/// workflow only for reusable-workflow callee jobs. Jobs inlined from a
+/// reusable workflow carry their callee identity on the plan (stamped when
+/// the call expands); everything else falls back to the run's workflow.
+/// Caller placeholder nodes are jobs of the calling workflow, so they keep
+/// the caller's identity. A local callee has no repository or sha of its
+/// own — it lives in the caller's repository at the run's sha — so those
+/// two fall back to the run's values, and its `./path` ref renders as
+/// `owner/repo/path@<git ref>` the way the OIDC claims already do.
+fn job_source_identity(
+    job: &preloop_gha_protocol::JobPlan,
+    workflow_path: &str,
+    workflow_ref: &str,
+    git_ref: &str,
+    sha: &str,
+    repository: &str,
+) -> (String, String, String, String) {
+    if job.workflow_file.is_some() && job.reusable_call.is_none() {
+        // Remote callees store their file as `owner/repo/path`, but GitHub's
+        // `job.workflow_file_path` is the bare path.
+        let repository = job
+            .workflow_repository
+            .clone()
+            .unwrap_or_else(|| repository.to_owned());
+        let file_path = job
+            .workflow_file
+            .as_deref()
+            .map(|file| strip_repo_prefix(file, &repository))
+            .unwrap_or_default();
+        // Local `uses: ./path` refs render as `owner/repo/path@<git ref>`;
+        // remote refs keep their `owner/repo/path@ref` shape.
+        let workflow_ref = job
+            .workflow_ref
+            .as_deref()
+            .map(|reference| {
+                crate::broker::format_reusable_workflow_ref(&repository, reference, git_ref)
+            })
+            .unwrap_or_default();
+        (
+            workflow_ref,
+            job.workflow_sha.clone().unwrap_or_else(|| sha.to_owned()),
+            repository,
+            file_path.to_owned(),
+        )
+    } else {
+        (
+            workflow_ref.to_owned(),
+            sha.to_owned(),
+            repository.to_owned(),
+            workflow_path.to_owned(),
+        )
+    }
+}
+
 /// Build one job's runner message and correlation records.
 ///
 /// Pure computation shared by the submission prebuild and the scheduler's
@@ -2879,21 +2938,35 @@ pub fn build_job_artifacts(
             "check_run_id".to_owned(),
             preloop_gha_protocol::azdo::PipelineContextData::Number(0.0),
         );
+        // The `job.workflow_*` properties name the workflow defining the
+        // job: the callee for reusable-workflow jobs, the run's workflow
+        // otherwise. The message builder already wrote the plan's own
+        // values; this restamps the four properties with the resolved
+        // identity so the caller path never leaks onto a callee job.
+        let (job_workflow_ref, job_workflow_sha, job_workflow_repository, job_workflow_file_path) =
+            job_source_identity(
+                job,
+                workflow_path,
+                workflow_ref,
+                &submission.git_ref,
+                sha,
+                &submission.repository,
+            );
         job_dict.insert(
             "workflow_ref".to_owned(),
-            preloop_gha_protocol::azdo::PipelineContextData::String(workflow_ref.to_owned()),
+            preloop_gha_protocol::azdo::PipelineContextData::String(job_workflow_ref),
         );
         job_dict.insert(
             "workflow_sha".to_owned(),
-            preloop_gha_protocol::azdo::PipelineContextData::String(sha.to_owned()),
+            preloop_gha_protocol::azdo::PipelineContextData::String(job_workflow_sha),
         );
         job_dict.insert(
             "workflow_repository".to_owned(),
-            preloop_gha_protocol::azdo::PipelineContextData::String(submission.repository.clone()),
+            preloop_gha_protocol::azdo::PipelineContextData::String(job_workflow_repository),
         );
         job_dict.insert(
             "workflow_file_path".to_owned(),
-            preloop_gha_protocol::azdo::PipelineContextData::String(workflow_path.to_owned()),
+            preloop_gha_protocol::azdo::PipelineContextData::String(job_workflow_file_path),
         );
     }
     agent_msg.enable_debugger = submission.enable_debugger;
@@ -4141,6 +4214,170 @@ mod tests {
             reusable_file_table_entry(&job).as_deref(),
             Some(".github/workflows/reusable-build.yml")
         );
+    }
+    /// The smallest job plan the source-identity logic reads; everything
+    /// else stays empty.
+    fn source_identity_job(
+        workflow_file: Option<&str>,
+        workflow_ref: Option<&str>,
+        workflow_sha: Option<&str>,
+        workflow_repository: Option<&str>,
+        reusable_call: bool,
+    ) -> preloop_gha_protocol::JobPlan {
+        preloop_gha_protocol::JobPlan {
+            id: JobId("call/build".to_owned()),
+            base_id: "call/build".to_owned(),
+            name: "call / build".to_owned(),
+            runner_group: None,
+            runs_on: vec!["ubuntu-latest".to_owned()],
+            needs: Vec::new(),
+            matrix: Default::default(),
+            matrix_index: None,
+            matrix_total: None,
+            deferred_matrix: None,
+            env: BTreeMap::new(),
+            steps: Vec::new(),
+            if_condition: None,
+            fail_fast: true,
+            continue_on_error: false,
+            max_parallel: None,
+            secrets_inherit: false,
+            container: None,
+            services: None,
+            inputs: BTreeMap::new(),
+            workflow_file: workflow_file.map(str::to_owned),
+            workflow_ref: workflow_ref.map(str::to_owned),
+            workflow_sha: workflow_sha.map(str::to_owned),
+            workflow_repository: workflow_repository.map(str::to_owned),
+            secrets_map: BTreeMap::new(),
+            job_outputs: BTreeMap::new(),
+            oidc_id_token_granted: false,
+            permissions: None,
+            oidc_environment: None,
+            oidc_job_workflow_ref: None,
+            environment: None,
+            defaults: Vec::new(),
+            concurrency_group: None,
+            concurrency_cancel_in_progress: None,
+            concurrency_queue: None,
+            reusable_call: reusable_call.then(|| preloop_gha_protocol::ReusableCallPlan {
+                uses: "octo-org/octo-repo/.github/workflows/callee.yml@main".to_owned(),
+                workflow_file: "octo-org/octo-repo/.github/workflows/callee.yml".to_owned(),
+                workflow_sha: Some("abc123".to_owned()),
+                workflow_repository: Some("octo-org/octo-repo".to_owned()),
+                depth: 1,
+            }),
+            timeout_minutes: None,
+        }
+    }
+    /// GitHub's `job.workflow_*` properties describe the workflow defining
+    /// the job. A job inlined from a remote reusable workflow must report
+    /// the callee on all four values, not the caller that triggered the run.
+    #[test]
+    fn job_source_identity_names_the_remote_callee_workflow() {
+        let job = source_identity_job(
+            Some("octo-org/octo-repo/.github/workflows/callee.yml"),
+            Some("octo-org/octo-repo/.github/workflows/callee.yml@main"),
+            Some("abc123abc123abc123abc123abc123abc123abc1"),
+            Some("octo-org/octo-repo"),
+            false,
+        );
+        let (workflow_ref, workflow_sha, workflow_repository, workflow_file_path) =
+            job_source_identity(
+                &job,
+                ".github/workflows/caller.yml",
+                "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main",
+                "refs/heads/main",
+                "def456def456def456def456def456def456def4",
+                "caller-owner/caller-repo",
+            );
+        assert_eq!(
+            workflow_ref,
+            "octo-org/octo-repo/.github/workflows/callee.yml@main"
+        );
+        assert_eq!(workflow_sha, "abc123abc123abc123abc123abc123abc123abc1");
+        assert_eq!(workflow_repository, "octo-org/octo-repo");
+        // The bare path, not the `owner/repo`-prefixed storage form.
+        assert_eq!(workflow_file_path, ".github/workflows/callee.yml");
+    }
+    /// A locally-called reusable workflow has no repository or sha of its
+    /// own: it lives in the caller's repository at the run's sha, and its
+    /// `./path` ref renders in the full `owner/repo/path@ref` shape.
+    #[test]
+    fn job_source_identity_names_the_local_callee_workflow() {
+        let job = source_identity_job(
+            Some(".github/workflows/callee.yml"),
+            Some("./.github/workflows/callee.yml"),
+            None,
+            None,
+            false,
+        );
+        let (workflow_ref, workflow_sha, workflow_repository, workflow_file_path) =
+            job_source_identity(
+                &job,
+                ".github/workflows/caller.yml",
+                "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main",
+                "refs/heads/main",
+                "def456def456def456def456def456def456def4",
+                "caller-owner/caller-repo",
+            );
+        assert_eq!(
+            workflow_ref,
+            "caller-owner/caller-repo/.github/workflows/callee.yml@refs/heads/main"
+        );
+        assert_eq!(workflow_sha, "def456def456def456def456def456def456def4");
+        assert_eq!(workflow_repository, "caller-owner/caller-repo");
+        assert_eq!(workflow_file_path, ".github/workflows/callee.yml");
+    }
+    /// Jobs defined in the run's own workflow keep the run's identity.
+    #[test]
+    fn job_source_identity_keeps_the_run_workflow_for_top_level_jobs() {
+        let job = source_identity_job(None, None, None, None, false);
+        let (workflow_ref, workflow_sha, workflow_repository, workflow_file_path) =
+            job_source_identity(
+                &job,
+                ".github/workflows/caller.yml",
+                "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main",
+                "refs/heads/main",
+                "def456def456def456def456def456def456def4",
+                "caller-owner/caller-repo",
+            );
+        assert_eq!(
+            workflow_ref,
+            "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main"
+        );
+        assert_eq!(workflow_sha, "def456def456def456def456def456def456def4");
+        assert_eq!(workflow_repository, "caller-owner/caller-repo");
+        assert_eq!(workflow_file_path, ".github/workflows/caller.yml");
+    }
+    /// A reusable-call placeholder node is declared in the calling workflow
+    /// (its `workflow_file` names the callee it is *about*), so it keeps the
+    /// caller's identity rather than the callee's.
+    #[test]
+    fn job_source_identity_keeps_the_caller_for_reusable_call_placeholders() {
+        let job = source_identity_job(
+            Some("octo-org/octo-repo/.github/workflows/callee.yml"),
+            Some("octo-org/octo-repo/.github/workflows/callee.yml@main"),
+            Some("abc123abc123abc123abc123abc123abc123abc1"),
+            Some("octo-org/octo-repo"),
+            true,
+        );
+        let (workflow_ref, workflow_sha, workflow_repository, workflow_file_path) =
+            job_source_identity(
+                &job,
+                ".github/workflows/caller.yml",
+                "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main",
+                "refs/heads/main",
+                "def456def456def456def456def456def456def4",
+                "caller-owner/caller-repo",
+            );
+        assert_eq!(
+            workflow_ref,
+            "caller-owner/caller-repo/.github/workflows/caller.yml@refs/heads/main"
+        );
+        assert_eq!(workflow_sha, "def456def456def456def456def456def456def4");
+        assert_eq!(workflow_repository, "caller-owner/caller-repo");
+        assert_eq!(workflow_file_path, ".github/workflows/caller.yml");
     }
     /// The broadcast channel fans out every run's events, so a stalled run's
     /// stream sees — and discards — traffic it must not treat as liveness.
