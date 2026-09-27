@@ -12,6 +12,8 @@ pub mod job_builder;
 mod expand;
 mod matrix_expand;
 mod models;
+/// Secret references a workflow tree reads from the engine's store.
+pub mod secrets;
 mod trigger;
 mod yaml;
 
@@ -24,6 +26,7 @@ pub use expand::{
     expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
 };
 pub use models::*;
+pub use secrets::{ENGINE_PROVIDED_SECRETS, SecretRequirements, collect_secret_requirements};
 pub use trigger::{TriggerMismatch, glob_match};
 pub use yaml::{parse_action_metadata, parse_workflow};
 

@@ -50,6 +50,7 @@ Submit a workflow and stream its events until terminal.
 | `--no-debug` | Tear down on failure instead of pausing for debugging (hidden compatibility flag) |
 | `--preserve-on-failure` | Keep the failed job VM alive when nothing can attach interactively |
 | `--secret <NAME=VALUE>` | Inline secret, repeatable |
+| `--strict-secrets` | Fail instead of warning when the workflow reads secrets this engine has not stored |
 | `-d, --detach` | Submit and return immediately (run continues in the background) |
 | `--push` | After the run completes, push the tested commit and publish the result (pull request + check runs) |
 | `--create-pr` | Create a pull request for the branch when none is open (implies `--push`) |
@@ -63,6 +64,15 @@ Behavior notes:
   changes included) — the run never depends on what was pushed.
 - Local reusable workflows (`uses: ./.github/workflows/…`) are uploaded with
   the submission automatically.
+- **Secret preflight**: before submitting, `preloop run` lists the secrets the
+  workflow reads through `${{ secrets.NAME }}` and warns about any this engine
+  has not stored, with the `preloop secret set` lines to fix them.
+  `--strict-secrets` turns that warning into a failure. The check reads the
+  engine's own store (global, repository, and each declared `environment:`
+  tier) and never GitHub's, whose secret values are write-only. A job that
+  passes `secrets: inherit` to a reusable workflow is called out, because its
+  callee's names cannot be listed statically. `GITHUB_TOKEN` and the
+  `ACTIONS_*` runtime tokens are ignored — the engine mints those per job.
 - **Simulated event context**: a local run stands in for a webhook delivery, so
   the CLI fills in the parts of that delivery git can answer for. Nothing else
   is invented — see below.
