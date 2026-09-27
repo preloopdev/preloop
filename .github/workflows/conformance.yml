@@ -28,7 +28,19 @@ jobs:
           persist-credentials: false
           lfs: true
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        with:
+          version: 0.26.3
+          s3-bucket: preloop-kache
+          s3-endpoint: ${{ secrets.KACHE_R2_ENDPOINT }}
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
+          # This job builds the server once; its own manifest-key keeps its
+          # entries out of the ci.yml test plans.
+          manifest-key: conformance
+          min-compile-ms: 2000
+          pr-comment: false
       - name: Replay configured official runner flows
         run: bash ./benchmarks/conformance/run.sh
       - name: Name the diverging scenarios

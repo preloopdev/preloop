@@ -54,12 +54,27 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Content-addressed restore replaces the whole-target/ tarball this job
+      # used to restore: only crates whose inputs changed are recompiled, and
+      # entries are shared across branches, shards and machines. A failing run
+      # still publishes what it built, because uploads happen as builds finish
+      # rather than in a post-job save step.
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # A failing lint run still primes the cache for the next one; the
-          # default skips the save step on failure, so nothing is ever stored
-          # while a break is being fixed.
-          cache-on-failure: true
+          version: 0.26.3
+          s3-bucket: preloop-kache
+          s3-endpoint: ${{ secrets.KACHE_R2_ENDPOINT }}
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
+          # Scopes the prefetch manifest and the shard namespace: one key per
+          # build variant so plans never mix clippy, test and release entries.
+          manifest-key: clippy
+          # Below this, recompiling is cheaper than prefetching.
+          min-compile-ms: 2000
+          # Stats land in the job summary; PR comments would need
+          # pull-requests: write, which this workflow deliberately withholds.
+          pr-comment: false
       - run: cargo fmt --all --check
       - run: |
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
@@ -139,16 +154,27 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # All four shards build the same workspace and differ only in which tests
+      # they select, so they share one manifest-key and one set of entries
+      # instead of each warming separately. PR runs restore what a protected
+      # branch published but never write, so this cache cannot be poisoned by
+      # a pull request.
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          # All four shards build the same workspace and differ only in which
-          # tests they select, so they share one cache entry instead of each
-          # keying on its own job name and starting cold.
-          shared-key: rust-test
-          # Shards fail while a regression is being fixed. The save step is
-          # skipped on failure by default, so nothing was ever cached and the
-          # next run recompiled from scratch.
-          cache-on-failure: true
+          version: 0.26.3
+          s3-bucket: preloop-kache
+          s3-endpoint: ${{ secrets.KACHE_R2_ENDPOINT }}
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
+          # Scopes the prefetch manifest and the shard namespace: one key per
+          # build variant so plans never mix clippy, test and release entries.
+          manifest-key: test
+          # Below this, recompiling is cheaper than prefetching.
+          min-compile-ms: 2000
+          # Stats land in the job summary; PR comments would need
+          # pull-requests: write, which this workflow deliberately withholds.
+          pr-comment: false
       - name: Install cargo-nextest
         run: |
           # `cargo install` built nextest from source on every cold cache
@@ -237,9 +263,22 @@ jobs:
           echo "RUSTC=$toolchain_bin/rustc" >> "$GITHUB_ENV"
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: 0.26.3
+          s3-bucket: preloop-kache
+          s3-endpoint: ${{ secrets.KACHE_R2_ENDPOINT }}
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
+          # Scopes the prefetch manifest and the shard namespace: one key per
+          # build variant so plans never mix clippy, test and release entries.
+          manifest-key: property-tests-fast
+          # Below this, recompiling is cheaper than prefetching.
+          min-compile-ms: 2000
+          # Stats land in the job summary; PR comments would need
+          # pull-requests: write, which this workflow deliberately withholds.
+          pr-comment: false
 
       - name: Verify property filters match tests
         run: |
@@ -354,9 +393,22 @@ jobs:
           echo "RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_RUSTDOC=$toolchain_bin/rustdoc" >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
+          version: 0.26.3
+          s3-bucket: preloop-kache
+          s3-endpoint: ${{ secrets.KACHE_R2_ENDPOINT }}
+          s3-region: auto
+          s3-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
+          # Release builds key differently from the fast profile, so this
+          # variant gets its own manifest and shard namespace.
+          manifest-key: property-tests-intensive
+          # Below this, recompiling is cheaper than prefetching.
+          min-compile-ms: 2000
+          # Stats land in the job summary; PR comments would need
+          # pull-requests: write, which this workflow deliberately withholds.
+          pr-comment: false
 
       - name: Verify property filters match tests
         run: |
