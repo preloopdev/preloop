@@ -739,6 +739,11 @@ pub fn ensure_broker_request_owner(
     }
 }
 
+/// How long a Busy poll lingers once its session's job has finished. Short
+/// enough that the runner's next (Online) poll is not held back; long enough
+/// that a runner still draining its worker does not spin on empty replies.
+const BUSY_DRAIN_POLL: Duration = Duration::from_secs(1);
+
 pub async fn next_message_broker_ref_root(
     State(shared): State<Arc<SharedState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -774,9 +779,11 @@ pub async fn next_message_broker_ref_root(
         .get("status")
         .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    let mut deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
+        // Set when nothing on this session is still running.
+        let mut drained = false;
         let maybe = {
             let mut inner = shared.state.inner.lock().await;
             // Prefer delivering JobCancellation for the active request (official
@@ -802,13 +809,16 @@ pub async fn next_message_broker_ref_root(
                         None
                     } else {
                         inner.session_active_requests.remove(&session_id);
+                        drained = true;
                         None
                     }
                 } else {
                     inner.session_active_requests.remove(&session_id);
+                    drained = true;
                     None
                 }
             } else if runner_busy {
+                drained = true;
                 None
             } else {
                 let runner = inner.runner_capabilities_for_session(&session_id);
@@ -854,6 +864,14 @@ pub async fn next_message_broker_ref_root(
 
         if let Some(message) = maybe {
             return Ok(Json(message).into_response());
+        }
+        if runner_busy && drained {
+            // Busy, but the session's job has finished: the reported status is
+            // stale. Runners keep this poll open across job completion
+            // (actions/runner#4728), so a full long-poll here would hold back
+            // the Online poll that receives the next job. End it after a short
+            // drain beat instead of dispatching on a Busy poll.
+            deadline = deadline.min(std::time::Instant::now() + BUSY_DRAIN_POLL);
         }
         if wait == 0 || std::time::Instant::now() >= deadline {
             return Ok(Json(serde_json::Value::Null).into_response());

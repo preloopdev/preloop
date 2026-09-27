@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+
+### Fixed
+
+- **Runner no longer drops the job handed out at job completion**: when a
+  job finished, `preloop-runner` aborted its in-flight `status=Busy` broker
+  poll, the same pattern as actions/runner#4728. On github.com the service
+  hands the next job out on that poll, so the job was lost and later cancelled
+  as "not acquired by Runner". The poll now stays open across job completion
+  and the new status goes out on the next poll. To match, the server ends a
+  Busy poll within one second once the session's job has finished, rather than
+  holding it for the full 50 seconds, so the following Online poll claims the
+  next job without delay. The server still never dispatches a job on a Busy
+  poll.
+- **Broker poll client timeout outlasts the server's long poll**: the runner
+  gave up on `GET /message` after 50 s, the same length as the broker's
+  long-poll window. A job claimed in the final moments of that window was
+  written to a request the runner had already abandoned. The poll timeout is
+  now 100 s, matching the official runner's default `SendTimeout`.
+- **Empty broker polls are no longer read as messages**: a `200` with a
+  `null` body was treated as a message with id 0 and type `unknown`. It is
+  now an empty poll, as in the official listener.
+
 ## [0.33.9] - 2026-10-02
 
 ### Changed
