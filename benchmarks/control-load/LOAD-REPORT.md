@@ -24,6 +24,8 @@ Chaos rounds define a measurable steady state, inject a bounded fault, and compa
 | r9 burst | 5/s + 5x burst, 60s, 100 runners | 707 | 2,120 | 443 | 285 | 1,835 | 230 | 9,483 / 13,769 | 12,558 | 4,161 | 1.58 |
 | r10 no-global-poll-lock | 5/s + 5x burst, 60s, 100 runners | 742 | 2,038 | 543 | 260 | 1,778 | 243 | 8,874 / 10,903 | 11,886 | 3,709 | 1.44 |
 | r11 chaos | 2/s, 90s, 60 runners | 214 | 597 | 310 | 178 | 419 | 72 | 787 / 9,255 | 274 | 150 | 0.84 |
+| r12 node-kill | 2/s, 90s, 60 runners, node 0 killed at 30s | 174 | 458 | 681 | 381 | 77 | 60 | 979 / 2,949 | 927 | 482 | 1.81 |
+| r13 database-restart | 2/s, 90s, 60 runners, Postgres restarted at ~35s | 112 | 359 | 179 | 124 | 235 | 42 | 331 / 8,132 | 140 | 84 | 0.59 |
 
 Round data is retained in `load-results/<label>/summary.json`, including rates, latency distributions, database samples, transaction statistics, and integrity output.
 
@@ -44,12 +46,14 @@ r11 injected:
 - a 10-second database network partition
 - a connection reset epoch at 70 seconds
 
+r12 killed node 0 at 30 seconds and restarted it through the round harness. r13 stopped and restarted the real test Postgres process at approximately 35 seconds.
+
 Observed behavior:
 
-- database remained structurally valid: `duplicate_inflight = 0`, `duplicate_runners = 0`
-- 5,538 transient `connection closed` backend errors were observed by runners during the fault window
-- 30 webhook submissions returned 500 after retry exhaustion; redelivery/replay remains an operational recovery requirement
-- backlog grew to 419 jobs
+- r11 retained `duplicate_inflight = 0` and `duplicate_runners = 0`; it left 419 queued jobs.
+- r12 requeued 49 orphaned claims but left 30 duplicate runner registrations after runner re-registration; `duplicate_inflight = 0`, backlog 77.
+- r13 recovered database connectivity and retained `duplicate_inflight = 0`, but returned 64 API 500s and left 235 queued jobs.
+- Network/database faults generated connection-closed errors and webhook retry exhaustion; redelivery/replay remains an operational recovery requirement.
 
 ## Findings and fixes
 
@@ -69,5 +73,4 @@ Required next work:
 - replace timeline reconciliation with direct SQL row updates/upserts;
 - merge broker completion bookkeeping with completion persistence to remove the second transaction;
 - remove remaining hot-path TxState loads, culminating in deleting the TxState backend model;
-- rerun burst profiles at progressively higher arrival rates until backlog remains bounded;
-- repeat chaos rounds with node kill/restart and database failover, not only proxy faults.
+- fix runner identity/session re-registration after node restart (r12 left 30 duplicate runner names);
