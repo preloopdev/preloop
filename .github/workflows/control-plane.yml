@@ -1,0 +1,82 @@
+name: control-plane
+permissions:
+  contents: read
+
+# Control-plane database tests: every command against both backends.
+# SQLite runs in-process; Postgres runs as one server in the job and each
+# test creates (and drops) its own database on it, so tests stay isolated
+# and parallel. Race tests use two backends on one database.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/preloop-runner-server/src/control/**"
+      - "crates/preloop-runner-server/src/concurrency.rs"
+      - "crates/preloop-runner-server/src/secret_provider.rs"
+      - "docs/control-schema.sql"
+      - ".github/workflows/control-plane.yml"
+  workflow_dispatch:
+
+jobs:
+  control-tests:
+    name: control ${{ matrix.postgres }}
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "17"]
+    env:
+      CARGO_BUILD_JOBS: "6"
+      RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.97"
+      - name: Install lld and PostgreSQL ${{ matrix.postgres }}
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lld curl ca-certificates gnupg
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}"
+      - name: Start PostgreSQL (trust auth on loopback)
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: |
+          conf="/etc/postgresql/${PG_MAJOR}/main"
+          echo "host all all 127.0.0.1/32 trust" | sudo tee "$conf/pg_hba.conf"
+          echo "local all all trust" | sudo tee -a "$conf/pg_hba.conf"
+          echo "max_connections = 400" | sudo tee -a "$conf/postgresql.conf"
+          sudo pg_ctlcluster "${PG_MAJOR}" main restart
+          for _ in $(seq 1 30); do
+            psql "$PRELOOP_TEST_POSTGRES_URL" -Atc 'select 1' && exit 0
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version 0.9.144
+      - name: Control tests (SQLite + PostgreSQL)
+        run: cargo nextest run --locked -p preloop-runner-server -E 'test(/^control::/)'
+      - name: Target schema applies cleanly
+        run: psql "$PRELOOP_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -q -f docs/control-schema.sql
+      - name: No leaked per-test databases
+        run: |
+          leaked=$(psql "$PRELOOP_TEST_POSTGRES_URL" -Atc "select count(*) from pg_database where datname like 'preloop_t_%'")
+          test "$leaked" -eq 0 || { echo "leaked $leaked test databases" >&2; exit 1; }

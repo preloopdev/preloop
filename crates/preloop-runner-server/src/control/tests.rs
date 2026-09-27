@@ -2494,33 +2494,95 @@ mod postgres {
             .port()
     }
 
-    /// Build a backend against a disposable cluster, or the database named
-    /// by `PRELOOP_TEST_POSTGRES_URL` when set (CI/dev with an existing
-    /// cluster). The guard must stay alive for the test's duration.
-    async fn backend() -> (Option<DisposablePg>, PostgresBackend) {
-        if let Ok(url) = std::env::var("PRELOOP_TEST_POSTGRES_URL") {
-            let backend = PostgresBackend::connect(
-                &url,
-                super::test_cipher(),
-                false,
-                false,
-                std::time::Duration::from_secs(300),
-            )
+    /// Isolation guard for one test's database: a disposable local cluster,
+    /// or a fresh database created on the shared server named by
+    /// `PRELOOP_TEST_POSTGRES_URL` (the smolvm Postgres locally, a service
+    /// container in CI) and dropped when the guard goes out of scope.
+    enum PgGuard {
+        Cluster(#[allow(dead_code)] DisposablePg),
+        Database { admin_url: String, name: String },
+    }
+
+    impl Drop for PgGuard {
+        fn drop(&mut self) {
+            let Self::Database { admin_url, name } = self else {
+                return;
+            };
+            // `Drop` is sync and may run inside a tokio runtime: drop the
+            // database from a plain thread with its own runtime.
+            let (admin_url, name) = (admin_url.clone(), name.clone());
+            let _ = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        if let Ok((client, conn)) =
+                            tokio_postgres::connect(&admin_url, tokio_postgres::NoTls).await
+                        {
+                            tokio::spawn(conn);
+                            let _ = client
+                                .batch_execute(&format!(
+                                    "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+                                ))
+                                .await;
+                        }
+                    })
+            })
+            .join();
+        }
+    }
+
+    /// A URL to a database nobody else uses, plus its cleanup guard.
+    async fn fresh_database() -> (PgGuard, String) {
+        let Ok(admin_url) = std::env::var("PRELOOP_TEST_POSTGRES_URL") else {
+            let pg = DisposablePg::start();
+            let url = pg.url();
+            return (PgGuard::Cluster(pg), url);
+        };
+        let name = format!("preloop_t_{}", uuid::Uuid::new_v4().simple());
+        let (client, conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
             .await
             .expect("PRELOOP_TEST_POSTGRES_URL set but connection failed");
-            return (None, backend);
-        }
-        let pg = DisposablePg::start();
-        let backend = PostgresBackend::connect(
-            &pg.url(),
+        tokio::spawn(conn);
+        client
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .expect("create per-test database");
+        let url = match admin_url.rsplit_once('/') {
+            Some((server, _)) => format!("{server}/{name}"),
+            None => panic!("PRELOOP_TEST_POSTGRES_URL must name a database"),
+        };
+        (PgGuard::Database { admin_url, name }, url)
+    }
+
+    async fn connect(url: &str) -> PostgresBackend {
+        PostgresBackend::connect(
+            url,
             super::test_cipher(),
             false,
             false,
             std::time::Duration::from_secs(300),
         )
         .await
-        .expect("disposable cluster connection failed");
-        (Some(pg), backend)
+        .expect("test database connection failed")
+    }
+
+    /// A backend on its own fresh database. Keep the guard alive for the
+    /// test's duration.
+    async fn backend() -> (PgGuard, PostgresBackend) {
+        let (guard, url) = fresh_database().await;
+        let backend = connect(&url).await;
+        (guard, backend)
+    }
+
+    /// Two independent backends (separate writer pools) on ONE database: the
+    /// shape of two engine nodes sharing a cell database, for race tests.
+    async fn backend_pair() -> (PgGuard, PostgresBackend, PostgresBackend) {
+        let (guard, url) = fresh_database().await;
+        let first = connect(&url).await;
+        let second = connect(&url).await;
+        (guard, first, second)
     }
 
     #[tokio::test]
@@ -2633,11 +2695,8 @@ mod postgres {
     /// the authority: submit on one connection, claim on another.
     #[tokio::test]
     async fn state_survives_reconnect() {
-        let (pg, backend) = backend().await;
-        let url = pg
-            .as_ref()
-            .map(|p| p.url())
-            .unwrap_or_else(|| std::env::var("PRELOOP_TEST_POSTGRES_URL").unwrap());
+        let (_pg, url) = fresh_database().await;
+        let backend = connect(&url).await;
 
         let run_id = RunId::new();
         backend
@@ -2653,15 +2712,7 @@ mod postgres {
             .unwrap();
         drop(backend);
 
-        let backend = PostgresBackend::connect(
-            &url,
-            super::test_cipher(),
-            false,
-            false,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap();
+        let backend = connect(&url).await;
         let stats = backend.queue_stats().await.unwrap();
         assert_eq!(stats.ready, 1, "queued job must survive reconnect");
         let record = backend.run_record(run_id).await.unwrap();
@@ -2676,20 +2727,7 @@ mod postgres {
     /// blocked; the second must wait, then observe the committed change.
     #[tokio::test]
     async fn writers_serialize_across_connections() {
-        let (pg, backend_a) = backend().await;
-        let url = pg
-            .as_ref()
-            .map(|p| p.url())
-            .unwrap_or_else(|| std::env::var("PRELOOP_TEST_POSTGRES_URL").unwrap());
-        let backend_b = PostgresBackend::connect(
-            &url,
-            super::test_cipher(),
-            false,
-            false,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap();
+        let (_pg, backend_a, backend_b) = backend_pair().await;
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
