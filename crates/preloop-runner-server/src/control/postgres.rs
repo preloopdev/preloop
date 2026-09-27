@@ -5327,13 +5327,34 @@ impl ControlBackend for PostgresBackend {
     async fn live_assignments(
         &self,
     ) -> Result<Vec<preloop_observability::status::RunnerAssignment>, ControlError> {
-        self.read(|tx| {
-            Ok(crate::runtime_scheduling::live_runner_assignments(
-                &tx.job_requests,
-                &tx.session_active_requests,
-                std::time::SystemTime::now(),
-            ))
-        })
-        .await
+        let client = self.checkout_reader().await?;
+        let result = client
+            .query(
+                "SELECT r.owner_runner_id, r.run_id, r.job_id, r.started_at_us
+                 FROM runner_sessions s JOIN job_requests r
+                   ON s.active_request_id = r.request_id
+                 WHERE r.result IS NULL AND r.owner_runner_id IS NOT NULL
+                 ORDER BY r.owner_runner_id",
+                &[],
+            )
+            .await
+            .map(|rows| {
+                let now = std::time::SystemTime::now();
+                rows.into_iter()
+                    .map(|row| preloop_observability::status::RunnerAssignment {
+                        runner_id: row.get(0),
+                        run_id: row.get(1),
+                        job_id: row.get(2),
+                        assigned_seconds_ago: row
+                            .get::<_, Option<i64>>(3)
+                            .and_then(|us| now.duration_since(us_to_system(us)).ok())
+                            .map(|age| age.as_secs_f64())
+                            .unwrap_or(0.0),
+                    })
+                    .collect()
+            })
+            .map_err(ControlError::backend);
+        self.return_reader(client).await;
+        result
     }
 }

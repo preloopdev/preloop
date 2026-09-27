@@ -401,6 +401,11 @@ pub(crate) mod suite {
         let stats = backend.queue_stats().await.unwrap();
         assert_eq!((stats.ready, stats.claimed), (0, 1));
         assert!(stats.next_runs_on.is_empty());
+        let assignments = backend.live_assignments().await.unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].runner_id, runner.runner.id);
+        assert_eq!(assignments[0].run_id, run_id.to_string());
+        assert_eq!(assignments[0].job_id, "build");
 
         let ctx = backend.acquire_context(1).await.unwrap();
         assert_eq!(ctx.request.request_id, 1);
@@ -422,6 +427,7 @@ pub(crate) mod suite {
         assert_eq!(done.record.status, ExecutionStatus::Success);
         let stats = backend.queue_stats().await.unwrap();
         assert_eq!((stats.ready, stats.claimed), (0, 0));
+        assert!(backend.live_assignments().await.unwrap().is_empty());
     }
 
     pub(crate) async fn webhook_replay_is_idempotent(backend: &dyn ControlBackend) {
