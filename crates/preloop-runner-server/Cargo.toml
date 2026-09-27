@@ -134,6 +134,11 @@ name = "execution_protection_api"
 path = "tests/execution_protection_api.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "runner_deprecations"
+path = "tests/runner_deprecations.rs"
+required-features = ["test-support"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true

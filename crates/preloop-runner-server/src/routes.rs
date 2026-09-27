@@ -469,6 +469,24 @@ pub fn build_app(
             "/api/v3/repos/:owner/:repo/actions/runners/registration-token",
             post(github_registration_token),
         )
+        // Runner version end-of-life schedule (GitHub's September 2026
+        // changelog): same three-level scoping as the registration routes
+        // above — control plane, org, repo. The org/repo segments are
+        // accepted and ignored; preloop is single-tenant, so the schedule
+        // is global. Credential posture matches the neighbors: no
+        // routing-layer middleware, the handler requires the system token.
+        .route(
+            "/api/v3/actions/runners/deprecations/:version",
+            get(runner_deprecation_lookup),
+        )
+        .route(
+            "/api/v3/orgs/:org/actions/runners/deprecations/:version",
+            get(runner_deprecation_lookup_org),
+        )
+        .route(
+            "/api/v3/repos/:owner/:repo/actions/runners/deprecations/:version",
+            get(runner_deprecation_lookup_repo),
+        )
         // GitHub-compatible dispatch API (surface 2): merged sub-router with
         // a single dispatch-auth layer — see `dispatch_api` above.
         .merge(dispatch_api)
