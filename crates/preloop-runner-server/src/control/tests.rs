@@ -453,7 +453,7 @@ pub(crate) mod suite {
         assert_eq!(ctx.repository, "owner/repo");
 
         let done = backend
-            .complete_job(JobCompletionInput {
+            .complete_job(crate::control::backend::JobCompletionInput {
                 run_id,
                 job_id: JobId("build".to_owned()),
                 agent_job_id: Some(claimed.request.agent_job_id),
@@ -609,7 +609,9 @@ pub(crate) mod suite {
         );
         assert_eq!(
             backend
-                .request(RequestKey::AgentJobId(first_request.agent_job_id))
+                .request(crate::control::backend::RequestKey::AgentJobId(
+                    first_request.agent_job_id
+                ))
                 .await
                 .unwrap()
                 .request_id,
@@ -3806,5 +3808,298 @@ mod postgres {
             }
         }
         assert_eq!(claimed.len(), JOBS);
+    }
+
+    // ── The new `control/pg` backend (no TxState; the shared suite on the ──
+    // ── agreed schema). Divergence: secrets are stored as `secret_refs` ──
+    // ── (names/scopes) and resolve through the provider at acquire, so ──
+    // ── `secrets_survive_seal_unseal` (values round-trip inside the ──
+    // ── submission blob) does not apply — `secret_values_never_persist` ──
+    // ── pins the new contract instead. ──
+    mod pg {
+        use super::super::*;
+        use super::{fresh_database, PgGuard};
+        use crate::control::pg::PgBackend;
+
+        async fn connect(url: &str) -> PgBackend {
+            PgBackend::connect(url, false, false, std::time::Duration::from_secs(300))
+                .await
+                .expect("test database connection failed")
+        }
+
+        /// A backend on its own fresh database. Keep the guard alive for the
+        /// test's duration.
+        async fn backend() -> (PgGuard, PgBackend) {
+            let (guard, url) = fresh_database().await;
+            let backend = connect(&url).await;
+            (guard, backend)
+        }
+
+        /// Two independent backends (separate pools) on ONE database: the
+        /// shape of two engine nodes sharing a cell, for race tests.
+        async fn backend_pair() -> (PgGuard, PgBackend, PgBackend) {
+            let (guard, url) = fresh_database().await;
+            let first = connect(&url).await;
+            let second = connect(&url).await;
+            (guard, first, second)
+        }
+
+        #[tokio::test]
+        async fn submit_poll_complete_lifecycle() {
+            let (_pg, backend) = backend().await;
+            suite::submit_poll_complete_lifecycle(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn sessionless_runner_is_not_idle_capacity() {
+            let (_pg, backend) = backend().await;
+            suite::sessionless_runner_is_not_idle_capacity(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn step_reports_merge_into_manifest() {
+            let (_pg, backend) = backend().await;
+            suite::step_reports_merge_into_manifest(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn webhook_replay_is_idempotent() {
+            let (_pg, backend) = backend().await;
+            suite::webhook_replay_is_idempotent(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn request_lookup_uses_latest_correlation() {
+            let (_pg, backend) = backend().await;
+            suite::request_lookup_uses_latest_correlation(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn push_state_only_changes_its_run_column() {
+            let (_pg, backend) = backend().await;
+            suite::push_state_only_changes_its_run_column(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn cancel_run_queues_cancellation() {
+            let (_pg, backend) = backend().await;
+            suite::cancel_run_queues_cancellation(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn artifact_scopes_map_plan_ids_to_latest_run() {
+            let (_pg, backend) = backend().await;
+            suite::artifact_scopes_map_plan_ids_to_latest_run(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn concurrency_gate_serializes_group() {
+            let (_pg, backend) = backend().await;
+            suite::concurrency_gate_serializes_group(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn run_record_round_trips_through_tables() {
+            let (_pg, backend) = backend().await;
+            suite::run_record_round_trips_through_tables(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn reconcile_recovers_orphaned_claim() {
+            let (_pg, backend) = backend().await;
+            suite::reconcile_recovers_orphaned_claim(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn purge_requeues_claimed_as_queued() {
+            let (_pg, backend) = backend().await;
+            suite::purge_requeues_claimed_as_queued(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn purge_requeues_ownerless_claim() {
+            let (_pg, backend) = backend().await;
+            suite::purge_requeues_ownerless_claim(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn check_run_mapping() {
+            let (_pg, backend) = backend().await;
+            suite::check_run_mapping(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn submit_unhostable_job_persists_failure() {
+            let (_pg, backend) = backend().await;
+            suite::submit_unhostable_job_persists_failure(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn submit_skipped_parent_settles_child() {
+            let (_pg, backend) = backend().await;
+            suite::submit_skipped_parent_settles_child(&backend).await;
+        }
+
+        #[tokio::test]
+        async fn cancel_in_progress_submit_reports_surviving_depth() {
+            let (_pg, backend) = backend().await;
+            suite::cancel_in_progress_submit_reports_surviving_depth(&backend).await;
+        }
+
+        /// Secret names survive in `secret_refs`, but values are never
+        /// written to the control database: the submission is stored minus
+        /// secrets, so `run_record` returns an empty secrets map. Values are
+        /// resolved by the provider at acquire, not read back from here.
+        #[tokio::test]
+        async fn secret_values_never_persist() {
+            let (_pg, backend) = backend().await;
+            let run_id = RunId::new();
+            let mut record = run_record(run_id);
+            Arc::make_mut(&mut record.submission).secrets.insert(
+                "TOKEN".to_owned(),
+                preloop_gha_protocol::SecretString::new("s3cr3t-value"),
+            );
+            backend
+                .submit_run(SubmitRun {
+                    namespace: "default".to_owned(),
+                    record,
+                    jobs: vec![submit_job(run_id, "build", 1)],
+                    workflow_concurrency: None,
+                    empty_concurrency_group: false,
+                    check_hostable: false,
+                })
+                .await
+                .unwrap();
+
+            let restored = backend.run_record(run_id).await.unwrap();
+            assert!(
+                restored.submission.secrets.is_empty(),
+                "secret values must never round-trip through the control database"
+            );
+        }
+
+        async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
+            // Distinct `run_number` per submit: the agreed schema keys
+            // `runs_number` on (namespace, repo, path, number, attempt), so
+            // fixture submits that all carry number 1 collide.
+            static NEXT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1_000_000);
+            let submits: Vec<_> = (0..count)
+                .map(|_| {
+                    let run_id = RunId::new();
+                    let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", 0)]);
+                    submit.record.run_number =
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    submit
+                })
+                .collect();
+            let agents = submits
+                .iter()
+                .map(|s| s.jobs[0].request.as_ref().unwrap().agent_job_id)
+                .collect();
+            let results =
+                futures::future::join_all(submits.into_iter().map(|s| node.submit_run(s))).await;
+            for result in results {
+                result.unwrap();
+            }
+            agents
+        }
+
+        /// Two backend instances on one database must never mint a duplicate
+        /// request id.
+        #[tokio::test]
+        async fn concurrent_submits_mint_distinct_request_ids() {
+            let (_pg, node_a, node_b) = backend_pair().await;
+            const PER_NODE: usize = 24;
+            let (agents_a, agents_b) = tokio::join!(
+                submit_many(&node_a, PER_NODE),
+                submit_many(&node_b, PER_NODE)
+            );
+
+            let mut request_ids = std::collections::BTreeSet::new();
+            for agent in agents_a.into_iter().chain(agents_b) {
+                let request = node_a
+                    .request(RequestKey::AgentJobId(agent))
+                    .await
+                    .unwrap_or_else(|e| panic!("attempt {agent} lost its request row: {e:?}"));
+                assert!(
+                    request_ids.insert(request.request_id),
+                    "request id {} was minted twice",
+                    request.request_id
+                );
+            }
+            assert_eq!(request_ids.len(), PER_NODE * 2);
+        }
+
+        /// Two backend instances on one database must never hand out the
+        /// same job twice.
+        #[tokio::test]
+        async fn concurrent_polls_across_nodes_claim_each_job_once() {
+            use crate::control::types::PollOutcome;
+            const JOBS: usize = 24;
+            const RUNNERS: usize = 12;
+            let (_pg, node_a, node_b) = backend_pair().await;
+            let nodes = [std::sync::Arc::new(node_a), std::sync::Arc::new(node_b)];
+            let mut sessions = Vec::new();
+            for i in 0..RUNNERS {
+                let node = &nodes[i % 2];
+                let runner = node
+                    .register_runner(register_runner(&format!("r{i}")))
+                    .await
+                    .unwrap();
+                let session = node
+                    .create_session(create_session(runner.runner.id))
+                    .await
+                    .unwrap();
+                sessions.push((i % 2, session.session_id, runner.runner.id));
+            }
+            let run_id = RunId::new();
+            let jobs = (0..JOBS)
+                .map(|i| submit_job(run_id, &format!("j{i}"), i as i64 + 1))
+                .collect();
+            nodes[0].submit_run(submit_run(run_id, jobs)).await.unwrap();
+
+            let mut claimed = std::collections::BTreeSet::new();
+            let mut rounds = 0;
+            while claimed.len() < JOBS {
+                rounds += 1;
+                assert!(rounds <= 6, "fan-out drained too slowly: {claimed:?}");
+                let polls = sessions.iter().map(|(node, session_id, runner_id)| {
+                    let node = nodes[*node].clone();
+                    let poll = poll(session_id, *runner_id);
+                    tokio::spawn(async move { node.poll_session(poll).await })
+                });
+                let mut finished = Vec::new();
+                for outcome in futures::future::join_all(polls).await {
+                    if let PollOutcome::Claimed(claim) = outcome.unwrap().unwrap() {
+                        assert!(
+                            claimed.insert(claim.queued.job_id.clone()),
+                            "job {} claimed twice",
+                            claim.queued.job_id.0
+                        );
+                        finished.push((
+                            claim.queued.job_id,
+                            claim.request.agent_job_id,
+                            claim.runner_id,
+                        ));
+                    }
+                }
+                // Finish this round's jobs so each runner is free to claim again.
+                for (job_id, agent_job_id, runner_id) in finished {
+                    nodes[0]
+                        .complete_job(JobCompletionInput {
+                            run_id,
+                            job_id,
+                            agent_job_id: Some(agent_job_id),
+                            status: ExecutionStatus::Success,
+                            outputs: std::collections::BTreeMap::new(),
+                            runner_id: Some(runner_id),
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+            assert_eq!(claimed.len(), JOBS);
+        }
     }
 }

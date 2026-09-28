@@ -28,6 +28,7 @@ mod runners;
 #[cfg(test)]
 mod tests;
 mod timelines;
+mod trait_impl;
 
 use super::types::ControlError;
 use tokio_postgres::{Client, NoTls};
