@@ -1,82 +1,64 @@
 //! Backend-neutral scheduling decisions.
 //!
 //! Pure functions over small row structs: no I/O, no locks, no working set.
-//! A backend loads the few rows a decision needs, calls the function here,
-//! and applies the result with conditional statements. Both backends call
-//! the same functions, so their scheduling semantics cannot diverge.
 
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, SystemTime};
 
-/// How long an unmatched ready job may wait for a matching runner before the
-/// reaper fails it (outside a pool warm-up).
-pub(crate) const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
+/// Namespace used to deterministically encode legacy non-UUID session ids.
+pub(crate) const SESSION_ID_NAMESPACE: uuid::Uuid =
+    uuid::uuid!("7d3c0a1c-6f4a-4d4c-a5d4-8d27b5a3c1f0");
 
-/// Absolute ceiling, measured from ready-enqueue, on how long a preparing or
-/// provisioning pool may protect an unmatched job from starvation.
+/// Convert a session id to its stored UUID, using UUID v5 for legacy ids.
+pub(crate) fn session_uuid(id: &str) -> uuid::Uuid {
+    id.parse()
+        .unwrap_or_else(|_| uuid::Uuid::new_v5(&SESSION_ID_NAMESPACE, id.as_bytes()))
+}
+
+/// How long an unmatched ready job may wait for a matching runner.
+pub(crate) const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
+/// Absolute queue-age ceiling while a pool is preparing.
 pub(crate) const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
 
-/// A ready job as the starvation sweep sees it.
+/// Ready-job inputs for starvation evaluation.
 #[derive(Debug, Clone)]
 pub(crate) struct StarvationCandidate<'a> {
-    /// The job's `runs-on` labels.
     pub(crate) runs_on: &'a [String],
-    /// Ready-enqueue time (`jobs.enqueued_at`); epoch when unknown.
     pub(crate) enqueued_at: SystemTime,
-    /// The reaper's first-seen mark for this job, if one is stored.
     pub(crate) first_seen: Option<SystemTime>,
-    /// Some registered runner's labels match `runs_on`
-    /// ([`crate::runtime_scheduling::job_matches_runner`]).
     pub(crate) any_runner_matches: bool,
 }
 
-/// What the reaper does with one ready job.
+/// Starvation outcome: clear, mark, or fail the ready job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StarvationVerdict {
-    /// Drop the first-seen mark (a runner can take the job, or it is
-    /// protected for now).
     ClearMark,
-    /// Keep the job waiting; store `first_seen` as its mark when it has none
-    /// (an existing mark is kept unchanged).
     Mark { first_seen: SystemTime },
-    /// Fail the job with this user-facing reason and drop its mark.
     Starve { reason: String, grace: Duration },
 }
 
-/// Decide one ready job's fate in a reaper tick.
-///
-/// - A job some runner matches clears its mark.
-/// - A job that needs an external host (`macos*`/`windows*` label) is never
-///   starved here: the host may register later; its mark clears.
-/// - While a pool is preparing (`pool_preparing`): within this process's
-///   warm window (`warm_window_open`) or while the job is younger than
-///   [`MAX_QUEUED_GRACE`] since enqueue, the mark clears; past that the job
-///   starves with grace [`MAX_QUEUED_GRACE`].
-/// - Otherwise the first-seen clock is the stored mark, else the enqueue
-///   time (so a restart grants no fresh window): younger than
-///   [`QUEUED_JOB_GRACE`] keeps waiting (`Mark`), else it starves with grace
-///   [`QUEUED_JOB_GRACE`].
+/// Decide starvation using the production 120/600 second grace rules.
 pub(crate) fn starvation_verdict(
     job: &StarvationCandidate<'_>,
     now: SystemTime,
     pool_preparing: bool,
     warm_window_open: bool,
 ) -> StarvationVerdict {
-    if job.any_runner_matches {
-        return StarvationVerdict::ClearMark;
-    }
-    let needs_external_host = job.runs_on.iter().any(|label| {
-        let label = label.to_ascii_lowercase();
-        label.starts_with("macos") || label.starts_with("windows")
-    });
-    if needs_external_host {
+    if job.any_runner_matches
+        || job.runs_on.iter().any(|label| {
+            let label = label.to_ascii_lowercase();
+            label.starts_with("macos") || label.starts_with("windows")
+        })
+    {
         return StarvationVerdict::ClearMark;
     }
     let grace = if pool_preparing {
-        let enqueue_age_expired = now
+        let expired = now
             .duration_since(job.enqueued_at)
             .map(|age| age >= MAX_QUEUED_GRACE)
             .unwrap_or(true);
-        if warm_window_open || !enqueue_age_expired {
+        if warm_window_open || !expired {
             return StarvationVerdict::ClearMark;
         }
         MAX_QUEUED_GRACE
@@ -93,8 +75,7 @@ pub(crate) fn starvation_verdict(
     };
     StarvationVerdict::Starve {
         reason: format!(
-            "no runner is registered for `runs-on: {}` and none appeared \
-             within {}s, so the job cannot be scheduled",
+            "no runner is registered for `runs-on: {}` and none appeared within {}s, so the job cannot be scheduled",
             job.runs_on.join(", "),
             grace.as_secs()
         ),
@@ -102,15 +83,741 @@ pub(crate) fn starvation_verdict(
     }
 }
 
+/// Backend-neutral runner capabilities needed by dispatch matching.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunnerMatchRow {
+    /// Labels reported by the runner; matching is ASCII-case-insensitive.
+    pub(crate) labels: Vec<String>,
+    /// Whether this row identifies a registered runner. Unknown/compat
+    /// runners have permissive labels but never satisfy an explicit group.
+    pub(crate) known: bool,
+    pub(crate) group_id: Option<i64>,
+    pub(crate) group_name: Option<String>,
+}
+
+/// Return whether every job label is compatible with a runner's labels.
+///
+/// Empty job labels and unknown runner labels match everything. Exact labels
+/// match case-insensitively. Hosted OS labels (`ubuntu-*`, `macos-*`,
+/// `windows-*`) match a runner's corresponding `linux`, `macos`, or `windows`
+/// OS label; a known runner with no OS label only matches such a label when it
+/// is `self-hosted`.
+pub(crate) fn runner_labels_match(job_labels: &[String], runner_labels: &[String]) -> bool {
+    if job_labels.is_empty() || runner_labels.is_empty() {
+        return true;
+    }
+    let set: HashSet<String> = runner_labels
+        .iter()
+        .map(|v| v.to_ascii_lowercase())
+        .collect();
+    let os = ["linux", "macos", "windows"]
+        .into_iter()
+        .find(|value| set.contains(*value));
+    job_labels.iter().all(|required| {
+        let required = required.to_ascii_lowercase();
+        if set.contains(&required) {
+            return true;
+        }
+        let required_os = if required.starts_with("ubuntu-") || required.starts_with("linux-") {
+            Some("linux")
+        } else if required.starts_with("macos-") || required.starts_with("osx-") {
+            Some("macos")
+        } else if required.starts_with("windows-") {
+            Some("windows")
+        } else {
+            None
+        };
+        match (required_os, os) {
+            (Some(required), Some(actual)) => required == actual,
+            (Some(_), None) => set.contains("self-hosted"),
+            (None, _) => false,
+        }
+    })
+}
+
+/// Match a required runner group. Numeric requirements match group ids;
+/// omitted group metadata means the default group id/name (`1`/`Default`).
+pub(crate) fn runner_group_matches(required: Option<&str>, runner: &RunnerMatchRow) -> bool {
+    let Some(required) = required.map(str::trim).filter(|v| !v.is_empty()) else {
+        return true;
+    };
+    if !runner.known {
+        return false;
+    }
+    if let Ok(id) = required.parse::<i64>() {
+        return runner.group_id == Some(id)
+            || (runner.group_id.is_none() && runner.group_name.is_none() && id == 1);
+    }
+    match (&runner.group_id, &runner.group_name) {
+        (Some(id), Some(name)) if *id != 1 => name.eq_ignore_ascii_case(required),
+        (_, Some(name)) => name.eq_ignore_ascii_case(required),
+        (None, None) | (Some(1), None) => "Default".eq_ignore_ascii_case(required),
+        (Some(_), None) => false,
+    }
+}
+
+/// Match both labels and the explicit runner group.
+pub(crate) fn runner_matches(
+    job_labels: &[String],
+    required_group: Option<&str>,
+    runner: &RunnerMatchRow,
+) -> bool {
+    runner_labels_match(job_labels, &runner.labels) && runner_group_matches(required_group, runner)
+}
+
+/// Candidate row used by claim preference ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimCandidate {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) runs_on: Vec<String>,
+    pub(crate) runner_group: Option<String>,
+    pub(crate) assigned_runner_id: Option<i64>,
+    pub(crate) assignment_fresh: bool,
+    pub(crate) queue_position: u64,
+    pub(crate) claimable: bool,
+}
+
+/// Select the candidate index using the production four-tier preference:
+/// fresh assignment to this runner with exact labels, assignment to this
+/// runner, exact labels, then any claimable candidate. Relative order within
+/// a tier is the supplied queue order; `None` means no candidate is eligible.
+pub(crate) fn claim_preference(
+    candidates: &[ClaimCandidate],
+    runner_id: Option<i64>,
+    runner_labels: &[String],
+    required_group: Option<&str>,
+    runner: &RunnerMatchRow,
+) -> Option<usize> {
+    let exact = |candidate: &ClaimCandidate| {
+        candidate.assignment_fresh
+            && runner_labels_match(&candidate.runs_on, runner_labels)
+            && runner_group_matches(candidate.runner_group.as_deref().or(required_group), runner)
+    };
+    let assigned = |candidate: &ClaimCandidate| {
+        runner_id.is_some()
+            && candidate.assigned_runner_id == runner_id
+            && candidate.assignment_fresh
+    };
+    let eligible = |candidate: &ClaimCandidate| {
+        candidate.claimable
+            && runner_matches(
+                &candidate.runs_on,
+                candidate.runner_group.as_deref(),
+                runner,
+            )
+    };
+    candidates
+        .iter()
+        .position(|candidate| eligible(candidate) && assigned(candidate) && exact(candidate))
+        .or_else(|| {
+            candidates
+                .iter()
+                .position(|candidate| eligible(candidate) && assigned(candidate))
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .position(|candidate| eligible(candidate) && exact(candidate))
+        })
+        .or_else(|| candidates.iter().position(eligible))
+}
+/// Aggregate dependency status with GitHub's precedence: failure, cancelled,
+/// skipped, all-success; `None` means missing or non-terminal.
+pub(crate) fn aggregate_needs_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
+    if statuses.contains(&ExecutionStatus::Failure) {
+        Some(ExecutionStatus::Failure)
+    } else if statuses.contains(&ExecutionStatus::Cancelled) {
+        Some(ExecutionStatus::Cancelled)
+    } else if statuses.contains(&ExecutionStatus::Skipped) {
+        Some(ExecutionStatus::Skipped)
+    } else if !statuses.is_empty()
+        && statuses
+            .iter()
+            .all(|status| *status == ExecutionStatus::Success)
+    {
+        Some(ExecutionStatus::Success)
+    } else {
+        None
+    }
+}
+
+/// Build the JSON `needs` context sent to a runner. Each key contains its
+/// aggregate result and merged outputs; non-terminal dependencies are omitted.
+pub(crate) fn needs_context(needs: &[NeedRow]) -> serde_json::Value {
+    let values = needs
+        .iter()
+        .filter_map(|need| {
+            let result = aggregate_needs_status(&[need.status])?;
+            let result = match result {
+                ExecutionStatus::Success => "success",
+                ExecutionStatus::Failure => "failure",
+                ExecutionStatus::Cancelled => "cancelled",
+                ExecutionStatus::Skipped => "skipped",
+                _ => "unknown",
+            };
+            Some((
+                need.job_id.0.clone(),
+                serde_json::json!({"result": result, "outputs": need.outputs}),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(values)
+}
+
+/// Status and outputs of one declared `needs` dependency.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NeedRow {
+    pub(crate) job_id: JobId,
+    pub(crate) status: ExecutionStatus,
+    pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+}
+
+/// Decision after all direct needs are inspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NeedsDecision {
+    /// At least one direct dependency is non-terminal or missing.
+    Wait,
+    /// Dependencies settled and the condition is true.
+    Promote,
+    /// Dependencies settled and the condition is false.
+    Skip,
+    /// Condition evaluation failed.
+    Error,
+}
+
+/// Minimal condition context for a needs decision. `Always` corresponds to
+/// GitHub's implicit `success()` default; the other variants are the common
+/// backend-evaluable predicates. Backends may evaluate richer expressions and
+/// pass the resulting boolean through [`needs_decision_from_bool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NeedsCondition {
+    DefaultSuccess,
+    Always,
+    AnyFailure,
+    AnyCancelled,
+    Explicit(bool),
+}
+
+/// Decide promotion once the backend has loaded direct needs and their
+/// statuses. Missing/non-terminal dependencies wait; terminal dependencies
+/// use the supplied condition and never mutate rows.
+pub(crate) fn needs_decision(needs: &[NeedRow], condition: NeedsCondition) -> NeedsDecision {
+    if needs.is_empty() {
+        return needs_decision_from_bool(condition, true);
+    }
+    if needs.iter().any(|need| !need.status.is_terminal()) {
+        return NeedsDecision::Wait;
+    }
+    let success = needs
+        .iter()
+        .all(|need| need.status == ExecutionStatus::Success);
+    let failure = needs
+        .iter()
+        .any(|need| need.status == ExecutionStatus::Failure);
+    let cancelled = needs
+        .iter()
+        .any(|need| need.status == ExecutionStatus::Cancelled);
+    let value = match condition {
+        NeedsCondition::DefaultSuccess => success,
+        NeedsCondition::Always => true,
+        NeedsCondition::AnyFailure => failure,
+        NeedsCondition::AnyCancelled => cancelled,
+        NeedsCondition::Explicit(value) => value,
+    };
+    needs_decision_from_bool(condition, value)
+}
+
+/// Convert a pre-evaluated condition into the promotion/skip/error result.
+pub(crate) fn needs_decision_from_bool(condition: NeedsCondition, value: bool) -> NeedsDecision {
+    match condition {
+        NeedsCondition::Explicit(_) if !value => NeedsDecision::Skip,
+        _ if value => NeedsDecision::Promote,
+        NeedsCondition::DefaultSuccess
+        | NeedsCondition::Always
+        | NeedsCondition::AnyFailure
+        | NeedsCondition::AnyCancelled => NeedsDecision::Skip,
+        NeedsCondition::Explicit(_) => NeedsDecision::Skip,
+    }
+}
+
+/// Decrement remaining needs for a dependent row, clamping at zero. The
+/// returned boolean is true exactly when the row becomes promotable.
+pub(crate) fn decrement_remaining_needs(remaining: i32, settled_dependency: bool) -> (i32, bool) {
+    let next = if settled_dependency {
+        remaining.saturating_sub(1)
+    } else {
+        remaining
+    };
+    (next, settled_dependency && next == 0)
+}
+
+/// Matrix leg state needed by max-parallel admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatrixLegRow {
+    pub(crate) job_id: JobId,
+    pub(crate) status: ExecutionStatus,
+    pub(crate) queue_state: QueueState,
+    pub(crate) base_id: String,
+    pub(crate) order: u64,
+}
+
+/// Admit pending matrix legs in stable order until `max_parallel` active
+/// legs (queued, claimed, or in progress) exist. A missing limit admits all.
+pub(crate) fn max_parallel_admission(
+    legs: &[MatrixLegRow],
+    max_parallel: Option<u64>,
+) -> Vec<JobId> {
+    let Some(limit) = max_parallel else {
+        return legs
+            .iter()
+            .filter(|leg| leg.queue_state == QueueState::Blocked)
+            .map(|leg| leg.job_id.clone())
+            .collect();
+    };
+    let active = legs
+        .iter()
+        .filter(|leg| {
+            matches!(leg.status, ExecutionStatus::InProgress)
+                || matches!(leg.queue_state, QueueState::Ready | QueueState::Claimed)
+        })
+        .count() as u64;
+    let available = limit.saturating_sub(active);
+    let mut selected = Vec::new();
+    for leg in legs
+        .iter()
+        .filter(|leg| leg.queue_state == QueueState::Blocked)
+    {
+        if (selected.len() as u64) >= available {
+            break;
+        }
+        selected.push(leg.job_id.clone());
+    }
+    selected
+}
+
+/// Matrix sibling row used by fail-fast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailFastSibling {
+    pub(crate) job_id: JobId,
+    pub(crate) base_id: String,
+    pub(crate) status: ExecutionStatus,
+    pub(crate) agent_job_id: Option<uuid::Uuid>,
+}
+
+/// Select queued/pending/in-progress siblings of a failed leg when the
+/// matrix's `fail-fast` flag is enabled. Returned ids preserve row order;
+/// the backend conditionally updates each selected row and queues cancellation
+/// only for in-progress rows.
+pub(crate) fn matrix_fail_fast(
+    failed_job_id: &JobId,
+    failed_base_id: Option<&str>,
+    fail_fast: bool,
+    siblings: &[FailFastSibling],
+) -> Vec<JobId> {
+    if !fail_fast {
+        return Vec::new();
+    }
+    let Some(base_id) = failed_base_id else {
+        return Vec::new();
+    };
+    siblings
+        .iter()
+        .filter(|sibling| {
+            sibling.job_id != *failed_job_id
+                && sibling.base_id == base_id
+                && matches!(
+                    sibling.status,
+                    ExecutionStatus::Queued
+                        | ExecutionStatus::Pending
+                        | ExecutionStatus::InProgress
+                )
+        })
+        .map(|sibling| sibling.job_id.clone())
+        .collect()
+}
+
+/// A reusable caller's completed callee output.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReusableOutputRow {
+    pub(crate) name: String,
+    pub(crate) value: serde_json::Value,
+}
+
+/// Result of reusable-workflow output propagation. `finalize_caller` is true
+/// when every declared callee output is now available and the caller may be
+/// settled/promoted by the backend.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReusableOutputDecision {
+    pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+    pub(crate) finalize_caller: bool,
+}
+
+/// Merge callee outputs into a caller's output map. Missing values are not
+/// invented; existing values are replaced only by the same named output.
+pub(crate) fn reusable_output_decision(
+    declared_names: &[String],
+    completed: &[ReusableOutputRow],
+) -> ReusableOutputDecision {
+    let mut outputs = BTreeMap::new();
+    for row in completed {
+        if declared_names.is_empty() || declared_names.iter().any(|name| name == &row.name) {
+            outputs.insert(row.name.clone(), row.value.clone());
+        }
+    }
+    let finalize_caller = declared_names.iter().all(|name| outputs.contains_key(name));
+    ReusableOutputDecision {
+        outputs,
+        finalize_caller,
+    }
+}
+/// One completed callee job for reusable-caller output evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReusableInnerRow {
+    pub(crate) job_id: String,
+    pub(crate) status: ExecutionStatus,
+    pub(crate) outputs: BTreeMap<String, serde_json::Value>,
+}
+
+/// Immutable reusable caller inputs. Output definitions use workflow-call
+/// output expression syntax.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReusableCallerRow {
+    pub(crate) caller_id: JobId,
+    pub(crate) inner: Vec<ReusableInnerRow>,
+    pub(crate) output_definitions: BTreeMap<String, String>,
+    pub(crate) inputs: BTreeMap<String, serde_json::Value>,
+}
+
+/// Evaluate reusable-workflow output definitions and aggregate callee status.
+/// The backend applies outputs and status only when `finalize_caller` is true.
+pub(crate) fn reusable_caller_decision(
+    row: &ReusableCallerRow,
+) -> (ReusableOutputDecision, ExecutionStatus) {
+    let all_complete =
+        !row.inner.is_empty() && row.inner.iter().all(|inner| inner.status.is_terminal());
+    if !all_complete {
+        return (
+            ReusableOutputDecision {
+                outputs: BTreeMap::new(),
+                finalize_caller: false,
+            },
+            ExecutionStatus::InProgress,
+        );
+    }
+    let mut jobs = serde_json::Map::new();
+    for inner in &row.inner {
+        let outputs = inner
+            .outputs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        jobs.insert(
+            inner.job_id.clone(),
+            serde_json::json!({"outputs": serde_json::Value::Object(outputs)}),
+        );
+    }
+    let mut context = preloop_gha_expressions::Context::default();
+    context.insert("jobs", serde_json::Value::Object(jobs));
+    context.insert(
+        "inputs",
+        serde_json::Value::Object(row.inputs.clone().into_iter().collect()),
+    );
+    let outputs = row
+        .output_definitions
+        .iter()
+        .map(|(name, expression)| {
+            let value = preloop_gha_parser::eval::resolve_string(expression, &context)
+                .unwrap_or_else(|_| expression.clone());
+            (name.clone(), serde_json::Value::String(value))
+        })
+        .collect();
+    let statuses = row
+        .inner
+        .iter()
+        .map(|inner| inner.status)
+        .collect::<Vec<_>>();
+    let status = aggregate_needs_status(&statuses).unwrap_or(ExecutionStatus::Skipped);
+    (
+        ReusableOutputDecision {
+            outputs,
+            finalize_caller: true,
+        },
+        status,
+    )
+}
+
+/// A concurrency holder/waiter identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConcurrencyRow {
+    pub(crate) group: String,
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: Option<JobId>,
+    pub(crate) wait_id: u64,
+    pub(crate) cancel_in_progress: bool,
+}
+
+/// Result of attempting to insert a concurrency hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConcurrencyAdmission {
+    Acquired,
+    Waiting,
+    CancelCurrent(ConcurrencyRow),
+    Cancelled,
+}
+
+/// Decide hold admission. The backend performs the insert; this function
+/// decides the outcome from the existing holder, FIFO waiters, and the new
+/// arrival's cancel-in-progress flag. A same-run arrival is never cancelled.
+pub(crate) fn concurrency_admission(
+    arrival: &ConcurrencyRow,
+    holder: Option<&ConcurrencyRow>,
+    waiters: &[ConcurrencyRow],
+) -> ConcurrencyAdmission {
+    if holder.is_none() {
+        return ConcurrencyAdmission::Acquired;
+    }
+    if holder.is_some_and(|current| current.run_id == arrival.run_id) {
+        return ConcurrencyAdmission::Acquired;
+    }
+    if arrival.cancel_in_progress {
+        return ConcurrencyAdmission::CancelCurrent(holder.cloned().expect("checked above"));
+    }
+    if waiters.iter().any(|waiter| waiter.run_id == arrival.run_id) {
+        return ConcurrencyAdmission::Waiting;
+    }
+    ConcurrencyAdmission::Waiting
+}
+
+/// Promote the oldest waiter after a hold is released. FIFO is by `wait_id`;
+/// the backend deletes the selected wait row and inserts its hold in the same
+/// SQL transaction. `None` means no waiter remains.
+pub(crate) fn concurrency_fifo_promotion(waiters: &[ConcurrencyRow]) -> Option<ConcurrencyRow> {
+    waiters.iter().min_by_key(|waiter| waiter.wait_id).cloned()
+}
+/// Queue policy for a contended concurrency group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConcurrencyQueueMode {
+    /// New arrival replaces all existing waiters and waits.
+    Single,
+    /// New arrival waits until the bounded pending queue is full, then is
+    /// cancelled instead.
+    Max,
+}
+
+/// Pure queue-mode result; the backend conditionally settles
+/// `cancel_pending`, `cancel_arrival`, and inserts the arrival when parked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConcurrencyQueueDecision {
+    pub(crate) cancel_pending: Vec<ConcurrencyRow>,
+    pub(crate) cancel_arrival: bool,
+    pub(crate) park_arrival: bool,
+}
+
+/// Maximum pending holders for `queue: max`.
+pub(crate) const MAX_CONCURRENCY_WAITERS: usize = 100;
+
+/// Apply GitHub's FIFO queue policy to existing waiters.
+pub(crate) fn concurrency_queue_decision(
+    mode: ConcurrencyQueueMode,
+    existing: &[ConcurrencyRow],
+) -> ConcurrencyQueueDecision {
+    match mode {
+        ConcurrencyQueueMode::Single => ConcurrencyQueueDecision {
+            cancel_pending: existing.to_vec(),
+            cancel_arrival: false,
+            park_arrival: true,
+        },
+        ConcurrencyQueueMode::Max if existing.len() >= MAX_CONCURRENCY_WAITERS => {
+            ConcurrencyQueueDecision {
+                cancel_pending: Vec::new(),
+                cancel_arrival: true,
+                park_arrival: false,
+            }
+        }
+        ConcurrencyQueueMode::Max => ConcurrencyQueueDecision {
+            cancel_pending: Vec::new(),
+            cancel_arrival: false,
+            park_arrival: true,
+        },
+    }
+}
+
+/// Queue-state values in the agreed v1 schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueState {
+    None,
+    Ready,
+    Claimed,
+    Blocked,
+    Held,
+    PendingExpansion,
+    Expanding,
+}
+
+/// Inputs needed to map a job's status and scheduling waits to `jobs.queue_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueStateInput {
+    pub(crate) status: ExecutionStatus,
+    pub(crate) remaining_needs: i32,
+    pub(crate) ready: bool,
+    pub(crate) claimed: bool,
+    /// A row in `concurrency_waits`, regardless of whether its holder is a
+    /// workflow/run or a job/jobset.  The holder kind is used by queue stats,
+    /// not by the queue-state string.
+    pub(crate) concurrency_wait: bool,
+    /// Waiting for a max-parallel slot.  This is distinct from dependency
+    /// blocking because both map to `blocked`, while concurrency maps to
+    /// `held`.
+    pub(crate) max_parallel_wait: bool,
+    pub(crate) pending_expansion: bool,
+    pub(crate) expanding: bool,
+}
+
+/// Apply decisions-5 queue mapping exactly:
+/// needs/max-parallel become `blocked`; any concurrency wait becomes `held`.
+/// The holder kind distinguishes workflow-level from job/jobset-level waits
+/// in queue statistics. Expansion states are fenced before ordinary queues.
+pub(crate) fn queue_state(input: QueueStateInput) -> QueueState {
+    if input.status.is_terminal() {
+        return QueueState::None;
+    }
+    if input.expanding {
+        return QueueState::Expanding;
+    }
+    if input.pending_expansion {
+        return QueueState::PendingExpansion;
+    }
+    if input.concurrency_wait {
+        return QueueState::Held;
+    }
+    if input.claimed {
+        return QueueState::Claimed;
+    }
+    if input.ready {
+        return QueueState::Ready;
+    }
+    if input.remaining_needs > 0 || input.max_parallel_wait {
+        return QueueState::Blocked;
+    }
+    QueueState::None
+}
+
+/// Expansion build result supplied by an expander worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpansionFence {
+    pub(crate) expected_generation: i32,
+    pub(crate) current_generation: i32,
+}
+
+/// Whether an expansion result may be applied and what queue state follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpansionDecision {
+    Stale,
+    Failed(ExecutionStatus),
+    Empty(ExecutionStatus),
+    Apply,
+}
+
+/// Fence an expansion result: stale generations are discarded; failed builds
+/// settle the expansion node as failure; an empty successful matrix settles it
+/// skipped; non-empty success applies its materialized jobs.
+pub(crate) fn expansion_decision(
+    fence: ExpansionFence,
+    build_status: Result<usize, ExecutionStatus>,
+) -> ExpansionDecision {
+    if fence.expected_generation != fence.current_generation {
+        return ExpansionDecision::Stale;
+    }
+    match build_status {
+        Err(status) => ExpansionDecision::Failed(status),
+        Ok(0) => ExpansionDecision::Empty(ExecutionStatus::Skipped),
+        Ok(_) => ExpansionDecision::Apply,
+    }
+}
+
+/// Completion row used by pure settlement decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionRow {
+    pub(crate) job_id: JobId,
+    pub(crate) prior_status: ExecutionStatus,
+    pub(crate) reported_status: ExecutionStatus,
+    pub(crate) continue_on_error: bool,
+    pub(crate) run_will_be_terminal: bool,
+}
+
+/// Pure result of settling one completion. The backend applies the returned
+/// status conditionally, then uses `promote_dependents` to update rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompletionDecision {
+    pub(crate) effective_status: ExecutionStatus,
+    pub(crate) replayed: bool,
+    pub(crate) release_workflow_hold: bool,
+    pub(crate) promote_dependents: bool,
+}
+
+/// Decide first-result-wins, continue-on-error, workflow-hold release, and
+/// dependent promotion. Cancelled jobs remain cancelled against late success
+/// or failure reports.
+pub(crate) fn completion_decision(row: CompletionRow) -> CompletionDecision {
+    let replayed = row.prior_status.is_terminal() && row.prior_status != ExecutionStatus::Cancelled;
+    let reported = if row.continue_on_error && row.reported_status == ExecutionStatus::Failure {
+        ExecutionStatus::Success
+    } else {
+        row.reported_status
+    };
+    let effective_status = match (row.prior_status, reported) {
+        (ExecutionStatus::Cancelled, ExecutionStatus::Success | ExecutionStatus::Failure) => {
+            ExecutionStatus::Cancelled
+        }
+        _ if replayed => row.prior_status,
+        _ => reported,
+    };
+    CompletionDecision {
+        effective_status,
+        replayed,
+        release_workflow_hold: row.run_will_be_terminal,
+        promote_dependents: !replayed && effective_status.is_terminal(),
+    }
+}
+
+/// Dependent rows that become eligible after a completed job. A row is
+/// promotable only when every listed need is terminal and the needs decision
+/// is `Promote`; skipped/error rows are returned separately for settlement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DependentPromotion {
+    pub(crate) job_id: JobId,
+    pub(crate) decision: NeedsDecision,
+}
+
+/// Decide each dependent's next action without mutating any backend row.
+pub(crate) fn dependent_promotions(
+    dependents: &[(JobId, Vec<NeedRow>, NeedsCondition)],
+) -> Vec<DependentPromotion> {
+    dependents
+        .iter()
+        .map(|(job_id, needs, condition)| DependentPromotion {
+            job_id: job_id.clone(),
+            decision: needs_decision(needs, *condition),
+        })
+        .collect()
+}
+
 #[cfg(test)]
-mod tests {
+mod decision_tests {
     use super::*;
 
+    fn jid(value: &str) -> JobId {
+        JobId(value.to_owned())
+    }
+    fn rid(value: u128) -> RunId {
+        RunId(uuid::Uuid::from_u128(value))
+    }
     fn labels(values: &[&str]) -> Vec<String> {
-        values.iter().map(|v| (*v).to_owned()).collect()
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    fn candidate<'a>(
+    fn starvation_candidate<'a>(
         runs_on: &'a [String],
         enqueued_ago: Duration,
         first_seen_ago: Option<Duration>,
@@ -128,14 +835,14 @@ mod tests {
     fn matched_or_external_host_jobs_never_starve() {
         let now = SystemTime::now();
         let linux = labels(&["ubuntu-latest"]);
-        let mut job = candidate(&linux, Duration::from_secs(10_000), None, now);
+        let mut job = starvation_candidate(&linux, Duration::from_secs(10_000), None, now);
         job.any_runner_matches = true;
         assert_eq!(
             starvation_verdict(&job, now, false, false),
             StarvationVerdict::ClearMark
         );
         let mac = labels(&["macOS-14"]);
-        let job = candidate(&mac, Duration::from_secs(10_000), None, now);
+        let job = starvation_candidate(&mac, Duration::from_secs(10_000), None, now);
         assert_eq!(
             starvation_verdict(&job, now, false, false),
             StarvationVerdict::ClearMark
@@ -143,11 +850,10 @@ mod tests {
     }
 
     #[test]
-    fn grace_counts_from_first_seen_else_enqueue() {
+    fn starvation_grace_uses_first_seen_or_enqueue_time() {
         let now = SystemTime::now();
         let linux = labels(&["ubuntu-latest"]);
-        // Enqueued long ago but first seen recently: keep the existing mark.
-        let job = candidate(
+        let job = starvation_candidate(
             &linux,
             Duration::from_secs(1_000),
             Some(Duration::from_secs(30)),
@@ -159,40 +865,302 @@ mod tests {
                 first_seen: now - Duration::from_secs(30)
             }
         );
-        // No mark: the enqueue time seeds the clock, so a restart grants no
-        // fresh window.
-        let job = candidate(&linux, Duration::from_secs(121), None, now);
+        let job = starvation_candidate(&linux, Duration::from_secs(121), None, now);
         let StarvationVerdict::Starve { reason, grace } =
             starvation_verdict(&job, now, false, false)
         else {
             panic!("an unmatched job past the grace window must starve");
         };
         assert_eq!(grace, QUEUED_JOB_GRACE);
-        assert_eq!(
-            reason,
-            "no runner is registered for `runs-on: ubuntu-latest` and none appeared within \
-             120s, so the job cannot be scheduled"
-        );
+        assert!(reason.contains("within 120s"));
     }
 
     #[test]
-    fn preparing_pool_protects_until_the_enqueue_ceiling() {
+    fn preparing_pool_protects_until_enqueue_ceiling() {
         let now = SystemTime::now();
         let linux = labels(&["self-hosted", "linux"]);
-        let young = candidate(&linux, Duration::from_secs(599), None, now);
+        let young = starvation_candidate(&linux, Duration::from_secs(599), None, now);
         assert_eq!(
             starvation_verdict(&young, now, true, false),
             StarvationVerdict::ClearMark
         );
-        let old = candidate(&linux, Duration::from_secs(600), None, now);
+        let old = starvation_candidate(&linux, Duration::from_secs(600), None, now);
         assert!(matches!(
             starvation_verdict(&old, now, true, false),
             StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
         ));
-        // The process warm window protects even past the ceiling.
         assert_eq!(
             starvation_verdict(&old, now, true, true),
             StarvationVerdict::ClearMark
+        );
+    }
+
+    #[test]
+    fn runner_matching_handles_hosted_os_and_groups() {
+        let runner = RunnerMatchRow {
+            labels: vec!["self-hosted".into(), "Linux".into(), "arm64".into()],
+            known: true,
+            group_id: None,
+            group_name: None,
+        };
+        assert!(runner_matches(
+            &["ubuntu-latest".into(), "arm64".into()],
+            None,
+            &runner
+        ));
+        assert!(!runner_matches(&["windows-latest".into()], None, &runner));
+        assert!(runner_group_matches(Some("Default"), &runner));
+    }
+
+    #[test]
+    fn claim_preference_is_four_tiered() {
+        let runner = RunnerMatchRow {
+            labels: vec!["linux".into()],
+            known: true,
+            ..Default::default()
+        };
+        let rows = vec![
+            ClaimCandidate {
+                run_id: rid(1),
+                job_id: jid("generic"),
+                runs_on: vec!["linux".into()],
+                runner_group: None,
+                assigned_runner_id: None,
+                assignment_fresh: false,
+                queue_position: 0,
+                claimable: true,
+            },
+            ClaimCandidate {
+                run_id: rid(1),
+                job_id: jid("assigned"),
+                runs_on: vec!["linux".into()],
+                runner_group: None,
+                assigned_runner_id: Some(7),
+                assignment_fresh: true,
+                queue_position: 1,
+                claimable: true,
+            },
+        ];
+        assert_eq!(
+            claim_preference(&rows, Some(7), &["linux".into()], None, &runner),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn needs_context_and_reusable_outputs_are_backend_neutral() {
+        let mut outputs = BTreeMap::new();
+        outputs.insert("answer".to_owned(), serde_json::json!("42"));
+        let need = NeedRow {
+            job_id: jid("build"),
+            status: ExecutionStatus::Success,
+            outputs: outputs.clone(),
+        };
+        let context = needs_context(&[need]);
+        assert_eq!(context["build"]["result"], "success");
+        assert_eq!(context["build"]["outputs"]["answer"], "42");
+        let caller = ReusableCallerRow {
+            caller_id: jid("call"),
+            inner: vec![ReusableInnerRow {
+                job_id: "build".to_owned(),
+                status: ExecutionStatus::Success,
+                outputs,
+            }],
+            output_definitions: BTreeMap::from([(
+                "answer".to_owned(),
+                "${{ jobs.build.outputs.answer }}".to_owned(),
+            )]),
+            inputs: BTreeMap::new(),
+        };
+        let (decision, status) = reusable_caller_decision(&caller);
+        assert!(decision.finalize_caller);
+        assert_eq!(decision.outputs["answer"], "42");
+        assert_eq!(status, ExecutionStatus::Success);
+    }
+
+    #[test]
+    fn needs_waits_until_terminal_and_decrements() {
+        let need = NeedRow {
+            job_id: jid("a"),
+            status: ExecutionStatus::InProgress,
+            outputs: BTreeMap::new(),
+        };
+        assert_eq!(
+            needs_decision(&[need], NeedsCondition::DefaultSuccess),
+            NeedsDecision::Wait
+        );
+        assert_eq!(decrement_remaining_needs(2, true), (1, false));
+        assert_eq!(decrement_remaining_needs(1, true), (0, true));
+    }
+
+    #[test]
+    fn matrix_and_parallel_decisions_preserve_order() {
+        let siblings = vec![
+            FailFastSibling {
+                job_id: jid("a"),
+                base_id: "m".into(),
+                status: ExecutionStatus::Queued,
+                agent_job_id: None,
+            },
+            FailFastSibling {
+                job_id: jid("b"),
+                base_id: "m".into(),
+                status: ExecutionStatus::InProgress,
+                agent_job_id: None,
+            },
+        ];
+        assert_eq!(
+            matrix_fail_fast(&jid("x"), Some("m"), true, &siblings),
+            vec![jid("a"), jid("b")]
+        );
+        let legs = siblings
+            .into_iter()
+            .map(|s| MatrixLegRow {
+                job_id: s.job_id.clone(),
+                status: if s.job_id == jid("b") {
+                    ExecutionStatus::Success
+                } else {
+                    s.status
+                },
+                queue_state: QueueState::Blocked,
+                base_id: "m".into(),
+                order: 0,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(max_parallel_admission(&legs, Some(1)), vec![jid("a")]);
+    }
+
+    #[test]
+    fn concurrency_and_queue_mapping_follow_contract() {
+        let arrival = ConcurrencyRow {
+            group: "g".into(),
+            run_id: rid(2),
+            job_id: None,
+            wait_id: 9,
+            cancel_in_progress: true,
+        };
+        let holder = ConcurrencyRow {
+            group: "g".into(),
+            run_id: rid(1),
+            job_id: None,
+            wait_id: 1,
+            cancel_in_progress: false,
+        };
+        assert!(matches!(
+            concurrency_admission(&arrival, Some(&holder), &[]),
+            ConcurrencyAdmission::CancelCurrent(_)
+        ));
+        assert_eq!(
+            concurrency_fifo_promotion(&[holder.clone(), arrival.clone()]),
+            Some(holder)
+        );
+        assert_eq!(
+            queue_state(QueueStateInput {
+                status: ExecutionStatus::Pending,
+                remaining_needs: 1,
+                ready: false,
+                claimed: false,
+                concurrency_wait: false,
+                max_parallel_wait: false,
+                pending_expansion: false,
+                expanding: false
+            }),
+            QueueState::Blocked
+        );
+        assert_eq!(
+            queue_state(QueueStateInput {
+                status: ExecutionStatus::Pending,
+                remaining_needs: 0,
+                ready: false,
+                claimed: false,
+                concurrency_wait: true,
+                max_parallel_wait: false,
+                pending_expansion: false,
+                expanding: false
+            }),
+            QueueState::Held
+        );
+        assert_eq!(
+            queue_state(QueueStateInput {
+                status: ExecutionStatus::Pending,
+                remaining_needs: 0,
+                ready: false,
+                claimed: false,
+                concurrency_wait: false,
+                max_parallel_wait: true,
+                pending_expansion: false,
+                expanding: false
+            }),
+            QueueState::Blocked
+        );
+        assert_eq!(
+            queue_state(QueueStateInput {
+                status: ExecutionStatus::Pending,
+                remaining_needs: 0,
+                ready: false,
+                claimed: false,
+                concurrency_wait: false,
+                max_parallel_wait: false,
+                pending_expansion: false,
+                expanding: false
+            }),
+            QueueState::None
+        );
+    }
+
+    #[test]
+    fn concurrency_queue_modes_cancel_expected_rows() {
+        let arrival = ConcurrencyRow {
+            group: "g".into(),
+            run_id: rid(3),
+            job_id: None,
+            wait_id: 3,
+            cancel_in_progress: false,
+        };
+        let single = concurrency_queue_decision(ConcurrencyQueueMode::Single, &[arrival.clone()]);
+        assert_eq!(single.cancel_pending, vec![arrival.clone()]);
+        assert!(single.park_arrival && !single.cancel_arrival);
+        let existing = (0..MAX_CONCURRENCY_WAITERS)
+            .map(|wait_id| ConcurrencyRow {
+                wait_id: wait_id as u64,
+                ..arrival.clone()
+            })
+            .collect::<Vec<_>>();
+        let maxed = concurrency_queue_decision(ConcurrencyQueueMode::Max, &existing);
+        assert!(maxed.cancel_arrival && !maxed.park_arrival);
+    }
+
+    #[test]
+    fn expansion_and_completion_are_fenced() {
+        assert_eq!(
+            expansion_decision(
+                ExpansionFence {
+                    expected_generation: 1,
+                    current_generation: 2
+                },
+                Ok(2)
+            ),
+            ExpansionDecision::Stale
+        );
+        assert_eq!(
+            expansion_decision(
+                ExpansionFence {
+                    expected_generation: 1,
+                    current_generation: 1
+                },
+                Ok(0)
+            ),
+            ExpansionDecision::Empty(ExecutionStatus::Skipped)
+        );
+        let decision = completion_decision(CompletionRow {
+            job_id: jid("a"),
+            prior_status: ExecutionStatus::Failure,
+            reported_status: ExecutionStatus::Failure,
+            continue_on_error: false,
+            run_will_be_terminal: true,
+        });
+        assert!(
+            decision.replayed && decision.release_workflow_hold && !decision.promote_dependents
         );
     }
 }

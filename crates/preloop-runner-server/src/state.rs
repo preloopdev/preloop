@@ -1378,7 +1378,7 @@ fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64
 }
 
 /// HKDF-SHA256 session-key derivation (see [`AppState::session_encryption`]).
-pub(crate) fn derive_session_encryption(cluster_key: &[u8], session_id: &str) -> SessionEncryption {
+pub fn derive_session_encryption(cluster_key: &[u8], session_id: &str) -> SessionEncryption {
     let mut info = b"preloop-session-key-v1".to_vec();
     info.extend_from_slice(session_id.as_bytes());
     let mut key = vec![0u8; 32];

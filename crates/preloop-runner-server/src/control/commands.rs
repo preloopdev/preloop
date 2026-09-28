@@ -21,7 +21,7 @@ fn system_to_us(t: std::time::SystemTime) -> i64 {
 }
 
 fn parse_uuid(s: &str) -> uuid::Uuid {
-    s.parse().unwrap_or_default()
+    super::logic::session_uuid(s)
 }
 
 pub(crate) fn submit_run_tx(
