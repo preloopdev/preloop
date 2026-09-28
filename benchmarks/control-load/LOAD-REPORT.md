@@ -27,18 +27,59 @@ Chaos rounds define a measurable steady state, inject a bounded fault, and compa
 | r12 node-kill | 2/s, 90s, 60 runners, node 0 killed at 30s | 174 | 458 | 681 | 381 | 77 | 60 | 979 / 2,949 | 927 | 482 | 1.81 |
 | r13 database-restart | 2/s, 90s, 60 runners, Postgres restarted at ~35s | 112 | 359 | 179 | 124 | 235 | 42 | 331 / 8,132 | 140 | 84 | 0.59 |
 
+
+Direct-SQL cutover rounds (the new `control/lite` / `control/pg` backends):
+
+| Round | Load | Workflows | Jobs submitted | Acquired | Completed | Backlog | Webhooks | Submit p50/p99 ms | Complete p50 ms | Timeline p50 ms | Completed/s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| r18 new engine | 10/s, 90s, 200 runners | 330 | 1,609 | 1,583 | 1,570 | 0.44/s | 185 | 745 / 6,408 | 40 | 7 | 17.44 |
+| r19 new engine | 25/s, 90s, 400 runners | 297 | 3,283 | 1,894 | 1,871 | 15.70/s | 388 | 4,650 / 13,039 | 277 | 84 | 20.78 |
+| r20 `SKIP LOCKED` | 25/s, 90s, 400 runners | 270 | 3,107 | 1,955 | 1,933 | 13.05/s | 634 | 11,341 / 25,539 | 484 | 102 | 21.47 |
+| r21 pool/webhook fixes | 25/s, 90s, 400 runners | 216 | 3,479 | 2,054 | 2,041 | 15.96/s | 796 | 7,601 / 18,627 | 149 | 19 | 22.71 |
+| r23 nested-pool fix | 25/s, 90s, 400 runners | 265 | 2,849 | 2,049 | 2,032 | 9.08/s | 677 | 9,693 / 27,194 | 77 | 11 | 22.57 |
+| r24 node-kill chaos | 25/s, 90s, 400 runners, node 0 killed at 45s | 408 | 2,437 | 2,108 | 2,056 | 4.23/s | 254 | 5,895 / 14,164 | 390 | 69 | 22.85 |
+
+The first direct-SQL round exposed a Postgres-only startup crash: the
+`control/pg` module declaration for `webhooks.rs` had been lost in a merge,
+so every webhook trait forwarder recursively called itself. `15bd7901`
+restored the module and added a shared inbox regression test. The first
+10/s round then reached 17.44 completed jobs/s versus 6.27 jobs/s in the
+old r16 baseline.
+
+At 25/s, the claim path initially spent 563 seconds in 23,036 conditional
+claim updates with only 4,444 wins. `b892be5a` changed the candidate claim
+to `FOR UPDATE SKIP LOCKED` and joined assignments into the candidate read.
+The dominant remaining cost is per-run serialization (`runs.event_seq` and
+the run mutex); database CPU was not saturated.
+
+`ffe1bff4` fixed a separate pool self-deadlock: `acquire_for_runner`,
+status snapshots, OIDC grants, and completion paths could hold one pooled
+connection while checking out another. It also bounded pool checkout at 30s
+and added eight concurrent webhook drain loops. The dedicated regression
+test fails by timeout without the connection release and passes with it.
+
+The node-kill round retained `duplicate_inflight = 0` and completed at
+22.85 jobs/s, but left 150 jobs in progress after the killed node. Claim
+recovery and runner re-registration still need hardening before capacity is
+claimed.
 Round data is retained in `load-results/<label>/summary.json`, including rates, latency distributions, database samples, transaction statistics, and integrity output.
 
-## Integrity
+## Capacity conclusion
 
-Successful steady-state rounds r6–r10 reported:
+5M jobs/day requires approximately 57.9 completed jobs/s. The direct-SQL
+cutover reached 22.85 completed jobs/s at 25 workflow submissions/s and
+17.44 jobs/s at 10 submissions/s. This is a substantial improvement over
+the old r16 baseline (6.27 jobs/s), but the control plane is **not yet
+validated for 5M jobs/day**.
 
-- `duplicate_inflight = 0`
-- `duplicate_runners = 0` after the session-diff and fixed-deadline changes
-- no duplicate job claims in the cross-node poll regression test
-- no failed control-plane unit/lib tests after the changes
+Remaining capacity work:
 
-## Chaos
+- reduce per-run `event_seq`/run-mutex serialization;
+- harden runner identity/session re-registration after node restart;
+- eliminate the remaining webhook enqueue timeouts and drain backlog;
+- repeat 50/s and burst rounds after those fixes;
+- run the chaos matrix again after claim recovery reaches zero in-progress
+  orphaned jobs.
 
 r11 injected:
 
@@ -57,20 +98,22 @@ Observed behavior:
 
 ## Findings and fixes
 
-1. Full TxState submit/poll transactions caused multi-second to minute-scale latency. Narrow scopes and concurrent poll claims reduced submit p50 from roughly 40 s to below 2 s in steady state.
-2. Polling while taking the global advisory lock serialized runners behind maintenance. Removing that redundant lock reduced poll global-lock wait from roughly 240 ms to 70–79 ms in the comparable burst round.
-3. Delete-and-reinsert side tables caused duplicate session/attempt errors under concurrent writers. Sessions, broker messages, token requests, grants, OIDC contexts, assignments, pool state, and cancellations now use keyed diffs/upserts.
-4. Global writers could race run-scoped writers. Global transactions now lock loaded runs in a deterministic advisory-lock order; the archiver uses nonblocking run locks.
-5. Repeated wakeups extended long-poll requests indefinitely. All long-poll handlers now use one fixed deadline.
-6. Remaining dominant hotspots are timeline reconciliation and concurrency-aware completion. Both still perform substantial TxState work and keep the system well below the 5M jobs/day target.
+1. The direct-SQL backends raised completed throughput from 6.27 jobs/s
+   (old r16) to 17.44 jobs/s at 10 submissions/s and 22.85 jobs/s during
+   the 25/s node-kill round.
+2. A lost `pg/mod.rs` module declaration left every Postgres webhook
+   forwarder recursively calling itself. `15bd7901` restored `webhooks.rs`
+   and added a shared inbox regression test.
+3. Ready-job claims initially thrashed on one head row. `b892be5a` added
+   `FOR UPDATE SKIP LOCKED` and removed the per-candidate assignment query.
+4. Nested Postgres pool checkouts could hold every reader indefinitely.
+   `ffe1bff4` releases connections before nested reads, uses transaction-
+   scoped readers, bounds checkout at 30s, and drains webhook deliveries
+   with bounded concurrency.
+5. The remaining dominant hotspot is per-run serialization: `runs.event_seq`
+   and the run mutex. At r21, the top event-sequence statement consumed
+   77 seconds; CPU was not saturated. Webhook enqueue timeouts and
+   post-node-kill orphan recovery also remain.
 
-## Capacity conclusion
-
-5M jobs/day requires approximately 57.9 completed jobs/s. The highest measured burst result was approximately 3.15 completed jobs/s in r8 and 1.58 jobs/s in the 5x burst r9; r10 measured 1.44 jobs/s. The control plane is therefore **not yet validated for 5M jobs/day**.
-
-Required next work:
-
-- replace timeline reconciliation with direct SQL row updates/upserts;
-- merge broker completion bookkeeping with completion persistence to remove the second transaction;
-- remove remaining hot-path TxState loads, culminating in deleting the TxState backend model;
-- fix runner identity/session re-registration after node restart (r12 left 30 duplicate runner names);
+The control plane remains **not validated for 5M jobs/day**: 57.9 completed
+jobs/s is still above the current 22.85 jobs/s peak.
