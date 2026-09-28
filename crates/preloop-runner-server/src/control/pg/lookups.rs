@@ -1268,4 +1268,393 @@ impl PgBackend {
             })
             .collect())
     }
+
+    /// Runs matching the list filter, active before terminal and newest
+    /// first inside each group (live and archived interleaved). Job rows
+    /// carry (status, queue kind, latest attempt) so `project_run_rows`
+    /// rebuilds the same `jobs`/`jobs_list` shape the single-run read
+    /// serves; archived jobs project `none` queue kind and lose caller
+    /// metadata (decisions-4 accepts the projection narrowing).
+    ///
+    /// Statements: one `UNION ALL` selection over `runs`/`run_history`;
+    /// per run the `load_graph` or the archived `run_history` +
+    /// `job_history`/`attempt_history` reads; one batched `job_steps` ∪
+    /// `step_history` read for the latest attempts' step manifests.
+    pub(super) async fn list_runs(
+        &self,
+        filter: crate::control::backend::RunListFilter,
+    ) -> Result<Vec<crate::models::RunRecord>, ControlError> {
+        let limit = filter.limit.min(200) as i64;
+        let mut client = self.reader().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        // The selected runs: live and archived, terminal_rank ordering
+        // (`active before newer terminal runs` parity). `status` filters on
+        // the API word: live `status` except a workflow-gated run reads
+        // 'pending'; archived reads the conclusion ('completed' matches any).
+        let selected = tx
+            .query(
+                concat!(
+                    "SELECT run_id::text, archived, has_run_wait, terminal_rank, sort_at FROM (\
+                       SELECT r.run_id, false AS archived, \
+                         EXISTS (SELECT 1 FROM concurrency_waits w \
+                                 WHERE w.holder_run_id = r.run_id AND w.holder_kind = 'run') \
+                           AS has_run_wait, \
+                         CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END AS terminal_rank, \
+                         COALESCE(",
+                    us!("r.completed_at"),
+                    ", ",
+                    us!("r.started_at"),
+                    ", ",
+                    us!("r.created_at"),
+                    ") AS sort_at, \
+                         r.workflow_path, r.event, \
+                         CASE WHEN r.status = 'completed' THEN COALESCE(r.conclusion,'success') \
+                              WHEN EXISTS (SELECT 1 FROM concurrency_waits w \
+                                           WHERE w.holder_run_id = r.run_id \
+                                             AND w.holder_kind = 'run') THEN 'pending' \
+                              ELSE r.status END AS status \
+                       FROM runs r \
+                       UNION ALL \
+                       SELECT h.run_id, true, false, 1, COALESCE(",
+                    us!("h.completed_at"),
+                    ", ",
+                    us!("h.started_at"),
+                    ", ",
+                    us!("h.created_at"),
+                    "), h.workflow_path, h.event, \
+                         COALESCE(h.conclusion,'success') \
+                       FROM run_history h\
+                     ) s \
+                     WHERE ($1::text IS NULL OR position($1 in s.workflow_path) > 0) \
+                       AND ($2::text IS NULL OR s.status = $2 OR \
+                            ($2 = 'completed' AND s.terminal_rank = 1)) \
+                       AND ($3::text IS NULL OR s.event = $3) \
+                     ORDER BY s.terminal_rank, s.sort_at DESC, s.run_id LIMIT $4"
+                ),
+                &[&filter.workflow, &filter.status, &filter.event, &limit],
+            )
+            .await
+            .map_err(db)?;
+        let mut runs = Vec::with_capacity(selected.len());
+        for row in &selected {
+            let run_id = codec::run_id(row.get::<_, &str>(0))?;
+            let archived: bool = row.get(1);
+            let run_wait: bool = row.get(2);
+            let (record, mut jobs) = if archived {
+                (archived_record_tx(&tx, run_id).await?, archived_job_rows(&tx, run_id).await?)
+            } else {
+                match PgBackend::load_graph(self, &tx, run_id).await? {
+                    Some(graph) => (graph.record, live_job_rows(&tx, run_id).await?),
+                    None => {
+                        // Archived between select and read: fall back.
+                        (
+                            archived_record_tx(&tx, run_id).await?,
+                            archived_job_rows(&tx, run_id).await?,
+                        )
+                    }
+                }
+            };
+            hydrate_steps(&tx, &mut jobs).await?;
+            let jobs: Vec<(JobId, ExecutionStatus, String, Option<Vec<StepRecord>>)> = jobs
+                .into_iter()
+                .map(|(job_id, status, kind, steps, _)| (job_id, status, kind, steps))
+                .collect();
+            let mut projected = crate::control::backend::project_run_rows(record, jobs);
+            // `record.status` is the ExecutionStatus word; a run parked on
+            // its workflow-level gate reads `Pending` (submit's `held`).
+            if run_wait && projected.status == ExecutionStatus::Queued {
+                projected.status = ExecutionStatus::Pending;
+            }
+            runs.push(projected);
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(runs)
+    }
+
+    /// Every run (live or archived) of `repository`, case-insensitive —
+    /// `runs_for_repository` parity (map-order by run id).
+    ///
+    /// Statements: `SELECT run_id FROM runs UNION ALL run_history WHERE
+    /// lower(repository) = lower($1)`; per run the `load_graph` or archived
+    /// decode.
+    pub(super) async fn runs_for_repository(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<crate::models::RunRecord>, ControlError> {
+        let mut client = self.reader().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let rows = tx
+            .query(
+                "SELECT run_id::text, false FROM runs \
+                 WHERE lower(repository) = lower($1) \
+                 UNION ALL SELECT run_id::text, true FROM run_history \
+                 WHERE lower(repository) = lower($1) \
+                 ORDER BY run_id",
+                &[&repository],
+            )
+            .await
+            .map_err(db)?;
+        let mut runs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run_id = codec::run_id(row.get::<_, &str>(0))?;
+            if row.get::<_, bool>(1) {
+                runs.push(archived_record_tx(&tx, run_id).await?);
+            } else if let Some(graph) = PgBackend::load_graph(self, &tx, run_id).await? {
+                runs.push(graph.record);
+            } else {
+                runs.push(archived_record_tx(&tx, run_id).await?);
+            }
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(runs)
+    }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// List-run assembly
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One `project_run_rows` input plus the job's latest attempt (step-manifest
+/// key), before the batch step read resolves it.
+type JobProjection = (
+    JobId,
+    ExecutionStatus,
+    String,
+    Option<Vec<StepRecord>>,
+    Option<String>,
+);
+
+/// The run's live job rows as `(job_id, status, queue_state, latest
+/// agent_job_id)`. An expanded matrix parent does not appear — it left
+/// `run.jobs` when its legs registered.
+///
+/// Statement: `SELECT .. FROM jobs WHERE run_id AND NOT (matrix_parent with
+/// children) ORDER BY job_id`.
+async fn live_job_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+) -> Result<Vec<JobProjection>, ControlError> {
+    tx.query(
+        "SELECT j.job_id, j.status, j.queue_state, \
+         (SELECT q.agent_job_id::text FROM job_requests q \
+          WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
+          ORDER BY q.request_id DESC LIMIT 1) \
+         FROM jobs j WHERE j.run_id = $1::text::uuid \
+         AND NOT (j.kind = 'matrix_parent' AND EXISTS (\
+              SELECT 1 FROM jobs c WHERE c.run_id = j.run_id \
+              AND c.parent_job_id = j.job_id)) \
+         ORDER BY j.job_id",
+        &[&run_text(run_id)],
+    )
+    .await
+    .map_err(db)?
+    .iter()
+    .map(|row| {
+        Ok((
+            JobId(row.get::<_, String>(0)),
+            codec::status(row.get(1)),
+            row.get::<_, String>(2),
+            None,
+            row.get::<_, Option<String>>(3),
+        ))
+    })
+    .collect()
+}
+
+/// The archived run's job rows from the latest archive snapshot
+/// (`run_created_at` = its `run_history.created_at`). Expanded parents
+/// (matrix or caller) are excluded by their surviving children — the
+/// caller's `inner_job_ids` are not archived, so children presence is the
+/// only expansion signal.
+///
+/// Statement: `SELECT .. FROM job_history WHERE run_id AND run_created_at =
+/// latest ORDER BY job_id`.
+async fn archived_job_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+) -> Result<Vec<JobProjection>, ControlError> {
+    tx.query(
+        "SELECT j.job_id, j.status, 'none', \
+         (SELECT a.agent_job_id::text FROM attempt_history a \
+          WHERE a.run_id = j.run_id AND a.run_created_at = j.run_created_at \
+            AND a.job_id = j.job_id ORDER BY a.request_id DESC LIMIT 1) \
+         FROM job_history j WHERE j.run_id = $1::text::uuid \
+         AND j.run_created_at = (SELECT max(created_at) FROM run_history \
+                                 WHERE run_id = $1::text::uuid) \
+         AND NOT (j.kind IN ('matrix_parent','reusable_caller') AND EXISTS (\
+              SELECT 1 FROM job_history c WHERE c.run_id = j.run_id \
+              AND c.run_created_at = j.run_created_at \
+              AND c.parent_job_id = j.job_id)) \
+         ORDER BY j.job_id",
+        &[&run_text(run_id)],
+    )
+    .await
+    .map_err(db)?
+    .iter()
+    .map(|row| {
+        Ok((
+            JobId(row.get::<_, String>(0)),
+            codec::status(row.get(1)),
+            row.get::<_, String>(2),
+            None,
+            row.get::<_, Option<String>>(3),
+        ))
+    })
+    .collect()
+}
+
+/// Fill the step slot of each job row from the latest attempt's manifest —
+/// `job_steps` ∪ `step_history` in one batched read.
+async fn hydrate_steps(
+    tx: &tokio_postgres::Transaction<'_>,
+    jobs: &mut [JobProjection],
+) -> Result<(), ControlError> {
+    let attempts: Vec<String> = jobs.iter().filter_map(|job| job.4.clone()).collect();
+    if attempts.is_empty() {
+        return Ok(());
+    }
+    let mut steps: BTreeMap<uuid::Uuid, Vec<StepRecord>> = BTreeMap::new();
+    for chunk in attempts.chunks(500) {
+        let key_list: Vec<String> = chunk.to_vec();
+        for row in tx
+            .query(
+                &format!(
+                    "SELECT {STEP_COLUMNS}, position FROM (\
+                       SELECT {STEP_COLUMNS}, position FROM job_steps \
+                       WHERE agent_job_id = ANY($1::text[]::uuid[]) \
+                       UNION ALL \
+                       SELECT {STEP_COLUMNS}, position FROM step_history \
+                       WHERE agent_job_id = ANY($1::text[]::uuid[])) s \
+                     ORDER BY agent_job_id, position"
+                ),
+                &[&key_list],
+            )
+            .await
+            .map_err(db)?
+        {
+            let (agent, step) = step_from_row(&row)?;
+            steps.entry(agent).or_default().push(step);
+        }
+    }
+    for job in jobs.iter_mut() {
+        if let Some(agent) = &job.4 {
+            if let Ok(agent) = uuid::Uuid::parse_str(agent) {
+                job.3 = steps.remove(&agent);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The archived `RunRecord`: `run_history` head row plus its latest
+/// `job_history` snapshot as `jobs`/`job_names`/`jobs_list` (the blob
+/// fields the archive keeps are narrower — outputs, caller plans, needs
+/// and gate state are gone with the live row).
+///
+/// Statements: `SELECT .. FROM run_history WHERE run_id ORDER BY created_at
+/// DESC LIMIT 1`; `SELECT job_id, status, display_name FROM job_history`
+/// of that snapshot.
+pub(super) async fn archived_record_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+) -> Result<crate::models::RunRecord, ControlError> {
+    let run = run_text(run_id);
+    let row = tx
+        .query_opt(
+            concat!(
+                "SELECT namespace_id, repository, workflow_path, run_number, \
+                 run_attempt, run_name, event, conclusion, head_sha, \
+                 submission::text, ",
+                us!("created_at"),
+                ", ",
+                us!("started_at"),
+                ", ",
+                us!("completed_at"),
+                " FROM run_history WHERE run_id = $1::text::uuid \
+                 ORDER BY created_at DESC LIMIT 1"
+            ),
+            &[&run],
+        )
+        .await
+        .map_err(db)?
+        .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+    let submission: crate::WorkflowSubmission =
+        serde_json::from_str(row.get::<_, String>(9).as_str()).map_err(ControlError::backend)?;
+    let status = match row.get::<_, Option<&str>>(7) {
+        Some("success") => ExecutionStatus::Success,
+        Some("failure") => ExecutionStatus::Failure,
+        Some("cancelled") => ExecutionStatus::Cancelled,
+        Some("skipped") => ExecutionStatus::Skipped,
+        _ => ExecutionStatus::Failure,
+    };
+    let created_at = codec::us_to_system(row.get::<_, Option<i64>>(10).unwrap_or(0));
+    let jobs_rows = tx
+        .query(
+            "SELECT job_id, status, display_name FROM job_history \
+             WHERE run_id = $1::text::uuid \
+             AND run_created_at = (SELECT max(created_at) FROM run_history \
+                                   WHERE run_id = $1::text::uuid) \
+             AND NOT (kind IN ('matrix_parent','reusable_caller') AND EXISTS (\
+                  SELECT 1 FROM job_history c WHERE c.run_id = $1::text::uuid \
+                  AND c.run_created_at = job_history.run_created_at \
+                  AND c.parent_job_id = job_history.job_id)) \
+             ORDER BY job_id",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+    let mut jobs = BTreeMap::new();
+    let mut job_names = BTreeMap::new();
+    let mut jobs_list = Vec::new();
+    for job_row in &jobs_rows {
+        let job_id = JobId(job_row.get::<_, String>(0));
+        let status = codec::status(job_row.get::<_, &str>(1));
+        let name: String = job_row.get(2);
+        jobs.insert(job_id.clone(), status);
+        job_names.insert(job_id.clone(), name.clone());
+        jobs_list.push(JobDetail {
+            job_id: job_id.0.clone(),
+            name,
+            conclusion: crate::status_string(status),
+            steps: Vec::new(),
+            annotations: Vec::new(),
+        });
+    }
+    Ok(crate::models::RunRecord {
+        run_id,
+        webhook_delivery_id: None,
+        run_name: row.get(5),
+        submission: std::sync::Arc::new(submission),
+        jobs,
+        status,
+        job_outputs: BTreeMap::new(),
+        job_base_ids: BTreeMap::new(),
+        job_needs: BTreeMap::new(),
+        caller_plans: BTreeMap::new(),
+        job_names,
+        github: serde_json::Value::Null,
+        head_sha: row.get(8),
+        workflow_ref: String::new(),
+        workspace_snapshot: None,
+        job_fail_fast: BTreeMap::new(),
+        job_continue_on_error: BTreeMap::new(),
+        job_check_run_ids: BTreeMap::new(),
+        reusable_calls: BTreeMap::new(),
+        jobs_list,
+        created_at: created_at.into(),
+        started_at: row
+            .get::<_, Option<i64>>(11)
+            .map(|us| codec::us_to_system(us).into()),
+        completed_at: row
+            .get::<_, Option<i64>>(12)
+            .map(|us| codec::us_to_system(us).into()),
+        run_number: row.get::<_, i64>(3).max(0) as u64,
+        run_attempt: row.get::<_, i32>(4).max(0) as u64,
+        workflow_path_str: row.get(2),
+        event: row.get(6),
+        conclusion: row.get(7),
+        push_state: None,
+        snapshot_timing: None,
+    })
+}
+

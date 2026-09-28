@@ -12,9 +12,9 @@ use crate::control::types::{
 };
 use crate::models::{RunRecord, RunnerCapabilities};
 use crate::runtime_scheduling;
-use preloop_gha_protocol::{azdo, WorkflowSubmission};
-use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
-use std::collections::{BTreeMap, BTreeSet};
+use preloop_gha_protocol::azdo;
+use preloop_gha_protocol::{JobId, RunId};
+use std::collections::BTreeSet;
 
 /// `(repository, permissions, declared, untrusted)` of a stored token
 /// request; `acquire_context` needs the full row.
@@ -1285,95 +1285,35 @@ impl PgBackend {
         let run = run_id.0.to_string();
         let mut client = self.reader().await?;
         let tx = client.transaction().await.map_err(db)?;
-        let mut record = match PgBackend::load_graph(self, &tx, run_id).await? {
-            Some(graph) => graph.record,
-            None => {
-                // Archived: the run row is gone, its history rows are not.
-                let row = tx
-                    .query_opt(
-                        concat!(
-                            "SELECT namespace_id, repository, workflow_path, run_number, \
-                             run_attempt, run_name, event, conclusion, head_sha, \
-                             submission::text, ",
-                            us!("created_at"),
-                            ", ",
-                            us!("started_at"),
-                            ", ",
-                            us!("completed_at"),
-                            " FROM run_history WHERE run_id = $1::text::uuid \
-                             ORDER BY created_at DESC LIMIT 1"
-                        ),
+        let record = match PgBackend::load_graph(self, &tx, run_id).await? {
+            Some(graph) => {
+                let mut record = graph.record;
+                // Statuses of archived attempts of the same run (a rerun
+                // archives the attempts, not the run): previous-attempt jobs
+                // the rerun dropped stay visible.
+                for row in tx
+                    .query(
+                        "SELECT job_id, status FROM job_history \
+                         WHERE run_id = $1::text::uuid",
                         &[&run],
                     )
                     .await
                     .map_err(db)?
-                    .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
-                let submission: WorkflowSubmission =
-                    serde_json::from_str(row.get::<_, String>(9).as_str())
-                        .map_err(ControlError::backend)?;
-                let status = match row.get::<_, Option<&str>>(7) {
-                    Some("success") => ExecutionStatus::Success,
-                    Some("failure") => ExecutionStatus::Failure,
-                    Some("cancelled") => ExecutionStatus::Cancelled,
-                    Some("skipped") => ExecutionStatus::Skipped,
-                    _ => ExecutionStatus::Failure,
-                };
-                let created_at = codec::us_to_system(row.get::<_, Option<i64>>(10).unwrap_or(0));
-                RunRecord {
-                    run_id,
-                    webhook_delivery_id: None,
-                    run_name: row.get(5),
-                    submission: std::sync::Arc::new(submission),
-                    jobs: BTreeMap::new(),
-                    status,
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids: BTreeMap::new(),
-                    job_needs: BTreeMap::new(),
-                    caller_plans: BTreeMap::new(),
-                    job_names: BTreeMap::new(),
-                    github: serde_json::Value::Null,
-                    head_sha: row.get(8),
-                    workflow_ref: String::new(),
-                    workspace_snapshot: None,
-                    job_fail_fast: BTreeMap::new(),
-                    job_continue_on_error: BTreeMap::new(),
-                    job_check_run_ids: BTreeMap::new(),
-                    reusable_calls: BTreeMap::new(),
-                    jobs_list: Vec::new(),
-                    created_at: created_at.into(),
-                    started_at: row
-                        .get::<_, Option<i64>>(11)
-                        .map(|us| codec::us_to_system(us).into()),
-                    completed_at: row
-                        .get::<_, Option<i64>>(12)
-                        .map(|us| codec::us_to_system(us).into()),
-                    run_number: row.get::<_, i64>(3).max(0) as u64,
-                    run_attempt: row.get::<_, i32>(4).max(0) as u64,
-                    workflow_path_str: row.get(2),
-                    event: row.get(6),
-                    conclusion: row.get(7),
-                    push_state: None,
-                    snapshot_timing: None,
+                {
+                    record
+                        .jobs
+                        .entry(JobId(row.get::<_, String>(0)))
+                        .or_insert_with(|| {
+                            crate::control::types::status_parse(
+                                row.get::<_, String>(1).as_str(),
+                            )
+                        });
                 }
+                record
             }
+            // Archived: the run row is gone, its history rows are not.
+            None => super::lookups::archived_record_tx(&tx, run_id).await?,
         };
-        // Statuses of archived attempts of the same run (a rerun archives the
-        // attempts, not the run).
-        let archived = tx
-            .query(
-                "SELECT job_id, status FROM job_history WHERE run_id = $1::text::uuid",
-                &[&run],
-            )
-            .await
-            .map_err(db)?;
-        for row in &archived {
-            record
-                .jobs
-                .entry(JobId(row.get::<_, String>(0)))
-                .or_insert_with(|| {
-                    crate::control::types::status_parse(row.get::<_, String>(1).as_str())
-                });
-        }
         tx.commit().await.map_err(db)?;
         Ok(record)
     }
