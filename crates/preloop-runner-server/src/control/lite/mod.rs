@@ -14,9 +14,14 @@
 
 mod codec;
 mod concurrency;
+mod dispatch;
+mod expansion;
 mod jobs;
+mod lifecycle;
+mod poll;
 mod promote;
 mod queries;
+mod reaper;
 mod requests;
 mod runners;
 mod settle;
@@ -59,6 +64,9 @@ pub(crate) struct LiteBackend {
     require_job_assignments: AtomicBool,
     /// Runner liveness timeout in nanoseconds.
     runner_liveness_timeout: AtomicU64,
+    /// Stale bindings released since this node started (replaces
+    /// `TxState::released_bindings_count`; node-local, not persisted).
+    released_bindings: AtomicU64,
 }
 
 /// Run `f` without stalling the async executor. On a multi-thread runtime
@@ -231,6 +239,7 @@ impl LiteBackend {
             pool_assignments_enabled: AtomicBool::new(pool_assignments_enabled),
             require_job_assignments: AtomicBool::new(require_job_assignments),
             runner_liveness_timeout: AtomicU64::new(runner_liveness_timeout.as_nanos() as u64),
+            released_bindings: AtomicU64::new(0),
         }
     }
 
@@ -242,6 +251,17 @@ impl LiteBackend {
             self.require_job_assignments.load(Ordering::Acquire),
             Duration::from_nanos(self.runner_liveness_timeout.load(Ordering::Acquire)),
         )
+    }
+
+    /// Stale bindings released since this node started.
+    pub(super) fn released_bindings(&self) -> u64 {
+        self.released_bindings.load(Ordering::Acquire)
+    }
+
+    /// Add to the released-bindings counter (sweep bookkeeping).
+    pub(super) fn count_released_bindings(&self, released: usize) {
+        self.released_bindings
+            .fetch_add(released as u64, Ordering::AcqRel);
     }
 
     /// Apply the real server config once bootstrap knows it.

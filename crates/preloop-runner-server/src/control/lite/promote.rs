@@ -295,7 +295,7 @@ fn hydrate_message(
 
 /// `on_job_enqueued`: record dispatch intent for a fresh ready row
 /// (`job_assignments`/`provision_requests` under the configured policy).
-fn on_job_enqueued(
+pub(super) fn on_job_enqueued(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     job: &JobRow,
