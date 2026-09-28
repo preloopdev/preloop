@@ -28,6 +28,10 @@ use std::sync::Arc;
 struct DisposablePg {
     dir: PathBuf,
     port: u16,
+    /// Retains a per-test database created on `PRELOOP_TEST_POSTGRES_URL`.
+    /// Without this guard, the temporary database is dropped immediately
+    /// after `fresh_database` returns and all backend connections fail.
+    database: Option<crate::test_pg::TestDatabase>,
 }
 
 impl DisposablePg {
@@ -65,7 +69,11 @@ impl DisposablePg {
                 "start".into(),
             ],
         );
-        Self { dir, port }
+        Self {
+            dir,
+            port,
+            database: None,
+        }
     }
 
     fn url(&self) -> String {
@@ -75,6 +83,9 @@ impl DisposablePg {
 
 impl Drop for DisposablePg {
     fn drop(&mut self) {
+        if self.database.is_some() {
+            return;
+        }
         let bin = pg_bin();
         let _ = Command::new(bin.join("pg_ctl"))
             .args([
@@ -162,13 +173,12 @@ async fn fresh_database() -> (DisposablePg, String) {
     // A shared server (PRELOOP_TEST_POSTGRES_URL) is honored by the suite
     // harness; the pg unit tests always isolate via a disposable cluster so
     // they also run without configuration.
-    if let Some((_db, url)) = crate::test_pg::fresh_database().await {
-        // The suite's guard drops the database; DisposablePg::start is a
-        // no-op here — reuse the guard slot by pointing it at nothing.
+    if let Some((database, url)) = crate::test_pg::fresh_database().await {
         return (
             DisposablePg {
-                dir: PathBuf::from("/tmp/preloop-newpg-shared"),
+                dir: PathBuf::new(),
                 port: 0,
+                database: Some(database),
             },
             url,
         );
@@ -371,6 +381,36 @@ async fn submit_many(node: &PgBackend, count: usize, base_run_number: u64) -> Ve
         result.unwrap();
     }
     agents
+}
+
+/// The counter is durable and scoped by `(namespace, repository, workflow)`.
+/// Two nodes racing on one key receive distinct consecutive numbers; another
+/// repository starts at one without colliding.
+#[tokio::test]
+async fn run_numbers_are_atomic_and_scoped() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let key = ("default", "owner/repo", ".github/workflows/ci.yml");
+    let (first, second) = tokio::join!(
+        node_a.allocate_run_number(key.0, key.1, key.2),
+        node_b.allocate_run_number(key.0, key.1, key.2)
+    );
+    let mut numbers = [first.unwrap(), second.unwrap()];
+    numbers.sort_unstable();
+    assert_eq!(numbers, [1, 2]);
+    assert_eq!(
+        node_a
+            .allocate_run_number(key.0, key.1, key.2)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        node_b
+            .allocate_run_number("default", "other/repo", key.2)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 /// Submits on different runs overlap across two nodes. The request id each
