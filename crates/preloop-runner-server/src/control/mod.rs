@@ -27,6 +27,9 @@ pub mod commands;
 #[allow(dead_code)]
 pub(crate) mod lite;
 pub(crate) mod logic;
+// New PostgreSQL backend (agreed schema); unused until cutover.
+#[allow(dead_code)]
+pub(crate) mod pg;
 pub mod postgres;
 pub mod rows;
 pub mod sched;
