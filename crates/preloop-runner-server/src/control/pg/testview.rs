@@ -240,16 +240,6 @@ impl PgBackend {
         // ── Runners / sessions / session messages ────────────────────
         for row in client
             .query(
-                "SELECT runner_id, name, labels::text, ephemeral, runner_group_id, \
-                        runner_group_name, client_id, public_key, \
-                        rsa_public_key, pool_proven, ",
-                &[],
-            )
-            .await
-            .unwrap_or_default()
-        {}
-        for row in client
-            .query(
                 &format!(
                     "SELECT runner_id, name, labels::text, ephemeral, runner_group_id, \
                             runner_group_name, client_id, public_key, rsa_public_key, \
@@ -340,14 +330,15 @@ impl PgBackend {
             let session_id: String = row.get(1);
             let message_type: String = row.get(2);
             let body: String = row.get::<_, Option<String>>(3).unwrap_or_default();
-            let msg = serde_json::from_str::<azdo::TaskAgentMessage>(&body).unwrap_or_else(|_| {
-                azdo::TaskAgentMessage {
+            let msg = match serde_json::from_str::<azdo::TaskAgentMessage>(&body) {
+                Ok(msg) => msg,
+                Err(_) => azdo::TaskAgentMessage {
                     message_id,
                     message_type,
                     body,
                     iv: None,
-                }
-            });
+                },
+            };
             t.inflight_messages
                 .entry(session_id)
                 .or_default()
