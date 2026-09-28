@@ -129,8 +129,7 @@ impl PgBackend {
             runner_id: session.runner_id,
             protocol: session.protocol,
             client_id: session.client_id,
-            encryption: session.encryption,
-            active_request_id: None,
+                        active_request_id: None,
             last_seen_at_us: Some(now),
         })
     }
@@ -850,6 +849,10 @@ impl PgBackend {
         Ok(AcquireContext {
             request,
             message,
+            // No secret values at rest in the new schema: the fill path
+            // resolves everything from the provider; `provided` names the
+            // worker trusts come from the caller's request, not storage.
+            run_secrets: std::collections::BTreeMap::new(),
             token_request,
             id_token_granted: grant,
             repository,

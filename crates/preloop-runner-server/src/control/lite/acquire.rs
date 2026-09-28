@@ -93,6 +93,10 @@ impl LiteBackend {
             Ok(AcquireContext {
                 request,
                 message,
+                // No secret values at rest in the new schema: the fill path
+                // resolves everything from the provider; `provided` names the
+                // worker trusts come from the caller's request, not storage.
+                run_secrets: std::collections::BTreeMap::new(),
                 token_request,
                 id_token_granted,
                 repository,
