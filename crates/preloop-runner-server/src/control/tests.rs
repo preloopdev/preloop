@@ -4127,8 +4127,8 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn request_lookup_uses_latest_correlation() {
-        suite::request_lookup_uses_latest_correlation(&LiteBackend::in_memory().unwrap()).await;
+    async fn request_lookup_resolves_attempt_correlations() {
+        suite::request_lookup_resolves_attempt_correlations(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
