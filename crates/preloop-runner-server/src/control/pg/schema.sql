@@ -34,6 +34,7 @@ CREATE TABLE schema_meta (
     value                   bytea NOT NULL
 );
 
+
 -- ── Tenancy ──────────────────────────────────────────────────────────
 -- The cell-local copy of what the platform decided for a tenant. Only the
 -- values the control engine enforces in its own transactions (submit,
