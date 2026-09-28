@@ -1,7 +1,7 @@
 //! The per-run scheduling projection every scheduling command shares.
 //!
 //! One locked read builds the in-memory run graph a command mutates: the
-//! `runs` row (locked `FOR UPDATE` — the per-run mutex of the schema's
+//! `runs` row (locked `FOR NO KEY UPDATE` — the per-run mutex of the schema's
 //! design rules), the `run_submissions` payload, and one [`Node`] per
 //! `jobs` row joining `job_specs` / `job_needs` / `job_messages` data that
 //! the shared scheduling decisions need. Commands mutate the projection and
@@ -294,16 +294,18 @@ pub(crate) fn queue_state_str(state: QueueState) -> &'static str {
 }
 
 impl PgBackend {
-    /// Lock a run row for this command's writes (`FOR UPDATE` — the
-    /// per-run mutex). `false` when the run does not exist (it may live in
-    /// history; callers that read archived runs UNION separately).
+    /// Lock a run row for this command's writes (`FOR NO KEY UPDATE` — the
+    /// per-run mutex: exclusive between commands, but it does not block the
+    /// `FOR KEY SHARE` foreign-key checks of child-row inserts). `false` when
+    /// the run does not exist (it may live in history; callers that read
+    /// archived runs UNION separately).
     pub(super) async fn lock_run(
         tx: &Transaction<'_>,
         run_id: RunId,
     ) -> Result<bool, ControlError> {
         Ok(tx
             .query_opt(
-                "SELECT 1 FROM runs WHERE run_id = $1::text::uuid FOR UPDATE",
+                "SELECT 1 FROM runs WHERE run_id = $1::text::uuid FOR NO KEY UPDATE",
                 &[&run_id.0.to_string()],
             )
             .await

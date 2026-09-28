@@ -891,14 +891,18 @@ impl PgBackend {
                 "request {request_id} already settled"
             )));
         }
+        // Release this connection before `acquire_context` checks out its
+        // own: holding one reader while waiting for another deadlocks the
+        // pool once every reader is held by a concurrent acquire.
         drop(row);
+        drop(client);
         self.acquire_context(request_id).await
     }
 
     /// `record_token_request`: upsert the deferred `github_token_requests`
-    /// row. The `FOR UPDATE` on the run row serializes the insert against
-    /// archival — `archive_finished_runs` selects candidates `FOR UPDATE
-    /// SKIP LOCKED`, so a run locked here cannot vanish under the FK.
+    /// row. The run-row lock serializes the insert against archival —
+    /// `archive_finished_runs` selects candidates `FOR UPDATE SKIP LOCKED`,
+    /// so a run locked here cannot vanish under the FK.
     pub(super) async fn record_token_request(
         &self,
         run_id: RunId,
@@ -908,7 +912,7 @@ impl PgBackend {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         tx.execute(
-            "SELECT 1 FROM runs WHERE run_id=$1::text::uuid FOR UPDATE",
+            "SELECT 1 FROM runs WHERE run_id=$1::text::uuid FOR NO KEY UPDATE",
             &[&run_id.0.to_string()],
         )
         .await
@@ -985,6 +989,8 @@ impl PgBackend {
                 "job {job_id} has no OIDC context"
             )));
         }
+        // Never hold one pooled connection while checking out another.
+        drop(client);
         let record = self.run_record(run_id).await?;
         Ok(crate::control::types::OidcGrant {
             run: record,

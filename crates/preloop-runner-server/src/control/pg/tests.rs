@@ -512,6 +512,26 @@ async fn submit_and_claim(
     (claimed.request, runner.runner.id)
 }
 
+/// Far more concurrent acquires than pooled readers must all complete. An
+/// acquire that held one reader while checking out a second deadlocked the
+/// pool as soon as every reader was held by an acquire waiting for another —
+/// taking every other command (and the webhook inbox) down with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_acquires_beyond_pool_size_complete() {
+    let (_pg, node, _other) = backend_pair().await;
+    let (request, runner_id) = submit_and_claim(&node, RunId::new()).await;
+    let acquires = (0..64).map(|_| node.acquire_for_runner(request.request_id, runner_id));
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        futures::future::join_all(acquires),
+    )
+    .await
+    .expect("concurrent acquires deadlocked the connection pool");
+    for result in results {
+        assert_eq!(result.unwrap().request.request_id, request.request_id);
+    }
+}
+
 /// PATCH on node A and GET on node B share one counter and one row set;
 /// concurrent PATCHes never reuse a change id. Unknown timelines are
 /// `NotFound` (a PATCH must not create a timeline for a request that does

@@ -21,6 +21,7 @@ use crate::control::types::{
 use crate::models::TaskAgentJobRequestRecord;
 use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
+use tokio_postgres::GenericClient;
 
 /// Columns of every runner read, in [`runner_from_row`] order.
 pub(super) const RUNNER_COLUMNS: &str = concat!(
@@ -287,7 +288,14 @@ impl PgBackend {
         &self,
         request_id: i64,
     ) -> Result<Option<(Option<i64>, Option<i64>, bool)>, ControlError> {
-        let client = self.reader().await?;
+        Self::request_owner_on(&*self.reader().await?, request_id).await
+    }
+
+    /// [`Self::request_owner`] on a caller's connection or open transaction.
+    pub(super) async fn request_owner_on(
+        client: &impl GenericClient,
+        request_id: i64,
+    ) -> Result<Option<(Option<i64>, Option<i64>, bool)>, ControlError> {
         Ok(client
             .query_opt(
                 "SELECT q.runner_id, s.runner_id, s.session_id IS NOT NULL FROM job_requests q \

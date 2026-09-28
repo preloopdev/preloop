@@ -234,6 +234,9 @@ impl PgBackend {
         &self,
         stale_after: std::time::Duration,
     ) -> Result<StatusInputs, ControlError> {
+        // Checked out (and released) before this function's own connection:
+        // one caller must never hold two pooled connections at once.
+        let runner_assignments = self.live_assignments().await?;
         let client = self.reader().await?;
         let mut out = StatusInputs::default();
         // Queue buckets by the mapping the shared suite adopted (round 5).
@@ -387,7 +390,7 @@ impl PgBackend {
                 out.runner_idle += 1;
             }
         }
-        out.runner_assignments = self.live_assignments().await?;
+        out.runner_assignments = runner_assignments;
         // Oldest ready job with a known enqueue instant.
         let oldest = client
             .query_opt(

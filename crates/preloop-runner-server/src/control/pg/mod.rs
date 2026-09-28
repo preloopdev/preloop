@@ -7,7 +7,7 @@
 //! conditional `UPDATE`s (zero rows = someone else won); queues are consumed
 //! with `FOR UPDATE SKIP LOCKED`; ids come from identity columns. A command
 //! that needs a consistent view of one run's jobs serializes on the run row
-//! (`SELECT .. FROM runs WHERE run_id = $1 FOR UPDATE`).
+//! (`SELECT .. FROM runs WHERE run_id = $1 FOR NO KEY UPDATE`).
 //!
 //! Layout: one command per function, each with a doc comment naming its
 //! statements, so the SQLite backend (`control/lite`) can mirror it:
@@ -48,6 +48,8 @@ const WRITERS_ENV: &str = "PRELOOP_PG_WRITERS";
 /// Reader connections per node (`PRELOOP_PG_READERS`, default 16).
 const READERS_ENV: &str = "PRELOOP_PG_READERS";
 const DEFAULT_POOL_SIZE: usize = 16;
+/// How long a command waits for a pooled connection before failing.
+const CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often a booting node re-checks schema setup after losing the
 /// creation race to another node.
@@ -86,15 +88,22 @@ impl Pool {
             rx: tokio::sync::Mutex::new(rx),
         })
     }
-
     async fn checkout(&self) -> Result<Pooled<'_>, ControlError> {
-        let client = self
-            .rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| ControlError::backend(anyhow::anyhow!("connection pool closed")))?;
+        // Bounded: an exhausted pool fails the one command (which the caller
+        // retries or reports) instead of parking it forever. A caller must
+        // never hold one pooled connection while waiting for another — that
+        // is how an exhausted pool becomes a deadlock.
+        let client = tokio::time::timeout(CHECKOUT_TIMEOUT, async {
+            self.rx.lock().await.recv().await
+        })
+        .await
+        .map_err(|_| {
+            ControlError::backend(anyhow::anyhow!(
+                "no pooled Postgres connection free after {}s",
+                CHECKOUT_TIMEOUT.as_secs()
+            ))
+        })?
+        .ok_or_else(|| ControlError::backend(anyhow::anyhow!("connection pool closed")))?;
         let client = if client.is_closed() {
             match connect_one(&self.url).await {
                 Ok(fresh) => fresh,

@@ -30,7 +30,7 @@ use crate::state::JobSetGate;
 use preloop_gha_parser::ConcurrencyQueue;
 use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use tokio_postgres::Transaction;
+use tokio_postgres::{GenericClient, Transaction};
 
 /// Claim-race retries inside one `claim_one` call: losing the conditional
 /// `UPDATE` re-reads the ready set before giving up.
@@ -3470,6 +3470,7 @@ impl PgBackend {
                     )
                     .await?;
                     tx.commit().await.map_err(db)?;
+                    drop(client);
                     return Ok(SubmitOutcome {
                         run_id: record.run_id,
                         run_number: record.run_number,
@@ -3486,7 +3487,7 @@ impl PgBackend {
             }
         }
 
-        let platforms = self.registered_platforms().await?;
+        let platforms = Self::registered_platforms_on(&tx).await?;
         let accepted = jobs.len();
         let final_status;
         let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
@@ -3671,6 +3672,7 @@ impl PgBackend {
             .await?;
         }
         tx.commit().await.map_err(db)?;
+        drop(client);
         Ok(SubmitOutcome {
             run_id: record.run_id,
             run_number: record.run_number,
@@ -3690,7 +3692,13 @@ impl PgBackend {
     /// Platform names (`linux` / `macos` / `windows`) some registered runner
     /// can host — the unhostable-platform check's input.
     pub(super) async fn registered_platforms(&self) -> Result<Vec<&'static str>, ControlError> {
-        let client = self.reader().await?;
+        Self::registered_platforms_on(&*self.reader().await?).await
+    }
+
+    /// [`Self::registered_platforms`] on a caller's connection or open transaction.
+    pub(super) async fn registered_platforms_on(
+        client: &impl GenericClient,
+    ) -> Result<Vec<&'static str>, ControlError> {
         let rows = client
             .query("SELECT labels::text FROM runners", &[])
             .await
@@ -3715,7 +3723,11 @@ impl PgBackend {
 
     /// Ready-queue depth (the node-local gauge the runner supervisor reads).
     pub(super) async fn queue_depth(&self) -> Result<usize, ControlError> {
-        let client = self.reader().await?;
+        Self::queue_depth_on(&*self.reader().await?).await
+    }
+
+    /// [`Self::queue_depth`] on a caller's connection or open transaction.
+    pub(super) async fn queue_depth_on(client: &impl GenericClient) -> Result<usize, ControlError> {
         let count = client
             .query_one("SELECT count(*) FROM jobs WHERE queue_state = 'ready'", &[])
             .await
@@ -3726,7 +3738,13 @@ impl PgBackend {
 
     /// `runs-on` labels of the ready-queue front, for `next_job_runs_on`.
     pub(super) async fn ready_front_labels(&self) -> Result<Vec<String>, ControlError> {
-        let client = self.reader().await?;
+        Self::ready_front_labels_on(&*self.reader().await?).await
+    }
+
+    /// [`Self::ready_front_labels`] on a caller's connection or open transaction.
+    pub(super) async fn ready_front_labels_on(
+        client: &impl GenericClient,
+    ) -> Result<Vec<String>, ControlError> {
         let row = client
             .query_opt(
                 "SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
@@ -3758,6 +3776,8 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        // Never hold one pooled connection while checking out another.
+        drop(client);
         match row {
             Some(row) => Ok(Some(
                 self.run_record(codec::run_id(&row.get::<_, String>(0))?)
@@ -4271,6 +4291,7 @@ impl PgBackend {
         .await?;
         let runner_id = session.runner_id.unwrap_or(0);
         tx.commit().await.map_err(db)?;
+        drop(client);
 
         Ok(PollOutcome::Claimed(Box::new(ClaimedJob {
             queued,
@@ -4547,7 +4568,7 @@ impl PgBackend {
             sweep.sweep().await?;
         }
         let scheduling = std::mem::take(&mut sweep.outcome);
-        let queue_nonempty = self.work_pending().await?;
+        let queue_nonempty = Self::work_pending_on(&tx).await?;
         let record = sweep
             .graphs
             .get(&run_id)
@@ -4555,6 +4576,7 @@ impl PgBackend {
             .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
         sweep.flush().await?;
         tx.commit().await.map_err(db)?;
+        drop(client);
         Ok(CompleteOutcome {
             record,
             effective_status: applied.effective_status,
@@ -4592,7 +4614,7 @@ impl PgBackend {
                 .ok_or_else(|| {
                     ControlError::NotFound("broker complete request not found".to_owned())
                 })?;
-            let owner = self.request_owner(request_id).await?;
+            let owner = Self::request_owner_on(&tx, request_id).await?;
             match owner {
                 Some((Some(owner), _, _)) if owner != settle_attempt.runner_id => {
                     return Err(ControlError::Forbidden(
@@ -4653,8 +4675,10 @@ impl PgBackend {
         }
         sweep.sweep().await?;
         let scheduling = std::mem::take(&mut sweep.outcome);
-        let (queue_len, next_runs_on) =
-            (self.queue_depth().await?, self.ready_front_labels().await?);
+        let (queue_len, next_runs_on) = (
+            Self::queue_depth_on(&tx).await?,
+            Self::ready_front_labels_on(&tx).await?,
+        );
         let queue_nonempty = queue_len > 0;
         sweep.flush().await?;
         tx.commit().await.map_err(db)?;
@@ -4725,7 +4749,11 @@ impl PgBackend {
 
     /// Whether any ready/claimed work or pending cancellation exists.
     pub(super) async fn work_pending(&self) -> Result<bool, ControlError> {
-        let client = self.reader().await?;
+        Self::work_pending_on(&*self.reader().await?).await
+    }
+
+    /// [`Self::work_pending`] on a caller's connection or open transaction.
+    pub(super) async fn work_pending_on(client: &impl GenericClient) -> Result<bool, ControlError> {
         let pending: bool = client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM jobs \
@@ -5133,7 +5161,7 @@ impl PgBackend {
         run_id: RunId,
         jobs: Vec<BuiltJob>,
     ) -> Result<usize, ControlError> {
-        let platforms = self.registered_platforms().await?;
+        let platforms = Self::registered_platforms_on(tx).await?;
         let now = now_us();
         let mut registered = 0usize;
         for built in jobs {

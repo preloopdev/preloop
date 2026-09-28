@@ -1947,12 +1947,31 @@ pub async fn run_webhook_queue_worker(
     }
 }
 
-/// Drain pending webhook deliveries in FIFO order by `received_at_us`.
-pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
-    // Claim one row at a time so every processing lease is heartbeated; a
-    // claimed batch could let later rows expire while earlier ones run.
-    const BATCH_SIZE: usize = 1;
+/// Concurrent webhook deliveries processed per node
+/// (`PRELOOP_WEBHOOK_WORKERS`, default 8). Deliveries are independent:
+/// cross-delivery ordering is decided by GitHub event timestamps
+/// (`concurrency::EventOrder`), not by processing order, and other nodes
+/// already drain the same queue in parallel.
+fn webhook_workers() -> usize {
+    std::env::var("PRELOOP_WEBHOOK_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1)
+}
 
+/// Drain pending webhook deliveries (oldest received first) with
+/// [`webhook_workers`] concurrent claim loops.
+pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
+    let loops = (0..webhook_workers()).map(|_| drain_webhook_queue_loop(shared));
+    let mut total = 0;
+    for result in futures::future::join_all(loops).await {
+        total += result?;
+    }
+    Ok(total)
+}
+
+async fn drain_webhook_queue_loop(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
     let mut total_processed = 0;
     loop {
         if shared.shutdown.is_cancelled() {
@@ -1969,21 +1988,18 @@ pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<us
             );
             break;
         }
+        // One row per claim so every processing lease is heartbeated; a
+        // claimed batch could let later rows expire while earlier ones run.
         let deliveries = shared
             .state
             .backend
-            .claim_webhook_deliveries(BATCH_SIZE, WEBHOOK_LEASE_DURATION_SECS)
+            .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
             .await?;
-        if deliveries.is_empty() {
+        let Some(delivery) = deliveries.first() else {
             break;
-        }
-        for delivery in &deliveries {
-            process_one_delivery(shared, delivery).await;
-            total_processed += 1;
-        }
-        if deliveries.len() < BATCH_SIZE {
-            break;
-        }
+        };
+        process_one_delivery(shared, delivery).await;
+        total_processed += 1;
     }
     Ok(total_processed)
 }
