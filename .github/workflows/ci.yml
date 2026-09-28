@@ -203,9 +203,27 @@ jobs:
           tar -xzf "$archive" -C "$HOME/.local/bin" cargo-nextest
           "$HOME/.local/bin/cargo-nextest" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - run: cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4
+      - name: Run cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4
+        run: |
+          set -o pipefail
+          # Keep the full log in the guest before printing it. The engine caps
+          # a job's retained log, so a step that prints tens of megabytes can
+          # lose its output — including the failing test names — and the run
+          # becomes undiagnosable. The summary step below re-prints just the
+          # verdict, which always fits.
+          cargo nextest run --locked --workspace --partition hash:${{ matrix.shard }}/4 2>&1 \
+            | tee "$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
         env:
           RUSTFLAGS: "-A warnings"
+      - name: Shard failure summary
+        if: failure()
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
+          test -f "$log" || { echo "no shard log captured"; exit 0; }
+          echo "::group::shard ${{ matrix.shard }} verdict"
+          grep -E "^ *FAIL |^ *TRY |^ *SIGSEGV|^ *SIGKILL|^failures:|^test result:|^error(\[|:)|Out of memory|oom-kill|Killed process|Cannot allocate memory" "$log" | tail -80 || true
+          echo "::endgroup::"
       # The preloop-runner-server integration tests were split out of the lib
       # into separate tests/*.rs crates (the single ~27k-line unit OOMed the
       # 4 GiB guest). They need the `test-support` feature for the deterministic
