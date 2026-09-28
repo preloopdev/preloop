@@ -24,6 +24,7 @@ pub(crate) use crate::*;
 
 pub mod backend;
 pub mod commands;
+pub(crate) mod logic;
 pub mod postgres;
 pub mod rows;
 pub mod sched;
