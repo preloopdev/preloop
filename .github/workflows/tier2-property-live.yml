@@ -79,7 +79,13 @@ jobs:
           run_filter preloop-runner worker::contexts::tests::masking_
           run_filter preloop-runner worker::file_commands::tests
           run_filter preloop-runner lifecycle
-          run_filter preloop-runner-server workflow_steps_update_ --features test-support --tests
+          # The workflow-steps tests live in the integration crates since the
+          # lib split, and those declare `required-features = ["test-support"]`.
+          # Name the two crates that hold them rather than `--tests`: that keeps
+          # the gate from rebuilding the crate's lib-test target, whose rustc
+          # job dies in the runner guest (no diagnostic, just "could not
+          # compile") on top of a cold workspace build.
+          run_filter preloop-runner-server workflow_steps_update_ --features test-support --test broker --test security
 
       - name: Run remote JavaScript oracle (declaration 1)
         id: oracle_first
