@@ -4000,7 +4000,7 @@ impl PgBackend {
             // whose conditional `UPDATE` lands. Concurrent pollers collapse
             // onto the same top candidate, so one failed claim must advance
             // to the next-eligible row — not retry the same collision.
-            let mut candidates = candidates;
+
             while let Some(index) =
                 logic::claim_preference(&candidates, runner_id, &caps.labels, None, &runner_match)
             {
