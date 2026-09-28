@@ -13,10 +13,15 @@
 //! the SQL mirrors the Postgres backend statement for statement.
 
 mod codec;
+mod concurrency;
+mod jobs;
+mod promote;
 mod queries;
 mod requests;
 mod runners;
+mod settle;
 mod steps;
+mod submit;
 #[cfg(test)]
 mod tests;
 mod timelines;
@@ -334,8 +339,15 @@ impl LiteBackend {
     /// `INSERT .. ON CONFLICT DO UPDATE SET last_run_number = last_run_number
     /// + 1 RETURNING last_run_number`. Namespace `'default'` and repository
     /// `''` until the trait passes both (decision round 1, Q4).
+    /// Allocate the next run number for a workflow:
+    /// `INSERT .. ON CONFLICT DO UPDATE SET last_run_number = last_run_number
+    /// + 1 RETURNING last_run_number`, scoped by the
+    /// `workflow_run_numbers` primary key (core's trait signature takes
+    /// `(namespace_id, repository, workflow_path)`).
     pub(crate) async fn allocate_run_number(
         &self,
+        namespace_id: &str,
+        repository: &str,
         workflow_path: &str,
     ) -> Result<u64, ControlError> {
         self.write(|tx| {
@@ -343,11 +355,11 @@ impl LiteBackend {
                 .query_row(
                     "INSERT INTO workflow_run_numbers \
                          (namespace_id, repository, workflow_path, last_run_number) \
-                     VALUES (?1, '', ?2, 1) \
+                     VALUES (?1, ?2, ?3, 1) \
                      ON CONFLICT (namespace_id, repository, workflow_path) \
                      DO UPDATE SET last_run_number = last_run_number + 1 \
                      RETURNING last_run_number",
-                    rusqlite::params![DEFAULT_NAMESPACE, workflow_path],
+                    rusqlite::params![namespace_id, repository, workflow_path],
                     |row| row.get(0),
                 )
                 .map_err(db)?;

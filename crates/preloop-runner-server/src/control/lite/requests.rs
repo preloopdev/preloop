@@ -76,6 +76,17 @@ fn set_lease(
     Ok(())
 }
 
+/// Synchronous settle tail for the scheduling commands (`settle.rs`): the
+/// async trait method wraps the same statement.
+pub(super) fn stamp_result_row(
+    tx: &rusqlite::Transaction<'_>,
+    request_id: i64,
+    result: ExecutionStatus,
+    locked_until: &str,
+) -> Result<(), ControlError> {
+    stamp_result(tx, request_id, result, locked_until).map(|_| ())
+}
+
 /// The shared settle tail: stamp `result`/`finished_at` iff still in
 /// flight and record the final lease expiry. Returns whether this call
 /// settled the attempt (first result wins).

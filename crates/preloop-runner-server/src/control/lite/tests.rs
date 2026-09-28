@@ -65,8 +65,21 @@ async fn webhook_claim_is_fenced_and_deduplicated() {
 #[tokio::test]
 async fn run_number_fingerprint_and_unknown_request() {
     let backend = LiteBackend::in_memory().unwrap();
-    assert_eq!(backend.allocate_run_number("ci.yml").await.unwrap(), 1);
-    assert_eq!(backend.allocate_run_number("ci.yml").await.unwrap(), 2);
+    let workflow = ".github/workflows/ci.yml";
+    assert_eq!(
+        backend
+            .allocate_run_number("default", "owner/repo", workflow)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        backend
+            .allocate_run_number("default", "owner/repo", workflow)
+            .await
+            .unwrap(),
+        2
+    );
     backend.ensure_key_fingerprint("f1").await.unwrap();
     assert!(backend.ensure_key_fingerprint("f2").await.is_err());
     assert!(matches!(
