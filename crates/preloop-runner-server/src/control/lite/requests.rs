@@ -212,9 +212,10 @@ impl LiteBackend {
                  WHERE run_id = ?1 AND agent_job_id = ?2)",
             )
             .map_err(db)?
-            .query_row(params![codec::run_key(run_id), agent_job_id.to_string()], |row| {
-                row.get(0)
-            })
+            .query_row(
+                params![codec::run_key(run_id), agent_job_id.to_string()],
+                |row| row.get(0),
+            )
             .map_err(db)
         })
     }
@@ -316,7 +317,9 @@ impl LiteBackend {
                 }
             }
             let row = tx
-                .prepare_cached("SELECT result, runner_id FROM job_requests WHERE agent_job_id = ?1")
+                .prepare_cached(
+                    "SELECT result, runner_id FROM job_requests WHERE agent_job_id = ?1",
+                )
                 .map_err(db)?
                 .query_row([&agent], |row| Ok((row.get(0)?, row.get(1)?)))
                 .optional()
@@ -342,7 +345,9 @@ impl LiteBackend {
                  WHERE q.request_id = ?1",
             )
             .map_err(db)?
-            .query_row([request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_row([request_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .optional()
             .map_err(db)
         })

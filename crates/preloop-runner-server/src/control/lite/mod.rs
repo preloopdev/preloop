@@ -17,6 +17,8 @@ mod queries;
 mod requests;
 mod runners;
 mod steps;
+#[cfg(test)]
+mod tests;
 mod timelines;
 mod webhooks;
 
@@ -306,7 +308,10 @@ impl LiteBackend {
     ///
     /// `INSERT .. ON CONFLICT DO NOTHING` into `schema_meta`, then read the
     /// stored value back and compare.
-    pub(crate) async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
+    pub(crate) async fn ensure_key_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<(), ControlError> {
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('key_fingerprint', ?1) \
@@ -329,7 +334,10 @@ impl LiteBackend {
     /// `INSERT .. ON CONFLICT DO UPDATE SET last_run_number = last_run_number
     /// + 1 RETURNING last_run_number`. Namespace `'default'` and repository
     /// `''` until the trait passes both (decision round 1, Q4).
-    pub(crate) async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
+    pub(crate) async fn allocate_run_number(
+        &self,
+        workflow_path: &str,
+    ) -> Result<u64, ControlError> {
         self.write(|tx| {
             let number: i64 = tx
                 .query_row(

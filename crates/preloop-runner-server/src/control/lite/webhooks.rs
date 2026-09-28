@@ -50,7 +50,9 @@ fn finish_redelivery(
     (mut record, reason): (WebhookRedeliveryRecord, String),
 ) -> Result<WebhookRedeliveryRecord, ControlError> {
     record.reason = WebhookRepairReason::parse(&reason).ok_or_else(|| {
-        ControlError::backend(anyhow::anyhow!("invalid webhook redelivery reason: {reason}"))
+        ControlError::backend(anyhow::anyhow!(
+            "invalid webhook redelivery reason: {reason}"
+        ))
     })?;
     Ok(record)
 }
@@ -396,7 +398,10 @@ impl LiteBackend {
 
     /// Operator requeue of a terminal (`done`/`failed`) delivery with a
     /// fresh attempt budget.
-    pub(crate) async fn requeue_webhook_delivery(&self, delivery_id: &str) -> Result<bool, ControlError> {
+    pub(crate) async fn requeue_webhook_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<bool, ControlError> {
         self.write(|tx| {
             let changed = tx
                 .execute(
@@ -491,7 +496,9 @@ impl LiteBackend {
                 .prepare_cached("SELECT state, COUNT(*) FROM webhook_deliveries GROUP BY state")
                 .map_err(db)?;
             let rows = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
                 .map_err(db)?;
             for row in rows {
                 let (state, count) = row.map_err(db)?;
