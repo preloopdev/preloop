@@ -26,6 +26,14 @@
 CREATE SCHEMA IF NOT EXISTS control;
 SET search_path = control;
 
+-- Cell-local boot invariants. `schema_version` is exactly 1 (greenfield;
+-- other values are refused) and `key_fingerprint` fences nodes with
+-- different cluster HMAC keys from sharing the same database.
+CREATE TABLE schema_meta (
+    key                     text PRIMARY KEY,
+    value                   bytea NOT NULL
+);
+
 -- ── Tenancy ──────────────────────────────────────────────────────────
 -- The cell-local copy of what the platform decided for a tenant. Only the
 -- values the control engine enforces in its own transactions (submit,
@@ -340,21 +348,20 @@ CREATE TABLE timeline_records (
     PRIMARY KEY (timeline_id, record_id)
 ) WITH (fillfactor = 80);
 
--- Per-log counters for results-service reads (content lives in file segments).
+-- Per-plan log ids fit the official runner's 32-bit TaskLog.Id and remain
+-- stable across nodes. The unique pair arbitrates concurrent allocations.
+-- Content lives in file segments; this row tracks result-service counters.
 CREATE TABLE log_files (
-    log_key                 text PRIMARY KEY,       -- '{plan_id}/{log_id}'
+    log_key                 text PRIMARY KEY,
     run_id                  uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    -- Allowed addition (coordinator decision round 1 Q3): per-plan log ids.
-    -- The official runner's TaskLog.Id is 32-bit, so ids are allocated per
-    -- plan (`MAX(log_id)+1`, arbitrated by the unique constraint).
-    plan_id                 uuid NOT NULL,
-    log_id                  integer NOT NULL,
+    plan_id                 uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
+    log_id                  integer NOT NULL CHECK (log_id > 0),
     byte_count              bigint NOT NULL DEFAULT 0,
     line_count              bigint NOT NULL DEFAULT 0,
-    updated_at              timestamptz NOT NULL DEFAULT now()
+    updated_at              timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (plan_id, log_id)
 );
 CREATE INDEX log_files_run ON log_files(run_id);
-CREATE UNIQUE INDEX log_files_plan ON log_files(plan_id, log_id);
 
 -- ── Runners and sessions ─────────────────────────────────────────────
 CREATE TABLE runners (
@@ -693,11 +700,3 @@ CREATE TABLE step_history (
 ) PARTITION BY RANGE (run_created_at);
 CREATE TABLE step_history_default PARTITION OF step_history DEFAULT;
 CREATE INDEX step_history_run ON step_history(run_id);
-
--- ── Schema bookkeeping (the one allowed addition) ────────────────────
--- `schema_version` (greenfield v1; any other value is refused at connect)
--- and `key_fingerprint` (multi-node cluster-key check).
-CREATE TABLE schema_meta (
-    key                     text PRIMARY KEY,
-    value                   bytea NOT NULL
-);
