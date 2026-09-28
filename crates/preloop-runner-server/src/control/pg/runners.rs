@@ -627,7 +627,6 @@ impl PgBackend {
                 job_id: codec::job_id(row.get(1)),
                 runs_on: codec::from_json(row.get(2))?,
                 enqueued_at_unix_nanos: row.get::<_, Option<i64>>(3).unwrap_or(0) * 1000,
-                observed: false,
             });
         }
         for row in client

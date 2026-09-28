@@ -609,21 +609,9 @@ pub async fn submit_run_inner_with_webhook_delivery(
     };
     let key = (delivery_id.to_owned(), workflow_path.to_owned());
     loop {
-        // A committed run for this delivery wins over any in-flight
-        // reservation — check the backend first.
-        if let Some(existing) = shared
-            .state
-            .backend
-            .find_run_by_delivery(delivery_id, workflow_path)
-            .await
-            .map_err(ApiError::from)?
-        {
-            return Ok(RunAccepted {
-                run_id: existing.run_id,
-                run_number: existing.run_number,
-                queued_jobs: existing.jobs.len(),
-            });
-        }
+        // In-transaction dedup inside `submit_run` (SubmitOutcome::existing)
+        // makes a committed run win over any in-flight reservation; the
+        // reservation only serializes concurrent builders for one delivery.
         let reservation_acquired = {
             let mut inner = shared.state.inner.lock().await;
             inner.webhook_run_reservations.insert(key.clone())
@@ -695,40 +683,8 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     webhook_delivery_id: Option<&str>,
 ) -> Result<RunAccepted, ApiError> {
     let webhook_delivery_id = webhook_delivery_id.map(str::to_owned);
-    // Fork-PR workflow policy: runs from fork pull-request events wait for
-    // explicit operator approval before any job may start. The trust tier is
-    // stamped by the webhook path before submission; native submissions carry
-    // no tier and are never held.
-    let fork_approval_pending = crate::fork_policy::fork_approval_required(
-        &shared.state.fork_policy,
-        crate::events::trust_tier::tier_of(&submission),
-    );
-    let fork_approval_requested_at_unix_nanos =
-        fork_approval_pending.then(crate::models::now_unix_nanos);
-    if let (Some(delivery_id), Some(workflow_path)) = (
-        webhook_delivery_id.as_deref(),
-        submission.workflow_path.as_deref(),
-    ) {
-        let existing = shared
-            .state
-            .backend
-            .find_run_by_delivery(delivery_id, workflow_path)
-            .await
-            .map_err(ApiError::from)?;
-        if let Some(existing) = existing {
-            tracing::info!(
-                %delivery_id,
-                %workflow_path,
-                run_id = %existing.run_id,
-                "reusing run for replayed webhook delivery"
-            );
-            return Ok(RunAccepted {
-                run_id: existing.run_id,
-                run_number: existing.run_number,
-                queued_jobs: existing.jobs.len(),
-            });
-        }
-    }
+    // Dedup is now transactional: `submit_run` returns
+    // `SubmitOutcome::existing` for a replayed delivery, so no pre-check.
 
     let t_parse = std::time::Instant::now();
     let workflow = parse_workflow(&submission.workflow_yaml)?;
@@ -1467,32 +1423,38 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // returns here instead of advancing the counter. The reservation set
     // (above) already serializes in-flight submits for this delivery, so the
     // committed-run check and the counter increment need no shared lock.
-    if let Some(delivery_id) = webhook_delivery_id.as_deref() {
-        if let Some(existing) = shared
-            .state
-            .backend
-            .find_run_by_delivery(delivery_id, &workflow_path)
-            .await
-            .map_err(ApiError::from)?
-        {
-            tracing::info!(
-                %delivery_id,
-                %workflow_path,
-                run_id = %existing.run_id,
-                "reusing run after webhook reservation race"
-            );
-            return Ok(RunAccepted {
-                run_id: existing.run_id,
-                run_number: existing.run_number,
-                queued_jobs: existing.jobs.len(),
-            });
-        }
-    }
+    // No pre-check needed: `submit_run` dedups the delivery inside its own
+    // transaction (`SubmitOutcome::existing`), so a replay that committed
+    // while messages were built still short-circuits there.
     // Durable run-number allocation lives in the control backend so it is
     // atomic with the committed state and survives restarts. It is its own
     // transaction because the number is embedded in `github.run_number`
     // before the job messages are built; a crash between here and
     // `submit_run` burns a number, which is acceptable.
+    // A committed run for this delivery already exists (replay observed
+    // between reservation release and here): return it without burning a
+    // run number.
+    if let Some(delivery_id) = webhook_delivery_id.as_deref() {
+        if let Some(run_id) = shared
+            .state
+            .backend
+            .run_for_webhook_delivery(delivery_id, &workflow_path)
+            .await
+            .map_err(ApiError::from)?
+        {
+            let existing = shared
+                .state
+                .backend
+                .run_record(run_id)
+                .await
+                .map_err(ApiError::from)?;
+            return Ok(RunAccepted {
+                run_id,
+                run_number: existing.run_number,
+                queued_jobs: existing.jobs.len(),
+            });
+        }
+    }
     let run_number = shared
         .state
         .backend
@@ -1630,30 +1592,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     }
 
     {
-        // Recheck the durable delivery identity against the backend before
-        // the atomic insert — a replay that committed while we built
-        // messages returns here.
-        if let Some(delivery_id) = webhook_delivery_id.as_deref() {
-            if let Some(existing) = shared
-                .state
-                .backend
-                .find_run_by_delivery(delivery_id, &workflow_path)
-                .await
-                .map_err(ApiError::from)?
-            {
-                tracing::info!(
-                    %delivery_id,
-                    %workflow_path,
-                    run_id = %existing.run_id,
-                    "reusing run after webhook race during message building"
-                );
-                return Ok(RunAccepted {
-                    run_id: existing.run_id,
-                    run_number: existing.run_number,
-                    queued_jobs: existing.jobs.len(),
-                });
-            }
-        }
+        // The dedup recheck moved into `submit_run`'s transaction —
+        // `SubmitOutcome::existing` below short-circuits a replayed
+        // delivery that committed while messages were built.
         // Build the run record and per-job submit inputs without any lock —
         // the durable insert, concurrency gates, queue classification and
         // correlation-record writes all happen inside one `submit_run`
@@ -1712,6 +1653,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // events from `pre_initially_skipped` below.
         let mut submit_jobs: Vec<crate::control::types::SubmitJob> =
             Vec::with_capacity(prebuilt.len());
+        // plan_ids = each job's agent_job_id (string form): the log masker
+        // keys its provided-secret cache on them at accept below.
+        let mut submit_plan_ids: Vec<String> = Vec::with_capacity(prebuilt.len());
         for pb in prebuilt {
             if pb.skipped {
                 continue;
@@ -1757,6 +1701,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 deferred_matrix: pb.job.deferred_matrix.clone(),
                 reusable_call: pb.job.reusable_call.clone(),
             };
+            submit_plan_ids.push(queued_job.message.plan.plan_id.clone());
             submit_jobs.push(crate::control::types::SubmitJob {
                 queued: queued_job,
                 request: pb.job_request,
@@ -1813,6 +1758,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 run_number: existing.run_number,
                 queued_jobs: existing.jobs.len(),
             });
+        }
+
+        // Masker cache: provided + merged secret values for this run, keyed
+        // by run_id (log URI scope) and by every job's agent_job_id (the
+        // runner-facing plan id). `mask_log_bytes_cached` reads these so no
+        // secret blob is ever read back at log-append time.
+        if !secrets_exposed.is_empty() {
+            let values = Arc::new(secrets_exposed.values().cloned().collect::<Vec<String>>());
+            let mut inner = shared.state.inner.lock().await;
+            inner
+                .plan_secret_masker
+                .insert(run_id.to_string(), Arc::clone(&values));
+            for plan_id in &submit_plan_ids {
+                inner
+                    .plan_secret_masker
+                    .insert(plan_id.clone(), Arc::clone(&values));
+            }
         }
 
         // The expansion sweep runs with the lock released; it materializes

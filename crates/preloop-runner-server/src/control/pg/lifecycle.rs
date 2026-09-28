@@ -935,21 +935,6 @@ impl PgBackend {
 
     // ── Small reads/writes ───────────────────────────────────────────
 
-    /// `ensure_job_detail`: details are derived — the check reduces to job
-    /// existence (`NotFound` otherwise).
-    pub(super) async fn ensure_job_detail(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-        _conclusion: Option<&str>,
-    ) -> Result<(), ControlError> {
-        if self.job_exists(run_id, job_id).await? {
-            Ok(())
-        } else {
-            Err(ControlError::NotFound(format!("job {}", job_id.0)))
-        }
-    }
-
     /// `issue_debug_token`: one token per attempt (monotonic flag flip),
     /// returning `(run_id, job_id)` for the minted credential's subject.
     pub(super) async fn issue_debug_token(
@@ -1013,31 +998,6 @@ impl PgBackend {
                 job_workflow_sha: row.get(5),
             },
         })
-    }
-
-    /// `run_secret_values`: the run's stored secret values. The new schema
-    /// stores names/scopes only (`secret_refs`); values resolve through the
-    /// provider at acquire. `None` when the run is unknown or archived,
-    /// `Some(vec![])` otherwise — an empty map is the durable truth.
-    pub(super) async fn run_secret_values(
-        &self,
-        run_id: RunId,
-    ) -> Result<Option<Vec<String>>, ControlError> {
-        let client = self.reader().await?;
-        Ok(client
-            .query_opt(
-                "SELECT 1 FROM run_submissions WHERE run_id=$1::text::uuid",
-                &[&run_id.0.to_string()],
-            )
-            .await
-            .map_err(db)?
-            .map(|_| Vec::new()))
-    }
-
-    /// `all_secret_values`: union of every live run's stored secrets — empty
-    /// (values are never persisted; see `run_secret_values`).
-    pub(super) async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
-        Ok(Vec::new())
     }
 
     // ── Events / archive / reconcile ─────────────────────────────────

@@ -252,17 +252,58 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             due_runs.insert(request.run_id);
         }
     }
-    for job in &inputs.ready {
-        let matched = inputs
-            .runner_labels
+    // Node-local starvation marks (decisions-5 B2). The verdict here decides
+    // only the mark; the backend re-evaluates the same verdict inside its
+    // transaction, where the conditional ready→failure UPDATE is the
+    // one-writer-wins guard across nodes.
+    let first_seen = {
+        let mut inner = shared.state.inner.lock().await;
+        let marks = &mut inner.reaper_first_seen;
+        let in_queue: std::collections::BTreeSet<(RunId, JobId)> = inputs
+            .ready
             .iter()
-            .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
-        // Unmatched: stamp its first-seen mark or starve it. Matched but
-        // marked: the mark clears.
-        if !matched || job.observed {
-            due_runs.insert(job.run_id);
+            .map(|job| (job.run_id, job.job_id.clone()))
+            .collect();
+        marks.retain(|key, _| in_queue.contains(key));
+        for job in &inputs.ready {
+            let key = (job.run_id, job.job_id.clone());
+            let any_runner_matches = inputs
+                .runner_labels
+                .iter()
+                .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
+            // An unmarked job measures from its enqueue instant (an unknown
+            // age — `enqueued_at` 0 after a restore — is not granted a fresh
+            // window); the verdict's `Mark` carries the instant to keep.
+            let candidate = crate::control::logic::StarvationCandidate {
+                runs_on: &job.runs_on,
+                enqueued_at: std::time::UNIX_EPOCH
+                    + Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
+                first_seen: marks.get(&key).copied(),
+                any_runner_matches,
+            };
+            match crate::control::logic::starvation_verdict(
+                &candidate,
+                now,
+                pool_preparing,
+                started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            ) {
+                crate::control::logic::StarvationVerdict::ClearMark => {
+                    marks.remove(&key);
+                }
+                // Nothing persists for a mark: no backend work is due.
+                crate::control::logic::StarvationVerdict::Mark { first_seen } => {
+                    marks.entry(key).or_insert(first_seen);
+                }
+                // The mark stays until the job leaves the ready queue
+                // (`retain` above): the backend re-evaluates this verdict
+                // with the same mark, and a lost race re-decides identically.
+                crate::control::logic::StarvationVerdict::Starve { .. } => {
+                    due_runs.insert(job.run_id);
+                }
+            }
         }
-    }
+        marks.clone()
+    };
     // ── Node-local: debug-session sweep + pause credits ─────────────────
     // Drop sessions whose worker stopped polling before reading pause credit,
     // and sessions whose job has since ended. Either way a crashed or finished
@@ -308,6 +349,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             paused: paused_credits,
             pool_preparing,
             warm_window_open: started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            first_seen,
         };
         match shared.state.backend.reap_sweep(sweep).await {
             Ok(outcome) => {
@@ -343,7 +385,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // re-registers and polls, or the lease reaper bounds them).
     // Liveness sweep on the authoritative backend: `sessions`,
     // `broker_session_runners`, `runner_registered_at`, `session_last_seen`
-    // and `runner_liveness_timeout` are all TxState. Reading the dead
+    // and `runner_liveness_timeout` are all backend rows. Reading the dead
     // node-local maps here would mark every restored runner "phantom" (both
     // session negations unconditionally true) and purge live identities.
     let (stale_runners, phantom_runners) = (inputs.stale_runners, inputs.phantom_runners);
@@ -1257,10 +1299,8 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             }
         }
         let inner = state.inner.lock().await;
-        // `pool_assignments_enabled`/`require_job_assignments` live on the
-        // authoritative TxState, not `inner`; the backend reads them from its
-        // own config on every transaction (`with_config`).
-        // The authoritative backend reads these flags from its own config on
+        // `pool_assignments_enabled`/`require_job_assignments`: the
+        // authoritative backend reads these flags from its own config on
         // every transaction (`with_config`); mirror the effective values into
         // it now that the real server config is known. `runner_liveness_timeout`
         // is not part of the bootstrap config — keep the value `open` seeded.

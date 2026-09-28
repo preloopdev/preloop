@@ -282,37 +282,48 @@ impl AppState {
         })
     }
 
-    /// Read the authoritative scheduling working set for assertions. Tests
-    /// previously locked `inner` and read its scheduling fields directly;
-    /// those fields now live on `TxState` behind the backend.
-    pub(crate) async fn test_tx(&self) -> crate::control::txstate::TxState {
+    /// Read a consistent snapshot of the authoritative scheduling state for
+    /// assertions. Post-cutover this is a [`TestState`]: same field names as
+    /// the old `TxState`, populated by `Backend::test_working_set`.
+    pub(crate) async fn test_tx(&self) -> crate::control::testview::TestState {
         self.backend
-            .read(|tx| Ok(tx.clone()))
-            .await
-            .expect("test_tx read failed")
+            .test_working_set()
+            .expect("test_working_set failed")
     }
 
-    /// Run a mutation against the authoritative `TxState` in a test.
-    pub(crate) async fn test_tx_mutate<R>(
+    /// `#[cfg(test)]`: adjust runner liveness timing without a restart
+    /// (SQLite backend only).
+    pub(crate) fn test_set_runner_liveness(&self, d: std::time::Duration) {
+        match &*self.backend {
+            crate::control::Backend::Sqlite(b) => {
+                let (pool, require, _) = b.config();
+                b.set_config(pool, require, d);
+            }
+            crate::control::Backend::Postgres(_) => {
+                panic!("test_set_runner_liveness is SQLite-only")
+            }
+        }
+    }
+
+    /// Mutate the control database directly. Escape hatch for seeds that no
+    /// `ControlBackend` command expresses (forced-terminal runs, planted
+    /// timestamps). SQLite only: production servers never see it, and the
+    /// shared suite must not use it (Postgres parity).
+    ///
+    /// The closure receives the backend's writer connection inside a `BEGIN
+    /// IMMEDIATE` transaction so seeds interleave correctly with commands.
+    pub(crate) async fn test_db_mutate<R>(
         &self,
-        f: impl FnOnce(&mut crate::control::txstate::TxState) -> R + Send,
+        f: impl FnOnce(&crate::control::lite::TestDb<'_>) -> R + Send,
     ) -> R {
-        self.backend
-            .transact(|tx| Ok(f(tx)))
-            .await
-            .expect("test_tx_mutate failed")
-    }
-
-    /// Read under an explicit `TxScope` for tests that exercise narrow loads.
-    /// Returns the loaded working set so assertions can inspect it directly.
-    pub(crate) async fn test_tx_scoped(
-        &self,
-        scope: &crate::control::txstate::TxScope,
-    ) -> crate::control::txstate::TxState {
-        self.backend
-            .read_scoped(scope, |tx| Ok(tx.clone()))
-            .await
-            .expect("test_tx_scoped failed")
+        match &*self.backend {
+            crate::control::Backend::Sqlite(b) => {
+                b.test_db_mutate(f).expect("test_db_mutate failed")
+            }
+            crate::control::Backend::Postgres(_) => {
+                panic!("test_db_mutate is SQLite-only; drive Postgres state through ControlBackend commands")
+            }
+        }
     }
 }
 
@@ -1138,7 +1149,6 @@ impl AppState {
             crate::control::Backend::open(
                 store_url,
                 &state_dir,
-                crate::store::Envelope::new(&local_jwt_key),
                 false,
                 false,
                 inner.runner_liveness_timeout,
@@ -1613,6 +1623,12 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Reaper starvation marks (decisions-5 B2, node-local): when this node
+    /// first saw each ready job that no registered runner matches. Cleared
+    /// once a runner matches, while a pool is preparing, or when the job
+    /// leaves the ready queue; a restart resets them, which only delays a
+    /// starvation failure.
+    pub reaper_first_seen: BTreeMap<(RunId, JobId), std::time::SystemTime>,
     pub next_cache_id: i64,
     pub next_log_id: usize,
     pub flows_file: Option<std::fs::File>,

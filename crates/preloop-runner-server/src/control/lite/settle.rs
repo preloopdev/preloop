@@ -576,11 +576,13 @@ pub(super) fn cancel_run_inner(
             cancellations += 1;
         }
     }
-    // Nodes minted a request at submit even though they never ran.
+    // Every expandable node (deferred matrix parent / reusable caller) minted
+    // a request at submit even though it never ran — settle them now,
+    // whatever queue slot they were parked in.
     let nodes: Vec<JobId> = {
         let mut stmt = tx
             .prepare_cached(
-                "SELECT job_id FROM jobs WHERE run_id = ?1 AND queue_state = 'none' \
+                "SELECT job_id FROM jobs WHERE run_id = ?1 \
                    AND status NOT IN ('success','failure','cancelled','skipped')",
             )
             .map_err(db)?;

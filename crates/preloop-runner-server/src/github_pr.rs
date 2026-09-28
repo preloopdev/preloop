@@ -449,12 +449,19 @@ mod tests {
                     uuid::Uuid::parse_str(accepted["run_id"].as_str().unwrap()).unwrap(),
                 );
                 state
-                    .test_tx_mutate(|inner| {
-                        let run = inner.runs.get_mut(&run_id).expect("run recorded");
-                        run.conclusion = Some("success".to_owned());
+                    .test_db_mutate(|tx| {
+                        tx.execute(
+                            "UPDATE runs SET conclusion = 'success' WHERE run_id = ?1",
+                            [run_id.to_string()],
+                        )
+                        .unwrap();
                         // The webhook dispatcher stamps the trust tier; native
                         // submissions carry none and are never auto-PR'd.
-                        Arc::make_mut(&mut run.submission).trust_tier = Some("internal".to_owned());
+                        tx.execute(
+                            "UPDATE run_submissions                              SET submission = json_set(submission, '$.trust_tier', 'internal')                              WHERE run_id = ?1",
+                            [run_id.to_string()],
+                        )
+                        .unwrap();
                     })
                     .await;
                 run_id
@@ -551,9 +558,12 @@ mod tests {
         let run_id =
             crate::RunId(uuid::Uuid::parse_str(accepted["run_id"].as_str().unwrap()).unwrap());
         state
-            .test_tx_mutate(|inner| {
-                let run = inner.runs.get_mut(&run_id).expect("run recorded");
-                run.conclusion = Some("success".to_owned());
+            .test_db_mutate(|tx| {
+                tx.execute(
+                    "UPDATE runs SET conclusion = 'success' WHERE run_id = ?1",
+                    [run_id.to_string()],
+                )
+                .unwrap();
             })
             .await;
         let shared = Arc::new(crate::SharedState {

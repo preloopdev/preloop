@@ -122,34 +122,16 @@ pub async fn patch_timeline_records(
         );
     }
 
-    // Backend: reconcile the attempt's step rows and, when needed, the run's
-    // `jobs_list` detail. Steps are direct keyed upserts (no run lock); the
-    // run transaction runs only to create the job's detail entry or record a
-    // non-running conclusion on it.
-    if let (Some(run_id), Some(job_id)) = (run_id, logical_job_id.clone()) {
+    // Backend: reconcile the attempt's step rows. Job detail is derived
+    // (the `jobs` row is the projection), so only the step patches persist;
+    // timeline records never move `jobs.status` — settlement owns that.
+    if let (Some(_run_id), Some(_job_id)) = (run_id, logical_job_id.clone()) {
         let job_status = job_status_for_run;
         let observed_us = chrono::Utc::now().timestamp_micros();
         let patches: Vec<crate::control::types::StepPatch> = records
             .iter()
             .filter_map(|record| step_patch(record, job_status, observed_us))
             .collect();
-        let needs_detail = job_status.is_some_and(|s| s != ExecutionStatus::InProgress)
-            || shared
-                .state
-                .backend
-                .job_detail_missing(run_id, &job_id)
-                .await
-                .unwrap_or(true);
-        if needs_detail {
-            let conclusion = job_status
-                .filter(|s| *s != ExecutionStatus::InProgress)
-                .map(|s| format!("{s:?}").to_lowercase());
-            let _ = shared
-                .state
-                .backend
-                .ensure_job_detail(run_id, &job_id, conclusion.as_deref())
-                .await;
-        }
         if let Some(agent_job_id) = agent_job_id {
             if let Err(error) = shared
                 .state
@@ -210,12 +192,19 @@ pub async fn create_log(
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let next_id = shared
-        .state
-        .backend
-        .create_log(&plan_id)
-        .await
-        .map_err(ApiError::from)?;
+    // A plan_id that is not a job's agent_job_id (test hooks, standalone
+    // uploads) has no log_files row to allocate against: its bytes live only
+    // in the node-local buffer, so fall back to the in-memory counter like
+    // the pre-backend model did. Real plans keep the per-plan log_files ids.
+    let next_id = match shared.state.backend.create_log(&plan_id).await {
+        Ok(id) => id,
+        Err(crate::control::ControlError::NotFound(_)) => {
+            let mut inner = shared.state.inner.lock().await;
+            inner.next_log_id += 1;
+            inner.next_log_id as i64
+        }
+        Err(other) => return Err(ApiError::from(other)),
+    };
     log.id = next_id;
     let key = format!("{plan_id}/{next_id}");
     let evicted = {
@@ -362,6 +351,12 @@ pub async fn mask_log_bytes_cached(
     // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
     // only when the plan mapped to a concrete run row, so the fallback
     // union is never cached as if it were the run's real masker.
+    // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
+    // only when the plan mapped to a concrete run row, so the fallback
+    // union is never cached as if it were the run's real masker. Secret
+    // values come from the SecretProvider (the submission row no longer
+    // stores values); provided names already sit in `plan_secret_masker`
+    // from submit, so a resolved run also unions every node-cached entry.
     let resolved_run_id = shared
         .state
         .backend
@@ -371,13 +366,51 @@ pub async fn mask_log_bytes_cached(
         .flatten()
         .map(|callback| callback.run_id)
         .or_else(|| plan_id.parse::<RunId>().ok());
-    let run_secrets = match resolved_run_id {
-        Some(run_id) => shared.state.backend.run_secret_values(run_id).await?,
-        None => None,
-    };
-    let (secrets, resolved) = match run_secrets {
-        Some(values) => (values, true),
-        None => (shared.state.backend.all_secret_values().await?, false),
+    let provider = shared.state.secret_provider.as_ref();
+    let (secrets, resolved) = match resolved_run_id {
+        Some(run_id) => {
+            let record = shared.state.backend.run_record(run_id).await.ok();
+            let repository = record
+                .as_ref()
+                .map(|record| record.submission.repository.clone())
+                .unwrap_or_default();
+            let mut values: Vec<String> = provider
+                .resolve(crate::secret_provider::SecretScope {
+                    repository: &repository,
+                    environment: None,
+                })
+                .map(|map| {
+                    preloop_gha_protocol::masking::expose_all(&map)
+                        .into_values()
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Backends that still persist the sealed submission blob (lite)
+            // can serve provided values after a restart; pg keeps none.
+            if let Some(record) = record {
+                values.extend(
+                    preloop_gha_protocol::masking::expose_all(&record.submission.secrets)
+                        .into_values(),
+                );
+            }
+            values.sort();
+            values.dedup();
+            (values, true)
+        }
+        None => {
+            // Unresolvable plan: union of stored provider secrets plus every
+            // provided value the node already cached at submit/acquire.
+            let mut values = provider.resolve_all().unwrap_or_default();
+            {
+                let inner = shared.state.inner.lock().await;
+                for cached in inner.plan_secret_masker.values() {
+                    values.extend(cached.iter().cloned());
+                }
+            }
+            values.sort();
+            values.dedup();
+            (values, false)
+        }
     };
 
     {
@@ -922,9 +955,7 @@ fn step_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{RunRecord, TaskAgentJobRequestRecord};
-    use preloop_gha_protocol::{ExecutionStatus, WorkflowSubmission};
-    use std::collections::BTreeMap;
+    use crate::store::now_us;
     use std::sync::Arc;
 
     /// Seed a single in-flight run with one job, its plan→request mapping, and
@@ -951,81 +982,52 @@ mod tests {
         let plan_id = run_id.to_string();
         let timeline_id = uuid::Uuid::new_v4();
         let request_id = 7_i64;
-        // Seed the authoritative backend (runs/job_requests are TxState, not
-        // node-local InnerState) so the handler's `read_scoped` sees them.
-        {
-            let plan_id = plan_id.clone();
-            let job_id = job_id.clone();
-            state
-                .backend
-                .transact(move |tx| {
-                    tx.runs.insert(
-                        run_id,
-                        RunRecord {
-                            run_id,
-                            webhook_delivery_id: None,
-                            run_name: Some("timeline-conclusion-test".to_owned()),
-                            submission: Arc::new(WorkflowSubmission {
-                                workflow_yaml: "on: push\njobs: {}\n".to_owned(),
-                                event: "push".to_owned(),
-                                repository: "test/repo".to_owned(),
-                                git_ref: "refs/heads/main".to_owned(),
-                                ..Default::default()
-                            }),
-                            jobs: BTreeMap::from([(job_id.clone(), ExecutionStatus::InProgress)]),
-                            status: ExecutionStatus::InProgress,
-                            job_outputs: BTreeMap::new(),
-                            job_base_ids: BTreeMap::new(),
-                            job_needs: BTreeMap::new(),
-                            caller_plans: BTreeMap::new(),
-                            job_names: BTreeMap::from([(job_id.clone(), "build".to_owned())]),
-                            github: serde_json::json!({}),
-                            head_sha: String::new(),
-                            workflow_ref: String::new(),
-                            workspace_snapshot: None,
-                            job_fail_fast: BTreeMap::new(),
-                            job_continue_on_error: BTreeMap::new(),
-                            job_check_run_ids: BTreeMap::new(),
-                            reusable_calls: BTreeMap::new(),
-                            jobs_list: Vec::new(),
-                            created_at: chrono::Utc::now(),
-                            started_at: None,
-                            completed_at: None,
-                            run_number: 1,
-                            run_attempt: 1,
-                            workflow_path_str: ".github/workflows/ci.yml".to_owned(),
-                            event: "push".to_owned(),
-                            conclusion: None,
-                            push_state: None,
-                            snapshot_timing: None,
-                        },
-                    );
-                    tx.plan_requests.insert(plan_id.clone(), request_id);
-                    tx.job_requests.insert(
+        // Seed the authoritative backend (runs/job_requests are backend rows,
+        // not node-local InnerState) so the handler's lookups see them.
+        let plan_id_captured = plan_id.clone();
+        state
+            .test_db_mutate(move |tx| {
+                let now = now_us();
+                // Minimal run + job + request rows: the PATCH path resolves
+                // timeline_id -> job_requests, so only the columns it reads
+                // need real values; the rest satisfy NOT NULLs.
+                tx.execute(
+                    "INSERT INTO runs (run_id, namespace_id, repository, \
+                     workflow_path, run_number, run_attempt, run_name, event, \
+                     ref, ref_type, head_ref, base_ref, head_sha, workflow_ref, \
+                     status, conclusion, webhook_delivery_id, origin, actor, \
+                     tree_digest, concurrency_group, \
+                     concurrency_cancel_in_progress, created_at, started_at, \
+                     completed_at) VALUES (?1,'default','test/repo',\
+                     'ci.yml',1,1,'timeline-conclusion-test','push',\
+                     'refs/heads/main','branch',NULL,NULL,'abc123',\
+                     'test/repo/ci.yml@refs/heads/main','in_progress',NULL,NULL,\
+                     'api','tester',NULL,NULL,0,?2,NULL,NULL)",
+                    rusqlite::params![run_id.to_string(), now],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO jobs (run_id, job_id, namespace_id, kind, \
+                     base_id, status, queue_state) \
+                     VALUES (?1,'build','default','job','build','in_progress','claimed')",
+                    rusqlite::params![run_id.to_string()],
+                )
+                .unwrap();
+                let agent_job_id = uuid::Uuid::parse_str(&plan_id_captured).unwrap();
+                tx.execute(
+                    "INSERT INTO job_requests (request_id, run_id, job_id, \
+                     namespace_id, agent_job_id, timeline_id) \
+                     VALUES (?1,?2,'build','default',?3,?4)",
+                    rusqlite::params![
                         request_id,
-                        TaskAgentJobRequestRecord {
-                            request_id,
-                            run_id,
-                            job_id: job_id.clone(),
-                            agent_job_id: uuid::Uuid::new_v4(),
-                            plan_id: plan_id.clone(),
-                            plan_type: "Build".to_owned(),
-                            timeline_id,
-                            result: None,
-                            locked_until: String::new(),
-                            claimed_at: None,
-                            owner_runner_id: None,
-                            started_at: None,
-                            last_renewed_at: None,
-                            timeout_triggered: false,
-                            debug_token_issued: false,
-                        },
-                    );
-                    Ok(())
-                })
-                .await
-                .expect("seed backend");
-        }
+                        run_id.to_string(),
+                        agent_job_id.to_string(),
+                        timeline_id.to_string()
+                    ],
+                )
+                .unwrap();
+            })
+            .await;
         (temp, shared, run_id, job_id, plan_id, timeline_id)
     }
 
@@ -1055,19 +1057,16 @@ mod tests {
 
         // `runs` is authoritative backend state — read it via the backend,
         // not node-local `inner`.
-        let detail = state
-            .backend
-            .read(move |tx| {
-                Ok(tx.runs.get(&run_id).and_then(|run| {
-                    run.jobs_list
-                        .iter()
-                        .find(|detail| detail.name == "build")
-                        .map(|d| d.conclusion.clone())
-                }))
+        let detail = {
+            let tx = state.test_tx().await;
+            tx.runs.get(&run_id).and_then(|run| {
+                run.jobs_list
+                    .iter()
+                    .find(|detail| detail.name == "build")
+                    .map(|d| d.conclusion.clone())
             })
-            .await
-            .expect("read run")
-            .expect("timeline PATCH created the job detail");
+        }
+        .expect("timeline PATCH created the job detail");
         assert_eq!(
             detail, "in_progress",
             "an in-flight job must not read as 'success' or 'inprogress'"

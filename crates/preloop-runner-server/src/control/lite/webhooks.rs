@@ -152,23 +152,50 @@ impl LiteBackend {
             for id in ids {
                 let token = uuid::Uuid::new_v4().to_string();
                 let record = stmt
-                    .query_row(params![until, token, id], |row| {
-                        let payload: String = row.get(2)?;
+                    .query_row(params![until, token, &id], |row| {
+                        let payload: rusqlite::types::Value = row.get(2)?;
                         let attempts: i64 = row.get(4)?;
-                        Ok(WebhookDeliveryRecord {
-                            delivery_id: row.get(0)?,
-                            event: row.get(1)?,
-                            payload: payload.into_bytes(),
-                            received_at_us: row.get(3)?,
-                            state: WebhookDeliveryStatus::Processing,
-                            attempts: attempts.max(0) as u32,
-                            lease_until_us: Some(until),
-                            lease_token: Some(token.clone()),
-                            last_error: row.get(5)?,
-                        })
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            payload,
+                            row.get::<_, i64>(3)?,
+                            attempts,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
                     })
                     .map_err(db)?;
-                claimed.push(record);
+                // Payload must be UTF-8 JSON text; anything else is a
+                // poisoned row the handler can never deliver — dead-letter
+                // it instead of wedging the queue.
+                let payload = match record.2 {
+                    rusqlite::types::Value::Text(text) => Some(text),
+                    rusqlite::types::Value::Blob(bytes) => String::from_utf8(bytes).ok(),
+                    _ => None,
+                }
+                .filter(|text| serde_json::from_str::<serde_json::Value>(text).is_ok());
+                let Some(payload) = payload else {
+                    tx.prepare_cached(
+                        "UPDATE webhook_deliveries SET state = 'failed', \
+                         lease_until = NULL, last_error = 'undeliverable payload' \
+                         WHERE delivery_id = ?1",
+                    )
+                    .map_err(db)?
+                    .execute([&id])
+                    .map_err(db)?;
+                    continue;
+                };
+                claimed.push(WebhookDeliveryRecord {
+                    delivery_id: record.0,
+                    event: record.1,
+                    payload: payload.into_bytes(),
+                    received_at_us: record.3,
+                    state: WebhookDeliveryStatus::Processing,
+                    attempts: record.4.max(0) as u32,
+                    lease_until_us: Some(until),
+                    lease_token: Some(token),
+                    last_error: record.5,
+                });
             }
             Ok(claimed)
         })

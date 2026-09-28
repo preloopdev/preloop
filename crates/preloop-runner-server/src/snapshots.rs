@@ -4056,7 +4056,7 @@ async fn authorize_snapshot_token(
     };
 
     // Backend: agent_job → request → run membership check (`job_requests`
-    // and its derived `agent_job_requests` are TxState, scoped to this run).
+    // rows, scoped to this run).
     let belongs_to_run = state
         .backend
         .attempt_in_run(run_id, &identity.plan_id, identity.job_id)

@@ -494,6 +494,7 @@ impl From<ControlError> for ApiError {
                 // caller that can reach a control-backed handler — including
                 // untrusted workflow code holding a runtime token. Log it
                 // server-side; return a fixed message to the client.
+                eprintln!("control backend error: {error:?}");
                 tracing::error!(?error, "control backend error");
                 ApiError::internal("control backend error")
             }
@@ -640,9 +641,6 @@ pub(crate) struct ReadyRow {
     pub(crate) job_id: JobId,
     pub(crate) runs_on: Vec<String>,
     pub(crate) enqueued_at_unix_nanos: i64,
-    /// The reaper has a first-seen mark on the row (cleared once a runner
-    /// can take the job).
-    pub(crate) observed: bool,
 }
 
 /// Everything one reaper tick decides from, read without a lock.
@@ -803,6 +801,11 @@ pub(crate) struct ReapSweep {
     pub(crate) pool_preparing: bool,
     /// This process started less than `MAX_QUEUED_GRACE` ago.
     pub(crate) warm_window_open: bool,
+    /// Node-local starvation marks (decisions-5 B2): the instant this node's
+    /// reaper first saw each unmatched ready job. Backends feed
+    /// `first_seen.get(&(run, job))` to `logic::starvation_verdict`; they
+    /// never persist marks. A missing entry falls back to `enqueued_at`.
+    pub(crate) first_seen: std::collections::BTreeMap<(RunId, JobId), std::time::SystemTime>,
 }
 
 /// An attempt whose lease expired in `reap_sweep`; the reaper completes its

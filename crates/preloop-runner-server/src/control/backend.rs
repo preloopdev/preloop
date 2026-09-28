@@ -389,21 +389,6 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Every job id belonging to `run_id` (jobs ∪ its requests' job ids),
     /// sorted. `NotFound` when the run row does not exist.
     async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError>;
-    /// Whether the run's `jobs_list` has no detail entry for `job_id` yet.
-    async fn job_detail_missing(&self, run_id: RunId, job_id: &JobId)
-        -> Result<bool, ControlError>;
-
-    /// Create `job_id`'s `jobs_list` detail when missing (defaulting to
-    /// `in_progress`) and stamp `conclusion` when it is a terminal string.
-    /// Serialized on the run advisory lock; the timeline PATCH calls this
-    /// instead of loading the run's working set.
-    async fn ensure_job_detail(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-        conclusion: Option<&str>,
-    ) -> Result<(), ControlError>;
-
     /// Record the GitHub check-run id for a job that is part of the run.
     /// Writes nothing when the job has no `jobs` row (the check mapping is
     /// only meaningful for real jobs). Returns whether the mapping changed.
@@ -534,6 +519,15 @@ pub(crate) trait ControlBackend: Send + Sync {
         workflow_path: &str,
     ) -> Result<Option<RunId>, ControlError>;
 
+    /// The committed run a webhook delivery produced (`webhook_delivery_id`
+    /// + `workflow_path` uniqueness), if any. Submit checks it before
+    /// allocating a run number so a replayed delivery does not burn one.
+    async fn run_for_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError>;
+
     /// Whether `run_id` currently waits on a concurrency slot
     /// (`jobs.queue_kind='held'` row). Point read.
     async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError>;
@@ -565,14 +559,6 @@ pub(crate) trait ControlBackend: Send + Sync {
         timeline_id: Option<uuid::Uuid>,
         agent_job_id: Option<uuid::Uuid>,
     ) -> Result<Option<CallbackJob>, ControlError>;
-
-    /// Exposed secret values of one run's stored submission; `None` when no
-    /// such run. The log masker caches this per plan.
-    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError>;
-
-    /// Exposed secret values across every live run — the masker's fallback
-    /// union when a plan resolves to no run.
-    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError>;
 
     /// The session-claimed request that is still in flight, when exactly one
     /// exists (the finish_job compatibility fallback). More than one active
@@ -1110,14 +1096,14 @@ pub(crate) struct ReconcileOutcome {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The configured control backend: SQLite (default, single node) or
-/// PostgreSQL (shared nodes). `AppState` holds `Arc<Backend>` — a concrete
-/// enum, not `Arc<dyn ControlBackend>`, so [`Backend::transact`] can stay
-/// generic (a generic method is not object-safe over `dyn`).
+/// PostgreSQL (shared nodes). `AppState` holds `Arc<Backend>`; the enum
+/// dispatches to the two `ControlBackend` implementations under
+/// `control/lite` and `control/pg`.
 pub(crate) enum Backend {
     /// Single-node default: one writer on `<state_dir>/preloop.db`.
-    Sqlite(super::sqlite::SqliteBackend),
-    /// Shared-node: a connection pool against the `control` schema.
-    Postgres(super::postgres::PostgresBackend),
+    Sqlite(super::lite::LiteBackend),
+    /// Shared-node: connection pools against the `control` schema.
+    Postgres(super::pg::PgBackend),
 }
 
 impl Backend {
@@ -1132,13 +1118,21 @@ impl Backend {
         }
     }
 
+    /// `#[cfg(test)]` working-set snapshot for pre-cutover assertions. Each
+    /// backend rebuilds the old field names from its own tables.
+    #[cfg(test)]
+    pub(crate) fn test_working_set(&self) -> Result<super::testview::TestState, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.test_working_set(),
+            Self::Postgres(b) => b.test_working_set(),
+        }
+    }
     /// Open the backend selected by `store_url`: `postgres://…` → PostgreSQL,
     /// anything else (`sqlite://<path>`, a bare path) → SQLite. The default
     /// authoritative database is `<state_dir>/preloop.db`.
     pub(crate) async fn open(
         store_url: Option<&str>,
         state_dir: &std::path::Path,
-        cipher: crate::store::Envelope,
         pool_assignments_enabled: bool,
         require_job_assignments: bool,
         runner_liveness_timeout: std::time::Duration,
@@ -1146,9 +1140,8 @@ impl Backend {
         if let Some(url) =
             store_url.filter(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
         {
-            let backend = super::postgres::PostgresBackend::connect(
+            let backend = super::pg::PgBackend::connect(
                 url,
-                cipher,
                 pool_assignments_enabled,
                 require_job_assignments,
                 runner_liveness_timeout,
@@ -1156,10 +1149,15 @@ impl Backend {
             .await?;
             return Ok(Self::Postgres(backend));
         }
-        let path = state_dir.join("preloop.db");
-        let backend = super::sqlite::SqliteBackend::open(
+        let path = match store_url {
+            Some(url) if url.starts_with("sqlite://") => {
+                std::path::PathBuf::from(url.trim_start_matches("sqlite://"))
+            }
+            Some(url) if !url.is_empty() => std::path::PathBuf::from(url),
+            _ => state_dir.join("preloop.db"),
+        };
+        let backend = super::lite::LiteBackend::open(
             &path,
-            cipher,
             pool_assignments_enabled,
             require_job_assignments,
             runner_liveness_timeout,
@@ -1167,129 +1165,17 @@ impl Backend {
         Ok(Self::Sqlite(backend))
     }
 
-    /// Run `f` inside one transaction on the scheduling working set.
-    /// `&self` — serialization lives in the database. The SQLite arm runs
-    /// its synchronous transaction inline (a short local `BEGIN
-    /// IMMEDIATE`); the Postgres arm awaits its connection.
-    pub(crate) async fn transact<T>(
-        &self,
-        f: impl FnOnce(&mut super::txstate::TxState) -> Result<T, ControlError>,
-    ) -> Result<T, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.transact(f),
-            Self::Postgres(backend) => backend.transact(f).await,
-        }
-    }
-
-    /// Run `f` on a read-only pooled connection — concurrent with the
-    /// writer, never queued behind it. Use for commands that only read the
-    /// working set (`acquire_context`, `run_record`, `queue_stats`, …);
-    /// read-modify-write commands go through [`Backend::transact`].
-    pub(crate) async fn read<T>(
-        &self,
-        f: impl FnOnce(&super::txstate::TxState) -> Result<T, ControlError>,
-    ) -> Result<T, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.read(f),
-            Self::Postgres(backend) => backend.read(f).await,
-        }
-    }
-
-    /// `read` under an explicit [`TxScope`] — loads only that working set on
-    /// a pooled read connection. Hot read paths (`append_log`, `console_log`)
-    /// use a narrow scope instead of materializing the full working set.
-    pub(crate) async fn read_scoped<T>(
-        &self,
-        scope: &super::txstate::TxScope,
-        f: impl FnOnce(&super::txstate::TxState) -> Result<T, ControlError>,
-    ) -> Result<T, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.read_scoped(scope, f),
-            Self::Postgres(backend) => backend.read_scoped(scope, f).await,
-        }
-    }
-
-    /// `transact` under an explicit [`TxScope`] — loads only that working
-    /// set. Used by the boot import (full scope) and hot paths that opt into
-    /// a narrow scope.
-    pub(crate) async fn transact_scoped<T>(
-        &self,
-        scope: &super::txstate::TxScope,
-        f: impl FnOnce(&mut super::txstate::TxState) -> Result<T, ControlError>,
-    ) -> Result<T, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.transact_scoped(scope, f),
-            Self::Postgres(backend) => backend.transact_scoped(scope, f).await,
-        }
-    }
-
-    /// Find the run a webhook delivery already produced, by its durable
-    /// `(delivery_id, workflow_path)` dedup key. O(1) via `runs_delivery` —
-    /// the submit path calls this before `transact_scoped` so the replay
-    /// check never scans the whole `runs` table.
-    pub(crate) async fn find_run_by_delivery(
-        &self,
-        delivery_id: &str,
-        workflow_path: &str,
-    ) -> Result<Option<crate::models::RunRecord>, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.find_run_by_delivery(delivery_id, workflow_path),
-            Self::Postgres(backend) => {
-                backend
-                    .find_run_by_delivery(delivery_id, workflow_path)
-                    .await
-            }
-        }
-    }
-
     /// Resolve a request's `(request_id, run_id)` from its `agent_job_id`.
-    /// O(1) via `job_requests_agent` — the broker complete path calls this
-    /// before `transact_scoped` so the working set stays narrow.
+    /// Thin alias over [`ControlBackend::request`] — the broker acquire path
+    /// wants the bare `(request_id, run_id)`, not the whole record.
     pub(crate) async fn find_request_by_agent_job_id(
         &self,
         agent_job_id: uuid::Uuid,
     ) -> Result<Option<(i64, RunId)>, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.find_request_by_agent_job_id(agent_job_id),
-            Self::Postgres(backend) => backend.find_request_by_agent_job_id(agent_job_id).await,
-        }
-    }
-
-    /// The session that owns the request for `agent_job_id`. `complete_job`
-    /// resolves this before `transact_scoped` so `settle_request` can drop
-    /// the moot cancellation from the owner session's inflight messages.
-    pub(crate) async fn find_session_by_agent_job_id(
-        &self,
-        agent_job_id: uuid::Uuid,
-    ) -> Result<Option<String>, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.find_session_by_agent_job_id(agent_job_id),
-            Self::Postgres(backend) => backend.find_session_by_agent_job_id(agent_job_id).await,
-        }
-    }
-
-    /// Every session owning a request of `run_id`. `cancel_run`/`cancel_job`
-    /// resolve these before `transact_scoped` so `settle_request` can drop
-    /// moot cancellations from each owner session's inflight messages.
-    pub(crate) async fn find_sessions_by_run(
-        &self,
-        run_id: RunId,
-    ) -> Result<std::collections::BTreeSet<String>, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.find_sessions_by_run(run_id),
-            Self::Postgres(backend) => backend.find_sessions_by_run(run_id).await,
-        }
-    }
-
-    /// `(run_id, owner_session)` for `request_id`. `acquire_context` resolves
-    /// this before `read_scoped` so the read stays narrow.
-    pub(crate) async fn find_request_context(
-        &self,
-        request_id: i64,
-    ) -> Result<Option<(RunId, Option<String>)>, ControlError> {
-        match self {
-            Self::Sqlite(backend) => backend.find_request_context(request_id),
-            Self::Postgres(backend) => backend.find_request_context(request_id).await,
+        match self.request(RequestKey::AgentJobId(agent_job_id)).await {
+            Ok(record) => Ok(Some((record.request_id, record.run_id))),
+            Err(ControlError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -1504,7 +1390,7 @@ impl ControlBackend for Backend {
     }
     async fn run_record(&self, run_id: RunId) -> Result<RunRecord, ControlError> {
         match self {
-            Self::Sqlite(b) => b.run_record(run_id).await,
+            Self::Sqlite(b) => ControlBackend::run_record(b, run_id).await,
             Self::Postgres(b) => b.run_record(run_id).await,
         }
     }
@@ -1702,33 +1588,10 @@ impl ControlBackend for Backend {
         }
     }
 
-    async fn job_detail_missing(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-    ) -> Result<bool, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.job_detail_missing(run_id, job_id).await,
-            Self::Postgres(b) => b.job_detail_missing(run_id, job_id).await,
-        }
-    }
-
     async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError> {
         match self {
             Self::Sqlite(b) => b.run_job_ids(run_id).await,
             Self::Postgres(b) => b.run_job_ids(run_id).await,
-        }
-    }
-
-    async fn ensure_job_detail(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-        conclusion: Option<&str>,
-    ) -> Result<(), ControlError> {
-        match self {
-            Self::Sqlite(b) => b.ensure_job_detail(run_id, job_id, conclusion).await,
-            Self::Postgres(b) => b.ensure_job_detail(run_id, job_id, conclusion).await,
         }
     }
 
@@ -1746,18 +1609,6 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.reap_inputs().await,
             Self::Postgres(b) => b.reap_inputs().await,
-        }
-    }
-    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.run_secret_values(run_id).await,
-            Self::Postgres(b) => b.run_secret_values(run_id).await,
-        }
-    }
-    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.all_secret_values().await,
-            Self::Postgres(b) => b.all_secret_values().await,
         }
     }
     async fn sole_inflight_request(
@@ -1935,6 +1786,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.published_run(repository, sha, workflow_path).await,
             Self::Postgres(b) => b.published_run(repository, sha, workflow_path).await,
+        }
+    }
+    async fn run_for_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.run_for_webhook_delivery(delivery_id, workflow_path).await,
+            Self::Postgres(b) => b.run_for_webhook_delivery(delivery_id, workflow_path).await,
         }
     }
     async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {

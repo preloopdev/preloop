@@ -294,7 +294,10 @@ fn pair_runner_tx(
 }
 
 /// `purge_runner_tx` (pg lifecycle.rs): capture the runner's claimed jobs,
-/// delete the runner (sessions cascade), then requeue each job.
+/// delete the runner and its sessions, then requeue each job.
+/// `runner_sessions.runner_id` carries no FK (a declared id may precede
+/// registration), so the sessions are deleted explicitly — a revoked
+/// long-poll must find no session and get `Forbidden`.
 fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlError> {
     let requeue: Vec<(String, String)> = {
         let mut stmt = tx
@@ -319,7 +322,7 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlEr
         rows.collect::<Result<Vec<_>, _>>().map_err(db)?
     };
     // Requests bound through this runner's sessions lose owner, session and
-    // start stamps before the session rows cascade away.
+    // start stamps before the session rows are deleted below.
     tx.prepare_cached(
         "UPDATE job_requests SET runner_id = NULL, session_id = NULL, \
          started_at = NULL, timeout_triggered = 0 \
@@ -329,7 +332,32 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlEr
     .map_err(db)?
     .execute([runner_id])
     .map_err(db)?;
+    // Ready-but-assigned jobs of the dead runner return to pool-pending so
+    // provisioning re-runs for them. Collected BEFORE the runner row goes
+    // away — job_assignments.runner_id is ON DELETE SET NULL, so the delete
+    // below would hide them.
+    let unclaimed: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare_cached(
+                "SELECT j.run_id, j.job_id FROM jobs j \
+                 WHERE j.queue_state = 'ready' AND EXISTS ( \
+                   SELECT 1 FROM job_assignments a WHERE a.run_id = j.run_id \
+                   AND a.job_id = j.job_id AND a.runner_id = ?1)",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([runner_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+    };
     tx.prepare_cached("DELETE FROM job_leases WHERE runner_id = ?1")
+        .map_err(db)?
+        .execute([runner_id])
+        .map_err(db)?;
+    // Session messages cascade from `runner_sessions` (FK on session_id).
+    tx.prepare_cached("DELETE FROM runner_sessions WHERE runner_id = ?1")
         .map_err(db)?
         .execute([runner_id])
         .map_err(db)?;
@@ -339,6 +367,23 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlEr
         .map_err(db)?;
     for (run, job) in requeue {
         requeue_claimed(tx, codec::run_id(&run), &JobId(job))?;
+    }
+    let now = now_us();
+    for (run, job) in unclaimed {
+        tx.prepare_cached("DELETE FROM job_assignments WHERE run_id = ?1 AND job_id = ?2")
+            .map_err(db)?
+            .execute(params![run, job])
+            .map_err(db)?;
+        tx.prepare_cached(
+            "INSERT INTO provision_requests (run_id, job_id, namespace_id, \
+             pool_key, labels, requested_at) \
+             SELECT j.run_id, j.job_id, j.namespace_id, j.pool_key, j.runs_on, ?3 \
+             FROM jobs j WHERE j.run_id = ?1 AND j.job_id = ?2 \
+             ON CONFLICT (run_id, job_id) DO UPDATE SET requested_at = ?3",
+        )
+        .map_err(db)?
+        .execute(params![run, job, now])
+        .map_err(db)?;
     }
     Ok(())
 }
@@ -436,6 +481,8 @@ impl LiteBackend {
                     )));
                 }
             }
+            // runner_id has no FK (see schema.sql): an unverified create may
+            // declare an agent id whose registration arrives later.
             tx.prepare_cached(
                 "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
                  verified) VALUES (?1, ?2, ?3, ?4) \
@@ -476,6 +523,10 @@ impl LiteBackend {
                 }
             }
             // Release the session's live requests so the jobs can be retried.
+            // runner_id stays: the attempt's owner survives session teardown
+            // so only that runner may still complete/renew it (legacy
+            // AgentRequest semantics — verified by
+            // legacy_agent_requests_are_bound_to_runner_identity).
             let requests: Vec<i64> = {
                 let mut stmt = tx
                     .prepare_cached(
@@ -494,7 +545,7 @@ impl LiteBackend {
                 .map_err(db)?;
             for request_id in requests {
                 tx.prepare_cached(
-                    "UPDATE job_requests SET session_id = NULL, runner_id = NULL, \
+                    "UPDATE job_requests SET session_id = NULL, \
                      started_at = NULL, timeout_triggered = 0 \
                      WHERE request_id = ?1 AND result IS NULL",
                 )

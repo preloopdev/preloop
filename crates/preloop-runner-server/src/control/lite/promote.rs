@@ -241,6 +241,12 @@ fn hydrate_message(
         );
         needs_map.insert(need.0.clone(), azdo::PipelineContextData::Dict(entry));
     }
+    if !needs_map.is_empty() {
+        message.context_data.insert(
+            "needs".to_owned(),
+            azdo::PipelineContextData::Dict(needs_map),
+        );
+    }
     let spec = jobs::load_spec(tx, job.run_id, &job.job_id)?;
     if let Some(spec) = spec {
         if let Some(environment) = spec.environment.as_ref() {
@@ -609,10 +615,14 @@ pub(super) fn advance_jobset(
                 .map_err(db)?;
             return Ok(Advance::Ready);
         };
-        let (run_id_txt,): (String,) = tx
-            .prepare_cached("SELECT run_id FROM jobsets WHERE jobset_id = ?1")
+        // The gate's hold/wait rows live under the caller's namespace —
+        // `cg::acquire` must scope to it or it never sees the holder.
+        let (run_id_txt, namespace_id): (String, String) = tx
+            .prepare_cached(
+                "SELECT js.run_id, COALESCE((                    SELECT j.namespace_id FROM jobs j                     WHERE j.run_id = js.run_id                       AND j.job_id = json_extract(js.job_ids, '$[0]')                 ), 'default') FROM jobsets js WHERE js.jobset_id = ?1",
+            )
             .map_err(db)?
-            .query_row([jobset], |row| Ok((row.get::<_, String>(0)?,)))
+            .query_row([jobset], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(db)?;
         let run_id = codec::run_id(&run_id_txt);
         let member_ids: BTreeSet<JobId> = {
@@ -635,7 +645,7 @@ pub(super) fn advance_jobset(
         let mut cancel = super::settle::canceler(backend);
         match cg::acquire(
             tx,
-            "default",
+            &namespace_id,
             &repo,
             &group,
             &display,
@@ -821,11 +831,15 @@ pub(super) fn promote_run(
                             )?;
                         }
                         Advance::Blocked => {
-                            // Already parked on the gate; leave blocked with
-                            // the wait stamp set.
+                            // Parked on the gate: flip to `held` like the
+                            // job-gate arm does — leaving the row `blocked`
+                            // would re-enter this loop every pass (it stays a
+                            // candidate), and `concurrency_waits` is what
+                            // actually re-arms it on release.
                             tx.prepare_cached(
-                                "UPDATE jobs SET concurrency_wait_at = \
-                                     COALESCE(concurrency_wait_at, ?3) \
+                                "UPDATE jobs SET queue_state = 'held', \
+                                     status = 'pending', \
+                                     concurrency_wait_at = COALESCE(concurrency_wait_at, ?3) \
                                  WHERE run_id = ?1 AND job_id = ?2",
                             )
                             .map_err(db)?

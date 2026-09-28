@@ -23,8 +23,8 @@ use preloop_gha_protocol::ExecutionStatus;
 
 impl PgBackend {
     /// `reap_sweep`: starvation verdicts for unmatched ready jobs
-    /// (decisions-5 B2 — marks are node-local, `observed` is always false
-    /// and `first_seen` falls back to `enqueued_at`), timeout
+    /// (decisions-5 B2 — marks are node-local, passed in as
+    /// `ReapSweep::first_seen`; unmarked rows fall back to `enqueued_at`), timeout
     /// `job_cancellations` markers, and expired-lease settlements, all
     /// conditional on the row still being unsettled/ready. Only writes to
     /// `sweep.runs`' runs.
@@ -50,6 +50,7 @@ impl PgBackend {
             paused,
             pool_preparing,
             warm_window_open,
+            first_seen,
         } = sweep;
         let now_us = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -78,9 +79,9 @@ impl PgBackend {
                 enqueued_at: SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
                 // No durable first-seen column (decisions-5 B2): the mark
-                // lives in the caller's memory; unmarked rows fall back to
-                // the enqueue instant.
-                first_seen: None,
+                // lives in the caller's memory (`ReapSweep::first_seen`);
+                // unmarked rows fall back to the enqueue instant.
+                first_seen: first_seen.get(&(job.run_id, job.job_id.clone())).copied(),
                 any_runner_matches: runner_labels.iter().any(|labels| {
                     crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                 }),

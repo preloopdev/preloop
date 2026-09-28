@@ -67,32 +67,6 @@ impl LiteBackend {
         })
     }
 
-    /// Job details are derived in the new model (round 1, Q6): a detail is
-    /// "missing" never; `NotFound` when the job has no row.
-    pub(crate) async fn job_detail_missing(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-    ) -> Result<bool, ControlError> {
-        if self.job_exists(run_id, job_id).await? {
-            Ok(false)
-        } else {
-            Err(ControlError::NotFound(format!("job {}", job_id.0)))
-        }
-    }
-
-    /// No-op (round 1, Q6): the detail is derived from `job_specs`,
-    /// `jobs.status`, `job_steps` and `jobs.annotations`. A timeline PATCH
-    /// must never settle a job.
-    pub(crate) async fn ensure_job_detail(
-        &self,
-        _run_id: RunId,
-        _job_id: &JobId,
-        _conclusion: Option<&str>,
-    ) -> Result<(), ControlError> {
-        Ok(())
-    }
-
     /// Record the job's check-run id: one conditional UPDATE of the `jobs`
     /// row. Returns whether the mapping changed (no row = no change).
     pub(crate) async fn set_job_check_run(
@@ -288,7 +262,7 @@ impl LiteBackend {
             let mut jobs = Vec::with_capacity(job_rows.len());
             for (job, status, display_name, check_run_id, annotations) in job_rows {
                 let steps = if archived {
-                    archived_attempt_steps(tx, &run, &job)?
+                    super::steps::archived_attempt_steps(tx, &run, &job)?
                 } else {
                     super::steps::latest_attempt_steps(tx, &run, &job)?
                 };
@@ -420,9 +394,12 @@ impl LiteBackend {
     ) -> Result<Option<RunId>, ControlError> {
         self.read(|tx| {
             tx.prepare_cached(
-                "SELECT r.run_id FROM runs r JOIN run_push_states p ON p.run_id = r.run_id \
+                "SELECT r.run_id FROM runs r \
+                 JOIN run_push_states p ON p.run_id = r.run_id \
+                 JOIN run_submissions s ON s.run_id = r.run_id \
                  WHERE r.conclusion IS NOT NULL AND r.repository = ?1 \
-                   AND r.workflow_path = ?3 AND (r.head_sha = ?2 OR p.effective_sha = ?2) \
+                   AND s.submission ->> '$.workflow_path' = ?3 \
+                   AND (s.submission ->> '$.sha' = ?2 OR p.effective_sha = ?2) \
                  ORDER BY r.run_id LIMIT 1",
             )
             .map_err(db)?
@@ -431,6 +408,26 @@ impl LiteBackend {
             })
             .optional()
             .map(|run| run.map(|run| codec::run_id(&run)))
+            .map_err(db)
+        })
+    }
+
+    /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path)`
+    /// point read over live runs; `None` when no committed run exists yet.
+    pub(crate) async fn run_for_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        self.read(|tx| {
+            tx.prepare_cached(
+                "SELECT run_id FROM runs WHERE webhook_delivery_id = ?1 \
+                 AND workflow_path = ?2",
+            )
+            .map_err(db)?
+            .query_row(params![delivery_id, workflow_path], |row| row.get(0))
+            .optional()
+            .map(|run| run.map(|run: String| codec::run_id(&run)))
             .map_err(db)
         })
     }
@@ -700,28 +697,6 @@ const QUEUE_KIND: &str = "CASE j.queue_state \
      WHEN 'expanding' THEN 'expand' \
      ELSE j.queue_state END";
 
-/// The newest archived attempt's steps for one job.
-fn archived_attempt_steps(
-    tx: &rusqlite::Transaction<'_>,
-    run: &str,
-    job: &str,
-) -> Result<Vec<crate::models::StepRecord>, ControlError> {
-    let mut stmt = tx
-        .prepare_cached(&format!(
-            "SELECT {} FROM step_history WHERE agent_job_id = ( \
-                 SELECT agent_job_id FROM attempt_history WHERE run_id = ?1 AND job_id = ?2 \
-                 ORDER BY request_id DESC LIMIT 1) \
-             ORDER BY position",
-            super::steps::STEP_COLUMNS
-        ))
-        .map_err(db)?;
-    let rows = stmt
-        .query_map(params![run, job], super::steps::step_row)
-        .map_err(db)?;
-    rows.map(|row| row.map(|(_, record)| record).map_err(db))
-        .collect()
-}
-
 /// An `attempt_history` row decoded into the live-request shape
 /// (`RECORD_COLUMNS` parity: no lease, no timeout/debug flags).
 fn attempt_history_row(
@@ -752,8 +727,12 @@ fn attempt_history_row(
 
 /// The `RECORD_COLUMNS` projection over `attempt_history` (same column
 /// order; lease/flags are absent in history).
+/// Must stay column-for-column with [`super::requests::RECORD_COLUMNS`]:
+/// archived attempts carry no lease (`expires_at`, `renewed_at` → NULL) and
+/// their timeout / debug-token flags are no longer meaningful (→ 0).
 const ATTEMPT_HISTORY_COLUMNS: &str = "q.request_id, q.run_id, q.job_id, q.agent_job_id, \
-     q.timeline_id, q.result, NULL, q.claimed_at, q.runner_id, q.started_at";
+     q.timeline_id, q.result, NULL, q.claimed_at, q.runner_id, q.started_at, \
+     NULL, 0, 0";
 
 const ATTEMPT_HISTORY_FROM: &str = "attempt_history q";
 

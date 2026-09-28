@@ -90,17 +90,33 @@ impl LiteBackend {
                 .optional()
                 .map_err(db)?
                 .unwrap_or_default();
+            // The stored submission's secrets blob: submission-provided
+            // values merged over the submit-time repo/global snapshot —
+            // `fill_template` serves `spec.provided` names from it and falls
+            // back for names the provider no longer serves.
+            let stored_submission = tx
+                .prepare_cached("SELECT submission FROM run_submissions WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([&run], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(db)?
+                .and_then(|json| {
+                    serde_json::from_str::<preloop_gha_protocol::WorkflowSubmission>(&json).ok()
+                });
+            let trust_tier = stored_submission
+                .as_ref()
+                .and_then(|submission| submission.trust_tier.clone());
+            let run_secrets = stored_submission
+                .map(|submission| preloop_gha_protocol::masking::expose_all(&submission.secrets))
+                .unwrap_or_default();
             Ok(AcquireContext {
                 request,
                 message,
-                // No secret values at rest in the new schema: the fill path
-                // resolves everything from the provider; `provided` names the
-                // worker trusts come from the caller's request, not storage.
-                run_secrets: std::collections::BTreeMap::new(),
+                run_secrets,
                 token_request,
                 id_token_granted,
                 repository,
-                trust_tier: None,
+                trust_tier,
             })
         })
     }
@@ -228,70 +244,6 @@ impl LiteBackend {
                     job_workflow_sha: oidc_sha,
                 },
             })
-        })
-    }
-}
-
-impl LiteBackend {
-    /// `run_secret_values`: the exposed secret values of one run's stored
-    /// submission (`mask_log_bytes_cached` unions them into the plan's
-    /// mask set). `None` only when the run does not exist at all; an
-    /// existing run with no secrets yields `Some([])`.
-    pub(crate) async fn run_secret_values(
-        &self,
-        run_id: RunId,
-    ) -> Result<Option<Vec<String>>, ControlError> {
-        let run = codec::run_key(run_id);
-        self.read(move |tx| {
-            let json: Option<String> = tx
-                .prepare_cached("SELECT submission FROM run_submissions WHERE run_id = ?1")
-                .map_err(db)?
-                .query_row([&run], |row| row.get(0))
-                .optional()
-                .map_err(db)?;
-            let Some(json) = json else {
-                // A run row without a submission still exists — `None` only
-                // when the run is gone entirely (masker falls back to
-                // `all_secret_values`).
-                let exists = tx
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1 UNION ALL \
-                         SELECT 1 FROM run_history WHERE run_id = ?1)",
-                    )
-                    .map_err(db)?
-                    .query_row([&run], |row| row.get::<_, bool>(0))
-                    .map_err(db)?;
-                return Ok(exists.then_some(Vec::new()));
-            };
-            let submission: preloop_gha_protocol::WorkflowSubmission =
-                serde_json::from_str(&json).map_err(ControlError::backend)?;
-            Ok(Some(
-                submission
-                    .secrets
-                    .values()
-                    .map(|v| v.expose().to_owned())
-                    .collect(),
-            ))
-        })
-    }
-
-    /// `all_secret_values`: the masker's fallback union — every live run's
-    /// stored submission secrets.
-    pub(crate) async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
-        self.read(move |tx| {
-            let mut stmt = tx
-                .prepare_cached("SELECT submission FROM run_submissions")
-                .map_err(db)?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(db)?;
-            let mut values = Vec::new();
-            for row in rows {
-                let submission: preloop_gha_protocol::WorkflowSubmission =
-                    serde_json::from_str(&row.map_err(db)?).map_err(ControlError::backend)?;
-                values.extend(submission.secrets.values().map(|v| v.expose().to_owned()));
-            }
-            Ok(values)
         })
     }
 }

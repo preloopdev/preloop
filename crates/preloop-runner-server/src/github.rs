@@ -4099,7 +4099,7 @@ mod tests {
         let connection = rusqlite::Connection::open(db_path).unwrap();
         connection
             .execute(
-                "UPDATE webhook_deliveries SET payload_blob = ?1 WHERE delivery_id = ?2",
+                "UPDATE webhook_deliveries SET payload = ?1 WHERE delivery_id = ?2",
                 rusqlite::params![vec![0_u8, 1, 2], corrupt.delivery_id],
             )
             .unwrap();
