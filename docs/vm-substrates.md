@@ -152,9 +152,10 @@ under-provisioning or failing a spec that is merely smaller than the base.
 ## Prerequisites on the host
 
 1. Linux ≥ 6.8 with `/dev/kvm` and cgroup v2.
-2. AgentENV server and CLI installed, service running:
-   `curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh | sudo bash`
-   then `sudo systemctl start aenv`.
+2. AgentENV server and CLI installed, service running: fetch
+   `https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh`,
+   read it (it runs as root), then `sudo sh install.sh`; afterwards
+   `sudo systemctl start aenv`.
 3. The `aenv` CLI authenticated **as the user the engine runs as** — AgentENV
    reads credentials from `~/.config/aenv/credentials` (TOML: `url`,
    `api_key`), not from the environment. The server's key is at

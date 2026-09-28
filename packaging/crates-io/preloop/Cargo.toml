@@ -1,0 +1,22 @@
+# Standalone workspace on purpose: this crate is not a member of the repository
+# root workspace, so claiming the name never rewrites `Cargo.lock` (the
+# supply-chain policy keeps lockfile changes in their own PR).
+[workspace]
+
+[package]
+name = "preloop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT"
+description = "Name reservation for preloop, a local self-hosted GitHub Actions control plane — the CLI installs from GitHub releases, Homebrew, or npm"
+repository = "https://github.com/preloopdev/preloop"
+homepage = "https://github.com/preloopdev/preloop"
+readme = "README.md"
+keywords = ["ci", "github-actions", "self-hosted", "microvm"]
+categories = ["development-tools"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

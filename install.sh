@@ -1,6 +1,11 @@
 #!/bin/sh
 #
-#   curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
+#   ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+#   curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+#   less install.sh && sh install.sh
+#
+# Fetch it at a release tag, read it, then run it — never pipe it straight into
+# a shell from a moving branch.
 #
 # Downloads the prebuilt binaries for your platform (preloop, preloop-server,
 # preloop-runner) from the latest GitHub release, verifies the sha256, and
@@ -32,8 +37,10 @@ while [ $# -gt 0 ]; do
 preloop installer
 
 Usage:
-  curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh -s -- --runner
+  ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+  curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+  less install.sh && sh install.sh
+  sh install.sh --runner        # install only preloop-runner (no control plane or smolvm)
 
 Options:
   --runner         install only preloop-runner (no control plane or smolvm)

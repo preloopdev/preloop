@@ -21,10 +21,17 @@ Preloop doesnt rely only on Github Webhooks to update the status of the CI. We r
 ## Quick start
 
 ```sh
-# Install (macOS/Linux): downloads the release binary and verifies its sha256
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
-```
+# Install (macOS/Linux), any one of:
+brew install preloopdev/tap/preloop   # Homebrew — formula published by the release workflow
+npm install -g @preloop-dev/cli       # npm — same release binaries, fetched at install time
 
+# Or fetch the installer at a release tag, read it, then run it. It downloads
+# the release binaries and verifies every artifact's sha256.
+ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sh install.sh
+```
 ```
 preloop serve            # engine on 127.0.0.1:9090
 ```
@@ -33,7 +40,14 @@ cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
 This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so atleast 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
-
+Prefer not to run a script: take `preloop-cli-<target>.tar.gz` and its `.sha256`
+from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
+verify the checksum, put `preloop` on your `PATH`, and run `preloop update` to
+install the pinned SmolVM runtime. Every release asset also carries keyless
+build provenance (`gh attestation verify <asset> --repo preloopdev/preloop`).
+MicroVM jobs need the Linux guest runner at
+`<prefix>/lib/preloop/runner/<triple>/preloop-runner`; `install.sh` places it,
+and [docs/self-hosting.md §3](docs/self-hosting.md) has the manual commands.
 
 On Apple Silicon, x86_64 goldens also run through Rosetta 2 translation (enabled automatically for every VM). Performance is slightly slower than arm64 native, so prefer arm64 goldens on Apple Silicon when you can. Docker actions are not supported yet on this path: amd64 images inside the VM's Docker lack the Rosetta mount, so they fail with a cryptic `rosetta-wrapper` error. Fixing soon.
 

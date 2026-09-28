@@ -12,9 +12,21 @@ targets = [
   "aarch64-unknown-linux-gnu",
   "x86_64-unknown-linux-gnu",
 ]
-installers = ["shell", "powershell"]
+# `shell` covers macOS/Linux; `homebrew` and `npm` are the two channels that
+# reach users who never curl a script. There is deliberately no `powershell`
+# installer and no Windows archive: every target below is macOS or Linux
+# (Windows runs the Linux path under WSL2 — see docs/setup.md), so both would
+# only be regenerated when a Windows target lands.
+installers = ["shell", "homebrew", "npm"]
+# The publish jobs live in .github/workflows/release.yml (which `allow-dirty`
+# keeps hand-maintained). Homebrew needs HOMEBREW_TAP_TOKEN (contents:write on
+# preloopdev/homebrew-tap) and skips with a workflow warning while it is
+# missing, so a tag never fails on a package-manager credential. npm needs no
+# secret: the package publishes with OIDC trusted publishing configured on
+# npmjs.com against this repository and the release workflow.
+publish-jobs = ["homebrew", "npm"]
+tap = "preloopdev/homebrew-tap"
 install-updater = true
 checksum = "sha256"
 unix-archive = ".tar.gz"
-windows-archive = ".zip"
 ci = "github"

@@ -1,5 +1,10 @@
 /target/
 /target-arm/
+# The crates.io name-claim crate is its own workspace and builds in place; its
+# lockfile stays out of the repository so the supply-chain audit sees exactly
+# one Cargo.lock.
+/packaging/crates-io/preloop/target/
+/packaging/crates-io/preloop/Cargo.lock
 /.preloop/
 /.aksh/
 /.runner-watch/repos/

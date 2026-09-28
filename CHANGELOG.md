@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- Homebrew and npm install channels: `brew install preloopdev/tap/preloop` and
+  `npm install -g @preloop-dev/cli`. The release workflow builds both
+  (`installers = ["shell", "homebrew", "npm"]`, tap `preloopdev/homebrew-tap`).
+  Homebrew skips with a workflow warning while `HOMEBREW_TAP_TOKEN` is unset, so
+  a tag never fails on a missing credential; npm authenticates with OIDC
+  trusted publishing, so it stores no credential at all. 0.33.6 was the first
+  release published to both channels (by hand, to bootstrap them).
+- `install.sh` and `install.sh.sha256` now ship as release assets, so the
+  documented install path can be verified against a published checksum instead
+  of being reachable only through a moving branch.
+- Release assets additionally carry keyless build provenance
+  (`gh attestation verify <asset> --repo preloopdev/preloop`), complementing the
+  detached RSA signature (`<asset>.sig`) that `preloop update` already verifies
+  against its pinned public key.
+- A documentation-only crate under `packaging/crates-io/preloop/` reserves the
+  `preloop` name on crates.io; it is released by hand (`cargo publish` from that
+  directory) and no workflow touches it. The CLI itself is not published to
+  crates.io: it embeds the server, and the workspace's path dependencies and
+  `build.rs` version pins make it unpackable there.
+
+### Changed
+
+- Install guidance no longer pipes a script into a shell. README,
+  `docs/setup.md`, and `docs/self-hosting.md` fetch the installer at an
+  immutable release tag (read it, then run it), or unpack the release archive
+  after verifying its published `sha256`; `docs/self-hosting.md` documents the
+  artifact-by-artifact layout, including the Linux guest runner the engine
+  discovers.
+- `preloop update` and the `preloop-vm` socket-mount error point at the SmolVM
+  releases instead of telling users to run `curl … | bash`.
+
 ## [0.33.6] - 2026-09-24
 
 ### Fixed

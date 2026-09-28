@@ -4,11 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
 description = "Preloop CI command-line interface"
 
 [package.metadata.dist]
 dist = true
+# The crate is `preloop-cli` and the binary `preloop`; dist derives the
+# Homebrew formula and npm package from the package name, so both are pinned
+# to the names users actually type:
+#   brew install preloopdev/tap/preloop
+#   npm install -g @preloop-dev/cli
+formula = "preloop"
+npm-scope = "@preloop-dev"
+npm-package = "cli"
 
 [[bin]]
 name = "preloop"

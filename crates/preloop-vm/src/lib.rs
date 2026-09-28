@@ -275,7 +275,8 @@ pub enum VmError {
     #[error(
         "the resolved smolvm (`{binary}`) does not support `machine create --mount-socket`, \
          which preloop needs to mount the control socket into the guest; check which smolvm \
-         the engine resolves (PATH) and update it, e.g. https://smolmachines.com/install.sh"
+         the engine resolves (PATH) and update it from \
+         https://github.com/smol-machines/smolvm/releases"
     )]
     UnsupportedSocketMount {
         /// Program path.

@@ -52,13 +52,66 @@ access at all** — see option A.
 
 ## 3. Install
 
-For a Linux system service, install the CLI and SmolVM runtime in system
-locations. A user-local binary under `/home` cannot be traversed by the
-dedicated service account, and a user-local runtime is not visible to it:
+Two paths, both from the
+[latest release](https://github.com/preloopdev/preloop/releases/latest). Neither
+pipes a download into a shell: you fetch a file, read it or verify it, then run
+or unpack it.
+
+**Installer script.** Fetch it at a release tag — a tag is immutable, `main` is
+not — read it, then run it. It installs the CLI, the Linux guest runner, and the
+SmolVM runtime, verifying every artifact against the release's published
+`sha256`:
 
 ```sh
-sudo -H env PREFIX=/usr/local sh -c \
-  'curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh'
+ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sudo -H env PREFIX=/usr/local sh install.sh
+```
+
+A user-local binary under `/home` cannot be traversed by the dedicated service
+account, and a user-local runtime is not visible to it, hence `PREFIX=/usr/local`.
+
+**Artifact by artifact.** The same release, unpacked by hand — for pinned
+deployments and review pipelines:
+
+```sh
+base=https://github.com/preloopdev/preloop/releases/latest/download
+triple=x86_64-unknown-linux-gnu          # or aarch64-unknown-linux-gnu
+asset=preloop-cli-$triple
+
+curl -fsSLO "$base/$asset.tar.gz" "$base/$asset.tar.gz.sha256"
+shasum -a 256 -c "$asset.tar.gz.sha256"  # GNU/Linux: sha256sum -c
+tar -xzf "$asset.tar.gz"
+sudo install -m 0755 "$asset/preloop" /usr/local/bin/preloop
+
+# Every job executes in the Linux guest runner, and the engine discovers it
+# here; it is a standalone release asset, not part of the CLI archive.
+sudo mkdir -p "/usr/local/lib/preloop/runner/$triple"
+sudo curl -fsSL -o "/usr/local/lib/preloop/runner/$triple/preloop-runner" \
+  "$base/preloop-runner-$triple"
+sudo chmod 0755 "/usr/local/lib/preloop/runner/$triple/preloop-runner"
+
+sudo preloop update     # installs the pinned SmolVM runtime
+```
+
+Every asset in a release carries keyless build provenance, and the installer is
+itself a release asset with a checksum, so a pinned deployment can verify
+exactly what it runs:
+
+```sh
+base=https://github.com/preloopdev/preloop/releases/latest/download
+curl -fsSLO "$base/install.sh" "$base/install.sh.sha256"
+shasum -a 256 -c install.sh.sha256        # GNU/Linux: sha256sum -c
+gh attestation verify install.sh --repo preloopdev/preloop
+```
+
+On a workstation, Homebrew (`brew install preloopdev/tap/preloop`) and npm
+(`npm install -g @preloop-dev/cli`) install the same binaries and keep them updated.
+
+Point it at GitHub:
+
+```sh
 sudo /usr/local/bin/preloop setup github --via app --public-url https://ci.example.com
 ```
 

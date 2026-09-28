@@ -55,6 +55,36 @@ wire captures before merging.
 
 
 
+## Releases
+
+Tags matching `**[0-9]+.[0-9]+.[0-9]+*` drive `.github/workflows/release.yml`
+(cargo-dist): it builds the four platform archives, the shell installer, the
+Homebrew formula, and the npm package, attests every asset with keyless build
+provenance, and creates the GitHub Release. Three repository secrets control the
+release surface; each publish job skips with a workflow warning when its secret
+is absent, so a missing credential never fails a release:
+
+| Secret | Scope | Effect when set |
+|---|---|---|
+| `HOMEBREW_TAP_TOKEN` | `contents: write` on `preloopdev/homebrew-tap` | pushes `Formula/preloop.rb`, making `brew install preloopdev/tap/preloop` work |
+| `RELEASES_TOKEN` | `contents: write` on this repository | creates and edits the GitHub Release (the org disables workflow write tokens) |
+
+The npm package `@preloop-dev/cli` needs **no secret**: it publishes with OIDC
+trusted publishing, configured on npmjs.com for that package against this
+repository and the `release.yml` workflow. npm is removing direct publishing
+with bypass-2FA tokens in January 2027, so a token here would be both a
+standing credential and a dead end. `publish-npm` therefore runs whenever a
+stable release is announced, while `publish-homebrew-formula` skips with a
+workflow warning when the tap token is missing.
+
+`dist-workspace.toml` is the source of truth for what gets built and
+`cargo-dist-version` pins the dist that runs in CI, but `release.yml` is
+hand-maintained (`allow-dirty = ["ci"]`) and carries the publish jobs — change
+both together. The `preloop` name on crates.io is reserved by a documentation-only
+crate under `packaging/crates-io/preloop/`; no workflow publishes it, so it is
+released by hand (`cargo publish` from that directory, which needs a crates.io
+token with `publish-new` and a verified account email).
+
 ## Project structure
 
 - `docs/architecture.md` — crate map + module map.

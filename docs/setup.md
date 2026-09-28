@@ -11,7 +11,16 @@ Windows is supported **via WSL2** for now tho native Windows support is coming
 is planned). Inside WSL2, everything works like Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/preloopdev/preloop/main/install.sh | sh
+# Homebrew and npm install the same binaries (macOS and Linux/WSL2):
+brew install preloopdev/tap/preloop
+npm install -g @preloop-dev/cli
+
+# Or fetch the installer at a release tag, read it, then run it — it downloads
+# the release binaries and verifies every artifact's sha256.
+ver=v0.33.6   # any tag from https://github.com/preloopdev/preloop/releases
+curl -fsSL "https://raw.githubusercontent.com/preloopdev/preloop/$ver/install.sh" -o install.sh
+less install.sh
+sh install.sh
 ```
 
 - For the full microVM runner pool, enable nested virtualization in

@@ -30,6 +30,7 @@ edition = "2021"
 version = "0.33.6"
 license = "MIT"
 repository = "https://github.com/preloopdev/preloop"
+homepage = "https://github.com/preloopdev/preloop"
 rust-version = "1.97"
 
 [workspace.lints.rust]

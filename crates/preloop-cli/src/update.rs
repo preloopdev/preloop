@@ -191,7 +191,9 @@ pub(crate) async fn run(args: UpdateArgs) -> anyhow::Result<()> {
             Ok(()) => {}
             Err(error) => println!(
                 "warning: smolvm not updated: {error:#}\n  \
-                 install it with: curl -sSL https://smolmachines.com/install.sh | bash"
+                 install a compatible build from \
+                 https://github.com/smol-machines/smolvm/releases — the engine needs \
+                 `machine create --mount-socket`"
             ),
         }
     }

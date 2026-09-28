@@ -250,6 +250,11 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
+    permissions:
+      
+      "contents": "write"
+      "attestations": "write"
+      "id-token": "write"
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
@@ -296,6 +301,25 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # The installer is documented as a fetch from the repository at an
+      # immutable release tag (raw.githubusercontent.com), which leaves that
+      # one file outside the release's checksum and signature machinery. Ship
+      # it as an asset with its own checksum so the documented path is
+      # verifiable exactly like every other asset.
+      - name: Ship the installer script with its checksum
+        run: |
+          cp install.sh artifacts/install.sh
+          (cd artifacts && sha256sum install.sh > install.sh.sha256)
+      # Keyless build provenance for every asset in this release, so
+      # `gh attestation verify <asset> --repo preloopdev/preloop` works without a
+      # key to distribute. This complements the detached RSA signature the
+      # signing step writes (`<asset>.sig`, verified by `preloop update` against
+      # its pinned public key). Golden packs are attested by release-golden.yml
+      # when it uploads the fresh bake.
+      - name: Attest release artifacts (build provenance)
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: artifacts/*
       # Engines resolve the golden at their own release tag. Seed the new
       # release with the newest complete pair before publishing; the
       # release-golden workflow then replaces each asset with a fresh bake.
@@ -380,14 +404,138 @@ jobs:
           cat "$RUNNER_TEMP/pr-notes.md" "$RUNNER_TEMP/dist-notes.md" > "$RUNNER_TEMP/notes.md"
           gh release edit "$tag" --notes-file "$RUNNER_TEMP/notes.md"
 
+  # The Homebrew tap push needs a credential, and a tag must not fail because
+  # it was never minted. A job-level `if` cannot read `secrets`, so its
+  # presence is detected once here and consumed by the publish job through
+  # `needs`. The value written is a boolean, never the token. The npm publish
+  # needs no secret at all: it authenticates with OIDC (trusted publishing).
+  publish-targets:
+    needs:
+      - plan
+    runs-on: "ubuntu-22.04"
+    outputs:
+      homebrew: ${{ steps.detect.outputs.homebrew }}
+    steps:
+      - id: detect
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "homebrew=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set — the Homebrew formula is not published for this release"
+          fi
+
+  # Pushes the generated formula into the tap configured by `tap` in
+  # dist-workspace.toml, which is what makes `brew install
+  # preloopdev/tap/preloop` work. Homebrew has exactly one version per formula,
+  # so dist only publishes stable releases (publish_prereleases stays off).
+  publish-homebrew-formula:
+    needs:
+      - plan
+      - host
+      - publish-targets
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ needs.plan.outputs.val }}
+      GITHUB_USER: "preloop-release-bot"
+      GITHUB_EMAIL: "preloop-release-bot@users.noreply.github.com"
+    if: ${{ needs.publish-targets.outputs.homebrew == 'true' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: true
+          repository: preloopdev/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      # So we have access to the formula
+      - name: Fetch homebrew formulae
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-*
+          path: Formula/
+          merge-multiple: true
+      # This is extra complex because you can make your Formula name not match your app name
+      # so we need to find releases with a *.rb file, and publish with that filename.
+      - name: Commit formula files
+        run: |
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
+            filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
+            name=$(echo "$filename" | sed "s/\.rb$//")
+            version=$(echo "$release" | jq .app_version --raw-output)
+
+            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+            brew update
+            # We avoid reformatting user-provided data such as the app description and homepage.
+            brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
+
+            git add "Formula/${filename}"
+            # Re-running a release must not fail on an unchanged formula:
+            # Homebrew keeps one version per formula, so a re-run has nothing
+            # to commit.
+            if git diff --cached --quiet; then
+              echo "Formula/${filename} already matches ${version}; nothing to commit"
+            else
+              git commit -m "${name} ${version}"
+            fi
+          done
+          git push
+
+  # Publishes the npm package dist builds alongside the archives, which is what
+  # makes `npm install -g @preloop-dev/cli` work. The package fetches the same
+  # GitHub release archives, so it carries no binaries of its own.
+  #
+  # Authentication is OIDC trusted publishing (configured on the package at
+  # npmjs.com for this repository and workflow), so no npm token is stored
+  # here. npm is removing direct publishing with bypass-2FA tokens in January
+  # 2027, and a trusted publisher cannot leak.
+  publish-npm:
+    needs:
+      - plan
+      - host
+      - publish-targets
+    runs-on: "ubuntu-22.04"
+    permissions:
+      "contents": "read"
+      "id-token": "write"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ needs.plan.outputs.val }}
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    steps:
+      - name: Fetch npm packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-*
+          path: npm/
+          merge-multiple: true
+      # Node 24 ships npm 11; trusted publishing needs npm >= 11.5.1.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.x'
+          registry-url: 'https://registry.npmjs.org'
+          # A tag-triggered publish job must not consume a cache an earlier run
+          # (or a poisoned branch) could have written (zizmor: cache-poisoning).
+          package-manager-cache: false
+      - run: |
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
+            pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
+            npm publish --access public "./npm/${pkg}"
+          done
+
   announce:
     needs:
       - plan
       - host
+      - publish-homebrew-formula
+      - publish-npm
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.publish-npm.result == 'skipped' || needs.publish-npm.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
