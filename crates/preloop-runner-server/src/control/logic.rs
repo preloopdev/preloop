@@ -662,15 +662,22 @@ pub(crate) struct QueueStateInput {
     pub(crate) remaining_needs: i32,
     pub(crate) ready: bool,
     pub(crate) claimed: bool,
-    pub(crate) workflow_hold: bool,
+    /// A row in `concurrency_waits`, regardless of whether its holder is a
+    /// workflow/run or a job/jobset.  The holder kind is used by queue stats,
+    /// not by the queue-state string.
     pub(crate) concurrency_wait: bool,
+    /// Waiting for a max-parallel slot.  This is distinct from dependency
+    /// blocking because both map to `blocked`, while concurrency maps to
+    /// `held`.
+    pub(crate) max_parallel_wait: bool,
     pub(crate) pending_expansion: bool,
     pub(crate) expanding: bool,
 }
 
-/// Apply decisions-5 queue mapping exactly: needs/max-parallel both become
-/// `blocked`; any concurrency wait is also `blocked` (distinguished by its
-/// wait row); workflow holds become `held`; expansion states are fenced.
+/// Apply decisions-5 queue mapping exactly:
+/// needs/max-parallel become `blocked`; any concurrency wait becomes `held`.
+/// The holder kind distinguishes workflow-level from job/jobset-level waits
+/// in queue statistics. Expansion states are fenced before ordinary queues.
 pub(crate) fn queue_state(input: QueueStateInput) -> QueueState {
     if input.status.is_terminal() {
         return QueueState::None;
@@ -681,7 +688,7 @@ pub(crate) fn queue_state(input: QueueStateInput) -> QueueState {
     if input.pending_expansion {
         return QueueState::PendingExpansion;
     }
-    if input.workflow_hold {
+    if input.concurrency_wait {
         return QueueState::Held;
     }
     if input.claimed {
@@ -690,7 +697,7 @@ pub(crate) fn queue_state(input: QueueStateInput) -> QueueState {
     if input.ready {
         return QueueState::Ready;
     }
-    if input.remaining_needs > 0 || input.concurrency_wait {
+    if input.remaining_needs > 0 || input.max_parallel_wait {
         return QueueState::Blocked;
     }
     QueueState::None
@@ -1053,8 +1060,8 @@ mod decision_tests {
                 remaining_needs: 1,
                 ready: false,
                 claimed: false,
-                workflow_hold: false,
                 concurrency_wait: false,
+                max_parallel_wait: false,
                 pending_expansion: false,
                 expanding: false
             }),
@@ -1066,12 +1073,38 @@ mod decision_tests {
                 remaining_needs: 0,
                 ready: false,
                 claimed: false,
-                workflow_hold: true,
-                concurrency_wait: false,
+                concurrency_wait: true,
+                max_parallel_wait: false,
                 pending_expansion: false,
                 expanding: false
             }),
             QueueState::Held
+        );
+        assert_eq!(
+            queue_state(QueueStateInput {
+                status: ExecutionStatus::Pending,
+                remaining_needs: 0,
+                ready: false,
+                claimed: false,
+                concurrency_wait: false,
+                max_parallel_wait: true,
+                pending_expansion: false,
+                expanding: false
+            }),
+            QueueState::Blocked
+        );
+        assert_eq!(
+            queue_state(QueueStateInput {
+                status: ExecutionStatus::Pending,
+                remaining_needs: 0,
+                ready: false,
+                claimed: false,
+                concurrency_wait: false,
+                max_parallel_wait: false,
+                pending_expansion: false,
+                expanding: false
+            }),
+            QueueState::None
         );
     }
 
