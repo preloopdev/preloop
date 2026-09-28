@@ -4308,15 +4308,7 @@ impl ControlBackend for PostgresBackend {
             runs_referenced: true,
         };
         self.transact_scoped(&scope, |tx| {
-            let cancellations = sched::cancel_run_inner(tx, run_id, reason.as_deref());
-            let run_status = tx.runs.get(&run_id).map(|r| r.status);
-            Ok(CancelOutcome {
-                cancellations,
-                run_status,
-                queue_nonempty: !tx.ready_index.is_empty()
-                    || !tx.queue.is_empty()
-                    || !tx.cancellation_queue.is_empty(),
-            })
+            commands::cancel_run_tx(tx, run_id, reason.as_deref())
         })
         .await
     }
@@ -4342,14 +4334,7 @@ impl ControlBackend for PostgresBackend {
         };
         self.transact_scoped(&scope, |tx| {
             let cancellations = sched::cancel_job_inner(tx, run_id, &job_id);
-            let run_status = tx.runs.get(&run_id).map(|r| r.status);
-            Ok(CancelOutcome {
-                cancellations,
-                run_status,
-                queue_nonempty: !tx.ready_index.is_empty()
-                    || !tx.queue.is_empty()
-                    || !tx.cancellation_queue.is_empty(),
-            })
+            Ok(commands::cancel_outcome(tx, run_id, cancellations))
         })
         .await
     }
@@ -7224,5 +7209,207 @@ impl ControlBackend for PostgresBackend {
             .map_err(ControlError::backend);
         self.return_reader(client).await;
         result
+    }
+    async fn pair_runner(&self, runner_id: i64) -> Result<(), ControlError> {
+        self.transact(move |tx| {
+            sched::pair_registered_runner(tx, runner_id);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_runners(&self, run_id: Option<RunId>) -> Result<RunnerListing, ControlError> {
+        self.read(move |tx| Ok(commands::list_runners_tx(tx, run_id)))
+            .await
+    }
+
+    async fn runner_rsa_public_key(
+        &self,
+        runner_id: i64,
+    ) -> Result<Option<AgentRsaPublicKey>, ControlError> {
+        self.read(move |tx| Ok(tx.runner_rsa_public_keys.get(&runner_id).cloned()))
+            .await
+    }
+
+    async fn open_runner_session(&self, open: OpenRunnerSession) -> Result<(), ControlError> {
+        self.transact(move |tx| commands::open_runner_session_tx(tx, open))
+            .await
+    }
+
+    async fn close_runner_session(
+        &self,
+        session_id: &str,
+        caller_runner_id: Option<i64>,
+    ) -> Result<bool, ControlError> {
+        self.transact(move |tx| commands::close_runner_session_tx(tx, session_id, caller_runner_id))
+            .await
+    }
+
+    async fn purge_runner_guarded(
+        &self,
+        runner_id: i64,
+        guard: PurgeGuard,
+    ) -> Result<bool, ControlError> {
+        self.transact(move |tx| commands::purge_runner_guarded_tx(tx, runner_id, guard))
+            .await
+    }
+
+    async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError> {
+        self.read(|tx| {
+            Ok(tx
+                .runners
+                .values()
+                .filter(|runner| runner.ephemeral)
+                .map(|runner| runner.id)
+                .collect())
+        })
+        .await
+    }
+
+    async fn runner_ids_named(&self, name: &str) -> Result<Vec<i64>, ControlError> {
+        self.read(move |tx| {
+            Ok(tx
+                .runners
+                .iter()
+                .filter(|(_, runner)| runner.name == name)
+                .map(|(id, _)| *id)
+                .collect())
+        })
+        .await
+    }
+
+    async fn lookup_agent(
+        &self,
+        name: &str,
+    ) -> Result<Option<(preloop_gha_protocol::RegisteredRunner, String)>, ControlError> {
+        self.transact(move |tx| Ok(commands::lookup_agent_tx(tx, name)))
+            .await
+    }
+
+    async fn bind_runner_client(
+        &self,
+        runner_id: i64,
+        client_id: &str,
+        pair_with_pending_job: bool,
+    ) -> Result<(), ControlError> {
+        self.transact(move |tx| {
+            commands::bind_runner_client_tx(tx, runner_id, client_id, pair_with_pending_job);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn update_runner(
+        &self,
+        runner_id: i64,
+        name: Option<String>,
+        labels: Option<Vec<String>>,
+    ) -> Result<RunnerRow, ControlError> {
+        self.transact(move |tx| commands::update_runner_tx(tx, runner_id, name, labels))
+            .await
+    }
+
+    async fn reap_sweep(&self, sweep: ReapSweep) -> Result<ReapSweepOutcome, ControlError> {
+        if sweep.runs.is_empty() {
+            return Ok(ReapSweepOutcome::default());
+        }
+        let mut scope = TxScope::runs(sweep.runs.clone());
+        // Settling an expired lease frees its owner session.
+        scope.sessions = None;
+        self.transact_scoped(&scope, move |tx| Ok(commands::reap_sweep_tx(tx, sweep)))
+            .await
+    }
+
+    async fn status_inputs(
+        &self,
+        stale_after: std::time::Duration,
+    ) -> Result<StatusInputs, ControlError> {
+        self.read(move |tx| Ok(commands::status_inputs_tx(tx, stale_after)))
+            .await
+    }
+
+    async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError> {
+        self.transact(|tx| {
+            commands::rebuild_dispatch_intent_tx(tx);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn runs_for_repository(&self, repository: &str) -> Result<Vec<RunRecord>, ControlError> {
+        self.read(move |tx| {
+            Ok(tx
+                .runs
+                .values()
+                .filter(|run| run.submission.repository.eq_ignore_ascii_case(repository))
+                .cloned()
+                .collect())
+        })
+        .await
+    }
+
+    async fn poll_azdo_session(&self, poll: AzdoPoll) -> Result<AzdoPollOutcome, ControlError> {
+        self.transact(move |tx| Ok(commands::poll_azdo_session_tx(tx, poll)))
+            .await
+    }
+
+    async fn settle_job(&self, settle: SettleJob) -> Result<SettleJobOutcome, ControlError> {
+        let run_id = settle.completion.run_id;
+        // `sessions: {owner}` — `settle_request` drops the moot cancellation
+        // from the owner session's inflight messages; resolve the owners
+        // before the transaction. Internal completions carry no attempt:
+        // every session owning a request of the run.
+        let sessions = match settle.completion.agent_job_id {
+            Some(id) => self
+                .find_session_by_agent_job_id(id)
+                .await?
+                .into_iter()
+                .collect(),
+            None => self.find_sessions_by_run(run_id).await?,
+        };
+        let in_concurrency = self.run_in_concurrency(run_id).await?;
+        // A workflow-level group changes only when the whole run turns
+        // terminal, so such a run first settles under its own run scope and
+        // widens to the global scope only if this completion finishes the
+        // run. Job-level gates always go global.
+        let mut widen = in_concurrency == RunConcurrency::Gated;
+        loop {
+            let guard_terminal = !widen && in_concurrency == RunConcurrency::WorkflowOnly;
+            let scope = TxScope {
+                include_archived: false,
+                runs: Some(BTreeSet::from([run_id])),
+                // `needs:` never cross runs: this run's pending rows load via
+                // `runs`; the queue snapshots stay O(1).
+                ready_queue: false,
+                blocked_jobs: false,
+                sessions: Some(sessions.clone()),
+                // Only a completion that can release a gate needs every
+                // holder's run.
+                concurrency: widen,
+                runs_referenced: true,
+                job_requests_all: false,
+                pending_expansions: false,
+                runs_via_requests: false,
+            };
+            let input = settle.clone();
+            match self
+                .transact_scoped(&scope, move |tx| {
+                    commands::settle_job_tx(tx, input, guard_terminal)
+                })
+                .await
+            {
+                Err(ControlError::WidenScope) if !widen => widen = true,
+                other => return other,
+            }
+        }
+    }
+
+    async fn oidc_grant(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<OidcGrant, ControlError> {
+        self.read(move |tx| commands::oidc_grant_tx(tx, plan_id, agent_job_id))
+            .await
     }
 }
