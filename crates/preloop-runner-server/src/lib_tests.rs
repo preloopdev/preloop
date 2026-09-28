@@ -2250,9 +2250,10 @@ async fn live_log_key_follows_the_newest_attempt() {
 
     let key = state
         .backend
-        .read(move |tx| Ok(crate::live_logs::live_log_key_for_job(tx, run_id, "build")))
+        .live_log_key(run_id, "build")
         .await
         .expect("read")
+        .map(|(key, _terminal)| key)
         .expect("a logical job key must resolve");
     assert_eq!(
         key,
@@ -2264,15 +2265,10 @@ async fn live_log_key_follows_the_newest_attempt() {
     // older feed stays reachable when asked for by name.
     let explicit = state
         .backend
-        .read(move |tx| {
-            Ok(crate::live_logs::live_log_key_for_job(
-                tx,
-                run_id,
-                &first_attempt.to_string(),
-            ))
-        })
+        .live_log_key(run_id, &first_attempt.to_string())
         .await
         .expect("read")
+        .map(|(key, _terminal)| key)
         .expect("an explicit attempt id must resolve");
     assert_eq!(
         explicit,
@@ -23663,7 +23659,7 @@ jobs:
     // no session owns, so a cancelled placeholder can neither be renewed nor
     // resurrected.
     assert!(
-        crate::broker::ensure_broker_request_owner(&inner, request_id, 1).is_err(),
+        crate::control::commands::ensure_broker_request_owner(&inner, request_id, 1).is_err(),
         "MC-3: no runner may renew the cancelled placeholder"
     );
     // Completion-equivalent grant semantics, verified rather than assumed:
