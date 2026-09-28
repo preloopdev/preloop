@@ -1166,7 +1166,10 @@ mod decision_tests {
             wait_id: 3,
             cancel_in_progress: false,
         };
-        let single = concurrency_queue_decision(ConcurrencyQueueMode::Single, &[arrival.clone()]);
+        let single = concurrency_queue_decision(
+            ConcurrencyQueueMode::Single,
+            std::slice::from_ref(&arrival),
+        );
         assert_eq!(single.cancel_pending, vec![arrival.clone()]);
         assert!(single.park_arrival && !single.cancel_arrival);
         let existing = (0..MAX_CONCURRENCY_WAITERS)

@@ -3603,8 +3603,19 @@ impl ControlBackend for SqliteBackend {
         self.transact_scoped(&scope, |tx| commands::submit_run_tx(tx, submit))
     }
 
-    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
-        let workflow_path = workflow_path.to_owned();
+    async fn allocate_run_number(
+        &self,
+        namespace_id: &str,
+        repository: &str,
+        workflow_path: &str,
+    ) -> Result<u64, ControlError> {
+        // The legacy counter map is keyed on `workflow_path` only; the new
+        // `pg`/`lite` backends key on `(namespace_id, repository,
+        // workflow_path)`. Fold the composite in here so a shared store keeps
+        // numbers unique per (repo, workflow) even if a namespace column is
+        // ever back-filled into the legacy map.
+        let _ = namespace_id;
+        let workflow_path = format!("{repository}\x1f{workflow_path}");
         // Only `workflow_run_counters` is touched — a full load would parse
         // every `record_blob`/job payload per submission for one counter.
         let scope = TxScope {
