@@ -843,8 +843,47 @@ pub(super) fn run_record(
     run_id: RunId,
 ) -> Result<Option<RunRecord>, ControlError> {
     let run = codec::run_key(run_id);
-    let head = tx
-        .prepare_cached(
+    let archived = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM run_history WHERE run_id = ?1)")
+        .map_err(db)?
+        .query_row([&run], |row| row.get::<_, bool>(0))
+        .map_err(db)?;
+    // An archived run's live row is gone: the head read falls back to
+    // `run_history` (decision Q10), the job projection to `job_history`.
+    let head = if archived {
+        tx.prepare_cached(
+            "SELECT 'completed', r.conclusion, r.run_number, r.run_attempt, \
+                    r.run_name, r.event, r.head_sha, r.workflow_path, \
+                    NULL, r.created_at, r.started_at, r.completed_at, \
+                    r.workflow_path, r.submission, NULL, NULL, NULL \
+             FROM run_history r WHERE r.run_id = ?1",
+        )
+        .map_err(db)?
+        .query_row([&run], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+            ))
+        })
+        .optional()
+        .map_err(db)?
+    } else {
+        tx.prepare_cached(
             "SELECT r.status, r.conclusion, r.run_number, r.run_attempt, \
                     r.run_name, r.event, r.head_sha, r.workflow_ref, \
                     r.webhook_delivery_id, r.created_at, r.started_at, r.completed_at, \
@@ -876,7 +915,8 @@ pub(super) fn run_record(
             ))
         })
         .optional()
-        .map_err(db)?;
+        .map_err(db)?
+    };
     let Some((
         status,
         conclusion,
@@ -907,15 +947,65 @@ pub(super) fn run_record(
             .unwrap_or_else(|_| serde_json::json!({}));
     // Leaf statuses, plus held detection (a 'held' job of a holder_kind
     // 'run' wait means the whole run parks — RunRecord.status = Pending).
-    let graph = run_graph(tx, run_id)?;
-    let held = tx
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM concurrency_waits w \
-             WHERE w.holder_run_id = ?1 AND w.holder_kind = 'run')",
-        )
-        .map_err(db)?
-        .query_row([&run], |row| row.get::<_, bool>(0))
-        .map_err(db)?;
+    let graph = if archived {
+        // job_history carries kind/parent_job_id, so the matrix-parent
+        // exclusion still applies; needs edges were never archived.
+        let mut stmt = tx
+            .prepare_cached(
+                "SELECT job_id, status, base_id, outputs FROM job_history h \
+                 WHERE h.run_id = ?1 AND h.run_created_at = ( \
+                     SELECT MAX(run_created_at) FROM job_history \
+                     WHERE run_id = ?1) \
+                 AND NOT (h.kind = 'matrix_parent' AND EXISTS ( \
+                     SELECT 1 FROM job_history c WHERE c.run_id = h.run_id \
+                     AND c.run_created_at = h.run_created_at \
+                     AND c.parent_job_id = h.job_id))",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([&run], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(db)?;
+        let mut statuses = BTreeMap::new();
+        let mut base_ids = BTreeMap::new();
+        let mut outputs = BTreeMap::new();
+        for row in rows {
+            let (job_id, status, base_id, out) = row.map_err(db)?;
+            let id = JobId(job_id);
+            statuses.insert(id.clone(), status_parse(&status));
+            base_ids.insert(id.clone(), base_id);
+            if let Some(json) = out {
+                if let Ok(map) =
+                    serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json)
+                {
+                    outputs.insert(id, map);
+                }
+            }
+        }
+        RunGraph {
+            statuses,
+            base_ids,
+            needs: BTreeMap::new(),
+            outputs,
+        }
+    } else {
+        run_graph(tx, run_id)?
+    };
+    let held = !archived
+        && tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM concurrency_waits w \
+                 WHERE w.holder_run_id = ?1 AND w.holder_kind = 'run')",
+            )
+            .map_err(db)?
+            .query_row([&run], |row| row.get::<_, bool>(0))
+            .map_err(db)?;
     let mut record_status = match (status.as_str(), conclusion.as_deref()) {
         ("completed", Some("success")) => ExecutionStatus::Success,
         ("completed", Some("failure")) | ("completed", Some("timed_out")) => {
@@ -949,17 +1039,17 @@ pub(super) fn run_record(
     let mut job_fail_fast = BTreeMap::new();
     let mut job_continue_on_error = BTreeMap::new();
     let mut jobs_list = Vec::new();
-    let mut stmt = tx
-        .prepare_cached(&format!(
-            "SELECT s.job_id, s.display_name, s.reusable_call, s.fail_fast, \
-                    s.continue_on_error, j.check_run_id, j.annotations, \
-                    j.base_id, s.display_order, j.status \
-             FROM job_specs s JOIN jobs j \
-               ON j.run_id = s.run_id AND j.job_id = s.job_id \
-             WHERE s.run_id = ?1 ORDER BY s.display_order"
-        ))
-        .map_err(db)?;
-    let spec_rows = stmt
+    // job_history carries no spec envelope: spec columns project as NULL
+    // and display order falls back to job-id order.
+    let spec_rows: Vec<(String, String, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, String)> = if archived {
+        tx.prepare_cached(
+            "SELECT job_id, display_name, NULL, NULL, NULL, check_run_id, \
+                    annotations, base_id, 0, status FROM job_history \
+             WHERE run_id = ?1 AND run_created_at = ( \
+                 SELECT MAX(run_created_at) FROM job_history WHERE run_id = ?1) \
+             ORDER BY job_id",
+        )
+        .map_err(db)?
         .query_map([&run], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -974,20 +1064,49 @@ pub(super) fn run_record(
                 row.get::<_, String>(9)?,
             ))
         })
-        .map_err(db)?;
-    for row in spec_rows {
-        let (
-            job_id,
-            display_name,
-            reusable_json,
-            fail_fast,
-            continue_on_error,
-            check_run_id,
-            annotations,
-            base_id,
-            _order,
-            status,
-        ) = row.map_err(db)?;
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db)?
+    } else {
+        tx.prepare_cached(
+            "SELECT s.job_id, s.display_name, s.reusable_call, s.fail_fast, \
+                    s.continue_on_error, j.check_run_id, j.annotations, \
+                    j.base_id, s.display_order, j.status \
+             FROM job_specs s JOIN jobs j \
+               ON j.run_id = s.run_id AND j.job_id = s.job_id \
+             WHERE s.run_id = ?1 ORDER BY s.display_order",
+        )
+        .map_err(db)?
+        .query_map([&run], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })
+        .map_err(db)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db)?
+    };
+    for (
+        job_id,
+        display_name,
+        reusable_json,
+        fail_fast,
+        continue_on_error,
+        check_run_id,
+        annotations,
+        base_id,
+        _order,
+        status,
+    ) in spec_rows {
         let id = JobId(job_id.clone());
         job_names.insert(id.clone(), display_name.clone());
         if let Some(id) = check_run_id {
