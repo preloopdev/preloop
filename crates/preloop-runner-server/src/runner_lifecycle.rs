@@ -32,14 +32,10 @@ pub async fn register_runner(
         // Native-bearer registration is engine-authorized: pair the fresh
         // runner with a pending pool-assigned job immediately, same as
         // `register_runner_native`.
-        let runner_id = runner.id;
         shared
             .state
             .backend
-            .transact(move |tx| {
-                crate::control::sched::pair_registered_runner(tx, runner_id);
-                Ok(())
-            })
+            .pair_runner(runner.id)
             .await
             .map_err(ApiError::from)?;
     }
@@ -114,14 +110,10 @@ pub async fn register_runner_native(
 ) -> Result<Json<RegisteredRunner>, ApiError> {
     let runner = register_runner_inner(&shared, request).await?;
     {
-        let runner_id = runner.id;
         shared
             .state
             .backend
-            .transact(move |tx| {
-                crate::control::sched::pair_registered_runner(tx, runner_id);
-                Ok(())
-            })
+            .pair_runner(runner.id)
             .await
             .map_err(ApiError::from)?;
     }
@@ -159,57 +151,30 @@ pub async fn list_runners_native(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<RunnerListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run_id = query.run_id;
-    let (runners, queued, claimable) = shared
+    let listing = shared
         .state
         .backend
-        .read(move |tx| {
-            let runners: Vec<serde_json::Value> = tx
-                .runners
-                .values()
-                .map(|runner| {
-                    json!({
-                        "id": runner.id,
-                        "name": runner.name,
-                        "labels": runner.labels,
-                    })
-                })
-                .collect();
-            let (queued, claimable) = match run_id {
-                Some(run_id) => {
-                    let queued = tx
-                        .ready_index
-                        .iter()
-                        .filter(|job| job.run_id == run_id)
-                        .count();
-                    let claimable = tx
-                        .runners
-                        .values()
-                        .filter(|runner| {
-                            let caps = crate::runtime_scheduling::capabilities_of(runner);
-                            tx.ready_index.iter().any(|job| {
-                                job.run_id == run_id
-                                    && crate::runtime_scheduling::job_matches_runner_capabilities(
-                                        job, &caps,
-                                    )
-                            })
-                        })
-                        .count();
-                    (queued, claimable)
-                }
-                None => (0, 0),
-            };
-            Ok((runners, queued, claimable))
-        })
+        .list_runners(query.run_id)
         .await
         .map_err(ApiError::from)?;
+    let runners: Vec<serde_json::Value> = listing
+        .runners
+        .iter()
+        .map(|runner| {
+            json!({
+                "id": runner.id,
+                "name": runner.name,
+                "labels": runner.labels,
+            })
+        })
+        .collect();
     let mut response = json!({
         "count": runners.len(),
         "runners": runners,
     });
-    if run_id.is_some() {
-        response["queued"] = json!(queued);
-        response["claimable"] = json!(claimable);
+    if let Some(run_queue) = listing.run_queue {
+        response["queued"] = json!(run_queue.queued);
+        response["claimable"] = json!(run_queue.claimable);
     }
     Ok(Json(response))
 }
@@ -220,13 +185,15 @@ pub async fn create_session(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = uuid::Uuid::new_v4();
 
-    // Generate AES session key
-    let session_enc = SessionEncryption::generate();
+    // The AES session key is derived from the cluster key and the session id
+    // (never stored): any node re-derives it to encrypt this session's
+    // messages.
+    let session_enc = shared.state.session_encryption(&session_id.to_string());
 
     let runner_public_key = shared
         .state
         .backend
-        .read(move |tx| Ok(tx.runner_rsa_public_keys.get(&request.runner_id).cloned()))
+        .runner_rsa_public_key(request.runner_id)
         .await
         .map_err(ApiError::from)?;
     let (key_bytes, encrypted) = if let Some(public_key) = runner_public_key {
@@ -236,25 +203,17 @@ pub async fn create_session(
     };
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
 
-    // Store the session key for later message decryption
-    {
-        let sid = session_id.to_string();
-        let runner_id = request.runner_id;
-        shared
-            .state
-            .backend
-            .transact(move |tx| {
-                tx.session_keys.insert(sid.clone(), session_enc);
-                // Broker session: `broker_session_runners` only. `sessions` is
-                // the AzDO projection — inserting into both emits two
-                // `runner_sessions` rows and violates the session_id PK.
-                tx.broker_session_runners.insert(sid.clone(), runner_id);
-                tx.mark_session_seen(&sid);
-                Ok(())
-            })
-            .await
-            .map_err(ApiError::from)?;
-    }
+    shared
+        .state
+        .backend
+        .open_runner_session(crate::control::OpenRunnerSession {
+            session_id: session_id.to_string(),
+            runner_id: Some(request.runner_id),
+            protocol: crate::control::SessionProtocol::Broker,
+            verified: false,
+        })
+        .await
+        .map_err(ApiError::from)?;
 
     info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
 
@@ -279,7 +238,7 @@ pub async fn create_session_disttask(
     // RSA-wrapped keys are only needed for real internet-facing GHES; for local
     // use the runner's from_rsaparams may not reconstruct the keypair correctly.
     let session_id = uuid::Uuid::new_v4();
-    let session_enc = SessionEncryption::generate();
+    let session_enc = shared.state.session_encryption(&session_id.to_string());
 
     let requested_runner_id = body
         .pointer("/agent/id")
@@ -305,12 +264,15 @@ pub async fn create_session_disttask(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let runner_public_key = shared
-        .state
-        .backend
-        .read(move |tx| Ok(runner_id.and_then(|id| tx.runner_rsa_public_keys.get(&id).cloned())))
-        .await
-        .map_err(ApiError::from)?;
+    let runner_public_key = match runner_id {
+        Some(id) => shared
+            .state
+            .backend
+            .runner_rsa_public_key(id)
+            .await
+            .map_err(ApiError::from)?,
+        None => None,
+    };
     let (key_bytes, _encrypted) = if use_fips_encryption {
         let Some(public_key) = runner_public_key else {
             return Err(ApiError::bad_request(
@@ -325,68 +287,28 @@ pub async fn create_session_disttask(
         (session_enc.key.clone(), false)
     };
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
-    {
-        let sid = session_id.to_string();
-        let azdo_opt_in = body
-            .get("preloopAzdo")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        shared
-            .state
-            .backend
-            .transact(move |tx| {
-                // The official control plane answers 409 when the runner
-                // already holds a live session — a second POST for the same
-                // agent without an intervening DELETE is a conflict, not a
-                // new session. Only *verified* sessions count: an unverified
-                // compat session (no listen token) must not squat a runner id
-                // and block the legitimate runner's own session, and an
-                // unverified create never conflicts at all.
-                tx.session_keys.insert(sid.clone(), session_enc);
-                if let Some(runner_id) = runner_id {
-                    let is_verified = verified == Some(runner_id);
-                    if is_verified {
-                        let already_live = tx
-                            .verified_sessions
-                            .iter()
-                            .filter_map(|sid| {
-                                tx.broker_session_runners
-                                    .get(sid)
-                                    .copied()
-                                    .or_else(|| tx.sessions.get(sid).map(|s| s.runner_id))
-                            })
-                            .any(|id| id == runner_id);
-                        if already_live {
-                            return Err(crate::control::ControlError::Conflict(format!(
-                                "runner {runner_id} already has a live session"
-                            )));
-                        }
-                        tx.verified_sessions.insert(sid.clone());
-                    }
-                    if azdo_opt_in {
-                        // AzDO protocol session: `sessions` + `azdo_sessions`.
-                        tx.sessions.insert(
-                            sid.clone(),
-                            RunnerSession {
-                                session_id: SessionId(session_id),
-                                runner_id,
-                            },
-                        );
-                        tx.azdo_sessions.insert(sid.clone());
-                    } else {
-                        // Broker-hybrid session: `broker_session_runners` only.
-                        // `sessions` is the AzDO projection — inserting into
-                        // both emits two `runner_sessions` rows and violates
-                        // the session_id PK.
-                        tx.broker_session_runners.insert(sid.clone(), runner_id);
-                    }
-                    tx.mark_session_seen(&sid);
-                }
-                Ok(())
-            })
-            .await
-            .map_err(ApiError::from)?;
-    }
+    let azdo_opt_in = body
+        .get("preloopAzdo")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // The official control plane answers 409 when the runner already holds a
+    // live session. Only *verified* sessions count: an unverified compat
+    // session (no listen token) must not squat a runner id.
+    shared
+        .state
+        .backend
+        .open_runner_session(crate::control::OpenRunnerSession {
+            session_id: session_id.to_string(),
+            runner_id,
+            protocol: if azdo_opt_in {
+                crate::control::SessionProtocol::Azdo
+            } else {
+                crate::control::SessionProtocol::Broker
+            },
+            verified: runner_id.is_some() && verified == runner_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
     persist_full_state(&shared).await?;
 
     let owner_name = body
@@ -430,34 +352,16 @@ pub async fn delete_session(
             "registration tokens cannot delete sessions",
         ));
     }
-    {
-        let sid = session_id.clone();
-        shared
-            .state
-            .backend
-            .transact(move |tx| {
-                if let crate::auth::AdminCaller::Runner(runner_id) = caller {
-                    match tx.runner_id_for_session(&sid) {
-                        Some(owner) if owner == runner_id => {}
-                        // Ending another runner's session strands its
-                        // in-flight job until the lease reaper notices.
-                        Some(_) => {
-                            return Err(crate::control::ControlError::Forbidden(
-                                "session belongs to another runner".to_owned(),
-                            ));
-                        }
-                        // Unknown session: nothing to strand, stay idempotent.
-                        None => return Ok(false),
-                    }
-                }
-                tx.sessions.remove(&sid);
-                tx.broker_session_runners.remove(&sid);
-                tx.verified_sessions.remove(&sid);
-                Ok(true)
-            })
-            .await
-            .map_err(ApiError::from)?;
-    }
+    let caller_runner_id = match caller {
+        crate::auth::AdminCaller::Runner(runner_id) => Some(runner_id),
+        _ => None,
+    };
+    shared
+        .state
+        .backend
+        .close_runner_session(&session_id, caller_runner_id)
+        .await
+        .map_err(ApiError::from)?;
     if let Err(error) = persist_full_state(&shared).await {
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
@@ -499,38 +403,17 @@ pub async fn purge_runner_identity_guarded(
     // Caller-guard + active-session check + purge run in ONE writer
     // transaction: a session created between a separate read and the purge
     // would let a RunnerManager token delete an active runner (TOCTOU).
+    let guard = match caller {
+        crate::auth::AdminCaller::System => crate::control::PurgeGuard::System,
+        crate::auth::AdminCaller::Runner(runner_id) => {
+            crate::control::PurgeGuard::Runner(runner_id)
+        }
+        crate::auth::AdminCaller::RunnerManager => crate::control::PurgeGuard::RegistrationToken,
+    };
     shared
         .state
         .backend
-        .transact(move |tx| {
-            match caller {
-                crate::auth::AdminCaller::System => {}
-                crate::auth::AdminCaller::Runner(runner_id) => {
-                    if runner_id != agent_id {
-                        return Err(crate::control::ControlError::Forbidden(
-                            "a runner may only deregister itself".to_owned(),
-                        ));
-                    }
-                }
-                crate::auth::AdminCaller::RunnerManager => {
-                    let has_active_session = tx
-                        .sessions
-                        .values()
-                        .any(|session| session.runner_id == agent_id)
-                        || tx
-                            .broker_session_runners
-                            .values()
-                            .any(|runner_id| *runner_id == agent_id);
-                    if has_active_session {
-                        return Err(crate::control::ControlError::Forbidden(
-                            "cannot delete an active runner using a registration token".to_owned(),
-                        ));
-                    }
-                }
-            }
-            crate::control::commands::purge_runner_tx(tx, agent_id);
-            Ok(())
-        })
+        .purge_runner_guarded(agent_id, guard)
         .await
         .map_err(ApiError::from)?;
     // `runner_public_keys` is node-local — outside the scheduling tx.
@@ -564,31 +447,15 @@ async fn purge_runner_identity_with_phantom_check(
     // Phantom-check + purge in ONE writer transaction: a session created
     // between a separate read and the purge would let us delete a runner that
     // just went active (TOCTOU).
+    let guard = if only_if_phantom {
+        crate::control::PurgeGuard::IfPhantom
+    } else {
+        crate::control::PurgeGuard::System
+    };
     let purged = shared
         .state
         .backend
-        .transact(move |tx| {
-            let exists = tx.runners.contains_key(&runner_id)
-                || tx.runner_client_ids.values().any(|id| *id == runner_id);
-            if !exists {
-                return Ok(false);
-            }
-            if only_if_phantom {
-                let has_session = tx
-                    .sessions
-                    .values()
-                    .any(|session| session.runner_id == runner_id)
-                    || tx
-                        .broker_session_runners
-                        .values()
-                        .any(|id| *id == runner_id);
-                if has_session {
-                    return Ok(false);
-                }
-            }
-            crate::control::commands::purge_runner_tx(tx, runner_id);
-            Ok(true)
-        })
+        .purge_runner_guarded(runner_id, guard)
         .await
         .unwrap_or(false);
     if !purged {
@@ -619,14 +486,7 @@ pub async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
     let runner_ids: Vec<i64> = shared
         .state
         .backend
-        .read(|tx| {
-            Ok(tx
-                .runners
-                .values()
-                .filter(|runner| runner.ephemeral)
-                .map(|runner| runner.id)
-                .collect())
-        })
+        .ephemeral_runner_ids()
         .await
         .unwrap_or_default();
     if runner_ids.is_empty() {
@@ -695,24 +555,10 @@ pub async fn agent_lookup(
     let Some(agent_name) = params.get("agentName") else {
         return Json(json!({"count": 0, "value": []}));
     };
-    let agent_name = agent_name.clone();
     let found = shared
         .state
         .backend
-        .transact(move |tx| {
-            let runner = tx.runners.values().find(|r| r.name == agent_name).cloned();
-            let Some(runner) = runner else {
-                return Ok(None);
-            };
-            let client_id = tx
-                .runner_client_ids
-                .iter()
-                .find(|(_, &id)| id == runner.id)
-                .map(|(k, _)| k.clone())
-                .unwrap_or_else(|| format!("{:08x}-0000-4000-8000-000000000000", runner.id as u32));
-            tx.runner_client_ids.insert(client_id.clone(), runner.id);
-            Ok(Some((runner, client_id)))
-        })
+        .lookup_agent(agent_name)
         .await
         .unwrap_or(None);
     if let Some((runner, client_id)) = found {
@@ -882,25 +728,14 @@ pub async fn register_runner_compat(
         let pair = provision_authorized
             .then(|| provision_token.clone())
             .flatten();
-        let cid = client_id.clone();
-        let pair_tx = pair.clone();
+        // The OAuth client id must be durable before the runner's next token
+        // request. Pairing is gated on the one-time provision token the pool
+        // generated host-side — a rogue process on another machine cannot
+        // mint it, so it cannot steal pairings.
         shared
             .state
             .backend
-            .transact(move |tx| {
-                // The OAuth client id must be durable before the runner's next
-                // token request, or a restart between registration and commit
-                // rejects it as an unknown client.
-                tx.runner_client_ids.insert(cid, runner_id);
-                // Pair the fresh runner with the job its machine was
-                // provisioned for. Pairing is gated on the one-time provision
-                // token the pool generated host-side — a rogue process on
-                // another machine cannot mint it, so it cannot steal pairings.
-                if pair_tx.is_some() {
-                    crate::control::sched::pair_registered_runner(tx, runner_id);
-                }
-                Ok(())
-            })
+            .bind_runner_client(runner_id, &client_id, pair.is_some())
             .await
             .map_err(ApiError::from)?;
         // Mirror into the consolidated pool handle so the sampler's
@@ -977,7 +812,7 @@ pub async fn replace_runner_compat(
     let exists = shared
         .state
         .backend
-        .read(|tx| Ok(tx.runners.contains_key(&old_id)))
+        .runner_exists(old_id)
         .await
         .unwrap_or(false);
     if !exists {
@@ -1024,7 +859,7 @@ pub(crate) async fn update_agent(
     let row = shared
         .state
         .backend
-        .transact(move |tx| crate::control::commands::update_runner_tx(tx, runner_id, name, labels))
+        .update_runner(runner_id, name, labels)
         .await
         .map_err(ApiError::from)?;
     let runner = row.runner;
@@ -1134,18 +969,10 @@ pub async fn purge_runners_by_name(
             Json(json!({ "error": "name is required" })),
         );
     }
-    let name = name.to_owned();
     let id_or_ids: Vec<i64> = shared
         .state
         .backend
-        .read(move |tx| {
-            Ok(tx
-                .runners
-                .iter()
-                .filter(|(_, runner)| runner.name == name)
-                .map(|(id, _)| *id)
-                .collect())
-        })
+        .runner_ids_named(name)
         .await
         .unwrap_or_default();
     let mut purge_failures = 0usize;

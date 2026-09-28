@@ -175,7 +175,11 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Cancel a run or one job: mark non-terminal jobs cancelled, enqueue
     /// cancellation messages for in-flight jobs, release concurrency, and
-    /// settle expandable-node request records.
+    /// settle expandable-node request records. `cancel_run` fails with
+    /// `NotFound` when the run does not exist (nothing is written). The
+    /// outcome carries the post-transition run record, every job of the run
+    /// now `Cancelled` (job-id order), and the global ready-queue depth and
+    /// front `runs-on` labels for the pool wake gauges.
     async fn cancel_run(
         &self,
         run_id: RunId,
@@ -778,6 +782,229 @@ pub(crate) trait ControlBackend: Send + Sync {
     async fn live_assignments(
         &self,
     ) -> Result<Vec<preloop_observability::status::RunnerAssignment>, ControlError>;
+
+    // ── Handler commands (formerly `TxState` closures in handlers) ────
+    //
+    // Each method is one transaction. "Session" below means a
+    // `runner_sessions` row of either protocol; "owns" means
+    // `runner_sessions.runner_id`. Decisions that need Rust evaluation name
+    // the shared function in `control::logic` / `control::sched` the backend
+    // must call instead of re-deriving it.
+
+    /// Pair an engine-authorized, freshly registered runner with the pending
+    /// pool job it can serve (`sched::pair_registered_runner`). No-op unless
+    /// pool assignments or strict job assignments are enabled. Otherwise, in
+    /// order: mark the runner pool-proven; if the runner row is missing stop
+    /// there; (pool assignments only) every assignment whose binding is
+    /// stale (`at` older than the claim-binding TTL) or whose runner no
+    /// longer exists loses its runner (`runner_id = NULL`), is re-marked
+    /// pool-pending at `now` and bumps the released-bindings counter; then
+    /// among pool-pending jobs that are in the ready queue and match the
+    /// runner's capabilities, the one with the oldest pending mark (ties:
+    /// earlier ready-queue position) is bound to the runner (`at = now`,
+    /// `first_at` kept from an existing assignment else `now`) and its
+    /// pending mark dropped.
+    async fn pair_runner(&self, runner_id: i64) -> Result<(), ControlError>;
+
+    /// Registered runners (id order) and, when `run_id` is `Some`, that
+    /// run's ready-job count and the number of registered runners whose
+    /// capabilities match at least one of those ready jobs. Read-only.
+    async fn list_runners(&self, run_id: Option<RunId>) -> Result<RunnerListing, ControlError>;
+
+    /// The parsed RSA public key registered for `runner_id`; `None` when the
+    /// runner is unknown or registered without one.
+    async fn runner_rsa_public_key(
+        &self,
+        runner_id: i64,
+    ) -> Result<Option<preloop_gha_protocol::crypto::AgentRsaPublicKey>, ControlError>;
+
+    /// Insert a session row for `open.runner_id` (`last_seen_at = now`).
+    /// `runner_id = None` writes nothing and succeeds. When `open.verified`,
+    /// fails with `Conflict` (nothing written) if the runner already owns a
+    /// verified session; otherwise the new session is recorded as verified.
+    /// No session key is stored: keys are derived from the cluster key and
+    /// the session id by the caller.
+    async fn open_runner_session(&self, open: OpenRunnerSession) -> Result<(), ControlError>;
+
+    /// Delete a session row on the runner-facing DELETE. `caller_runner_id`
+    /// is the runner behind a listen token (`None` = system/admin caller).
+    /// With a runner caller: unknown session → `Ok(false)`, session owned by
+    /// another runner → `Forbidden`. Otherwise the session row (and its
+    /// verified mark) is deleted → `Ok(true)`. Its active request, queued
+    /// messages and claimed job are deliberately left for the lease reaper
+    /// (unlike `delete_session`).
+    async fn close_runner_session(
+        &self,
+        session_id: &str,
+        caller_runner_id: Option<i64>,
+    ) -> Result<bool, ControlError>;
+
+    /// Check `guard` and purge `runner_id` in one transaction (see
+    /// [`PurgeGuard`]). Purging (`commands::purge_runner_tx`) deletes the
+    /// runner, its client ids, RSA key and pool-proven mark, deletes every
+    /// session it owns (each like `delete_session`: active request released
+    /// for retry, queued messages dropped), requeues every claimed job it
+    /// owned (by an unfinished attempt's recorded owner, by a doomed
+    /// session's active request, or by an assignment naming it) back to the
+    /// ready queue as `queued`, and releases every assignment still naming it
+    /// (pool assignments on + job still ready → pool-pending at `now`).
+    /// Returns `true` when a purge ran; `IfPhantom` returns `false` without
+    /// writing when the runner is missing or owns a session.
+    async fn purge_runner_guarded(
+        &self,
+        runner_id: i64,
+        guard: PurgeGuard,
+    ) -> Result<bool, ControlError>;
+
+    /// Ids of every registered ephemeral runner, ascending.
+    async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError>;
+
+    /// Ids of every registered runner named exactly `name`, ascending.
+    async fn runner_ids_named(&self, name: &str) -> Result<Vec<i64>, ControlError>;
+
+    /// The lowest-id runner named exactly `name` and its OAuth client id.
+    /// When the runner has no client id, one is synthesized as
+    /// `format!("{:08x}-0000-4000-8000-000000000000", runner_id as u32)` and
+    /// recorded for the runner (so a later token request resolves). `None`
+    /// when no runner has that name.
+    async fn lookup_agent(
+        &self,
+        name: &str,
+    ) -> Result<Option<(preloop_gha_protocol::RegisteredRunner, String)>, ControlError>;
+
+    /// Record `client_id` as an OAuth client id of `runner_id` (upsert;
+    /// a client id maps to one runner). When `pair_with_pending_job`, then
+    /// pair the runner exactly like [`ControlBackend::pair_runner`], in the
+    /// same transaction.
+    async fn bind_runner_client(
+        &self,
+        runner_id: i64,
+        client_id: &str,
+        pair_with_pending_job: bool,
+    ) -> Result<(), ControlError>;
+
+    /// In-place runner update (`PUT …/agents/{id}`): replace the name and/or
+    /// label set when supplied, keep the id. `NotFound` for an unknown
+    /// runner. The returned row has `client_id: None`.
+    async fn update_runner(
+        &self,
+        runner_id: i64,
+        name: Option<String>,
+        labels: Option<Vec<String>>,
+    ) -> Result<RunnerRow, ControlError>;
+
+    // ── Reaper and status ─────────────────────────────────────────────
+
+    /// One reaper sweep, touching only rows of `sweep.runs`:
+    /// 1. Starvation: first-seen marks of ready jobs of those runs that are
+    ///    not in `sweep.ready` are cleared. For each `sweep.ready` job the
+    ///    verdict comes from `logic::starvation_verdict` (any registered
+    ///    runner's labels match its `runs-on`, first-seen mark, pool
+    ///    preparing, warm window): clear the mark, set the mark (keeping an
+    ///    existing one), or starve it — remove it from the ready queue, set
+    ///    the job `failure`, recompute the run status and finalize the run if
+    ///    every job is terminal (no dependent promotion, no concurrency
+    ///    release) and report `(run, job, reason)`.
+    /// 2. Per `sweep.active` attempt, timeout: started, not yet
+    ///    `timeout_triggered`, and `now - started_at - paused[request]` ≥ the
+    ///    job message's `timeout-minutes` (default 21600 s) → set
+    ///    `timeout_triggered` and queue a job cancellation for the job's
+    ///    unfinished attempt.
+    /// 3. Lease: `now - last_renewed_at` ≥ `JOB_LEASE_SECONDS` → set the
+    ///    attempt `result = failure`, unbind it from every session's active
+    ///    request and drop its inflight marker; report it in `expired`.
+    async fn reap_sweep(&self, sweep: ReapSweep) -> Result<ReapSweepOutcome, ControlError>;
+
+    /// Status-page inputs over live control state (see [`StatusInputs`]).
+    /// `stale_after` is the idle-session staleness threshold. Read-only.
+    async fn status_inputs(
+        &self,
+        stale_after: std::time::Duration,
+    ) -> Result<StatusInputs, ControlError>;
+
+    /// Re-derive dispatch intent for every ready job after the effective
+    /// scheduling config becomes known at boot: for each ready job in queue
+    /// order apply `sched::on_job_enqueued` (config-gated and idempotent:
+    /// a job with an assignment is untouched; otherwise bind it to an idle
+    /// matching runner that owns a session — pool-proven only when pool
+    /// assignments are on — else, with pool assignments on, mark it
+    /// pool-pending).
+    async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError>;
+
+    // ── Runs and jobs ─────────────────────────────────────────────────
+
+    /// Every live (non-archived) run whose repository equals `repository`
+    /// ASCII-case-insensitively, as full records, in any order.
+    async fn runs_for_repository(&self, repository: &str) -> Result<Vec<RunRecord>, ControlError>;
+
+    /// AzDO `GET …/messages` step, one transaction:
+    /// 1. `verified_runner_id` set but not the session's owner → `Forbidden`.
+    /// 2. Touch the session (`last_seen_at = now`).
+    /// 3. Oldest queued session message → `Redeliver` (nothing else written).
+    /// 4. If the session has an active request: finished or missing → unbind
+    ///    it and continue; unfinished with a queued cancellation for its job
+    ///    → consume that cancellation, queue a `JobCancellation` message with
+    ///    body `concurrency::job_cancel_body(agent_job_id)` → `Cancel`;
+    ///    otherwise → `Wait`.
+    /// 5. Claim: the runner capabilities of the session's owner (unknown =
+    ///    empty) choose a ready job via the claim preference
+    ///    (`sched::choose_claim_position` with `verified_runner_id`); none →
+    ///    `Wait`. Otherwise remove it from the ready queue (drop its
+    ///    assignment/pending mark), set job and run `in_progress`, bind the
+    ///    session's active request to the job's attempt
+    ///    (`message.request_id`), stamp the attempt's owner
+    ///    (`verified_runner_id`, else the session owner) and
+    ///    `claimed_at`/`started_at`/`last_renewed_at = now`, and queue a
+    ///    `PipelineAgentJobRequest` message carrying only that request id →
+    ///    `Claimed`.
+    ///
+    /// Message ids come from the shared session-message id sequence.
+    async fn poll_azdo_session(&self, poll: AzdoPoll) -> Result<AzdoPollOutcome, ControlError>;
+
+    /// Record a terminal job completion (the runner `completejob` path, the
+    /// lease reaper and internal completions). Serializes on the run.
+    ///
+    /// With `settle`: the attempt is resolved by `agent_job_id` (`NotFound`
+    /// if unknown), its ownership checked like `renew_broker_request`
+    /// (`Forbidden`/`NotFound`); an attempt that already has a result, or
+    /// is no longer inflight, returns `Unchanged(current run)` after (for the
+    /// latter) recording the result; otherwise its `result = status`,
+    /// `locked_until` = now + lease, and it is unbound from every session.
+    ///
+    /// Then: `NotFound` for an unknown run; the job must belong to the run.
+    /// A job already terminal and not `cancelled` → `Unchanged(run)`.
+    /// Effective status: a `failure` of a `continue-on-error` job counts as
+    /// `success`; a job already `cancelled` stays `cancelled` against
+    /// `success`/`failure`. Store it; upsert the job's `jobs_list` detail
+    /// (conclusion; annotations, secret-masked with the run's secrets, when
+    /// reported); store outputs; propagate reusable-caller outputs; recompute
+    /// run status (`started_at` defaults to now; first terminal status sets
+    /// `completed_at` + conclusion, and `newly_terminal_success` when it is
+    /// `success`). Reported step results update the attempt's step manifest
+    /// (conclusion, runner number); still-`in_progress` steps take the job
+    /// status and a `finished_at`. A `failure` applies matrix fail-fast to
+    /// siblings. The job leaves every queue (ready/blocked/concurrency-
+    /// blocked/held). Job-level concurrency held by the job and by any
+    /// finalized reusable caller is released (FIFO promotion of waiters),
+    /// dependents are promoted, and every attempt of the job is settled with
+    /// the effective status (`sched::settle_request`: token request dropped,
+    /// session unbound, moot cancellation messages dropped).
+    ///
+    /// A run whose only concurrency is workflow-level must not need global
+    /// state for a completion that leaves the run non-terminal; only the
+    /// completion that finishes the run releases (and promotes) its
+    /// workflow hold.
+    async fn settle_job(&self, settle: SettleJob) -> Result<SettleJobOutcome, ControlError>;
+
+    /// OIDC token inputs for the attempt behind `plan_id`: the attempt must
+    /// exist and its `agent_job_id` equal `agent_job_id` (`NotFound`
+    /// otherwise, also for a missing run); the job's OIDC context must exist
+    /// (`Backend` error otherwise). Read-only.
+    async fn oidc_grant(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<OidcGrant, ControlError>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2036,6 +2263,151 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.live_assignments().await,
             Self::Postgres(b) => b.live_assignments().await,
+        }
+    }
+    async fn pair_runner(&self, runner_id: i64) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.pair_runner(runner_id).await,
+            Self::Postgres(b) => b.pair_runner(runner_id).await,
+        }
+    }
+    async fn list_runners(&self, run_id: Option<RunId>) -> Result<RunnerListing, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.list_runners(run_id).await,
+            Self::Postgres(b) => b.list_runners(run_id).await,
+        }
+    }
+    async fn runner_rsa_public_key(
+        &self,
+        runner_id: i64,
+    ) -> Result<Option<preloop_gha_protocol::crypto::AgentRsaPublicKey>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.runner_rsa_public_key(runner_id).await,
+            Self::Postgres(b) => b.runner_rsa_public_key(runner_id).await,
+        }
+    }
+    async fn open_runner_session(&self, open: OpenRunnerSession) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.open_runner_session(open).await,
+            Self::Postgres(b) => b.open_runner_session(open).await,
+        }
+    }
+    async fn close_runner_session(
+        &self,
+        session_id: &str,
+        caller_runner_id: Option<i64>,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.close_runner_session(session_id, caller_runner_id).await,
+            Self::Postgres(b) => b.close_runner_session(session_id, caller_runner_id).await,
+        }
+    }
+    async fn purge_runner_guarded(
+        &self,
+        runner_id: i64,
+        guard: PurgeGuard,
+    ) -> Result<bool, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.purge_runner_guarded(runner_id, guard).await,
+            Self::Postgres(b) => b.purge_runner_guarded(runner_id, guard).await,
+        }
+    }
+    async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.ephemeral_runner_ids().await,
+            Self::Postgres(b) => b.ephemeral_runner_ids().await,
+        }
+    }
+    async fn runner_ids_named(&self, name: &str) -> Result<Vec<i64>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.runner_ids_named(name).await,
+            Self::Postgres(b) => b.runner_ids_named(name).await,
+        }
+    }
+    async fn lookup_agent(
+        &self,
+        name: &str,
+    ) -> Result<Option<(preloop_gha_protocol::RegisteredRunner, String)>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.lookup_agent(name).await,
+            Self::Postgres(b) => b.lookup_agent(name).await,
+        }
+    }
+    async fn bind_runner_client(
+        &self,
+        runner_id: i64,
+        client_id: &str,
+        pair_with_pending_job: bool,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => {
+                b.bind_runner_client(runner_id, client_id, pair_with_pending_job)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.bind_runner_client(runner_id, client_id, pair_with_pending_job)
+                    .await
+            }
+        }
+    }
+    async fn update_runner(
+        &self,
+        runner_id: i64,
+        name: Option<String>,
+        labels: Option<Vec<String>>,
+    ) -> Result<RunnerRow, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.update_runner(runner_id, name, labels).await,
+            Self::Postgres(b) => b.update_runner(runner_id, name, labels).await,
+        }
+    }
+    async fn reap_sweep(&self, sweep: ReapSweep) -> Result<ReapSweepOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.reap_sweep(sweep).await,
+            Self::Postgres(b) => b.reap_sweep(sweep).await,
+        }
+    }
+    async fn status_inputs(
+        &self,
+        stale_after: std::time::Duration,
+    ) -> Result<StatusInputs, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.status_inputs(stale_after).await,
+            Self::Postgres(b) => b.status_inputs(stale_after).await,
+        }
+    }
+    async fn rebuild_dispatch_intent(&self) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.rebuild_dispatch_intent().await,
+            Self::Postgres(b) => b.rebuild_dispatch_intent().await,
+        }
+    }
+    async fn runs_for_repository(&self, repository: &str) -> Result<Vec<RunRecord>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.runs_for_repository(repository).await,
+            Self::Postgres(b) => b.runs_for_repository(repository).await,
+        }
+    }
+    async fn poll_azdo_session(&self, poll: AzdoPoll) -> Result<AzdoPollOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.poll_azdo_session(poll).await,
+            Self::Postgres(b) => b.poll_azdo_session(poll).await,
+        }
+    }
+    async fn settle_job(&self, settle: SettleJob) -> Result<SettleJobOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.settle_job(settle).await,
+            Self::Postgres(b) => b.settle_job(settle).await,
+        }
+    }
+    async fn oidc_grant(
+        &self,
+        plan_id: &str,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<OidcGrant, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.oidc_grant(plan_id, agent_job_id).await,
+            Self::Postgres(b) => b.oidc_grant(plan_id, agent_job_id).await,
         }
     }
 }
