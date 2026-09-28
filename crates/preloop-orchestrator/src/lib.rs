@@ -2031,6 +2031,10 @@ async fn install_base_dependencies<P: VmProvider>(
     Ok(())
 }
 
+/// Where a baked golden records its provenance. Root-owned, so writing it
+/// needs the privileged hop — see [`write_bake_manifest`].
+const BAKE_MANIFEST_PATH: &str = "/etc/preloop-bake.json";
+
 /// Record what a golden actually baked, so provenance is inspectable
 /// instead of reconstructed.
 ///
@@ -2076,22 +2080,49 @@ async fn write_bake_manifest<P: VmProvider>(
     });
     let json =
         serde_json::to_string(&manifest).expect("bake manifest is a fixed string-only structure");
+    // `/etc` is root-owned and the bake runs as the unprivileged runner
+    // account, so a plain redirect fails with `Permission denied` on every
+    // bake: the golden shipped without its provenance. Take the same
+    // root-or-sudo hop as the other privileged bake steps.
+    let write = format!(
+        "printf '%s' '{}' > {BAKE_MANIFEST_PATH}",
+        json.replace('\'', "'\\''")
+    );
     provider
         .exec(
             name,
             &[
                 "sh".to_owned(),
                 "-c".to_owned(),
-                format!(
-                    "printf '%s' '{}' > /etc/preloop-bake.json",
-                    json.replace('\'', "'\\''")
-                ),
+                run_as_root_or_sudo(&write),
             ],
         )
         .await?;
+    // `run_as_root_or_sudo` ends in `|| true`, so a refused sudo still exits
+    // 0: the exec result cannot prove the write happened. Ask the guest.
+    let verify = provider
+        .exec(
+            name,
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("test -s {BAKE_MANIFEST_PATH}"),
+            ],
+        )
+        .await?;
+    if verify.exit_code != 0 {
+        return Err(OrchestratorError::Config(format!(
+            "bake manifest missing after write (exit {}): {}",
+            verify.exit_code,
+            String::from_utf8_lossy(&verify.stderr)
+                .lines()
+                .last()
+                .unwrap_or("no stderr")
+        )));
+    }
     info!(
         machine = name.as_str(),
-        "bake manifest written to /etc/preloop-bake.json"
+        "bake manifest written to {BAKE_MANIFEST_PATH}"
     );
     Ok(())
 }
@@ -6126,6 +6157,9 @@ mod lifecycle_tests {
         suspends: bool,
         /// Names passed to `prune_pack_intermediates`, in call order.
         prune_pack_calls: Mutex<Vec<String>>,
+        /// When set, `exec` answers exit 1 for any argv whose debug form
+        /// contains this marker — models a guest command that fails.
+        fail_exec_containing: Mutex<Option<String>>,
     }
 
     impl TestProvider {
@@ -6158,6 +6192,7 @@ mod lifecycle_tests {
                 probe_transport_error: std::sync::atomic::AtomicBool::new(false),
                 suspends: false,
                 prune_pack_calls: Mutex::new(Vec::new()),
+                fail_exec_containing: Mutex::new(None),
             }
         }
 
@@ -6526,6 +6561,61 @@ esac
             stderr: Vec::new(),
             truncated: false,
         }
+    }
+
+    /// The bake manifest lands in root-owned `/etc` while the bake runs as the
+    /// unprivileged runner account: a plain redirect fails with
+    /// `Permission denied` on every bake, so goldens shipped without the
+    /// provenance they are supposed to carry. The write therefore takes the
+    /// root-or-sudo hop — and because that hop swallows a refused sudo
+    /// (`|| true`), a manifest that never landed has to be caught by asking
+    /// the guest rather than trusting the write's exit status.
+    #[tokio::test]
+    async fn bake_manifest_is_written_as_root_and_verified() {
+        let provider = TestProvider::new(false, false, false, false, false);
+        let name = MachineName::new("golden-manifest".to_owned()).unwrap();
+        let env_spec = EnvironmentSpec::for_base(crate::environment::DEFAULT_BASE_IMAGE.to_owned());
+
+        write_bake_manifest(&provider, &name, &env_spec)
+            .await
+            .expect("manifest write");
+
+        let events = provider.events.lock().await.clone();
+        let write = events
+            .iter()
+            .find(|event| event.contains("printf %s"))
+            .expect("manifest write exec");
+        assert!(
+            write.contains("sudo -n sh"),
+            "the manifest write must reach the guest as root: {write}"
+        );
+        let payload = write
+            .split("printf %s '")
+            .nth(1)
+            .and_then(|rest| rest.split("' | base64 -d").next())
+            .expect("privileged payload");
+        let script = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .expect("payload is base64"),
+        )
+        .expect("payload is utf-8");
+        assert!(
+            script.contains(&format!("> {BAKE_MANIFEST_PATH}")),
+            "payload must write the manifest: {script}"
+        );
+        assert!(
+            script.contains("\"preloop\""),
+            "payload must carry this bake's manifest: {script}"
+        );
+
+        *provider.fail_exec_containing.lock().await = Some(format!("test -s {BAKE_MANIFEST_PATH}"));
+        assert!(
+            write_bake_manifest(&provider, &name, &env_spec)
+                .await
+                .is_err(),
+            "a manifest that never landed must not read as success"
+        );
     }
 
     #[test]
@@ -7468,6 +7558,15 @@ chmod +x "$dest/bin/node"
                 .lock()
                 .await
                 .push(format!("exec:{}:{:?}", name.as_str(), argv));
+            if let Some(marker) = self.fail_exec_containing.lock().await.clone()
+                && format!("{argv:?}").contains(&marker)
+            {
+                return Ok(ExecOutput {
+                    exit_code: 1,
+                    stderr: b"scripted exec failure".to_vec(),
+                    ..test_output()
+                });
+            }
             if self.wedged_guest && argv == ["true"] {
                 std::future::pending::<()>().await;
             }

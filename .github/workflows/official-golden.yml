@@ -91,6 +91,9 @@ jobs:
     timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "1"
+      # Guest disk for the bake VM; the headroom gate below and
+      # PRELOOP_RUNNER_STORAGE_GB both read it.
+      GOLDEN_GUEST_GIB: "200"
     permissions:
       contents: read
       id-token: write
@@ -223,6 +226,29 @@ jobs:
         env:
           AGENT_TOOLSDIRECTORY: ${{ env.AGENT_TOOLSDIRECTORY }}
 
+      - name: Require disk headroom for pack staging
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          # `pack create` writes the export's layers and an ext4 template the
+          # size of the guest disk next to the output, so the host needs at
+          # least the guest's own size free. 35257438708 burned three attempts
+          # inside `smolvm pack` with 110G free for a ${GOLDEN_GUEST_GIB}G
+          # guest; fail fast here instead.
+          need_gib=$((GOLDEN_GUEST_GIB + 20))
+          avail_gib=$(df --output=avail -BG / | tail -n1 | tr -dc '0-9')
+          echo "pack staging: ${avail_gib}G free, needs ~${need_gib}G (guest ${GOLDEN_GUEST_GIB}G + staging and output)"
+          if [ "$avail_gib" -lt "$need_gib" ]; then
+            echo "::error::not enough disk to pack a ${GOLDEN_GUEST_GIB}G guest: ${avail_gib}G free, need ~${need_gib}G"
+            cat >&2 <<MSG
+          This runner's filesystem cannot hold the pack staging, so the bake
+          would fail every attempt with ENOSPC after an hour of backoff.
+          Bake on a host with the space (scripts/build-golden-x86_64.sh on the
+          x86_64+KVM host) or raise this pool's PRELOOP_RUNNER_STORAGE_GB.
+          MSG
+            exit 1
+          fi
+
       - name: Pack Golden MicroVM Artifact
         if: runner.environment == 'github-hosted'
         env:
@@ -251,10 +277,13 @@ jobs:
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
           # Guest disk must hold extracted layers + merged layer + pack
-          # staging. 120G died at `pack binary: tar error: No space left
-          # on device` (35267336773); sparse on host, so 200G is safe.
-          export PRELOOP_RUNNER_STORAGE_GB=200
-          export PRELOOP_RUNNER_OVERLAY_GB=200
+          # staging. 120G died at `pack binary: tar error: No space left on
+          # device` (35267336773), and 200G died the same way on a host with
+          # 110G free (35257438708): the pack materialises the template on the
+          # *host*, so "sparse on host" does not make 200G safe — the headroom
+          # gate above requires host free space to cover it before starting.
+          export PRELOOP_RUNNER_STORAGE_GB="$GOLDEN_GUEST_GIB"
+          export PRELOOP_RUNNER_OVERLAY_GB="$GOLDEN_GUEST_GIB"
           # The runner-large base archive is ~17 GiB uncompressed, over
           # smolvm's 8 GiB default local-archive cap. Without this the bake
           # fails every attempt at `smolvm create` before extracting a byte.
