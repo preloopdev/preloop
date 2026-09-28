@@ -24,6 +24,8 @@ pub(crate) use crate::*;
 
 pub mod backend;
 pub mod commands;
+#[allow(dead_code)]
+pub(crate) mod lite;
 pub(crate) mod logic;
 pub mod postgres;
 pub mod rows;
