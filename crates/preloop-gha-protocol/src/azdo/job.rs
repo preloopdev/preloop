@@ -285,10 +285,7 @@ pub struct MessageSecretSpec {
 impl MessageSecretSpec {
     /// True when the spec carries no secret surface at all.
     pub fn is_empty(&self) -> bool {
-        !self.inherit
-            && self.names.is_empty()
-            && self.map.is_empty()
-            && self.environment.is_none()
+        !self.inherit && self.names.is_empty() && self.map.is_empty() && self.environment.is_none()
     }
 }
 
