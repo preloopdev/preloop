@@ -49,15 +49,27 @@ jobs:
           run_filter() {
             local package="$1"
             local filter="$2"
+            shift 2
+            # Extra cargo args (target scope, features); the unit tests are the
+            # default. A filter whose tests moved into `tests/*.rs` (the lib
+            # split) matches nothing under `--lib`, and those crates additionally
+            # declare `required-features = ["test-support"]`, so without both
+            # flags the zero-match guard below fails the gate for every push
+            # that touches this workflow's paths — the tests exist, just not
+            # where this used to look.
+            local cargo_args=("$@")
+            if [[ "${#cargo_args[@]}" -eq 0 ]]; then
+              cargo_args=(--lib)
+            fi
             local output
-            echo "=== cargo test -p ${package} ${filter} --lib ==="
-            if ! output="$(cargo test -p "$package" "$filter" --lib -- --nocapture 2>&1)"; then
+            echo "=== cargo test -p ${package} ${filter} ${cargo_args[*]} ==="
+            if ! output="$(cargo test -p "$package" "$filter" "${cargo_args[@]}" -- --nocapture 2>&1)"; then
               printf '%s\n' "$output"
               return 1
             fi
             printf '%s\n' "$output"
             if [[ "$output" == *"running 0 tests"* ]]; then
-              echo "filter matched zero tests: ${package} ${filter}" >&2
+              echo "filter matched zero tests: ${package} ${filter} ${cargo_args[*]}" >&2
               return 1
             fi
           }
@@ -67,7 +79,7 @@ jobs:
           run_filter preloop-runner worker::contexts::tests::masking_
           run_filter preloop-runner worker::file_commands::tests
           run_filter preloop-runner lifecycle
-          run_filter preloop-runner-server workflow_steps_update_
+          run_filter preloop-runner-server workflow_steps_update_ --features test-support --tests
 
       - name: Run remote JavaScript oracle (declaration 1)
         id: oracle_first
