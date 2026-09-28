@@ -16,8 +16,8 @@ use crate::concurrency;
 use crate::control::backend::{JobCompletionInput, PollRequest};
 use crate::control::logic;
 use crate::control::types::{
-    status_str, ClaimedJob, CompleteOutcome, ControlError, JobSettled, PollOutcome, SessionMessage,
-    SettleJob, SettleJobOutcome, SubmitJob, SubmitOutcome, SubmitRun,
+    status_str, AzdoPoll, AzdoPollOutcome, ClaimedJob, CompleteOutcome, ControlError, JobSettled,
+    PollOutcome, SessionMessage, SettleJob, SettleJobOutcome, SubmitJob, SubmitOutcome, SubmitRun,
 };
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use crate::runtime_scheduling::{self as sched_helpers, DependencyDecision, SchedulingOutcome};
@@ -198,13 +198,13 @@ async fn insert_spec_rows(
     let concurrency_json = node
         .concurrency
         .as_ref()
-        .map(|c| serde_json::to_string(c))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(ControlError::backend)?;
     let reusable_json = node
         .reusable
         .as_ref()
-        .map(|r| serde_json::to_string(r))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(ControlError::backend)?;
     tx.execute(
@@ -469,17 +469,16 @@ pub(super) async fn agent_job_id(
     run_id: RunId,
     job_id: &JobId,
 ) -> Result<Option<uuid::Uuid>, ControlError> {
-    Ok(tx
-        .query_opt(
-            "SELECT agent_job_id::text FROM job_requests \
-             WHERE run_id=$1::text::uuid AND job_id=$2 \
-             ORDER BY (result IS NULL) DESC, request_id DESC LIMIT 1",
-            &[&run_id.0.to_string(), &job_id.0],
-        )
-        .await
-        .map_err(db)?
-        .map(|row| codec::uuid(row.get(0)))
-        .transpose()?)
+    tx.query_opt(
+        "SELECT agent_job_id::text FROM job_requests \
+         WHERE run_id=$1::text::uuid AND job_id=$2 \
+         ORDER BY (result IS NULL) DESC, request_id DESC LIMIT 1",
+        &[&run_id.0.to_string(), &job_id.0],
+    )
+    .await
+    .map_err(db)?
+    .map(|row| codec::uuid(row.get(0)))
+    .transpose()
 }
 
 /// Enqueue a `job.cancellation` session message for the runner holding the
@@ -1304,7 +1303,7 @@ async fn promote_waiter(
         concurrency::Holder::Run(run_id) => {
             set_holder(
                 tx,
-                &namespace,
+                namespace,
                 key,
                 key.1.as_str(),
                 &GateHolder {
@@ -1322,7 +1321,7 @@ async fn promote_waiter(
             if !under {
                 park_waiter(
                     tx,
-                    &namespace,
+                    namespace,
                     key,
                     &GateHolder {
                         holder: holder.clone(),
@@ -1334,7 +1333,7 @@ async fn promote_waiter(
             }
             set_holder(
                 tx,
-                &namespace,
+                namespace,
                 key,
                 key.1.as_str(),
                 &GateHolder {
@@ -2476,7 +2475,7 @@ impl<'a> Sweep<'a> {
         job_id: &JobId,
         gates: &[JobSetGate],
     ) -> Result<i64, ControlError> {
-        let ids = serde_json::to_string(&[job_id.0.clone()]).unwrap_or_default();
+        let ids = serde_json::to_string(&[job_id.0.as_str()]).unwrap_or_default();
         let row = self
             .tx
             .query_opt(
@@ -3724,6 +3723,30 @@ impl PgBackend {
         })
     }
 
+    /// A registered runner's capabilities for matching (labels + group).
+    async fn runner_capabilities_row(
+        &self,
+        tx: &Transaction<'_>,
+        runner_id: i64,
+    ) -> Result<Option<RunnerCapabilities>, ControlError> {
+        tx.query_opt(
+            "SELECT labels::text, runner_group_id, runner_group_name \
+             FROM runners WHERE runner_id = $1",
+            &[&runner_id],
+        )
+        .await
+        .map_err(db)?
+        .map(|row| -> Result<RunnerCapabilities, ControlError> {
+            Ok(RunnerCapabilities {
+                known: true,
+                labels: codec::from_json(row.get::<_, String>(0).as_str())?,
+                runner_group_id: row.get(1),
+                runner_group_name: row.get(2),
+            })
+        })
+        .transpose()
+    }
+
     /// `poll_session`: redelivery, cancellation, active request, then a claim.
     pub(super) async fn poll_session(
         &self,
@@ -4314,5 +4337,133 @@ impl PgBackend {
             .map_err(db)?
             .get(0);
         Ok(pending)
+    }
+}
+
+impl PgBackend {
+    /// `poll_azdo_session`: the distributedtask poll shape — redeliver, cancel,
+    /// then claim — returning the session message row the handler renders.
+    ///
+    /// Statements: session read + touch; `session_messages` oldest; active
+    /// request read; cancellation read/insert; the claim batch and its
+    /// conditional update; `job_requests`/`job_leases`/`job_assignments`
+    /// binding; the job-message insert.
+    pub(super) async fn poll_azdo_session(
+        &self,
+        poll: AzdoPoll,
+    ) -> Result<AzdoPollOutcome, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let Some(session) = self.session_ref(&tx, &poll.session_id).await? else {
+            // An unknown session is answered like a foreign one: the runner
+            // must re-register rather than receive work it cannot decode.
+            return Ok(AzdoPollOutcome::Forbidden);
+        };
+        if let Some(verified) = poll.verified_runner_id {
+            if session.runner_id != Some(verified) {
+                return Ok(AzdoPollOutcome::Forbidden);
+            }
+        }
+        self.touch_session_row(&tx, &session.session_uuid).await?;
+        if let Some(message) = self
+            .oldest_session_message(&tx, &session.session_uuid)
+            .await?
+        {
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Redeliver(message));
+        }
+        if let Some(request) = self
+            .session_active_request(&tx, &session.session_uuid)
+            .await?
+        {
+            if self
+                .pending_cancellation(&tx, request.request_id)
+                .await?
+                .is_some()
+            {
+                let message = self
+                    .queue_cancellation_message(
+                        &tx,
+                        &session.session_uuid,
+                        session.runner_id,
+                        request.request_id,
+                        request.agent_job_id,
+                    )
+                    .await?;
+                tx.commit().await.map_err(db)?;
+                return Ok(AzdoPollOutcome::Cancel(message));
+            }
+            // Still executing: the runner keeps polling until it finishes.
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Wait);
+        }
+        let caps = match session.runner_id {
+            Some(runner_id) => match self.runner_capabilities_row(&tx, runner_id).await? {
+                Some(caps) => caps,
+                None => {
+                    tx.commit().await.map_err(db)?;
+                    return Ok(AzdoPollOutcome::Wait);
+                }
+            },
+            // A compat session has no registered runner: its labels are
+            // unknown, which the shared matcher treats as permissive.
+            None => RunnerCapabilities {
+                known: false,
+                labels: Vec::new(),
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        };
+        let Some((run_id, job_id)) = self.claim_one(&tx, session.runner_id, &caps).await? else {
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Wait);
+        };
+        let Some(request) = self
+            .bind_claim(
+                &tx,
+                run_id,
+                &job_id,
+                &session.session_uuid,
+                session.runner_id,
+            )
+            .await?
+        else {
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Wait);
+        };
+        let message = self
+            .queue_job_message(
+                &tx,
+                &session.session_uuid,
+                session.runner_id,
+                request.request_id,
+            )
+            .await?;
+        let mut graph = match PgBackend::load_graph(self, &tx, run_id).await? {
+            Some(graph) => graph,
+            None => {
+                tx.commit().await.map_err(db)?;
+                return Ok(AzdoPollOutcome::Wait);
+            }
+        };
+        let stamp = now_us();
+        if let Some(node) = graph.nodes.get_mut(&job_id) {
+            node.claimed_by_runner_id = session.runner_id;
+            node.claimed_at_us = Some(stamp);
+            node.started_at_us = Some(stamp);
+            graph
+                .record
+                .jobs
+                .insert(job_id.clone(), ExecutionStatus::InProgress);
+            graph.touched = true;
+            flush_node(&tx, run_id, &job_id, node).await?;
+        }
+        flush_run(&tx, &graph).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(AzdoPollOutcome::Claimed {
+            message,
+            run_id,
+            job_id,
+        })
     }
 }
