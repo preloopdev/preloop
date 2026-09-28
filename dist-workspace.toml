@@ -19,11 +19,12 @@ targets = [
 # only be regenerated when a Windows target lands.
 installers = ["shell", "homebrew", "npm"]
 # The publish jobs live in .github/workflows/release.yml (which `allow-dirty`
-# keeps hand-maintained). Homebrew needs HOMEBREW_TAP_TOKEN (contents:write on
-# preloopdev/homebrew-tap) and skips with a workflow warning while it is
-# missing, so a tag never fails on a package-manager credential. npm needs no
-# secret: the package publishes with OIDC trusted publishing configured on
-# npmjs.com against this repository and the release workflow.
+# keeps hand-maintained). Homebrew needs HOMEBREW_TAP_DEPLOY_KEY (the private
+# half of a write-enabled deploy key on preloopdev/homebrew-tap) and skips with
+# a workflow warning while it is missing, so a tag never fails on a
+# package-manager credential. npm needs no secret: the package publishes with
+# OIDC trusted publishing configured on npmjs.com against this repository and
+# the release workflow.
 publish-jobs = ["homebrew", "npm"]
 tap = "preloopdev/homebrew-tap"
 install-updater = true

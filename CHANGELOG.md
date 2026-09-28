@@ -13,10 +13,10 @@ Releases before v0.27.0 predate the changelog.
 - Homebrew and npm install channels: `brew install preloopdev/tap/preloop` and
   `npm install -g @preloop-dev/cli`. The release workflow builds both
   (`installers = ["shell", "homebrew", "npm"]`, tap `preloopdev/homebrew-tap`).
-  Homebrew skips with a workflow warning while `HOMEBREW_TAP_TOKEN` is unset, so
-  a tag never fails on a missing credential; npm authenticates with OIDC
-  trusted publishing, so it stores no credential at all. 0.33.6 was the first
-  release published to both channels (by hand, to bootstrap them).
+  Homebrew skips with a workflow warning while `HOMEBREW_TAP_DEPLOY_KEY` is
+  unset, so a tag never fails on a missing credential; npm authenticates with
+  OIDC trusted publishing, so it stores no credential at all. 0.33.6 was the
+  first release published to both channels (by hand, to bootstrap them).
 - `install.sh` and `install.sh.sha256` now ship as release assets, so the
   documented install path can be verified against a published checksum instead
   of being reachable only through a moving branch.

@@ -66,7 +66,7 @@ is absent, so a missing credential never fails a release:
 
 | Secret | Scope | Effect when set |
 |---|---|---|
-| `HOMEBREW_TAP_TOKEN` | `contents: write` on `preloopdev/homebrew-tap` | pushes `Formula/preloop.rb`, making `brew install preloopdev/tap/preloop` work |
+| `HOMEBREW_TAP_DEPLOY_KEY` | write-enabled deploy key on `preloopdev/homebrew-tap` only | pushes `Formula/preloop.rb`, making `brew install preloopdev/tap/preloop` work |
 | `RELEASES_TOKEN` | `contents: write` on this repository | creates and edits the GitHub Release (the org disables workflow write tokens) |
 
 The npm package `@preloop-dev/cli` needs **no secret**: it publishes with OIDC
