@@ -671,7 +671,7 @@ pub fn job_request_tuple(
 /// worker-crash detail from `ForceFailJob`) embed worker stdout/stderr, which
 /// can contain secret values; the raw `JobCompletion` is the protocol boundary
 /// and is not safe to store or return as-is.
-fn mask_completion_annotations(
+pub(crate) fn mask_completion_annotations(
     run: &RunRecord,
     completion: &JobCompletion,
 ) -> Vec<serde_json::Value> {
@@ -691,7 +691,9 @@ fn mask_completion_annotations(
 /// steps stay for the reconciliation pass. Conclusion is the official
 /// TaskResult (`succeeded`/`succeededwithissues`/`failed`/`canceled`/
 /// `skipped`/`abandoned`, or the numeric 0..5 forms).
-fn completion_step_conclusion(wire: &preloop_gha_protocol::CompletionStepResult) -> Option<String> {
+pub(crate) fn completion_step_conclusion(
+    wire: &preloop_gha_protocol::CompletionStepResult,
+) -> Option<String> {
     let terminal = match wire.status.as_ref()?.as_str() {
         Some("completed") => true,
         Some(_) => false,

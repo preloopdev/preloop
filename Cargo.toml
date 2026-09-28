@@ -99,7 +99,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-semantic-conventions = "0.32"
-uuid = { version = "1.8", features = ["v4", "serde"] }
+uuid = { version = "1.8", features = ["v4", "v5", "serde"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["block-padding"] }
 cipher = { version = "0.4", features = ["block-padding", "alloc"] }

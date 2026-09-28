@@ -21,7 +21,7 @@ fn system_to_us(t: std::time::SystemTime) -> i64 {
 }
 
 fn parse_uuid(s: &str) -> uuid::Uuid {
-    s.parse().unwrap_or_default()
+    super::logic::session_uuid(s)
 }
 
 pub(crate) fn submit_run_tx(
@@ -834,5 +834,1000 @@ pub(crate) fn purge_runner_tx(tx: &mut TxState, runner_id: i64) {
                 .entry(key)
                 .or_insert_with(std::time::SystemTime::now);
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Handler commands (the former `TxState` closures of the HTTP handlers)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `ControlBackend::list_runners` over the working set.
+pub(crate) fn list_runners_tx(tx: &TxState, run_id: Option<RunId>) -> RunnerListing {
+    let runners: Vec<preloop_gha_protocol::RegisteredRunner> =
+        tx.runners.values().cloned().collect();
+    let run_queue = run_id.map(|run_id| {
+        let queued = tx
+            .ready_index
+            .iter()
+            .filter(|job| job.run_id == run_id)
+            .count();
+        let claimable = tx
+            .runners
+            .values()
+            .filter(|runner| {
+                let caps = crate::runtime_scheduling::capabilities_of(runner);
+                tx.ready_index.iter().any(|job| {
+                    job.run_id == run_id
+                        && crate::runtime_scheduling::job_matches_runner_capabilities(job, &caps)
+                })
+            })
+            .count();
+        RunQueueClaimability { queued, claimable }
+    });
+    RunnerListing { runners, run_queue }
+}
+
+/// `ControlBackend::open_runner_session` over the working set.
+pub(crate) fn open_runner_session_tx(
+    tx: &mut TxState,
+    open: OpenRunnerSession,
+) -> Result<(), ControlError> {
+    let Some(runner_id) = open.runner_id else {
+        return Ok(());
+    };
+    let sid = open.session_id;
+    if open.verified {
+        // The official control plane answers 409 when the runner already
+        // holds a live session. Only verified sessions count: an unverified
+        // compat session must not squat a runner id.
+        let already_live = tx
+            .verified_sessions
+            .iter()
+            .filter_map(|sid| tx.runner_id_for_session(sid))
+            .any(|id| id == runner_id);
+        if already_live {
+            return Err(ControlError::Conflict(format!(
+                "runner {runner_id} already has a live session"
+            )));
+        }
+        tx.verified_sessions.insert(sid.clone());
+    }
+    match open.protocol {
+        SessionProtocol::Azdo => {
+            tx.sessions.insert(
+                sid.clone(),
+                preloop_gha_protocol::RunnerSession {
+                    session_id: SessionId(parse_uuid(&sid)),
+                    runner_id,
+                },
+            );
+            tx.azdo_sessions.insert(sid.clone());
+        }
+        // Broker session: `broker_session_runners` only. `sessions` is the
+        // AzDO projection — inserting into both emits two `runner_sessions`
+        // rows and violates the session_id PK.
+        SessionProtocol::Broker => {
+            tx.broker_session_runners.insert(sid.clone(), runner_id);
+        }
+        SessionProtocol::Compat => {
+            return Err(ControlError::BadRequest(
+                "compat sessions are not opened by runners".to_owned(),
+            ));
+        }
+    }
+    tx.mark_session_seen(&sid);
+    Ok(())
+}
+
+/// `ControlBackend::close_runner_session` over the working set.
+pub(crate) fn close_runner_session_tx(
+    tx: &mut TxState,
+    session_id: &str,
+    caller_runner_id: Option<i64>,
+) -> Result<bool, ControlError> {
+    if let Some(runner_id) = caller_runner_id {
+        match tx.runner_id_for_session(session_id) {
+            Some(owner) if owner == runner_id => {}
+            // Ending another runner's session strands its in-flight job
+            // until the lease reaper notices.
+            Some(_) => {
+                return Err(ControlError::Forbidden(
+                    "session belongs to another runner".to_owned(),
+                ));
+            }
+            // Unknown session: nothing to strand, stay idempotent.
+            None => return Ok(false),
+        }
+    }
+    tx.sessions.remove(session_id);
+    tx.broker_session_runners.remove(session_id);
+    tx.verified_sessions.remove(session_id);
+    Ok(true)
+}
+
+fn runner_has_session(tx: &TxState, runner_id: i64) -> bool {
+    tx.sessions
+        .values()
+        .any(|session| session.runner_id == runner_id)
+        || tx
+            .broker_session_runners
+            .values()
+            .any(|id| *id == runner_id)
+}
+
+/// `ControlBackend::purge_runner_guarded` over the working set.
+pub(crate) fn purge_runner_guarded_tx(
+    tx: &mut TxState,
+    runner_id: i64,
+    guard: PurgeGuard,
+) -> Result<bool, ControlError> {
+    match guard {
+        PurgeGuard::System => {}
+        PurgeGuard::Runner(caller) => {
+            if caller != runner_id {
+                return Err(ControlError::Forbidden(
+                    "a runner may only deregister itself".to_owned(),
+                ));
+            }
+        }
+        PurgeGuard::RegistrationToken => {
+            if runner_has_session(tx, runner_id) {
+                return Err(ControlError::Forbidden(
+                    "cannot delete an active runner using a registration token".to_owned(),
+                ));
+            }
+        }
+        PurgeGuard::IfPhantom => {
+            let exists = tx.runners.contains_key(&runner_id)
+                || tx.runner_client_ids.values().any(|id| *id == runner_id);
+            if !exists || runner_has_session(tx, runner_id) {
+                return Ok(false);
+            }
+        }
+    }
+    purge_runner_tx(tx, runner_id);
+    Ok(true)
+}
+
+/// `ControlBackend::lookup_agent` over the working set.
+pub(crate) fn lookup_agent_tx(
+    tx: &mut TxState,
+    name: &str,
+) -> Option<(preloop_gha_protocol::RegisteredRunner, String)> {
+    let runner = tx.runners.values().find(|r| r.name == name).cloned()?;
+    let client_id = tx
+        .runner_client_ids
+        .iter()
+        .find(|(_, &id)| id == runner.id)
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| format!("{:08x}-0000-4000-8000-000000000000", runner.id as u32));
+    tx.runner_client_ids.insert(client_id.clone(), runner.id);
+    Some((runner, client_id))
+}
+
+/// `ControlBackend::bind_runner_client` over the working set.
+pub(crate) fn bind_runner_client_tx(
+    tx: &mut TxState,
+    runner_id: i64,
+    client_id: &str,
+    pair_with_pending_job: bool,
+) {
+    // The OAuth client id must be durable before the runner's next token
+    // request, or a restart between registration and commit rejects it.
+    tx.runner_client_ids.insert(client_id.to_owned(), runner_id);
+    if pair_with_pending_job {
+        sched::pair_registered_runner(tx, runner_id);
+    }
+}
+
+/// `ControlBackend::reap_sweep` over the working set.
+pub(crate) fn reap_sweep_tx(tx: &mut TxState, sweep: ReapSweep) -> ReapSweepOutcome {
+    use super::logic::{starvation_verdict, StarvationCandidate, StarvationVerdict};
+    let ReapSweep {
+        now,
+        runs: _,
+        ready,
+        active,
+        paused,
+        pool_preparing,
+        warm_window_open,
+    } = sweep;
+
+    let in_queue: std::collections::BTreeSet<(RunId, JobId)> = ready
+        .iter()
+        .map(|job| (job.run_id, job.job_id.clone()))
+        .collect();
+    tx.queued_at.retain(|key, _| in_queue.contains(key));
+    let mut starved: Vec<(RunId, JobId, String)> = Vec::new();
+    for job in &ready {
+        let key = (job.run_id, job.job_id.clone());
+        let candidate = StarvationCandidate {
+            runs_on: &job.runs_on,
+            enqueued_at: std::time::UNIX_EPOCH
+                + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
+            first_seen: tx.queued_at.get(&key).copied(),
+            any_runner_matches: tx.runners.values().any(|runner| {
+                crate::runtime_scheduling::job_matches_runner(&job.runs_on, &runner.labels)
+            }),
+        };
+        match starvation_verdict(&candidate, now, pool_preparing, warm_window_open) {
+            StarvationVerdict::ClearMark => {
+                tx.queued_at.remove(&key);
+            }
+            StarvationVerdict::Mark { first_seen } => {
+                tx.queued_at.entry(key).or_insert(first_seen);
+            }
+            StarvationVerdict::Starve { reason, grace } => {
+                tracing::warn!(
+                    run_id = %job.run_id,
+                    job_id = %job.job_id.0,
+                    labels = ?job.runs_on,
+                    "starving queued job failed after {}s without a matching runner",
+                    grace.as_secs()
+                );
+                tx.queued_at.remove(&key);
+                starved.push((job.run_id, job.job_id.clone(), reason));
+            }
+        }
+    }
+
+    let mut cancellations = Vec::new();
+    let mut expired = Vec::new();
+    for request in &active {
+        let (request_id, run_id, job_id) =
+            (request.request_id, request.run_id, request.job_id.clone());
+        // 1. Timeout enforcement. Time paused at a failed step is debugging,
+        // not execution.
+        if let Some(started_at) = request.started_at {
+            if !request.timeout_triggered {
+                let paused = paused.get(&request_id).copied().unwrap_or_default();
+                let elapsed = now
+                    .duration_since(started_at)
+                    .unwrap_or_default()
+                    .saturating_sub(paused);
+                let job_timeout = tx
+                    .broker_messages
+                    .get(&request_id)
+                    .and_then(|msg| msg.job_timeout)
+                    .unwrap_or(21600); // 360 minutes in seconds
+                if elapsed >= std::time::Duration::from_secs(job_timeout as u64) {
+                    tracing::info!(
+                        %run_id,
+                        %job_id,
+                        request_id,
+                        "Job timed out after {}s",
+                        job_timeout
+                    );
+                    if let Some(req) = tx.job_requests.get_mut(&request_id) {
+                        req.timeout_triggered = true;
+                    }
+                    if let Some(agent_job_id) = sched::agent_job_id_for(tx, run_id, &job_id) {
+                        cancellations.push(crate::models::QueuedCancellation {
+                            run_id,
+                            job_id: job_id.clone(),
+                            agent_job_id,
+                        });
+                    }
+                }
+            }
+        }
+        // 2. Lease expiration / disconnect reaper.
+        if let Some(last_renewed_at) = request.last_renewed_at {
+            let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
+            if elapsed >= std::time::Duration::from_secs(crate::distributed_task::JOB_LEASE_SECONDS)
+            {
+                tracing::info!(
+                    %run_id,
+                    %job_id,
+                    request_id,
+                    "Runner lease expired (last renewed {}s ago). Marking job as failed.",
+                    elapsed.as_secs()
+                );
+                if let Some(req) = tx.job_requests.get_mut(&request_id) {
+                    req.result = Some(ExecutionStatus::Failure);
+                }
+                expired.push(ExpiredLease {
+                    request_id,
+                    run_id,
+                    job_id: job_id.clone(),
+                    // The lease that expired names the attempt exactly.
+                    agent_job_id: tx
+                        .job_requests
+                        .get(&request_id)
+                        .map(|record| record.agent_job_id),
+                });
+            }
+        }
+    }
+    for lease in &expired {
+        tx.inflight_requests.remove(&lease.request_id);
+        tx.session_active_requests
+            .retain(|_, &mut v| v != lease.request_id);
+    }
+    let cancellation_count = cancellations.len();
+    tx.cancellation_queue.extend(cancellations);
+
+    // Starvation failures: leave the ready queue and turn terminal so a run
+    // with no surviving jobs concludes.
+    for (run_id, job_id, _) in &starved {
+        tx.ready_index
+            .retain(|job| job.run_id != *run_id || job.job_id != *job_id);
+        tx.queue
+            .retain(|job| job.run_id != *run_id || job.job_id != *job_id);
+        if let Some(run) = tx.runs.get_mut(run_id) {
+            run.jobs.insert(job_id.clone(), ExecutionStatus::Failure);
+            run.status = crate::runtime_scheduling::summarize_run(run.jobs.values().copied());
+            crate::runtime_scheduling::finalize_run_if_complete(run);
+        }
+    }
+    ReapSweepOutcome {
+        cancellations: cancellation_count,
+        expired,
+        starved,
+    }
+}
+
+fn count_run_statuses(statuses: impl IntoIterator<Item = ExecutionStatus>) -> (u32, u32, u32) {
+    let mut queued = 0;
+    let mut in_progress = 0;
+    let mut completed = 0;
+    for status in statuses {
+        match status {
+            ExecutionStatus::Queued => queued += 1,
+            ExecutionStatus::Pending | ExecutionStatus::InProgress => in_progress += 1,
+            ExecutionStatus::Success
+            | ExecutionStatus::Failure
+            | ExecutionStatus::Skipped
+            | ExecutionStatus::Cancelled => completed += 1,
+        }
+    }
+    (queued, in_progress, completed)
+}
+
+/// `ControlBackend::status_inputs` over the working set.
+pub(crate) fn status_inputs_tx(tx: &TxState, stale_after: std::time::Duration) -> StatusInputs {
+    let (runs_queued, runs_in_progress, runs_completed) =
+        count_run_statuses(tx.runs.values().map(|run| run.status));
+    let mut runner_ids_by_run: BTreeMap<RunId, std::collections::BTreeSet<i64>> = BTreeMap::new();
+    for (key, assignment) in &tx.job_assignments {
+        if let Some(runner_id) = assignment.runner_id {
+            runner_ids_by_run
+                .entry(key.0)
+                .or_default()
+                .insert(runner_id);
+        }
+    }
+    for request in tx.job_requests.values() {
+        if request.result.is_none() {
+            if let Some(runner_id) = request.owner_runner_id {
+                runner_ids_by_run
+                    .entry(request.run_id)
+                    .or_default()
+                    .insert(runner_id);
+            }
+        }
+    }
+    let mut active_runs: Vec<_> = tx
+        .runs
+        .values()
+        .filter(|run| !run.status.is_terminal())
+        .map(|run| {
+            let assigned_runners = runner_ids_by_run
+                .get(&run.run_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|runner_id| tx.runners.get(runner_id))
+                .map(|runner| runner.name.clone())
+                .collect();
+            preloop_observability::status::ActiveRunSnapshot {
+                run_id: run.run_id.to_string(),
+                workflow: run.workflow_path_str.clone(),
+                status: serde_json::to_value(run.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                event: run.event.clone(),
+                started_at: run.started_at,
+                assigned_runners,
+            }
+        })
+        .collect();
+    active_runs.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.run_id.cmp(&left.run_id))
+    });
+    // A run can sit `in_progress` while nothing is executing it: its claim
+    // leaked, its machine died, or a restart dropped the pairing.
+    let live_run_ids: std::collections::BTreeSet<RunId> = tx
+        .queue
+        .iter()
+        .map(|job| job.run_id)
+        .chain(tx.claimed_jobs.keys().map(|(run_id, _)| *run_id))
+        .chain(tx.pending_jobs.iter().map(|job| job.run_id))
+        .collect();
+    let orphaned_run_ids: Vec<String> = active_runs
+        .iter()
+        .filter(|run| run.status == "in_progress" && run.assigned_runners.is_empty())
+        .filter(|run| {
+            run.run_id
+                .parse::<uuid::Uuid>()
+                .map(RunId)
+                .is_ok_and(|run_id| !live_run_ids.contains(&run_id))
+        })
+        .map(|run| run.run_id.clone())
+        .collect();
+    let now_unix_nanos = crate::models::now_unix_nanos();
+    let oldest_ready = sched::ready_jobs(tx)
+        .filter(|job| job.enqueued_at_unix_nanos != 0)
+        .min_by_key(|job| job.enqueued_at_unix_nanos);
+    let oldest_ready_seconds = oldest_ready.map(|job| {
+        now_unix_nanos.saturating_sub(job.enqueued_at_unix_nanos) as f64 / 1_000_000_000.0
+    });
+    let session_ids: std::collections::BTreeSet<&String> = tx
+        .broker_session_runners
+        .keys()
+        .chain(tx.sessions.keys())
+        .collect();
+
+    // busy = an owned session holds an active request; stale = every owned
+    // session stopped polling; idle = ≥1 session and neither. A session never
+    // seen (restored) is not stale.
+    let now = std::time::SystemTime::now();
+    let mut runner_idle = 0u32;
+    let mut runner_busy = 0u32;
+    let mut runner_stale = 0u32;
+    for runner_id in tx.runners.keys() {
+        let mut owned: std::collections::BTreeSet<&String> = tx
+            .broker_session_runners
+            .iter()
+            .filter(|(_, owner)| **owner == *runner_id)
+            .map(|(session_id, _)| session_id)
+            .collect();
+        owned.extend(
+            tx.sessions
+                .iter()
+                .filter(|(_, session)| session.runner_id == *runner_id)
+                .map(|(session_id, _)| session_id),
+        );
+        let busy = owned
+            .iter()
+            .any(|session_id| tx.session_active_requests.contains_key(*session_id));
+        let stale = !owned.is_empty()
+            && owned.iter().all(|session_id| {
+                tx.session_last_seen
+                    .get(*session_id)
+                    .and_then(|seen| now.duration_since(*seen).ok())
+                    .is_some_and(|elapsed| elapsed > stale_after)
+            });
+        if busy {
+            runner_busy += 1;
+        }
+        if stale {
+            runner_stale += 1;
+        }
+        if !owned.is_empty() && !busy && !stale {
+            runner_idle += 1;
+        }
+    }
+    let runner_assignments = crate::runtime_scheduling::live_runner_assignments(
+        &tx.job_requests,
+        &tx.session_active_requests,
+        std::time::SystemTime::now(),
+    );
+    let mut concurrency_groups_active = 0u32;
+    let mut concurrency_groups_contended = 0u32;
+    let mut concurrency_pending_holders = 0u32;
+    let mut concurrency_deepest_group_pending = 0u32;
+    for group in tx.concurrency_groups.values() {
+        if group.running.is_some() {
+            concurrency_groups_active += 1;
+        }
+        if !group.pending.is_empty() {
+            concurrency_groups_contended += 1;
+        }
+        concurrency_pending_holders += group.pending.len() as u32;
+        concurrency_deepest_group_pending =
+            concurrency_deepest_group_pending.max(group.pending.len() as u32);
+    }
+    StatusInputs {
+        queue_len: tx.ready_count.max(0) as usize,
+        pending_jobs_len: tx.pending_jobs.len(),
+        pending_expansions_len: tx.pending_expansions.len(),
+        expanding_len: tx.expanding.len(),
+        runs_queued,
+        runs_in_progress,
+        runs_completed,
+        active_runs,
+        orphaned_run_ids,
+        registered: tx.runners.len() as u32,
+        sessions: session_ids.len() as u32,
+        runner_idle,
+        runner_busy,
+        runner_stale,
+        runner_assignments,
+        oldest_ready_seconds,
+        oldest_ready_run_id: oldest_ready.map(|job| job.run_id.to_string()),
+        oldest_ready_job_id: oldest_ready.map(|job| job.job_id.0.clone()),
+        queue_runner_reqs: sched::ready_jobs(tx)
+            .map(|job| (job.runs_on.clone(), job.runner_group.clone()))
+            .collect(),
+        runner_caps: tx
+            .runners
+            .values()
+            .map(crate::runtime_scheduling::capabilities_of)
+            .collect(),
+        concurrency_blocked: tx.concurrency_blocked.len() as u32,
+        concurrency_groups_active,
+        concurrency_groups_contended,
+        concurrency_pending_holders,
+        concurrency_deepest_group_pending,
+        released_bindings: tx.released_bindings_count,
+    }
+}
+
+/// `ControlBackend::rebuild_dispatch_intent` over the working set.
+pub(crate) fn rebuild_dispatch_intent_tx(tx: &mut TxState) {
+    let ready: Vec<crate::models::QueuedJob> = sched::ready_jobs(tx).cloned().collect();
+    for job in &ready {
+        sched::on_job_enqueued(tx, job);
+    }
+}
+
+/// Queue a per-session message in the working set's inflight map. Job
+/// assignments store only the request id (as the body) so the handler builds
+/// and encrypts the message when it answers the poll.
+fn queue_session_message(
+    tx: &mut TxState,
+    session_id: &str,
+    message_type: &str,
+    request_id: Option<i64>,
+    body: Option<String>,
+) -> SessionMessage {
+    tx.next_message_id += 1;
+    let message_id = tx.next_message_id;
+    let stored = azdo::TaskAgentMessage {
+        message_id,
+        message_type: message_type.to_owned(),
+        body: request_id
+            .map(|id| id.to_string())
+            .or_else(|| body.clone())
+            .unwrap_or_default(),
+        iv: None,
+    };
+    tx.inflight_messages
+        .entry(session_id.to_owned())
+        .or_default()
+        .insert(message_id, stored);
+    SessionMessage {
+        message_id,
+        message_type: message_type.to_owned(),
+        request_id,
+        body,
+    }
+}
+
+/// Decode an inflight message queued by [`queue_session_message`].
+fn session_message_of(stored: &azdo::TaskAgentMessage) -> SessionMessage {
+    let is_job = stored.message_type == azdo::message_type::PIPELINE_AGENT_JOB_REQUEST;
+    SessionMessage {
+        message_id: stored.message_id,
+        message_type: stored.message_type.clone(),
+        request_id: is_job.then(|| stored.body.parse().ok()).flatten(),
+        body: (!is_job).then(|| stored.body.clone()),
+    }
+}
+
+/// `ControlBackend::poll_azdo_session` over the working set.
+pub(crate) fn poll_azdo_session_tx(tx: &mut TxState, poll: AzdoPoll) -> AzdoPollOutcome {
+    let sid = poll.session_id;
+    if let Some(runner_id) = poll.verified_runner_id {
+        if tx.runner_id_for_session(&sid) != Some(runner_id) {
+            return AzdoPollOutcome::Forbidden;
+        }
+    }
+    tx.mark_session_seen(&sid);
+    if let Some(stored) = tx
+        .inflight_messages
+        .get(&sid)
+        .and_then(|messages| messages.values().next())
+    {
+        return AzdoPollOutcome::Redeliver(session_message_of(stored));
+    }
+    if let Some(request_id) = tx.session_active_requests.get(&sid).copied() {
+        let request_finished = tx
+            .job_requests
+            .get(&request_id)
+            .is_none_or(|request| request.result.is_some());
+        if request_finished {
+            tx.session_active_requests.remove(&sid);
+        } else {
+            let cancellation_pos = tx.job_requests.get(&request_id).and_then(|request| {
+                tx.cancellation_queue.iter().position(|cancellation| {
+                    cancellation.run_id == request.run_id && cancellation.job_id == request.job_id
+                })
+            });
+            let Some(pos) = cancellation_pos else {
+                return AzdoPollOutcome::Wait;
+            };
+            let cancellation = tx
+                .cancellation_queue
+                .remove(pos)
+                .expect("cancellation position was found in the queue");
+            return AzdoPollOutcome::Cancel(queue_session_message(
+                tx,
+                &sid,
+                azdo::message_type::JOB_CANCELLED,
+                None,
+                Some(concurrency::job_cancel_body(cancellation.agent_job_id)),
+            ));
+        }
+    }
+    let runner = tx.runner_capabilities_for_session(&sid);
+    // The poll already proved `verified_runner_id` owns the session.
+    let verified_claim = poll.verified_runner_id;
+    let Some(queued) = sched::choose_claim_position(tx, &runner, verified_claim)
+        .and_then(|pos| sched::apply_claim(tx, pos))
+    else {
+        return AzdoPollOutcome::Wait;
+    };
+    let claimed_at = std::time::SystemTime::now();
+    if let Some(run) = tx.runs.get_mut(&queued.run_id) {
+        run.status = ExecutionStatus::InProgress;
+        run.jobs
+            .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
+    }
+    let request_id = queued.message.request_id;
+    let owner_runner_id = verified_claim.or_else(|| tx.runner_id_for_session(&sid));
+    tx.session_active_requests.insert(sid.clone(), request_id);
+    if let Some(request) = tx.job_requests.get_mut(&request_id) {
+        request.owner_runner_id = owner_runner_id;
+        request.claimed_at = Some(claimed_at);
+        request.started_at = Some(claimed_at);
+        request.last_renewed_at = Some(claimed_at);
+    }
+    let message = queue_session_message(
+        tx,
+        &sid,
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
+        Some(request_id),
+        None,
+    );
+    AzdoPollOutcome::Claimed {
+        message,
+        run_id: queued.run_id,
+        job_id: queued.job_id,
+    }
+}
+
+/// The broker ownership ladder over the working set: the immutable claim
+/// owner wins; else the runner of the session whose active request it is.
+pub(crate) fn ensure_broker_request_owner(
+    tx: &TxState,
+    request_id: i64,
+    runner_id: i64,
+) -> Result<(), ControlError> {
+    let owner_runner_id = tx
+        .job_requests
+        .get(&request_id)
+        .and_then(|request| request.owner_runner_id);
+    let session_id = tx
+        .session_active_requests
+        .iter()
+        .find_map(|(session_id, active)| (*active == request_id).then_some(session_id.clone()));
+    let has_session = session_id.is_some();
+    let session_runner = session_id.and_then(|sid| tx.runner_id_for_session(&sid));
+    ensure_request_owner(owner_runner_id, session_runner, has_session, runner_id)
+}
+
+fn latest_agent_job_id(tx: &TxState, run_id: RunId, job_id: &JobId) -> Option<uuid::Uuid> {
+    tx.job_requests
+        .values()
+        .filter(|record| record.run_id == run_id && record.job_id == *job_id)
+        .max_by_key(|record| record.request_id)
+        .map(|record| record.agent_job_id)
+}
+
+/// `ControlBackend::settle_job` over the working set. `guard_terminal`: the
+/// working set is narrow (a workflow-grouped run without global concurrency
+/// state), so a completion that finishes the run returns
+/// [`ControlError::WidenScope`] and the caller reruns it globally.
+pub(crate) fn settle_job_tx(
+    tx: &mut TxState,
+    input: SettleJob,
+    guard_terminal: bool,
+) -> Result<SettleJobOutcome, ControlError> {
+    let SettleJob {
+        completion: comp,
+        settle,
+    } = input;
+    let unchanged = |tx: &TxState| {
+        tx.runs
+            .get(&comp.run_id)
+            .cloned()
+            .map(|run| SettleJobOutcome::Unchanged(Box::new(run)))
+            .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))
+    };
+    if let Some(settle) = settle {
+        let request_id = tx
+            .agent_job_requests
+            .get(&settle.agent_job_id)
+            .copied()
+            .ok_or_else(|| {
+                ControlError::NotFound("broker complete request not found".to_owned())
+            })?;
+        ensure_broker_request_owner(tx, request_id, settle.runner_id)?;
+        if tx
+            .job_requests
+            .get(&request_id)
+            .is_some_and(|record| record.result.is_some())
+        {
+            tracing::info!(request_id, "broker complete: ignoring duplicate completion");
+            return unchanged(tx);
+        }
+        if let Some(record) = tx.job_requests.get_mut(&request_id) {
+            record.result = Some(comp.status);
+            record.locked_until = crate::distributed_task::agent_request_locked_until();
+        }
+        // Free the session so the next poll can take a new job now.
+        tx.session_active_requests
+            .retain(|_, &mut rid| rid != request_id);
+        if tx.inflight_requests.remove(&request_id).is_none() {
+            tracing::warn!(
+                request_id,
+                "broker complete: no inflight_requests entry found"
+            );
+            return unchanged(tx);
+        }
+    }
+    let mut newly_terminal_success = false;
+    tx.claimed_jobs.remove(&(comp.run_id, comp.job_id.clone()));
+    let finalized_callers: Vec<JobId>;
+    {
+        let run = tx
+            .runs
+            .get_mut(&comp.run_id)
+            .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
+        let prior =
+            run.jobs.get(&comp.job_id).copied().ok_or_else(|| {
+                ControlError::Backend(anyhow::anyhow!("job does not belong to run"))
+            })?;
+        if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
+            return Ok(SettleJobOutcome::Unchanged(Box::new(run.clone())));
+        }
+        let tolerated = run
+            .job_continue_on_error
+            .get(&comp.job_id.to_string())
+            .copied()
+            .unwrap_or(false);
+        let reported_status = if tolerated && comp.status == ExecutionStatus::Failure {
+            ExecutionStatus::Success
+        } else {
+            comp.status
+        };
+        let effective = match (prior, reported_status) {
+            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
+            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
+            _ => reported_status,
+        };
+        run.jobs.insert(comp.job_id.clone(), effective);
+        let job_name = comp.job_id.0.clone();
+        let annotations = crate::distributed_task::mask_completion_annotations(run, &comp);
+        if let Some(detail) = crate::models::JobDetail::find(&mut run.jobs_list, &job_name) {
+            detail.conclusion = format!("{:?}", effective).to_lowercase();
+            if !comp.annotations.is_empty() {
+                detail.annotations = annotations;
+            }
+        } else {
+            run.jobs_list.push(crate::models::JobDetail {
+                job_id: job_name.clone(),
+                name: job_name,
+                conclusion: format!("{:?}", effective).to_lowercase(),
+                steps: Vec::new(),
+                annotations,
+            });
+        }
+        run.job_outputs.insert(
+            comp.job_id.clone(),
+            comp.outputs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
+        finalized_callers = crate::reusable_workflows::propagate_reusable_outputs(run);
+        run.status = crate::runtime_scheduling::summarize_run(run.jobs.values().copied());
+        if run.started_at.is_none() {
+            run.started_at = Some(chrono::Utc::now());
+        }
+        if matches!(
+            run.status,
+            ExecutionStatus::Success
+                | ExecutionStatus::Failure
+                | ExecutionStatus::Cancelled
+                | ExecutionStatus::Skipped
+        ) && run.completed_at.is_none()
+        {
+            run.completed_at = Some(chrono::Utc::now());
+            run.conclusion = Some(crate::runtime_scheduling::status_string(run.status));
+            newly_terminal_success = run.status == ExecutionStatus::Success;
+        }
+    }
+    let attempt = comp
+        .agent_job_id
+        .or_else(|| latest_agent_job_id(tx, comp.run_id, &comp.job_id));
+    let live_log_key = attempt
+        .map(|agent_job_id| agent_job_id.to_string())
+        .unwrap_or_else(|| comp.job_id.0.clone());
+    let effective_status = tx
+        .runs
+        .get(&comp.run_id)
+        .and_then(|r| r.jobs.get(&comp.job_id).copied())
+        .unwrap_or(comp.status);
+    if let Some(manifest) = attempt.and_then(|id| tx.job_steps.get_mut(&id)) {
+        for wire in &comp.step_results {
+            let Some(external_id) = wire.external_id.as_deref() else {
+                continue;
+            };
+            let Some(pos) = crate::models::StepRecord::find_by_id(manifest, external_id) else {
+                continue;
+            };
+            if let Some(conclusion) = crate::distributed_task::completion_step_conclusion(wire) {
+                manifest[pos].conclusion = conclusion;
+            }
+            if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                manifest[pos].runner_number = Some(number);
+            }
+        }
+        let orphan_conclusion = crate::runtime_scheduling::status_string(effective_status);
+        for step in manifest.iter_mut() {
+            if step.conclusion == "in_progress" {
+                step.conclusion = orphan_conclusion.clone();
+                step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+            }
+        }
+    }
+    let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
+        sched::apply_matrix_fail_fast(tx, comp.run_id, &comp.job_id)
+    } else {
+        Vec::new()
+    };
+    tx.retain_ready(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+    tx.pending_jobs
+        .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+    tx.concurrency_blocked
+        .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
+    if let Some(held) = tx.held_runs.get_mut(&comp.run_id) {
+        held.retain(|job| job.job_id != comp.job_id);
+        if held.is_empty() {
+            tx.held_runs.remove(&comp.run_id);
+        }
+    }
+    sched::release_concurrency_for_job(tx, comp.run_id, &comp.job_id);
+    for caller_id in &finalized_callers {
+        sched::release_concurrency_for_job(tx, comp.run_id, caller_id);
+    }
+    let scheduling = sched::promote_ready_jobs(tx);
+    let finished_request_ids: Vec<i64> = tx
+        .job_requests
+        .iter()
+        .filter(|(_, r)| r.run_id == comp.run_id && r.job_id == comp.job_id)
+        .map(|(id, _)| *id)
+        .collect();
+    for request_id in finished_request_ids {
+        // Shared settlement also clears the session's moot `JobCancellation`
+        // inflight message so it is not redelivered on the next busy poll.
+        sched::settle_request(tx, request_id, effective_status);
+    }
+    // `ready_count` is the O(1) pre-tx global count; `ready_index` holds this
+    // tx's promotions under the narrow scope.
+    let queue_nonempty =
+        tx.ready_count > 0 || !tx.ready_index.is_empty() || !tx.cancellation_queue.is_empty();
+    let queue_len = tx.ready_count.max(0) as usize;
+    // The load-time queue front, or this completion's first promotion when
+    // the queue was empty.
+    let next_runs_on = match sched::next_job_labels(tx) {
+        labels if labels.is_empty() => tx
+            .queue
+            .front()
+            .map(|job| job.runs_on.clone())
+            .unwrap_or_default(),
+        labels => labels,
+    };
+    // This completion finished the run: its workflow-level hold must be
+    // released, which needs every group and holder run.
+    if guard_terminal
+        && tx.runs.get(&comp.run_id).is_some_and(|run| {
+            concurrency::holder_is_terminal(&concurrency::Holder::Run(comp.run_id), &run.jobs)
+        })
+    {
+        return Err(ControlError::WidenScope);
+    }
+    Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
+        effective_status,
+        cancelled_siblings,
+        scheduling,
+        queue_nonempty,
+        newly_terminal_success,
+        live_log_key,
+        queue_len,
+        next_runs_on,
+    })))
+}
+
+/// `ControlBackend::oidc_grant` over the working set.
+pub(crate) fn oidc_grant_tx(
+    tx: &TxState,
+    plan_id: &str,
+    agent_job_id: uuid::Uuid,
+) -> Result<OidcGrant, ControlError> {
+    let request_id = tx
+        .plan_requests
+        .get(plan_id)
+        .copied()
+        .ok_or_else(|| ControlError::NotFound("OIDC: plan not found".to_owned()))?;
+    let request = tx
+        .job_requests
+        .get(&request_id)
+        .ok_or_else(|| ControlError::NotFound("OIDC: job request not found".to_owned()))?;
+    if request.agent_job_id != agent_job_id {
+        return Err(ControlError::NotFound(
+            "OIDC: plan and job do not match".to_owned(),
+        ));
+    }
+    let key = (request.run_id, request.job_id.clone());
+    let granted = tx.id_token_grants.get(&key).copied().unwrap_or(false);
+    let context = tx.oidc_job_contexts.get(&key).cloned().ok_or_else(|| {
+        ControlError::Backend(anyhow::anyhow!("OIDC context missing for dispatched job"))
+    })?;
+    let run = tx
+        .runs
+        .get(&request.run_id)
+        .cloned()
+        .ok_or_else(|| ControlError::NotFound("OIDC: run not found".to_owned()))?;
+    Ok(OidcGrant {
+        run,
+        job_id: key.1,
+        granted,
+        context,
+    })
+}
+
+/// `ControlBackend::cancel_run` over the working set.
+pub(crate) fn cancel_run_tx(
+    tx: &mut TxState,
+    run_id: RunId,
+    reason: Option<&str>,
+) -> Result<CancelOutcome, ControlError> {
+    if !tx.runs.contains_key(&run_id) {
+        return Err(ControlError::NotFound("run not found".to_owned()));
+    }
+    let cancellations = sched::cancel_run_inner(tx, run_id, reason);
+    Ok(cancel_outcome(tx, run_id, cancellations))
+}
+
+/// The shared `CancelOutcome` projection after a cancel transition.
+pub(crate) fn cancel_outcome(tx: &TxState, run_id: RunId, cancellations: usize) -> CancelOutcome {
+    let record = tx.runs.get(&run_id).cloned();
+    let cancelled_jobs = record
+        .as_ref()
+        .map(|run| {
+            run.jobs
+                .iter()
+                .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
+                .map(|(job_id, _)| job_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    CancelOutcome {
+        cancellations,
+        run_status: record.as_ref().map(|r| r.status),
+        queue_nonempty: !tx.ready_index.is_empty()
+            || !tx.queue.is_empty()
+            || !tx.cancellation_queue.is_empty(),
+        record,
+        cancelled_jobs,
+        queue_depth: tx.ready_index.len(),
+        next_runs_on: sched::next_job_labels(tx),
     }
 }
