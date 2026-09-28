@@ -110,7 +110,10 @@ pub async fn live_logs_sse(
     State(shared): State<Arc<SharedState>>,
     Path((run_id, job_id)): Path<(RunId, String)>,
     headers: HeaderMap,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>>,
+    ApiError,
+> {
     let (key, job_id) = authorize_live_log_read(&shared, &headers, run_id, &job_id).await?;
     live_log_stream(&shared, run_id, &job_id, &key).await
 }
@@ -232,7 +235,10 @@ async fn live_log_stream(
     run_id: RunId,
     job_id: &str,
     key: &str,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>>,
+    ApiError,
+> {
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
         let lines_arc = inner

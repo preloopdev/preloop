@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use super::server_queue::{step_conclusion, step_status, StepUpdate};
+use super::server_queue::{StepUpdate, step_conclusion, step_status};
 
 /// Partial step update — omitted fields preserve existing values on merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +95,10 @@ pub fn merge_step_update(
         merged.name = name;
     }
 
-    if let Some(status) = incoming.status {
-        if status_rank(status) >= status_rank(merged.status) {
-            merged.status = status;
-        }
+    if let Some(status) = incoming.status
+        && status_rank(status) >= status_rank(merged.status)
+    {
+        merged.status = status;
     }
 
     if incoming.has_started_at {
@@ -126,12 +126,12 @@ pub fn merge_step_update(
     }
 
     // Completed steps must keep a terminal conclusion if one was ever set.
-    if merged.status == step_status::COMPLETED && merged.conclusion == 0 {
-        if let Some(prev) = existing {
-            if prev.conclusion != 0 {
-                merged.conclusion = prev.conclusion;
-            }
-        }
+    if merged.status == step_status::COMPLETED
+        && merged.conclusion == 0
+        && let Some(prev) = existing
+        && prev.conclusion != 0
+    {
+        merged.conclusion = prev.conclusion;
     }
 
     merged.external_id = incoming.external_id.clone();

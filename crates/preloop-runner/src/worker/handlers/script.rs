@@ -45,10 +45,10 @@ pub async fn run_script(
         custom.to_string()
     } else {
         let mut desc_args = args.clone();
-        if let Some(last) = desc_args.last_mut() {
-            if last == &script_path.to_string_lossy().to_string() {
-                *last = "{0}".to_string();
-            }
+        if let Some(last) = desc_args.last_mut()
+            && last == &script_path.to_string_lossy().to_string()
+        {
+            *last = "{0}".to_string();
         }
         let p_path = if program == "bash" {
             if Path::new("/usr/bin/bash").exists() {
@@ -155,7 +155,9 @@ pub async fn run_script_in_container(
         .map(|a| crate::worker::container_ops::translate_to_container_path(a, &host_work))
         .collect();
 
-    debug!("Running script in container: docker exec {container_id} {container_program} {container_args:?}");
+    debug!(
+        "Running script in container: docker exec {container_id} {container_program} {container_args:?}"
+    );
 
     // Build environment and translate path-valued vars
     let mut env = ctx.build_env();
@@ -185,15 +187,14 @@ pub async fn run_script_in_container(
         custom.to_string()
     } else {
         let mut desc_args = container_args.clone();
-        if let Some(last) = desc_args.last_mut() {
-            if last
+        if let Some(last) = desc_args.last_mut()
+            && last
                 == &crate::worker::container_ops::translate_to_container_path(
                     &script_path.to_string_lossy(),
                     &host_work,
                 )
-            {
-                *last = "{0}".to_string();
-            }
+        {
+            *last = "{0}".to_string();
         }
         let p_path = if container_program == "bash" {
             "/usr/bin/bash"

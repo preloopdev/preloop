@@ -22,9 +22,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::{Context, anyhow, bail};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use preloop_gha_protocol::crypto::sha256_hex;
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -309,10 +309,11 @@ impl GitHubApps {
             signers.push((legacy.to_owned(), WebhookSigner::Legacy));
         }
         for app in &self.apps {
-            if let Some(secret) = &app.webhook_secret {
-                if !secret.is_empty() && !signers.iter().any(|(have, _)| have == secret) {
-                    signers.push((secret.clone(), WebhookSigner::App(app.app_id.clone())));
-                }
+            if let Some(secret) = &app.webhook_secret
+                && !secret.is_empty()
+                && !signers.iter().any(|(have, _)| have == secret)
+            {
+                signers.push((secret.clone(), WebhookSigner::App(app.app_id.clone())));
             }
         }
         signers
@@ -531,19 +532,17 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
                 serde_json::from_str(&raw).with_context(|| "parsing PRELOOP_GITHUB_APPS_JSON")?;
             let store = OsCredentialStore;
             for app in &mut env_apps {
-                if let Some(reference) = &app.pem_ref {
-                    if let Ok(reference_ref) = CredentialRef::new(reference) {
-                        if let Ok(Some(secret)) = store.get(&reference_ref) {
-                            app.resolved_pem = Some(secret);
-                        }
-                    }
+                if let Some(reference) = &app.pem_ref
+                    && let Ok(reference_ref) = CredentialRef::new(reference)
+                    && let Ok(Some(secret)) = store.get(&reference_ref)
+                {
+                    app.resolved_pem = Some(secret);
                 }
-                if let Some(reference) = &app.webhook_secret_ref {
-                    if let Ok(reference_ref) = CredentialRef::new(reference) {
-                        if let Ok(Some(secret)) = store.get(&reference_ref) {
-                            app.resolved_webhook_secret = Some(secret);
-                        }
-                    }
+                if let Some(reference) = &app.webhook_secret_ref
+                    && let Ok(reference_ref) = CredentialRef::new(reference)
+                    && let Ok(Some(secret)) = store.get(&reference_ref)
+                {
+                    app.resolved_webhook_secret = Some(secret);
                 }
             }
             env_apps
@@ -1313,7 +1312,7 @@ async fn verify_repo_access_at(
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("probing {permission} read access on {repo}"))
+                    .with_context(|| format!("probing {permission} read access on {repo}"));
             }
         }
     }
@@ -2720,9 +2719,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_app_subscription_parses_events_and_permissions_from_github() {
-        use axum::routing::get;
         use axum::Json;
         use axum::Router;
+        use axum::routing::get;
 
         let seen_auth: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -2784,9 +2783,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_app_subscription_fails_closed_when_github_refuses() {
+        use axum::Router;
         use axum::http::StatusCode;
         use axum::routing::get;
-        use axum::Router;
 
         let stub = Router::new().route(
             "/app",

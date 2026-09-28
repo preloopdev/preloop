@@ -16,8 +16,8 @@
 
 use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -807,6 +807,8 @@ pub fn checkout_cache_config(config: &ConfigFile) -> anyhow::Result<CheckoutCach
 }
 
 #[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
 mod checkout_cache_tests {
     use super::*;
 
@@ -854,18 +856,20 @@ run_retention_seconds = 60
     #[test]
     fn checkout_cache_unknown_env_mode_falls_back_to_off() {
         let prior = std::env::var(CHECKOUT_CACHE_MODE_ENV).ok();
-        std::env::set_var(CHECKOUT_CACHE_MODE_ENV, "everything");
+        unsafe { std::env::set_var(CHECKOUT_CACHE_MODE_ENV, "everything") };
         let effective =
             checkout_cache_config(&ConfigFile::default()).expect("fallback is not an error");
         assert_eq!(effective.mode, CheckoutCacheMode::Off);
         match prior {
-            Some(value) => std::env::set_var(CHECKOUT_CACHE_MODE_ENV, value),
-            None => std::env::remove_var(CHECKOUT_CACHE_MODE_ENV),
+            Some(value) => unsafe { std::env::set_var(CHECKOUT_CACHE_MODE_ENV, value) },
+            None => unsafe { std::env::remove_var(CHECKOUT_CACHE_MODE_ENV) },
         }
     }
 }
 
 #[cfg(test)]
+// SAFETY: edition-2024 env mutation; tests restore each variable they touch.
+#[allow(unsafe_code)]
 mod retention_config_tests {
     use super::*;
 
@@ -898,17 +902,17 @@ mod retention_config_tests {
     fn retention_days_env_handling() {
         let prior = std::env::var(RETENTION_DAYS_ENV).ok();
         let config: ConfigFile = toml::from_str("retention_days = 30").unwrap();
-        std::env::remove_var(RETENTION_DAYS_ENV);
+        unsafe { std::env::remove_var(RETENTION_DAYS_ENV) };
         assert_eq!(retention_days(&config).unwrap(), 30);
-        std::env::set_var(RETENTION_DAYS_ENV, "7");
+        unsafe { std::env::set_var(RETENTION_DAYS_ENV, "7") };
         assert_eq!(retention_days(&config).unwrap(), 7);
-        std::env::set_var(RETENTION_DAYS_ENV, "   ");
+        unsafe { std::env::set_var(RETENTION_DAYS_ENV, "   ") };
         assert_eq!(retention_days(&config).unwrap(), 30);
-        std::env::set_var(RETENTION_DAYS_ENV, "ninety");
+        unsafe { std::env::set_var(RETENTION_DAYS_ENV, "ninety") };
         assert!(retention_days(&config).is_err());
         match prior {
-            Some(value) => std::env::set_var(RETENTION_DAYS_ENV, value),
-            None => std::env::remove_var(RETENTION_DAYS_ENV),
+            Some(value) => unsafe { std::env::set_var(RETENTION_DAYS_ENV, value) },
+            None => unsafe { std::env::remove_var(RETENTION_DAYS_ENV) },
         }
     }
 
@@ -1018,14 +1022,13 @@ impl std::fmt::Debug for ConfigFile {
             self.env_secrets.len(),
             self.environments.len(),
             self.environment_rules.len(),
-            self.token_permissions_ceiling.as_ref().map_or(
-                "none".to_owned(),
-                |ceiling| format!(
+            self.token_permissions_ceiling
+                .as_ref()
+                .map_or("none".to_owned(), |ceiling| format!(
                     "default={} ({} scoped)",
                     ceiling.r#default.as_str(),
                     ceiling.scopes.len()
-                )
-            ),
+                )),
             self.fork_policy,
             self.execution_protection.mode,
             self.execution_protection.event_rules.len(),
@@ -1430,7 +1433,7 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfigFile::default())
+            return Ok(ConfigFile::default());
         }
         Err(error) => return Err(error).context(format!("reading config {}", path.display())),
     };
@@ -1594,6 +1597,9 @@ pub fn env_or<T>(env_value: Option<T>, config_value: Option<T>) -> Option<T> {
 static CONFIG_PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(any(test, feature = "test-support"))]
+// SAFETY: env write is confined to test builds and runs before parallel
+// tests can observe a torn value (callers hold CONFIG_PATH_LOCK).
+#[allow(unsafe_code)]
 fn pin_test_config_path() {
     use std::sync::LazyLock;
     static TEST_CONFIG_PATH: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
@@ -1602,11 +1608,14 @@ fn pin_test_config_path() {
         dir.join("config.toml")
     });
     if std::env::var_os(CONFIG_PATH_ENV).is_none() {
-        std::env::set_var(CONFIG_PATH_ENV, TEST_CONFIG_PATH.as_path());
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, TEST_CONFIG_PATH.as_path()) };
     }
 }
 
 #[cfg(test)]
+// SAFETY: env writes here are confined to tests that serialize on the
+// module's own usage; each case restores its variables.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::credential_store::WriteOnlyCredentialStore;
@@ -1777,7 +1786,7 @@ mod tests {
     }
 
     use crate::credential_store::{
-        github_reference, MemoryCredentialStore, UnavailableCredentialStore,
+        MemoryCredentialStore, UnavailableCredentialStore, github_reference,
     };
 
     fn config_with_refs(store: &MemoryCredentialStore) -> ConfigFile {

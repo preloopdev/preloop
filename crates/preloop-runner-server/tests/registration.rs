@@ -1589,9 +1589,11 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
             1,
             "job still queued inside the grace window"
         );
-        assert!(inner
-            .queued_at
-            .contains_key(&(run_id, JobId("build".to_owned()))));
+        assert!(
+            inner
+                .queued_at
+                .contains_key(&(run_id, JobId("build".to_owned())))
+        );
     }
 
     // Backdate the first-seen mark past the grace window and reap again: the
@@ -1611,9 +1613,11 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
             inner.queue.is_empty(),
             "starving job must leave the ready queue"
         );
-        assert!(!inner
-            .queued_at
-            .contains_key(&(run_id, JobId("build".to_owned()))));
+        assert!(
+            !inner
+                .queued_at
+                .contains_key(&(run_id, JobId("build".to_owned())))
+        );
         let run = inner.runs.get(&run_id).expect("run record must survive");
         assert_eq!(
             run.jobs.get(&JobId("build".to_owned())),

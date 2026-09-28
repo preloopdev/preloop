@@ -93,9 +93,7 @@ pub enum ParserError {
     #[error("maximum nested reusable workflows depth (10) exceeded")]
     MaxNestingDepthExceeded,
     /// Maximum unique reusable workflows limit exceeded in workflow tree.
-    #[error(
-        "maximum unique reusable workflows ({limit}) exceeded in workflow tree: found {count}"
-    )]
+    #[error("maximum unique reusable workflows ({limit}) exceeded in workflow tree: found {count}")]
     MaxReusableWorkflowsExceeded {
         /// Number of unique reusable workflows found.
         count: usize,

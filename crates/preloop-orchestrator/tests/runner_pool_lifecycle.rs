@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use preloop_orchestrator::{
-    artifact_payload, node_externals, RunnerPool, RunnerPoolConfig, DEBUG_MARKER_IDLE,
-    RUNNER_BUSY_LINE,
+    DEBUG_MARKER_IDLE, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig, artifact_payload,
+    node_externals,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
@@ -318,10 +318,12 @@ struct GoldenUrlGuard {
 impl GoldenUrlGuard {
     fn new() -> Self {
         let previous = std::env::var("PRELOOP_GOLDEN_URL").ok();
-        std::env::set_var(
-            "PRELOOP_GOLDEN_URL",
-            "http://127.0.0.1:1/preloop-golden-unreachable",
-        );
+        unsafe {
+            std::env::set_var(
+                "PRELOOP_GOLDEN_URL",
+                "http://127.0.0.1:1/preloop-golden-unreachable",
+            )
+        };
         Self { previous }
     }
 }
@@ -329,8 +331,8 @@ impl GoldenUrlGuard {
 impl Drop for GoldenUrlGuard {
     fn drop(&mut self) {
         match &self.previous {
-            Some(value) => std::env::set_var("PRELOOP_GOLDEN_URL", value),
-            None => std::env::remove_var("PRELOOP_GOLDEN_URL"),
+            Some(value) => unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", value) },
+            None => unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") },
         }
     }
 }
@@ -365,7 +367,7 @@ impl Fixture {
 
         let token_env = format!("PRELOOP_TEST_TOKEN_{label}_{id}");
         let token = format!("sentinel-registration-token-{id}");
-        std::env::set_var(&token_env, &token);
+        unsafe { std::env::set_var(&token_env, &token) };
         let config = RunnerPoolConfig {
             size: 1,
             use_fork: false,
@@ -414,7 +416,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        std::env::remove_var(&self.token_env);
+        unsafe { std::env::remove_var(&self.token_env) };
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -625,9 +627,11 @@ async fn fork_golden_is_marked_forkable_after_guest_provisioning() {
         .position(|event| matches!(event, Event::Stop(name) if name == &golden))
         .expect("golden stopped before forkable restart");
     assert!(first_start < stop);
-    assert!(events[first_start + 1..stop]
-        .iter()
-        .any(|event| matches!(event, Event::Exec(name, _) if name == &golden)));
+    assert!(
+        events[first_start + 1..stop]
+            .iter()
+            .any(|event| matches!(event, Event::Exec(name, _) if name == &golden))
+    );
     assert!(stop < golden_starts[1]);
 }
 
@@ -657,10 +661,12 @@ async fn configure_passes_secret_environment_mapping_without_token_value() {
             SecretSource::HostEnv(fixture.token_env.clone())
         )]
     );
-    assert!(configure
-        .0
-        .iter()
-        .all(|argument| argument != &fixture.token));
+    assert!(
+        configure
+            .0
+            .iter()
+            .all(|argument| argument != &fixture.token)
+    );
     // Only a reference to the credential is ever handed to SmolVM.
     assert!(configure.1.iter().all(|(key, source)| {
         key != &fixture.token
@@ -897,14 +903,18 @@ async fn stale_owned_machines_are_removed_without_touching_unrelated_machines() 
     let snapshot = provider.snapshot().await;
     assert!(!snapshot.machines.contains_key(&stale));
     assert!(snapshot.machines.contains_key(unrelated));
-    assert!(snapshot
-        .events
-        .iter()
-        .any(|event| matches!(event, Event::Delete(name) if name == &stale)));
-    assert!(!snapshot
-        .events
-        .iter()
-        .any(|event| matches!(event, Event::Delete(name) if name == unrelated)));
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &stale))
+    );
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == unrelated))
+    );
 }
 
 #[tokio::test]
@@ -920,10 +930,12 @@ async fn cancellation_deletes_owned_active_machine() {
     let snapshot = provider.snapshot().await;
     let runner = first_slot_machine(&snapshot.events, &fixture.config.name_prefix);
     assert_eq!(snapshot.machines.get(&runner), None);
-    assert!(snapshot
-        .events
-        .iter()
-        .any(|event| matches!(event, Event::Delete(name) if name == &runner)));
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+    );
 }
 
 #[tokio::test]
@@ -951,11 +963,13 @@ async fn preserved_runner_expires_at_idle_timeout_without_heartbeat() {
 
     tokio::time::advance(std::time::Duration::from_secs(599)).await;
     yield_to_pool().await;
-    assert!(task_provider
-        .snapshot()
-        .await
-        .machines
-        .contains_key(&runner));
+    assert!(
+        task_provider
+            .snapshot()
+            .await
+            .machines
+            .contains_key(&runner)
+    );
 
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     yield_to_pool().await;

@@ -945,10 +945,12 @@ mod tests {
         .expect("background child cancellation timed out");
         let _ = cancel_task.await;
 
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("process cancelled"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("process cancelled")
+        );
 
         let pid = nix::unistd::Pid::from_raw(
             std::fs::read_to_string(&pid_path)
@@ -1048,10 +1050,12 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert_eq!(
             result.lines,
-            vec![std::fs::canonicalize(dir.path())
-                .unwrap()
-                .to_string_lossy()
-                .to_string()]
+            vec![
+                std::fs::canonicalize(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            ]
         );
     }
 

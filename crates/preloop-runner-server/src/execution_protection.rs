@@ -96,14 +96,14 @@ pub fn denies_event(
         if !is_unscoped(&rule.workflows) {
             continue;
         }
-        if let Some(actor) = actor {
-            if rule.actor.eq_ignore_ascii_case(actor) {
-                return Some(RuleHit {
-                    kind: "actor",
-                    detail: format!("actor={actor:?}"),
-                    scope: scope_of(&rule.workflows),
-                });
-            }
+        if let Some(actor) = actor
+            && rule.actor.eq_ignore_ascii_case(actor)
+        {
+            return Some(RuleHit {
+                kind: "actor",
+                detail: format!("actor={actor:?}"),
+                scope: scope_of(&rule.workflows),
+            });
         }
     }
     None
@@ -135,16 +135,15 @@ pub fn denies_workflow(
         if is_unscoped(&rule.workflows) {
             continue;
         }
-        if let Some(actor) = actor {
-            if rule.actor.eq_ignore_ascii_case(actor)
-                && workflow_matches(rule.workflows.as_deref().unwrap_or(&[]), workflow_file)
-            {
-                return Some(RuleHit {
-                    kind: "actor",
-                    detail: format!("actor={actor:?}"),
-                    scope: scope_of(&rule.workflows),
-                });
-            }
+        if let Some(actor) = actor
+            && rule.actor.eq_ignore_ascii_case(actor)
+            && workflow_matches(rule.workflows.as_deref().unwrap_or(&[]), workflow_file)
+        {
+            return Some(RuleHit {
+                kind: "actor",
+                detail: format!("actor={actor:?}"),
+                scope: scope_of(&rule.workflows),
+            });
         }
     }
     None
@@ -163,10 +162,10 @@ pub fn denies_submission(
     if let Some(hit) = denies_event(policy, event, actor) {
         return Some(hit);
     }
-    if let Some(file) = workflow_file {
-        if let Some(hit) = denies_workflow(policy, event, actor, file) {
-            return Some(hit);
-        }
+    if let Some(file) = workflow_file
+        && let Some(hit) = denies_workflow(policy, event, actor, file)
+    {
+        return Some(hit);
     }
     None
 }
@@ -301,13 +300,15 @@ mod tests {
             actor_rules: Vec::new(),
         };
         assert!(denies_event(&policy, "pull_request_target", Some("mallory")).is_none());
-        assert!(denies_workflow(
-            &policy,
-            "pull_request_target",
-            Some("mallory"),
-            "deploy.yml"
-        )
-        .is_none());
+        assert!(
+            denies_workflow(
+                &policy,
+                "pull_request_target",
+                Some("mallory"),
+                "deploy.yml"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -404,12 +405,14 @@ workflows = ["deploy.yml"]
             toml::from_str("[execution_protection]\nevent_rules = []\n")
                 .expect("config must parse");
         assert!(config.execution_protection.event_rules.is_empty());
-        assert!(denies_event(
-            &config.execution_protection,
-            "pull_request_target",
-            Some("alice")
-        )
-        .is_none());
+        assert!(
+            denies_event(
+                &config.execution_protection,
+                "pull_request_target",
+                Some("alice")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -488,16 +491,20 @@ workflows = ["deploy.yml"]
             vec![],
         );
         // Unscoped event rule hits without a workflow file.
-        assert!(denies_submission(&policy, "push", Some("alice"), None)
-            .is_some_and(|hit| hit.kind == "event"));
+        assert!(
+            denies_submission(&policy, "push", Some("alice"), None)
+                .is_some_and(|hit| hit.kind == "event")
+        );
         // Scoped event rule hits only for the matching file.
-        assert!(denies_submission(
-            &policy,
-            "workflow_dispatch",
-            Some("alice"),
-            Some("deploy.yml")
-        )
-        .is_some());
+        assert!(
+            denies_submission(
+                &policy,
+                "workflow_dispatch",
+                Some("alice"),
+                Some("deploy.yml")
+            )
+            .is_some()
+        );
         assert!(
             denies_submission(&policy, "workflow_dispatch", Some("alice"), Some("ci.yml"))
                 .is_none()

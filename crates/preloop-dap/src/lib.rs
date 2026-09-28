@@ -56,11 +56,11 @@ pub use debugger::{DapDebugger, DapSessionState, IDapDebugger};
 // Re-export at the top level for downstream consumers that want
 // `aksg_dap::IDapDebugger` without reaching into the `debugger` module.
 pub use framing::{
-    read_message, write_message, FrameError, MAX_HEADER_LINE_LENGTH, MAX_MESSAGE_SIZE,
+    FrameError, MAX_HEADER_LINE_LENGTH, MAX_MESSAGE_SIZE, read_message, write_message,
 };
 pub use messages::{
-    DapCommand, Event, Message, ProtocolMessage, Request, Response, EVENT_CONTINUED, EVENT_EXITED,
-    EVENT_INITIALIZED, EVENT_OUTPUT, EVENT_STOPPED, EVENT_TERMINATED, EVENT_THREAD,
+    DapCommand, EVENT_CONTINUED, EVENT_EXITED, EVENT_INITIALIZED, EVENT_OUTPUT, EVENT_STOPPED,
+    EVENT_TERMINATED, EVENT_THREAD, Event, Message, ProtocolMessage, Request, Response,
 };
 pub use repl::{DapReplCommand, DapReplExecutor, DapReplParser, HelpCommand, RunCommand};
 pub use variables::{DapScope, DapVariable, DapVariableProvider};

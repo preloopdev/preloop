@@ -7,12 +7,12 @@
 //! can happen right after each step completes (F019 + F020).
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
 
 use super::contexts::{JobContext, JobStatus, StepResult};
 use super::execution_context::StepContext;
-use super::server_queue::{step_conclusion, step_status, ServerQueue, StepUpdate};
+use super::server_queue::{ServerQueue, StepUpdate, step_conclusion, step_status};
 
 /// A step to execute, with its metadata.
 ///
@@ -224,25 +224,25 @@ pub async fn run_steps(
             job.get_variable("system.github.token.permissions")
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         });
-        if let Some(token_perms) = token_permissions {
-            if let Some(perms) = token_perms.as_object() {
-                setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
-                for (perm, level) in perms {
-                    if let Some(level_str) = level.as_str() {
-                        setup_lines.push(format!("{ts} {perm}: {level_str}"));
-                    }
+        if let Some(token_perms) = token_permissions
+            && let Some(perms) = token_perms.as_object()
+        {
+            setup_lines.push(format!("{ts} ##[group]GITHUB_TOKEN Permissions"));
+            for (perm, level) in perms {
+                if let Some(level_str) = level.as_str() {
+                    setup_lines.push(format!("{ts} {perm}: {level_str}"));
                 }
-                // H3: a static-PAT-backed GITHUB_TOKEN does not honor the
-                // workflow's `permissions:` block, so the declared set above is
-                // not what the token carries. State the token's real authority
-                // in the same group rather than leaving it to be inferred.
-                if let Some(pat_scopes) = job.get_variable("system.github.token.pat_scopes") {
-                    setup_lines.push(format!(
+            }
+            // H3: a static-PAT-backed GITHUB_TOKEN does not honor the
+            // workflow's `permissions:` block, so the declared set above is
+            // not what the token carries. State the token's real authority
+            // in the same group rather than leaving it to be inferred.
+            if let Some(pat_scopes) = job.get_variable("system.github.token.pat_scopes") {
+                setup_lines.push(format!(
                         "{ts} PAT mode: `permissions:` is NOT enforced; GITHUB_TOKEN authority: {pat_scopes}"
                     ));
-                }
-                setup_lines.push(format!("{ts} ##[endgroup]"));
             }
+            setup_lines.push(format!("{ts} ##[endgroup]"));
         }
 
         setup_lines.push(format!("{ts} Secret source: Actions"));
@@ -727,31 +727,31 @@ pub async fn run_steps(
 
             // DAP: OnStepStarting — pause for debugger before step execution.
             // Mirrors StepsRunner.cs: `await dapDebugger?.OnStepStartingAsync(step);`
-            if !step.is_background {
-                if let Some(dbg) = dap_debugger.as_ref() {
-                    let context_val = step_ctx.job.context_data.clone();
-                    let masks: std::collections::HashSet<String> = step_ctx.job.masks.clone();
-                    dbg.update_context(context_val, masks);
-                    let is_pre = step.id.starts_with("__pre_")
-                        || step
-                            .raw
-                            .get("isPre")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                    let is_post = step.id.starts_with("__post_")
-                        || step
-                            .raw
-                            .get("isPost")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                    let source_entry = preloop_dap::SourceEntry {
-                        display_name: resolved_display_name.clone(),
-                        is_pre,
-                        is_post,
-                    };
-                    if let Err(e) = dbg.on_step_starting(&source_entry).await {
-                        warn!("DAP OnStepStarting failed: {e}");
-                    }
+            if !step.is_background
+                && let Some(dbg) = dap_debugger.as_ref()
+            {
+                let context_val = step_ctx.job.context_data.clone();
+                let masks: std::collections::HashSet<String> = step_ctx.job.masks.clone();
+                dbg.update_context(context_val, masks);
+                let is_pre = step.id.starts_with("__pre_")
+                    || step
+                        .raw
+                        .get("isPre")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let is_post = step.id.starts_with("__post_")
+                    || step
+                        .raw
+                        .get("isPost")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                let source_entry = preloop_dap::SourceEntry {
+                    display_name: resolved_display_name.clone(),
+                    is_pre,
+                    is_post,
+                };
+                if let Err(e) = dbg.on_step_starting(&source_entry).await {
+                    warn!("DAP OnStepStarting failed: {e}");
                 }
             }
 
@@ -965,256 +965,250 @@ pub async fn run_steps(
                 cancelled,
                 step.is_background,
                 debugging_declined,
-            ) {
-                if let Some(client) = debug_client.as_ref() {
-                    let elapsed_ms = attempt_started.elapsed().as_millis() as u64;
-                    // Use only this attempt's log/annotation slice so a retry
-                    // does not report the prior attempt's exit code or errors.
-                    let attempt_log = step_ctx.log_content_since(attempt_log_line);
-                    let attempt_annotations = &step_ctx.annotations[attempt_annotation_offset..];
-                    let diagnostics =
-                        super::debug_pause::diagnostics_from_annotations(attempt_annotations, 10);
-                    let log_excerpt = if diagnostics.is_empty() {
-                        super::debug_pause::log_excerpt(&attempt_log, 20)
-                    } else {
-                        None
-                    };
-                    let exit_code = super::debug_pause::exit_code_from_log(&attempt_log);
+            ) && let Some(client) = debug_client.as_ref()
+            {
+                let elapsed_ms = attempt_started.elapsed().as_millis() as u64;
+                // Use only this attempt's log/annotation slice so a retry
+                // does not report the prior attempt's exit code or errors.
+                let attempt_log = step_ctx.log_content_since(attempt_log_line);
+                let attempt_annotations = &step_ctx.annotations[attempt_annotation_offset..];
+                let diagnostics =
+                    super::debug_pause::diagnostics_from_annotations(attempt_annotations, 10);
+                let log_excerpt = if diagnostics.is_empty() {
+                    super::debug_pause::log_excerpt(&attempt_log, 20)
+                } else {
+                    None
+                };
+                let exit_code = super::debug_pause::exit_code_from_log(&attempt_log);
 
-                    attempt_journal.push(preloop_gha_protocol::debug_session::AttemptRecord {
-                        attempt,
-                        outcome: outcome_str.clone(),
-                        exit_code,
-                        elapsed_ms,
-                        source_revision: source_revision.clone(),
-                    });
+                attempt_journal.push(preloop_gha_protocol::debug_session::AttemptRecord {
+                    attempt,
+                    outcome: outcome_str.clone(),
+                    exit_code,
+                    elapsed_ms,
+                    source_revision: source_revision.clone(),
+                });
 
-                    let failed_step = preloop_gha_protocol::debug_session::FailedStep {
-                        index: idx,
-                        total: total_steps,
-                        context_name: step.context_name.clone(),
-                        display_name: resolved_display_name.clone(),
-                        command: match &step.step_type {
-                            StepType::Script { script, .. } => Some(script.clone()),
-                            StepType::Action { uses, .. } => Some(format!("uses: {uses}")),
-                        },
-                        working_directory: Some(workspace.to_owned()),
-                        exit_code,
-                        elapsed_ms,
-                        diagnostics,
-                        log_excerpt,
-                    };
+                let failed_step = preloop_gha_protocol::debug_session::FailedStep {
+                    index: idx,
+                    total: total_steps,
+                    context_name: step.context_name.clone(),
+                    display_name: resolved_display_name.clone(),
+                    command: match &step.step_type {
+                        StepType::Script { script, .. } => Some(script.clone()),
+                        StepType::Action { uses, .. } => Some(format!("uses: {uses}")),
+                    },
+                    working_directory: Some(workspace.to_owned()),
+                    exit_code,
+                    elapsed_ms,
+                    diagnostics,
+                    log_excerpt,
+                };
 
-                    // What this attempt changed, as distinct from pre-existing dirt.
-                    // Requires a baseline: without one there is no way to tell the
-                    // two apart, and offering a revert anyway risks deleting work
-                    // the step never produced.
-                    let attempt_changes = match (&workspace_baseline, snapshot_commit) {
-                        (Some(baseline), Some(commit)) => {
-                            match super::workspace_diff::diff_workspace_async(
-                                std::path::PathBuf::from(workspace),
-                                commit.to_owned(),
-                            )
-                            .await
-                            {
-                                Ok(now) => super::workspace_diff::changes_since(baseline, &now),
-                                Err(error) => {
-                                    warn!(%error, "could not diff the workspace — no revert offered");
-                                    Vec::new()
-                                }
-                            }
-                        }
-                        _ => Vec::new(),
-                    };
-
-                    // P1-3: Race the blocking pause against cancellation so a
-                    // cancel arriving while the worker waits for a verdict
-                    // does not hang the job/VM indefinitely.
-                    let decision = {
-                        let pause_fut = client.pause(
-                            failed_step,
-                            attempt_journal.clone(),
-                            attempt_changes.clone(),
-                            job_step_summaries.clone(),
-                        );
-                        let mut cancel_watch = cancel_rx.clone();
-                        tokio::select! {
-                            d = pause_fut => d,
-                            _ = cancel_watch.changed() => {
-                                if *cancel_watch.borrow() {
-                                    warn!("Job cancelled while paused for debug verdict");
-                                    step_ctx.log("##[error]The operation was canceled.");
-                                    cancelled = true;
-                                    step_ctx.job.job_status = JobStatus::Cancelled;
-                                    break ("Cancelled".to_string(), file_command_paths);
-                                }
-                                // Spurious wake — pause already returned None
-                                None
-                            }
-                        }
-                    };
-
-                    match decision.as_ref().map(|d| d.verdict) {
-                        Some(preloop_gha_protocol::debug_session::Verdict::Retry)
-                            if attempt >= MAX_DEBUG_ATTEMPTS =>
+                // What this attempt changed, as distinct from pre-existing dirt.
+                // Requires a baseline: without one there is no way to tell the
+                // two apart, and offering a revert anyway risks deleting work
+                // the step never produced.
+                let attempt_changes = match (&workspace_baseline, snapshot_commit) {
+                    (Some(baseline), Some(commit)) => {
+                        match super::workspace_diff::diff_workspace_async(
+                            std::path::PathBuf::from(workspace),
+                            commit.to_owned(),
+                        )
+                        .await
                         {
-                            // The journal is cloned into every pause and retained
-                            // server-side, so an unbounded retry loop grows both
-                            // sides without ever converging. Stop offering.
-                            warn!(
-                                "Step '{}' has been retried {MAX_DEBUG_ATTEMPTS} times — \
-                                 failing it and ending the debug session",
-                                resolved_display_name
-                            );
-                            step_ctx.log(&format!(
-                                "##[error]Retry limit ({MAX_DEBUG_ATTEMPTS}) reached for this step."
-                            ));
-                            debugging_declined = true;
-                            break (conclusion_str, file_command_paths);
+                            Ok(now) => super::workspace_diff::changes_since(baseline, &now),
+                            Err(error) => {
+                                warn!(%error, "could not diff the workspace — no revert offered");
+                                Vec::new()
+                            }
                         }
-                        Some(preloop_gha_protocol::debug_session::Verdict::Retry) => {
-                            // `retry_from_step` is a 0-based index into the
-                            // resolved runner-step list; the CLI maps
-                            // workflow-facing numbers before sending it.
-                            let target = decision.as_ref().and_then(|d| d.retry_from_step);
+                    }
+                    _ => Vec::new(),
+                };
 
-                            info!(
-                                "Retrying step '{}' (attempt {})",
-                                resolved_display_name,
-                                attempt + 1
+                // P1-3: Race the blocking pause against cancellation so a
+                // cancel arriving while the worker waits for a verdict
+                // does not hang the job/VM indefinitely.
+                let decision = {
+                    let pause_fut = client.pause(
+                        failed_step,
+                        attempt_journal.clone(),
+                        attempt_changes.clone(),
+                        job_step_summaries.clone(),
+                    );
+                    let mut cancel_watch = cancel_rx.clone();
+                    tokio::select! {
+                        d = pause_fut => d,
+                        _ = cancel_watch.changed() => {
+                            if *cancel_watch.borrow() {
+                                warn!("Job cancelled while paused for debug verdict");
+                                step_ctx.log("##[error]The operation was canceled.");
+                                cancelled = true;
+                                step_ctx.job.job_status = JobStatus::Cancelled;
+                                break ("Cancelled".to_string(), file_command_paths);
+                            }
+                            // Spurious wake — pause already returned None
+                            None
+                        }
+                    }
+                };
+
+                match decision.as_ref().map(|d| d.verdict) {
+                    Some(preloop_gha_protocol::debug_session::Verdict::Retry)
+                        if attempt >= MAX_DEBUG_ATTEMPTS =>
+                    {
+                        // The journal is cloned into every pause and retained
+                        // server-side, so an unbounded retry loop grows both
+                        // sides without ever converging. Stop offering.
+                        warn!(
+                            "Step '{}' has been retried {MAX_DEBUG_ATTEMPTS} times — \
+                                 failing it and ending the debug session",
+                            resolved_display_name
+                        );
+                        step_ctx.log(&format!(
+                            "##[error]Retry limit ({MAX_DEBUG_ATTEMPTS}) reached for this step."
+                        ));
+                        debugging_declined = true;
+                        break (conclusion_str, file_command_paths);
+                    }
+                    Some(preloop_gha_protocol::debug_session::Verdict::Retry) => {
+                        // `retry_from_step` is a 0-based index into the
+                        // resolved runner-step list; the CLI maps
+                        // workflow-facing numbers before sending it.
+                        let target = decision.as_ref().and_then(|d| d.retry_from_step);
+
+                        info!(
+                            "Retrying step '{}' (attempt {})",
+                            resolved_display_name,
+                            attempt + 1
+                        );
+                        // Undo what the controller approved, before anything
+                        // else. A leftover `build/` from the failed attempt
+                        // makes the retry fail for a different reason than the
+                        // original, which is worse than not retrying at all.
+                        if let (Some(decision), Some(commit)) = (&decision, snapshot_commit) {
+                            let selected = super::workspace_diff::select_for_policy(
+                                &attempt_changes,
+                                decision.revert,
                             );
-                            // Undo what the controller approved, before anything
-                            // else. A leftover `build/` from the failed attempt
-                            // makes the retry fail for a different reason than the
-                            // original, which is worse than not retrying at all.
-                            if let (Some(decision), Some(commit)) = (&decision, snapshot_commit) {
-                                let selected = super::workspace_diff::select_for_policy(
-                                    &attempt_changes,
-                                    decision.revert,
-                                );
-                                if !selected.is_empty() {
-                                    match super::workspace_diff::revert_paths_async(
-                                        std::path::PathBuf::from(workspace),
-                                        commit.to_owned(),
-                                        selected,
-                                    )
-                                    .await
-                                    {
-                                        Ok(count) => {
-                                            info!(
-                                                "Reverted {count} path(s) from the failed attempt"
-                                            );
-                                            step_ctx.log(&format!(
+                            if !selected.is_empty() {
+                                match super::workspace_diff::revert_paths_async(
+                                    std::path::PathBuf::from(workspace),
+                                    commit.to_owned(),
+                                    selected,
+                                )
+                                .await
+                                {
+                                    Ok(count) => {
+                                        info!("Reverted {count} path(s) from the failed attempt");
+                                        step_ctx.log(&format!(
                                                 "##[group]Reverted {count} path(s) left by the failed attempt\n##[endgroup]"
                                             ));
-                                        }
-                                        Err(error) => {
-                                            warn!(%error, "revert failed — retrying without it");
-                                            step_ctx
-                                                .log(&format!("##[warning]Revert failed: {error}"));
-                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(%error, "revert failed — retrying without it");
+                                        step_ctx.log(&format!("##[warning]Revert failed: {error}"));
                                     }
                                 }
                             }
-                            step_ctx.log(&format!(
-                                "##[group]Retry attempt {} — {}",
-                                attempt + 1,
-                                resolved_display_name
-                            ));
-                            attempt += 1;
-                            source_revision = decision
-                                .as_ref()
-                                .and_then(|d| d.source_revision.clone())
-                                .unwrap_or_else(|| client.current_revision());
-                            // The snapshot checkout token pinned at submission
-                            // may be expired by now; the verdict carried a
-                            // fresh one. Swap it in before the replay so the
-                            // re-run does not fail with a git 401.
-                            if let Some(token) =
-                                decision.as_ref().and_then(|d| d.snapshot_token.as_deref())
-                            {
-                                client.refresh_snapshot_tokens(std::slice::from_mut(step), token);
-                                pending_snapshot_token = Some(token.to_owned());
-                            }
-
-                            match target {
-                                Some(target) if target <= idx && target < step_count => {
-                                    // Report this attempt first, then replay the
-                                    // range. Applied below, once the step's
-                                    // completion has been recorded.
-                                    jump_to = Some(target);
-                                    // Persist attempt state so we pick up
-                                    // where we left off after the jump.
-                                    step_attempt_state.insert(
-                                        idx,
-                                        (attempt, attempt_journal.clone(), source_revision.clone()),
-                                    );
-                                    break (conclusion_str, file_command_paths);
-                                }
-                                Some(target) => {
-                                    warn!(
-                                        "retry_from_step {target} is not at or before current step {idx}, retrying current step"
-                                    );
-                                }
-                                None => {}
-                            }
-                            // Retry just the current step.
-                            super::file_commands::cleanup_file_commands(&file_command_paths);
-                            step_state_snapshot.restore(step_ctx.job, &step.context_name);
-                            continue;
                         }
-                        Some(preloop_gha_protocol::debug_session::Verdict::Continue) => {
-                            // The step still failed; the controller accepted it.
-                            // Mirrors runtime `continue-on-error`, except a
-                            // durable masking failure must never be laundered
-                            // into success by an interactive verdict.
-                            let continued_conclusion =
-                                interactive_continue_conclusion(durable_log_error.is_some());
-                            warn!(
-                                "Step '{}' failed but was continued interactively",
-                                resolved_display_name
-                            );
-                            step_ctx.log("##[warning]Step failed but was continued interactively.");
+                        step_ctx.log(&format!(
+                            "##[group]Retry attempt {} — {}",
+                            attempt + 1,
+                            resolved_display_name
+                        ));
+                        attempt += 1;
+                        source_revision = decision
+                            .as_ref()
+                            .and_then(|d| d.source_revision.clone())
+                            .unwrap_or_else(|| client.current_revision());
+                        // The snapshot checkout token pinned at submission
+                        // may be expired by now; the verdict carried a
+                        // fresh one. Swap it in before the replay so the
+                        // re-run does not fail with a git 401.
+                        if let Some(token) =
+                            decision.as_ref().and_then(|d| d.snapshot_token.as_deref())
+                        {
+                            client.refresh_snapshot_tokens(std::slice::from_mut(step), token);
+                            pending_snapshot_token = Some(token.to_owned());
+                        }
+
+                        match target {
+                            Some(target) if target <= idx && target < step_count => {
+                                // Report this attempt first, then replay the
+                                // range. Applied below, once the step's
+                                // completion has been recorded.
+                                jump_to = Some(target);
+                                // Persist attempt state so we pick up
+                                // where we left off after the jump.
+                                step_attempt_state.insert(
+                                    idx,
+                                    (attempt, attempt_journal.clone(), source_revision.clone()),
+                                );
+                                break (conclusion_str, file_command_paths);
+                            }
+                            Some(target) => {
+                                warn!(
+                                    "retry_from_step {target} is not at or before current step {idx}, retrying current step"
+                                );
+                            }
+                            None => {}
+                        }
+                        // Retry just the current step.
+                        super::file_commands::cleanup_file_commands(&file_command_paths);
+                        step_state_snapshot.restore(step_ctx.job, &step.context_name);
+                        continue;
+                    }
+                    Some(preloop_gha_protocol::debug_session::Verdict::Continue) => {
+                        // The step still failed; the controller accepted it.
+                        // Mirrors runtime `continue-on-error`, except a
+                        // durable masking failure must never be laundered
+                        // into success by an interactive verdict.
+                        let continued_conclusion =
+                            interactive_continue_conclusion(durable_log_error.is_some());
+                        warn!(
+                            "Step '{}' failed but was continued interactively",
+                            resolved_display_name
+                        );
+                        step_ctx.log("##[warning]Step failed but was continued interactively.");
+                        if let Some(step_result) = step_ctx.job.steps.get_mut(&step.context_name) {
+                            step_result.conclusion = continued_conclusion.to_string();
+                        }
+                        break (continued_conclusion.to_string(), file_command_paths);
+                    }
+                    Some(preloop_gha_protocol::debug_session::Verdict::Abort) => {
+                        // The step keeps its failure and the job unwinds
+                        // normally, so `always()` cleanup still runs and
+                        // containers still stop. What abort adds is a promise
+                        // not to ask again: without it a later `always()`
+                        // step failing would pause a job the user already
+                        // walked away from.
+                        info!("Debug session aborted — failing the job without pausing again");
+                        step_ctx.log(
+                            "##[error]Debugging aborted. The job fails from here; \
+                                 cleanup steps still run.",
+                        );
+                        debugging_declined = true;
+                        // An aborted `continue-on-error` step keeps its
+                        // failure: the verdict promises "the job fails
+                        // from here", and the tolerated conclusion would
+                        // leave `any_failed` false and the job green.
+                        // Flip the recorded conclusion so the aggregation
+                        // and the step report agree.
+                        if outcome_str == "Failure" {
                             if let Some(step_result) =
                                 step_ctx.job.steps.get_mut(&step.context_name)
                             {
-                                step_result.conclusion = continued_conclusion.to_string();
+                                step_result.conclusion = "Failure".to_string();
                             }
-                            break (continued_conclusion.to_string(), file_command_paths);
+                            break ("Failure".to_string(), file_command_paths);
                         }
-                        Some(preloop_gha_protocol::debug_session::Verdict::Abort) => {
-                            // The step keeps its failure and the job unwinds
-                            // normally, so `always()` cleanup still runs and
-                            // containers still stop. What abort adds is a promise
-                            // not to ask again: without it a later `always()`
-                            // step failing would pause a job the user already
-                            // walked away from.
-                            info!("Debug session aborted — failing the job without pausing again");
-                            step_ctx.log(
-                                "##[error]Debugging aborted. The job fails from here; \
-                                 cleanup steps still run.",
-                            );
-                            debugging_declined = true;
-                            // An aborted `continue-on-error` step keeps its
-                            // failure: the verdict promises "the job fails
-                            // from here", and the tolerated conclusion would
-                            // leave `any_failed` false and the job green.
-                            // Flip the recorded conclusion so the aggregation
-                            // and the step report agree.
-                            if outcome_str == "Failure" {
-                                if let Some(step_result) =
-                                    step_ctx.job.steps.get_mut(&step.context_name)
-                                {
-                                    step_result.conclusion = "Failure".to_string();
-                                }
-                                break ("Failure".to_string(), file_command_paths);
-                            }
-                            break (conclusion_str, file_command_paths);
-                        }
-                        // No session, or the session vanished. Neither is a
-                        // decision: fall through and fail normally.
-                        None => break (conclusion_str, file_command_paths),
+                        break (conclusion_str, file_command_paths);
                     }
+                    // No session, or the session vanished. Neither is a
+                    // decision: fall through and fail normally.
+                    None => break (conclusion_str, file_command_paths),
                 }
             }
 
@@ -1223,27 +1217,27 @@ pub async fn run_steps(
 
         // DAP: OnStepCompleted — emit `continued` if we paused.
         // Mirrors StepsRunner.cs: `dapDebugger?.OnStepCompleted(step);`
-        if !step.is_background {
-            if let Some(dbg) = dap_debugger.as_ref() {
-                let is_pre = step.id.starts_with("__pre_")
-                    || step
-                        .raw
-                        .get("isPre")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                let is_post = step.id.starts_with("__post_")
-                    || step
-                        .raw
-                        .get("isPost")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                let source_entry = preloop_dap::SourceEntry {
-                    display_name: resolved_display_name.clone(),
-                    is_pre,
-                    is_post,
-                };
-                dbg.on_step_completed(&source_entry);
-            }
+        if !step.is_background
+            && let Some(dbg) = dap_debugger.as_ref()
+        {
+            let is_pre = step.id.starts_with("__pre_")
+                || step
+                    .raw
+                    .get("isPre")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            let is_post = step.id.starts_with("__post_")
+                || step
+                    .raw
+                    .get("isPost")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            let source_entry = preloop_dap::SourceEntry {
+                display_name: resolved_display_name.clone(),
+                is_pre,
+                is_post,
+            };
+            dbg.on_step_completed(&source_entry);
         }
 
         let step_end = crate::worker::helpers::iso_now();
@@ -1347,10 +1341,10 @@ pub async fn run_steps(
             // A jumped range may include other pinned checkout steps whose
             // submission-time credential expired while the job waited. Swap
             // in the verdict's replacement for all of them before the replay.
-            if let Some(token) = pending_snapshot_token.as_deref() {
-                if let Some(client) = debug_client.as_ref() {
-                    client.refresh_snapshot_tokens(&mut steps, token);
-                }
+            if let Some(token) = pending_snapshot_token.as_deref()
+                && let Some(client) = debug_client.as_ref()
+            {
+                client.refresh_snapshot_tokens(&mut steps, token);
             }
             // Clear every runner-managed per-step value for the range about to
             // re-run. Restoring only the target snapshot leaves saveState and
@@ -1405,10 +1399,10 @@ pub async fn run_steps(
             job.step_annotations
                 .insert(result.context_name.clone(), result.annotations.clone());
         }
-        if let Some(rpt) = reporting {
-            if !result.logs.is_empty() {
-                crate::worker::reporting::upload_step_log(rpt, &result.step_id, &result.logs).await;
-            }
+        if let Some(rpt) = reporting
+            && !result.logs.is_empty()
+        {
+            crate::worker::reporting::upload_step_log(rpt, &result.step_id, &result.logs).await;
         }
     }
 
@@ -1577,11 +1571,7 @@ fn should_pause_on_failure(
 /// Interactive Continue may tolerate an execution failure, but it cannot
 /// override a durable masking failure.
 fn interactive_continue_conclusion(masking_failed: bool) -> &'static str {
-    if masking_failed {
-        "Failure"
-    } else {
-        "Success"
-    }
+    if masking_failed { "Failure" } else { "Success" }
 }
 
 /// Execute a single step, threading cancel_rx to the process invoker.

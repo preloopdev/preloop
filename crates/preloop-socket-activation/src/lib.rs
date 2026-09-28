@@ -1,6 +1,6 @@
 //! Minimal systemd socket activation support.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 
 /// Take the single TCP listener passed by systemd, if socket activation is
 /// configured for this process.

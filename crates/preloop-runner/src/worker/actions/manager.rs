@@ -254,13 +254,13 @@ pub async fn download_action(
     };
     // A pin/attestation disagreement means the engine attested different
     // bytes than it pinned: fail closed rather than guess which to trust.
-    if let (ArchiveDigestPin::Pinned(expected), Some(attested)) = (&digest_pin, &attested_digest) {
-        if attested != expected {
-            anyhow::bail!(
-                "action archive sha256 attestation mismatch for {owner}/{repo}@{git_ref}: \
+    if let (ArchiveDigestPin::Pinned(expected), Some(attested)) = (&digest_pin, &attested_digest)
+        && attested != expected
+    {
+        anyhow::bail!(
+            "action archive sha256 attestation mismatch for {owner}/{repo}@{git_ref}: \
                  pinned {expected} but engine attested {attested}; refusing to extract"
-            );
-        }
+        );
     }
     let observed_digest = if verifying {
         let observed = archive_sha256_hex(&bytes);
@@ -405,10 +405,10 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
         if entry_type.is_dir() {
             dest_dir.create_dir_all(&stripped)?;
         } else if entry_type.is_file() {
-            if let Some(parent) = stripped.parent() {
-                if parent.components().count() > 0 {
-                    dest_dir.create_dir_all(parent)?;
-                }
+            if let Some(parent) = stripped.parent()
+                && parent.components().count() > 0
+            {
+                dest_dir.create_dir_all(parent)?;
             }
             let mut outfile = dest_dir.create(&stripped)?;
             std::io::copy(&mut entry, &mut outfile)?;
@@ -425,10 +425,10 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
         } else if entry_type.is_symlink() {
             if let Some(link_target) = entry.link_name()? {
                 let parent = stripped.parent();
-                if let Some(parent) = parent {
-                    if parent.components().count() > 0 {
-                        dest_dir.create_dir_all(parent)?;
-                    }
+                if let Some(parent) = parent
+                    && parent.components().count() > 0
+                {
+                    dest_dir.create_dir_all(parent)?;
                 }
 
                 // Resolve physical parent directory relative to dest to account for
@@ -689,10 +689,12 @@ mod tests {
         );
         let result = extract_tarball(&tar_bytes, &dest);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported or dangerous"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported or dangerous")
+        );
     }
 
     #[test]
@@ -708,10 +710,12 @@ mod tests {
         );
         let result = extract_tarball(&tar_bytes, &dest);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("symlink with escaping or absolute target rejected"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("symlink with escaping or absolute target rejected")
+        );
     }
 
     #[test]
@@ -798,10 +802,12 @@ mod tests {
         let tar_bytes = enc.finish().unwrap();
         let result = extract_tarball(&tar_bytes, &dest);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("symlink with escaping or absolute target rejected"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("symlink with escaping or absolute target rejected")
+        );
     }
 
     #[cfg(unix)]
@@ -905,7 +911,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_action_atomic_cleanup_on_error() {
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         let evil_tar = create_test_tarball(&[("root/../../escape.txt", b"evil")]);
 
         let app = Router::new().route("/tarball", get(|| async move { evil_tar }));
@@ -943,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_action_atomic_success_and_cache_hit() {
-        use axum::{routing::get, Router};
+        use axum::{Router, routing::get};
         let valid_tar = create_test_tarball(&[("checkout-v4/action.yml", b"name: Checkout\n")]);
 
         let app = Router::new().route("/tarball", get(|| async move { valid_tar }));
@@ -1095,10 +1101,12 @@ mod tests {
         let actions_dir = temp.path().join("actions");
         let result = copy_local_action(&source, &actions_dir, "my-local-action");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("escaping or absolute symlink"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("escaping or absolute symlink")
+        );
         assert!(!actions_dir.join("my-local-action").exists());
     }
 
@@ -1135,7 +1143,7 @@ mod tests {
     /// When `digest` is `Some`, the engine attestation header is set, like
     /// `download_action_tarball` does for a pinned fetch.
     async fn serve_test_tarball_with_digest(tar_bytes: Vec<u8>, digest: Option<String>) -> String {
-        use axum::{http::HeaderMap, routing::get, Router};
+        use axum::{Router, http::HeaderMap, routing::get};
         let app = Router::new().route(
             "/tarball",
             get(|| async move {

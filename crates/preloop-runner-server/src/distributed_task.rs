@@ -20,10 +20,10 @@ pub async fn next_message(
 
     loop {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(runner_id) = verified {
-            if inner.runner_id_for_session(&session_id) != Some(runner_id) {
-                return (StatusCode::FORBIDDEN, Json(None));
-            }
+        if let Some(runner_id) = verified
+            && inner.runner_id_for_session(&session_id) != Some(runner_id)
+        {
+            return (StatusCode::FORBIDDEN, Json(None));
         }
         inner.mark_session_seen(&session_id);
         if let Some(message) = inner
@@ -376,12 +376,12 @@ pub async fn agent_request_get(
         .job_requests
         .get(&request_id)
         .ok_or_else(|| ApiError::not_found("agent request not found"))?;
-    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        if !runner_owns_agent_request(&inner, request_id, runner_id) {
-            return Err(ApiError::forbidden(
-                "agent request belongs to another runner",
-            ));
-        }
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id)
+        && !runner_owns_agent_request(&inner, request_id, runner_id)
+    {
+        return Err(ApiError::forbidden(
+            "agent request belongs to another runner",
+        ));
     }
     Ok(Json(agent_request_json(pool_id, request)))
 }
@@ -458,14 +458,13 @@ pub async fn agent_request_patch(
         // complete_job_inner which acquires the lock itself.
         let completion = {
             let mut inner = shared.state.inner.lock().await;
-            if let Some(runner_id) = verified_runner_id {
-                if inner.job_requests.contains_key(&request_id)
-                    && !runner_owns_agent_request(&inner, request_id, runner_id)
-                {
-                    return Err(ApiError::forbidden(
-                        "agent request belongs to another runner",
-                    ));
-                }
+            if let Some(runner_id) = verified_runner_id
+                && inner.job_requests.contains_key(&request_id)
+                && !runner_owns_agent_request(&inner, request_id, runner_id)
+            {
+                return Err(ApiError::forbidden(
+                    "agent request belongs to another runner",
+                ));
             }
             let already_completed = inner
                 .job_requests
@@ -523,24 +522,21 @@ pub async fn agent_request_patch(
     // requests are immutable, so a late duplicate cannot rewrite their timing.
     {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(runner_id) = verified_runner_id {
-            if inner.job_requests.contains_key(&request_id)
-                && !runner_owns_agent_request(&inner, request_id, runner_id)
-            {
-                return Err(ApiError::forbidden(
-                    "agent request belongs to another runner",
-                ));
-            }
+        if let Some(runner_id) = verified_runner_id
+            && inner.job_requests.contains_key(&request_id)
+            && !runner_owns_agent_request(&inner, request_id, runner_id)
+        {
+            return Err(ApiError::forbidden(
+                "agent request belongs to another runner",
+            ));
         }
         let request_active = inner
             .job_requests
             .get(&request_id)
             .is_some_and(|request| request.result.is_none());
-        if request_active {
-            if let Some(request) = inner.job_requests.get_mut(&request_id) {
-                request.locked_until = agent_request_locked_until();
-                request.last_renewed_at = Some(std::time::SystemTime::now());
-            }
+        if request_active && let Some(request) = inner.job_requests.get_mut(&request_id) {
+            request.locked_until = agent_request_locked_until();
+            request.last_renewed_at = Some(std::time::SystemTime::now());
         }
     }
     Ok(Json(
@@ -872,34 +868,33 @@ pub async fn complete_job_inner(
             })
             .max_by_key(|record| record.request_id)
             .map(|record| record.agent_job_id)
-    }) {
-        if let Some(manifest) = inner.job_steps.get_mut(&agent_job_id) {
-            for wire in &completion.step_results {
-                let Some(external_id) = wire.external_id.as_deref() else {
-                    continue;
-                };
-                let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
-                    continue;
-                };
-                if let Some(conclusion) = completion_step_conclusion(wire) {
-                    manifest[pos].conclusion = conclusion;
-                }
-                if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
-                    manifest[pos].runner_number = Some(number);
-                }
+    }) && let Some(manifest) = inner.job_steps.get_mut(&agent_job_id)
+    {
+        for wire in &completion.step_results {
+            let Some(external_id) = wire.external_id.as_deref() else {
+                continue;
+            };
+            let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
+                continue;
+            };
+            if let Some(conclusion) = completion_step_conclusion(wire) {
+                manifest[pos].conclusion = conclusion;
             }
-            let orphan_conclusion = status_string(effective_status);
-            for step in manifest.iter_mut() {
-                if step.conclusion == "in_progress" {
-                    step.conclusion = orphan_conclusion.clone();
-                    step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-                }
+            if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
+                manifest[pos].runner_number = Some(number);
             }
-            completed_attempt = Some((agent_job_id, manifest.clone()));
-            let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
-            *counter += 1;
-            completion_revision = *counter;
         }
+        let orphan_conclusion = status_string(effective_status);
+        for step in manifest.iter_mut() {
+            if step.conclusion == "in_progress" {
+                step.conclusion = orphan_conclusion.clone();
+                step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
+            }
+        }
+        completed_attempt = Some((agent_job_id, manifest.clone()));
+        let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
+        *counter += 1;
+        completion_revision = *counter;
     }
     let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
         apply_matrix_fail_fast(&mut inner, completion.run_id, &completion.job_id)
@@ -952,10 +947,10 @@ pub async fn complete_job_inner(
         .map(|(id, _)| *id)
         .collect();
     for request_id in &finished_request_ids {
-        if let Some(req) = inner.job_requests.get_mut(request_id) {
-            if req.result.is_none() {
-                req.result = Some(effective_status);
-            }
+        if let Some(req) = inner.job_requests.get_mut(request_id)
+            && req.result.is_none()
+        {
+            req.result = Some(effective_status);
         }
         inner
             .session_active_requests
@@ -978,8 +973,8 @@ pub async fn complete_job_inner(
     // Best-effort, outside the lock: the completion's own step conclusions
     // must survive a restart, and the run-event projection deliberately no
     // longer carries step rows.
-    if let Some((agent_job_id, records)) = completed_attempt {
-        if let Err(error) = shared
+    if let Some((agent_job_id, records)) = completed_attempt
+        && let Err(error) = shared
             .state
             .store
             .store_job_steps(
@@ -989,9 +984,8 @@ pub async fn complete_job_inner(
                 completion_revision,
             )
             .await
-        {
-            warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");
-        }
+    {
+        warn!(?error, run_id = %completion.run_id, "failed to persist completion step records");
     }
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was

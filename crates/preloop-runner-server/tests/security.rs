@@ -258,11 +258,13 @@ jobs:
     let body_b64 = cancellation["body"].as_str().unwrap();
     let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert!(body["jobId"]
-        .as_str()
-        .unwrap()
-        .parse::<uuid::Uuid>()
-        .is_ok());
+    assert!(
+        body["jobId"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok()
+    );
     assert_eq!(body["timeout"], "00:05:00");
 
     let run_b = get_run_json(&app, b_id).await;
@@ -736,11 +738,13 @@ jobs:
         cancel_msg["messageId"]
     );
     let body: Value = serde_json::from_str(cancel_msg["body"].as_str().unwrap()).unwrap();
-    assert!(body["jobId"]
-        .as_str()
-        .unwrap()
-        .parse::<uuid::Uuid>()
-        .is_ok());
+    assert!(
+        body["jobId"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok()
+    );
     assert_eq!(body["timeout"], "00:05:00");
 
     // Simulate runner finishing the cancelled job, freeing the session.
@@ -1074,7 +1078,7 @@ jobs:
     // (and possibly concurrency).
     assert_eq!(run["jobs"]["first"], "queued");
     assert_eq!(run["jobs"]["second"], "queued"); // in pending_jobs (needs)
-                                                 // peer has no needs → evaluates concurrency immediately.
+    // peer has no needs → evaluates concurrency immediately.
     assert!(
         run["jobs"]["peer"] == "queued" || run["jobs"]["peer"] == "pending",
         "peer={}",
@@ -1870,14 +1874,18 @@ jobs:
             inner.runs[&second_run].jobs[&second_job],
             ExecutionStatus::Pending
         );
-        assert!(inner
-            .queue
-            .iter()
-            .any(|job| job.run_id == first_run && job.job_id == first_job));
-        assert!(inner
-            .concurrency_blocked
-            .iter()
-            .any(|job| job.run_id == second_run && job.job_id == second_job));
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == first_run && job.job_id == first_job)
+        );
+        assert!(
+            inner
+                .concurrency_blocked
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job)
+        );
         (first_job, second_job)
     };
 
@@ -1899,14 +1907,18 @@ jobs:
             inner.runs[&second_run].jobs[&second_inner],
             ExecutionStatus::Queued
         );
-        assert!(inner
-            .queue
-            .iter()
-            .any(|job| job.run_id == second_run && job.job_id == second_inner));
-        assert!(!inner
-            .concurrency_blocked
-            .iter()
-            .any(|job| job.run_id == second_run && job.job_id == second_job));
+        assert!(
+            inner
+                .queue
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_inner)
+        );
+        assert!(
+            !inner
+                .concurrency_blocked
+                .iter()
+                .any(|job| job.run_id == second_run && job.job_id == second_job)
+        );
     };
     complete_via_api(&app, &second_run.to_string(), "call/inner").await;
     assert_eq!(
@@ -3177,10 +3189,12 @@ async fn workspace_snapshot_captures_git_state_without_mutating_source() {
 
     assert_eq!(snapshot.repository, format!("snapshots/{run_id}"));
     assert_eq!(snapshot.commit_sha.len(), 40);
-    assert!(snapshot
-        .commit_sha
-        .bytes()
-        .all(|byte| byte.is_ascii_hexdigit()));
+    assert!(
+        snapshot
+            .commit_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
     assert_eq!(
         git_fixture_output(&workspace, &["status", "--porcelain=v1"]),
         status_before,

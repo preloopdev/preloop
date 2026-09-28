@@ -24,8 +24,8 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -114,9 +114,24 @@ impl Drop for ControlBridge {
 /// (default 256); excess connections are closed immediately. Connections idle
 /// longer than `PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS` (default 300) are closed.
 pub async fn spawn_from_env() -> Option<ControlBridge> {
-    let origin = std::env::var(CONTROL_ORIGIN_ENV).ok()?;
-    let socket = std::env::var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
-    let upstream_addr = std::env::var(CONTROL_UPSTREAM_ENV).ok();
+    spawn_from_env_lookup(
+        |name| std::env::var(name).ok(),
+        |name| std::env::var_os(name),
+    )
+    .await
+}
+
+/// [`spawn_from_env`] with the environment reads behind `lookup` closures so
+/// tests — and any caller that resolves env another way — never write the
+/// process environment (`set_var` is unsafe under edition 2024 and this
+/// crate forbids `unsafe`).
+pub async fn spawn_from_env_lookup(
+    var: impl Fn(&str) -> Option<String>,
+    var_os: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<ControlBridge> {
+    let origin = var(CONTROL_ORIGIN_ENV)?;
+    let socket = var_os(CONTROL_SOCKET_ENV).map(PathBuf::from);
+    let upstream_addr = var(CONTROL_UPSTREAM_ENV);
     let upstream = match (socket, upstream_addr.as_deref()) {
         #[cfg(unix)]
         (Some(socket), _) => Upstream::Socket(socket),
@@ -142,13 +157,11 @@ pub async fn spawn_from_env() -> Option<ControlBridge> {
     let address = loopback_address(&origin)?;
     // Absurd values fall back to the default: 0 would refuse everything and
     // anything above Semaphore::MAX_PERMITS would panic in the constructor.
-    let max_connections = std::env::var(BRIDGE_MAX_CONNECTIONS_ENV)
-        .ok()
+    let max_connections = var(BRIDGE_MAX_CONNECTIONS_ENV)
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
         .unwrap_or(DEFAULT_MAX_CONNECTIONS);
-    let idle_timeout = std::env::var(BRIDGE_IDLE_TIMEOUT_SECS_ENV)
-        .ok()
+    let idle_timeout = var(BRIDGE_IDLE_TIMEOUT_SECS_ENV)
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&s| s > 0)
         .map(Duration::from_secs)

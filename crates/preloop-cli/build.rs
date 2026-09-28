@@ -102,14 +102,12 @@ fn main() {
         .args(["rev-parse", "--symbolic-full-name", "HEAD"])
         .current_dir(&manifest_dir)
         .output()
+        && output.status.success()
+        && let Ok(ref_name) = String::from_utf8(output.stdout)
     {
-        if output.status.success() {
-            if let Ok(ref_name) = String::from_utf8(output.stdout) {
-                let ref_name = ref_name.trim();
-                if let Some(short) = ref_name.strip_prefix("refs/") {
-                    ref_paths.push(format!("../../.git/{short}"));
-                }
-            }
+        let ref_name = ref_name.trim();
+        if let Some(short) = ref_name.strip_prefix("refs/") {
+            ref_paths.push(format!("../../.git/{short}"));
         }
     }
     ref_paths.push(String::from("../../.git/packed-refs"));

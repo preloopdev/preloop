@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::client::broker::BrokerClient;
 use crate::client::http::{HttpClient, SessionBackoff};
 use crate::client::run_service::RunServiceClient;
-use crate::listener::job_dispatcher::{self, cancellation_timing, parse_timespan_secs, RunningJob};
+use crate::listener::job_dispatcher::{self, RunningJob, cancellation_timing, parse_timespan_secs};
 use crate::settings::RunnerConfig;
 use crate::worker::helpers::extract_service_endpoint;
 
@@ -241,8 +241,8 @@ pub async fn run_broker_loop(
     loop {
         // Proactive OAuth token refresh — renew 5 minutes before expiry so the
         // next poll cycle always uses a live token (RLIS-02).
-        if let Some(exp) = token_expires_at {
-            if std::time::Instant::now() >= exp {
+        if let Some(exp) = token_expires_at
+            && std::time::Instant::now() >= exp {
                 info!("OAuth token expiring soon, proactively refreshing...");
                 match crate::listener::oauth::get_oauth_token(http, &config).await {
                     Ok((t, ea)) => {
@@ -255,7 +255,6 @@ pub async fn run_broker_loop(
                     }
                 }
             }
-        }
 
         // Check if active job has finished (non-blocking) — covers the case
         // where the job completed between loop iterations without going through select!.
@@ -607,14 +606,13 @@ pub async fn run_broker_loop(
                                     continue;
                                 };
                                 if let Some(job) = active_job.as_mut() {
-                                    if let Some(active_id) = job.job_id {
-                                        if msg_id != active_id {
+                                    if let Some(active_id) = job.job_id
+                                        && msg_id != active_id {
                                             debug!(
                                                 "JobCancellation jobId {msg_id} does not match active {active_id} — ignoring"
                                             );
                                             continue;
                                         }
-                                    }
                                     info!(
                                         "Cancelling active job {} (timeout={}s, kill_after={}s)",
                                         job.request_id,
@@ -806,12 +804,11 @@ fn is_session_expired(err: &anyhow::Error) -> bool {
             crate::client::http::HttpError::Status { status, body } => {
                 // Official BrokerHttpClient: errorKind RunnerSessionInvalid →
                 // TaskAgentSessionExpiredException (recreate session).
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                    if json.get("errorKind").and_then(|v| v.as_str())
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body)
+                    && json.get("errorKind").and_then(|v| v.as_str())
                         == Some("RunnerSessionInvalid")
-                    {
-                        return true;
-                    }
+                {
+                    return true;
                 }
                 // Pre-structured-body / AzDO session paths still use 404.
                 *status == reqwest::StatusCode::NOT_FOUND
@@ -876,34 +873,33 @@ fn parse_message_body(
     let body_val = msg.get("body");
 
     // If body is already a JSON object (plaintext broker path), return directly
-    if let Some(body) = body_val {
-        if body.is_object() || body.is_array() {
-            if use_fips_encryption {
-                anyhow::bail!("FIPS broker message must be encrypted");
-            }
-            return Ok(body.clone());
+    if let Some(body) = body_val
+        && (body.is_object() || body.is_array())
+    {
+        if use_fips_encryption {
+            anyhow::bail!("FIPS broker message must be encrypted");
         }
+        return Ok(body.clone());
     }
 
     let body_str = body_val.and_then(|v| v.as_str()).unwrap_or("{}");
     let iv_str = msg.get("iv").and_then(|v| v.as_str());
 
     // Decrypt if we have key + IV
-    if let (Some(key), Some(iv)) = (session_key, iv_str) {
-        if !iv.is_empty() {
-            let body_bytes = base64::engine::general_purpose::STANDARD
-                .decode(body_str)
-                .context("base64 decode body")?;
-            let iv_bytes = base64::engine::general_purpose::STANDARD
-                .decode(iv)
-                .context("base64 decode IV")?;
-            let enc = preloop_gha_protocol::crypto::SessionEncryption::from_key(key.to_vec());
-            let plain = enc
-                .decrypt(&body_bytes, &iv_bytes)
-                .map_err(|e| anyhow::anyhow!("decrypting: {e}"))?;
-            return serde_json::from_str(&String::from_utf8(plain)?)
-                .context("parsing decrypted body");
-        }
+    if let (Some(key), Some(iv)) = (session_key, iv_str)
+        && !iv.is_empty()
+    {
+        let body_bytes = base64::engine::general_purpose::STANDARD
+            .decode(body_str)
+            .context("base64 decode body")?;
+        let iv_bytes = base64::engine::general_purpose::STANDARD
+            .decode(iv)
+            .context("base64 decode IV")?;
+        let enc = preloop_gha_protocol::crypto::SessionEncryption::from_key(key.to_vec());
+        let plain = enc
+            .decrypt(&body_bytes, &iv_bytes)
+            .map_err(|e| anyhow::anyhow!("decrypting: {e}"))?;
+        return serde_json::from_str(&String::from_utf8(plain)?).context("parsing decrypted body");
     }
 
     if use_fips_encryption {
@@ -1061,10 +1057,9 @@ async fn re_resolve_broker_url(http: &HttpClient, server_url: &str) -> Option<St
         if let Some(properties) = resp
             .get("locationServiceData")
             .and_then(|l| l.get("properties"))
+            && let Some(broker_url) = properties.get("ServerUrlV2").and_then(|v| v.as_str())
         {
-            if let Some(broker_url) = properties.get("ServerUrlV2").and_then(|v| v.as_str()) {
-                return Some(broker_url.to_string());
-            }
+            return Some(broker_url.to_string());
         }
     }
     None

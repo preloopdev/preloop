@@ -243,9 +243,11 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     let first_alternates = git_alternate_object_directories(&first_repository);
     let second_alternates = git_alternate_object_directories(&second_repository);
     assert_eq!(first_alternates, second_alternates);
-    assert!(first_alternates
-        .iter()
-        .all(|alternate| { alternate.starts_with(&state_dir) && alternate != &state_dir }));
+    assert!(
+        first_alternates
+            .iter()
+            .all(|alternate| { alternate.starts_with(&state_dir) && alternate != &state_dir })
+    );
     assert!(
         git_pack_bytes(&first_repository) < source_pack_bytes / 2,
         "first run repository contains a full-base pack"
@@ -465,7 +467,7 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         redirect_primary_checkout(
             &mut empty_ref,
             &WorkspaceSnapshot {
-            head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
+                head_sha: Some("f000000000000000000000000000000000000000".to_owned()),
                 commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 tree_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 repository: "snapshots/33333333-3333-4333-8333-333333333333".to_owned(),
@@ -1038,9 +1040,11 @@ jobs:
     let advertisement_body = to_bytes(advertisement.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(advertisement_body
-        .windows(commit.len())
-        .any(|window| window == commit.as_bytes()));
+    assert!(
+        advertisement_body
+            .windows(commit.len())
+            .any(|window| window == commit.as_bytes())
+    );
 
     fn pkt_line(payload: &[u8]) -> Vec<u8> {
         let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
@@ -1370,13 +1374,17 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
 
     // The objects live in the checkout cache, not in a per-run copy of the
     // repository.
-    assert!(state_dir
-        .join(format!("checkout-cache/runs/{run_id}.git"))
-        .is_dir());
-    assert!(!state_dir
-        .join("snapshots")
-        .join(run_id.to_string())
-        .exists());
+    assert!(
+        state_dir
+            .join(format!("checkout-cache/runs/{run_id}.git"))
+            .is_dir()
+    );
+    assert!(
+        !state_dir
+            .join("snapshots")
+            .join(run_id.to_string())
+            .exists()
+    );
 }
 
 /// Uploaded job logs must stay bounded, and pruning must not cost a run its
@@ -2228,10 +2236,12 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let recovered_inner = recovered.inner.lock().await;
     assert!(!recovered_inner.runners.contains_key(&runner_a));
-    assert!(recovered_inner
-        .runner_client_ids
-        .values()
-        .all(|id| *id != runner_a));
+    assert!(
+        recovered_inner
+            .runner_client_ids
+            .values()
+            .all(|id| *id != runner_a)
+    );
 }
 
 #[tokio::test]

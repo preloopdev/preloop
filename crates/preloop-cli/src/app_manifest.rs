@@ -22,14 +22,14 @@
 //! | `/installed` | GitHub's post-install redirect; reports the installation   |
 
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 /// Default permissions of the generated App.
 ///
@@ -389,10 +389,10 @@ async fn page_installed(
     State((flow, _)): State<(Arc<Flow>, Option<String>)>,
     Query(query): Query<InstalledQuery>,
 ) -> impl IntoResponse {
-    if let Some(id) = query.installation_id {
-        if let Some(tx) = flow.installed_tx.lock().await.take() {
-            let _ = tx.send(id);
-        }
+    if let Some(id) = query.installation_id
+        && let Some(tx) = flow.installed_tx.lock().await.take()
+    {
+        let _ = tx.send(id);
     }
     Html(success_page(
         "preloop is connected",
@@ -621,10 +621,12 @@ mod tests {
             registration.credentials.webhook_secret.as_deref(),
             Some("hook-secret")
         );
-        assert!(registration
-            .credentials
-            .pem
-            .contains("BEGIN RSA PRIVATE KEY"));
+        assert!(
+            registration
+                .credentials
+                .pem
+                .contains("BEGIN RSA PRIVATE KEY")
+        );
         assert_eq!(registration.installation_id, Some(99));
     }
 

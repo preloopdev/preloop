@@ -3,10 +3,10 @@ use std::borrow::Cow;
 use std::io::Write;
 
 use super::{
+    ContextFunctionCall, ExpressionError, ExpressionReferences,
     ast::{BinaryOp, Expr},
     conditions::is_truthy,
     context::Context,
-    ContextFunctionCall, ExpressionError, ExpressionReferences,
 };
 
 fn function_arity(name: &str) -> Option<(usize, usize)> {
@@ -580,10 +580,10 @@ fn from_json_lenient(input: &str) -> Result<Value, String> {
     match serde_json::from_str(input) {
         Ok(value) => Ok(value),
         Err(strict_error) => {
-            if let Some(normalized) = normalize_newtonsoft_json(input) {
-                if let Ok(value) = serde_json::from_str(&normalized) {
-                    return Ok(value);
-                }
+            if let Some(normalized) = normalize_newtonsoft_json(input)
+                && let Ok(value) = serde_json::from_str(&normalized)
+            {
+                return Ok(value);
             }
             Err(strict_error.to_string())
         }
@@ -797,10 +797,11 @@ fn string_value(value: &Value) -> String {
             if let Some(u) = value.as_u64() {
                 return u.to_string();
             }
-            if let Some(f) = value.as_f64() {
-                if f.fract() == 0.0 && f.abs() < 1e15 {
-                    return (f as i64).to_string();
-                }
+            if let Some(f) = value.as_f64()
+                && f.fract() == 0.0
+                && f.abs() < 1e15
+            {
+                return (f as i64).to_string();
             }
             value.to_string()
         }

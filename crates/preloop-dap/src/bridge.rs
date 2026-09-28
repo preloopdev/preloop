@@ -40,8 +40,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 use tracing::{debug, warn};
 
 /// Detected transport kind of the first packet of an inbound

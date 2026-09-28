@@ -348,11 +348,11 @@ mod tests {
 
     #[tokio::test]
     async fn auto_pr_opens_draft_and_respects_labels_and_dedup() {
-        use axum::body::{to_bytes, Body};
-        use axum::http::{header, Method, Request, StatusCode};
-        use axum::{routing::get, routing::post, Json as AxumJson, Router};
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Method, Request, StatusCode, header};
+        use axum::{Json as AxumJson, Router, routing::get, routing::post};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio_util::sync::CancellationToken;
         use tower::ServiceExt;
 
@@ -497,9 +497,9 @@ mod tests {
 
     #[tokio::test]
     async fn native_push_submission_never_auto_opens_a_pr() {
-        use axum::body::{to_bytes, Body};
-        use axum::http::{header, Method, Request, StatusCode};
-        use axum::{routing::get, Router};
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Method, Request, StatusCode, header};
+        use axum::{Router, routing::get};
         use tokio_util::sync::CancellationToken;
         use tower::ServiceExt;
 
@@ -568,8 +568,8 @@ mod tests {
 
     #[tokio::test]
     async fn dirty_push_submission_records_snapshot_tree() {
-        use axum::body::{to_bytes, Body};
-        use axum::http::{header, Method, Request, StatusCode};
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Method, Request, StatusCode, header};
         use base64::Engine as _;
         use std::process::Command;
         use tokio_util::sync::CancellationToken;

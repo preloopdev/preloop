@@ -618,12 +618,14 @@ exit 0
                 }
             }
         }
-        assert!(args
-            .windows(2)
-            .any(|pair| { pair == ["--proxy", "http://preloop.proxy:8080"] }));
-        assert!(args
-            .windows(2)
-            .any(|pair| { pair == ["--no-proxy", ".preloop.internal"] }));
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--proxy", "http://preloop.proxy:8080"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--no-proxy", ".preloop.internal"] })
+        );
         assert!(!args.iter().any(|arg| arg.contains("standard.proxy")));
         assert!(!args.iter().any(|arg| arg.contains("standard.internal")));
     }
@@ -668,9 +670,11 @@ exit 0
         let mut spec = valid_spec(MachineName::new("test-floor").unwrap());
         spec.network = NetworkPolicy::PublicOnly;
         provider.create(&spec).await.unwrap();
-        assert!(captured_args(&executable)
-            .windows(2)
-            .any(|args| args == ["--net-backend", "virtio-net"]));
+        assert!(
+            captured_args(&executable)
+                .windows(2)
+                .any(|args| args == ["--net-backend", "virtio-net"])
+        );
         assert_eq!(captured_env(&executable), "SMOLVM_EGRESS_FLOOR=strict");
     }
 

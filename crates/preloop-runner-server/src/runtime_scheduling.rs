@@ -481,15 +481,13 @@ pub fn cancel_job_inner(inner: &mut InnerState, run_id: RunId, job_id: &JobId) -
     };
 
     let mut count = 0;
-    if was_in_progress {
-        if let Some(agent_job_id) = agent_job_id_for(inner, run_id, job_id) {
-            inner.cancellation_queue.push_back(QueuedCancellation {
-                run_id,
-                job_id: job_id.clone(),
-                agent_job_id,
-            });
-            count = 1;
-        }
+    if was_in_progress && let Some(agent_job_id) = agent_job_id_for(inner, run_id, job_id) {
+        inner.cancellation_queue.push_back(QueuedCancellation {
+            run_id,
+            job_id: job_id.clone(),
+            agent_job_id,
+        });
+        count = 1;
     }
     inner
         .queue
@@ -594,15 +592,16 @@ pub fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id
             group.pending.retain(|h| !h.contains_job(run_id, job_id));
         }
         if should_release {
-            if let Some(group) = inner.concurrency_groups.get_mut(&key) {
-                if let Some(done) = group.running.take() {
-                    promote_next_from_group(inner, &key, done);
-                }
+            if let Some(group) = inner.concurrency_groups.get_mut(&key)
+                && let Some(done) = group.running.take()
+            {
+                promote_next_from_group(inner, &key, done);
             }
-        } else if let Some(group) = inner.concurrency_groups.get(&key) {
-            if group.running.is_none() && group.pending.is_empty() {
-                inner.concurrency_groups.remove(&key);
-            }
+        } else if let Some(group) = inner.concurrency_groups.get(&key)
+            && group.running.is_none()
+            && group.pending.is_empty()
+        {
+            inner.concurrency_groups.remove(&key);
         }
         // C-07: prune this key from holder_keys when the run has no remaining
         // presence in the group (neither running nor pending).
@@ -610,12 +609,10 @@ pub fn release_concurrency_for_job(inner: &mut InnerState, run_id: RunId, job_id
             g.running.as_ref().is_some_and(|h| h.run_id() == run_id)
                 || g.pending.iter().any(|h| h.run_id() == run_id)
         });
-        if !run_still_present {
-            if let Some(rkeys) = inner.holder_keys.get_mut(&run_id) {
-                rkeys.retain(|k| k != &key);
-                if rkeys.is_empty() {
-                    inner.holder_keys.remove(&run_id);
-                }
+        if !run_still_present && let Some(rkeys) = inner.holder_keys.get_mut(&run_id) {
+            rkeys.retain(|k| k != &key);
+            if rkeys.is_empty() {
+                inner.holder_keys.remove(&run_id);
             }
         }
     }
@@ -672,12 +669,10 @@ pub fn release_holder_key(
                 .iter()
                 .any(|candidate| candidate.run_id() == run_id)
     });
-    if !run_still_present {
-        if let Some(keys) = inner.holder_keys.get_mut(&run_id) {
-            keys.retain(|candidate| candidate != key);
-            if keys.is_empty() {
-                inner.holder_keys.remove(&run_id);
-            }
+    if !run_still_present && let Some(keys) = inner.holder_keys.get_mut(&run_id) {
+        keys.retain(|candidate| candidate != key);
+        if keys.is_empty() {
+            inner.holder_keys.remove(&run_id);
         }
     }
 }
@@ -697,10 +692,10 @@ pub fn advance_jobset_admission(
     id: &JobSetId,
     promoted_key: Option<&(String, String)>,
 ) -> Result<JobSetAdmissionResult, String> {
-    if let Some(key) = promoted_key {
-        if let Some(admission) = inner.jobset_admissions.get_mut(id) {
-            admission.acquired_keys.insert(key.clone());
-        }
+    if let Some(key) = promoted_key
+        && let Some(admission) = inner.jobset_admissions.get_mut(id)
+    {
+        admission.acquired_keys.insert(key.clone());
     }
 
     loop {
@@ -756,10 +751,11 @@ pub fn promote_next_from_group(
     };
 
     let Some(next) = next else {
-        if let Some(group) = inner.concurrency_groups.get(key) {
-            if group.running.is_none() && group.pending.is_empty() {
-                inner.concurrency_groups.remove(key);
-            }
+        if let Some(group) = inner.concurrency_groups.get(key)
+            && group.running.is_none()
+            && group.pending.is_empty()
+        {
+            inner.concurrency_groups.remove(key);
         }
         return;
     };
@@ -767,10 +763,10 @@ pub fn promote_next_from_group(
     // Install as running immediately for Run and JobSet; for Holder::Job, defer
     // until max-parallel is confirmed free so the job cannot contend with its
     // own pending holder (C-01).
-    if !matches!(&next, concurrency::Holder::Job { .. }) {
-        if let Some(group) = inner.concurrency_groups.get_mut(key) {
-            group.running = Some(next.clone());
-        }
+    if !matches!(&next, concurrency::Holder::Job { .. })
+        && let Some(group) = inner.concurrency_groups.get_mut(key)
+    {
+        group.running = Some(next.clone());
     }
 
     match next {
@@ -862,10 +858,10 @@ pub fn promote_next_from_group(
                             inner.pending_jobs.push_back(job);
                         }
                     }
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        if run.status == ExecutionStatus::Pending {
-                            run.status = ExecutionStatus::Queued;
-                        }
+                    if let Some(run) = inner.runs.get_mut(&run_id)
+                        && run.status == ExecutionStatus::Pending
+                    {
+                        run.status = ExecutionStatus::Queued;
                     }
                 } // end else: normal dispatch path
             }
@@ -1113,10 +1109,10 @@ pub fn cancel_holder(inner: &mut InnerState, holder: &concurrency::Holder, _reas
                 cancel_job_inner(inner, *run_id, job_id);
             }
             // If all jobs cancelled, mark run cancelled when appropriate.
-            if let Some(run) = inner.runs.get_mut(run_id) {
-                if run.jobs.values().all(|status| status.is_terminal()) {
-                    run.status = summarize_run(run.jobs.values().copied());
-                }
+            if let Some(run) = inner.runs.get_mut(run_id)
+                && run.jobs.values().all(|status| status.is_terminal())
+            {
+                run.status = summarize_run(run.jobs.values().copied());
             }
         }
     }
@@ -2031,17 +2027,17 @@ pub fn pair_registered_runner(inner: &mut InnerState, runner_id: i64) {
         // Fix 1: set runner_id to None on release instead of re-stamping record.at,
         // so exclusivity for a dead machine is immediately cleared while preserving
         // record and first_at.
-        if let Some(record) = inner.job_assignments.get_mut(&key) {
-            if record.runner_id.is_some() {
-                record.runner_id = None;
-                info!(
-                    run_id = %key.0,
-                    job_id = %key.1.0,
-                    "stale binding released; job requeued at back of pool waitlist"
-                );
-                inner.pool_pending.insert(key, now);
-                inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
-            }
+        if let Some(record) = inner.job_assignments.get_mut(&key)
+            && record.runner_id.is_some()
+        {
+            record.runner_id = None;
+            info!(
+                run_id = %key.0,
+                job_id = %key.1.0,
+                "stale binding released; job requeued at back of pool waitlist"
+            );
+            inner.pool_pending.insert(key, now);
+            inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
         }
     }
 
@@ -2137,20 +2133,20 @@ pub fn sweep_stale_bindings(inner: &mut InnerState, now: std::time::SystemTime) 
             .map(|(key, _)| key.clone())
             .collect();
         for key in dead {
-            if let Some(record) = inner.job_assignments.get_mut(&key) {
-                if record.runner_id.is_some() {
-                    record.runner_id = None;
-                    info!(
-                        run_id = %key.0,
-                        job_id = %key.1.0,
-                        "stale binding released on timer; job requeued at back of pool waitlist"
-                    );
-                    if inner.pool_assignments_enabled && queued_keys.contains(&key) {
-                        inner.pool_pending.insert(key, now);
-                    }
-                    inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
-                    swept += 1;
+            if let Some(record) = inner.job_assignments.get_mut(&key)
+                && record.runner_id.is_some()
+            {
+                record.runner_id = None;
+                info!(
+                    run_id = %key.0,
+                    job_id = %key.1.0,
+                    "stale binding released on timer; job requeued at back of pool waitlist"
+                );
+                if inner.pool_assignments_enabled && queued_keys.contains(&key) {
+                    inner.pool_pending.insert(key, now);
                 }
+                inner.released_bindings_count = inner.released_bindings_count.saturating_add(1);
+                swept += 1;
             }
         }
     }
@@ -3291,10 +3287,10 @@ pub fn settle_request(inner: &mut InnerState, request_id: i64, status: Execution
         .retain(|_, &mut rid| rid != request_id);
     inner.inflight_requests.remove(&request_id);
     inner.github_token_requests.remove(&request_id);
-    if let Some(record) = inner.job_requests.get_mut(&request_id) {
-        if record.result.is_none() {
-            record.result = Some(status);
-        }
+    if let Some(record) = inner.job_requests.get_mut(&request_id)
+        && record.result.is_none()
+    {
+        record.result = Some(status);
     }
 }
 /// Release an interrupted claim so the same request can be delivered again.

@@ -25,10 +25,10 @@ use crate::client::results::ResultsClient;
 use crate::client::run_service::RunServiceClient;
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use tracing::{error, info, warn};
 
 /// AzDO-specific reporting state threaded into [`ReportingContext`] when
@@ -220,10 +220,9 @@ pub async fn run_job(
     if let Some(deps) = job_message
         .get("actionsDependencies")
         .and_then(|v| v.as_array())
+        && !deps.is_empty()
     {
-        if !deps.is_empty() {
-            info!("Using locked actions versions from the workflow's lockfile");
-        }
+        info!("Using locked actions versions from the workflow's lockfile");
     }
     let raw_container = job_message.get("jobContainer");
     let raw_services = job_message.get("jobServiceContainers");
@@ -313,24 +312,24 @@ pub async fn run_job(
     job_ctx.declared_step_ids = main_steps.iter().map(|step| step.id.clone()).collect();
     let mut ordered_steps =
         super::job_extension::build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
-    if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_STARTED") {
-        if !hook.is_empty() {
-            info!("Injecting ACTIONS_RUNNER_HOOK_JOB_STARTED: {hook}");
-            ordered_steps.insert(
-                0,
-                make_hook_step("__hook_job_started", "__hook_job_started", &hook),
-            );
-        }
+    if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_STARTED")
+        && !hook.is_empty()
+    {
+        info!("Injecting ACTIONS_RUNNER_HOOK_JOB_STARTED: {hook}");
+        ordered_steps.insert(
+            0,
+            make_hook_step("__hook_job_started", "__hook_job_started", &hook),
+        );
     }
-    if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_COMPLETED") {
-        if !hook.is_empty() {
-            info!("Injecting ACTIONS_RUNNER_HOOK_JOB_COMPLETED: {hook}");
-            ordered_steps.push(make_hook_step(
-                "__hook_job_completed",
-                "__hook_job_completed",
-                &hook,
-            ));
-        }
+    if let Ok(hook) = std::env::var("ACTIONS_RUNNER_HOOK_JOB_COMPLETED")
+        && !hook.is_empty()
+    {
+        info!("Injecting ACTIONS_RUNNER_HOOK_JOB_COMPLETED: {hook}");
+        ordered_steps.push(make_hook_step(
+            "__hook_job_completed",
+            "__hook_job_completed",
+            &hook,
+        ));
     }
     {
         let enable_debugger = job_message
@@ -353,32 +352,31 @@ pub async fn run_job(
                 .and_then(|v| v.get("actions_runner_override_debugger_welcome_message"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Some(tunnel_json) = debugger_tunnel_json {
-                if let Ok(tunnel) =
+            if let Some(tunnel_json) = debugger_tunnel_json
+                && let Ok(tunnel) =
                     serde_json::from_value::<preloop_gha_protocol::DebuggerTunnelInfo>(tunnel_json)
-                {
-                    let cfg = preloop_dap::DebuggerConfig::new_with_transport(
-                        true,
-                        Some(preloop_dap::DebuggerTunnelInfo {
-                            tunnel_id: tunnel.tunnel_id,
-                            cluster_id: tunnel.cluster_id,
-                            host_token: tunnel.host_token,
-                            port: tunnel.port,
-                        }),
-                        override_welcome,
-                        debugger_welcome,
-                        debugger_transport,
-                    );
-                    if cfg.is_runnable() {
-                        let dbg = std::sync::Arc::new(preloop_dap::DapDebugger::new(cfg));
-                        job_ctx.dap_debugger =
-                            Some(dbg.clone() as std::sync::Arc<dyn preloop_dap::IDapDebugger>);
-                    } else {
-                        warn!(
-                            "Debugger enabled but tunnel config is invalid \
+            {
+                let cfg = preloop_dap::DebuggerConfig::new_with_transport(
+                    true,
+                    Some(preloop_dap::DebuggerTunnelInfo {
+                        tunnel_id: tunnel.tunnel_id,
+                        cluster_id: tunnel.cluster_id,
+                        host_token: tunnel.host_token,
+                        port: tunnel.port,
+                    }),
+                    override_welcome,
+                    debugger_welcome,
+                    debugger_transport,
+                );
+                if cfg.is_runnable() {
+                    let dbg = std::sync::Arc::new(preloop_dap::DapDebugger::new(cfg));
+                    job_ctx.dap_debugger =
+                        Some(dbg.clone() as std::sync::Arc<dyn preloop_dap::IDapDebugger>);
+                } else {
+                    warn!(
+                        "Debugger enabled but tunnel config is invalid \
                              — skipping DAP startup"
-                        );
-                    }
+                    );
                 }
             }
         }
@@ -416,28 +414,28 @@ pub async fn run_job(
         dbg.on_job_steps_initialized(&entries, &post, &predicted)
             .await;
     }
-    if let Some(rpt) = &reporting {
-        if let Some(azdo) = &rpt.azdo {
-            let job_record = serde_json::json!({
-                "count": 1,
-                "value": [{
-                    "id": job_id,
-                    "type": "job",
-                    "name": job_name,
-                    "order": 1,
-                    "state": "inProgress",
-                    "startTime": iso_now(),
-                    "percentComplete": 0_u32,
-                }]
-            });
-            match azdo
-                .client
-                .update_timeline(&rpt.token(), &plan_id, &azdo.timeline_id, &job_record)
-                .await
-            {
-                Ok(_) => info!("AzDO: job timeline record set to InProgress"),
-                Err(e) => warn!("AzDO: job timeline InProgress failed (non-fatal): {e:#}"),
-            }
+    if let Some(rpt) = &reporting
+        && let Some(azdo) = &rpt.azdo
+    {
+        let job_record = serde_json::json!({
+            "count": 1,
+            "value": [{
+                "id": job_id,
+                "type": "job",
+                "name": job_name,
+                "order": 1,
+                "state": "inProgress",
+                "startTime": iso_now(),
+                "percentComplete": 0_u32,
+            }]
+        });
+        match azdo
+            .client
+            .update_timeline(&rpt.token(), &plan_id, &azdo.timeline_id, &job_record)
+            .await
+        {
+            Ok(_) => info!("AzDO: job timeline record set to InProgress"),
+            Err(e) => warn!("AzDO: job timeline InProgress failed (non-fatal): {e:#}"),
         }
     }
     let live_logs = if let Some(feed_url) = super::live_logs::extract_feed_stream_url(&job_message)
@@ -476,10 +474,10 @@ pub async fn run_job(
         .unwrap_or(360 * 60);
     info!("Job timeout: {} minutes", job_timeout_seconds / 60);
     // v2.336.0 (#4538): log effective cache mode when present
-    if let Some(cache_mode) = job_ctx.env.get("ACTIONS_CACHE_MODE") {
-        if !cache_mode.is_empty() {
-            info!("Effective cache mode: {cache_mode}");
-        }
+    if let Some(cache_mode) = job_ctx.env.get("ACTIONS_CACHE_MODE")
+        && !cache_mode.is_empty()
+    {
+        info!("Effective cache mode: {cache_mode}");
     }
     let (job_cancel_tx, job_cancel_rx) = watch::channel(false);
     // Spawn periodic step-status drain (matches official runner's 500ms JobServerQueue interval)
@@ -582,18 +580,17 @@ pub async fn run_job(
             if let Some(run_id_str) = job_message
                 .get("preloopDebugRunId")
                 .and_then(|v| v.as_str())
+                && let Some((svc_url, token)) = extract_service_endpoint(&job_message)
             {
-                if let Some((svc_url, token)) = extract_service_endpoint(&job_message) {
-                    let port = dbg.local_port().unwrap_or(preloop_dap::DAP_TUNNEL_PORT);
-                    let url = format!("{svc_url}/api/v1/runs/{run_id_str}/debug");
-                    if let Ok(http) = HttpClient::new(None) {
-                        let body = serde_json::json!({ "port": port, "job_id": job_id });
-                        if let Err(e) = http
-                            .post_json_bearer::<serde_json::Value>(&url, &body, &token)
-                            .await
-                        {
-                            warn!("Failed to register DAP port with server: {e}");
-                        }
+                let port = dbg.local_port().unwrap_or(preloop_dap::DAP_TUNNEL_PORT);
+                let url = format!("{svc_url}/api/v1/runs/{run_id_str}/debug");
+                if let Ok(http) = HttpClient::new(None) {
+                    let body = serde_json::json!({ "port": port, "job_id": job_id });
+                    if let Err(e) = http
+                        .post_json_bearer::<serde_json::Value>(&url, &body, &token)
+                        .await
+                    {
+                        warn!("Failed to register DAP port with server: {e}");
                     }
                 }
             }
@@ -848,24 +845,23 @@ pub async fn run_job(
     if preserve_requested
         && (conclusion.eq_ignore_ascii_case("failed") || steps_had_failure)
         && !debug_was_active
+        && let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER")
     {
-        if let Some(path) = std::env::var_os("PRELOOP_FAILURE_MARKER") {
-            let path = std::path::PathBuf::from(path);
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // The marker names the preservation reason, not the job's final
-            // conclusion: a job preserved only because a `continue-on-error`
-            // step failed concludes "Success", and a tool reading
-            // `.preloop-job-failed` must see why the VM was held.
-            let marker = if conclusion.eq_ignore_ascii_case("failed") || steps_had_failure {
-                "Failed"
-            } else {
-                &conclusion
-            };
-            if let Err(error) = std::fs::write(&path, marker) {
-                warn!(path = %path.display(), %error, "failed to write Preloop failure marker");
-            }
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // The marker names the preservation reason, not the job's final
+        // conclusion: a job preserved only because a `continue-on-error`
+        // step failed concludes "Success", and a tool reading
+        // `.preloop-job-failed` must see why the VM was held.
+        let marker = if conclusion.eq_ignore_ascii_case("failed") || steps_had_failure {
+            "Failed"
+        } else {
+            &conclusion
+        };
+        if let Err(error) = std::fs::write(&path, marker) {
+            warn!(path = %path.display(), %error, "failed to write Preloop failure marker");
         }
     }
 

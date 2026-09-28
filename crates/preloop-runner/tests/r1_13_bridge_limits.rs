@@ -8,9 +8,8 @@
 //! it, and the idle scenario never closes the silent splice — both
 //! assertions fail.
 
-use preloop_runner::control_bridge::{
-    self, CONTROL_ORIGIN_ENV, CONTROL_SOCKET_ENV, CONTROL_UPSTREAM_ENV,
-};
+use preloop_runner::control_bridge::{self, CONTROL_ORIGIN_ENV, CONTROL_UPSTREAM_ENV};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,6 +23,19 @@ const BRIDGE_IDLE_TIMEOUT_SECS_ENV: &str = "PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS";
 /// a process: serialize scenarios that mutate them. Async mutex: the guard
 /// is held across awaits by design.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `spawn_from_env` against an env map — edition 2024 makes `set_var` unsafe
+/// and the crate forbids `unsafe`, so tests hand the bridge its variables
+/// instead of exporting them.
+async fn spawn_bridge_with(vars: &[(&str, String)]) -> control_bridge::ControlBridge {
+    let map: BTreeMap<&str, String> = vars.iter().cloned().collect();
+    control_bridge::spawn_from_env_lookup(
+        |name| map.get(name).cloned(),
+        |name| map.get(name).map(std::ffi::OsString::from),
+    )
+    .await
+    .expect("bridge should spawn")
+}
 
 /// Fake upstream: accepts connections, drains anything forwarded, never
 /// writes back — so splices only end when the bridge or the client ends them.
@@ -53,15 +65,13 @@ async fn bridge_enforces_connection_cap_and_idle_timeout() {
 
     // Bridge via the TCP-upstream fallback (no Unix socket in the sandbox),
     // with a 2-connection cap and a 1-second idle timeout.
-    std::env::set_var(CONTROL_ORIGIN_ENV, "http://127.0.0.1:0");
-    std::env::remove_var(CONTROL_SOCKET_ENV);
-    std::env::set_var(CONTROL_UPSTREAM_ENV, upstream_addr.to_string());
-    std::env::set_var(BRIDGE_MAX_CONNECTIONS_ENV, "2");
-    std::env::set_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV, "1");
-
-    let bridge = control_bridge::spawn_from_env()
-        .await
-        .expect("bridge should spawn");
+    let bridge = spawn_bridge_with(&[
+        (CONTROL_ORIGIN_ENV, "http://127.0.0.1:0".to_owned()),
+        (CONTROL_UPSTREAM_ENV, upstream_addr.to_string()),
+        (BRIDGE_MAX_CONNECTIONS_ENV, "2".to_owned()),
+        (BRIDGE_IDLE_TIMEOUT_SECS_ENV, "1".to_owned()),
+    ])
+    .await;
     let addr = bridge.address();
 
     // --- Scenario 1: excess connections are closed, not parked. ---
@@ -113,11 +123,6 @@ async fn bridge_enforces_connection_cap_and_idle_timeout() {
     );
     drop(active);
     drop(bridge);
-
-    std::env::remove_var(CONTROL_ORIGIN_ENV);
-    std::env::remove_var(CONTROL_UPSTREAM_ENV);
-    std::env::remove_var(BRIDGE_MAX_CONNECTIONS_ENV);
-    std::env::remove_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV);
 }
 
 /// Half-close: a client that finishes its request and shuts down its write
@@ -141,15 +146,13 @@ async fn bridge_half_close_preserves_response() {
         }
     });
 
-    std::env::set_var(CONTROL_ORIGIN_ENV, "http://127.0.0.1:0");
-    std::env::remove_var(CONTROL_SOCKET_ENV);
-    std::env::set_var(CONTROL_UPSTREAM_ENV, upstream_addr.to_string());
-    std::env::set_var(BRIDGE_MAX_CONNECTIONS_ENV, "8");
-    std::env::set_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV, "10");
-
-    let bridge = control_bridge::spawn_from_env()
-        .await
-        .expect("bridge should spawn");
+    let bridge = spawn_bridge_with(&[
+        (CONTROL_ORIGIN_ENV, "http://127.0.0.1:0".to_owned()),
+        (CONTROL_UPSTREAM_ENV, upstream_addr.to_string()),
+        (BRIDGE_MAX_CONNECTIONS_ENV, "8".to_owned()),
+        (BRIDGE_IDLE_TIMEOUT_SECS_ENV, "10".to_owned()),
+    ])
+    .await;
     let addr = bridge.address();
 
     let mut client = TcpStream::connect(addr).await.unwrap();
@@ -164,11 +167,6 @@ async fn bridge_half_close_preserves_response() {
         b"reply-to:ping",
         "upstream response lost after half-close: {reply:?}"
     );
-
-    std::env::remove_var(CONTROL_ORIGIN_ENV);
-    std::env::remove_var(CONTROL_UPSTREAM_ENV);
-    std::env::remove_var(BRIDGE_MAX_CONNECTIONS_ENV);
-    std::env::remove_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV);
 }
 
 /// Sustained one-way traffic must not trip the idle deadline: the timer is
@@ -189,15 +187,13 @@ async fn bridge_one_way_traffic_survives_idle_timeout() {
         }
     });
 
-    std::env::set_var(CONTROL_ORIGIN_ENV, "http://127.0.0.1:0");
-    std::env::remove_var(CONTROL_SOCKET_ENV);
-    std::env::set_var(CONTROL_UPSTREAM_ENV, upstream_addr.to_string());
-    std::env::set_var(BRIDGE_MAX_CONNECTIONS_ENV, "8");
-    std::env::set_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV, "1");
-
-    let bridge = control_bridge::spawn_from_env()
-        .await
-        .expect("bridge should spawn");
+    let bridge = spawn_bridge_with(&[
+        (CONTROL_ORIGIN_ENV, "http://127.0.0.1:0".to_owned()),
+        (CONTROL_UPSTREAM_ENV, upstream_addr.to_string()),
+        (BRIDGE_MAX_CONNECTIONS_ENV, "8".to_owned()),
+        (BRIDGE_IDLE_TIMEOUT_SECS_ENV, "1".to_owned()),
+    ])
+    .await;
     let addr = bridge.address();
 
     // One byte every 500ms for 3s: always under the 1s deadline, while the
@@ -217,9 +213,4 @@ async fn bridge_one_way_traffic_survives_idle_timeout() {
 
     drop(client);
     drop(bridge);
-
-    std::env::remove_var(CONTROL_ORIGIN_ENV);
-    std::env::remove_var(CONTROL_UPSTREAM_ENV);
-    std::env::remove_var(BRIDGE_MAX_CONNECTIONS_ENV);
-    std::env::remove_var(BRIDGE_IDLE_TIMEOUT_SECS_ENV);
 }

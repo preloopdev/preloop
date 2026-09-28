@@ -5,14 +5,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use preloop_gha_expressions::{eval_expression, Context};
+use preloop_gha_expressions::{Context, eval_expression};
 use preloop_gha_protocol::{JobId, JobPlan, ReusableCallPlan, StepPlan};
 use serde_json::Value;
 
 use crate::{
-    dag, matrix_expand, parse_workflow, Concurrency, ConcurrencyQueue, DeferredBool,
-    DeferredNumber, ExpandedWorkflows, InputType, Job, JobContinueOnError, JobDefaults,
-    MatrixValue, ParserError, ReusableCallMetadata, Step, Workflow,
+    Concurrency, ConcurrencyQueue, DeferredBool, DeferredNumber, ExpandedWorkflows, InputType, Job,
+    JobContinueOnError, JobDefaults, MatrixValue, ParserError, ReusableCallMetadata, Step,
+    Workflow, dag, matrix_expand, parse_workflow,
 };
 
 /// Maximum number of workflow levels that may be connected (1 top-level caller + up to 9 nested reusable workflows).
@@ -653,15 +653,15 @@ fn job_plan_from_job(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut defaults = Vec::new();
-    if let Some(wf_defaults) = workflow_defaults {
-        if let Some(run) = &wf_defaults.run {
-            defaults.push(defaults_run_token(run));
-        }
+    if let Some(wf_defaults) = workflow_defaults
+        && let Some(run) = &wf_defaults.run
+    {
+        defaults.push(defaults_run_token(run));
     }
-    if let Some(job_defaults) = &job.defaults {
-        if let Some(run) = &job_defaults.run {
-            defaults.push(defaults_run_token(run));
-        }
+    if let Some(job_defaults) = &job.defaults
+        && let Some(run) = &job_defaults.run
+    {
+        defaults.push(defaults_run_token(run));
     }
     let name = resolved_job_name(job.name.as_deref(), &expanded_id, &matrix, inputs);
     Ok(JobPlan {
@@ -897,18 +897,18 @@ fn expand_jobs_with_reusables_internal(
                     Some(Value::Object(map)) => Some(map),
                     _ => None,
                 };
-                if !trigger.secrets.is_empty() {
-                    if let Some(c_secrets) = caller_secrets {
-                        for caller_sec_name in c_secrets.keys() {
-                            let declared = trigger
-                                .secrets
-                                .keys()
-                                .any(|k| k.eq_ignore_ascii_case(caller_sec_name));
-                            if !declared {
-                                return Err(ParserError::UndeclaredSecret {
-                                    name: caller_sec_name.clone(),
-                                });
-                            }
+                if !trigger.secrets.is_empty()
+                    && let Some(c_secrets) = caller_secrets
+                {
+                    for caller_sec_name in c_secrets.keys() {
+                        let declared = trigger
+                            .secrets
+                            .keys()
+                            .any(|k| k.eq_ignore_ascii_case(caller_sec_name));
+                        if !declared {
+                            return Err(ParserError::UndeclaredSecret {
+                                name: caller_sec_name.clone(),
+                            });
                         }
                     }
                 }
@@ -1546,22 +1546,22 @@ fn expand_matrix(
         ("include", &mut matrix.include),
         ("exclude", &mut matrix.exclude),
     ] {
-        if values.len() == 1 {
-            if let Value::String(expression) = &values[0] {
-                let resolved = eval_expression(
-                    expression,
-                    &expression_context(&IndexMap::new(), inputs, event_name),
-                )
-                .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
-                if resolved.is_null() {
-                    return Ok(MatrixExpansion::Combinations(vec![IndexMap::new()]));
-                }
-                *values = resolved.as_array().cloned().ok_or_else(|| {
-                    ParserError::InvalidExpression(format!(
-                        "matrix {field} expression did not return an array"
-                    ))
-                })?;
+        if values.len() == 1
+            && let Value::String(expression) = &values[0]
+        {
+            let resolved = eval_expression(
+                expression,
+                &expression_context(&IndexMap::new(), inputs, event_name),
+            )
+            .map_err(|error| ParserError::InvalidExpression(error.to_string()))?;
+            if resolved.is_null() {
+                return Ok(MatrixExpansion::Combinations(vec![IndexMap::new()]));
             }
+            *values = resolved.as_array().cloned().ok_or_else(|| {
+                ParserError::InvalidExpression(format!(
+                    "matrix {field} expression did not return an array"
+                ))
+            })?;
         }
     }
     let spec = matrix_expand::matrix_to_spec(job_id, &matrix)?;
@@ -1838,17 +1838,17 @@ pub fn expand_deferred_reusable_call(
                 .and_then(|(_, tail)| caller_workflow.jobs.get(tail))
         }) {
             for (name, value) in &caller_job.with {
-                if let Value::String(raw) = value {
-                    if raw.contains("${{") {
-                        let resolved = crate::eval::resolve_string(
-                            raw,
-                            &expression_context(&cell_plan.matrix, Some(&caller_plan.inputs), None),
-                        )
-                        .map_err(ParserError::InvalidExpression)?;
-                        cell_plan
-                            .inputs
-                            .insert(name.clone(), Value::String(resolved));
-                    }
+                if let Value::String(raw) = value
+                    && raw.contains("${{")
+                {
+                    let resolved = crate::eval::resolve_string(
+                        raw,
+                        &expression_context(&cell_plan.matrix, Some(&caller_plan.inputs), None),
+                    )
+                    .map_err(ParserError::InvalidExpression)?;
+                    cell_plan
+                        .inputs
+                        .insert(name.clone(), Value::String(resolved));
                 }
             }
         }

@@ -21,11 +21,11 @@ use crate::models::{
 use anyhow::Context;
 use async_trait::async_trait;
 use preloop_gha_protocol::SessionId;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::Digest;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const DATABASE_FILE: &str = "preloop.db";
@@ -4746,12 +4746,10 @@ mod tests {
         let associated_data = broker_message_payload_aad("session-1", 7);
         let legacy = serde_json::to_string(&token_message()).unwrap();
         assert!(legacy.contains("live-runtime-token-abc123"));
-        assert!(unseal_message_payload::<azdo::TaskAgentMessage>(
-            &cipher,
-            &legacy,
-            &associated_data
-        )
-        .is_err());
+        assert!(
+            unseal_message_payload::<azdo::TaskAgentMessage>(&cipher, &legacy, &associated_data)
+                .is_err()
+        );
     }
 
     /// A sealed row under the wrong host key fails closed — the HMAC rejects
@@ -4867,9 +4865,11 @@ mod tests {
         assert_eq!(rows.len(), 2, "malformed legacy row was not dropped");
         for (_, raw) in &rows {
             assert!(!raw.contains("live-runtime-token-abc123"));
-            assert!(serde_json::from_str::<serde_json::Value>(raw)
-                .unwrap()
-                .is_string());
+            assert!(
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .unwrap()
+                    .is_string()
+            );
         }
 
         let mut inner = InnerState::default();

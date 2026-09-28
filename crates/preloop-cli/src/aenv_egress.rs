@@ -194,11 +194,11 @@ fn sandbox_pools(config_text: &str) -> Vec<String> {
                 );
             }
         }
-        if let Some(value) = value {
-            if Cidr::parse(&value).is_some() {
-                pools.push(value);
-                continue;
-            }
+        if let Some(value) = value
+            && Cidr::parse(&value).is_some()
+        {
+            pools.push(value);
+            continue;
         }
         pools.push(DEFAULT_POOLS[pools.len()].to_owned());
     }
@@ -396,7 +396,9 @@ fn write_config_atomically(path: &Path, rewritten: &str) -> anyhow::Result<()> {
 /// Restart the AgentENV service after a config change and wait for it to
 /// come back. Nothing else re-reads the node deny-list.
 fn restart_aenv() -> anyhow::Result<()> {
-    tracing::warn!("restarting the `aenv` service for the deny-list change; sandboxes keep running, new starts pick up the policy");
+    tracing::warn!(
+        "restarting the `aenv` service for the deny-list change; sandboxes keep running, new starts pick up the policy"
+    );
     sudo_ok(
         "systemctl",
         &["restart", "aenv"],
@@ -434,9 +436,11 @@ mod tests {
         }
         assert_eq!(covered, (1u64 << 16) - 1);
         // Spot-check the interesting edge: the allowed /32's sibling /32.
-        assert!(complement
-            .iter()
-            .any(|c| c.to_string() == "192.168.8.175/32"));
+        assert!(
+            complement
+                .iter()
+                .any(|c| c.to_string() == "192.168.8.175/32")
+        );
         // A covering prefix that does not strictly contain the host refuses.
         assert!(exclude_host(Cidr::parse("10.0.0.0/8").unwrap(), allowed).is_none());
         assert!(exclude_host(Cidr::parse("192.168.8.174/32").unwrap(), allowed).is_none());

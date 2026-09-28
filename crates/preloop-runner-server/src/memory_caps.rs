@@ -1310,10 +1310,12 @@ mod tests {
         );
         assert!(!inner.inflight_requests.contains_key(&request_id));
         assert!(!inner.plan_requests.values().any(|id| *id == request_id));
-        assert!(!inner
-            .agent_job_requests
-            .values()
-            .any(|id| *id == request_id));
+        assert!(
+            !inner
+                .agent_job_requests
+                .values()
+                .any(|id| *id == request_id)
+        );
         assert!(!inner.timeline_requests.values().any(|id| *id == request_id));
         assert!(
             !inner

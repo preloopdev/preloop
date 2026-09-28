@@ -1,6 +1,6 @@
 use super::*;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 
 const MAX_REUSABLE_WORKFLOW_DEPTH: usize = 4;
@@ -176,7 +176,7 @@ fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_github_contents, parse_remote_reference, GithubContentResponse};
+    use super::{GithubContentResponse, decode_github_contents, parse_remote_reference};
 
     #[test]
     fn parses_remote_workflow_reference() {

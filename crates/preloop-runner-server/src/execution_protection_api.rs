@@ -23,9 +23,9 @@
 //!   same kind is deleted — there is no stable database behind them, so a
 //!   client that caches IDs should re-list after a delete.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

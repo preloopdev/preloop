@@ -190,21 +190,21 @@ fn evaluated_inputs(
         }
     }
 
-    if let Some(manifest) = manifest {
-        if let Some(manifest_inputs) = &manifest.inputs {
-            let expr_ctx = ctx.job.build_expression_context();
-            for (key, input_def) in manifest_inputs {
-                if inputs.contains_key(key) {
-                    continue;
-                }
-                if let Some(default) = input_def
-                    .get("default")
-                    .and_then(super::factory::input_default_string)
-                {
-                    let evaluated = crate::worker::template::evaluate_template(&default, &expr_ctx)
-                        .unwrap_or_else(|_| default.to_string());
-                    inputs.insert(key.clone(), evaluated);
-                }
+    if let Some(manifest) = manifest
+        && let Some(manifest_inputs) = &manifest.inputs
+    {
+        let expr_ctx = ctx.job.build_expression_context();
+        for (key, input_def) in manifest_inputs {
+            if inputs.contains_key(key) {
+                continue;
+            }
+            if let Some(default) = input_def
+                .get("default")
+                .and_then(super::factory::input_default_string)
+            {
+                let evaluated = crate::worker::template::evaluate_template(&default, &expr_ctx)
+                    .unwrap_or_else(|_| default.to_string());
+                inputs.insert(key.clone(), evaluated);
             }
         }
     }
@@ -476,9 +476,10 @@ mod tests {
             &entrypoint_args,
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--entrypoint", "run.sh"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--entrypoint", "run.sh"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["-e", "MY_SECRET"]));
         assert!(!args.iter().any(|arg| arg.contains("s3cr3t")));
         let image_index = args.iter().position(|arg| arg == "alpine:3.20").unwrap();

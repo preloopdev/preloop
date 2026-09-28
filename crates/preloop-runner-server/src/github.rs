@@ -1,10 +1,10 @@
 //! GitHub App Webhook Integration.
 
 use axum::{
+    Json,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use crate::{
-    changed_paths_from_payload, submit_run_inner_with_webhook_delivery, ExecutionStatus,
-    SharedState,
+    ExecutionStatus, SharedState, changed_paths_from_payload,
+    submit_run_inner_with_webhook_delivery,
 };
 use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
 
@@ -278,10 +278,10 @@ pub async fn report_check_run_queued(
                     "persisted GitHub check run is stale; reconciling it"
                 );
                 let mut inner = shared.state.inner.lock().await;
-                if let Some(run) = inner.runs.get_mut(&run_id) {
-                    if run.job_check_run_ids.get(job_id) == Some(&check_run_id) {
-                        run.job_check_run_ids.remove(job_id);
-                    }
+                if let Some(run) = inner.runs.get_mut(&run_id)
+                    && run.job_check_run_ids.get(job_id) == Some(&check_run_id)
+                {
+                    run.job_check_run_ids.remove(job_id);
                 }
             }
         }
@@ -741,29 +741,28 @@ pub async fn report_check_run_completed(
                     line,
                     ..
                 } = event
+                    && event_job_id == job_id
                 {
-                    if event_job_id == job_id {
-                        let level_str = match level {
-                            AnnotationLevel::Notice => "notice",
-                            AnnotationLevel::Warning => "warning",
-                            AnnotationLevel::Error => "failure",
-                        };
-                        if let Some(file_path) = file {
-                            let line_num = line.unwrap_or(1);
-                            annotations.push(serde_json::json!({
-                                "path": file_path,
-                                "start_line": line_num,
-                                "end_line": line_num,
-                                "annotation_level": level_str,
-                                "message": message,
-                            }));
-                        } else {
-                            global_issues.push(format!(
-                                "**{}**: {}",
-                                level_str.to_uppercase(),
-                                message
-                            ));
-                        }
+                    let level_str = match level {
+                        AnnotationLevel::Notice => "notice",
+                        AnnotationLevel::Warning => "warning",
+                        AnnotationLevel::Error => "failure",
+                    };
+                    if let Some(file_path) = file {
+                        let line_num = line.unwrap_or(1);
+                        annotations.push(serde_json::json!({
+                            "path": file_path,
+                            "start_line": line_num,
+                            "end_line": line_num,
+                            "annotation_level": level_str,
+                            "message": message,
+                        }));
+                    } else {
+                        global_issues.push(format!(
+                            "**{}**: {}",
+                            level_str.to_uppercase(),
+                            message
+                        ));
                     }
                 }
             }
@@ -955,15 +954,13 @@ pub async fn fetch_workflows_at(
             let mut dir = tokio::fs::read_dir(workflows_dir).await?;
             while let Some(entry) = dir.next_entry().await? {
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext == "yml" || ext == "yaml" {
-                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                let content = tokio::fs::read_to_string(&path).await?;
-                                workflows.insert(name.to_owned(), content);
-                            }
-                        }
-                    }
+                if path.is_file()
+                    && let Some(ext) = path.extension()
+                    && (ext == "yml" || ext == "yaml")
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    let content = tokio::fs::read_to_string(&path).await?;
+                    workflows.insert(name.to_owned(), content);
                 }
             }
         }
@@ -989,15 +986,13 @@ pub async fn fetch_workflows_at(
                 let mut dir = tokio::fs::read_dir(workflows_dir).await?;
                 while let Some(entry) = dir.next_entry().await? {
                     let path = entry.path();
-                    if path.is_file() {
-                        if let Some(ext) = path.extension() {
-                            if ext == "yml" || ext == "yaml" {
-                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                    let content = tokio::fs::read_to_string(&path).await?;
-                                    workflows.insert(name.to_owned(), content);
-                                }
-                            }
-                        }
+                    if path.is_file()
+                        && let Some(ext) = path.extension()
+                        && (ext == "yml" || ext == "yaml")
+                        && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    {
+                        let content = tokio::fs::read_to_string(&path).await?;
+                        workflows.insert(name.to_owned(), content);
                     }
                 }
             }
@@ -1048,29 +1043,30 @@ async fn fetch_remote_workflows(
     let mut workflows = BTreeMap::new();
 
     for item in &items {
-        if item.r#type == "file" && (item.name.ends_with(".yml") || item.name.ends_with(".yaml")) {
-            if let Some(download_url) = &item.download_url {
-                let file_res = crate::github_breaker::send_observed(
-                    breaker,
-                    client
-                        .get(download_url)
-                        .header("User-Agent", "preloop")
-                        .header("Authorization", format!("Bearer {}", token)),
-                )
-                .await?;
-                if !file_res.status().is_success() {
-                    let status = file_res.status();
-                    let err_text = file_res.text().await.unwrap_or_default();
-                    anyhow::bail!(
-                        "failed to download workflow file {}: GitHub returned {} ({})",
-                        item.name,
-                        status,
-                        err_text
-                    );
-                }
-                let content = file_res.text().await?;
-                workflows.insert(item.name.clone(), content);
+        if item.r#type == "file"
+            && (item.name.ends_with(".yml") || item.name.ends_with(".yaml"))
+            && let Some(download_url) = &item.download_url
+        {
+            let file_res = crate::github_breaker::send_observed(
+                breaker,
+                client
+                    .get(download_url)
+                    .header("User-Agent", "preloop")
+                    .header("Authorization", format!("Bearer {}", token)),
+            )
+            .await?;
+            if !file_res.status().is_success() {
+                let status = file_res.status();
+                let err_text = file_res.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "failed to download workflow file {}: GitHub returned {} ({})",
+                    item.name,
+                    status,
+                    err_text
+                );
             }
+            let content = file_res.text().await?;
+            workflows.insert(item.name.clone(), content);
         }
     }
     Ok(workflows)
@@ -1404,30 +1400,30 @@ pub async fn handle_github_webhook(
     // repository granularity: an owner-granularity check would pass a
     // selected-repository installation for a sibling repo under the same
     // owner that the installation does not cover.
-    if let crate::github_app::WebhookSigner::App(app_id) = &signer {
-        if let Some(claimed) = claimed_repository(&body) {
-            // Resolve the App's credentials here rather than in the signer:
-            // the signer carries only the id, so a delivery never clones App
-            // key material.
-            let covers = match shared
-                .state
-                .github_apps
-                .as_ref()
-                .and_then(|apps| apps.app_by_id(app_id))
-            {
-                Some(app) => crate::github_app::app_covers_repository(app, &claimed).await,
-                // The payload's secret matched a registered App's secret, so
-                // its id must resolve. Fail closed rather than skip binding.
-                None => false,
-            };
-            if !covers {
-                warn!(
-                    app_id = %app_id,
-                    repository = %claimed,
-                    "webhook signer is not installed on the claimed repository; rejecting"
-                );
-                return Err(StatusCode::FORBIDDEN);
-            }
+    if let crate::github_app::WebhookSigner::App(app_id) = &signer
+        && let Some(claimed) = claimed_repository(&body)
+    {
+        // Resolve the App's credentials here rather than in the signer:
+        // the signer carries only the id, so a delivery never clones App
+        // key material.
+        let covers = match shared
+            .state
+            .github_apps
+            .as_ref()
+            .and_then(|apps| apps.app_by_id(app_id))
+        {
+            Some(app) => crate::github_app::app_covers_repository(app, &claimed).await,
+            // The payload's secret matched a registered App's secret, so
+            // its id must resolve. Fail closed rather than skip binding.
+            None => false,
+        };
+        if !covers {
+            warn!(
+                app_id = %app_id,
+                repository = %claimed,
+                "webhook signer is not installed on the claimed repository; rejecting"
+            );
+            return Err(StatusCode::FORBIDDEN);
         }
     }
     // `WebhookSigner::Legacy`: the single shared secret is the only trust
@@ -2476,54 +2472,55 @@ async fn process_delivery_payload_with_lease(
             }
         };
 
-        if effective.event == "push" && effective.git_ref == ref_default {
-            if let Some(scheduler) = &shared.state.scheduler {
-                let scheduler_source = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
-                    .await
-                {
-                    Ok(Some(scheduler_sha)) => {
-                        let scheduler_workflows = if scheduler_sha == resolved_sha {
-                            Some(workflows.clone())
-                        } else {
-                            match fetch_workflows(shared, &repo_full_name, &scheduler_sha).await {
-                                Ok(workflows) => Some(workflows),
-                                Err(error) => {
-                                    warn!(
-                                        sha = %scheduler_sha,
-                                        ?error,
-                                        "failed to fetch current default-branch workflows — skipping cron reconciliation"
-                                    );
-                                    None
-                                }
+        if effective.event == "push"
+            && effective.git_ref == ref_default
+            && let Some(scheduler) = &shared.state.scheduler
+        {
+            let scheduler_source = match resolve_ref_sha(shared, &repo_full_name, &ref_default)
+                .await
+            {
+                Ok(Some(scheduler_sha)) => {
+                    let scheduler_workflows = if scheduler_sha == resolved_sha {
+                        Some(workflows.clone())
+                    } else {
+                        match fetch_workflows(shared, &repo_full_name, &scheduler_sha).await {
+                            Ok(workflows) => Some(workflows),
+                            Err(error) => {
+                                warn!(
+                                    sha = %scheduler_sha,
+                                    ?error,
+                                    "failed to fetch current default-branch workflows — skipping cron reconciliation"
+                                );
+                                None
                             }
-                        };
-                        scheduler_workflows.map(|workflows| (scheduler_sha, workflows))
-                    }
-                    Ok(None) => {
-                        warn!(
-                            ref_name = %ref_default,
-                            "current default branch has no resolvable commit SHA — skipping cron reconciliation"
-                        );
-                        None
-                    }
-                    Err(error) => {
-                        warn!(
-                            ?error,
-                            ref_name = %ref_default,
-                            "failed to resolve current default branch SHA — skipping cron reconciliation"
-                        );
-                        None
-                    }
-                };
-                if let Some((scheduler_sha, scheduler_workflows)) = scheduler_source {
-                    let mut scheduler_payload = payload_val.clone();
-                    if let Some(object) = scheduler_payload.as_object_mut() {
-                        object.insert("after".to_owned(), Value::String(scheduler_sha));
-                    }
-                    scheduler
-                        .reconcile_all(&scheduler_workflows, scheduler_payload, shared.clone())
-                        .await;
+                        }
+                    };
+                    scheduler_workflows.map(|workflows| (scheduler_sha, workflows))
                 }
+                Ok(None) => {
+                    warn!(
+                        ref_name = %ref_default,
+                        "current default branch has no resolvable commit SHA — skipping cron reconciliation"
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ref_name = %ref_default,
+                        "failed to resolve current default branch SHA — skipping cron reconciliation"
+                    );
+                    None
+                }
+            };
+            if let Some((scheduler_sha, scheduler_workflows)) = scheduler_source {
+                let mut scheduler_payload = payload_val.clone();
+                if let Some(object) = scheduler_payload.as_object_mut() {
+                    object.insert("after".to_owned(), Value::String(scheduler_sha));
+                }
+                scheduler
+                    .reconcile_all(&scheduler_workflows, scheduler_payload, shared.clone())
+                    .await;
             }
         }
 
@@ -3003,6 +3000,7 @@ export PRELOOP_WEBHOOK_SECRET="{}"
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // SAFETY: env writes confined to serialized tests.
 mod tests {
     use super::*;
     use crate::AppState;
@@ -3104,7 +3102,7 @@ mod tests {
         // process-global and other tests build apps concurrently; the
         // fallback must be asserted with the override absent.
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
+        unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
         let defaults = manifest_default_events();
         assert_eq!(defaults, vec!["push", "pull_request"]);
     }
@@ -3114,15 +3112,15 @@ mod tests {
         // Held for the whole test: `PRELOOP_GITHUB_APP_DEFAULT_EVENTS` is
         // process-global and other tests build apps concurrently.
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "push, pull_request");
+        unsafe { std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "push, pull_request") };
         let events = manifest_default_events();
         assert_eq!(events, vec!["push".to_owned(), "pull_request".to_owned()]);
-        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
+        unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
 
         // A blank override falls back to the minimal default.
-        std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ");
+        unsafe { std::env::set_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS", "  ") };
         assert_eq!(manifest_default_events(), vec!["push", "pull_request"]);
-        std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS");
+        unsafe { std::env::remove_var("PRELOOP_GITHUB_APP_DEFAULT_EVENTS") };
     }
 
     /// The signed push payload GitHub would deliver for `owner/repo`.
@@ -3427,9 +3425,11 @@ mod tests {
             record.attempts, WEBHOOK_MAX_ATTEMPTS,
             "parking refunds the attempt the claim charged"
         );
-        assert!(record
-            .lease_until_us
-            .is_some_and(|lease_until| lease_until > crate::store::now_us()));
+        assert!(
+            record
+                .lease_until_us
+                .is_some_and(|lease_until| lease_until > crate::store::now_us())
+        );
     }
 
     /// A delivery whose ref SHA cannot be resolved is retried internally rather than dropped.
@@ -3731,7 +3731,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_skips_github_owned_workflows() {
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        std::env::set_var(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml");
+        unsafe { std::env::set_var(GITHUB_OWNED_WORKFLOWS_ENV, "release.yml") };
 
         let temp = tempfile::tempdir().unwrap();
         let ws_dir = temp.path().join("ws");
@@ -3764,7 +3764,7 @@ mod tests {
         let inner = fixture.state.inner.lock().await;
         assert!(inner.runs.is_empty());
 
-        std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV);
+        unsafe { std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV) };
     }
 
     /// Crash recovery: processing that died mid-flight has its expired lease
@@ -3850,18 +3850,20 @@ mod tests {
         // Simulate a worker crash after run creation but before marking the
         // delivery done. The replay must reuse that persisted run.
         let lease_token = claimed[0].lease_token.as_deref().unwrap();
-        assert!(fixture
-            .state
-            .store
-            .fail_webhook_delivery(
-                "delivery-replay",
-                lease_token,
-                "simulated crash",
-                false,
-                Some(Duration::ZERO),
-            )
-            .await
-            .unwrap());
+        assert!(
+            fixture
+                .state
+                .store
+                .fail_webhook_delivery(
+                    "delivery-replay",
+                    lease_token,
+                    "simulated crash",
+                    false,
+                    Some(Duration::ZERO),
+                )
+                .await
+                .unwrap()
+        );
         fixture.drain().await;
 
         let inner = fixture.state.inner.lock().await;
@@ -3894,12 +3896,14 @@ mod tests {
             lease_token: None,
             last_error: None,
         };
-        assert!(fixture
-            .state
-            .store
-            .enqueue_webhook_delivery(&delivery)
-            .await
-            .unwrap());
+        assert!(
+            fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&delivery)
+                .await
+                .unwrap()
+        );
         let claimed = fixture
             .state
             .store
@@ -3907,18 +3911,20 @@ mod tests {
             .await
             .unwrap();
         let lease_token = claimed[0].lease_token.as_deref().unwrap();
-        assert!(fixture
-            .state
-            .store
-            .fail_webhook_delivery(
-                &delivery.delivery_id,
-                lease_token,
-                "permanent test failure",
-                true,
-                None,
-            )
-            .await
-            .unwrap());
+        assert!(
+            fixture
+                .state
+                .store
+                .fail_webhook_delivery(
+                    &delivery.delivery_id,
+                    lease_token,
+                    "permanent test failure",
+                    true,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
 
         let failed = fixture
             .state
@@ -3982,18 +3988,22 @@ mod tests {
             received_at_us: crate::store::now_us(),
             ..corrupt.clone()
         };
-        assert!(fixture
-            .state
-            .store
-            .enqueue_webhook_delivery(&corrupt)
-            .await
-            .unwrap());
-        assert!(fixture
-            .state
-            .store
-            .enqueue_webhook_delivery(&valid)
-            .await
-            .unwrap());
+        assert!(
+            fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&corrupt)
+                .await
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .state
+                .store
+                .enqueue_webhook_delivery(&valid)
+                .await
+                .unwrap()
+        );
 
         let db_path = temp.path().join("state").join("preloop.db");
         let connection = rusqlite::Connection::open(db_path).unwrap();
@@ -4037,12 +4047,14 @@ mod tests {
             "a corrupt FIFO row must not wedge later valid deliveries"
         );
         let lease_token = claimed[0].lease_token.as_deref().unwrap();
-        assert!(fixture
-            .state
-            .store
-            .complete_webhook_delivery(&valid.delivery_id, lease_token)
-            .await
-            .unwrap());
+        assert!(
+            fixture
+                .state
+                .store
+                .complete_webhook_delivery(&valid.delivery_id, lease_token)
+                .await
+                .unwrap()
+        );
     }
     #[tokio::test]
     async fn webhook_processing_lease_can_be_renewed() {
@@ -4083,12 +4095,14 @@ mod tests {
                 .unwrap(),
             "a stale worker must not renew a reclaimed lease"
         );
-        assert!(fixture
-            .state
-            .store
-            .renew_webhook_delivery("delivery-lease", lease_token, 60)
-            .await
-            .unwrap());
+        assert!(
+            fixture
+                .state
+                .store
+                .renew_webhook_delivery("delivery-lease", lease_token, 60)
+                .await
+                .unwrap()
+        );
         assert!(
             !fixture
                 .state
@@ -4217,20 +4231,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pruned, 1);
-        assert!(fixture
-            .state
-            .store
-            .get_webhook_delivery("delivery-old")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(fixture
-            .state
-            .store
-            .get_webhook_delivery("delivery-fresh")
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            fixture
+                .state
+                .store
+                .get_webhook_delivery("delivery-old")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .store
+                .get_webhook_delivery("delivery-fresh")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A check_run rerequest is a new trigger by the webhook sender, so both

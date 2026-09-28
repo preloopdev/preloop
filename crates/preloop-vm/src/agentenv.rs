@@ -57,8 +57,8 @@
 //!   its length.
 
 use crate::{
-    read_bounded, stream_output, ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy,
-    OutputChunk, SecretSource, VmError, VmProvider, VolumeMount, DEFAULT_CAPTURE_LIMIT,
+    DEFAULT_CAPTURE_LIMIT, ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy,
+    OutputChunk, SecretSource, VmError, VmProvider, VolumeMount, read_bounded, stream_output,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
 /// Sandbox lifetime requested from AgentENV, in seconds.
@@ -781,10 +781,10 @@ fn start_target(image: &str) -> StartTarget {
         return StartTarget::Artifact(snapshot.to_owned());
     }
     let path = Path::new(image);
-    if path.is_file() {
-        if let Some(descriptor) = read_pack_descriptor(path) {
-            return StartTarget::Artifact(descriptor.snapshot);
-        }
+    if path.is_file()
+        && let Some(descriptor) = read_pack_descriptor(path)
+    {
+        return StartTarget::Artifact(descriptor.snapshot);
     }
     StartTarget::Image(image.to_owned())
 }
@@ -860,14 +860,14 @@ impl VmProvider for AgentEnvProvider {
     async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
         validate_spec(spec)?;
         let mut registry = self.registry.lock().await;
-        if let Some(existing) = registry.machines.get(spec.name.as_str()) {
-            if existing.sandbox.is_some() {
-                return Err(VmError::Command {
-                    operation: "create",
-                    exit_code: 1,
-                    message: format!("machine `{}` already exists", spec.name.as_str()),
-                });
-            }
+        if let Some(existing) = registry.machines.get(spec.name.as_str())
+            && existing.sandbox.is_some()
+        {
+            return Err(VmError::Command {
+                operation: "create",
+                exit_code: 1,
+                message: format!("machine `{}` already exists", spec.name.as_str()),
+            });
         }
         registry.machines.insert(
             spec.name.as_str().to_owned(),
@@ -1008,14 +1008,14 @@ impl VmProvider for AgentEnvProvider {
         // A retry with an already-used clone name must not silently orphan the
         // previous sandbox: the insert below would drop its id without ever
         // deleting it. Mirror `create` and reject instead.
-        if let Ok(existing) = self.record(clone).await {
-            if existing.sandbox.is_some() {
-                return Err(VmError::Command {
-                    operation: "fork",
-                    exit_code: 1,
-                    message: format!("machine `{}` already exists", clone.as_str()),
-                });
-            }
+        if let Ok(existing) = self.record(clone).await
+            && existing.sandbox.is_some()
+        {
+            return Err(VmError::Command {
+                operation: "fork",
+                exit_code: 1,
+                message: format!("machine `{}` already exists", clone.as_str()),
+            });
         }
         let sandbox = self.start_sandbox(&snapshot, None, "fork").await?;
         {

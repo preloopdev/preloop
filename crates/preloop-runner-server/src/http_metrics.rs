@@ -5,9 +5,9 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use opentelemetry::KeyValue;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{FutureExt, Span, Status, TraceContextExt, Tracer};
-use opentelemetry::KeyValue;
 use preloop_observability::metrics::{classify_surface, normalize_route, status_class};
 use preloop_observability::{HeaderExtractor, TraceContextPropagator};
 

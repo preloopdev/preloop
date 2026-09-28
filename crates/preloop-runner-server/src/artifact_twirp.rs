@@ -59,10 +59,10 @@ pub fn artifact_v2_registry_key(run_id: &str, name: &str) -> String {
 /// to the recorded run id when it is known; fall back to the request value for
 /// unknown plans (control-plane callers, tests).
 pub fn canonical_artifact_scope(inner: &InnerState, plan_id: &str, fallback: &str) -> String {
-    if let Some(request_id) = inner.plan_requests.get(plan_id) {
-        if let Some(record) = inner.job_requests.get(request_id) {
-            return record.run_id.to_string();
-        }
+    if let Some(request_id) = inner.plan_requests.get(plan_id)
+        && let Some(record) = inner.job_requests.get(request_id)
+    {
+        return record.run_id.to_string();
     }
     fallback.to_owned()
 }
@@ -183,14 +183,14 @@ pub async fn twirp_artifact_v2_create(
         let mut inner = shared.state.inner.lock().await;
         // In-lock re-check: the job may have settled between the gate and
         // this lock — a settled job must not mint a fresh upload credential.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity {
-            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
-                drop(inner);
-                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-                return Err(ApiError::forbidden(
-                    "job is not live; writes are rejected for completed or unknown jobs",
-                ));
-            }
+        if let crate::auth::ResultsIdentity::Job(job) = &identity
+            && !crate::auth::job_is_live_locked(&inner, job.job_id)
+        {
+            drop(inner);
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+            return Err(ApiError::forbidden(
+                "job is not live; writes are rejected for completed or unknown jobs",
+            ));
         }
         if inner.artifact_v2_registry.contains_key(&registry_key) {
             let _ = tokio::fs::remove_dir_all(&stage_dir).await;

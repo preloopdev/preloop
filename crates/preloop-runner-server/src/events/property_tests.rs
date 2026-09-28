@@ -6,8 +6,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::events::trust_tier::TrustTier;
     use crate::events::EventAdapter;
+    use crate::events::trust_tier::TrustTier;
     use proptest::prelude::*;
 
     // Strategies for common webhook fields

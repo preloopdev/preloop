@@ -378,10 +378,16 @@ pub struct TestEnvVar {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+// SAFETY: edition 2024 makes process-env mutation `unsafe`; every caller
+// serializes on `GITHUB_ENV_LOCK`, so no thread observes a torn env. The
+// workspace `deny` blocks unsafe elsewhere; this helper exists precisely so
+// tests keep a safe-looking API.
+#[allow(unsafe_code)]
 impl TestEnvVar {
     pub fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
+        // SAFETY: serialized by `GITHUB_ENV_LOCK` at every callsite.
+        unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
 
@@ -395,18 +401,26 @@ impl TestEnvVar {
     /// suite.
     pub fn unset(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
-        std::env::remove_var(key);
+        // SAFETY: serialized by `GITHUB_ENV_LOCK` at every callsite.
+        unsafe { std::env::remove_var(key) };
         Self { key, previous }
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
+// SAFETY: restores a process env var under the same `GITHUB_ENV_LOCK`
+// serialization as `set`/`unset`; see the impl above.
+#[allow(unsafe_code)]
 impl Drop for TestEnvVar {
     fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            std::env::set_var(self.key, previous);
-        } else {
-            std::env::remove_var(self.key);
+        unsafe {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: serialized by `GITHUB_ENV_LOCK`.
+                std::env::set_var(self.key, previous);
+            } else {
+                // SAFETY: serialized by `GITHUB_ENV_LOCK`.
+                std::env::remove_var(self.key);
+            }
         }
     }
 }
@@ -1094,48 +1108,48 @@ impl AppState {
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let mut pr_config = config.github.pr.clone();
-        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_AUTO") {
-            if !value.trim().is_empty() {
-                pr_config.auto = match value.trim().to_ascii_lowercase().as_str() {
-                    "feature" => crate::config::PrAuto::Feature,
-                    "never" => crate::config::PrAuto::Never,
-                    other => {
-                        tracing::warn!(
-                            value = other,
-                            "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|never"
-                        );
-                        pr_config.auto
-                    }
-                };
-            }
+        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_AUTO")
+            && !value.trim().is_empty()
+        {
+            pr_config.auto = match value.trim().to_ascii_lowercase().as_str() {
+                "feature" => crate::config::PrAuto::Feature,
+                "never" => crate::config::PrAuto::Never,
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "unknown PRELOOP_GITHUB_PR_AUTO; expected feature|never"
+                    );
+                    pr_config.auto
+                }
+            };
         }
-        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_DRAFT") {
-            if !value.trim().is_empty() {
-                // A typo (`ture`) must not silently flip the configured
-                // draft policy: unknown values keep the configured default
-                // and warn, mirroring PRELOOP_GITHUB_PR_AUTO.
-                pr_config.draft = match value.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" => true,
-                    "0" | "false" | "no" => false,
-                    other => {
-                        tracing::warn!(
-                            value = other,
-                            "unknown PRELOOP_GITHUB_PR_DRAFT; expected 1|true|yes|0|false|no"
-                        );
-                        pr_config.draft
-                    }
-                };
-            }
+        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_DRAFT")
+            && !value.trim().is_empty()
+        {
+            // A typo (`ture`) must not silently flip the configured
+            // draft policy: unknown values keep the configured default
+            // and warn, mirroring PRELOOP_GITHUB_PR_AUTO.
+            pr_config.draft = match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "unknown PRELOOP_GITHUB_PR_DRAFT; expected 1|true|yes|0|false|no"
+                    );
+                    pr_config.draft
+                }
+            };
         }
-        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_EXCLUDE") {
-            if !value.trim().is_empty() {
-                pr_config.exclude = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|pattern| !pattern.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-            }
+        if let Ok(value) = env::var("PRELOOP_GITHUB_PR_EXCLUDE")
+            && !value.trim().is_empty()
+        {
+            pr_config.exclude = value
+                .split(',')
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -1314,16 +1328,14 @@ impl AppState {
                 }
                 crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
             };
-            if let Some(projection) = projection {
-                if let Err(error) = self.store.store_run_event(projection).await {
-                    error!(?error, %run_id, "failed to persist control-plane run event");
-                }
+            if let Some(projection) = projection
+                && let Err(error) = self.store.store_run_event(projection).await
+            {
+                error!(?error, %run_id, "failed to persist control-plane run event");
             }
         }
-        if !has_run_projection {
-            if let Err(error) = self.store.append_event(&event).await {
-                error!(?error, "failed to append durable control-plane event");
-            }
+        if !has_run_projection && let Err(error) = self.store.append_event(&event).await {
+            error!(?error, "failed to append durable control-plane event");
         }
         // Always broadcast: in-memory state is the source of truth and
         // subscribers see live events. A store hiccup must never

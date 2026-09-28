@@ -34,15 +34,15 @@
 //!   serde         — protocol serialization round trip.
 //!   all           — run every benchmark and emit all metrics.
 
-use anyhow::{bail, Context, Result};
-use axum::body::{to_bytes, Body};
-use axum::http::{Method, Request, StatusCode};
+use anyhow::{Context, Result, bail};
 use axum::Router;
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
@@ -1092,7 +1092,7 @@ async fn main() -> Result<()> {
     if std::env::var_os("PRELOOP_SYSTEM_TOKEN").is_none() {
         // This benchmark uses an explicit in-process client; it does not
         // exercise engine-token discovery.
-        std::env::set_var("PRELOOP_SYSTEM_TOKEN", SYSTEM_TOKEN);
+        unsafe { std::env::set_var("PRELOOP_SYSTEM_TOKEN", SYSTEM_TOKEN) };
     }
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(String::as_str).unwrap_or("all");
@@ -1118,7 +1118,9 @@ async fn main() -> Result<()> {
         }
         other => {
             eprintln!("Unknown subcommand: {other}");
-            eprintln!("Usage: preloop-loadtest [all|server-load|parser|expressions|snapshot|cold-boot|contention|serde]");
+            eprintln!(
+                "Usage: preloop-loadtest [all|server-load|parser|expressions|snapshot|cold-boot|contention|serde]"
+            );
             std::process::exit(1);
         }
     }

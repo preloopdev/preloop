@@ -1,3 +1,6 @@
+// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
+#![allow(unsafe_code)]
+
 //! preloop-runner-server integration tests — concurrency group.
 //! Split from the former `lib_tests.rs` unit; see `tests/common/mod.rs`.
 
@@ -1657,8 +1660,7 @@ jobs:
 #[tokio::test]
 async fn store_recovery_preserves_claim_state_across_run_events() {
     let temp = tempfile::tempdir().unwrap();
-    let workflow =
-        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let (claimed_job, other_job, request_id) = {
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         let app = app(state.clone(), CancellationToken::new());
@@ -1929,8 +1931,7 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
                 .unwrap();
         }
     }
-    let workflow =
-        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let (claimed_job, other_job, request_id) = {
         let state = AppState::new_with_store(
             temp.path().to_path_buf(),
@@ -2042,8 +2043,7 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
 #[tokio::test]
 async fn startup_fails_claims_orphaned_by_a_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let workflow =
-        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
+    let workflow = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let accepted = request_json(
@@ -2194,12 +2194,14 @@ async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
             ExecutionStatus::Queued,
             "releasing the old owner must not conclude its logical job"
         );
-        assert!(crate::runtime_scheduling::live_runner_assignments(
-            &inner.job_requests,
-            &inner.session_active_requests,
-            SystemTime::now(),
-        )
-        .is_empty());
+        assert!(
+            crate::runtime_scheduling::live_runner_assignments(
+                &inner.job_requests,
+                &inner.session_active_requests,
+                SystemTime::now(),
+            )
+            .is_empty()
+        );
     }
 
     let (runner_id, token) =
@@ -2234,8 +2236,8 @@ async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
 
 #[tokio::test]
 async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -2423,14 +2425,15 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         let inner = state.inner.lock().await;
         let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
         assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Blocked);
-        assert!(run
-            .push_state
-            .as_ref()
-            .unwrap()
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("does not match"));
+        assert!(
+            run.push_state
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("does not match")
+        );
     }
 
     // 6. A run submitted without --push can never be pushed.
@@ -2632,8 +2635,8 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
     });
 
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
-    std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+    unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}")) };
+    unsafe { std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token") };
 
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -2706,8 +2709,8 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
         );
     }
 
-    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+    unsafe { std::env::remove_var("PRELOOP_GITHUB_TOKEN") };
+    unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
 }
 
 #[tokio::test]

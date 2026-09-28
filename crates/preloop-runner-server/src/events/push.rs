@@ -36,15 +36,15 @@ fn has_skip_label(message: &str) -> bool {
 /// (`Any(...)` across the commit batch).
 fn has_skip_ci(payload: &Value) -> bool {
     // Check every commit in the batch.
-    if let Some(commits) = payload.get("commits").and_then(|v| v.as_array()) {
-        if !commits.is_empty() {
-            return commits.iter().any(|commit| {
-                commit
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .is_some_and(has_skip_label)
-            });
-        }
+    if let Some(commits) = payload.get("commits").and_then(|v| v.as_array())
+        && !commits.is_empty()
+    {
+        return commits.iter().any(|commit| {
+            commit
+                .get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(has_skip_label)
+        });
     }
 
     // Fall back to head_commit when commits[] is absent or empty

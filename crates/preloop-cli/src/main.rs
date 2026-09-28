@@ -5,8 +5,8 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
-use preloop_orchestrator::environment::{is_stock_base_image, DEFAULT_BASE_IMAGE};
-use preloop_orchestrator::{artifact_payload, RunnerPool, RunnerPoolConfig};
+use preloop_orchestrator::environment::{DEFAULT_BASE_IMAGE, is_stock_base_image};
+use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
 use preloop_runner_server::credential_store::{CredentialStore, OsCredentialStore};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -672,16 +672,16 @@ pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
     if let Some(previous) = &previous {
         path.push(previous);
     }
-    std::env::set_var("PATH", path);
-    std::env::set_var("PRELOOP_VM_BACKEND", "smolvm");
+    unsafe { std::env::set_var("PATH", path) };
+    unsafe { std::env::set_var("PRELOOP_VM_BACKEND", "smolvm") };
     let result = test(&executable);
     match previous {
-        Some(previous) => std::env::set_var("PATH", previous),
-        None => std::env::remove_var("PATH"),
+        Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+        None => unsafe { std::env::remove_var("PATH") },
     }
     match previous_backend {
-        Some(previous) => std::env::set_var("PRELOOP_VM_BACKEND", previous),
-        None => std::env::remove_var("PRELOOP_VM_BACKEND"),
+        Some(previous) => unsafe { std::env::set_var("PRELOOP_VM_BACKEND", previous) },
+        None => unsafe { std::env::remove_var("PRELOOP_VM_BACKEND") },
     }
     result
 }
@@ -1037,10 +1037,12 @@ async fn main() -> anyhow::Result<()> {
     // from the engine's reads ($PRELOOP_HOME/config.toml) — setup silently had
     // no effect. An explicit operator override still wins.
     if std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV).is_none() {
-        std::env::set_var(
-            preloop_runner_server::config::CONFIG_PATH_ENV,
-            github_setup::config_path_for_home(),
-        );
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::config::CONFIG_PATH_ENV,
+                github_setup::config_path_for_home(),
+            )
+        };
     }
     // Both run the daemon in this process, so neither may bootstrap another
     // one underneath itself.
@@ -1129,7 +1131,7 @@ async fn cmd_golden_path(args: GoldenPathArgs) -> anyhow::Result<()> {
 
 async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
     const TOKEN_ENV: &str = "PRELOOP_GOLDEN_BUILD_TOKEN";
-    std::env::set_var(TOKEN_ENV, "artifact-build-only");
+    unsafe { std::env::set_var(TOKEN_ENV, "artifact-build-only") };
     let runner_bundle = std::fs::canonicalize(&args.runner_bundle).with_context(|| {
         format!(
             "runner bundle does not exist: {}",
@@ -1529,7 +1531,7 @@ fn migrate_legacy_github_credentials(
     config: &mut preloop_runner_server::config::ConfigFile,
     store: &impl preloop_runner_server::credential_store::CredentialStore,
 ) -> anyhow::Result<bool> {
-    use preloop_runner_server::credential_store::{github_reference_with_host, SecretString};
+    use preloop_runner_server::credential_store::{SecretString, github_reference_with_host};
 
     let has_legacy = config
         .github
@@ -1721,7 +1723,9 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     auth.apply();
     eprintln!("[preloop] {}", github_auth::StoredAuth::report());
     if github_auth::StoredAuth::is_unconfigured() {
-        eprintln!("[preloop] connect GitHub with `preloop setup` — until then, jobs get local tokens and webhooks are unverified");
+        eprintln!(
+            "[preloop] connect GitHub with `preloop setup` — until then, jobs get local tokens and webhooks are unverified"
+        );
     }
     Ok(())
 }
@@ -1735,10 +1739,10 @@ async fn cmd_engine(
     let socket = home.join("preloop.sock");
 
     // Keep AppState's resolver on the same engine home as this CLI.
-    std::env::set_var("PRELOOP_HOME", &home);
+    unsafe { std::env::set_var("PRELOOP_HOME", &home) };
     let store = OsCredentialStore;
     let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok(), &store)?;
-    std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token);
+    unsafe { std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token) };
     let listen: std::net::SocketAddr = args
         .listen
         .clone()
@@ -1751,7 +1755,7 @@ async fn cmd_engine(
         .clone()
         .or_else(|| std::env::var("PRELOOP_PUBLIC_URL").ok())
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", listen.port()));
-    std::env::set_var("PRELOOP_PUBLIC_URL", &public_url);
+    unsafe { std::env::set_var("PRELOOP_PUBLIC_URL", &public_url) };
 
     // Runner-facing origin is always the loopback listen address: in-VM
     // runners reach it over the mounted control socket, and their job-side
@@ -1765,10 +1769,12 @@ async fn cmd_engine(
     // bridge makes them work.
     let control_upstream = std::env::var("PRELOOP_CONTROL_UPSTREAM").ok();
     if std::env::var("PRELOOP_RUNNER_URL").is_err() {
-        std::env::set_var(
-            "PRELOOP_RUNNER_URL",
-            format!("http://127.0.0.1:{}", listen.port()),
-        );
+        unsafe {
+            std::env::set_var(
+                "PRELOOP_RUNNER_URL",
+                format!("http://127.0.0.1:{}", listen.port()),
+            )
+        };
     }
     let runner_url = std::env::var("PRELOOP_RUNNER_URL").unwrap();
     let control_origin = mounted_control_origin(&runner_url);
@@ -1929,13 +1935,12 @@ async fn cmd_engine(
         }
     }
     shutdown.cancel();
-    if let Some(pool_task) = pool.as_mut() {
-        if tokio::time::timeout(Duration::from_secs(30), &mut *pool_task)
+    if let Some(pool_task) = pool.as_mut()
+        && tokio::time::timeout(Duration::from_secs(30), &mut *pool_task)
             .await
             .is_err()
-        {
-            pool_task.abort();
-        }
+    {
+        pool_task.abort();
     }
     server.abort();
     let _ = std::fs::remove_file(socket);
@@ -1998,7 +2003,9 @@ async fn wait_for_engine_socket(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if let Some(reason) = last_reason {
-        anyhow::bail!("local control plane did not become ready within 30 seconds: last readyz reason: {reason}")
+        anyhow::bail!(
+            "local control plane did not become ready within 30 seconds: last readyz reason: {reason}"
+        )
     }
     anyhow::bail!("local control plane did not become ready within 30 seconds")
 }
@@ -2009,19 +2016,20 @@ fn extract_readyz_reason(body: &str) -> Option<String> {
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         for key in ["reason", "code", "message", "error", "status"] {
-            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-                if !s.trim().is_empty() {
-                    return Some(s.to_owned());
-                }
+            if let Some(s) = v.get(key).and_then(|x| x.as_str())
+                && !s.trim().is_empty()
+            {
+                return Some(s.to_owned());
             }
         }
         // Nested { "ready": { "reason": ... } } or similar
         if let Some(obj) = v.as_object() {
             for (_, val) in obj {
-                if let Some(s) = val.as_str() {
-                    if !s.trim().is_empty() && s.len() < 200 {
-                        return Some(s.to_owned());
-                    }
+                if let Some(s) = val.as_str()
+                    && !s.trim().is_empty()
+                    && s.len() < 200
+                {
+                    return Some(s.to_owned());
                 }
                 if let Some(inner) = val.as_object() {
                     for k in ["reason", "code"] {
@@ -2623,12 +2631,11 @@ fn resolve_local_diff_base(explicit: Option<&str>) -> Option<String> {
     if let Ok(output) = std::process::Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let tracking = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !tracking.is_empty() {
-                candidates.push(tracking);
-            }
+        let tracking = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !tracking.is_empty() {
+            candidates.push(tracking);
         }
     }
     for remote in git_remotes() {
@@ -2666,13 +2673,13 @@ fn git_uncommitted_paths() -> anyhow::Result<Vec<String>> {
         }
         let status_code = &item_str[..2];
         let path_part = &item_str[3..];
-        if (status_code.starts_with('R') || status_code.starts_with('C')) && iter.size_hint().0 > 0
+        if (status_code.starts_with('R') || status_code.starts_with('C'))
+            && iter.size_hint().0 > 0
+            && let Some(target) = iter.next()
         {
-            if let Some(target) = iter.next() {
-                let target_str = String::from_utf8_lossy(target).to_string();
-                paths.push(target_str);
-                continue;
-            }
+            let target_str = String::from_utf8_lossy(target).to_string();
+            paths.push(target_str);
+            continue;
         }
         paths.push(path_part.to_string());
     }
@@ -3323,10 +3330,10 @@ async fn runner_capacity(
 }
 
 fn update_run_status(current: &mut Option<ExecutionStatus>, next: Option<ExecutionStatus>) {
-    if let Some(status) = next {
-        if status.is_terminal() || current.is_none() {
-            *current = Some(status);
-        }
+    if let Some(status) = next
+        && (status.is_terminal() || current.is_none())
+    {
+        *current = Some(status);
     }
 }
 
@@ -3427,24 +3434,22 @@ fn detect_git_ref() -> String {
     if let Ok(output) = std::process::Command::new("git")
         .args(["symbolic-ref", "HEAD"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let ref_str = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !ref_str.is_empty() {
-                return ref_str;
-            }
+        let ref_str = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !ref_str.is_empty() {
+            return ref_str;
         }
     }
 
     if let Ok(output) = std::process::Command::new("git")
         .args(["describe", "--tags", "--exact-match"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let tag = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !tag.is_empty() {
-                return format!("refs/tags/{tag}");
-            }
+        let tag = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !tag.is_empty() {
+            return format!("refs/tags/{tag}");
         }
     }
 
@@ -3552,13 +3557,13 @@ fn decide_dirty_push_opts(
                 return Ok(Some(push::PushOpts {
                     create_pr: true,
                     draft: pr_draft,
-                }))
+                }));
             }
             "d" => {
                 return Ok(Some(push::PushOpts {
                     create_pr: true,
                     draft: true,
-                }))
+                }));
             }
             _ => eprintln!("answer y, N, or d"),
         }
@@ -3876,7 +3881,9 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let claimable = get_u64(jobs, "claimable").unwrap_or(0);
     let unclaimable = get_u64(jobs, "unclaimable").unwrap_or(0);
     let oldest = get_f64(jobs, "oldest_ready_seconds");
-    println!("  ready: {ready}  claimable: {claimable}  unclaimable: {unclaimable}  dependency_blocked: {dep_blocked}  concurrency_blocked: {conc_blocked}  pending_expansion: {pending_exp}  expanding: {expanding}");
+    println!(
+        "  ready: {ready}  claimable: {claimable}  unclaimable: {unclaimable}  dependency_blocked: {dep_blocked}  concurrency_blocked: {conc_blocked}  pending_expansion: {pending_exp}  expanding: {expanding}"
+    );
     match oldest {
         Some(v) => println!("  oldest_ready: {v:.1}s"),
         None => println!("  oldest_ready: -"),
@@ -3900,7 +3907,9 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let deepest = get_u64(conc, "deepest_group_pending").unwrap_or(0);
     let qmax = get_u64(conc, "queue_max_pending").unwrap_or(0);
     let overflow = get_u64(conc, "overflow_cancellations").unwrap_or(0);
-    println!("  groups active: {groups_active}  contended: {groups_contended}  pending_holders: {pending_holders}  deepest_pending: {deepest}  queue_max: {qmax}  overflow_cancellations: {overflow}");
+    println!(
+        "  groups active: {groups_active}  contended: {groups_contended}  pending_holders: {pending_holders}  deepest_pending: {deepest}  queue_max: {qmax}  overflow_cancellations: {overflow}"
+    );
     let sched = status.get("scheduler").unwrap_or(&serde_json::Value::Null);
     let enabled = get_bool(sched, "enabled").unwrap_or(false);
     let schedules = get_u64(sched, "schedules").unwrap_or(0);
@@ -3910,7 +3919,9 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let skipped = get_u64(sched, "skipped_overlapping").unwrap_or(0);
     let late = get_u64(sched, "late_fires").unwrap_or(0);
     let max_delay = get_f64(sched, "max_fire_delay_seconds");
-    println!("  scheduler enabled: {enabled}  schedules: {schedules}  fired: {fired}  skipped_overlapping: {skipped}  late_fires: {late}");
+    println!(
+        "  scheduler enabled: {enabled}  schedules: {schedules}  fired: {fired}  skipped_overlapping: {skipped}  late_fires: {late}"
+    );
     println!(
         "  last_scan: {last_scan}  next_fire: {next_fire}  max_delay: {}",
         max_delay
@@ -3934,7 +3945,9 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let paused = get_u64(pool, "paused").unwrap_or(0);
     let failures = get_u64(pool, "consecutive_provision_failures").unwrap_or(0);
     let released_bindings = get_u64(pool, "released_bindings").unwrap_or(0);
-    println!("  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}  released_bindings: {released_bindings}");
+    println!(
+        "  pool mode: {mode}  desired: {desired}  idle: {pool_idle}  busy: {pool_busy}  building: {building}  provisioning: {provisioning}  paused: {paused}  preparing: {preparing}  provision_failures: {failures}  released_bindings: {released_bindings}"
+    );
     let runners = status.get("runners").unwrap_or(&serde_json::Value::Null);
     let reg = get_u64(runners, "registered").unwrap_or(0);
     let sessions = get_u64(runners, "sessions").unwrap_or(0);
@@ -3943,7 +3956,9 @@ fn render_status_human(status: &serde_json::Value, runs: &[serde_json::Value], l
     let stale = get_u64(runners, "stale").unwrap_or(0);
     let max_poll = get_f64(runners, "max_poll_age_seconds");
     let max_lease = get_f64(runners, "max_lease_age_seconds");
-    println!("  runners registered: {reg}  sessions: {sessions}  idle: {idle}  busy: {busy}  stale: {stale}");
+    println!(
+        "  runners registered: {reg}  sessions: {sessions}  idle: {idle}  busy: {busy}  stale: {stale}"
+    );
     println!(
         "  max_poll_age: {}  max_lease_age: {}",
         max_poll
@@ -4626,7 +4641,7 @@ mod tests {
         use super::super::migrate_legacy_github_credentials;
         use preloop_runner_server::config::{AppConfig, ConfigFile, GitHubConfig};
         use preloop_runner_server::credential_store::{
-            github_reference, CredentialStore, MemoryCredentialStore,
+            CredentialStore, MemoryCredentialStore, github_reference,
         };
 
         fn legacy_config() -> ConfigFile {
@@ -5263,12 +5278,14 @@ mod tests {
             default_local_changed_paths("push", None, &serde_json::json!({"paths": ["a.rs"]}))
                 .is_none()
         );
-        assert!(default_local_changed_paths(
-            "push",
-            None,
-            &serde_json::json!({"commits": [{"modified": ["a.rs"]}]})
-        )
-        .is_none());
+        assert!(
+            default_local_changed_paths(
+                "push",
+                None,
+                &serde_json::json!({"commits": [{"modified": ["a.rs"]}]})
+            )
+            .is_none()
+        );
         // Events without a file list never derive, payload or not.
         assert!(
             default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
@@ -5664,13 +5681,13 @@ mod tests {
         if let Some(previous) = &previous_path {
             path.push(previous);
         }
-        std::env::set_var("PATH", path);
+        unsafe { std::env::set_var("PATH", path) };
 
         let home = tempfile::tempdir().unwrap();
         let debug_dir = home.path().join("state/debug");
         std::fs::create_dir_all(&debug_dir).unwrap();
         std::fs::write(debug_dir.join("preloop-runner-0-1"), "claimed").unwrap();
-        std::env::set_var("PRELOOP_HOME", home.path());
+        unsafe { std::env::set_var("PRELOOP_HOME", home.path()) };
 
         let result = cmd_shell(ShellArgs {
             run_ref: Some("preloop-runner-0-1".to_owned()),
@@ -5678,12 +5695,12 @@ mod tests {
         .await;
 
         match previous_home {
-            Some(previous) => std::env::set_var("PRELOOP_HOME", previous),
-            None => std::env::remove_var("PRELOOP_HOME"),
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_HOME", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
         }
         match previous_path {
-            Some(previous) => std::env::set_var("PATH", previous),
-            None => std::env::remove_var("PATH"),
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
         }
         result.unwrap();
 
@@ -5950,11 +5967,11 @@ mod tests {
         });
 
         let previous_token = std::env::var_os("PRELOOP_TOKEN");
-        std::env::set_var("PRELOOP_TOKEN", "dummy-api-token");
+        unsafe { std::env::set_var("PRELOOP_TOKEN", "dummy-api-token") };
         let healthy = probe_engine_health(&build_client(), &base).await;
         match previous_token {
-            Some(previous) => std::env::set_var("PRELOOP_TOKEN", previous),
-            None => std::env::remove_var("PRELOOP_TOKEN"),
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_TOKEN", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_TOKEN") },
         }
 
         assert!(healthy, "stub /healthz should answer the probe");

@@ -109,16 +109,13 @@ impl BrokerClient {
             Err(e) => {
                 // v2.336.0 (#4540): 404 with AcknowledgeJobNotFound means the job
                 // no longer exists. Ephemeral runners should exit cleanly.
-                if let Some(HttpError::Status { status, body }) = e.downcast_ref::<HttpError>() {
-                    if *status == reqwest::StatusCode::NOT_FOUND {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-                            if json.get("errorKind").and_then(|v| v.as_str())
-                                == Some("AcknowledgeJobNotFound")
-                            {
-                                return Ok(AcknowledgeResult::JobNotFound);
-                            }
-                        }
-                    }
+                if let Some(HttpError::Status { status, body }) = e.downcast_ref::<HttpError>()
+                    && *status == reqwest::StatusCode::NOT_FOUND
+                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(body)
+                    && json.get("errorKind").and_then(|v| v.as_str())
+                        == Some("AcknowledgeJobNotFound")
+                {
+                    return Ok(AcknowledgeResult::JobNotFound);
                 }
                 Err(e).context("acknowledging broker message")
             }

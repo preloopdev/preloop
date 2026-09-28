@@ -771,7 +771,7 @@ pub async fn agent_lookup(
         let client_id = inner
             .runner_client_ids
             .iter()
-            .find(|(_, &id)| id == runner.id)
+            .find(|(_, id)| **id == runner.id)
             .map(|(k, _)| k.clone())
             .unwrap_or_else(|| format!("{:08x}-0000-4000-8000-000000000000", runner.id as u32));
         inner.runner_client_ids.insert(client_id.clone(), runner.id);
@@ -946,13 +946,11 @@ pub async fn register_runner_compat(
         // for. Pairing is gated on the one-time provision token the pool
         // generated host-side for exactly this machine — a rogue process on
         // another machine cannot mint it, so it cannot steal pairings.
-        if provision_authorized {
-            if let Some(token) = provision_token.as_deref() {
-                // Mirror into the consolidated pool handle so the sampler's
-                // pending-registration count drops with the consume.
-                shared.state.pool_status.remove_pending(token);
-                crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
-            }
+        if provision_authorized && let Some(token) = provision_token.as_deref() {
+            // Mirror into the consolidated pool handle so the sampler's
+            // pending-registration count drops with the consume.
+            shared.state.pool_status.remove_pending(token);
+            crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
         }
     }
     // One persist after every identity-bearing mutation, so client_id and any
@@ -1070,12 +1068,12 @@ pub async fn create_session_compat(
         let verified = identity
             .and_then(|axum::Extension(id)| id.runner_id)
             .ok_or_else(|| ApiError::unauthorized("runner listen token required"))?;
-        if let Some(requested) = requested_runner_id {
-            if requested != verified {
-                return Err(ApiError::forbidden(format!(
-                    "listen token names runner {verified} but session body requests agent {requested}"
-                )));
-            }
+        if let Some(requested) = requested_runner_id
+            && requested != verified
+        {
+            return Err(ApiError::forbidden(format!(
+                "listen token names runner {verified} but session body requests agent {requested}"
+            )));
         }
         verified
     };

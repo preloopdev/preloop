@@ -349,12 +349,11 @@ pub(crate) async fn report_completion(
         // loop keeps it fresh while running, but it is aborted before
         // completion — refresh once so the terminal completejob is not
         // rejected with 401.
-        if rpt.access_token.due_for_refresh() {
-            if let Some((fresh, refresh_at)) = super::job_runner::refresh_worker_oauth_token().await
-            {
-                rpt.access_token.update(fresh, refresh_at);
-                info!("OAuth token refreshed before completion");
-            }
+        if rpt.access_token.due_for_refresh()
+            && let Some((fresh, refresh_at)) = super::job_runner::refresh_worker_oauth_token().await
+        {
+            rpt.access_token.update(fresh, refresh_at);
+            info!("OAuth token refreshed before completion");
         }
         match via {
             ProtocolPath::Broker => {

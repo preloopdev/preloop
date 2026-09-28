@@ -449,13 +449,11 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                             .entry("ACTIONS_CACHE_SERVICE_V2".to_string())
                             .or_insert_with(|| "true".to_string());
                     }
-                    if let Some(url) = data.get("GenerateIdTokenUrl").and_then(|v| v.as_str()) {
-                        if !url.is_empty() {
-                            job.env.insert(
-                                "ACTIONS_ID_TOKEN_REQUEST_URL".to_string(),
-                                url.to_string(),
-                            );
-                        }
+                    if let Some(url) = data.get("GenerateIdTokenUrl").and_then(|v| v.as_str())
+                        && !url.is_empty()
+                    {
+                        job.env
+                            .insert("ACTIONS_ID_TOKEN_REQUEST_URL".to_string(), url.to_string());
                     }
                 }
                 break;
@@ -484,10 +482,9 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                 .get(*var_key)
                 .and_then(|v| v.get("value"))
                 .and_then(|v| v.as_str())
+                && !value.is_empty()
             {
-                if !value.is_empty() {
-                    job.env.insert(env_key.to_string(), value.to_string());
-                }
+                job.env.insert(env_key.to_string(), value.to_string());
             }
         }
     }
@@ -1209,10 +1206,10 @@ fn orphan_pids_with_tracking_id(needle: &str) -> Vec<u32> {
         {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
-                if line.contains(needle) {
-                    if let Some(pid) = line.split_whitespace().next().and_then(|s| s.parse().ok()) {
-                        pids.push(pid);
-                    }
+                if line.contains(needle)
+                    && let Some(pid) = line.split_whitespace().next().and_then(|s| s.parse().ok())
+                {
+                    pids.push(pid);
                 }
             }
         }

@@ -5,12 +5,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use preloop_gha_expressions::{eval_bool, Context};
+use preloop_gha_expressions::{Context, eval_bool};
 use preloop_gha_parser::eval::{build_context, resolve_string};
 use preloop_gha_parser::{Concurrency, ConcurrencyQueue};
-use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::events::trust_tier::TrustTier;

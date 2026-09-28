@@ -159,10 +159,10 @@ pub async fn patch_timeline_records(
                 // spelling, or "success" from the run-level status_string)
                 // lies about a job that is still running — keep the truthful
                 // "in_progress" default set above.
-                if let Some(status) = job_status {
-                    if status != ExecutionStatus::InProgress {
-                        detail.conclusion = format!("{:?}", status).to_lowercase();
-                    }
+                if let Some(status) = job_status
+                    && status != ExecutionStatus::InProgress
+                {
+                    detail.conclusion = format!("{:?}", status).to_lowercase();
                 }
             }
 
@@ -251,15 +251,14 @@ pub async fn patch_timeline_records(
         }
         new_id
     };
-    if let Some((run_id, agent_job_id, records, revision)) = touched_attempt {
-        if let Err(error) = shared
+    if let Some((run_id, agent_job_id, records, revision)) = touched_attempt
+        && let Err(error) = shared
             .state
             .store
             .store_job_steps(run_id, agent_job_id, &records, revision)
             .await
-        {
-            warn!(?error, %run_id, "failed to persist timeline step records");
-        }
+    {
+        warn!(?error, %run_id, "failed to persist timeline step records");
     }
     for event in projected {
         shared.state.emit(event).await;

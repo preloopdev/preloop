@@ -534,22 +534,30 @@ mod tests {
         .unwrap();
         let report = compute(&src, &dir, "9.9.9").unwrap();
         // A1: /runner/server alias matches the bare route.
-        assert!(report
-            .covered
-            .contains(&"GET /_apis/v1/AgentPools".to_owned()));
+        assert!(
+            report
+                .covered
+                .contains(&"GET /_apis/v1/AgentPools".to_owned())
+        );
         // A2: GET on the cache path is covered, POST is not.
-        assert!(report
-            .covered
-            .contains(&"GET /_apis/artifactcache/cache".to_owned()));
-        assert!(report
-            .uncovered_impl
-            .contains(&"POST /_apis/artifactcache/cache".to_owned()));
+        assert!(
+            report
+                .covered
+                .contains(&"GET /_apis/artifactcache/cache".to_owned())
+        );
+        assert!(
+            report
+                .uncovered_impl
+                .contains(&"POST /_apis/artifactcache/cache".to_owned())
+        );
         // A3: multi-segment path under the catch-all is covered.
         assert!(report.covered.contains(&"PUT /replay/results/*".to_owned()));
         // Genuinely unserved endpoint is reported.
-        assert!(report
-            .golden_without_route
-            .contains(&"GET /_apis/mystery/endpoint".to_owned()));
+        assert!(
+            report
+                .golden_without_route
+                .contains(&"GET /_apis/mystery/endpoint".to_owned())
+        );
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {

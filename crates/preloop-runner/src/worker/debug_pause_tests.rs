@@ -5,15 +5,15 @@
 //! round-trips, bearer auth, status handling, or the long-poll timeout path —
 //! and every bug this feature has hit so far lived in exactly those seams.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use preloop_gha_protocol::debug_session::{FailedStep, Verdict};
 use preloop_gha_protocol::{JobId, RunId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::debug_pause::DebugPauseClient;
 use super::steps_runner::{Step, StepType};
@@ -53,10 +53,10 @@ async fn spawn_fake(fake: Arc<Fake>) -> String {
         .route(
             "/api/v1/debug/sessions/:id/verdict",
             get(|State(fake): State<Arc<Fake>>| async move {
-                if let Some(probe) = fake.pause_probe.lock().as_ref() {
-                    if probe.load(Ordering::SeqCst) {
-                        fake.probe_saw_paused.store(true, Ordering::SeqCst);
-                    }
+                if let Some(probe) = fake.pause_probe.lock().as_ref()
+                    && probe.load(Ordering::SeqCst)
+                {
+                    fake.probe_saw_paused.store(true, Ordering::SeqCst);
                 }
                 let seen = fake.polls.fetch_add(1, Ordering::SeqCst);
                 let verdict = if seen >= fake.verdict_after {

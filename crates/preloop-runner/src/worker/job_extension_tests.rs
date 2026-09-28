@@ -630,9 +630,10 @@ fn injects_job_environment_variables_from_acquire_payload() {
         Some("global-env-ok")
     );
     assert!(!job.env.contains_key("system.orchestrationId"));
-    assert!(!job
-        .env
-        .contains_key("DistributedTask.EnableCompositeActions"));
+    assert!(
+        !job.env
+            .contains_key("DistributedTask.EnableCompositeActions")
+    );
     assert!(!job.env.contains_key("actions_runner_allow_artifacts_file"));
 }
 
@@ -1458,10 +1459,10 @@ fn golden_runner_version() -> String {
     let text = std::fs::read_to_string("../../versions.toml")
         .expect("read ../../versions.toml for runner_version");
     for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("runner_version") {
-            if let Some((_, value)) = rest.split_once('=') {
-                return value.trim().trim_matches('"').to_owned();
-            }
+        if let Some(rest) = line.trim_start().strip_prefix("runner_version")
+            && let Some((_, value)) = rest.split_once('=')
+        {
+            return value.trim().trim_matches('"').to_owned();
         }
     }
     panic!("runner_version not found in ../../versions.toml");

@@ -424,19 +424,25 @@ async fn job_results_token_cannot_update_another_jobs_steps() {
     );
 
     let inner = state.inner.lock().await;
-    assert!(inner
-        .job_steps
-        .get(&own_job_id)
-        .is_some_and(|steps| steps.iter().any(|step| step.id == "own-step")));
-    assert!(!inner
-        .job_steps
-        .get(&own_job_id)
-        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
+    assert!(
+        inner
+            .job_steps
+            .get(&own_job_id)
+            .is_some_and(|steps| steps.iter().any(|step| step.id == "own-step"))
+    );
+    assert!(
+        !inner
+            .job_steps
+            .get(&own_job_id)
+            .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step"))
+    );
     let other_job_id = uuid::Uuid::parse_str(&other_agent_job_id).unwrap();
-    assert!(!inner
-        .job_steps
-        .get(&other_job_id)
-        .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step")));
+    assert!(
+        !inner
+            .job_steps
+            .get(&other_job_id)
+            .is_some_and(|steps| steps.iter().any(|step| step.id == "other-step"))
+    );
 }
 
 #[tokio::test]
@@ -1197,10 +1203,12 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
     let artifact_key = artifact_v2_registry_key(&owner_run_id, artifact_name);
     {
         let inner = state.inner.lock().await;
-        assert!(inner
-            .artifact_v2_pending
-            .values()
-            .any(|pending| pending.registry_key == artifact_key));
+        assert!(
+            inner
+                .artifact_v2_pending
+                .values()
+                .any(|pending| pending.registry_key == artifact_key)
+        );
         assert!(!inner.artifact_v2_registry.contains_key(&artifact_key));
     }
 
@@ -1912,11 +1920,13 @@ async fn legacy_provision_token_is_consumed_atomically() {
         [first, second].contains(&StatusCode::UNAUTHORIZED),
         "the consumed token must reject the competing registration: {first}, {second}"
     );
-    assert!(state
-        .pending_registrations
-        .read()
-        .map(|pending| pending.is_empty())
-        .unwrap_or(false));
+    assert!(
+        state
+            .pending_registrations
+            .read()
+            .map(|pending| pending.is_empty())
+            .unwrap_or(false)
+    );
 }
 
 #[tokio::test]
@@ -1985,10 +1995,12 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     assert_eq!(claims["repository_owner"], "owner");
     assert_eq!(claims["event_name"], "push");
     assert_eq!(claims["runner_environment"], "self-hosted");
-    assert!(claims["sub"]
-        .as_str()
-        .unwrap()
-        .starts_with("repo:owner/repo:"));
+    assert!(
+        claims["sub"]
+            .as_str()
+            .unwrap()
+            .starts_with("repo:owner/repo:")
+    );
     assert!(claims["jti"].is_string());
     assert!(claims["exp"].as_u64().unwrap() > claims["iat"].as_u64().unwrap());
 
@@ -2151,8 +2163,8 @@ async fn oidc_forbidden_without_id_token_write() {
 
     // Use the real job-bound runtime token so this reaches permission enforcement.
     let uri = format!(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://test"
-        );
+        "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{agent_job_id}/oidctoken?audience=api://test"
+    );
     let request = Request::builder()
         .method(Method::GET)
         .uri(&uri)
@@ -2428,11 +2440,13 @@ jobs:
     let body_b64 = cancellation["body"].as_str().unwrap();
     let body_bytes = BASE64_STANDARD.decode(body_b64).unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert!(body["jobId"]
-        .as_str()
-        .unwrap()
-        .parse::<uuid::Uuid>()
-        .is_ok());
+    assert!(
+        body["jobId"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok()
+    );
     assert_eq!(body["timeout"], "00:05:00");
     assert!(body.get("runId").is_none());
 }

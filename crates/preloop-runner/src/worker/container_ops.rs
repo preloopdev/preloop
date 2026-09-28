@@ -706,11 +706,11 @@ pub async fn get_port_mappings(container_id: &str) -> Vec<(String, String)> {
 /// Golden cleanup order: job container → per-service (logs then rm) → network.
 pub async fn cleanup_containers(state: &ContainerState, log: &mut Vec<String>) -> Result<()> {
     // 1. Stop and remove job container
-    if let Some(name) = &state.job_container_name {
-        if let Some(id) = &state.job_container_id {
-            log.push(format!("Stop and remove container: {name}"));
-            let _ = docker_cmd(&["rm", "--force", id], log).await;
-        }
+    if let Some(name) = &state.job_container_name
+        && let Some(id) = &state.job_container_id
+    {
+        log.push(format!("Stop and remove container: {name}"));
+        let _ = docker_cmd(&["rm", "--force", id], log).await;
     }
 
     // 2. Per-service: print logs, then remove
@@ -1099,7 +1099,7 @@ fn split_options(options: &str) -> Vec<String> {
 fn rand_bytes() -> [u8; 3] {
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    [rng.gen(), rng.gen(), rng.gen()]
+    [rng.r#gen(), rng.r#gen(), rng.r#gen()]
 }
 
 #[cfg(test)]
@@ -1337,9 +1337,11 @@ mod tests {
         assert!(env_keys.contains(&"FOO".to_string()));
         assert!(env_keys.contains(&"BAZ".to_string()));
         // Values must NOT appear
-        assert!(!args
-            .iter()
-            .any(|a| a == "bar" || a == "qux" || a.contains("FOO=bar")));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "bar" || a == "qux" || a.contains("FOO=bar"))
+        );
 
         // Must end with container_id, program, args
         assert!(args.contains(&"cid123".to_string()));

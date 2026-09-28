@@ -611,10 +611,11 @@ impl DebugSessionRegistry {
             record.session.version += 1;
             record.push_event("session_closed", None, Some(state.as_str().to_owned()));
         }
-        if !state.is_open() && !retain_for_agent_reconnect {
-            if let Some(record) = self.sessions.remove(session_id) {
-                self.retire(session_id.to_owned(), record);
-            }
+        if !state.is_open()
+            && !retain_for_agent_reconnect
+            && let Some(record) = self.sessions.remove(session_id)
+        {
+            self.retire(session_id.to_owned(), record);
         }
         self.notify.notify_waiters();
     }
@@ -1060,16 +1061,16 @@ pub async fn poll_verdict(
                 // the time a human answers. Mint a replacement now so the
                 // replayed checkout authenticates. The worker only applies
                 // it to steps the message marks as pinned.
-                if response.verdict == Some(Verdict::Retry) && response.snapshot_token.is_none() {
-                    if let Some(record) = inner.debug_sessions.get(&session_id) {
-                        if let Some(request) = inner.job_requests.get(&record.request_id) {
-                            response.snapshot_token = Some(
-                                shared
-                                    .state
-                                    .mint_runtime_token(&request.plan_id, &record.agent_job_id),
-                            );
-                        }
-                    }
+                if response.verdict == Some(Verdict::Retry)
+                    && response.snapshot_token.is_none()
+                    && let Some(record) = inner.debug_sessions.get(&session_id)
+                    && let Some(request) = inner.job_requests.get(&record.request_id)
+                {
+                    response.snapshot_token = Some(
+                        shared
+                            .state
+                            .mint_runtime_token(&request.plan_id, &record.agent_job_id),
+                    );
                 }
                 return Ok(Json(response));
             }
@@ -1586,9 +1587,11 @@ mod tests {
         let (mut registry, id) = registry_with_session();
         // Worker polls at 80s, inside the window.
         registry.take_verdict(&id, at(80));
-        assert!(registry
-            .sweep_abandoned(at(WORKER_LIVENESS_WINDOW.as_secs() + 10), &active([7]))
-            .is_empty());
+        assert!(
+            registry
+                .sweep_abandoned(at(WORKER_LIVENESS_WINDOW.as_secs() + 10), &active([7]))
+                .is_empty()
+        );
         assert!(registry.is_paused(7, at(0)));
     }
 
@@ -1903,10 +1906,12 @@ mod tests {
                 .len(),
             5
         );
-        assert!(registry
-            .get(&second.session_id)
-            .unwrap()
-            .agent_lease
-            .is_some());
+        assert!(
+            registry
+                .get(&second.session_id)
+                .unwrap()
+                .agent_lease
+                .is_some()
+        );
     }
 }

@@ -33,17 +33,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex as PlMutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::{debug, error, warn};
 
 use crate::config::{DebuggerConfig, DebuggerTransportMode, DebuggerTunnelInfo};
 use crate::messages::{
-    Capabilities, Event, Request, Response, EVENT_CONTINUED, EVENT_EXITED, EVENT_INITIALIZED,
-    EVENT_OUTPUT, EVENT_STOPPED, EVENT_TERMINATED,
+    Capabilities, EVENT_CONTINUED, EVENT_EXITED, EVENT_INITIALIZED, EVENT_OUTPUT, EVENT_STOPPED,
+    EVENT_TERMINATED, Event, Request, Response,
 };
 use crate::repl::{DapReplExecutor, DapReplParser, ParseError};
 use crate::variables::DapVariableProvider;
@@ -204,13 +204,18 @@ struct DapTimeouts {
 
 impl DapTimeouts {
     fn from_env_and_config() -> Self {
-        let connection_minutes = std::env::var(crate::env_vars::DAP_CONNECTION_TIMEOUT)
-            .ok()
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Reads through `lookup` so tests exercise the same parsing without
+    /// touching the process environment (edition 2024 makes `set_var`
+    /// unsafe and this crate forbids unsafe code).
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let connection_minutes = lookup(crate::env_vars::DAP_CONNECTION_TIMEOUT)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(crate::DEFAULT_CONNECTION_TIMEOUT_MINUTES as u64);
-        let tunnel_seconds = std::env::var(crate::env_vars::DAP_TUNNEL_CONNECT_TIMEOUT_SECONDS)
-            .ok()
+        let tunnel_seconds = lookup(crate::env_vars::DAP_TUNNEL_CONNECT_TIMEOUT_SECONDS)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(crate::DEFAULT_TUNNEL_CONNECT_TIMEOUT_SECONDS as u64);
@@ -454,19 +459,19 @@ impl DapDebugger {
                     // Send welcome output event after configurationDone
                     // (matches official runner ordering).
                     let welcome = resolve_welcome_message(&core);
-                    if let Some(mut msg) = welcome {
-                        if !msg.is_empty() {
-                            if !msg.ends_with('\n') {
-                                msg.push('\n');
-                            }
-                            let event_seq = next_seq(&core).await;
-                            let _ = out_tx_dispatch.send(Outbound::Event(
-                                Event::new(event_seq, EVENT_OUTPUT).with_body(json!({
-                                    "category": "console",
-                                    "output": msg,
-                                })),
-                            ));
+                    if let Some(mut msg) = welcome
+                        && !msg.is_empty()
+                    {
+                        if !msg.ends_with('\n') {
+                            msg.push('\n');
                         }
+                        let event_seq = next_seq(&core).await;
+                        let _ = out_tx_dispatch.send(Outbound::Event(
+                            Event::new(event_seq, EVENT_OUTPUT).with_body(json!({
+                                "category": "console",
+                                "output": msg,
+                            })),
+                        ));
                     }
                 }
                 if matches!(
@@ -1080,10 +1085,12 @@ mod tests {
             .dispatch(Request::new("evaluate").with_arguments(json!({"expression": "help"})))
             .await;
         assert!(resp.success);
-        assert!(resp.body.unwrap()["result"]
-            .as_str()
-            .unwrap()
-            .contains("Available commands"));
+        assert!(
+            resp.body.unwrap()["result"]
+                .as_str()
+                .unwrap()
+                .contains("Available commands")
+        );
     }
 
     #[tokio::test]
@@ -1157,16 +1164,13 @@ mod tests {
 
     #[tokio::test]
     async fn env_var_overrides_timeout() {
-        let saved = std::env::var(crate::env_vars::DAP_CONNECTION_TIMEOUT).ok();
-        std::env::set_var(crate::env_vars::DAP_CONNECTION_TIMEOUT, "3");
-        let cfg = sample_config();
-        let dbg = DapDebugger::new(cfg);
-        let to = dbg.core.timeouts;
+        // Exercise the same parse path as `from_env_and_config` — the env
+        // override wins over the compiled default — without mutating the
+        // process environment.
+        let to = DapTimeouts::from_lookup(|name| {
+            (name == crate::env_vars::DAP_CONNECTION_TIMEOUT).then(|| "3".to_owned())
+        });
         assert_eq!(to.connection, Duration::from_secs(180));
-        match saved {
-            Some(v) => std::env::set_var(crate::env_vars::DAP_CONNECTION_TIMEOUT, v),
-            None => std::env::remove_var(crate::env_vars::DAP_CONNECTION_TIMEOUT),
-        }
     }
 
     #[test]

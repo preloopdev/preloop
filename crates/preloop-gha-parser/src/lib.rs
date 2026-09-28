@@ -16,15 +16,15 @@ mod trigger;
 mod yaml;
 
 pub use expand::{
-    effective_token_permissions, expand_deferred_matrix_job, expand_deferred_reusable_call,
-    expand_jobs, expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
+    DEFAULT_TOKEN_PERMISSIONS, MAX_REUSABLE_WORKFLOW_DEPTH, MAX_UNIQUE_REUSABLE_WORKFLOWS,
+    MAX_WORKFLOW_DEPTH, PERMISSION_SCOPES, READ_ONLY_SCOPES, effective_token_permissions,
+    expand_deferred_matrix_job, expand_deferred_reusable_call, expand_jobs,
+    expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
     expand_jobs_with_reusables_and_shas_and_inputs,
     expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
-    DEFAULT_TOKEN_PERMISSIONS, MAX_REUSABLE_WORKFLOW_DEPTH, MAX_UNIQUE_REUSABLE_WORKFLOWS,
-    MAX_WORKFLOW_DEPTH, PERMISSION_SCOPES, READ_ONLY_SCOPES,
 };
 pub use models::*;
-pub use trigger::{glob_match, TriggerMismatch};
+pub use trigger::{TriggerMismatch, glob_match};
 pub use yaml::{parse_action_metadata, parse_workflow};
 
 #[cfg(test)]

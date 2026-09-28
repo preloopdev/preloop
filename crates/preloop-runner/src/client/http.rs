@@ -124,13 +124,11 @@ impl HttpClient {
         // In TCP upstream mode, the server advertises loopback URLs but the
         // runner must reach it at the upstream LAN address. Rewrite matching
         // URLs transparently so configure and run both work.
-        if !has_socket {
-            if let (Some(origin), Some(upstream)) = (origin, upstream) {
-                client.upstream_rewrite = Some((
-                    origin.trim_end_matches('/').to_owned(),
-                    upstream.trim_end_matches('/').to_owned(),
-                ));
-            }
+        if !has_socket && let (Some(origin), Some(upstream)) = (origin, upstream) {
+            client.upstream_rewrite = Some((
+                origin.trim_end_matches('/').to_owned(),
+                upstream.trim_end_matches('/').to_owned(),
+            ));
         }
         Ok(client)
     }
@@ -174,10 +172,10 @@ impl HttpClient {
     /// Select the transport for a URL, routing only the configured local
     /// control-plane origin through its mounted Unix socket.
     pub fn client_for(&self, url: &str) -> &reqwest::Client {
-        if let Some(control) = &self.control {
-            if reqwest::Url::parse(url).is_ok_and(|url| same_origin(&url, &control.origin)) {
-                return &control.client;
-            }
+        if let Some(control) = &self.control
+            && reqwest::Url::parse(url).is_ok_and(|url| same_origin(&url, &control.origin))
+        {
+            return &control.client;
         }
         &self.inner
     }
@@ -185,10 +183,10 @@ impl HttpClient {
     /// Rewrite a URL if an upstream rewrite is configured, replacing the
     /// loopback origin prefix with the upstream address.
     pub fn rewrite_url<'a>(&self, url: &'a str) -> std::borrow::Cow<'a, str> {
-        if let Some((origin, upstream)) = &self.upstream_rewrite {
-            if url.starts_with(origin.as_str()) {
-                return std::borrow::Cow::Owned(format!("{}{}", upstream, &url[origin.len()..]));
-            }
+        if let Some((origin, upstream)) = &self.upstream_rewrite
+            && url.starts_with(origin.as_str())
+        {
+            return std::borrow::Cow::Owned(format!("{}{}", upstream, &url[origin.len()..]));
         }
         std::borrow::Cow::Borrowed(url)
     }

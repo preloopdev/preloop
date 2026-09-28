@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
-use opentelemetry::KeyValue;
 use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------

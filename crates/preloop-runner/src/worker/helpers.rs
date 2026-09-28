@@ -40,15 +40,14 @@ pub(crate) fn extract_results_url(job_message: &serde_json::Value) -> Option<Str
     {
         for ep in endpoints {
             let name = ep.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if name.eq_ignore_ascii_case("SystemVssConnection") {
-                if let Some(url) = ep
+            if name.eq_ignore_ascii_case("SystemVssConnection")
+                && let Some(url) = ep
                     .get("data")
                     .and_then(|d| d.get("ResultsServiceUrl"))
                     .and_then(|v| v.as_str())
                     .filter(|url| !url.is_empty())
-                {
-                    return Some(url.trim_end_matches('/').to_string());
-                }
+            {
+                return Some(url.trim_end_matches('/').to_string());
             }
         }
     }

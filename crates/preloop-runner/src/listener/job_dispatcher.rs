@@ -503,10 +503,10 @@ fn kill_process_tree(root: u32) {
         {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let mut fields = line.split_whitespace();
-                if let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) {
-                    if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
-                        children.entry(ppid).or_default().push(pid);
-                    }
+                if let (Some(pid), Some(ppid)) = (fields.next(), fields.next())
+                    && let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>())
+                {
+                    children.entry(ppid).or_default().push(pid);
                 }
             }
         }
@@ -740,7 +740,7 @@ pub fn parse_timespan_secs(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod timespan_tests {
-    use super::{cancellation_timing, parse_timespan_secs, WorkerMessage};
+    use super::{WorkerMessage, cancellation_timing, parse_timespan_secs};
     use proptest::prelude::*;
 
     #[test]
@@ -852,8 +852,8 @@ mod tests {
     use futures::future::BoxFuture;
     use parking_lot::Mutex as ParkingLotMutex;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::Instant;
     use tempfile::TempDir;

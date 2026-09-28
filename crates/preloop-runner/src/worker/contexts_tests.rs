@@ -217,9 +217,10 @@ fn new_extracts_masks_from_secret_variables() {
         serde_json::json!({}),
     );
     assert!(ctx.masks.contains("ghp_secret123"));
-    assert!(!ctx
-        .masks
-        .contains("https://results.actions.githubusercontent.com"));
+    assert!(
+        !ctx.masks
+            .contains("https://results.actions.githubusercontent.com")
+    );
 }
 
 #[test]

@@ -1698,11 +1698,13 @@ async fn current_runner_registration_to_broker_job_e2e() {
         Value::Null,
     )
     .await;
-    assert!(connection["locationServiceData"]["serviceDefinitions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|service| service["displayName"] == "brokerlistener"));
+    assert!(
+        connection["locationServiceData"]["serviceDefinitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|service| service["displayName"] == "brokerlistener")
+    );
 
     let agent = request_json(
         &app,
@@ -2301,10 +2303,12 @@ jobs:
     let body: Value = serde_json::from_str(message["body"].as_str().unwrap()).unwrap();
     assert_eq!(body["should_acknowledge"], true);
     let runner_request_id = body["runner_request_id"].as_str().unwrap();
-    assert!(body["run_service_url"]
-        .as_str()
-        .unwrap()
-        .contains("/broker/1/"));
+    assert!(
+        body["run_service_url"]
+            .as_str()
+            .unwrap()
+            .contains("/broker/1/")
+    );
     assert_eq!(session["ownerName"], "owner");
     assert_eq!(session["assignmentQueued"], false);
     assert_eq!(session["orchestrationId"], "");
@@ -2542,10 +2546,12 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
     let pool_body: Value = serde_json::from_str(pool_ref["body"].as_str().unwrap()).unwrap();
     let expected_run_service_url = format!("{}/broker/{runner_id}/", public_base_url());
     assert_eq!(pool_body["run_service_url"], expected_run_service_url);
-    assert!(!pool_body["run_service_url"]
-        .as_str()
-        .unwrap()
-        .contains("/broker/1/"));
+    assert!(
+        !pool_body["run_service_url"]
+            .as_str()
+            .unwrap()
+            .contains("/broker/1/")
+    );
     let pool_request_id = pool_body["runner_request_id"].as_str().unwrap();
 
     let root_ref = request_json_with_bearer(
@@ -2561,10 +2567,12 @@ async fn broker_job_refs_use_session_runner_id_for_pool_and_root_polls() {
     assert_eq!(root_ref["messageType"], "RunnerJobRequest");
     let root_body: Value = serde_json::from_str(root_ref["body"].as_str().unwrap()).unwrap();
     assert_eq!(root_body["run_service_url"], expected_run_service_url);
-    assert!(!root_body["run_service_url"]
-        .as_str()
-        .unwrap()
-        .contains("/broker/1/"));
+    assert!(
+        !root_body["run_service_url"]
+            .as_str()
+            .unwrap()
+            .contains("/broker/1/")
+    );
     let root_request_id = root_body["runner_request_id"].as_str().unwrap();
 
     // The runner-2 token must also authorize acquisition on the URL advertised
@@ -2678,10 +2686,12 @@ async fn action_download_info_returns_batch_download_collection() {
     // Repositories with dots in their names (e.g. actions/setup-node.js) resolve cleanly.
     let node = &actions["actions/setup-node.js@v4"];
     assert_eq!(node["nameWithOwner"], "actions/setup-node.js");
-    assert!(node["tarballUrl"]
-        .as_str()
-        .unwrap()
-        .contains("actions/setup-node.js/abc123def456abc123def456abc123def456abc1"));
+    assert!(
+        node["tarballUrl"]
+            .as_str()
+            .unwrap()
+            .contains("actions/setup-node.js/abc123def456abc123def456abc123def456abc1")
+    );
 
     // Subpath actions key on `nameWithOwner@ref` (path excluded, matching the
     // runner's `GetDownloadInfoLookupKey`).
@@ -2766,10 +2776,12 @@ async fn action_download_info_discards_malformed_or_abbreviated_sha() {
     let checkout = &actions["actions/checkout@v4"];
     // Short SHA was discarded; resolvedSha is null and tarball URL falls back to ref
     assert!(checkout["resolvedSha"].is_null());
-    assert!(checkout["tarballUrl"]
-        .as_str()
-        .unwrap()
-        .contains("actions/checkout/v4?"));
+    assert!(
+        checkout["tarballUrl"]
+            .as_str()
+            .unwrap()
+            .contains("actions/checkout/v4?")
+    );
 }
 
 #[tokio::test]
@@ -3322,12 +3334,10 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     // action_download_ticket returns None for absolute refs
-    assert!(crate::actions::action_download_ticket(
-        &state,
-        "test-owner/test-repo@/tmp/escape",
-        None
-    )
-    .is_none());
+    assert!(
+        crate::actions::action_download_ticket(&state, "test-owner/test-repo@/tmp/escape", None)
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -3394,7 +3404,10 @@ async fn runner_protocol_errors_use_official_envelopes_without_changing_native_a
     );
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["$type"], "Microsoft.VisualStudio.Services.Common.VssException, Microsoft.VisualStudio.Services.Common");
+    assert_eq!(
+        body["$type"],
+        "Microsoft.VisualStudio.Services.Common.VssException, Microsoft.VisualStudio.Services.Common"
+    );
     assert_eq!(body["message"], "runner or job protocol token required");
     assert_eq!(body["typeKey"], "UnauthorizedRequestException");
     assert!(body["typeName"].as_str().is_some());

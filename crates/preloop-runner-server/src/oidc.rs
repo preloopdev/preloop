@@ -10,9 +10,9 @@
 //! environment. The toolkit's `OidcClient.getIDToken()` hits this endpoint
 //! and reads `{"value":"<jwt>"}`.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use preloop_gha_protocol::crypto::{sign_jwt_rs256_with_key, AgentRsaKeypair, RsaParametersExport};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use preloop_gha_protocol::crypto::{AgentRsaKeypair, RsaParametersExport, sign_jwt_rs256_with_key};
 use rcgen::{CertificateParams, DnType, KeyPair, KeyUsagePurpose};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -382,10 +382,10 @@ pub fn parse_id_token_grant(workflow_yaml: &str, job_id: Option<&str>) -> bool {
         }
     }
 
-    if let Some(job_id) = job_id {
-        if let Some(job_permissions) = jobs.get(job_id).and_then(|job| job.get("permissions")) {
-            return permissions_grant(job_permissions);
-        }
+    if let Some(job_id) = job_id
+        && let Some(job_permissions) = jobs.get(job_id).and_then(|job| job.get("permissions"))
+    {
+        return permissions_grant(job_permissions);
     }
 
     parsed.get("permissions").is_some_and(permissions_grant)
@@ -676,11 +676,12 @@ mod tests {
         // Verify signature against the public key
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
-        assert!(kp
-            .keypair
-            .public_key()
-            .verify_signature_rs256(signing_input.as_bytes(), &sig_bytes)
-            .is_ok());
+        assert!(
+            kp.keypair
+                .public_key()
+                .verify_signature_rs256(signing_input.as_bytes(), &sig_bytes)
+                .is_ok()
+        );
     }
 
     // -- permission parsing --------------------------------------------------

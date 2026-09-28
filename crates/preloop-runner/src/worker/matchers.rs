@@ -343,17 +343,13 @@ impl MatcherRegistry {
                 let file = pm.file.clone().and_then(|f| {
                     let mut resolved = f.clone();
 
-                    if !Path::new(&resolved).is_absolute() {
-                        if let Some(from_path) = &pm.from_path {
-                            if !from_path.is_empty() {
-                                if let Some(dir) = Path::new(from_path).parent() {
-                                    if !dir.as_os_str().is_empty() {
-                                        resolved =
-                                            dir.join(&resolved).to_string_lossy().to_string();
-                                    }
-                                }
-                            }
-                        }
+                    if !Path::new(&resolved).is_absolute()
+                        && let Some(from_path) = &pm.from_path
+                        && !from_path.is_empty()
+                        && let Some(dir) = Path::new(from_path).parent()
+                        && !dir.as_os_str().is_empty()
+                    {
+                        resolved = dir.join(&resolved).to_string_lossy().to_string();
                     }
 
                     if !Path::new(&resolved).is_absolute() && !workspace.is_empty() {
@@ -379,19 +375,19 @@ impl MatcherRegistry {
                     }
 
                     let resolved_path = Path::new(&resolved);
-                    if resolved_path.exists() && resolved_path.is_file() {
-                        if let Some(repo_path) = get_repository_path(
+                    if resolved_path.exists()
+                        && resolved_path.is_file()
+                        && let Some(repo_path) = get_repository_path(
                             resolved_path,
                             workspace,
                             repository,
                             server_url,
                             failsafe,
-                        ) {
-                            if let Ok(rel) = resolved_path.strip_prefix(&repo_path) {
-                                let rel_str = rel.to_string_lossy().to_string();
-                                return Some(rel_str.replace('\\', "/"));
-                            }
-                        }
+                        )
+                        && let Ok(rel) = resolved_path.strip_prefix(&repo_path)
+                    {
+                        let rel_str = rel.to_string_lossy().to_string();
+                        return Some(rel_str.replace('\\', "/"));
                     }
                     None
                 });
@@ -495,14 +491,14 @@ fn validate_matcher_definition(def: &MatcherDefinition) -> Result<()> {
         let groups = re.captures_len();
 
         let check_range = |name: &str, val: Option<usize>| -> Result<()> {
-            if let Some(idx) = val {
-                if idx >= groups {
-                    anyhow::bail!(
-                        "The property '{}' is set to {} which is out of range",
-                        name,
-                        idx
-                    );
-                }
+            if let Some(idx) = val
+                && idx >= groups
+            {
+                anyhow::bail!(
+                    "The property '{}' is set to {} which is out of range",
+                    name,
+                    idx
+                );
             }
             Ok(())
         };
@@ -655,14 +651,14 @@ fn get_repository_path(
         }
 
         let git_config_path = current.join(".git").join("config");
-        if git_config_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&git_config_path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    for pattern in &patterns {
-                        if trimmed.eq_ignore_ascii_case(pattern) {
-                            return Some(current.to_path_buf());
-                        }
+        if git_config_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&git_config_path)
+        {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                for pattern in &patterns {
+                    if trimmed.eq_ignore_ascii_case(pattern) {
+                        return Some(current.to_path_buf());
                     }
                 }
             }
@@ -781,9 +777,11 @@ mod tests {
 
         registry.remove("removable");
 
-        assert!(registry
-            .match_line("ERR boom", "", "", "", false)
-            .is_empty());
+        assert!(
+            registry
+                .match_line("ERR boom", "", "", "", false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -815,28 +813,40 @@ mod tests {
         let mut registry = MatcherRegistry::new();
         registry.add_from_file(&path).unwrap();
 
-        assert!(registry
-            .match_line("Start: hello", "", "", "", false)
-            .is_empty());
-        assert!(registry
-            .match_line("Middle: world", "", "", "", false)
-            .is_empty());
+        assert!(
+            registry
+                .match_line("Start: hello", "", "", "", false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .match_line("Middle: world", "", "", "", false)
+                .is_empty()
+        );
         let anns = registry.match_line("End: final", "", "", "", false);
         assert_eq!(anns.len(), 1);
         assert_eq!(anns[0].message, "final");
 
-        assert!(registry
-            .match_line("Start: hello", "", "", "", false)
-            .is_empty());
-        assert!(registry
-            .match_line("Other line", "", "", "", false)
-            .is_empty());
-        assert!(registry
-            .match_line("Middle: world", "", "", "", false)
-            .is_empty());
-        assert!(registry
-            .match_line("End: final", "", "", "", false)
-            .is_empty());
+        assert!(
+            registry
+                .match_line("Start: hello", "", "", "", false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .match_line("Other line", "", "", "", false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .match_line("Middle: world", "", "", "", false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .match_line("End: final", "", "", "", false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -866,9 +876,11 @@ mod tests {
         let mut registry = MatcherRegistry::new();
         registry.add_from_file(&path).unwrap();
 
-        assert!(registry
-            .match_line("Start: hello", "", "", "", false)
-            .is_empty());
+        assert!(
+            registry
+                .match_line("Start: hello", "", "", "", false)
+                .is_empty()
+        );
         let anns1 = registry.match_line("End: first", "", "", "", false);
         assert_eq!(anns1.len(), 1);
         assert_eq!(anns1[0].message, "first");
@@ -877,12 +889,16 @@ mod tests {
         assert_eq!(anns2.len(), 1);
         assert_eq!(anns2[0].message, "second");
 
-        assert!(registry
-            .match_line("Other line", "", "", "", false)
-            .is_empty());
-        assert!(registry
-            .match_line("End: third", "", "", "", false)
-            .is_empty());
+        assert!(
+            registry
+                .match_line("Other line", "", "", "", false)
+                .is_empty()
+        );
+        assert!(
+            registry
+                .match_line("End: third", "", "", "", false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1063,9 +1079,10 @@ mod tests {
 
         let mut registry = MatcherRegistry::new();
         let err = registry.add_from_file(&path).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("property 'message' is set to 2 which is out of range"));
+        assert!(
+            err.to_string()
+                .contains("property 'message' is set to 2 which is out of range")
+        );
     }
 
     #[test]
@@ -1152,9 +1169,11 @@ mod tests {
 
         // Adding same owner replaces
         registry.add_from_file(&path2).unwrap();
-        assert!(registry
-            .match_line("OLD first", "", "", "", false)
-            .is_empty());
+        assert!(
+            registry
+                .match_line("OLD first", "", "", "", false)
+                .is_empty()
+        );
         assert_eq!(
             registry.match_line("NEW second", "", "", "", false).len(),
             1

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::models::{EnvValue, JobContinueOnError, ParserError, RunsOn, Workflow};
 use indexmap::IndexMap;
-use preloop_gha_expressions::{eval_expression, Context};
+use preloop_gha_expressions::{Context, eval_expression};
 use preloop_gha_protocol::expr_scan::find_expression_end;
 use serde_json::{Map, Value};
 
@@ -75,10 +75,10 @@ pub fn resolve_runs_on_label(label: &str, context: &Context) -> Vec<String> {
     if !label.contains("${{") {
         return vec![label.to_owned()];
     }
-    if let Some(expression) = whole_expression(label) {
-        if let Ok(Value::Array(items)) = eval_expression(expression, context) {
-            return items.iter().map(stringify_value).collect();
-        }
+    if let Some(expression) = whole_expression(label)
+        && let Ok(Value::Array(items)) = eval_expression(expression, context)
+    {
+        return items.iter().map(stringify_value).collect();
     }
     vec![resolve_string(label, context).unwrap_or_else(|_| label.to_owned())]
 }
@@ -143,10 +143,11 @@ pub(crate) fn stringify_value(value: &Value) -> String {
             if let Some(u) = n.as_u64() {
                 return u.to_string();
             }
-            if let Some(f) = n.as_f64() {
-                if f.fract() == 0.0 && f.abs() < 1e15 {
-                    return (f as i64).to_string();
-                }
+            if let Some(f) = n.as_f64()
+                && f.fract() == 0.0
+                && f.abs() < 1e15
+            {
+                return (f as i64).to_string();
             }
             n.to_string()
         }
@@ -242,14 +243,14 @@ fn validate_contexts(
         else {
             continue;
         };
-        if let Some((min, max)) = context_spec_arity(spec)? {
-            if !(min..=max).contains(&function.argument_count) {
-                return Err(format!(
-                    "function \"{}\" with {} argument(s) is not allowed here; \
+        if let Some((min, max)) = context_spec_arity(spec)?
+            && !(min..=max).contains(&function.argument_count)
+        {
+            return Err(format!(
+                "function \"{}\" with {} argument(s) is not allowed here; \
                      allowed contract is \"{spec}\".",
-                    function.name, function.argument_count
-                ));
-            }
+                function.name, function.argument_count
+            ));
         }
     }
     Ok(())

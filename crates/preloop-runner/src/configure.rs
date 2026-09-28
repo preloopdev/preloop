@@ -8,7 +8,7 @@
 
 use std::future::Future;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use crate::cli::{ConfigureArgs, GlobalArgs, RemoveArgs};
@@ -107,22 +107,22 @@ pub async fn run_configure(args: ConfigureArgs, global: &GlobalArgs) -> Result<(
         .get_json::<serde_json::Value>(&connection_url)
         .await
         .context("fetching connectionData")?;
-    if let Some(location) = conn_data.get("locationServiceData") {
-        if let (Some(last_change_id), Some(last_change_id64)) = (
+    if let Some(location) = conn_data.get("locationServiceData")
+        && let (Some(last_change_id), Some(last_change_id64)) = (
             location
                 .get("lastChangeId")
                 .and_then(serde_json::Value::as_i64),
             location
                 .get("lastChangeId64")
                 .and_then(serde_json::Value::as_i64),
-        ) {
-            let cache = serde_json::json!({
-                "lastChangeId": last_change_id,
-                "lastChangeId64": last_change_id64,
-            });
-            std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache)?)
-                .with_context(|| format!("writing {}", cache_path.display()))?;
-        }
+        )
+    {
+        let cache = serde_json::json!({
+            "lastChangeId": last_change_id,
+            "lastChangeId64": last_change_id64,
+        });
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache)?)
+            .with_context(|| format!("writing {}", cache_path.display()))?;
     }
 
     // Step 3: Obtain the RSA keypair
@@ -461,10 +461,10 @@ async fn check_existing_agent(
         .await
         .context("querying existing agents")?;
 
-    if let Some(agents) = resp.get("value").and_then(|v| v.as_array()) {
-        if let Some(agent) = agents.first() {
-            return Ok(agent.get("id").and_then(|v| v.as_i64()));
-        }
+    if let Some(agents) = resp.get("value").and_then(|v| v.as_array())
+        && let Some(agent) = agents.first()
+    {
+        return Ok(agent.get("id").and_then(|v| v.as_i64()));
     }
     Ok(None)
 }
@@ -651,7 +651,9 @@ where
         let shasums = match fetcher(&shasums_url).await {
             Ok(b) => Some(String::from_utf8_lossy(&b).into_owned()),
             Err(e) => {
-                warn!("could not fetch SHASUMS256.txt for {version_v}: {e:#}; relying on pinned SHA only");
+                warn!(
+                    "could not fetch SHASUMS256.txt for {version_v}: {e:#}; relying on pinned SHA only"
+                );
                 None
             }
         };
@@ -793,8 +795,8 @@ mod node_externals_tests {
         }
         let mut gz = Vec::new();
         {
-            use flate2::write::GzEncoder;
             use flate2::Compression;
+            use flate2::write::GzEncoder;
             use std::io::Write;
             let mut enc = GzEncoder::new(&mut gz, Compression::default());
             enc.write_all(&tar_data).unwrap();

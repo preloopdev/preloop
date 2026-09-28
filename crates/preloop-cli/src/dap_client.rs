@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 #[derive(Debug, Args)]
 pub struct DapArgs {
@@ -46,7 +46,9 @@ pub async fn run(args: DapArgs, base_url: String, token: Option<String>) -> Resu
     let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .context("connecting to preloop DAP endpoint")?;
-    println!("Connected. Commands: init, ready, wait, source, scopes, vars REF, eval EXPR, continue, quit");
+    println!(
+        "Connected. Commands: init, ready, wait, source, scopes, vars REF, eval EXPR, continue, quit"
+    );
 
     let mut seq = 0_i64;
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());

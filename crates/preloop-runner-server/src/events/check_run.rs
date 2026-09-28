@@ -76,9 +76,11 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_malformed_actions() {
-        assert!(Adapter
-            .project(&payload("rerequested_by_mistake"))
-            .is_empty());
+        assert!(
+            Adapter
+                .project(&payload("rerequested_by_mistake"))
+                .is_empty()
+        );
         assert!(Adapter.project(&json!({"action": "completed"})).is_empty());
     }
 }

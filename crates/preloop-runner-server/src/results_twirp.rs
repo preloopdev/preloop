@@ -216,12 +216,12 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
         let mut inner = shared.state.inner.lock().await;
         // In-lock re-check: the job may have settled between the gate and
         // this lock — a settled job must not mint a fresh upload credential.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity {
-            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
-                return Err(ApiError::forbidden(
-                    "job is not live; writes are rejected for completed or unknown jobs",
-                ));
-            }
+        if let crate::auth::ResultsIdentity::Job(job) = &identity
+            && !crate::auth::job_is_live_locked(&inner, job.job_id)
+        {
+            return Err(ApiError::forbidden(
+                "job is not live; writes are rejected for completed or unknown jobs",
+            ));
         }
         // Per-job cap, same bound as the other pending maps: a live job can
         // otherwise mint unlimited diag URLs for the full TTL. Evict the
@@ -878,14 +878,14 @@ pub async fn twirp_cache_v2_create(
         // In-lock re-check: the job may have settled between the gate above
         // and this lock acquisition — a settled job must not mint a fresh
         // upload credential in that window.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity {
-            if !crate::auth::job_is_live_locked(&inner, job.job_id) {
-                drop(inner);
-                let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-                return Err(ApiError::forbidden(
-                    "job is not live; writes are rejected for completed or unknown jobs",
-                ));
-            }
+        if let crate::auth::ResultsIdentity::Job(job) = &identity
+            && !crate::auth::job_is_live_locked(&inner, job.job_id)
+        {
+            drop(inner);
+            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+            return Err(ApiError::forbidden(
+                "job is not live; writes are rejected for completed or unknown jobs",
+            ));
         }
         if inner
             .cache_v2_pending

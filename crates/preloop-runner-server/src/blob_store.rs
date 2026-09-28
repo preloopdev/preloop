@@ -1,7 +1,7 @@
 use super::*;
 
 use axum::body::Body;
-use axum::http::{header::CONTENT_LENGTH, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_LENGTH};
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
@@ -25,10 +25,10 @@ fn blob_lock_for(kind: &str, token: &str) -> Arc<Mutex<()>> {
 fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
     let key = format!("{kind}/{token}");
     let mut map = BLOB_LOCKS.lock().expect("blob lock poisoned");
-    if let Some(existing) = map.get(&key) {
-        if Arc::strong_count(existing) <= 2 {
-            map.remove(&key);
-        }
+    if let Some(existing) = map.get(&key)
+        && Arc::strong_count(existing) <= 2
+    {
+        map.remove(&key);
     }
     drop(arc);
 }
@@ -108,10 +108,10 @@ pub fn parse_blob_path(path: &str) -> Option<(String, String)> {
     let mut token = raw_token.to_string();
     // Artifact download URLs append `.zip` for toolkit content-type
     // detection; strip it before validation and map lookup (mirrors blob_get).
-    if kind == "artifact" {
-        if let Some(stripped) = token.strip_suffix(".zip") {
-            token = stripped.to_string();
-        }
+    if kind == "artifact"
+        && let Some(stripped) = token.strip_suffix(".zip")
+    {
+        token = stripped.to_string();
     }
     let decoded = percent_encoding::percent_decode_str(&token)
         .decode_utf8()
@@ -201,15 +201,13 @@ pub async fn blob_put(
     // R1-10: if a bearer is present and verifies as a job identity, require
     // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
     // attributed; their liveness is enforced at URL-mint time.
-    if let Some(bearer) = crate::auth::bearer_from_headers(&headers) {
-        if let Ok(identity) = crate::auth::results_identity(&shared.state, bearer) {
-            if crate::auth::require_live_results_job(&shared.state, &identity)
-                .await
-                .is_err()
-            {
-                return StatusCode::FORBIDDEN;
-            }
-        }
+    if let Some(bearer) = crate::auth::bearer_from_headers(&headers)
+        && let Ok(identity) = crate::auth::results_identity(&shared.state, bearer)
+        && crate::auth::require_live_results_job(&shared.state, &identity)
+            .await
+            .is_err()
+    {
+        return StatusCode::FORBIDDEN;
     }
     // Early Content-Length check before buffering — avoids streaming a block
     // that will be rejected at the per-block cap.
@@ -609,10 +607,10 @@ pub async fn prune_replay_results(
     // Newest first, so everything past the retention window is the tail.
     plans.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
     for (path, _) in plans.into_iter().skip(REPLAY_PLANS_RETAINED) {
-        if let Err(error) = tokio::fs::remove_dir_all(&path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), %error, "failed to prune replay results");
-            }
+        if let Err(error) = tokio::fs::remove_dir_all(&path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "failed to prune replay results");
         }
     }
 }

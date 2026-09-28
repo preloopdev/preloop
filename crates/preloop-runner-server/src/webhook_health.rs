@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::state::SharedState;
-use crate::webhook_status::{now_us, AppWebhookConfigStatus};
+use crate::webhook_status::{AppWebhookConfigStatus, now_us};
 
 const DEFAULT_INTERVAL_SECS: u64 = 900;
 const MIN_INTERVAL_SECS: u64 = 60;

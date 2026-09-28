@@ -711,9 +711,11 @@ mod tests {
             .collect();
         // Both x64/linux and x64/windows get publish:true.
         assert_eq!(published.len(), 2);
-        assert!(published
-            .iter()
-            .all(|c| c.values.get("arch") == Some(&json!("x64"))));
+        assert!(
+            published
+                .iter()
+                .all(|c| c.values.get("arch") == Some(&json!("x64")))
+        );
     }
 
     /// Official: all-excluded product with no include-only → zero configurations.
@@ -1142,7 +1144,9 @@ jobs:
             let model_count = expand_matrix_spec(&spec).len();
 
             // Render as YAML
-            let mut yaml = String::from("on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n");
+            let mut yaml = String::from(
+                "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n",
+            );
             for (name, values) in &axes {
                 yaml.push_str(&format!("        {name}: ["));
                 for (i, v) in values.iter().enumerate() {

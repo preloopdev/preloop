@@ -29,17 +29,17 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap};
+use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
 use preloop_gha_protocol::crypto::sha256_hex;
 use tracing::warn;
 
+use crate::ApiError;
 use crate::events::trust_tier::TrustTier;
 use crate::github_app::{MintLedgerEntry, MintRejected};
 use crate::state::SharedState;
-use crate::ApiError;
 
 /// How long validated installation-token facts stay cached. The token itself
 /// lives an hour; 60s keeps github.com revocation effective within a minute
@@ -182,15 +182,15 @@ async fn authenticate(
     }
 
     // 2. PAT — the operator's static GitHub credential.
-    if let Some(pat) = shared.state.static_github_pat() {
-        if constant_time_eq(bearer, &pat) {
-            let actor = resolve_pat_actor(shared, bearer).await;
-            return Ok(DispatchIdentity {
-                actor,
-                tier: TrustTier::AdminManual,
-                kind: DispatchAuthKind::Pat,
-            });
-        }
+    if let Some(pat) = shared.state.static_github_pat()
+        && constant_time_eq(bearer, &pat)
+    {
+        let actor = resolve_pat_actor(shared, bearer).await;
+        return Ok(DispatchIdentity {
+            actor,
+            tier: TrustTier::AdminManual,
+            kind: DispatchAuthKind::Pat,
+        });
     }
 
     // 3. Own-App JWT — RS256, `iss` = one of the registered App ids.
@@ -202,10 +202,10 @@ async fn authenticate(
                 break;
             }
         }
-    } else if let Some(app) = &shared.state.github_app {
-        if verify_app_jwt(&app.app_id, bearer, &app.private_key.to_public_key()).is_ok() {
-            verified_app_id = Some(app.app_id.clone());
-        }
+    } else if let Some(app) = &shared.state.github_app
+        && verify_app_jwt(&app.app_id, bearer, &app.private_key.to_public_key()).is_ok()
+    {
+        verified_app_id = Some(app.app_id.clone());
     }
     if let Some(app_id) = verified_app_id {
         let actor = resolve_app_actor(shared, &app_id).await;
@@ -320,15 +320,14 @@ async fn validate_installation_online(
     let info = match fetch_installation_info(&api_base, token).await {
         Ok(info) => info,
         Err(error) => {
-            if let Some(rejected) = error.downcast_ref::<MintRejected>() {
-                if rejected.status == reqwest::StatusCode::UNAUTHORIZED
-                    || rejected.status == reqwest::StatusCode::FORBIDDEN
-                {
-                    return Err(ApiError::unauthorized(format!(
-                        "github.com rejected the installation token ({}): {}",
-                        rejected.status, rejected.message
-                    )));
-                }
+            if let Some(rejected) = error.downcast_ref::<MintRejected>()
+                && (rejected.status == reqwest::StatusCode::UNAUTHORIZED
+                    || rejected.status == reqwest::StatusCode::FORBIDDEN)
+            {
+                return Err(ApiError::unauthorized(format!(
+                    "github.com rejected the installation token ({}): {}",
+                    rejected.status, rejected.message
+                )));
             }
             warn!(
                 ?error,

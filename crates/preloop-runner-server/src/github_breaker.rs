@@ -140,14 +140,12 @@ impl GithubBreaker {
         if let Some(remaining) = Self::remaining(&inner, now) {
             return Some(remaining);
         }
-        if inner.open_until.is_some() {
-            if let Some(started) = inner.probe_started {
-                if let Some(elapsed) = now.checked_duration_since(started) {
-                    if elapsed < self.config.probe_timeout {
-                        return Some(self.config.probe_timeout - elapsed);
-                    }
-                }
-            }
+        if inner.open_until.is_some()
+            && let Some(started) = inner.probe_started
+            && let Some(elapsed) = now.checked_duration_since(started)
+            && elapsed < self.config.probe_timeout
+        {
+            return Some(self.config.probe_timeout - elapsed);
         }
         None
     }

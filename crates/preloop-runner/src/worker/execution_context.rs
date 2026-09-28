@@ -23,8 +23,52 @@ const DISABLE_STDOUT_MULTILINE_LOG_PREFIXING: &str =
 /// values are `1`, `true`, and `$true` (case-insensitive). Invalid and unset
 /// values retain the default of false.
 fn disable_stdout_multiline_log_prefixing() -> bool {
-    std::env::var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING)
-        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "$true"))
+    env_or_test(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "$true"))
+}
+
+/// `std::env::var` with a test-only thread-local override. Edition 2024 makes
+/// `std::env::set_var` unsafe and this crate forbids `unsafe`, so tests
+/// redirect reads rather than write the process environment.
+fn env_or_test(name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
+        // Blank override reads as unset, matching env_non_empty callers.
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run `body` with `vars` visible to `env_or_test` on this thread only.
+/// Replaces the old `std::env::set_var` fixture.
+#[cfg(test)]
+fn with_test_env<T>(vars: &[(&'static str, Option<String>)], body: impl FnOnce() -> T) -> T {
+    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
+    TEST_ENV.with(|cell| {
+        let mut map = cell.borrow_mut();
+        for (name, value) in vars {
+            match value {
+                Some(value) => {
+                    map.insert(*name, value.clone());
+                }
+                None => {
+                    map.insert(*name, String::new());
+                }
+            }
+        }
+    });
+    let result = body();
+    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
+    result
 }
 
 #[cfg(test)]
@@ -537,13 +581,11 @@ impl<'a> StepContext<'a> {
             // real user, not a fabricated one. Explicit job/step values win.
             // Containers have neither the runtime dir nor the host user on
             // hosted images either.
-            let runner_user = std::env::var("PRELOOP_RUNNER_USER")
-                .ok()
+            let runner_user = env_or_test("PRELOOP_RUNNER_USER")
                 .filter(|user| !user.is_empty())
-                .or_else(|| std::env::var("USER").ok())
+                .or_else(|| env_or_test("USER"))
                 .unwrap_or_else(|| "root".to_owned());
-            let runner_uid = std::env::var("PRELOOP_RUNNER_UID")
-                .ok()
+            let runner_uid = env_or_test("PRELOOP_RUNNER_UID")
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(0);
             env.insert("USER".to_owned(), runner_user.clone());
@@ -729,50 +771,20 @@ mod tests {
 
     static STDOUT_ENV_LOCK: std::sync::LazyLock<Mutex<()>> =
         std::sync::LazyLock::new(|| Mutex::new(()));
-    static RUNNER_USER_ENV_LOCK: std::sync::LazyLock<Mutex<()>> =
-        std::sync::LazyLock::new(|| Mutex::new(()));
 
-    /// Set process env vars for the duration of a test and restore them on
-    /// drop. Serialize with `RUNNER_USER_ENV_LOCK` (env is process-wide).
-    struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, Option<String>)]) -> Self {
-            let mut previous = Vec::new();
-            for (name, value) in vars {
-                previous.push((*name, std::env::var(name).ok()));
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-            EnvGuard(previous)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in &self.0 {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
+    /// Set env overrides for the duration of `test` on this thread only —
+    /// the thread-local `TEST_ENV` above keeps `env_or_test` reads inside the
+    /// test, so no process env is mutated and no serialization lock is
+    /// needed.
     fn with_stdout_toggle<T>(value: Option<&str>, test: impl FnOnce() -> T) -> T {
         let _guard = STDOUT_ENV_LOCK.lock();
-        let previous = std::env::var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING).ok();
-        match value {
-            Some(value) => std::env::set_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING, value),
-            None => std::env::remove_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING),
-        }
-        let result = test();
-        match previous {
-            Some(previous) => std::env::set_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING, previous),
-            None => std::env::remove_var(DISABLE_STDOUT_MULTILINE_LOG_PREFIXING),
-        }
-        result
+        with_test_env(
+            &[(
+                DISABLE_STDOUT_MULTILINE_LOG_PREFIXING,
+                value.map(str::to_owned),
+            )],
+            test,
+        )
     }
 
     fn make_job() -> JobContext {
@@ -804,20 +816,23 @@ mod tests {
     /// and XDG_RUNTIME_DIR points at its runtime dir.
     #[test]
     fn host_env_uses_configured_runner_user() {
-        let _lock = RUNNER_USER_ENV_LOCK.lock();
-        let _guard = EnvGuard::set(&[
-            ("PRELOOP_RUNNER_USER", Some("runner".to_owned())),
-            ("PRELOOP_RUNNER_UID", Some("1000".to_owned())),
-        ]);
-        let mut job = make_job();
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        with_test_env(
+            &[
+                ("PRELOOP_RUNNER_USER", Some("runner".to_owned())),
+                ("PRELOOP_RUNNER_UID", Some("1000".to_owned())),
+            ],
+            || {
+                let mut job = make_job();
+                let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
 
-        let env = ctx.build_env();
-        assert_eq!(env.get("USER").map(String::as_str), Some("runner"));
-        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("runner"));
-        assert_eq!(
-            env.get("XDG_RUNTIME_DIR").map(String::as_str),
-            Some("/run/user/1000")
+                let env = ctx.build_env();
+                assert_eq!(env.get("USER").map(String::as_str), Some("runner"));
+                assert_eq!(env.get("LOGNAME").map(String::as_str), Some("runner"));
+                assert_eq!(
+                    env.get("XDG_RUNTIME_DIR").map(String::as_str),
+                    Some("/run/user/1000")
+                );
+            },
         );
     }
 
@@ -825,34 +840,42 @@ mod tests {
     /// the process's real identity — never a fabricated root.
     #[test]
     fn host_env_keeps_process_user_when_unmanaged() {
-        let _lock = RUNNER_USER_ENV_LOCK.lock();
-        let _guard = EnvGuard::set(&[("PRELOOP_RUNNER_USER", None), ("PRELOOP_RUNNER_UID", None)]);
-        let mut job = make_job();
-        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        // Blank override masks the runner-user envs; the real USER still
+        // comes from the process env via env_or_test's fallback.
+        with_test_env(
+            &[("PRELOOP_RUNNER_USER", None), ("PRELOOP_RUNNER_UID", None)],
+            || {
+                let mut job = make_job();
+                let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
 
-        let env = ctx.build_env();
-        let expected = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
-        assert_eq!(env.get("USER").map(String::as_str), Some(expected.as_str()));
+                let env = ctx.build_env();
+                let expected = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+                assert_eq!(env.get("USER").map(String::as_str), Some(expected.as_str()));
+            },
+        );
     }
 
     /// An explicit job/step XDG_RUNTIME_DIR is user intent and must win over
     /// the contract default.
     #[test]
     fn host_env_keeps_explicit_runtime_dir() {
-        let _lock = RUNNER_USER_ENV_LOCK.lock();
-        let _guard = EnvGuard::set(&[
-            ("PRELOOP_RUNNER_USER", Some("runner".to_owned())),
-            ("PRELOOP_RUNNER_UID", Some("1000".to_owned())),
-        ]);
-        let mut job = make_job();
-        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
-        ctx.env
-            .insert("XDG_RUNTIME_DIR".into(), "/custom/run".into());
+        with_test_env(
+            &[
+                ("PRELOOP_RUNNER_USER", Some("runner".to_owned())),
+                ("PRELOOP_RUNNER_UID", Some("1000".to_owned())),
+            ],
+            || {
+                let mut job = make_job();
+                let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+                ctx.env
+                    .insert("XDG_RUNTIME_DIR".into(), "/custom/run".into());
 
-        let env = ctx.build_env();
-        assert_eq!(
-            env.get("XDG_RUNTIME_DIR").map(String::as_str),
-            Some("/custom/run")
+                let env = ctx.build_env();
+                assert_eq!(
+                    env.get("XDG_RUNTIME_DIR").map(String::as_str),
+                    Some("/custom/run")
+                );
+            },
         );
     }
 

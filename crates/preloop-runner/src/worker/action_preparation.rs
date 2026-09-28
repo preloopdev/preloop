@@ -201,10 +201,10 @@ pub(crate) async fn prepare_remote_actions(
                     if action_paths.contains_key(nested_uses) {
                         continue;
                     }
-                    if let Some(parsed) = parse_remote_uses(nested_uses) {
-                        if !nested.iter().any(|(u, _)| u == nested_uses) {
-                            nested.push((nested_uses.to_owned(), parsed));
-                        }
+                    if let Some(parsed) = parse_remote_uses(nested_uses)
+                        && !nested.iter().any(|(u, _)| u == nested_uses)
+                    {
+                        nested.push((nested_uses.to_owned(), parsed));
                     }
                 }
             }

@@ -416,12 +416,11 @@ enum PatScopeOutcome {
 async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
     use sha2::Digest as _;
     let cache_key = format!("{:x}", sha2::Sha256::digest(pat.as_bytes()));
-    if let Ok(cache) = PAT_SCOPE_CACHE.lock() {
-        if let Some((at, scopes)) = cache.get(&cache_key) {
-            if at.elapsed() < PAT_SCOPE_CACHE_TTL {
-                return PatScopeOutcome::Known(scopes.clone());
-            }
-        }
+    if let Ok(cache) = PAT_SCOPE_CACHE.lock()
+        && let Some((at, scopes)) = cache.get(&cache_key)
+        && at.elapsed() < PAT_SCOPE_CACHE_TTL
+    {
+        return PatScopeOutcome::Known(scopes.clone());
     }
     let url = format!("{}/", crate::github::github_api_base());
     let response = match crate::shared_http::CLIENT
@@ -911,15 +910,14 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     });
     let activity_type = activity_owned.as_deref();
     let mut upstream_names = submission.workflow_run_upstream_names.clone();
-    if upstream_names.is_empty() {
-        if let Some(name) = submission
+    if upstream_names.is_empty()
+        && let Some(name) = submission
             .payload
             .get("workflow_run")
             .and_then(|wr| wr.get("name"))
             .and_then(|v| v.as_str())
-        {
-            upstream_names.push(name.to_owned());
-        }
+    {
+        upstream_names.push(name.to_owned());
     }
     if let Err(reason) = workflow.on.match_event(
         &submission.event,
@@ -1244,10 +1242,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // tested tree (the client cannot know the snapshot tree in advance).
     // Record the snapshot's tree so push-back can verify the client's
     // materialized commit is byte-identical to what CI tested.
-    if submission.push.is_some() && submission.push_tree.is_none() {
-        if let Some(snapshot) = &workspace_snapshot {
-            submission.push_tree = Some(snapshot.tree_sha.clone());
-        }
+    if submission.push.is_some()
+        && submission.push_tree.is_none()
+        && let Some(snapshot) = &workspace_snapshot
+    {
+        submission.push_tree = Some(snapshot.tree_sha.clone());
     }
     // A push-requested run whose tree could not be captured can never be
     // pushed: the push endpoint refuses runs without a recorded tested tree.
@@ -1389,10 +1388,12 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             // identity the run is really based on.
             object.insert(
                 "sha".to_owned(),
-                serde_json::json!(snapshot
-                    .head_sha
-                    .clone()
-                    .unwrap_or_else(|| snapshot.commit_sha.clone())),
+                serde_json::json!(
+                    snapshot
+                        .head_sha
+                        .clone()
+                        .unwrap_or_else(|| snapshot.commit_sha.clone())
+                ),
             );
         }
     }
@@ -1402,53 +1403,53 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // downstream jobs cannot sit in the queue until a short-lived token
     // expires.
     let mut github_tokens: BTreeMap<JobId, PatToken> = BTreeMap::new();
-    if shared.state.github_app.is_none() {
-        if let Some(pat) = shared.state.static_github_pat() {
-            // H3: a static PAT cannot be narrowed per job, so a PAT broader
-            // than a job's declared `permissions:` would silently hand every
-            // non-fork job authority the workflow never claimed. Introspect
-            // the PAT's classic OAuth scopes and refuse the run on mismatch;
-            // an invalid PAT is refused outright, and a PAT whose bounds
-            // cannot be verified is withheld rather than embedded.
-            match pat_oauth_scopes(&pat).await {
-                PatScopeOutcome::Known(scopes) => {
-                    enforce_pat_permissions(&jobs, &submission, &scopes)?;
-                    tracing::warn!(
-                        %run_id,
-                        pat_scopes = %scopes.join(", "),
-                        "Using PRELOOP_GITHUB_TOKEN PAT for run jobs: workflow `permissions:` blocks are \
-                         NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
-                         GitHub App to mint least-privilege installation tokens."
-                    );
-                    github_tokens.extend(jobs.iter().map(|job| {
-                        (
-                            job.id.clone(),
-                            PatToken::with_scopes(pat.clone(), scopes.clone()),
-                        )
-                    }));
-                }
-                PatScopeOutcome::Unverifiable { reason } => {
-                    tracing::warn!(
-                        %run_id,
-                        reason = %reason,
-                        "Withholding PRELOOP_GITHUB_TOKEN for run jobs: its OAuth scopes could not be \
-                         introspected, so workflow `permissions:` blocks cannot be enforced and the \
-                         PAT is not embedded. Jobs keep the job-scoped runtime token, so any step that \
-                         needs GitHub fails. Configure a GitHub App to mint least-privilege installation \
-                         tokens, or make the GitHub API reachable so the scopes can be verified."
-                    );
-                    github_tokens.extend(
-                        jobs.iter()
-                            .map(|job| (job.id.clone(), PatToken::withheld())),
-                    );
-                }
-                PatScopeOutcome::Invalid(error) => {
-                    return Err(ApiError::forbidden(format!(
-                        "refusing run {run_id}: PRELOOP_GITHUB_TOKEN failed GitHub API \
+    if shared.state.github_app.is_none()
+        && let Some(pat) = shared.state.static_github_pat()
+    {
+        // H3: a static PAT cannot be narrowed per job, so a PAT broader
+        // than a job's declared `permissions:` would silently hand every
+        // non-fork job authority the workflow never claimed. Introspect
+        // the PAT's classic OAuth scopes and refuse the run on mismatch;
+        // an invalid PAT is refused outright, and a PAT whose bounds
+        // cannot be verified is withheld rather than embedded.
+        match pat_oauth_scopes(&pat).await {
+            PatScopeOutcome::Known(scopes) => {
+                enforce_pat_permissions(&jobs, &submission, &scopes)?;
+                tracing::warn!(
+                    %run_id,
+                    pat_scopes = %scopes.join(", "),
+                    "Using PRELOOP_GITHUB_TOKEN PAT for run jobs: workflow `permissions:` blocks are \
+                     NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
+                     GitHub App to mint least-privilege installation tokens."
+                );
+                github_tokens.extend(jobs.iter().map(|job| {
+                    (
+                        job.id.clone(),
+                        PatToken::with_scopes(pat.clone(), scopes.clone()),
+                    )
+                }));
+            }
+            PatScopeOutcome::Unverifiable { reason } => {
+                tracing::warn!(
+                    %run_id,
+                    reason = %reason,
+                    "Withholding PRELOOP_GITHUB_TOKEN for run jobs: its OAuth scopes could not be \
+                     introspected, so workflow `permissions:` blocks cannot be enforced and the \
+                     PAT is not embedded. Jobs keep the job-scoped runtime token, so any step that \
+                     needs GitHub fails. Configure a GitHub App to mint least-privilege installation \
+                     tokens, or make the GitHub API reachable so the scopes can be verified."
+                );
+                github_tokens.extend(
+                    jobs.iter()
+                        .map(|job| (job.id.clone(), PatToken::withheld())),
+                );
+            }
+            PatScopeOutcome::Invalid(error) => {
+                return Err(ApiError::forbidden(format!(
+                    "refusing run {run_id}: PRELOOP_GITHUB_TOKEN failed GitHub API \
                          authentication ({error:#}); refusing to embed an invalid PAT as \
                          job GITHUB_TOKENs"
-                    )));
-                }
+                )));
             }
         }
     }
@@ -1457,17 +1458,17 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // delivery identity under the same state lock used for run insertion.
     // A competing replay therefore returns before advancing the counter.
     let mut inner = shared.state.inner.lock().await;
-    if let Some(delivery_id) = webhook_delivery_id.as_deref() {
-        if let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path) {
-            tracing::info!(
-                %delivery_id,
-                %workflow_path,
-                run_id = %existing.run_id,
-                "reusing run after webhook reservation race"
-            );
-            drop(inner);
-            return Ok(existing);
-        }
+    if let Some(delivery_id) = webhook_delivery_id.as_deref()
+        && let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path)
+    {
+        tracing::info!(
+            %delivery_id,
+            %workflow_path,
+            run_id = %existing.run_id,
+            "reusing run after webhook reservation race"
+        );
+        drop(inner);
+        return Ok(existing);
     }
     let run_number = {
         let counter = inner
@@ -1610,16 +1611,16 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
 
     {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(delivery_id) = webhook_delivery_id.as_deref() {
-            if let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path) {
-                tracing::info!(
-                    %delivery_id,
-                    %workflow_path,
-                    run_id = %existing.run_id,
-                    "reusing run after webhook race during message building"
-                );
-                return Ok(existing);
-            }
+        if let Some(delivery_id) = webhook_delivery_id.as_deref()
+            && let Some(existing) = existing_webhook_run(&inner, delivery_id, &workflow_path)
+        {
+            tracing::info!(
+                %delivery_id,
+                %workflow_path,
+                run_id = %existing.run_id,
+                "reusing run after webhook race during message building"
+            );
+            return Ok(existing);
         }
         let created_at = chrono::Utc::now();
         let event = submission.event.clone();
@@ -2688,18 +2689,17 @@ pub fn build_job_artifacts(
     // off this same field). The name later resolved by
     // `hydrate_needs_context` is not re-validated against the registry;
     // it only reaches the runner's deployment record.
-    if let Some(env_name) = job.oidc_environment.as_deref() {
-        if !shared
+    if let Some(env_name) = job.oidc_environment.as_deref()
+        && !shared
             .state
             .secrets
             .read()
             .is_environment_registered(&submission.repository, env_name)
-        {
-            return Err(ApiError::forbidden(format!(
-                "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
-                submission.repository
-            )));
-        }
+    {
+        return Err(ApiError::forbidden(format!(
+            "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
+            submission.repository
+        )));
     }
 
     // Environment secrets are per-job: a job's `environment:` selects the
@@ -2711,25 +2711,25 @@ pub fn build_job_artifacts(
     // map can be large — copying it per job would be pure allocation cost.
     // The original map is borrowed directly in that case.
     let mut env_overlay: Option<BTreeMap<String, String>> = None;
-    if policy.allows_secrets {
-        if let Some(env_name) = job.oidc_environment.as_deref() {
-            let env_secrets = shared
-                .state
-                .secrets
-                .read()
-                .env
-                .get(&submission.repository)
-                .and_then(|envs| envs.get(env_name))
-                .cloned();
-            if let Some(env_secrets) = env_secrets {
-                let mut merged = secrets_exposed.clone();
-                for (name, value) in env_secrets {
-                    if !submission.submission_names.contains(&name) {
-                        merged.insert(name, value);
-                    }
+    if policy.allows_secrets
+        && let Some(env_name) = job.oidc_environment.as_deref()
+    {
+        let env_secrets = shared
+            .state
+            .secrets
+            .read()
+            .env
+            .get(&submission.repository)
+            .and_then(|envs| envs.get(env_name))
+            .cloned();
+        if let Some(env_secrets) = env_secrets {
+            let mut merged = secrets_exposed.clone();
+            for (name, value) in env_secrets {
+                if !submission.submission_names.contains(&name) {
+                    merged.insert(name, value);
                 }
-                env_overlay = Some(merged);
             }
+            env_overlay = Some(merged);
         }
     }
     let merged_secrets = env_overlay.as_ref().unwrap_or(secrets_exposed);
@@ -2821,9 +2821,7 @@ pub fn build_job_artifacts(
     if id_token_granted {
         let oidc_url = format!(
             "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
-            base_url,
-            agent_msg.plan.plan_id,
-            agent_msg.job_id,
+            base_url, agent_msg.plan.plan_id, agent_msg.job_id,
         );
         for endpoint in &mut agent_msg.resources.endpoints {
             if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
@@ -3219,10 +3217,10 @@ pub async fn list_runs(
         .runs
         .values()
         .filter(|run| {
-            if let Some(workflow) = &query.workflow {
-                if !run.workflow_path_str.contains(workflow) {
-                    return false;
-                }
+            if let Some(workflow) = &query.workflow
+                && !run.workflow_path_str.contains(workflow)
+            {
+                return false;
             }
             if let Some(status) = &query.status {
                 let run_status = serde_json::to_value(run.status)
@@ -3233,10 +3231,10 @@ pub async fn list_runs(
                     return false;
                 }
             }
-            if let Some(event) = &query.event {
-                if run.event != *event {
-                    return false;
-                }
+            if let Some(event) = &query.event
+                && run.event != *event
+            {
+                return false;
             }
             true
         })
@@ -3339,10 +3337,8 @@ async fn resolve_job_logs(
             )));
         }
     };
-    if !prefer_steps {
-        if let Some(contents) = merged {
-            return Ok(JobLogs::Merged(contents));
-        }
+    if !prefer_steps && let Some(contents) = merged {
+        return Ok(JobLogs::Merged(contents));
     }
 
     let mut step_files: Vec<(String, std::path::PathBuf)> = Vec::new();
@@ -3784,23 +3780,22 @@ pub async fn approve_job(
         .map(|rule| rule.required_reviewers)
         .unwrap_or(0);
     // Fail closed on an expired window before recording anything.
-    if let Some(requested_at) = gate.approval_requested_at_unix_nanos {
-        if crate::models::now_unix_nanos().saturating_sub(requested_at)
+    if let Some(requested_at) = gate.approval_requested_at_unix_nanos
+        && crate::models::now_unix_nanos().saturating_sub(requested_at)
             > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
-        {
-            crate::runtime_scheduling::promote_ready_jobs(
-                &mut inner,
-                &shared.state.environment_rules,
-                &shared.state.pool_status.snapshot().labels,
-            );
-            crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                crate::runtime_scheduling::finalize_run_if_complete(run);
-            }
-            return Err(ApiError::conflict(
-                "approval window expired; the job was failed closed",
-            ));
+    {
+        crate::runtime_scheduling::promote_ready_jobs(
+            &mut inner,
+            &shared.state.environment_rules,
+            &shared.state.pool_status.snapshot().labels,
+        );
+        crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            crate::runtime_scheduling::finalize_run_if_complete(run);
         }
+        return Err(ApiError::conflict(
+            "approval window expired; the job was failed closed",
+        ));
     }
     gate.approvals_unix_nanos
         .push(crate::models::now_unix_nanos());
@@ -3856,10 +3851,10 @@ pub async fn rerun_run_inner(
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
         {
             let mut inner = shared.state.inner.lock().await;
-            if let Some(run) = inner.runs.get_mut(&accepted.run_id) {
-                if run.jobs.contains_key(job_id) {
-                    run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
-                }
+            if let Some(run) = inner.runs.get_mut(&accepted.run_id)
+                && run.jobs.contains_key(job_id)
+            {
+                run.job_check_run_ids.insert(job_id.clone(), *check_run_id);
             }
         }
         // Same persistence obligation as `report_check_run_queued`: the
@@ -3923,22 +3918,21 @@ pub async fn approve_fork(
         return Err(ApiError::conflict("run is not awaiting fork approval"));
     }
     // Fail closed on an expired window before recording anything.
-    if let Some(requested_at) = run.fork_approval_requested_at_unix_nanos {
-        if crate::models::now_unix_nanos().saturating_sub(requested_at)
+    if let Some(requested_at) = run.fork_approval_requested_at_unix_nanos
+        && crate::models::now_unix_nanos().saturating_sub(requested_at)
             > crate::fork_policy::FORK_APPROVAL_WINDOW_NANOS
-        {
-            let expired = crate::fork_policy::sweep_expired_fork_approvals(
-                &mut inner,
-                crate::models::now_unix_nanos(),
-            );
-            drop(inner);
-            if !expired.is_empty() {
-                shared.state.message_notify.notify_waiters();
-            }
-            return Err(ApiError::conflict(
-                "approval window expired; the run was failed closed",
-            ));
+    {
+        let expired = crate::fork_policy::sweep_expired_fork_approvals(
+            &mut inner,
+            crate::models::now_unix_nanos(),
+        );
+        drop(inner);
+        if !expired.is_empty() {
+            shared.state.message_notify.notify_waiters();
         }
+        return Err(ApiError::conflict(
+            "approval window expired; the run was failed closed",
+        ));
     }
     let run = inner.runs.get_mut(&run_id).expect("run exists");
     run.fork_approval_pending = false;
@@ -4074,6 +4068,7 @@ fn live_run_events(
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // SAFETY: env writes confined to serialized tests.
 mod tests {
     use super::*;
     use futures::FutureExt;
@@ -4547,17 +4542,16 @@ mod tests {
     /// credential the config file holds.
     #[tokio::test]
     async fn remote_reusable_workflow_resolution_uses_config_backed_pat() {
-        use axum::body::Body;
-        use axum::http::{header, HeaderMap, Method, Request, StatusCode};
-        use axum::routing::get;
         use axum::Json;
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+        use axum::routing::get;
         use tower::ServiceExt;
 
         // A mock GitHub API that REQUIRES the engine credential, exactly like
         // a private repository: without a bearer token it answers 404.
         let seen_auth = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-        let callee_yaml =
-            "on: workflow_call\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo callee\n";
+        let callee_yaml = "on: workflow_call\njobs:\n  callee:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo callee\n";
         let encoded = base64::engine::general_purpose::STANDARD.encode(callee_yaml.as_bytes());
         let mock = axum::Router::new()
             .route(
@@ -4597,7 +4591,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
         // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        std::env::set_var("PRELOOP_GITHUB_API_URL", api_base);
+        unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", api_base) };
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
@@ -4641,13 +4635,13 @@ mod tests {
             "remote reusable-workflow resolution must send the config-backed PAT"
         );
 
-        std::env::remove_var("PRELOOP_GITHUB_API_URL");
+        unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
     }
 
     /// Submit a run through the public API against a config-file registry.
     async fn submit_push_run(config_toml: &str, workflow_yaml: &str) -> (StatusCode, String) {
         use axum::body::Body;
-        use axum::http::{header, Method, Request};
+        use axum::http::{Method, Request, header};
         use tower::ServiceExt;
 
         let temp = tempfile::tempdir().unwrap();

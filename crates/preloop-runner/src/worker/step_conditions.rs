@@ -12,8 +12,8 @@
 //! - Skipped is not success/failure/cancelled; default success gate fails after
 //!   a prior step failure even when the job is not cancelled.
 
+use preloop_gha_expressions::{Context, eval_bool};
 pub use preloop_gha_expressions::{contains_status_check_function, effective_condition};
-use preloop_gha_expressions::{eval_bool, Context};
 
 /// Job-level status flags used for condition evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

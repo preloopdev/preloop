@@ -412,10 +412,10 @@ pub async fn require_runner_bearer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if let Some(token) = bearer_token(&request) {
-        if registered_runner_id(&shared, token).await.is_some() {
-            return Ok(next.run(request).await);
-        }
+    if let Some(token) = bearer_token(&request)
+        && registered_runner_id(&shared, token).await.is_some()
+    {
+        return Ok(next.run(request).await);
     }
     Err(ApiError::unauthorized("runner listen token required"))
 }

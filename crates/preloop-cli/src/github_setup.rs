@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use preloop_runner_server::config::{load_config, store_memory, write_config};
 use preloop_runner_server::credential_store::{
-    github_reference, github_reference_with_host, CredentialStore, OsCredentialStore, SecretString,
+    CredentialStore, OsCredentialStore, SecretString, github_reference, github_reference_with_host,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -434,25 +434,25 @@ fn save_app_credentials(
     if config.github.mint_failure.is_none() {
         config.github.mint_failure = Some("local".into());
     }
-    if let Some(existing_primary) = &config.github.app_id {
-        if existing_primary == app_id {
-            if store_available {
-                config.github.legacy_app_pem = None;
-                config.github.app_pem_ref = pem_ref;
-                if webhook_ref.is_some() {
-                    config.github.legacy_webhook_secret = None;
-                    config.github.webhook_secret_ref = webhook_ref;
-                }
-            } else {
-                config.github.legacy_app_pem = Some(pem.to_owned());
-                config.github.app_pem_ref = None;
-                if let Some(secret) = webhook_secret {
-                    config.github.legacy_webhook_secret = Some(secret);
-                    config.github.webhook_secret_ref = None;
-                }
+    if let Some(existing_primary) = &config.github.app_id
+        && existing_primary == app_id
+    {
+        if store_available {
+            config.github.legacy_app_pem = None;
+            config.github.app_pem_ref = pem_ref;
+            if webhook_ref.is_some() {
+                config.github.legacy_webhook_secret = None;
+                config.github.webhook_secret_ref = webhook_ref;
             }
-            return write_config(&config);
+        } else {
+            config.github.legacy_app_pem = Some(pem.to_owned());
+            config.github.app_pem_ref = None;
+            if let Some(secret) = webhook_secret {
+                config.github.legacy_webhook_secret = Some(secret);
+                config.github.webhook_secret_ref = None;
+            }
         }
+        return write_config(&config);
     }
     if let Some(existing) = config.github.apps.iter_mut().find(|a| a.app_id == app_id) {
         if store_available {
@@ -747,7 +747,7 @@ fn workflow_permission_checklist(workspace: &Path) -> anyhow::Result<(Vec<String
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false))
+            return Ok((Vec::new(), false));
         }
         Err(error) => return Err(error.into()),
     };
@@ -946,11 +946,11 @@ pub(crate) async fn cmd_doctor(args: DoctorArgs) -> anyhow::Result<()> {
             "github pat: configured (mint failure = {})",
             config.github.mint_failure.as_deref().unwrap_or("local")
         );
-        if !args.repos.is_empty() {
-            if let Err(error) = doctor_pat(pat, &args.repos).await {
-                println!("{error:#}");
-                failed = true;
-            }
+        if !args.repos.is_empty()
+            && let Err(error) = doctor_pat(pat, &args.repos).await
+        {
+            println!("{error:#}");
+            failed = true;
         }
     } else {
         println!("github pat: not configured");
@@ -1013,7 +1013,7 @@ async fn api_request(
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) if error.is_connect() || error.is_timeout() => {
-            return Ok(ApiOutcome::Unavailable)
+            return Ok(ApiOutcome::Unavailable);
         }
         Err(error) => return Err(error).context("talking to the engine"),
     };
@@ -1123,10 +1123,10 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
             if !valid_secret_name(&name) {
                 anyhow::bail!("secret name must be UPPER_SNAKE (letters, digits, underscore)");
             }
-            if let Some(repo) = &repo {
-                if !valid_repo_scope(repo) {
-                    anyhow::bail!("--repo must look like owner/repo");
-                }
+            if let Some(repo) = &repo
+                && !valid_repo_scope(repo)
+            {
+                anyhow::bail!("--repo must look like owner/repo");
             }
             if let Some(env) = &env {
                 if !valid_env_scope(env) {
@@ -1201,20 +1201,20 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
             }
         }
         SecretCommand::List { repo, env } => {
-            if let Some(repo) = &repo {
-                if !valid_repo_scope(repo) {
-                    anyhow::bail!("--repo must look like owner/repo");
-                }
+            if let Some(repo) = &repo
+                && !valid_repo_scope(repo)
+            {
+                anyhow::bail!("--repo must look like owner/repo");
             }
             if env.is_some() && repo.is_none() {
                 anyhow::bail!("--env requires --repo (owner/repo)");
             }
-            if let Some(env) = &env {
-                if !valid_env_scope(env) {
-                    anyhow::bail!(
-                        "--env must be letters, digits, hyphens, underscores (max 255, not starting with `-` or `_`)"
-                    );
-                }
+            if let Some(env) = &env
+                && !valid_env_scope(env)
+            {
+                anyhow::bail!(
+                    "--env must be letters, digits, hyphens, underscores (max 255, not starting with `-` or `_`)"
+                );
             }
             match api_list_secrets(repo.as_deref(), env.as_deref()).await? {
                 ApiOutcome::Applied(secrets) => {
@@ -1284,10 +1284,10 @@ pub(crate) async fn cmd_secret(args: SecretArgs) -> anyhow::Result<()> {
             }
         }
         SecretCommand::Rm { name, repo, env } => {
-            if let Some(repo) = &repo {
-                if !valid_repo_scope(repo) {
-                    anyhow::bail!("--repo must look like owner/repo");
-                }
+            if let Some(repo) = &repo
+                && !valid_repo_scope(repo)
+            {
+                anyhow::bail!("--repo must look like owner/repo");
             }
             if let Some(env) = &env {
                 if !valid_env_scope(env) {

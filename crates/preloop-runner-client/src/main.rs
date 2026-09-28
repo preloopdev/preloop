@@ -372,7 +372,7 @@ async fn collect_reusable_workflows(
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(error) => {
-            return Err(error).with_context(|| format!("read {}", workflow_dir.display()))
+            return Err(error).with_context(|| format!("read {}", workflow_dir.display()));
         }
     };
     while let Some(entry) = entries.next_entry().await? {

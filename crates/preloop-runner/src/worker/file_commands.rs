@@ -7,7 +7,7 @@
 //! `$GITHUB_ARTIFACTS` / `$GITHUB_ARTIFACTS_LIST` match actions/runner v2.336.0
 //! (`CreateArtifactsFileCommand` / `ArtifactsListFileCommand`).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -105,10 +105,10 @@ pub fn create_file_commands_with_job(
     }
 
     // Official always creates the list file path; contents only when feature on.
-    if let Some(job) = job {
-        if artifacts_feature_enabled(job) {
-            write_artifacts_list_file(&paths.artifacts_list_file, job)?;
-        }
+    if let Some(job) = job
+        && artifacts_feature_enabled(job)
+    {
+        write_artifacts_list_file(&paths.artifacts_list_file, job)?;
     }
 
     Ok(paths)
@@ -237,56 +237,62 @@ pub fn parse_kv_file(path: &Path) -> Result<HashMap<String, String>> {
         let heredoc_index = line.find("<<");
 
         // Normal style NAME=VALUE
-        if let Some(eq_pos) = equals_index {
-            if heredoc_index.is_none() || eq_pos < heredoc_index.unwrap() {
-                let key = line[..eq_pos].to_string();
-                let value = line[eq_pos + 1..].to_string();
-                if key.is_empty() {
-                    anyhow::bail!("Invalid format '{}'. Name must not be empty", line);
-                }
-                result.insert(key, value);
-                continue;
+        if let Some(eq_pos) = equals_index
+            && (heredoc_index.is_none() || eq_pos < heredoc_index.unwrap())
+        {
+            let key = line[..eq_pos].to_string();
+            let value = line[eq_pos + 1..].to_string();
+            if key.is_empty() {
+                anyhow::bail!("Invalid format '{}'. Name must not be empty", line);
             }
+            result.insert(key, value);
+            continue;
         }
 
         // Heredoc style NAME<<EOF
-        if let Some(heredoc_pos) = heredoc_index {
-            if equals_index.is_none() || heredoc_pos < equals_index.unwrap() {
-                let key = line[..heredoc_pos].to_string();
-                let delimiter = line[heredoc_pos + 2..].to_string();
-                if key.is_empty() || delimiter.is_empty() {
-                    anyhow::bail!("Invalid format '{}'. Name must not be empty and delimiter must not be empty", line);
-                }
+        if let Some(heredoc_pos) = heredoc_index
+            && (equals_index.is_none() || heredoc_pos < equals_index.unwrap())
+        {
+            let key = line[..heredoc_pos].to_string();
+            let delimiter = line[heredoc_pos + 2..].to_string();
+            if key.is_empty() || delimiter.is_empty() {
+                anyhow::bail!(
+                    "Invalid format '{}'. Name must not be empty and delimiter must not be empty",
+                    line
+                );
+            }
 
-                let start_index = index;
-                let mut end_index = index;
+            let start_index = index;
+            let mut end_index = index;
 
-                loop {
-                    let (temp_line, newline) = read_line(&text, &mut index);
-                    let Some(t_line) = &temp_line else {
-                        anyhow::bail!("Invalid value. Matching delimiter not found '{}' (missing heredoc delimiter)", delimiter);
-                    };
-
-                    if t_line == &delimiter {
-                        break;
-                    }
-
-                    let Some(nl) = &newline else {
-                        anyhow::bail!("Invalid value. EOF marker missing new line.");
-                    };
-
-                    end_index = index - nl.len();
-                }
-
-                let output = if end_index > start_index {
-                    text[start_index..end_index].to_string()
-                } else {
-                    "".to_string()
+            loop {
+                let (temp_line, newline) = read_line(&text, &mut index);
+                let Some(t_line) = &temp_line else {
+                    anyhow::bail!(
+                        "Invalid value. Matching delimiter not found '{}' (missing heredoc delimiter)",
+                        delimiter
+                    );
                 };
 
-                result.insert(key, output);
-                continue;
+                if t_line == &delimiter {
+                    break;
+                }
+
+                let Some(nl) = &newline else {
+                    anyhow::bail!("Invalid value. EOF marker missing new line.");
+                };
+
+                end_index = index - nl.len();
             }
+
+            let output = if end_index > start_index {
+                text[start_index..end_index].to_string()
+            } else {
+                "".to_string()
+            };
+
+            result.insert(key, output);
+            continue;
         }
 
         anyhow::bail!("Invalid format '{}' (Invalid file command line)", line);
@@ -365,10 +371,10 @@ pub fn apply_file_commands(
     }
 
     // Summary: just check size (cap at 1MiB)
-    if let Ok(metadata) = std::fs::metadata(&paths.summary_file) {
-        if metadata.len() > 1_048_576 {
-            tracing::warn!("Step summary exceeds 1MiB limit, truncating");
-        }
+    if let Ok(metadata) = std::fs::metadata(&paths.summary_file)
+        && metadata.len() > 1_048_576
+    {
+        tracing::warn!("Step summary exceeds 1MiB limit, truncating");
     }
 
     // v2.336.0 CreateArtifactsFileCommand — feature-gated; env path always set.

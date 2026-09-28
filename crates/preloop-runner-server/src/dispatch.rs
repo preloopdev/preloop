@@ -18,18 +18,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::Json;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::dispatch_auth::DispatchIdentity;
-use crate::events::trust_tier::TrustTier;
 use crate::events::EventAdapter;
+use crate::events::trust_tier::TrustTier;
 use crate::state::SharedState;
-use crate::{errors::ApiErrorKind, ApiError, RunAccepted, WorkflowSubmission};
+use crate::{ApiError, RunAccepted, WorkflowSubmission, errors::ApiErrorKind};
 
 /// POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches
 ///
@@ -153,7 +153,7 @@ pub async fn repository_dispatch(
         Some(_) => {
             return Err(ApiError::unprocessable(
                 "`client_payload` must be a JSON object",
-            ))
+            ));
         }
     };
 
@@ -583,18 +583,17 @@ async fn resolve_default_branch(
             .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
             .output()
             .await;
-        if let Ok(output) = output {
-            if output.status.success() {
-                if let Ok(branch) = String::from_utf8(output.stdout) {
-                    // `git symbolic-ref --short refs/remotes/origin/HEAD` emits
-                    // `origin/<branch>` (e.g. `origin/main`) — strip the remote
-                    // prefix so the caller builds `refs/heads/main`.
-                    let trimmed = branch.trim();
-                    let branch = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
-                    if !branch.is_empty() && !branch.contains(' ') {
-                        return Ok(branch.to_owned());
-                    }
-                }
+        if let Ok(output) = output
+            && output.status.success()
+            && let Ok(branch) = String::from_utf8(output.stdout)
+        {
+            // `git symbolic-ref --short refs/remotes/origin/HEAD` emits
+            // `origin/<branch>` (e.g. `origin/main`) — strip the remote
+            // prefix so the caller builds `refs/heads/main`.
+            let trimmed = branch.trim();
+            let branch = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
+            if !branch.is_empty() && !branch.contains(' ') {
+                return Ok(branch.to_owned());
             }
         }
         // No `origin/HEAD`: answer with the currently checked-out branch,
@@ -605,14 +604,13 @@ async fn resolve_default_branch(
             .args(["symbolic-ref", "--short", "HEAD"])
             .output()
             .await;
-        if let Ok(output) = output {
-            if output.status.success() {
-                if let Ok(branch) = String::from_utf8(output.stdout) {
-                    let branch = branch.trim();
-                    if !branch.is_empty() && !branch.contains(' ') {
-                        return Ok(branch.to_owned());
-                    }
-                }
+        if let Ok(output) = output
+            && output.status.success()
+            && let Ok(branch) = String::from_utf8(output.stdout)
+        {
+            let branch = branch.trim();
+            if !branch.is_empty() && !branch.contains(' ') {
+                return Ok(branch.to_owned());
             }
         }
         return Ok("main".to_owned());

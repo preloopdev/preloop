@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::Value;
 use similar::TextDiff;
@@ -37,19 +37,19 @@ pub fn strip_transport_prefixes(path: &str) -> &str {
     } else {
         path
     };
-    if let Some(rest) = path.strip_prefix('/') {
-        if let Some(slash) = rest.find('/') {
-            let seg = &rest[..slash];
-            let tail = &rest[slash..]; // starts with /
-                                       // Only strip if the tail continues with /_apis/ and the
-                                       // segment is purely alphanumeric+hyphen (no dots — avoids
-                                       // stripping hostnames).
-            if tail.starts_with("/_apis/")
-                && !seg.is_empty()
-                && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            {
-                return tail;
-            }
+    if let Some(rest) = path.strip_prefix('/')
+        && let Some(slash) = rest.find('/')
+    {
+        let seg = &rest[..slash];
+        let tail = &rest[slash..]; // starts with /
+        // Only strip if the tail continues with /_apis/ and the
+        // segment is purely alphanumeric+hyphen (no dots — avoids
+        // stripping hostnames).
+        if tail.starts_with("/_apis/")
+            && !seg.is_empty()
+            && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return tail;
         }
     }
     path
@@ -796,14 +796,13 @@ fn header_keys(flows: &[Value]) -> BTreeSet<String> {
         for field in ["request_headers", "response_headers"] {
             if let Some(headers) = f.get(field).and_then(Value::as_array) {
                 for pair in headers {
-                    if let Some(arr) = pair.as_array() {
-                        if arr.len() == 2 {
-                            if let Some(name) = arr[0].as_str() {
-                                let lower = name.to_lowercase();
-                                if !ignored.contains(lower.as_str()) {
-                                    keys.insert(lower);
-                                }
-                            }
+                    if let Some(arr) = pair.as_array()
+                        && arr.len() == 2
+                        && let Some(name) = arr[0].as_str()
+                    {
+                        let lower = name.to_lowercase();
+                        if !ignored.contains(lower.as_str()) {
+                            keys.insert(lower);
                         }
                     }
                 }

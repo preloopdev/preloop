@@ -255,15 +255,15 @@ impl RunnerConfig {
             return Ok(false);
         };
 
-        if let Some(agent_id) = object.get("agentId") {
-            if agent_id.as_i64() != Some(self.settings.agent_id) {
-                return Ok(false);
-            }
+        if let Some(agent_id) = object.get("agentId")
+            && agent_id.as_i64() != Some(self.settings.agent_id)
+        {
+            return Ok(false);
         }
-        if let Some(agent_name) = object.get("agentName") {
-            if agent_name.as_str() != Some(self.settings.agent_name.as_str()) {
-                return Ok(false);
-            }
+        if let Some(agent_name) = object.get("agentName")
+            && agent_name.as_str() != Some(self.settings.agent_name.as_str())
+        {
+            return Ok(false);
         }
 
         const SUPPORTED_FIELDS: &[&str] = &[
@@ -290,11 +290,11 @@ impl RunnerConfig {
             .expect("RunnerSettings serializes as an object");
         let mut changed = false;
         for field in SUPPORTED_FIELDS {
-            if let Some(value) = object.get(*field) {
-                if merged_object.get(*field) != Some(value) {
-                    merged_object.insert((*field).to_string(), value.clone());
-                    changed = true;
-                }
+            if let Some(value) = object.get(*field)
+                && merged_object.get(*field) != Some(value)
+            {
+                merged_object.insert((*field).to_string(), value.clone());
+                changed = true;
             }
         }
         if !changed {
@@ -798,16 +798,20 @@ mod tests {
             }))
             .unwrap(),
         );
-        assert!(config
-            .apply_runner_settings_refresh(&serde_json::json!(encoded), dir.path())
-            .unwrap());
+        assert!(
+            config
+                .apply_runner_settings_refresh(&serde_json::json!(encoded), dir.path())
+                .unwrap()
+        );
         assert!(config.settings.ephemeral);
-        assert!(!config
-            .apply_runner_settings_refresh(
-                &serde_json::json!({"agentId": 999, "disableUpdate": false}),
-                dir.path(),
-            )
-            .unwrap());
+        assert!(
+            !config
+                .apply_runner_settings_refresh(
+                    &serde_json::json!({"agentId": 999, "disableUpdate": false}),
+                    dir.path(),
+                )
+                .unwrap()
+        );
         assert!(!config.settings.disable_update);
         let _: serde_json::Value = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
     }
@@ -817,9 +821,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = refresh_test_config();
         config.save(dir.path()).unwrap();
-        assert!(config
-            .apply_runner_settings_refresh(&serde_json::json!("not-base64"), dir.path())
-            .is_err());
+        assert!(
+            config
+                .apply_runner_settings_refresh(&serde_json::json!("not-base64"), dir.path())
+                .is_err()
+        );
         let persisted: RunnerSettings = load_json(&dir.path().join(RUNNER_FILE)).unwrap();
         assert!(!persisted.disable_update);
     }

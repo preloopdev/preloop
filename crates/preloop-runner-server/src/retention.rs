@@ -80,14 +80,14 @@ pub async fn sweep_once(shared: &Arc<SharedState>) -> RetentionSweepOutcome {
             }
         }
         for path in &removal.artifact_paths {
-            if let Err(error) = tokio::fs::remove_file(path).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        ?error,
-                        path = %path.display(),
-                        "retention sweep: failed to delete artifact file"
-                    );
-                }
+            if let Err(error) = tokio::fs::remove_file(path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    ?error,
+                    path = %path.display(),
+                    "retention sweep: failed to delete artifact file"
+                );
             }
         }
         for token in &removal.artifact_v2_blob_tokens {
@@ -97,14 +97,14 @@ pub async fn sweep_once(shared: &Arc<SharedState>) -> RetentionSweepOutcome {
                 .join("blobs")
                 .join("artifact")
                 .join(token);
-            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        ?error,
-                        path = %dir.display(),
-                        "retention sweep: failed to delete artifact blob directory"
-                    );
-                }
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    ?error,
+                    path = %dir.display(),
+                    "retention sweep: failed to delete artifact blob directory"
+                );
             }
         }
     }
@@ -417,25 +417,31 @@ mod tests {
         drop(inner);
 
         // Files on disk are gone for deleted runs, kept for the recent one.
-        assert!(!shared
-            .state
-            .state_dir
-            .join("artifacts")
-            .join(format!("{}.bin", old_terminal.run_id))
-            .exists());
-        assert!(!shared
-            .state
-            .state_dir
-            .join("blobs")
-            .join("artifact")
-            .join(format!("blob-{}", old_terminal.run_id))
-            .exists());
-        assert!(shared
-            .state
-            .state_dir
-            .join("artifacts")
-            .join(format!("{}.bin", recent_terminal.run_id))
-            .exists());
+        assert!(
+            !shared
+                .state
+                .state_dir
+                .join("artifacts")
+                .join(format!("{}.bin", old_terminal.run_id))
+                .exists()
+        );
+        assert!(
+            !shared
+                .state
+                .state_dir
+                .join("blobs")
+                .join("artifact")
+                .join(format!("blob-{}", old_terminal.run_id))
+                .exists()
+        );
+        assert!(
+            shared
+                .state
+                .state_dir
+                .join("artifacts")
+                .join(format!("{}.bin", recent_terminal.run_id))
+                .exists()
+        );
 
         // A restart must not resurrect the deleted runs.
         drop(shared);

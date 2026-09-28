@@ -1,6 +1,6 @@
 //! Release polling and atomic executable replacement.
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use flate2::read::GzDecoder;
 use reqwest::Client;
 use rsa::pkcs1::DecodeRsaPublicKey;
@@ -1247,20 +1247,20 @@ fn invalidate_managed_externals() {
         invalidate_stale_externals_at(&home.join("externals").join("externals"));
         invalidate_stale_externals_at(&home.join("externals"));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(prefix) = exe.parent().and_then(|d| d.parent()) {
-            let runner_dir = prefix.join("lib/preloop/runner");
-            if let Ok(entries) = std::fs::read_dir(&runner_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        invalidate_stale_externals_at(&path.join("externals"));
-                    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(prefix) = exe.parent().and_then(|d| d.parent())
+    {
+        let runner_dir = prefix.join("lib/preloop/runner");
+        if let Ok(entries) = std::fs::read_dir(&runner_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    invalidate_stale_externals_at(&path.join("externals"));
                 }
             }
-            let triple = crate::linux_guest_triple();
-            invalidate_stale_externals_at(&runner_dir.join(triple).join("externals"));
         }
+        let triple = crate::linux_guest_triple();
+        invalidate_stale_externals_at(&runner_dir.join(triple).join("externals"));
     }
 }
 
@@ -1618,8 +1618,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn install_from_archive_places_the_official_layout() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
 
         let directory = tempfile::tempdir().unwrap();
         // Build a fake smolvm release tree.
@@ -1788,8 +1788,8 @@ mod tests {
 
     #[test]
     fn upgrade_removes_stale_uncompressed_templates() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
 
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("smolvm-9.9.9-darwin-arm64");

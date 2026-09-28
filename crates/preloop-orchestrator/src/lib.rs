@@ -7,8 +7,8 @@ mod keys;
 pub mod node_externals;
 
 use crate::environment::{
-    curated_toolchains, is_stock_base_image, EnvironmentSpec, ToolchainLayer,
-    APT_INDICES_MARKER_PATH,
+    APT_INDICES_MARKER_PATH, EnvironmentSpec, ToolchainLayer, curated_toolchains,
+    is_stock_base_image,
 };
 use crate::keys::{KeyPool, StagedKey};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
@@ -17,8 +17,8 @@ use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 /// `VmProvider` implementation can model the handshake this pool relies on.
 pub use preloop_gha_protocol::RUNNER_BUSY_SENTINEL as RUNNER_BUSY_LINE;
 
-use futures::future::BoxFuture;
 use futures::StreamExt as _;
+use futures::future::BoxFuture;
 use preloop_vm::{
     MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
     SmolVmProvider, SocketMount, VmError, VmProvider, VolumeMount,
@@ -27,12 +27,12 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -607,10 +607,10 @@ struct GitHubRelease {
 async fn resolve_latest_golden_tag(client: &reqwest::Client, api_base: &str) -> Option<String> {
     static CACHE: std::sync::OnceLock<GoldenTagCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some((fetched_at, tag)) = cache.lock().await.get(api_base) {
-        if fetched_at.elapsed() < LATEST_GOLDEN_TAG_TTL {
-            return tag.clone();
-        }
+    if let Some((fetched_at, tag)) = cache.lock().await.get(api_base)
+        && fetched_at.elapsed() < LATEST_GOLDEN_TAG_TTL
+    {
+        return tag.clone();
     }
 
     let url = format!("{api_base}/repos/preloopdev/preloop/releases?per_page=30");
@@ -685,8 +685,7 @@ fn golden_partial_path(payload: &Path) -> PathBuf {
 /// the release flow retains the packed golden as a workflow artifact because
 /// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects a
 /// custom host when one is available.
-const DEFAULT_GOLDEN_OCI_REF: &str =
-    "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+const DEFAULT_GOLDEN_OCI_REF: &str = "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
 /// Deadline for a whole golden download, response body included.
 ///
 /// The packed golden runs to ~9.6 GB, so this budget is really a floor on
@@ -1981,7 +1980,7 @@ async fn await_guest_ready<P: VmProvider>(
         match provider.exec(name, &probe).await {
             Ok(_) => return Ok(()),
             Err(error) if tokio::time::Instant::now() >= deadline => {
-                return Err(OrchestratorError::from(error))
+                return Err(OrchestratorError::from(error));
             }
             Err(_) => tokio::time::sleep(GUEST_READY_POLL).await,
         }
@@ -3422,11 +3421,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // runner snapshots already contain it and workflow setup actions own
         // language-toolchain selection.
         let stock_base = is_stock_base_image(&self.config.base_image);
-        if stock_base {
-            if let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await {
-                let _ = self.provider.delete(&name).await;
-                return Err(error);
-            }
+        if stock_base
+            && let Err(error) = install_base_dependencies(self.provider.as_ref(), &name).await
+        {
+            let _ = self.provider.delete(&name).await;
+            return Err(error);
         }
         if stock_base {
             for layer in curated_toolchains() {
@@ -3973,10 +3972,10 @@ impl PreparingGuard {
         // newer one: `snapshot().provisioning` always matches the live
         // counter and cannot report a runner that no longer exists.
         let mut count = active.lock().unwrap();
-        if *count == 0 {
-            if let Some(signal) = &signal {
-                signal.store(true, Ordering::Release);
-            }
+        if *count == 0
+            && let Some(signal) = &signal
+        {
+            signal.store(true, Ordering::Release);
         }
         *count += 1;
         if let Some(ps) = &pool_status {
@@ -3995,10 +3994,10 @@ impl Drop for PreparingGuard {
     fn drop(&mut self) {
         let mut count = self.active.lock().unwrap();
         *count = count.saturating_sub(1);
-        if *count == 0 {
-            if let Some(signal) = &self.signal {
-                signal.store(false, Ordering::Release);
-            }
+        if *count == 0
+            && let Some(signal) = &self.signal
+        {
+            signal.store(false, Ordering::Release);
         }
         if let Some(ps) = &self.pool_status {
             ps.set_provisioning(*count as u32);
@@ -4153,17 +4152,16 @@ async fn watch_guest_pause_with_suspension<P: VmProvider + 'static>(
             paused_since = Some(tokio::time::Instant::now());
             if let Some(debug_dir) = debug_dir.as_deref() {
                 let marker = debug_dir.join(name.as_str());
-                if !marker.exists() {
-                    if let Err(error) = std::fs::create_dir_all(debug_dir)
+                if !marker.exists()
+                    && let Err(error) = std::fs::create_dir_all(debug_dir)
                         .and_then(|()| std::fs::write(&marker, DEBUG_MARKER_IDLE))
-                    {
-                        warn!(
-                            machine = name.as_str(),
-                            path = %marker.display(),
-                            %error,
-                            "could not create debug attach marker"
-                        );
-                    }
+                {
+                    warn!(
+                        machine = name.as_str(),
+                        path = %marker.display(),
+                        %error,
+                        "could not create debug attach marker"
+                    );
                 }
             }
         } else if !paused {
@@ -5480,13 +5478,13 @@ async fn provision_runner<P: VmProvider + 'static>(
             // The pack carries the apt baseline, but not necessarily apt's
             // indices — restore them before any workflow apt-installs. A
             // custom base is used as-is: no apt assumptions.
-            if environment.curated {
-                if let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await {
-                    warn!(
-                    machine = name.as_str(),
-                        %error, "apt list refresh failed; workflow apt installs may not resolve"
-                    );
-                }
+            if environment.curated
+                && let Err(error) = provider.exec(name, &apt_lists_refresh_command()).await
+            {
+                warn!(
+                machine = name.as_str(),
+                    %error, "apt list refresh failed; workflow apt installs may not resolve"
+                );
             }
             // Log the pack's apt-index age from the freshness marker baked
             // with it. A missing marker just means "stale" (packs predating
@@ -5743,16 +5741,16 @@ async fn provision_runner<P: VmProvider + 'static>(
         .exec_with_secret_env(name, &as_runner_user(config, &configure), &secrets)
         .await;
     drop(staged);
-    if configure_result.is_err() {
-        if let Some(token) = provision_token_value.as_deref() {
-            if let Some(pending) = &config.pending_registrations {
-                if let Ok(mut guard) = pending.write() {
-                    guard.remove(token);
-                }
-            }
-            if let Some(ps) = &config.pool_status {
-                ps.remove_pending(token);
-            }
+    if configure_result.is_err()
+        && let Some(token) = provision_token_value.as_deref()
+    {
+        if let Some(pending) = &config.pending_registrations
+            && let Ok(mut guard) = pending.write()
+        {
+            guard.remove(token);
+        }
+        if let Some(ps) = &config.pool_status {
+            ps.remove_pending(token);
         }
     }
     if let Some(path) = provision_token_file.take() {
@@ -5940,14 +5938,14 @@ async fn hold_for_debugging<P: VmProvider + 'static>(
         );
         return;
     }
-    if provider.capabilities().preserves_runtime_state_on_suspend {
-        if let Err(error) = provider.stop(name).await {
-            warn!(
-                machine = name.as_str(),
-                %error,
-                "could not suspend preserved AgentENV VM; leaving it running"
-            );
-        }
+    if provider.capabilities().preserves_runtime_state_on_suspend
+        && let Err(error) = provider.stop(name).await
+    {
+        warn!(
+            machine = name.as_str(),
+            %error,
+            "could not suspend preserved AgentENV VM; leaving it running"
+        );
     }
 
     warn!(
@@ -7597,9 +7595,11 @@ chmod +x "$dest/bin/node"
             .iter()
             .position(|event| event == &format!("create:{}", name.as_str()))
             .expect("machine creation event");
-        assert!(events[create + 1..]
-            .iter()
-            .any(|event| event == &format!("delete:{}", name.as_str())));
+        assert!(
+            events[create + 1..]
+                .iter()
+                .any(|event| event == &format!("delete:{}", name.as_str()))
+        );
     }
 
     #[tokio::test]
@@ -8303,9 +8303,11 @@ chmod +x "$dest/bin/node"
             golden_adopt_state(&provider, &config, &golden, "fp-1").await,
             GoldenAdopt::Rearm
         );
-        assert!(adopt_golden(&provider, &config, &golden, "fp-1", "golden")
-            .await
-            .unwrap());
+        assert!(
+            adopt_golden(&provider, &config, &golden, "fp-1", "golden")
+                .await
+                .unwrap()
+        );
         assert_eq!(
             provider.status(&golden).await.unwrap(),
             MachineState::Running
@@ -8356,9 +8358,11 @@ chmod +x "$dest/bin/node"
             .unwrap();
         provider.start(&golden).await.unwrap();
 
-        assert!(adopt_golden(&provider, &config, &golden, "fp-1", "golden")
-            .await
-            .unwrap());
+        assert!(
+            adopt_golden(&provider, &config, &golden, "fp-1", "golden")
+                .await
+                .unwrap()
+        );
         assert_eq!(
             *provider.prune_pack_calls.lock().await,
             vec![golden.as_str().to_owned()],
@@ -8508,9 +8512,11 @@ chmod +x "$dest/bin/node"
         )
         .await
         .expect_err("runner failure must propagate");
-        assert!(error
-            .to_string()
-            .contains("guest runner exited with code 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("guest runner exited with code 1")
+        );
         assert!(!error.to_string().contains("delete-failure"));
     }
 
@@ -8707,11 +8713,11 @@ mod golden_download_tests {
             body.clone(),
         )
         .await;
-        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
-        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
         assert_eq!(std::fs::read(&payload).unwrap(), body);
         assert!(leftovers(directory.path()).is_empty());
@@ -8734,11 +8740,11 @@ mod golden_download_tests {
             body,
         )
         .await;
-        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
-        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // The caller reads `false` as "build the golden locally", so a partial
         // file surviving here would be booted as if it were complete.
         assert!(!downloaded);
@@ -8923,11 +8929,11 @@ mod golden_download_tests {
             format!("{digest}  golden\n").into_bytes(),
         )
         .await;
-        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
-        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
         assert_eq!(std::fs::read(&payload).unwrap(), body);
         assert!(leftovers(directory.path()).is_empty());
@@ -8946,11 +8952,11 @@ mod golden_download_tests {
             format!("{}  golden\n", "00".repeat(32)).into_bytes(),
         )
         .await;
-        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
 
-        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // A corrupted artifact must never be published as the payload: the
         // pool would boot it and only fail when a VM cannot start.
         assert!(!downloaded);

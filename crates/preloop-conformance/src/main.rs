@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use preloop_gha_parser::{expand_jobs, parse_workflow};
 use tokio::process::Command;
@@ -744,12 +744,10 @@ async fn run_runner_e2e(
             .bearer_auth(native_api_token)
             .send()
             .await
+            && let Ok(v) = resp.json::<serde_json::Value>().await
+            && let Some(s) = v.get("status").and_then(|v| v.as_str())
         {
-            if let Ok(v) = resp.json::<serde_json::Value>().await {
-                if let Some(s) = v.get("status").and_then(|v| v.as_str()) {
-                    run_status = s.to_string();
-                }
-            }
+            run_status = s.to_string();
         }
         if terminal.contains(&run_status.as_str()) {
             break;

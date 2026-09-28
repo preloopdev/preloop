@@ -332,10 +332,12 @@ async fn a_fork_base_is_always_rearmable() {
 
     // SmolVM refuses while a clone is live; AgentENV has no spent-base state,
     // so the pool must be told it can keep forking.
-    assert!(provider
-        .rearm_fork_base(&golden, Some(&MachineName::new("clone-x").unwrap()))
-        .await
-        .unwrap());
+    assert!(
+        provider
+            .rearm_fork_base(&golden, Some(&MachineName::new("clone-x").unwrap()))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -661,10 +663,12 @@ async fn pack_writes_a_snapshot_descriptor_that_create_can_boot_from() {
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(descriptor["provider"], "agentenv");
         assert_eq!(descriptor["image"], "ubuntu:24.04");
-        assert!(descriptor["snapshot"]
-            .as_str()
-            .unwrap()
-            .starts_with("golden-pack-pack-"));
+        assert!(
+            descriptor["snapshot"]
+                .as_str()
+                .unwrap()
+                .starts_with("golden-pack-pack-")
+        );
     }
 
     // A machine created from the descriptor boots the snapshot, not an image.

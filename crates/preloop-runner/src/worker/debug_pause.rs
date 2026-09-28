@@ -16,8 +16,8 @@
 //!    the same logical state, rather than appending to it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use preloop_gha_protocol::debug_session::{
@@ -460,15 +460,15 @@ impl PauseMarker {
         let Some(path) = path else {
             return Self(None);
         };
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                warn!(
-                    pause_marker = %path.display(),
-                    %error,
-                    "failed to create pause marker directory — the pool will not \
-                     release its permit while this job is paused"
-                );
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            warn!(
+                pause_marker = %path.display(),
+                %error,
+                "failed to create pause marker directory — the pool will not \
+                 release its permit while this job is paused"
+            );
         }
         if let Err(error) = std::fs::write(path, "paused") {
             warn!(

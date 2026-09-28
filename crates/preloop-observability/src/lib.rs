@@ -32,8 +32,8 @@ pub use opentelemetry_sdk::propagation::TraceContextPropagator;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use opentelemetry::logs::{AnyValue, LogRecord, Logger, LoggerProvider, Severity};
@@ -41,10 +41,10 @@ use opentelemetry::metrics::MeterProvider;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{Key, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_sdk::Resource;
 use parking_lot::RwLock;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{EnvFilter, Registry};
@@ -700,14 +700,14 @@ impl Observability {
             ))
             .with_view(histogram_view("preloop.job.queue.wait", QUEUE_BUCKETS));
         meter_builder = meter_builder.with_reader(prometheus_handle.clone());
-        if let Some(target) = targets.metrics.as_ref() {
-            if let Some(exporter) = build_metric_exporter(target, http_client.as_ref()) {
-                meter_builder = meter_builder.with_reader(
-                    PeriodicReader::builder(exporter)
-                        .with_interval(Duration::from_secs(60))
-                        .build(),
-                );
-            }
+        if let Some(target) = targets.metrics.as_ref()
+            && let Some(exporter) = build_metric_exporter(target, http_client.as_ref())
+        {
+            meter_builder = meter_builder.with_reader(
+                PeriodicReader::builder(exporter)
+                    .with_interval(Duration::from_secs(60))
+                    .build(),
+            );
         }
         let meter_provider = meter_builder.build();
         let meter = meter_provider.meter("preloop");
@@ -929,9 +929,9 @@ fn histogram_view(
     name: &'static str,
     boundaries: &'static [f64],
 ) -> impl Fn(&opentelemetry_sdk::metrics::Instrument) -> Option<opentelemetry_sdk::metrics::Stream>
-       + Send
-       + Sync
-       + 'static {
++ Send
++ Sync
++ 'static {
     move |instrument: &opentelemetry_sdk::metrics::Instrument| {
         if instrument.name() != name {
             return None;
@@ -1048,6 +1048,10 @@ impl fmt::Debug for ObservabilityRuntime {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// SAFETY: edition 2024 makes env mutation unsafe; tests are serialized by
+// the harness only within a module, so each test below manages its own
+// variables and restores them — the allow is confined to this module.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -1082,7 +1086,7 @@ mod tests {
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
         // Also headers, so `has_otel_headers` is false.
         for k in [
@@ -1091,7 +1095,7 @@ mod tests {
             "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
             "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
         let cfg = ObservabilityConfig::from_env();
         assert!(
@@ -1109,10 +1113,10 @@ mod tests {
     #[test]
     fn none_disables_signal() {
         let _guard = env_guard();
-        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "none");
+        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "none") };
         let cfg = ObservabilityConfig::from_env();
         assert!(!cfg.otlp_enabled, "`none` must disable export");
-        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
@@ -1123,15 +1127,15 @@ mod tests {
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "NONE");
+        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "NONE") };
         let cfg = ObservabilityConfig::from_env();
         assert!(
             !cfg.otlp_enabled,
             "`NONE` must disable export case-insensitively"
         );
-        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
@@ -1142,12 +1146,14 @@ mod tests {
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        std::env::set_var(
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            "http://collector:4318/v1/traces",
-        );
+        unsafe {
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://collector:4318/v1/traces",
+            )
+        };
         let cfg = ObservabilityConfig::from_env();
         let targets = cfg.export_targets();
         assert!(cfg.otlp_enabled);
@@ -1160,7 +1166,7 @@ mod tests {
         // And it must not hijack the other signals.
         assert!(targets.logs.is_none());
         assert!(targets.metrics.is_none());
-        std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") };
     }
 
     #[test]
@@ -1171,9 +1177,9 @@ mod tests {
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318") };
         let cfg = ObservabilityConfig::from_env();
         let targets = cfg.export_targets();
         assert_eq!(
@@ -1188,7 +1194,7 @@ mod tests {
             targets.metrics.as_ref().unwrap().url,
             "http://collector:4318/v1/metrics"
         );
-        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
@@ -1199,12 +1205,14 @@ mod tests {
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        std::env::set_var(
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "https://collector/acme?tenant=x",
-        );
+        unsafe {
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://collector/acme?tenant=x",
+            )
+        };
         let cfg = ObservabilityConfig::from_env();
         let targets = cfg.export_targets();
         // The signal path must precede the query string, not become part of it.
@@ -1216,7 +1224,7 @@ mod tests {
             targets.logs.as_ref().unwrap().url,
             "https://collector/acme/v1/logs?tenant=x"
         );
-        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
     }
 
     #[test]
@@ -1228,10 +1236,10 @@ mod tests {
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
-        std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "none");
+        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318") };
+        unsafe { std::env::set_var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "none") };
 
         let targets = ObservabilityConfig::from_env().export_targets();
         assert!(targets.traces.is_none());
@@ -1248,7 +1256,7 @@ mod tests {
             "OTEL_EXPORTER_OTLP_ENDPOINT",
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
     }
 
@@ -1262,10 +1270,11 @@ mod tests {
             h.beat();
             assert_eq!(obs.heartbeat().len(), 1);
             // staleness: threshold 50ms, just-beat handle is fresh.
-            assert!(obs
-                .heartbeat()
-                .any_critical_stale(Duration::from_millis(50))
-                .is_none());
+            assert!(
+                obs.heartbeat()
+                    .any_critical_stale(Duration::from_millis(50))
+                    .is_none()
+            );
         }
         assert_eq!(obs.heartbeat().len(), 0, "Drop must deregister");
     }
@@ -1280,10 +1289,11 @@ mod tests {
         drop(first);
         assert_eq!(obs.heartbeat().len(), 1);
         second.beat();
-        assert!(obs
-            .heartbeat()
-            .any_critical_stale(Duration::from_secs(1))
-            .is_none());
+        assert!(
+            obs.heartbeat()
+                .any_critical_stale(Duration::from_secs(1))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1353,21 +1363,25 @@ mod tests {
     #[test]
     fn debug_redacts_headers_and_endpoint_userinfo() {
         let _guard = env_guard();
-        std::env::set_var(
-            "OTEL_EXPORTER_OTLP_ENDPOINT",
-            "https://user:secret@example.com:4318/v1/traces?token=abc",
-        );
+        unsafe {
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "https://user:secret@example.com:4318/v1/traces?token=abc",
+            )
+        };
         for k in [
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
         ] {
-            std::env::remove_var(k);
+            unsafe { std::env::remove_var(k) };
         }
-        std::env::set_var(
-            "OTEL_EXPORTER_OTLP_HEADERS",
-            "Authorization=Bearer secret123",
-        );
+        unsafe {
+            std::env::set_var(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "Authorization=Bearer secret123",
+            )
+        };
         let cfg = ObservabilityConfig::from_env();
         let dbg = format!("{cfg:?}");
         assert!(
@@ -1394,8 +1408,8 @@ mod tests {
             !targets_dbg.contains("Authorization=Bearer"),
             "Debug must not contain raw header pairs: {targets_dbg}"
         );
-        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
-        std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS");
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT") };
+        unsafe { std::env::remove_var("OTEL_EXPORTER_OTLP_HEADERS") };
     }
 
     #[test]

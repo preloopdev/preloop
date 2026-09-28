@@ -184,12 +184,11 @@ async fn resolve_ref_to_sha(
         return Some(git_ref.to_owned());
     }
     let cache_key = (owner.to_owned(), repo.to_owned(), git_ref.to_owned());
-    if let Ok(cache) = state.action_sha_cache.lock() {
-        if let Some((sha, at)) = cache.get(&cache_key) {
-            if sha_entry_fresh(sha, *at) {
-                return sha.clone();
-            }
-        }
+    if let Ok(cache) = state.action_sha_cache.lock()
+        && let Some((sha, at)) = cache.get(&cache_key)
+        && sha_entry_fresh(sha, *at)
+    {
+        return sha.clone();
     }
 
     let enc_owner = percent_encode_path_segment(owner);
@@ -198,10 +197,10 @@ async fn resolve_ref_to_sha(
     let api_base = state.github_urls.api_url.trim_end_matches('/').to_owned();
     let url = format!("{api_base}/repos/{enc_owner}/{enc_repo}/commits/{enc_git_ref}");
     let mut request = crate::shared_http::CLIENT.get(&url);
-    if let Some(pat) = state.static_github_pat() {
-        if url.starts_with("https://") {
-            request = request.bearer_auth(pat);
-        }
+    if let Some(pat) = state.static_github_pat()
+        && url.starts_with("https://")
+    {
+        request = request.bearer_auth(pat);
     }
     let response = match request.send().await {
         Ok(response) => response,
@@ -365,10 +364,10 @@ pub async fn download_action_tarball(
     // is the only credential that works for arbitrary third-party action
     // repos (a GitHub App installation token is scoped to the App's repos).
     let mut request = client.get(&github_url);
-    if let Some(pat) = shared.state.static_github_pat() {
-        if github_url.starts_with("https://") {
-            request = request.bearer_auth(pat);
-        }
+    if let Some(pat) = shared.state.static_github_pat()
+        && github_url.starts_with("https://")
+    {
+        request = request.bearer_auth(pat);
     }
     let response = request.send().await.map_err(|e| {
         ApiError::internal(format!("failed to send download request to GitHub: {e}"))

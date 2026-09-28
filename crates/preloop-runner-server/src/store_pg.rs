@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use postgres_rustls::MakeTlsConnector;
 use preloop_gha_protocol::SessionId;
 use std::future::Future;
-use tokio_postgres::{connect, Client, NoTls};
+use tokio_postgres::{Client, NoTls, connect};
 
 /// Advisory-lock key guarding schema migration. Any stable constant works; it
 /// only has to agree across every aksh process pointed at one database.

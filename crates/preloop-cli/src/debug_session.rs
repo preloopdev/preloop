@@ -418,9 +418,7 @@ async fn resolve(ctx: &Api, sessions: &[DebugSession], reference: &str) -> Resul
                     session_lines(&open)
                 )
             }
-            Err(error) => {
-                Err(error)
-            }
+            Err(error) => Err(error),
         },
         ambiguous => anyhow::bail!(
             "`{reference}` matches {} paused jobs:\n{}\nattach one with: preloop debug <session-id>",
@@ -899,35 +897,41 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                     None => continue,
                 };
                 let sync = flags.contains(&"--sync");
-               let (revert_for_verdict, revision) = if sync {
-                   if revert != RevertPolicy::None {
-                       if let (Some(machine), Some(workspace), Some(commit)) = (
-                           session.machine.as_deref(),
-                           session.workspace.as_deref(),
-                           session.snapshot_commit.as_deref(),
-                       ) {
-                           let selected = select_for_policy(&session.attempt_changes, revert);
-                           if !selected.is_empty() {
-                               let paths: Vec<String> = selected.iter().map(|s| shell_quote(s)).collect();
-                               let cmd = format!("cd {}; git checkout {} -- {}", shell_quote(workspace), shell_quote(commit), paths.join(" "));
-                               let _ = guest_check(machine, &cmd);
+                let (revert_for_verdict, revision) = if sync {
+                    if revert != RevertPolicy::None
+                        && let (Some(machine), Some(workspace), Some(commit)) = (
+                            session.machine.as_deref(),
+                            session.workspace.as_deref(),
+                            session.snapshot_commit.as_deref(),
+                        )
+                    {
+                        let selected = select_for_policy(&session.attempt_changes, revert);
+                        if !selected.is_empty() {
+                            let paths: Vec<String> =
+                                selected.iter().map(|s| shell_quote(s)).collect();
+                            let cmd = format!(
+                                "cd {}; git checkout {} -- {}",
+                                shell_quote(workspace),
+                                shell_quote(commit),
+                                paths.join(" ")
+                            );
+                            let _ = guest_check(machine, &cmd);
                         }
                     }
-                        }
                     match sync_workspace(&session, flags.contains(&"--force")) {
-                       Ok(revision) => {
-                           session.source_revision = revision.clone();
-                           (RevertPolicy::None, Some(revision))
-                       }
+                        Ok(revision) => {
+                            session.source_revision = revision.clone();
+                            (RevertPolicy::None, Some(revision))
+                        }
                         Err(error) => {
                             println!("  sync failed: {error:#}");
                             continue;
-                       }
-                   }
-               } else if session.source_revision != "original" {
-                   (revert, Some(session.source_revision.clone()))
+                        }
+                    }
+                } else if session.source_revision != "original" {
+                    (revert, Some(session.source_revision.clone()))
                 } else {
-                   (revert, None)
+                    (revert, None)
                 };
                 let from_arg = flags
                     .iter()
@@ -939,11 +943,17 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                         Err(error) => {
                             println!("  retry-from failed: {error:#}");
                             continue;
-                       }
+                        }
                     };
 
-               ctx.verdict(&session.session_id, Verdict::Retry, revert_for_verdict, revision, retry_from)
-                    .await?;
+                ctx.verdict(
+                    &session.session_id,
+                    Verdict::Retry,
+                    revert_for_verdict,
+                    revision,
+                    retry_from,
+                )
+                .await?;
                 if let Some(from) = retry_from {
                     let name = session
                         .job_steps
@@ -979,8 +989,14 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 return Ok(ReplOutcome::Resumed);
             }
             "abort" => {
-                ctx.verdict(&session.session_id, Verdict::Abort, RevertPolicy::None, None, None)
-                    .await?;
+                ctx.verdict(
+                    &session.session_id,
+                    Verdict::Abort,
+                    RevertPolicy::None,
+                    None,
+                    None,
+                )
+                .await?;
                 println!("  Run aborted. Cleanup steps will run.");
                 return Ok(ReplOutcome::Resumed);
             }
@@ -990,10 +1006,10 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 }
             }
             "sync" => match sync_workspace(&session, flags.contains(&"--force")) {
-               Ok(revision) => {
-                   session.source_revision = revision.clone();
-                   println!("  workspace now at {revision}");
-               }
+                Ok(revision) => {
+                    session.source_revision = revision.clone();
+                    println!("  workspace now at {revision}");
+                }
                 Err(error) => println!("  sync failed: {error:#}"),
             },
             "detach" => {
@@ -1007,7 +1023,10 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
             }
             "steps" => print_journal(&session),
             "changes" => show_changes(&session),
-            "log" => run_in_guest(&session, "tail -n 200 /var/log/preloop-runner.log 2>/dev/null || echo 'no log file in guest'"),
+            "log" => run_in_guest(
+                &session,
+                "tail -n 200 /var/log/preloop-runner.log 2>/dev/null || echo 'no log file in guest'",
+            ),
             "help" => print_banner(&session),
             other => println!("unknown command `:{other}` — try :help"),
         }

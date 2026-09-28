@@ -28,8 +28,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use preloop_gha_protocol::crypto::AgentRsaKeypair;
@@ -143,10 +143,10 @@ impl StagedKey {
 
 impl Drop for StagedKey {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %self.path.display(), %error, "failed to remove staged runner key");
-            }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %self.path.display(), %error, "failed to remove staged runner key");
         }
     }
 }

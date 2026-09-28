@@ -2,7 +2,7 @@ use super::*;
 use base64::Engine;
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, RngSeed};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 fn codec_config() -> ProptestConfig {

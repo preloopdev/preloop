@@ -494,10 +494,10 @@ async fn repair_delivery(
             .await?;
         return Ok(false);
     }
-    if let Some(last_attempt) = record.last_attempt_at_us {
-        if now - last_attempt < redelivery_backoff_us(record.attempts) {
-            return Ok(false);
-        }
+    if let Some(last_attempt) = record.last_attempt_at_us
+        && now - last_attempt < redelivery_backoff_us(record.attempts)
+    {
+        return Ok(false);
     }
 
     let url = format!(

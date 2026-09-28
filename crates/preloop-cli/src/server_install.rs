@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 #[cfg(any(target_os = "linux", test))]
@@ -212,16 +212,16 @@ fn install(args: InstallArgs) -> Result<()> {
     // The state dir is chowned to the service account recursively, so it must
     // be a directory dedicated to Preloop — never a shared system root.
     #[cfg(any(target_os = "linux", test))]
-    if !args.user {
-        if let Some(protected) = shared_system_path(&home) {
-            bail!(
-                "--home {} is too broad for a system install: the state directory is \
+    if !args.user
+        && let Some(protected) = shared_system_path(&home)
+    {
+        bail!(
+            "--home {} is too broad for a system install: the state directory is \
                  chowned to `{SERVICE_USER}` recursively, which would hand it {}. \
                  Use {DEFAULT_HOME} (the default) or another dedicated directory.",
-                home.display(),
-                protected.display()
-            );
-        }
+            home.display(),
+            protected.display()
+        );
     }
     // The service must be able to execute the binary the unit points at. An
     // exe under a 0700 /home/<user> or /root is unreachable for the same
@@ -515,7 +515,7 @@ fn ensure_service_user(home: &Path, dry_run: bool) -> Result<()> {
                     home.display()
                 ),
                 Err(error) => {
-                    return Err(error).with_context(|| format!("run useradd {SERVICE_USER}"))
+                    return Err(error).with_context(|| format!("run useradd {SERVICE_USER}"));
                 }
             }
         }
@@ -1244,10 +1244,8 @@ ProtectHome=read-only
 #[cfg(any(target_os = "linux", test))]
 fn readwrite_paths(exe: &Path, home: &Path, user: bool, replaceable_exe: bool) -> String {
     let mut paths = Vec::new();
-    if replaceable_exe {
-        if let Some(dir) = readwrite_dir(exe) {
-            paths.push(systemd_path(&dir));
-        }
+    if replaceable_exe && let Some(dir) = readwrite_dir(exe) {
+        paths.push(systemd_path(&dir));
     }
     if user {
         paths.push(systemd_path(home));
@@ -2238,9 +2236,9 @@ WantedBy=multi-user.target
     #[test]
     fn user_home_defaults_to_preloop_home() {
         let unique = std::env::temp_dir().join("preloop-home-test");
-        std::env::set_var("PRELOOP_HOME", &unique);
+        unsafe { std::env::set_var("PRELOOP_HOME", &unique) };
         let home = resolve_home(None, true).unwrap();
-        std::env::remove_var("PRELOOP_HOME");
+        unsafe { std::env::remove_var("PRELOOP_HOME") };
         assert_eq!(home, unique);
     }
 
@@ -2259,9 +2257,9 @@ WantedBy=multi-user.target
     #[test]
     fn user_launchd_target_is_gui_domain_in_home() {
         let unique = std::env::temp_dir().join("preloop-home-test");
-        std::env::set_var("HOME", &unique);
+        unsafe { std::env::set_var("HOME", &unique) };
         let (path, domain) = launchd_target(true);
-        std::env::remove_var("HOME");
+        unsafe { std::env::remove_var("HOME") };
         assert!(path.ends_with("Library/LaunchAgents/dev.preloop.server.plist"));
         assert!(domain.starts_with("gui/"));
         let (system_path, system_domain) = launchd_target(false);

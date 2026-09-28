@@ -352,36 +352,36 @@ impl Trigger {
 
         // A `paths` filter requires at least one known changed path matching
         // the positive pattern.
-        if let Some(path_filters) = obj.get("paths") {
-            if paths.is_empty() || !paths.iter().any(|path| matches_filter(path_filters, path)) {
-                return Err(TriggerMismatch::PathsUnmatched {
-                    changed: paths.len(),
-                    filters: filter_patterns(path_filters),
-                });
-            }
+        if let Some(path_filters) = obj.get("paths")
+            && (paths.is_empty() || !paths.iter().any(|path| matches_filter(path_filters, path)))
+        {
+            return Err(TriggerMismatch::PathsUnmatched {
+                changed: paths.len(),
+                filters: filter_patterns(path_filters),
+            });
         }
         // `paths-ignore` suppresses only when every changed path is ignored.
         // A mixed change set must still run.
-        if let Some(ignore) = obj.get("paths-ignore") {
-            if !paths.is_empty() && paths.iter().all(|path| matches_filter(ignore, path)) {
-                return Err(TriggerMismatch::PathsAllIgnored {
-                    changed: paths.len(),
-                    filters: filter_patterns(ignore),
-                });
-            }
+        if let Some(ignore) = obj.get("paths-ignore")
+            && !paths.is_empty()
+            && paths.iter().all(|path| matches_filter(ignore, path))
+        {
+            return Err(TriggerMismatch::PathsAllIgnored {
+                changed: paths.len(),
+                filters: filter_patterns(ignore),
+            });
         }
         // `workflow_run.workflows` matches the upstream workflow display name,
         // not its file path.
-        if let Some(wf_filter) = obj.get("workflows") {
-            if upstream_workflow_paths.is_empty()
+        if let Some(wf_filter) = obj.get("workflows")
+            && (upstream_workflow_paths.is_empty()
                 || !upstream_workflow_paths
                     .iter()
-                    .any(|name| matches_filter(wf_filter, name))
-            {
-                return Err(TriggerMismatch::UpstreamWorkflowUnmatched {
-                    filters: filter_patterns(wf_filter),
-                });
-            }
+                    .any(|name| matches_filter(wf_filter, name)))
+        {
+            return Err(TriggerMismatch::UpstreamWorkflowUnmatched {
+                filters: filter_patterns(wf_filter),
+            });
         }
         Ok(())
     }
@@ -415,18 +415,17 @@ impl Trigger {
     /// ParserError::InvalidFilterForKey (a warning — GitHub only warns,
     /// does not reject the workflow).
     pub fn validate_filters(&self, event: &str) -> Result<(), ParserError> {
-        if let Trigger::Map(values) = self {
-            if let Some(config) = values.get(event) {
-                if let Some(obj) = config.as_object() {
-                    let valid = Self::valid_filter_keys(event);
-                    for key in obj.keys() {
-                        if !valid.contains(&key.as_str()) {
-                            return Err(ParserError::InvalidFilterForKey {
-                                event: event.to_owned(),
-                                key: key.clone(),
-                            });
-                        }
-                    }
+        if let Trigger::Map(values) = self
+            && let Some(config) = values.get(event)
+            && let Some(obj) = config.as_object()
+        {
+            let valid = Self::valid_filter_keys(event);
+            for key in obj.keys() {
+                if !valid.contains(&key.as_str()) {
+                    return Err(ParserError::InvalidFilterForKey {
+                        event: event.to_owned(),
+                        key: key.clone(),
+                    });
                 }
             }
         }
@@ -436,23 +435,22 @@ impl Trigger {
     /// Check for mutually exclusive filter pairs. Mirrors
     /// MessageController.cs:1236-1250.
     pub fn check_conflicting_filters(&self, event: &str) -> Result<(), ParserError> {
-        if let Trigger::Map(values) = self {
-            if let Some(config) = values.get(event) {
-                if let Some(obj) = config.as_object() {
-                    let pairs: &[(&str, &str)] = &[
-                        ("branches", "branches-ignore"),
-                        ("tags", "tags-ignore"),
-                        ("paths", "paths-ignore"),
-                    ];
-                    for &(a, b) in pairs {
-                        if obj.contains_key(a) && obj.contains_key(b) {
-                            return Err(ParserError::ConflictingFilters {
-                                event: event.to_owned(),
-                                a: a.to_owned(),
-                                b: b.to_owned(),
-                            });
-                        }
-                    }
+        if let Trigger::Map(values) = self
+            && let Some(config) = values.get(event)
+            && let Some(obj) = config.as_object()
+        {
+            let pairs: &[(&str, &str)] = &[
+                ("branches", "branches-ignore"),
+                ("tags", "tags-ignore"),
+                ("paths", "paths-ignore"),
+            ];
+            for &(a, b) in pairs {
+                if obj.contains_key(a) && obj.contains_key(b) {
+                    return Err(ParserError::ConflictingFilters {
+                        event: event.to_owned(),
+                        a: a.to_owned(),
+                        b: b.to_owned(),
+                    });
                 }
             }
         }

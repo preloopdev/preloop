@@ -297,11 +297,11 @@ pub async fn replay_trace(
                 // Compare to the next a2c frame in the expected queue.
                 let mut consumed_expected: Option<DapFrame> = None;
                 let next = q.front();
-                if let Some(next) = next {
-                    if next.direction == "a2c" {
-                        consumed_expected = Some((*next).clone());
-                        q.pop_front();
-                    }
+                if let Some(next) = next
+                    && next.direction == "a2c"
+                {
+                    consumed_expected = Some((*next).clone());
+                    q.pop_front();
                 }
                 let path_diffs = match consumed_expected.as_ref() {
                     Some(exp) => {

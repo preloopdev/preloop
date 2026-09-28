@@ -173,11 +173,11 @@ pub fn is_valid_externals_dir(dir: &Path, runtime: &str, expected_version: &str)
     } else {
         // Non-native guest binary (e.g. linux-arm64 binary on macOS host).
         // If the binary can be executed locally (e.g. shell scripts in test fixtures), verify version.
-        if let Ok(output) = Command::new(&node_bin).arg("--version").output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                return stdout == format!("v{expected}");
-            }
+        if let Ok(output) = Command::new(&node_bin).arg("--version").output()
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            return stdout == format!("v{expected}");
         }
         // Foreign ELF binary cannot be executed on macOS host without virtualization;
         // validate via manifest provenance and non-empty binary file.
@@ -261,15 +261,15 @@ pub fn verify_digest(
         }
         verified = true;
     }
-    if let Some(shasums) = shasums_content {
-        if let Some(expected) = parse_shasums(shasums, archive_name) {
-            if digest_lc != expected {
-                return Err(format!(
-                    "SHA256 mismatch for {archive_name} vs SHASUMS256.txt: got {digest_lc}, expected {expected}"
-                ));
-            }
-            verified = true;
+    if let Some(shasums) = shasums_content
+        && let Some(expected) = parse_shasums(shasums, archive_name)
+    {
+        if digest_lc != expected {
+            return Err(format!(
+                "SHA256 mismatch for {archive_name} vs SHASUMS256.txt: got {digest_lc}, expected {expected}"
+            ));
         }
+        verified = true;
     }
     if !verified {
         return Err(format!(
@@ -325,23 +325,27 @@ mod tests {
         let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let pinned = Some(digest);
         let shasums = format!("{digest}  node-v20.19.0-linux-arm64.tar.gz");
-        assert!(verify_digest(
-            digest,
-            "node-v20.19.0-linux-arm64.tar.gz",
-            pinned,
-            Some(&shasums)
-        )
-        .is_ok());
+        assert!(
+            verify_digest(
+                digest,
+                "node-v20.19.0-linux-arm64.tar.gz",
+                pinned,
+                Some(&shasums)
+            )
+            .is_ok()
+        );
 
         // Mismatch vs pinned fails even if shasums would match.
         let wrong = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        assert!(verify_digest(
-            wrong,
-            "node-v20.19.0-linux-arm64.tar.gz",
-            pinned,
-            Some(&shasums)
-        )
-        .is_err());
+        assert!(
+            verify_digest(
+                wrong,
+                "node-v20.19.0-linux-arm64.tar.gz",
+                pinned,
+                Some(&shasums)
+            )
+            .is_err()
+        );
 
         // Absent pin and absent shasums fails closed.
         assert!(verify_digest(digest, "node-v20.19.0-linux-arm64.tar.gz", None, None).is_err());

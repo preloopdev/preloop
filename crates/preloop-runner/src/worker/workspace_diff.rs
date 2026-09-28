@@ -22,7 +22,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use preloop_gha_protocol::debug_session::{
     ChangeCategory, ChangeStatus, RevertPolicy, WorkspaceChange, WorkspaceDiff,
@@ -258,7 +258,7 @@ pub fn revert_paths(
             // Already gone is the desired end state.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).with_context(|| format!("removing {}", target.display()))
+                return Err(error).with_context(|| format!("removing {}", target.display()));
             }
         }
     }
@@ -518,9 +518,11 @@ mod tests {
                 ("gone.rs", '-'),
             ]
         );
-        assert!(parsed
-            .iter()
-            .all(|change| change.category == ChangeCategory::Tracked));
+        assert!(
+            parsed
+                .iter()
+                .all(|change| change.category == ChangeCategory::Tracked)
+        );
         // A truncated entry invents nothing.
         assert!(parse_name_status("R100\0old-only\0").is_empty());
     }
@@ -546,10 +548,11 @@ mod tests {
         );
 
         let diff = fixture.diff();
-        assert!(diff
-            .changes
-            .iter()
-            .all(|c| c.category == ChangeCategory::Tracked));
+        assert!(
+            diff.changes
+                .iter()
+                .all(|c| c.category == ChangeCategory::Tracked)
+        );
         assert_eq!(
             revert_paths(&fixture.path, &fixture.commit, &diff.changes).unwrap(),
             2

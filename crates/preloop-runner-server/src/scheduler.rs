@@ -22,10 +22,10 @@ use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
 
-use preloop_gha_parser::{parse_workflow, Trigger};
+use preloop_gha_parser::{Trigger, parse_workflow};
 use preloop_gha_protocol::WorkflowSubmission;
 
-use crate::{submit_run_inner, SharedState};
+use crate::{SharedState, submit_run_inner};
 
 /// Adjust GitHub Day-Of-Week format to cron crate format.
 ///
@@ -395,7 +395,9 @@ impl Scheduler {
             std::env::var("PRELOOP_GITHUB_REPOSITORY"),
             std::env::var("PRELOOP_GITHUB_TOKEN"),
         ) else {
-            warn!("scheduler: remote startup scan requires PRELOOP_GITHUB_REPOSITORY and PRELOOP_GITHUB_TOKEN");
+            warn!(
+                "scheduler: remote startup scan requires PRELOOP_GITHUB_REPOSITORY and PRELOOP_GITHUB_TOKEN"
+            );
             return;
         };
         let client = crate::shared_http::CLIENT.clone();
@@ -666,7 +668,7 @@ fn next_schedule_time(schedule: &Schedule, timezone: Option<&str>) -> Option<Dat
                 return schedule
                     .upcoming(zone)
                     .next()
-                    .map(|time| time.with_timezone(&Utc))
+                    .map(|time| time.with_timezone(&Utc));
             }
             Err(error) => warn!(%timezone, ?error, "scheduler: invalid timezone; using UTC"),
         }
@@ -1144,11 +1146,10 @@ jobs:
             let sched = github_to_cron(expr);
             prop_assert!(sched.is_ok(), "Expected Ok for {expr:?}, got {sched:?}");
             let s = sched.unwrap();
-            if let Some(next1) = s.upcoming(Utc).next() {
-                if let Some(next2) = s.upcoming(Utc).nth(1) {
+            if let Some(next1) = s.upcoming(Utc).next()
+                && let Some(next2) = s.upcoming(Utc).nth(1) {
                     prop_assert!(next2 > next1);
                 }
-            }
         }
         #[test]
         fn proptest_invalid_github_crons(ref expr in invalid_cron_expr()) {

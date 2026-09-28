@@ -2,5 +2,5 @@
 //! and `preloop-orchestrator` share the same registry without a circular dep.
 
 pub use preloop_observability::vm_telemetry::{
-    build_fleet_snapshot, sample_host, HostSample, VmRuntimeInfo, VmTelemetryRegistry,
+    HostSample, VmRuntimeInfo, VmTelemetryRegistry, build_fleet_snapshot, sample_host,
 };

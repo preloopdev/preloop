@@ -410,41 +410,41 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
     {
         // 1. Check Timeout Enforcement
-        if let Some(started_at) = started_at {
-            if !timeout_triggered {
-                // Time spent paused at a failed step is debugging, not
-                // execution. Without this subtraction a `timeout-minutes: 10`
-                // job is cancelled ten minutes into a debug session, through a
-                // path no client can see.
-                let paused = paused_credits.get(&request_id).copied().unwrap_or_default();
-                let elapsed = now
-                    .duration_since(started_at)
-                    .unwrap_or_default()
-                    .saturating_sub(paused);
-                let job_timeout = inner
-                    .broker_messages
-                    .get(&request_id)
-                    .and_then(|msg| msg.job_timeout)
-                    .unwrap_or(21600); // 360 minutes in seconds
+        if let Some(started_at) = started_at
+            && !timeout_triggered
+        {
+            // Time spent paused at a failed step is debugging, not
+            // execution. Without this subtraction a `timeout-minutes: 10`
+            // job is cancelled ten minutes into a debug session, through a
+            // path no client can see.
+            let paused = paused_credits.get(&request_id).copied().unwrap_or_default();
+            let elapsed = now
+                .duration_since(started_at)
+                .unwrap_or_default()
+                .saturating_sub(paused);
+            let job_timeout = inner
+                .broker_messages
+                .get(&request_id)
+                .and_then(|msg| msg.job_timeout)
+                .unwrap_or(21600); // 360 minutes in seconds
 
-                if elapsed >= Duration::from_secs(job_timeout as u64) {
-                    info!(
-                        %run_id,
-                        %job_id,
-                        request_id,
-                        "Job timed out after {}s",
-                        job_timeout
-                    );
-                    if let Some(req) = inner.job_requests.get_mut(&request_id) {
-                        req.timeout_triggered = true;
-                    }
-                    if let Some(agent_job_id) = agent_job_id_for(&inner, run_id, &job_id) {
-                        cancellations.push(QueuedCancellation {
-                            run_id,
-                            job_id: job_id.clone(),
-                            agent_job_id,
-                        });
-                    }
+            if elapsed >= Duration::from_secs(job_timeout as u64) {
+                info!(
+                    %run_id,
+                    %job_id,
+                    request_id,
+                    "Job timed out after {}s",
+                    job_timeout
+                );
+                if let Some(req) = inner.job_requests.get_mut(&request_id) {
+                    req.timeout_triggered = true;
+                }
+                if let Some(agent_job_id) = agent_job_id_for(&inner, run_id, &job_id) {
+                    cancellations.push(QueuedCancellation {
+                        run_id,
+                        job_id: job_id.clone(),
+                        agent_job_id,
+                    });
                 }
             }
         }
@@ -892,13 +892,13 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
         }
     }
     for request in inner.job_requests.values() {
-        if request.result.is_none() {
-            if let Some(runner_id) = request.owner_runner_id {
-                runner_ids_by_run
-                    .entry(request.run_id)
-                    .or_default()
-                    .insert(runner_id);
-            }
+        if request.result.is_none()
+            && let Some(runner_id) = request.owner_runner_id
+        {
+            runner_ids_by_run
+                .entry(request.run_id)
+                .or_default()
+                .insert(runner_id);
         }
     }
     let mut active_runs: Vec<_> = inner
@@ -1662,10 +1662,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     // is fixed for the process lifetime, so one lookup here covers every later
     // expansion. A failure is logged, not fatal: the run path withholds the PAT
     // rather than embedding one whose bounds could not be established.
-    if state.github_app.is_none() {
-        if let Some(pat) = state.static_github_pat() {
-            crate::runs::warm_pat_scope_cache(&pat).await;
-        }
+    if state.github_app.is_none()
+        && let Some(pat) = state.static_github_pat()
+    {
+        crate::runs::warm_pat_scope_cache(&pat).await;
     }
     // Resolve the effective store URL exactly once, mirroring `open_store`
     // precedence: the explicit URL wins, then the environment, then SQLite at
@@ -1750,10 +1750,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     {
         let inner = state.inner.lock().await;
         crate::runtime_scheduling::sync_next_job_labels(&inner, &state.next_job_runs_on);
-        if state.pool_status.snapshot().next_job_runs_on.is_empty() {
-            if let Ok(v) = state.next_job_runs_on.read() {
-                state.pool_status.set_next_job_runs_on(v.clone());
-            }
+        if state.pool_status.snapshot().next_job_runs_on.is_empty()
+            && let Ok(v) = state.next_job_runs_on.read()
+        {
+            state.pool_status.set_next_job_runs_on(v.clone());
         }
     }
     {
@@ -2088,7 +2088,9 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             let tls_config =
                 RustlsConfig::from_pem(cert.cert.into_bytes(), cert.key.into_bytes()).await?;
             info!(listen = %config.listen, scheme = "https", self_signed = true, "preloop runner server listening");
-            warn!("self-signed cert -- runner needs --ss-skip-tls-verify or GITHUB_ACTIONS_RUNNER_SKIP_TLS_VERIFY=1");
+            warn!(
+                "self-signed cert -- runner needs --ss-skip-tls-verify or GITHUB_ACTIONS_RUNNER_SKIP_TLS_VERIFY=1"
+            );
             let handle = Handle::new();
             tokio::spawn({
                 let handle = handle.clone();

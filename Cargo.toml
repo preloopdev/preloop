@@ -21,7 +21,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 # `preloop-cli` and `preloop-runner-server` ship as one unit: the CLI embeds
 # the server and `preloop status` reports both, so a drifting pair made the
 # deployed binary's provenance unreadable (a host reporting CLI 0.32.7 was
@@ -34,7 +34,10 @@ homepage = "https://github.com/preloopdev/preloop"
 rust-version = "1.97"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` (not `forbid`) so test targets may `#[allow(unsafe_code)]` around
+# `std::env::set_var`/`remove_var` — unsafe under edition 2024, with no safe
+# std alternative. Production code in workspace crates remains unsafe-free.
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.dependencies]

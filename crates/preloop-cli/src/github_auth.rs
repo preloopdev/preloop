@@ -78,7 +78,7 @@ impl StoredAuth {
         let raw = match std::fs::read_to_string(&file) {
             Ok(raw) => raw,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
+                return Ok(Self::default());
             }
             Err(error) => return Err(error).with_context(|| format!("reading {}", file.display())),
         };
@@ -251,7 +251,7 @@ fn set_if_unset(name: &str, value: Option<&str>) {
     if env_present(name) {
         return;
     }
-    std::env::set_var(name, value);
+    unsafe { std::env::set_var(name, value) };
 }
 
 #[cfg(test)]
@@ -278,8 +278,8 @@ mod tests {
             for &(name, value) in vars {
                 saved.push((name, std::env::var(name).ok()));
                 match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
                 }
             }
             Self { saved, _lock: lock }
@@ -290,8 +290,8 @@ mod tests {
         fn drop(&mut self) {
             for (name, value) in self.saved.drain(..) {
                 match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
+                    Some(value) => unsafe { std::env::set_var(name, value) },
+                    None => unsafe { std::env::remove_var(name) },
                 }
             }
         }

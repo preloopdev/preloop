@@ -664,10 +664,11 @@ mod tests {
         let mut ctx = make_ctx(&mut job);
         let group = parse_command("::group::Build step").unwrap();
         handle_command(&group, &mut ctx);
-        assert!(ctx
-            .log_lines
-            .iter()
-            .any(|l| l.contains("##[group]Build step")));
+        assert!(
+            ctx.log_lines
+                .iter()
+                .any(|l| l.contains("##[group]Build step"))
+        );
 
         let endgroup = parse_command("::endgroup::").unwrap();
         handle_command(&endgroup, &mut ctx);

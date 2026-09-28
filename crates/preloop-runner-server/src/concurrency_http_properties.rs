@@ -9,11 +9,11 @@
 
 use std::collections::BTreeMap;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode, header};
 use proptest::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -736,31 +736,31 @@ pub mod http_sequences {
                         all_run_ids.push(run_id);
                     }
                     GenOp::GetRun(wf_idx) => {
-                        if let Some(ids) = submitted.get(wf_idx) {
-                            if let Some(id) = ids.last() {
-                                let run = get_run(&app, id).await;
-                                // Status must be a known value.
-                                let status = run["status"].as_str().unwrap();
-                                assert!(
-                                    matches!(
-                                        status,
-                                        "queued"
-                                            | "pending"
-                                            | "in_progress"
-                                            | "success"
-                                            | "failure"
-                                            | "cancelled"
-                                    ),
-                                    "op {op_idx}: unexpected status {status}"
-                                );
-                            }
+                        if let Some(ids) = submitted.get(wf_idx)
+                            && let Some(id) = ids.last()
+                        {
+                            let run = get_run(&app, id).await;
+                            // Status must be a known value.
+                            let status = run["status"].as_str().unwrap();
+                            assert!(
+                                matches!(
+                                    status,
+                                    "queued"
+                                        | "pending"
+                                        | "in_progress"
+                                        | "success"
+                                        | "failure"
+                                        | "cancelled"
+                                ),
+                                "op {op_idx}: unexpected status {status}"
+                            );
                         }
                     }
                     GenOp::CancelRun(wf_idx) => {
-                        if let Some(ids) = submitted.get(wf_idx) {
-                            if let Some(id) = ids.last() {
-                                let _ = cancel_run(&app, id).await;
-                            }
+                        if let Some(ids) = submitted.get(wf_idx)
+                            && let Some(id) = ids.last()
+                        {
+                            let _ = cancel_run(&app, id).await;
                         }
                     }
                     GenOp::CompleteFirstJob(wf_idx) => {

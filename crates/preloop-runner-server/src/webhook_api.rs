@@ -17,15 +17,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
 use axum::Json;
+use axum::extract::{Path, Query, State};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::ApiError;
 use crate::models::{WebhookDeliveryStatus, WebhookQueueStats};
 use crate::state::SharedState;
 use crate::webhook_status::{age_seconds, now_us};
-use crate::ApiError;
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 500;

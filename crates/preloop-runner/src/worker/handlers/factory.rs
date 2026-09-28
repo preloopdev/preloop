@@ -61,14 +61,13 @@ pub fn load_action_manifest(action_dir: &Path) -> Result<ActionManifest> {
 
     if let (Ok(canonical_dir), Ok(canonical_manifest)) =
         (action_dir.canonicalize(), manifest_path.canonicalize())
+        && !canonical_manifest.starts_with(&canonical_dir)
     {
-        if !canonical_manifest.starts_with(&canonical_dir) {
-            anyhow::bail!(
-                "action manifest {} escapes action directory {}",
-                manifest_path.display(),
-                action_dir.display()
-            );
-        }
+        anyhow::bail!(
+            "action manifest {} escapes action directory {}",
+            manifest_path.display(),
+            action_dir.display()
+        );
     }
 
     let content = std::fs::read_to_string(&manifest_path)
@@ -540,9 +539,11 @@ runs:
 
         let result = load_action_manifest(&action_dir);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("escapes action directory"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("escapes action directory")
+        );
     }
 }

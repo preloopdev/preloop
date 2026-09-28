@@ -1,3 +1,6 @@
+// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
+#![allow(unsafe_code)]
+
 //! preloop-runner-server integration tests — recovery group.
 //! Split from the former `lib_tests.rs` unit; see `tests/common/mod.rs`.
 
@@ -389,7 +392,7 @@ async fn postgres_recovery_restores_post_restart_state() {
     // this variable, so setting it process-wide cannot affect other tests.
     if let Ok(ca) = std::env::var("PRELOOP_TEST_PG_CA") {
         if !ca.is_empty() {
-            std::env::set_var("SSL_CERT_FILE", ca);
+            unsafe { std::env::set_var("SSL_CERT_FILE", ca) };
         }
     }
 
@@ -1133,14 +1136,18 @@ async fn agent_request_patch_targets_only_the_request_id() {
     let inner = state.inner.lock().await;
     let first = inner.runs.get(&first_run).unwrap();
     let second = inner.runs.get(&second_run).unwrap();
-    assert!(first
-        .jobs
-        .values()
-        .all(|status| *status == ExecutionStatus::Success));
-    assert!(second
-        .jobs
-        .values()
-        .all(|status| *status == ExecutionStatus::InProgress));
+    assert!(
+        first
+            .jobs
+            .values()
+            .all(|status| *status == ExecutionStatus::Success)
+    );
+    assert!(
+        second
+            .jobs
+            .values()
+            .all(|status| *status == ExecutionStatus::InProgress)
+    );
     assert!(!inner.inflight_requests.contains_key(&first_req_id));
 }
 
@@ -1364,14 +1371,18 @@ async fn unacked_messages_are_scoped_to_their_session() {
     assert_eq!(redelivered["messageId"], first_message_id);
 
     let inner = state.inner.lock().await;
-    assert!(inner
-        .inflight_messages
-        .get("s1")
-        .is_some_and(|messages| messages.contains_key(&first_message_id)));
-    assert!(inner
-        .inflight_messages
-        .get("s2")
-        .is_some_and(|messages| messages.contains_key(&second_message_id)));
+    assert!(
+        inner
+            .inflight_messages
+            .get("s1")
+            .is_some_and(|messages| messages.contains_key(&first_message_id))
+    );
+    assert!(
+        inner
+            .inflight_messages
+            .get("s2")
+            .is_some_and(|messages| messages.contains_key(&second_message_id))
+    );
 }
 
 #[tokio::test]
@@ -1432,9 +1443,10 @@ async fn finish_job_resolves_plan_timeline_and_agent_job_ids() {
         run.jobs.get(&request.job_id),
         Some(&ExecutionStatus::Success)
     );
-    assert!(!run
-        .jobs
-        .contains_key(&JobId(request.agent_job_id.to_string())));
+    assert!(
+        !run.jobs
+            .contains_key(&JobId(request.agent_job_id.to_string()))
+    );
     assert_eq!(
         run.job_outputs
             .get(&request.job_id)
@@ -1744,12 +1756,14 @@ jobs:
     let run = inner.runs.get(&run_id).unwrap();
 
     // Verify downstream (ubuntu-latest) and downstream (macos-latest) were dynamically created and queued
-    assert!(run
-        .jobs
-        .contains_key(&JobId("downstream (ubuntu-latest)".to_string())));
-    assert!(run
-        .jobs
-        .contains_key(&JobId("downstream (macos-latest)".to_string())));
+    assert!(
+        run.jobs
+            .contains_key(&JobId("downstream (ubuntu-latest)".to_string()))
+    );
+    assert!(
+        run.jobs
+            .contains_key(&JobId("downstream (macos-latest)".to_string()))
+    );
 
     let queued_ids: Vec<String> = inner.queue.iter().map(|j| j.job_id.0.clone()).collect();
     assert!(queued_ids.contains(&"downstream (ubuntu-latest)".to_string()));
@@ -1826,7 +1840,7 @@ jobs:
     );
     // The un-expanded node is un-suffixed, the way GitHub shows it: the
     // deferred expression must not leak into the job's identity.
-    assert_eq!(downstream[0].0 .0, "downstream");
+    assert_eq!(downstream[0].0.0, "downstream");
     assert_eq!(
         downstream[0].1,
         ExecutionStatus::Failure,
@@ -1886,9 +1900,11 @@ jobs:
     assert_eq!(scripts.len(), 3);
     assert!(scripts.contains(&"echo first".to_owned()));
     assert!(scripts.contains(&"echo \"VAL=$VAL\"".to_owned()));
-    assert!(scripts
-        .iter()
-        .any(|script| script.contains("echo line1") && script.contains("echo line2")));
+    assert!(
+        scripts
+            .iter()
+            .any(|script| script.contains("echo line1") && script.contains("echo line2"))
+    );
 
     let message = request_json(
         &app,

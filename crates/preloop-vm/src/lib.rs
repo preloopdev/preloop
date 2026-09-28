@@ -1989,35 +1989,34 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
     let data_dir = explicit_data_dir
         .clone()
         .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
-    if explicit_data_dir.is_none() {
-        if let Some(data_dir) = &data_dir {
-            // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
-            // registry from HOME. Keep each Preloop home isolated while still
-            // leaving an explicit operator registry untouched.
-            #[cfg(target_os = "macos")]
-            if let Some(preloop_home) = effective_preloop_home() {
-                env.push((
-                    "HOME".to_owned(),
-                    preloop_home.join("smolvm-home").into_os_string(),
-                ));
-            }
+    if explicit_data_dir.is_none()
+        && let Some(data_dir) = &data_dir
+    {
+        // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its
+        // registry from HOME. Keep each Preloop home isolated while still
+        // leaving an explicit operator registry untouched.
+        #[cfg(target_os = "macos")]
+        if let Some(preloop_home) = effective_preloop_home() {
             env.push((
-                "SMOLVM_DATA_DIR".to_owned(),
-                data_dir.clone().into_os_string(),
+                "HOME".to_owned(),
+                preloop_home.join("smolvm-home").into_os_string(),
             ));
         }
+        env.push((
+            "SMOLVM_DATA_DIR".to_owned(),
+            data_dir.clone().into_os_string(),
+        ));
     }
 
     // HOME may be isolated above, so preserve the host installation assets
     // explicitly for the child SmolVM process: the agent rootfs lives in the
     // REAL host's platform data dir, which the isolated HOME would miss.
-    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none() {
-        if let Some(path) = agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none()
+        && let Some(path) = agent_rootfs_candidates(host_home.as_deref(), data_dir.as_deref())
             .into_iter()
             .find(|path| path.is_dir())
-        {
-            env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
-        }
+    {
+        env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
     }
 
     #[cfg(target_os = "macos")]
@@ -2072,12 +2071,12 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
 /// SmolVM starts (it does not create a missing data dir itself).
 fn runtime_dirs_to_create() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if std::env::var_os("SMOLVM_DATA_DIR").is_none() {
-        if let Some(home) = effective_preloop_home() {
-            dirs.push(home.join("smolvm"));
-            #[cfg(target_os = "macos")]
-            dirs.push(home.join("smolvm-home"));
-        }
+    if std::env::var_os("SMOLVM_DATA_DIR").is_none()
+        && let Some(home) = effective_preloop_home()
+    {
+        dirs.push(home.join("smolvm"));
+        #[cfg(target_os = "macos")]
+        dirs.push(home.join("smolvm-home"));
     }
     dirs
 }
@@ -2641,11 +2640,11 @@ mod tests {
             .expect("spawn dummy boot-vm");
         let pid = child.id() as i32;
         let previous = std::env::var_os("PRELOOP_HOME");
-        std::env::set_var("PRELOOP_HOME", &home);
+        unsafe { std::env::set_var("PRELOOP_HOME", &home) };
         let killed = purge_orphaned_vms().expect("purge");
         match previous {
-            Some(value) => std::env::set_var("PRELOOP_HOME", value),
-            None => std::env::remove_var("PRELOOP_HOME"),
+            Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
+            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
         }
         assert!(killed >= 1, "purge should have killed the matching process");
         // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
@@ -2860,14 +2859,18 @@ mod tests {
             assert!(sandbox.remove.contains(&"SMOLVM_CGROUP_ROOT"));
         }
         // Regardless of the host, the seccomp/Landlock halves are enforced.
-        assert!(sandbox
-            .set
-            .iter()
-            .any(|(key, value)| key == "SMOLVM_SECCOMP" && value == "enforce"));
-        assert!(sandbox
-            .set
-            .iter()
-            .any(|(key, value)| key == "SMOLVM_LANDLOCK" && value == "enforce"));
+        assert!(
+            sandbox
+                .set
+                .iter()
+                .any(|(key, value)| key == "SMOLVM_SECCOMP" && value == "enforce")
+        );
+        assert!(
+            sandbox
+                .set
+                .iter()
+                .any(|(key, value)| key == "SMOLVM_LANDLOCK" && value == "enforce")
+        );
     }
 
     /// An invalid override must not wedge the recovery operations: a typo in

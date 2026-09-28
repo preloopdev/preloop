@@ -1,6 +1,6 @@
 //! Golden tests for stable protocol JSON shapes.
 
-use preloop_gha_protocol::{event_to_ndjson, ExecutionStatus, JobId, NdjsonEvent, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId, event_to_ndjson};
 use uuid::Uuid;
 
 #[test]

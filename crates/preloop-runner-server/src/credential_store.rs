@@ -64,10 +64,10 @@ pub fn github_reference_with_host(
     host: Option<&str>,
     app_id: Option<&str>,
 ) -> Result<CredentialRef> {
-    if let Some(app_id) = app_id {
-        if app_id.is_empty() || !app_id.chars().all(|c| c.is_ascii_digit()) {
-            anyhow::bail!("GitHub App id must be numeric, got {app_id:?}");
-        }
+    if let Some(app_id) = app_id
+        && (app_id.is_empty() || !app_id.chars().all(|c| c.is_ascii_digit()))
+    {
+        anyhow::bail!("GitHub App id must be numeric, got {app_id:?}");
     }
     let host_prefix = match host {
         Some(h)
@@ -948,10 +948,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(token, "configured-token");
-        assert!(store
-            .get(&engine_token_reference(dir.path()).unwrap())
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get(&engine_token_reference(dir.path()).unwrap())
+                .unwrap()
+                .is_none()
+        );
         assert!(!dir.path().join(ENGINE_TOKEN_FILE).exists());
     }
 }

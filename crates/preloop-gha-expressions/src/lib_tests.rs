@@ -401,101 +401,133 @@ proptest! {
 #[test]
 fn condition_always_returns_true_regardless_of_status() {
     // all-success
-    assert!(eval_bool(
-        "always()",
-        &Context::default().with_status(true, false, false)
-    )
-    .unwrap());
+    assert!(
+        eval_bool(
+            "always()",
+            &Context::default().with_status(true, false, false)
+        )
+        .unwrap()
+    );
     // failure
-    assert!(eval_bool(
-        "always()",
-        &Context::default().with_status(false, true, false)
-    )
-    .unwrap());
+    assert!(
+        eval_bool(
+            "always()",
+            &Context::default().with_status(false, true, false)
+        )
+        .unwrap()
+    );
     // cancelled
-    assert!(eval_bool(
-        "always()",
-        &Context::default().with_status(false, false, true)
-    )
-    .unwrap());
+    assert!(
+        eval_bool(
+            "always()",
+            &Context::default().with_status(false, false, true)
+        )
+        .unwrap()
+    );
     // all-false (edge case: no status set)
-    assert!(eval_bool(
-        "always()",
-        &Context::default().with_status(false, false, false)
-    )
-    .unwrap());
+    assert!(
+        eval_bool(
+            "always()",
+            &Context::default().with_status(false, false, false)
+        )
+        .unwrap()
+    );
 }
 
 #[test]
 fn condition_success_true_only_when_success_flag_set() {
-    assert!(eval_bool(
-        "success()",
-        &Context::default().with_status(true, false, false)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "success()",
-        &Context::default().with_status(false, true, false)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "success()",
-        &Context::default().with_status(false, false, true)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "success()",
-        &Context::default().with_status(false, false, false)
-    )
-    .unwrap());
+    assert!(
+        eval_bool(
+            "success()",
+            &Context::default().with_status(true, false, false)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "success()",
+            &Context::default().with_status(false, true, false)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "success()",
+            &Context::default().with_status(false, false, true)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "success()",
+            &Context::default().with_status(false, false, false)
+        )
+        .unwrap()
+    );
 }
 
 #[test]
 fn condition_failure_true_only_when_failure_flag_set() {
-    assert!(!eval_bool(
-        "failure()",
-        &Context::default().with_status(true, false, false)
-    )
-    .unwrap());
-    assert!(eval_bool(
-        "failure()",
-        &Context::default().with_status(false, true, false)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "failure()",
-        &Context::default().with_status(false, false, true)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "failure()",
-        &Context::default().with_status(false, false, false)
-    )
-    .unwrap());
+    assert!(
+        !eval_bool(
+            "failure()",
+            &Context::default().with_status(true, false, false)
+        )
+        .unwrap()
+    );
+    assert!(
+        eval_bool(
+            "failure()",
+            &Context::default().with_status(false, true, false)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "failure()",
+            &Context::default().with_status(false, false, true)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "failure()",
+            &Context::default().with_status(false, false, false)
+        )
+        .unwrap()
+    );
 }
 
 #[test]
 fn condition_cancelled_true_only_when_cancelled_flag_set() {
-    assert!(!eval_bool(
-        "cancelled()",
-        &Context::default().with_status(true, false, false)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "cancelled()",
-        &Context::default().with_status(false, true, false)
-    )
-    .unwrap());
-    assert!(eval_bool(
-        "cancelled()",
-        &Context::default().with_status(false, false, true)
-    )
-    .unwrap());
-    assert!(!eval_bool(
-        "cancelled()",
-        &Context::default().with_status(false, false, false)
-    )
-    .unwrap());
+    assert!(
+        !eval_bool(
+            "cancelled()",
+            &Context::default().with_status(true, false, false)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "cancelled()",
+            &Context::default().with_status(false, true, false)
+        )
+        .unwrap()
+    );
+    assert!(
+        eval_bool(
+            "cancelled()",
+            &Context::default().with_status(false, false, true)
+        )
+        .unwrap()
+    );
+    assert!(
+        !eval_bool(
+            "cancelled()",
+            &Context::default().with_status(false, false, false)
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -552,9 +584,9 @@ fn format_with_multiline_template() {
     );
     // Matches what GHA sends: format string with real newlines
     let r = eval_expression(
-            "format('echo \"name={0}\"\necho \"target={1}\"\n', matrix.platform.name, matrix.platform.target)",
-            &ctx,
-        );
+        "format('echo \"name={0}\"\necho \"target={1}\"\n', matrix.platform.name, matrix.platform.target)",
+        &ctx,
+    );
     assert_eq!(
         r.unwrap(),
         serde_json::Value::String(

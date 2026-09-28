@@ -6,15 +6,15 @@
 use std::collections::BTreeMap;
 
 use preloop_gha_protocol::azdo::{
-    append_format_literal, AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType,
-    PipelineContextData, PlanReference, ServiceEndpoint, TaskResources, TaskStep,
-    TimelineReference, VariableValue,
+    AgentJobRequestMessage, EndpointAuthorization, MaskHint, MaskType, PipelineContextData,
+    PlanReference, ServiceEndpoint, TaskResources, TaskStep, TimelineReference, VariableValue,
+    append_format_literal,
 };
 
-use crate::eval::{build_context, resolve_string};
 use crate::JobPlan;
+use crate::eval::{build_context, resolve_string};
 use preloop_gha_expressions::Context;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn runner_condition(condition: &str) -> String {
     let trimmed = condition.trim();
@@ -86,18 +86,17 @@ fn job_outputs_token(outputs: &BTreeMap<String, String>, file_id: u32) -> Option
 pub(crate) fn template_string_token(raw: &str, file_id: u32) -> Value {
     let location = || json!({"file": file_id, "line": 1, "col": 1});
     let trimmed = raw.trim();
-    if let Some(expression_source) = trimmed.strip_prefix("${{") {
-        if let Some(end) = preloop_gha_protocol::expr_scan::find_expression_end(expression_source) {
-            if end + 2 == expression_source.len() {
-                return json!({
-                    "type": 3,
-                    "file": file_id,
-                    "line": 1,
-                    "col": 1,
-                    "expr": expression_source[..end].trim(),
-                });
-            }
-        }
+    if let Some(expression_source) = trimmed.strip_prefix("${{")
+        && let Some(end) = preloop_gha_protocol::expr_scan::find_expression_end(expression_source)
+        && end + 2 == expression_source.len()
+    {
+        return json!({
+            "type": 3,
+            "file": file_id,
+            "line": 1,
+            "col": 1,
+            "expr": expression_source[..end].trim(),
+        });
     }
     if !raw.contains("${{") {
         let mut token = location();
@@ -1038,7 +1037,7 @@ fn step_input_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parse_workflow, Workflow};
+    use crate::{Workflow, parse_workflow};
 
     fn simple_workflow() -> Workflow {
         let yaml = r#"
@@ -1077,11 +1076,12 @@ jobs:
         assert_eq!(msg.steps[0].condition.as_deref(), Some("success()"));
         assert!(msg.timeline.id != uuid::Uuid::nil());
         assert!(msg.job_id != uuid::Uuid::nil());
-        assert!(msg
-            .resources
-            .endpoints
-            .iter()
-            .any(|e| e.name == "SystemVssConnection"));
+        assert!(
+            msg.resources
+                .endpoints
+                .iter()
+                .any(|e| e.name == "SystemVssConnection")
+        );
     }
 
     /// `timeout-minutes` on the job must reach the runner as `jobTimeout` in
@@ -1656,14 +1656,18 @@ jobs:
 
         let container = message.job_container.as_ref().unwrap();
         assert_eq!(container["type"], 2);
-        assert!(container["map"]
-            .as_array()
-            .is_some_and(|map| !map.is_empty()));
+        assert!(
+            container["map"]
+                .as_array()
+                .is_some_and(|map| !map.is_empty())
+        );
         let services = message.job_service_containers.as_ref().unwrap();
         assert_eq!(services["type"], 2);
-        assert!(services["map"]
-            .as_array()
-            .is_some_and(|map| !map.is_empty()));
+        assert!(
+            services["map"]
+                .as_array()
+                .is_some_and(|map| !map.is_empty())
+        );
     }
 
     #[test]

@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{Context, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use walkdir::WalkDir;
@@ -872,14 +872,14 @@ fn collect_csharp(node: tree_sitter::Node, enclosing: &str, src: &[u8], model: &
                         if gc.kind() == "parameter_list" {
                             let mut c3 = gc.walk();
                             for p in gc.named_children(&mut c3) {
-                                if p.kind() == "parameter" {
-                                    if let Some(pn) = p.child_by_field_name("name") {
-                                        model.members.push((
-                                            name.clone(),
-                                            node_text(pn, src).to_string(),
-                                            p.start_position().row + 1,
-                                        ));
-                                    }
+                                if p.kind() == "parameter"
+                                    && let Some(pn) = p.child_by_field_name("name")
+                                {
+                                    model.members.push((
+                                        name.clone(),
+                                        node_text(pn, src).to_string(),
+                                        p.start_position().row + 1,
+                                    ));
                                 }
                             }
                         }
@@ -917,14 +917,14 @@ fn collect_csharp(node: tree_sitter::Node, enclosing: &str, src: &[u8], model: &
                     if gc.kind() == "variable_declaration" {
                         let mut c3 = gc.walk();
                         for vd in gc.named_children(&mut c3) {
-                            if vd.kind() == "variable_declarator" {
-                                if let Some(n) = vd.child_by_field_name("name") {
-                                    model.members.push((
-                                        enclosing.to_string(),
-                                        node_text(n, src).to_string(),
-                                        child.start_position().row + 1,
-                                    ));
-                                }
+                            if vd.kind() == "variable_declarator"
+                                && let Some(n) = vd.child_by_field_name("name")
+                            {
+                                model.members.push((
+                                    enclosing.to_string(),
+                                    node_text(n, src).to_string(),
+                                    child.start_position().row + 1,
+                                ));
                             }
                         }
                     }
@@ -1502,7 +1502,13 @@ async fn write_unknown_triage_prompt(
         .join("prompts")
         .join(format!("triage-{version}.md"));
     ensure_parent(&prompt_path)?;
-    fs::write(&prompt_path, format!("Review these actions/runner delta entries for preloop protocol relevance. Return TOML specs matching docs/runner-watch-plan.md.\n\n```json\n{}\n```\n", serde_json::to_string_pretty(&unknown)?))?;
+    fs::write(
+        &prompt_path,
+        format!(
+            "Review these actions/runner delta entries for preloop protocol relevance. Return TOML specs matching docs/runner-watch-plan.md.\n\n```json\n{}\n```\n",
+            serde_json::to_string_pretty(&unknown)?
+        ),
+    )?;
     let output_path = PathBuf::from(DEFAULT_ROOT).join("triage-ai-output.json");
     let status = Command::new(&config.agents.triage)
         .args([
@@ -1704,7 +1710,9 @@ fn existing_stage_paths() -> Vec<PathBuf> {
 
 fn implementation_prompt(spec: &Path) -> anyhow::Result<String> {
     let spec_text = fs::read_to_string(spec)?;
-    Ok(format!("You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.\n\nSpec:\n```toml\n{spec_text}\n```\n"))
+    Ok(format!(
+        "You are implementing an preloop protocol-sync spec. Follow existing Rust patterns exactly. Run cargo check and relevant tests, but do not run formatters or project-wide lint.\n\nSpec:\n```toml\n{spec_text}\n```\n"
+    ))
 }
 
 async fn review(config: &Config, args: &ReviewArgs) -> anyhow::Result<()> {
@@ -1720,14 +1728,18 @@ async fn review(config: &Config, args: &ReviewArgs) -> anyhow::Result<()> {
     let mut summary = Vec::new();
     for spec in sorted_files(&spec_dir, "toml")? {
         let spec_text = fs::read_to_string(&spec)?;
-        let prompt = format!("Adversarially review this preloop implementation against the spec. Return review.toml exactly as in docs/runner-watch-plan.md. You have independent cargo-test evidence from the orchestrator below; do not run formatters or project-wide lint.\n\nCargo test evidence:\n```text\n{test_evidence}\n```\n\nSpec:\n```toml\n{spec_text}\n```\n\nDiff:\n```diff\n{diff_text}\n```\n");
+        let prompt = format!(
+            "Adversarially review this preloop implementation against the spec. Return review.toml exactly as in docs/runner-watch-plan.md. You have independent cargo-test evidence from the orchestrator below; do not run formatters or project-wide lint.\n\nCargo test evidence:\n```text\n{test_evidence}\n```\n\nSpec:\n```toml\n{spec_text}\n```\n\nDiff:\n```diff\n{diff_text}\n```\n"
+        );
         let name = spec.file_stem().and_then(OsStr::to_str).unwrap_or("review");
         let out_path = review_dir.join(format!("{name}.toml"));
         if args.dry_run {
             fs::write(review_dir.join(format!("{name}.prompt.md")), prompt)?;
             fs::write(
                 &out_path,
-                format!("verdict = \"dry_run\"\nnotes = '''Prompt written; review agent not invoked.\n\n{test_evidence}\n'''\n"),
+                format!(
+                    "verdict = \"dry_run\"\nnotes = '''Prompt written; review agent not invoked.\n\n{test_evidence}\n'''\n"
+                ),
             )?;
             summary.push(out_path.display().to_string());
             continue;
@@ -1738,8 +1750,20 @@ async fn review(config: &Config, args: &ReviewArgs) -> anyhow::Result<()> {
             .await;
         match output {
             Ok(out) if out.status.success() => fs::write(&out_path, out.stdout)?,
-            Ok(out) => fs::write(&out_path, format!("[[issues]]\nseverity = \"must_fix\"\ndescription = '''review agent failed: {}\n{}'''\n", out.status, String::from_utf8_lossy(&out.stderr)))?,
-            Err(error) => fs::write(&out_path, format!("[[issues]]\nseverity = \"must_fix\"\ndescription = \"review agent invocation failed: {error}\"\n"))?,
+            Ok(out) => fs::write(
+                &out_path,
+                format!(
+                    "[[issues]]\nseverity = \"must_fix\"\ndescription = '''review agent failed: {}\n{}'''\n",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )?,
+            Err(error) => fs::write(
+                &out_path,
+                format!(
+                    "[[issues]]\nseverity = \"must_fix\"\ndescription = \"review agent invocation failed: {error}\"\n"
+                ),
+            )?,
         }
         summary.push(out_path.display().to_string());
     }
@@ -1792,12 +1816,12 @@ fn pinned_runner_version() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../versions.toml");
     let text = fs::read_to_string(&path).unwrap_or_default();
     for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("runner_version") {
-            if let Some((_, value)) = rest.split_once('=') {
-                let version = value.trim().trim_matches('"');
-                if !version.is_empty() {
-                    return version.to_owned();
-                }
+        if let Some(rest) = line.trim_start().strip_prefix("runner_version")
+            && let Some((_, value)) = rest.split_once('=')
+        {
+            let version = value.trim().trim_matches('"');
+            if !version.is_empty() {
+                return version.to_owned();
             }
         }
     }
@@ -2037,6 +2061,23 @@ fn scenario_dirs(root: &Path, only: Option<&str>) -> anyhow::Result<Vec<PathBuf>
     Ok(dirs)
 }
 
+/// `PRELOOP_SYSTEM_TOKEN` for native API calls. Tests override via a
+/// thread-local instead of `std::env::set_var`, which is unsafe under
+/// edition 2024 and forbidden in this crate.
+fn preloop_system_token() -> Option<String> {
+    #[cfg(test)]
+    if let Some(token) = TEST_SYSTEM_TOKEN.with(|cell| cell.borrow().clone()) {
+        return Some(token);
+    }
+    std::env::var("PRELOOP_SYSTEM_TOKEN").ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SYSTEM_TOKEN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 async fn replay_flows_to_preloop(
     golden_dir: &Path,
     out_dir: &Path,
@@ -2050,7 +2091,7 @@ async fn replay_flows_to_preloop(
         .parent()
         .unwrap_or(out_dir)
         .join("official-filtered");
-    let native_token = std::env::var("PRELOOP_SYSTEM_TOKEN")
+    let native_token = preloop_system_token()
         .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     // Runs are submitted by materialize before the replay starts; they must
     // be cancelled on EVERY exit from here on — including a materialization
@@ -2104,7 +2145,7 @@ async fn replay_flows_to_preloop_inner(
     // a JWT whose sub is "preloop-runner-listen-{numeric_id}" — the system token
     // alone does not satisfy authenticated_runner_id().
     let (broker_token, replay_runner_id) = {
-        use preloop_gha_protocol::crypto::{sign_jwt_ps256, AgentRsaKeypair};
+        use preloop_gha_protocol::crypto::{AgentRsaKeypair, sign_jwt_ps256};
         // Step 1: generate an ephemeral RSA keypair
         let keypair = match AgentRsaKeypair::generate() {
             Ok(kp) => kp,
@@ -2224,7 +2265,9 @@ async fn replay_flows_to_preloop_inner(
                         })
                         .unwrap_or_default();
                     if tok.is_empty() {
-                        eprintln!("runner-watch: OAuth pre-flight status={status}, no access_token, broker replay may 401");
+                        eprintln!(
+                            "runner-watch: OAuth pre-flight status={status}, no access_token, broker replay may 401"
+                        );
                         eprintln!("runner-watch: pre-flight body: {body_text}");
                     } else {
                         eprintln!(
@@ -2264,39 +2307,38 @@ async fn replay_flows_to_preloop_inner(
         );
         path = rewrite_replay_session_ids(&path, &session_ids);
         // Rewrite broker path runner_id to match the registered replay runner
-        if let Some(rest) = path.strip_prefix("/broker/") {
-            if let Some(slash_pos) = rest.find('/') {
-                path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
-            }
+        if let Some(rest) = path.strip_prefix("/broker/")
+            && let Some(slash_pos) = rest.find('/')
+        {
+            path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
         }
         // Rewrite OIDC plan/job IDs to match local replay state
-        if path.contains("/oidctoken") {
-            if let Some(rest) =
+        if path.contains("/oidctoken")
+            && let Some(rest) =
                 path.strip_prefix("/runner/server/_apis/distributedtask/hubs/actions/plans/")
-            {
-                let parts: Vec<&str> = rest.splitn(3, '/').collect();
-                if parts.len() >= 3 {
-                    let official_plan = parts[0];
-                    let official_job = parts[2]
-                        .split('/')
-                        .next()
-                        .unwrap_or(parts[2])
-                        .split('?')
-                        .next()
-                        .unwrap_or("");
-                    if let Some((local_plan, local_job)) =
-                        plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
-                    {
-                        let query = if let Some(q) = path.split_once('?') {
-                            format!("?{}", q.1)
-                        } else {
-                            String::new()
-                        };
-                        path = format!(
-                            "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken{}",
-                            local_plan, local_job, query
-                        );
-                    }
+        {
+            let parts: Vec<&str> = rest.splitn(3, '/').collect();
+            if parts.len() >= 3 {
+                let official_plan = parts[0];
+                let official_job = parts[2]
+                    .split('/')
+                    .next()
+                    .unwrap_or(parts[2])
+                    .split('?')
+                    .next()
+                    .unwrap_or("");
+                if let Some((local_plan, local_job)) =
+                    plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
+                {
+                    let query = if let Some(q) = path.split_once('?') {
+                        format!("?{}", q.1)
+                    } else {
+                        String::new()
+                    };
+                    path = format!(
+                        "/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken{}",
+                        local_plan, local_job, query
+                    );
                 }
             }
         }
@@ -2372,10 +2414,8 @@ async fn replay_flows_to_preloop_inner(
                 req = req.header(name, header_value.as_ref());
             }
         }
-        if !saw_auth {
-            if let Some(auth) = synthesized_authorization(&path, auth_token) {
-                req = req.header("Authorization", auth.as_ref());
-            }
+        if !saw_auth && let Some(auth) = synthesized_authorization(&path, auth_token) {
+            req = req.header("Authorization", auth.as_ref());
         }
         if let Some(body) = replay_body {
             req = req.body(body);
@@ -2407,14 +2447,14 @@ async fn replay_flows_to_preloop_inner(
                 captured["response_headers"] = json!(headers);
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
                     let mut runtime_token = None;
-                    if path.ends_with("/sessions") {
-                        if let (Some(official_id), Some(local_id)) = (
+                    if path.ends_with("/sessions")
+                        && let (Some(official_id), Some(local_id)) = (
                             flow.pointer("/response_body_json/sessionId")
                                 .and_then(Value::as_str),
                             body_json.get("sessionId").and_then(Value::as_str),
-                        ) {
-                            session_ids.insert(official_id.to_owned(), local_id.to_owned());
-                        }
+                        )
+                    {
+                        session_ids.insert(official_id.to_owned(), local_id.to_owned());
                     }
                     if let Some(official_id) = official_runner_request_id {
                         official_broker_job_ids.push(official_id);
@@ -2457,14 +2497,13 @@ async fn replay_flows_to_preloop_inner(
                         runtime_tokens.insert(lp.to_owned(), lj.to_owned(), token.clone());
                         runtime_token = Some(token);
                     }
-                    if is_blob_create_endpoint(&path) {
-                        if let Some(upload_url) = body_json
+                    if is_blob_create_endpoint(&path)
+                        && let Some(upload_url) = body_json
                             .get("signed_upload_url")
                             .and_then(Value::as_str)
                             .filter(|url| !url.is_empty())
-                        {
-                            blob_upload_urls.push_back(upload_url.to_owned());
-                        }
+                    {
+                        blob_upload_urls.push_back(upload_url.to_owned());
                     }
                     let mut captured_body = body_json;
                     redact_replay_credentials(&mut captured_body, runtime_token.as_deref());
@@ -2648,10 +2687,10 @@ impl ReplayRuntimeTokens {
     }
 
     fn token_for_plan(&self, plan_id: &str) -> Option<&str> {
-        if let Some(key) = self.active_job.as_ref() {
-            if key.0 == plan_id {
-                return self.by_job.get(key).map(String::as_str);
-            }
+        if let Some(key) = self.active_job.as_ref()
+            && key.0 == plan_id
+        {
+            return self.by_job.get(key).map(String::as_str);
         }
         let mut matches = self
             .by_job
@@ -2898,13 +2937,11 @@ fn rewrite_replay_body(
     if let (Some(official_plan), Some(official_job)) = (
         json_body.get("planId").and_then(Value::as_str),
         json_body.get("jobId").and_then(Value::as_str),
-    ) {
-        if let Some((local_plan, local_job)) =
-            plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
-        {
-            json_body["planId"] = json!(local_plan);
-            json_body["jobId"] = json!(local_job);
-        }
+    ) && let Some((local_plan, local_job)) =
+        plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
+    {
+        json_body["planId"] = json!(local_plan);
+        json_body["jobId"] = json!(local_job);
     }
     if let (Some(official_plan), Some(official_job)) = (
         json_body
@@ -2913,13 +2950,11 @@ fn rewrite_replay_body(
         json_body
             .get("workflow_job_run_backend_id")
             .and_then(Value::as_str),
-    ) {
-        if let Some((local_plan, local_job)) =
-            plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
-        {
-            json_body["workflow_run_backend_id"] = json!(local_plan);
-            json_body["workflow_job_run_backend_id"] = json!(local_job);
-        }
+    ) && let Some((local_plan, local_job)) =
+        plan_job_ids.get(&(official_plan.to_owned(), official_job.to_owned()))
+    {
+        json_body["workflow_run_backend_id"] = json!(local_plan);
+        json_body["workflow_job_run_backend_id"] = json!(local_job);
     }
     for key in ["planId", "workflow_run_backend_id"] {
         let Some(current) = json_body.get(key).and_then(Value::as_str) else {
@@ -2945,10 +2980,10 @@ fn rewrite_replay_body(
         json_body[key] = json!(rewritten);
     }
     // Rewrite agent.id in session creation to match the registered replay runner
-    if let Some(agent) = json_body.get_mut("agent") {
-        if agent.get("id").is_some() {
-            agent["id"] = json!(replay_runner_id);
-        }
+    if let Some(agent) = json_body.get_mut("agent")
+        && agent.get("id").is_some()
+    {
+        agent["id"] = json!(replay_runner_id);
     }
     if let Ok(rewritten) = serde_json::to_vec(&json_body) {
         *body = rewritten;
@@ -3046,21 +3081,20 @@ fn replay_workflow_submissions(
             .with_context(|| format!("read replay workflow {}", workflow_file.display()))?;
         let mut reusable_workflows = serde_json::Map::new();
         let workflows_dir = scenario_dir.join("workflows");
-        if workflows_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(&workflows_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let (Some(name), Ok(content)) = (
-                            path.file_name().and_then(|n| n.to_str()),
-                            fs::read_to_string(&path),
-                        ) {
-                            reusable_workflows
-                                .insert(format!("./.github/workflows/{name}"), json!(content));
-                            reusable_workflows
-                                .insert(format!(".github/workflows/{name}"), json!(content));
-                        }
-                    }
+        if workflows_dir.is_dir()
+            && let Ok(entries) = fs::read_dir(&workflows_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && let (Some(name), Ok(content)) = (
+                        path.file_name().and_then(|n| n.to_str()),
+                        fs::read_to_string(&path),
+                    )
+                {
+                    reusable_workflows
+                        .insert(format!("./.github/workflows/{name}"), json!(content));
+                    reusable_workflows.insert(format!(".github/workflows/{name}"), json!(content));
                 }
             }
         }
@@ -3112,7 +3146,7 @@ async fn materialize_replay_state(
         return Ok(());
     }
 
-    let native_api_token = std::env::var("PRELOOP_SYSTEM_TOKEN")
+    let native_api_token = preloop_system_token()
         .context("PRELOOP_SYSTEM_TOKEN must be set for runner-watch replay")?;
     let submissions = replay_workflow_submissions(golden_dir, scenario_root)?;
     // Idle scenarios have no submit_workflow steps — skip job creation.
@@ -3163,23 +3197,23 @@ async fn materialize_replay_state(
 fn normalize_request_path(_method: &str, path: &str) -> String {
     // OIDC id-token: /{runner_id}//idtoken/{plan_id}/{job_id}?audience=...
     // The double-slash path prefix is how the run-actions-* service exposes OIDC tokens.
-    if let Some(rest) = path.strip_prefix('/') {
-        if let Some(pos) = rest.find("//idtoken/") {
-            let after = &rest[pos + "//idtoken/".len()..];
-            let (ids, query) = after.split_once('?').unwrap_or((after, ""));
-            let parts: Vec<&str> = ids.splitn(2, '/').collect();
-            if parts.len() == 2 {
-                let plan_id = parts[0];
-                let job_id = parts[1].split('/').next().unwrap_or(parts[1]);
-                let q = if query.is_empty() {
-                    String::new()
-                } else {
-                    format!("?{query}")
-                };
-                return format!(
-                    "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{job_id}/oidctoken{q}"
-                );
-            }
+    if let Some(rest) = path.strip_prefix('/')
+        && let Some(pos) = rest.find("//idtoken/")
+    {
+        let after = &rest[pos + "//idtoken/".len()..];
+        let (ids, query) = after.split_once('?').unwrap_or((after, ""));
+        let parts: Vec<&str> = ids.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let plan_id = parts[0];
+            let job_id = parts[1].split('/').next().unwrap_or(parts[1]);
+            let q = if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            };
+            return format!(
+                "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{job_id}/oidctoken{q}"
+            );
         }
     }
     if path == "/actions/runner-registration" {
@@ -3975,7 +4009,10 @@ async fn run_all(config: &Config, args: &RunArgs) -> anyhow::Result<()> {
         )
         .await?;
     } else {
-        fs::write(PathBuf::from(DEFAULT_ROOT).join("conformance-report.md"), "# runner-watch conformance report\n\nConformance skipped: --preloop-url was not provided.\n")?;
+        fs::write(
+            PathBuf::from(DEFAULT_ROOT).join("conformance-report.md"),
+            "# runner-watch conformance report\n\nConformance skipped: --preloop-url was not provided.\n",
+        )?;
     }
     pr(
         config,
@@ -4112,9 +4149,11 @@ mod tests {
         let new = "public sealed class TimelineRecord {\n public string Name { get; set; }\n public bool? IsBackground { get; set; }\n}";
         let entries =
             extract_delta_entries("src/Runner.Sdk/TimelineRecord.cs", Some(old), Some(new));
-        assert!(entries
-            .iter()
-            .any(|e| e.change_type == "field_added" && e.fields == vec!["IsBackground"]));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.change_type == "field_added" && e.fields == vec!["IsBackground"])
+        );
     }
 
     #[test]
@@ -4133,8 +4172,7 @@ mod tests {
     #[test]
     fn treesitter_detects_added_method_overload() {
         let old = "public class Api {\n    public void Send(int x) {}\n}";
-        let new =
-            "public class Api {\n    public void Send(int x) {}\n    public void Send(int x, string y) {}\n}";
+        let new = "public class Api {\n    public void Send(int x) {}\n    public void Send(int x, string y) {}\n}";
         let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
         assert!(
             entries.iter().any(|e| e.change_type == "field_added"
@@ -4174,8 +4212,7 @@ mod tests {
     #[test]
     fn treesitter_method_signature_ignores_default_value() {
         let old = "public class Api {\n    public void Run() {}\n}";
-        let new =
-            "public class Api {\n    public void Run() {}\n    public void Log(string s = \"s\") {}\n}";
+        let new = "public class Api {\n    public void Run() {}\n    public void Log(string s = \"s\") {}\n}";
         let entries = extract_delta_entries("src/Api.cs", Some(old), Some(new));
         assert!(
             entries.iter().any(|e| e.change_type == "field_added"
@@ -4436,15 +4473,17 @@ mod tests {
             .unwrap(),
             Some("native-token")
         );
-        assert!(replay_auth_token(
-            "POST",
-            "/broker/7/completejob",
-            Some(&json!({"planId": "other-plan", "jobId": "other-job"})),
-            "native-token",
-            "listener-token",
-            &runtime_tokens,
-        )
-        .is_err());
+        assert!(
+            replay_auth_token(
+                "POST",
+                "/broker/7/completejob",
+                Some(&json!({"planId": "other-plan", "jobId": "other-job"})),
+                "native-token",
+                "listener-token",
+                &runtime_tokens,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4771,7 +4810,9 @@ mod tests {
     /// swallowed (`let _ =`), so queued runs cannot silently survive.
     #[tokio::test]
     async fn replay_surfaces_failed_cancellation_instead_of_silently_succeeding() {
-        std::env::set_var("PRELOOP_SYSTEM_TOKEN", "runner-watch-test-token");
+        TEST_SYSTEM_TOKEN.with(|cell| {
+            *cell.borrow_mut() = Some("runner-watch-test-token".to_owned());
+        });
         let temp = TestTemp::new("cancel-failure");
         let (golden, out, scenario_root) = replay_scenario_fixture(&temp, false);
         let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -4804,7 +4845,9 @@ mod tests {
     /// submissions: leftover queued runs contaminate the next scenario.
     #[tokio::test]
     async fn replay_cancels_runs_even_when_the_replay_errors() {
-        std::env::set_var("PRELOOP_SYSTEM_TOKEN", "runner-watch-test-token");
+        TEST_SYSTEM_TOKEN.with(|cell| {
+            *cell.borrow_mut() = Some("runner-watch-test-token".to_owned());
+        });
         let temp = TestTemp::new("cancel-on-error");
         let (golden, out, scenario_root) = replay_scenario_fixture(&temp, true);
         let cancels = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

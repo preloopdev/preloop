@@ -237,10 +237,11 @@ impl Model {
     }
 
     fn cleanup_group(&mut self, key: &(String, String)) {
-        if let Some(group) = self.groups.get(key) {
-            if group.running.is_none() && group.pending.is_empty() {
-                self.groups.remove(key);
-            }
+        if let Some(group) = self.groups.get(key)
+            && group.running.is_none()
+            && group.pending.is_empty()
+        {
+            self.groups.remove(key);
         }
     }
 
@@ -267,13 +268,13 @@ impl Model {
     /// Invariant 2: Running and pending sets are disjoint.
     fn check_inv2(&self) -> Result<(), String> {
         for (key, group) in &self.groups {
-            if let Some(running) = &group.running {
-                if group.pending.contains(running) {
-                    return Err(format!(
-                        "INV-2: group {:?} running holder {:?} also in pending",
-                        key, running
-                    ));
-                }
+            if let Some(running) = &group.running
+                && group.pending.contains(running)
+            {
+                return Err(format!(
+                    "INV-2: group {:?} running holder {:?} also in pending",
+                    key, running
+                ));
             }
         }
         Ok(())
@@ -455,10 +456,10 @@ impl ProdState {
         let job_id = jid(job_n);
         // Mark this job terminal
         if let Some(run) = self.inner.runs.get_mut(&run_id) {
-            if let Some(status) = run.jobs.get_mut(&job_id) {
-                if !status.is_terminal() {
-                    *status = ExecutionStatus::Success;
-                }
+            if let Some(status) = run.jobs.get_mut(&job_id)
+                && !status.is_terminal()
+            {
+                *status = ExecutionStatus::Success;
             }
             run.status = summarize_run(run.jobs.values().copied());
         }
@@ -596,13 +597,13 @@ fn check_production_invariants(inner: &InnerState) -> Result<(), String> {
 
     // INV-2: Running and pending are disjoint within each group.
     for (key, group) in &inner.concurrency_groups {
-        if let Some(running) = &group.running {
-            if group.pending.contains(running) {
-                return Err(format!(
-                    "INV-2: group {:?} running holder also in pending",
-                    key
-                ));
-            }
+        if let Some(running) = &group.running
+            && group.pending.contains(running)
+        {
+            return Err(format!(
+                "INV-2: group {:?} running holder also in pending",
+                key
+            ));
         }
     }
 
@@ -989,9 +990,9 @@ pub mod state_machine {
                 // After release, verify the new running was the old first pending
                 if matches!(op, Op::Release { .. }) {
                     for (key, group) in &model.groups {
-                        if let Some(running) = &group.running {
-                            if let Some(old_pending) = pre_pending.get(key) {
-                                if !old_pending.is_empty() {
+                        if let Some(running) = &group.running
+                            && let Some(old_pending) = pre_pending.get(key)
+                                && !old_pending.is_empty() {
                                     // If a promotion happened, the new running should be
                                     // the old first pending (if it was pending before)
                                     if model.holder_state.get(running) == Some(&HolderState::Running)
@@ -1000,8 +1001,6 @@ pub mod state_machine {
                                         // FIFO correct — first pending got promoted
                                     }
                                 }
-                            }
-                        }
                     }
                 }
             }

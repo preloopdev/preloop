@@ -16,7 +16,7 @@ pub use conditions::{contains_status_check_function, effective_condition, is_tru
 pub use context::Context;
 
 use evaluator::{
-    collect_expression_references_from_expr, eval, validate_function_calls, EvalBudget,
+    EvalBudget, collect_expression_references_from_expr, eval, validate_function_calls,
 };
 use expr_parser::Parser;
 use lexer::Lexer;
@@ -65,10 +65,10 @@ fn parse_cached(input: &str) -> Result<Arc<ast::Expr>, ExpressionError> {
     }
     cache.entries.insert(input.to_owned(), Arc::clone(&expr));
     cache.insertion_order.push_back(input.to_owned());
-    if cache.insertion_order.len() > PARSED_EXPRESSION_CACHE_CAPACITY {
-        if let Some(oldest) = cache.insertion_order.pop_front() {
-            cache.entries.remove(&oldest);
-        }
+    if cache.insertion_order.len() > PARSED_EXPRESSION_CACHE_CAPACITY
+        && let Some(oldest) = cache.insertion_order.pop_front()
+    {
+        cache.entries.remove(&oldest);
     }
     Ok(expr)
 }
@@ -119,7 +119,9 @@ pub enum ExpressionError {
     #[error("hashFiles() input exceeds the maximum of {0} bytes")]
     HashFilesTooLarge(u64),
     /// `hashFiles()` pattern is absolute or contains parent traversal.
-    #[error("hashFiles() pattern `{0}` is not allowed: patterns must be workspace-relative without absolute or parent components")]
+    #[error(
+        "hashFiles() pattern `{0}` is not allowed: patterns must be workspace-relative without absolute or parent components"
+    )]
     HashFilesDisallowedPattern(String),
     /// `format()` output exceeded the maximum length.
     #[error("format() output exceeds the maximum of {0} bytes")]

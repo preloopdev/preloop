@@ -1,3 +1,6 @@
+// SAFETY: edition-2024 env mutation; each test serializes via GITHUB_ENV_LOCK.
+#![allow(unsafe_code)]
+
 //! preloop-runner-server integration tests — broker group.
 //! Split from the former `lib_tests.rs` unit; see `tests/common/mod.rs`.
 
@@ -1326,10 +1329,12 @@ async fn github_app_manifest_registration_flow() {
     // 2. Configure mock API URL in environment
     // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    std::env::set_var(
-        "PRELOOP_GITHUB_API_URL",
-        format!("http://127.0.0.1:{}", port),
-    );
+    unsafe {
+        std::env::set_var(
+            "PRELOOP_GITHUB_API_URL",
+            format!("http://127.0.0.1:{}", port),
+        )
+    };
 
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
@@ -1376,7 +1381,7 @@ async fn github_app_manifest_registration_flow() {
     assert!(html_callback.contains("mock-webhook-secret-xyz"));
 
     // Clean up
-    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+    unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
 }
 
 #[tokio::test]
@@ -2725,8 +2730,7 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
         );
     }
     let app = app(state.clone(), CancellationToken::new());
-    let workflow =
-        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n";
+    let workflow = "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n";
 
     // owner/repo: the per-repo tier overrides the global tier per name and
     // contributes its own names.

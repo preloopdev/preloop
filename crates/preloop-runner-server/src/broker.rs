@@ -1769,7 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_routes_serve_default_json() {
-        use axum::body::{to_bytes, Body};
+        use axum::body::{Body, to_bytes};
         use axum::http::{Method, Request, StatusCode};
         use tokio_util::sync::CancellationToken;
         use tower::ServiceExt;

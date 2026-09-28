@@ -1,9 +1,9 @@
 use utoipa::{
-    openapi::{
-        security::{Http, HttpAuthScheme, SecurityScheme},
-        Components,
-    },
     Modify, OpenApi, ToSchema,
+    openapi::{
+        Components,
+        security::{Http, HttpAuthScheme, SecurityScheme},
+    },
 };
 
 use crate::runs::{ApproveForkRequest, ApproveForkResponse};

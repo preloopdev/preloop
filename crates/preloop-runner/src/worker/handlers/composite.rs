@@ -806,9 +806,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(ctx
-            .log_content()
-            .contains("first=provided second=default-second"));
+        assert!(
+            ctx.log_content()
+                .contains("first=provided second=default-second")
+        );
     }
 
     #[tokio::test]

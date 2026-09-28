@@ -10,8 +10,8 @@
 //! come to roughly 90 GB and are the job of setup actions and containers.
 
 use preloop_orchestrator::{
-    base_install_script, base_packages, compiler_packages, docker_data_root, docker_packages,
-    loopback_hosts, BASE_NODE_VERSION,
+    BASE_NODE_VERSION, base_install_script, base_packages, compiler_packages, docker_data_root,
+    docker_packages, loopback_hosts,
 };
 
 /// Commands a workflow may reasonably assume exist, because `ubuntu-latest`

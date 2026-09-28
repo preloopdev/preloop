@@ -4,7 +4,7 @@ use crate::worker::server_queue::ServerQueue;
 use crate::worker::step_conditions::contains_status_check_function;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 fn test_step(name: &str, condition: Option<&str>) -> Step {
     Step {
@@ -972,9 +972,11 @@ async fn test_step_summary_size_limit_and_scrubbing() {
         annotations[0].level,
         crate::worker::execution_context::AnnotationLevel::Error
     );
-    assert!(annotations[0]
-        .message
-        .contains("upload aborted, supports content up to a size of 1024k"));
+    assert!(
+        annotations[0]
+            .message
+            .contains("upload aborted, supports content up to a size of 1024k")
+    );
 }
 
 #[tokio::test]

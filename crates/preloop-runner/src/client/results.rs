@@ -212,7 +212,9 @@ mod tests {
 
         assert!(step.ends_with("results.services.receiver.Receiver/GetStepLogsSignedBlobURL"));
         assert!(job.ends_with("results.services.receiver.Receiver/GetJobLogsSignedBlobURL"));
-        assert!(summary.ends_with("results.services.receiver.Receiver/GetStepSummarySignedBlobURL"));
+        assert!(
+            summary.ends_with("results.services.receiver.Receiver/GetStepSummarySignedBlobURL")
+        );
         assert!(
             diagnostics.ends_with("results.services.receiver.Receiver/GetJobDiagLogsSignedBlobURL")
         );

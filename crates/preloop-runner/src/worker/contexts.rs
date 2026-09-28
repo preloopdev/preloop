@@ -120,37 +120,32 @@ impl JobContext {
                     continue;
                 }
                 let is_secret = v.get("isSecret").and_then(|s| s.as_bool()).unwrap_or(false);
-                if is_secret {
-                    if let Some(val) = v.get("value").and_then(|s| s.as_str()) {
-                        if !val.is_empty() {
-                            masks.insert(val.to_string());
-                            // Also mask trimmed variant and base64-encoded form (F028)
-                            let trimmed = val.trim();
-                            if trimmed != val {
-                                masks.insert(trimmed.to_string());
-                            }
-                            use base64::engine::Engine as _;
-                            masks.insert(base64::engine::general_purpose::STANDARD.encode(val));
-                            masks.insert(
-                                base64::engine::general_purpose::STANDARD_NO_PAD.encode(val),
-                            );
-                            masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
-                            masks.insert(
-                                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val),
-                            );
-                            // H1: register each non-empty trimmed CR/LF-delimited
-                            // line too. Log masking runs per assembled line, so
-                            // a multiline initial secret (PEM key, JSON blob)
-                            // would otherwise never match the whole value and
-                            // would leak line by line. Mirrors add_mask.
-                            for line in val
-                                .split(['\r', '\n'])
-                                .map(str::trim)
-                                .filter(|l| !l.is_empty())
-                            {
-                                masks.insert(line.to_string());
-                            }
-                        }
+                if is_secret
+                    && let Some(val) = v.get("value").and_then(|s| s.as_str())
+                    && !val.is_empty()
+                {
+                    masks.insert(val.to_string());
+                    // Also mask trimmed variant and base64-encoded form (F028)
+                    let trimmed = val.trim();
+                    if trimmed != val {
+                        masks.insert(trimmed.to_string());
+                    }
+                    use base64::engine::Engine as _;
+                    masks.insert(base64::engine::general_purpose::STANDARD.encode(val));
+                    masks.insert(base64::engine::general_purpose::STANDARD_NO_PAD.encode(val));
+                    masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
+                    masks.insert(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val));
+                    // H1: register each non-empty trimmed CR/LF-delimited
+                    // line too. Log masking runs per assembled line, so
+                    // a multiline initial secret (PEM key, JSON blob)
+                    // would otherwise never match the whole value and
+                    // would leak line by line. Mirrors add_mask.
+                    for line in val
+                        .split(['\r', '\n'])
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                    {
+                        masks.insert(line.to_string());
                     }
                 }
             }
@@ -376,12 +371,10 @@ impl JobContext {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .is_empty()
+                && let Some(token) = self.env.get("GITHUB_TOKEN")
+                && let Some(obj) = gh.as_object_mut()
             {
-                if let Some(token) = self.env.get("GITHUB_TOKEN") {
-                    if let Some(obj) = gh.as_object_mut() {
-                        obj.insert("token".to_string(), serde_json::json!(token));
-                    }
-                }
+                obj.insert("token".to_string(), serde_json::json!(token));
             }
             tracing::info!(
                 context_token_len,
@@ -394,12 +387,12 @@ impl JobContext {
             // Fill it in only when `context_data` has nothing usable, so a
             // value written through `set_github_context_value` — the mutable
             // source of truth — is not silently overwritten on every rebuild.
-            if let Some(workspace) = &self.workspace {
-                if let Some(obj) = gh.as_object_mut() {
-                    let current = obj.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
-                    if current.is_empty() {
-                        obj.insert("workspace".to_string(), serde_json::json!(workspace));
-                    }
+            if let Some(workspace) = &self.workspace
+                && let Some(obj) = gh.as_object_mut()
+            {
+                let current = obj.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
+                if current.is_empty() {
+                    obj.insert("workspace".to_string(), serde_json::json!(workspace));
                 }
             }
             ctx.insert("github", gh);
@@ -545,15 +538,13 @@ impl JobContext {
                     .get("isSecret")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if is_secret {
-                    if let Some(value) = val.get("value").and_then(|v| v.as_str()) {
-                        secrets_map.insert(key.clone(), serde_json::json!(value));
-                        // The wire uses the official runner's lower-case
-                        // `github_token` variable, while workflow expressions
-                        // address the built-in secret as `GITHUB_TOKEN`.
-                        if key == "github_token" {
-                            secrets_map.insert("GITHUB_TOKEN".to_owned(), serde_json::json!(value));
-                        }
+                if is_secret && let Some(value) = val.get("value").and_then(|v| v.as_str()) {
+                    secrets_map.insert(key.clone(), serde_json::json!(value));
+                    // The wire uses the official runner's lower-case
+                    // `github_token` variable, while workflow expressions
+                    // address the built-in secret as `GITHUB_TOKEN`.
+                    if key == "github_token" {
+                        secrets_map.insert("GITHUB_TOKEN".to_owned(), serde_json::json!(value));
                     }
                 }
             }

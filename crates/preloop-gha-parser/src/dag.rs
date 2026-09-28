@@ -170,12 +170,12 @@ pub fn dependency_closure(
     let mut closed = BTreeSet::new();
     let mut stack: Vec<String> = roots.to_vec();
     while let Some(node) = stack.pop() {
-        if closed.insert(node.clone()) {
-            if let Some(deps) = edges.get(&node) {
-                for dep in deps {
-                    if !closed.contains(dep) {
-                        stack.push(dep.clone());
-                    }
+        if closed.insert(node.clone())
+            && let Some(deps) = edges.get(&node)
+        {
+            for dep in deps {
+                if !closed.contains(dep) {
+                    stack.push(dep.clone());
                 }
             }
         }

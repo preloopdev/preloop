@@ -11,9 +11,9 @@
 //! Source: `MessageListener.cs` → `GetMessageDecryptor()`
 //! Source: `AgentSessionController.cs` → session creation
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
@@ -634,9 +634,10 @@ mod tests {
         let wrapped = kp
             .wrap_key_with_hash(b"fips session key", RsaOaepHash::Sha256)
             .unwrap();
-        assert!(kp
-            .unwrap_key_with_hash(&wrapped, RsaOaepHash::Sha1)
-            .is_err());
+        assert!(
+            kp.unwrap_key_with_hash(&wrapped, RsaOaepHash::Sha1)
+                .is_err()
+        );
     }
 
     #[test]

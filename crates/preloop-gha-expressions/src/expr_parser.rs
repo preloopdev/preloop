@@ -1,9 +1,9 @@
 use serde_json::Value;
 
 use super::{
+    ExpressionError,
     ast::{BinaryOp, Expr},
     lexer::Token,
-    ExpressionError,
 };
 
 /// Maximum expression nesting depth.

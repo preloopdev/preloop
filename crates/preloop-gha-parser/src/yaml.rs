@@ -30,10 +30,10 @@ pub(crate) fn normalize_yaml_keys(value: &mut serde_yaml::Value) {
             }
             let keys = map.keys().cloned().collect::<Vec<_>>();
             for key in keys {
-                if !matches!(key, serde_yaml::Value::String(_)) {
-                    if let Some(value) = map.remove(key.clone()) {
-                        map.insert(serde_yaml::Value::String(yaml_key_to_string(&key)), value);
-                    }
+                if !matches!(key, serde_yaml::Value::String(_))
+                    && let Some(value) = map.remove(key.clone())
+                {
+                    map.insert(serde_yaml::Value::String(yaml_key_to_string(&key)), value);
                 }
             }
             for value in map.values_mut() {

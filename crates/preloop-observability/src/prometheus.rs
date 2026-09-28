@@ -127,10 +127,10 @@ fn render_resource_metrics(rm: &ResourceMetrics) -> String {
             let unit = metric.unit();
             let description = metric.description();
             let data = metric.data();
-            if let Some((full, _)) = prom_identity(raw_name, unit, data) {
-                if conflicted.contains(&full) {
-                    continue;
-                }
+            if let Some((full, _)) = prom_identity(raw_name, unit, data)
+                && conflicted.contains(&full)
+            {
+                continue;
             }
             render_metric(
                 &mut out,

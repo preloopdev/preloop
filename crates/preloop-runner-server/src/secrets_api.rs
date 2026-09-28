@@ -9,8 +9,8 @@
 //! Values are never returned — `list` returns names and their repository
 //! scope only.
 
-use axum::extract::{Path, Query, State};
 use axum::Json;
+use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -101,17 +101,17 @@ pub async fn list_secrets(
             "env scope requires repo (owner/repo)",
         ));
     }
-    if let Some(repo) = &query.repo {
-        if !valid_repo(repo) {
-            return Err(ApiError::bad_request("repo must look like owner/repo"));
-        }
+    if let Some(repo) = &query.repo
+        && !valid_repo(repo)
+    {
+        return Err(ApiError::bad_request("repo must look like owner/repo"));
     }
-    if let Some(env) = &query.env {
-        if !valid_env(env) {
-            return Err(ApiError::bad_request(
-                "env must be an alphanumeric name (letters, digits, - and _)",
-            ));
-        }
+    if let Some(env) = &query.env
+        && !valid_env(env)
+    {
+        return Err(ApiError::bad_request(
+            "env must be an alphanumeric name (letters, digits, - and _)",
+        ));
     }
     let store = shared.state.secrets.read();
     let mut secrets = Vec::new();
@@ -175,10 +175,10 @@ pub async fn set_secret(
         .value
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("empty secret value"))?;
-    if let Some(repo) = &body.repo {
-        if !valid_repo(repo) {
-            return Err(ApiError::bad_request("repo must look like owner/repo"));
-        }
+    if let Some(repo) = &body.repo
+        && !valid_repo(repo)
+    {
+        return Err(ApiError::bad_request("repo must look like owner/repo"));
     }
     if let Some(env) = &body.env {
         if !valid_env(env) {
@@ -306,17 +306,17 @@ pub async fn delete_secret(
             "env scope requires repo (owner/repo)",
         ));
     }
-    if let Some(repo) = &query.repo {
-        if !valid_repo(repo) {
-            return Err(ApiError::bad_request("repo must look like owner/repo"));
-        }
+    if let Some(repo) = &query.repo
+        && !valid_repo(repo)
+    {
+        return Err(ApiError::bad_request("repo must look like owner/repo"));
     }
-    if let Some(env) = &query.env {
-        if !valid_env(env) {
-            return Err(ApiError::bad_request(
-                "env must be an alphanumeric name (letters, digits, - and _)",
-            ));
-        }
+    if let Some(env) = &query.env
+        && !valid_env(env)
+    {
+        return Err(ApiError::bad_request(
+            "env must be an alphanumeric name (letters, digits, - and _)",
+        ));
     }
     // Same immutable-scope rule as `set_secret`: credential-backed entries
     // re-apply at startup, so a config-file removal would either 404 or

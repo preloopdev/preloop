@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use super::*;
@@ -181,10 +181,12 @@ jobs:
     );
 
     // An accepted type still matches.
-    assert!(workflow
-        .on
-        .match_event("pull_request", Some("main"), None, &[], Some("opened"), &[])
-        .is_ok());
+    assert!(
+        workflow
+            .on
+            .match_event("pull_request", Some("main"), None, &[], Some("opened"), &[])
+            .is_ok()
+    );
 }
 
 /// A bare `pull_request:` still applies GitHub's default activity types, so a
@@ -311,17 +313,19 @@ jobs:
 
     // A mixed change set still runs — paths-ignore only suppresses when all
     // changed files are ignored.
-    assert!(workflow
-        .on
-        .match_event(
-            "pull_request",
-            Some("main"),
-            None,
-            &["README.md".to_owned(), "src/lib.rs".to_owned()],
-            Some("synchronize"),
-            &[],
-        )
-        .is_ok());
+    assert!(
+        workflow
+            .on
+            .match_event(
+                "pull_request",
+                Some("main"),
+                None,
+                &["README.md".to_owned(), "src/lib.rs".to_owned()],
+                Some("synchronize"),
+                &[],
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -358,17 +362,19 @@ jobs:
         }
     );
 
-    assert!(workflow
-        .on
-        .match_event(
-            "workflow_run",
-            Some("main"),
-            None,
-            &[],
-            Some("completed"),
-            &["CI".to_owned()],
-        )
-        .is_ok());
+    assert!(
+        workflow
+            .on
+            .match_event(
+                "workflow_run",
+                Some("main"),
+                None,
+                &[],
+                Some("completed"),
+                &["CI".to_owned()],
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -445,9 +451,11 @@ jobs:
     )
     .unwrap();
 
-    assert!(workflow
-        .on
-        .matches_with_context("pull_request", None, None, &[], Some("opened"), &[]));
+    assert!(
+        workflow
+            .on
+            .matches_with_context("pull_request", None, None, &[], Some("opened"), &[])
+    );
     assert!(!workflow.on.matches_with_context(
         "pull_request",
         None,
@@ -478,17 +486,23 @@ jobs:
     .unwrap();
 
     // Branch push to master: branch axis matches, tag axis inapplicable.
-    assert!(workflow
-        .on
-        .matches_with_context("push", Some("master"), None, &[], None, &[]));
+    assert!(
+        workflow
+            .on
+            .matches_with_context("push", Some("master"), None, &[], None, &[])
+    );
     // Tag push v1.2: tag axis matches, branch axis inapplicable.
-    assert!(workflow
-        .on
-        .matches_with_context("push", None, Some("v1.2"), &[], None, &[]));
+    assert!(
+        workflow
+            .on
+            .matches_with_context("push", None, Some("v1.2"), &[], None, &[])
+    );
     // Branch push to a non-matching branch: neither axis matches.
-    assert!(!workflow
-        .on
-        .matches_with_context("push", Some("dev"), None, &[], None, &[]));
+    assert!(
+        !workflow
+            .on
+            .matches_with_context("push", Some("dev"), None, &[], None, &[])
+    );
 }
 
 #[test]
@@ -507,13 +521,17 @@ jobs:
     )
     .unwrap();
 
-    assert!(workflow
-        .on
-        .matches_with_context("push", Some("master"), None, &[], None, &[]));
+    assert!(
+        workflow
+            .on
+            .matches_with_context("push", Some("master"), None, &[], None, &[])
+    );
     // Tag pushes do not match a branches-only workflow.
-    assert!(!workflow
-        .on
-        .matches_with_context("push", None, Some("v1.2"), &[], None, &[]));
+    assert!(
+        !workflow
+            .on
+            .matches_with_context("push", None, Some("v1.2"), &[], None, &[])
+    );
 }
 
 #[test]
@@ -878,13 +896,13 @@ jobs:
     }
 
     // The `gen` job defers its matrix on `needs.plan.outputs`.
-    let gen = expanded
+    let gen_job = expanded
         .jobs
         .iter()
         .find(|plan| plan.base_id == "gen")
         .unwrap();
     assert!(
-        gen.deferred_matrix.is_some(),
+        gen_job.deferred_matrix.is_some(),
         "a needs-dependent matrix must defer, not expand to zero cells"
     );
 
@@ -897,7 +915,7 @@ jobs:
     let cells = expand_deferred_matrix_job(
         &workflow,
         "gen",
-        gen.deferred_matrix.as_deref().unwrap(),
+        gen_job.deferred_matrix.as_deref().unwrap(),
         &needs_outputs,
         Some(&dispatch_inputs),
     )
@@ -2419,11 +2437,10 @@ mod coerce_value_properties {
         fn bool_string_bool_roundtrip(val in arb_valid_bool_value()) {
             if let Ok(b) = coerce_value(&val, InputType::Boolean, "test") {
                 let s = coerce_value(&b, InputType::String, "test").unwrap();
-                if let Ok(b2) = coerce_value(&s, InputType::Boolean, "test") {
-                    if b.is_boolean() {
+                if let Ok(b2) = coerce_value(&s, InputType::Boolean, "test")
+                    && b.is_boolean() {
                         prop_assert_eq!(b, b2);
                     }
-                }
             }
         }
     }

@@ -6,9 +6,9 @@
 //! private writable checkout through the unmodified `actions/checkout`.
 
 use super::*;
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Request};
-use axum::http::{header, HeaderName, HeaderValue, Response, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Response, StatusCode, header};
 use base64::Engine;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
@@ -177,18 +177,17 @@ async fn resolve_github_repo_meta(
         format!("{:x}", sha2::Sha256::digest(pat.as_bytes()))
     });
     let cache_key = (slug.to_owned(), pat_fp);
-    if let Some(shared) = shared {
-        if let Ok(cache) = shared.state.repo_meta_cache.lock() {
-            if let Some((meta, at)) = cache.get(&cache_key) {
-                let ttl = if meta.0.is_some() || meta.1.is_some() {
-                    REPO_META_CACHE_TTL
-                } else {
-                    REPO_META_NEGATIVE_TTL
-                };
-                if at.elapsed() < ttl {
-                    return *meta;
-                }
-            }
+    if let Some(shared) = shared
+        && let Ok(cache) = shared.state.repo_meta_cache.lock()
+        && let Some((meta, at)) = cache.get(&cache_key)
+    {
+        let ttl = if meta.0.is_some() || meta.1.is_some() {
+            REPO_META_CACHE_TTL
+        } else {
+            REPO_META_NEGATIVE_TTL
+        };
+        if at.elapsed() < ttl {
+            return *meta;
         }
     }
     // Prefer the App registry: a private repository configured App-only has
@@ -235,11 +234,11 @@ async fn resolve_github_repo_meta(
         .filter(|id| *id > 0);
     let private = body.get("private").and_then(|private| private.as_bool());
     let meta = (id, private);
-    if let Some(shared) = shared {
-        if let Ok(mut cache) = shared.state.repo_meta_cache.lock() {
-            cache.retain(|_, (_, at)| at.elapsed() < REPO_META_CACHE_TTL);
-            cache.insert(cache_key, (meta, std::time::Instant::now()));
-        }
+    if let Some(shared) = shared
+        && let Ok(mut cache) = shared.state.repo_meta_cache.lock()
+    {
+        cache.retain(|_, (_, at)| at.elapsed() < REPO_META_CACHE_TTL);
+        cache.insert(cache_key, (meta, std::time::Instant::now()));
     }
     meta
 }
@@ -261,10 +260,10 @@ fn github_remote_slug(remote_v: &str, github_host: &str) -> Option<String> {
         };
         // `git remote -v` appends "(fetch)"/"(push)"; accept a bare URL too
         // so the parser stays useful on trimmed input.
-        if let Some(marker) = fields.next() {
-            if marker != "(fetch)" {
-                continue;
-            }
+        if let Some(marker) = fields.next()
+            && marker != "(fetch)"
+        {
+            continue;
         }
         let Some(slug) = parse_github_remote_slug(url, github_host) else {
             continue;
@@ -390,14 +389,14 @@ pub async fn create_workspace_snapshot(
         ),
         detect_workspace_upstream(&workspace, shared, github_pat),
     );
-    if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await {
-        if staging_root.exists() {
-            warn!(
-                path = %staging_root.display(),
-                %error,
-                "Failed to remove snapshot staging directory"
-            );
-        }
+    if let Err(error) = tokio::fs::remove_dir_all(&staging_root).await
+        && staging_root.exists()
+    {
+        warn!(
+            path = %staging_root.display(),
+            %error,
+            "Failed to remove snapshot staging directory"
+        );
     }
 
     let SnapshotResult {
@@ -2053,10 +2052,10 @@ fn gitlink_paths(staged: &[u8]) -> Vec<String> {
         let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
             continue;
         };
-        if record[..tab].starts_with(b"160000 ") {
-            if let Ok(path) = std::str::from_utf8(&record[tab + 1..]) {
-                paths.push(path.to_owned());
-            }
+        if record[..tab].starts_with(b"160000 ")
+            && let Ok(path) = std::str::from_utf8(&record[tab + 1..])
+        {
+            paths.push(path.to_owned());
         }
     }
     paths
@@ -2130,10 +2129,10 @@ async fn configured_submodule_urls(workspace: &FsPath) -> BTreeSet<String> {
     }
     let mut configured = BTreeSet::new();
     for (name, path) in path_by_name {
-        if url_names.contains(name) {
-            if let Ok(path) = std::str::from_utf8(path) {
-                configured.insert(path.to_owned());
-            }
+        if url_names.contains(name)
+            && let Ok(path) = std::str::from_utf8(path)
+        {
+            configured.insert(path.to_owned());
         }
     }
     configured
@@ -3679,8 +3678,8 @@ mod auth_scoping_tests {
             decode_git_request_body(&plain, Some("identity")).unwrap(),
             plain
         );
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write as _;
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&plain).unwrap();
@@ -3696,8 +3695,8 @@ mod auth_scoping_tests {
 
     #[test]
     fn gzipped_git_body_rejects_decoded_over_limit() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write as _;
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         let chunk = [0u8; 64 * 1024];
