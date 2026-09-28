@@ -25,9 +25,9 @@ pub(crate) use crate::*;
 pub mod backend;
 pub mod commands;
 // New PostgreSQL backend (agreed schema); unused until cutover.
+pub(crate) mod logic;
 #[allow(dead_code)]
 pub(crate) mod pg;
-pub(crate) mod logic;
 pub mod postgres;
 pub mod rows;
 pub mod sched;

@@ -14,8 +14,8 @@ use super::graph::{self, queue_state_str, Node, NodeKind, ReusableNodeSpec, RunG
 use super::{db, lookups, PgBackend};
 use crate::concurrency;
 use crate::control::logic;
-use crate::control::types::{status_str, ControlError};
-use crate::models::{QueuedJob, TaskAgentJobRequestRecord};
+use crate::control::types::{status_str, ControlError, SubmitJob, SubmitOutcome, SubmitRun};
+use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
 use crate::runtime_scheduling::{self as sched_helpers, DependencyDecision, SchedulingOutcome};
 use crate::state::JobSetGate;
 use preloop_gha_parser::ConcurrencyQueue;
@@ -2801,4 +2801,575 @@ pub(super) async fn requeue_claimed_tx(
     .await
     .map_err(db)?;
     Ok(true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Run submission
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `runs.ref_type` from the trigger ref (`github.ref` shape).
+pub(super) fn ref_type(git_ref: &str, event: &str) -> &'static str {
+    if git_ref.starts_with("refs/pull/") {
+        "pull_request"
+    } else if git_ref.starts_with("refs/tags/") {
+        "tag"
+    } else if git_ref.starts_with("refs/heads/") {
+        "branch"
+    } else if event == "release" || event == "create" {
+        "tag"
+    } else {
+        "other"
+    }
+}
+
+/// `runs.origin` for a submission: the delivery id names a webhook, a
+/// schedule event names a schedule, a local workspace names the CLI; anything
+/// else arrived over the API.
+fn run_origin(record: &RunRecord) -> &'static str {
+    if record.webhook_delivery_id.is_some() {
+        "webhook"
+    } else if record.event == "schedule" {
+        "schedule"
+    } else if record.submission.local_workspace.is_some() {
+        "cli"
+    } else {
+        "api"
+    }
+}
+
+/// The node classification of a submitted job (`jobs.kind`).
+fn submit_kind(job: &QueuedJob) -> NodeKind {
+    if job.reusable_call.is_some() {
+        NodeKind::ReusableCaller
+    } else if job.deferred_matrix.is_some() {
+        NodeKind::MatrixParent
+    } else if !job.matrix.is_empty() && job.base_id != job.job_id.0 {
+        NodeKind::MatrixLeg
+    } else {
+        NodeKind::Job
+    }
+}
+
+/// Secret names carried by a message template, with every secret value (and
+/// the mask hints / endpoint credentials derived from them) removed. The
+/// acquire path resolves the names through the `SecretProvider` and fills the
+/// template; the runner still sees which variables are secret.
+fn strip_secret_values(message: &mut azdo::AgentJobRequestMessage) -> Vec<String> {
+    let mut names = Vec::new();
+    for (name, value) in message.variables.iter_mut() {
+        if value.is_secret == Some(true) {
+            names.push(name.clone());
+            value.value = None;
+        }
+    }
+    // Mask hints carry the secret values they redact; the acquire path
+    // rebuilds them from the resolved values.
+    message.mask_hints.clear();
+    for endpoint in &mut message.resources.endpoints {
+        endpoint.authorization.parameters.clear();
+    }
+    names
+}
+
+/// A node for one submitted job: spec columns from the `QueuedJob`, mutable
+/// columns at their submit-time defaults (`Pending` + `Blocked`; the
+/// promotion sweep moves it on).
+fn submit_node(
+    record: &RunRecord,
+    job: QueuedJob,
+    position: usize,
+    now_us: i64,
+) -> (Node, azdo::AgentJobRequestMessage, Vec<String>) {
+    let job_id = job.job_id.clone();
+    let kind = submit_kind(&job);
+    let mut message = job.message.clone();
+    let secret_names = strip_secret_values(&mut message);
+    let condition_context = job.condition_context.clone();
+    let reusable = record
+        .caller_plans
+        .get(&job_id)
+        .map(|plan| ReusableNodeSpec {
+            call: job.reusable_call.clone(),
+            meta: record.reusable_calls.get(&job_id.0).cloned(),
+            plan: Some(plan.clone()),
+        });
+    let node = Node {
+        kind,
+        status: ExecutionStatus::Pending,
+        queue_state: logic::QueueState::Blocked,
+        remaining_needs: job.needs.len() as i32,
+        base_id: job.base_id.clone(),
+        parent_job_id: None,
+        pool_key: crate::control::types::compute_pool_key(
+            &job.runs_on,
+            job.runner_group.as_deref(),
+        ),
+        runs_on: job.runs_on.clone(),
+        runner_group: job.runner_group.clone(),
+        priority: 0,
+        run_order: record.run_number as i64,
+        job_order: position as i32,
+        enqueued_at_us: None,
+        claimed_by_runner_id: None,
+        claimed_at_us: None,
+        expand_generation: 0,
+        outputs: None,
+        annotations: None,
+        check_run_id: record.job_check_run_ids.get(&job_id).map(|id| *id as i64),
+        created_at_us: now_us,
+        deps_ready_at_us: job.needs.is_empty().then_some(now_us),
+        concurrency_wait_at_us: None,
+        concurrency_acquired_at_us: None,
+        started_at_us: None,
+        completed_at_us: None,
+        display_name: message
+            .job_display_name
+            .clone()
+            .unwrap_or_else(|| message.job_name.clone()),
+        display_order: position as i32,
+        if_condition: job.if_condition.clone(),
+        matrix: job.matrix.clone(),
+        deferred_matrix: job.deferred_matrix.clone(),
+        max_parallel: job.max_parallel,
+        environment: job.environment.clone(),
+        concurrency: job.concurrency.clone(),
+        reusable,
+        fail_fast: Some(
+            record
+                .job_fail_fast
+                .get(&job.base_id)
+                .copied()
+                .unwrap_or(true),
+        ),
+        continue_on_error: record.job_continue_on_error.get(&job_id.0).copied(),
+        id_token_granted: false,
+        oidc: crate::state::OidcJobContext {
+            environment: None,
+            job_workflow_ref: None,
+            job_workflow_sha: None,
+        },
+        needs: job.needs.clone(),
+        condition_context,
+        secret_names: secret_names.clone(),
+        has_children: false,
+    };
+    (node, message, secret_names)
+}
+
+impl PgBackend {
+    /// `submit_run`: one transaction that records the run, its jobs and their
+    /// dispatch state, acquires the workflow-level gate, and runs the first
+    /// promotion sweep.
+    ///
+    /// Statements: replay `SELECT run_id` (webhook delivery + path); namespace
+    /// upsert; `INSERT INTO runs`; `run_submissions`; `run_push_states`;
+    /// per job `jobs` + `job_specs` + `job_needs` + `job_messages` +
+    /// `job_requests` (+ `github_token_requests`, `job_steps`); gate rows;
+    /// the sweep's own statements.
+    pub(super) async fn submit_run(
+        &self,
+        submit: SubmitRun,
+    ) -> Result<SubmitOutcome, ControlError> {
+        let SubmitRun {
+            namespace,
+            record,
+            jobs,
+            workflow_concurrency,
+            empty_concurrency_group,
+            check_hostable,
+        } = submit;
+        // A webhook delivery that already produced a run for this workflow
+        // path replays that run instead of duplicating it.
+        if let Some(delivery_id) = &record.webhook_delivery_id {
+            let existing = self
+                .existing_delivery_run(delivery_id, &record.workflow_path_str)
+                .await?;
+            if let Some(existing) = existing {
+                return Ok(SubmitOutcome {
+                    run_id: existing.run_id,
+                    run_number: existing.run_number,
+                    queued_jobs: 0,
+                    status: existing.status,
+                    concluded: Vec::new(),
+                    held: existing.status == ExecutionStatus::Pending,
+                    rejected: None,
+                    queue_depth: self.queue_depth().await?,
+                    next_runs_on: self.ready_front_labels().await?,
+                    existing: Some(Box::new(existing)),
+                });
+            }
+        }
+        // Reject outright on an empty concurrency group (nothing persists).
+        if empty_concurrency_group {
+            return Ok(SubmitOutcome {
+                run_id: record.run_id,
+                run_number: record.run_number,
+                queued_jobs: 0,
+                status: ExecutionStatus::Failure,
+                concluded: vec![(
+                    JobId("*".to_owned()),
+                    ExecutionStatus::Failure,
+                    Some("empty concurrency group".to_owned()),
+                )],
+                held: false,
+                rejected: Some(ExecutionStatus::Failure),
+                existing: None,
+                queue_depth: self.queue_depth().await?,
+                next_runs_on: Vec::new(),
+            });
+        }
+
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let now = now_us();
+        let run = record.run_id.0.to_string();
+        tx.execute(
+            "INSERT INTO namespaces (namespace_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            &[&namespace],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute(
+            concat!(
+                "INSERT INTO runs (run_id, namespace_id, repository, workflow_path, \
+                 run_number, run_attempt, run_name, event, ref, ref_type, head_ref, \
+                 base_ref, head_sha, workflow_ref, status, webhook_delivery_id, origin, \
+                 actor, tree_digest, concurrency_group, concurrency_cancel_in_progress, \
+                 created_at, started_at) VALUES ($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9,\
+                 $10,$11,$12,$13,$14,'queued',$15,$16,$17,$18,$19,$20,",
+                us!("$21"),
+                ",",
+                us!("$22"),
+                ")"
+            ),
+            &[
+                &run,
+                &namespace,
+                &record.submission.repository,
+                &record.workflow_path_str,
+                &(record.run_number as i64),
+                &(record.run_attempt as i32),
+                &record.run_name,
+                &record.event,
+                &record.submission.git_ref,
+                &ref_type(&record.submission.git_ref, &record.event),
+                &Option::<String>::None,
+                &Option::<String>::None,
+                &record.head_sha,
+                &record.workflow_ref,
+                &record.webhook_delivery_id,
+                &run_origin(&record),
+                &record.submission.actor,
+                &record.submission.push_tree,
+                &workflow_concurrency.as_ref().map(|wf| wf.group.clone()),
+                &workflow_concurrency
+                    .as_ref()
+                    .is_some_and(|wf| wf.cancel_in_progress),
+                &now,
+                &record.started_at.map(|at| codec::system_to_us(at.into())),
+            ],
+        )
+        .await
+        .map_err(db)?;
+        // The submission record minus secrets (`secret_refs` names them).
+        let mut stored_submission = (*record.submission).clone();
+        let secret_refs: serde_json::Value = stored_submission
+            .secrets
+            .keys()
+            .map(|name| (name.clone(), serde_json::json!({"scope": "run"})))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        stored_submission.secrets.clear();
+        tx.execute(
+            "INSERT INTO run_submissions (run_id, submission, github_context, \
+             workspace_snapshot, snapshot_timing, secret_refs) \
+             VALUES ($1::text::uuid,$2::text::jsonb,$3::text::jsonb,$4::text::jsonb,\
+             $5::text::jsonb,$6::text::jsonb)",
+            &[
+                &run,
+                &json(&stored_submission)?,
+                &record.github.to_string(),
+                &record
+                    .workspace_snapshot
+                    .as_ref()
+                    .map(|s| serde_json::to_string(s).unwrap_or_default())
+                    .unwrap_or_else(|| "null".to_owned()),
+                &record
+                    .snapshot_timing
+                    .as_ref()
+                    .map(|t| serde_json::to_string(t).unwrap_or_default()),
+                &secret_refs.to_string(),
+            ],
+        )
+        .await
+        .map_err(db)?;
+        if record.submission.push.is_some() {
+            tx.execute(
+                "INSERT INTO run_push_states (run_id, status) VALUES ($1::text::uuid,'pending')",
+                &[&run],
+            )
+            .await
+            .map_err(db)?;
+        }
+
+        // Workflow-level concurrency gate: the run either occupies the slot,
+        // parks behind it, or dies on arrival.
+        let mut held = false;
+        if let Some(wf) = &workflow_concurrency {
+            let key = concurrency::concurrency_key(&record.submission.repository, &wf.group);
+            match acquire_gate(
+                self,
+                &tx,
+                &namespace,
+                &key,
+                &wf.group,
+                &GateHolder {
+                    holder: concurrency::Holder::Run(record.run_id),
+                    jobset_id: None,
+                },
+                wf.cancel_in_progress,
+                wf.queue,
+            )
+            .await?
+            {
+                GateOutcome::Acquired => {}
+                GateOutcome::Parked => held = true,
+                GateOutcome::Cancelled | GateOutcome::Failed => {
+                    tx.execute(
+                        "UPDATE runs SET status='completed', conclusion='cancelled', \
+                         completed_at = now() WHERE run_id = $1::text::uuid",
+                        &[&run],
+                    )
+                    .await
+                    .map_err(db)?;
+                    tx.commit().await.map_err(db)?;
+                    return Ok(SubmitOutcome {
+                        run_id: record.run_id,
+                        run_number: record.run_number,
+                        queued_jobs: 0,
+                        status: ExecutionStatus::Cancelled,
+                        concluded: Vec::new(),
+                        held: false,
+                        rejected: Some(ExecutionStatus::Cancelled),
+                        existing: None,
+                        queue_depth: self.queue_depth().await?,
+                        next_runs_on: self.ready_front_labels().await?,
+                    });
+                }
+            }
+        }
+
+        let platforms = self.registered_platforms().await?;
+        let accepted = record.jobs.len();
+        let final_status;
+        let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
+        let mut graph = RunGraph {
+            record: record.clone(),
+            namespace: namespace.clone(),
+            nodes: BTreeMap::new(),
+            submission: record.submission.clone(),
+            github: record.github.clone(),
+            touched: true,
+        };
+        for (position, submit_job) in jobs.into_iter().enumerate() {
+            let SubmitJob {
+                queued,
+                request,
+                token_request,
+                id_token_granted,
+                oidc_context,
+                step_manifest,
+                initially_skipped,
+            } = submit_job;
+            let job_id = queued.job_id.clone();
+            let (mut node, mut message, _secret_names) =
+                submit_node(&record, queued.clone(), position, now);
+            node.id_token_granted = id_token_granted;
+            if let Some(oidc) = oidc_context {
+                node.oidc = oidc;
+            }
+            // Unhostable platform: conclude immediately.
+            if check_hostable {
+                if let Some(platform) =
+                    crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
+                {
+                    node.status = ExecutionStatus::Failure;
+                    node.queue_state = logic::QueueState::None;
+                    node.completed_at_us = Some(now);
+                    concluded.push((
+                        job_id.clone(),
+                        ExecutionStatus::Failure,
+                        Some(format!("no {platform} runner registered")),
+                    ));
+                }
+            }
+            if initially_skipped && node.status != ExecutionStatus::Failure {
+                node.status = ExecutionStatus::Skipped;
+                node.queue_state = logic::QueueState::None;
+                node.completed_at_us = Some(now);
+                concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
+            }
+            if held
+                && !matches!(
+                    node.status,
+                    ExecutionStatus::Failure | ExecutionStatus::Skipped
+                )
+            {
+                node.queue_state = logic::QueueState::Held;
+                node.concurrency_wait_at_us = Some(now);
+            }
+            insert_job_row(&tx, &graph, &node, &job_id).await?;
+            insert_spec_rows(&tx, &graph, &node, &job_id, None).await?;
+            // Mint the request correlation inside the writer transaction so
+            // the id is allocated under the cross-process writer lock.
+            if let Some(request) = &request {
+                let request_id = insert_request_row(
+                    &tx,
+                    &graph,
+                    request,
+                    token_request.as_ref(),
+                    &step_manifest,
+                )
+                .await?;
+                message.request_id = request_id;
+                message.job_id = request.agent_job_id;
+            }
+            tx.execute(
+                "INSERT INTO job_messages (run_id, job_id, message_template, secret_names, \
+                 condition_context) VALUES ($1::text::uuid,$2,$3::text::jsonb,$4::text::jsonb,\
+                 $5::text::jsonb)",
+                &[
+                    &run,
+                    &job_id.0,
+                    &json(&message)?,
+                    &json(&node.secret_names)?,
+                    &json(&node.condition_context)?,
+                ],
+            )
+            .await
+            .map_err(db)?;
+            graph.record.jobs.insert(job_id.clone(), node.status);
+            graph.nodes.insert(job_id, node);
+        }
+
+        // One promotion sweep: needs-satisfied nodes enqueue (or park behind
+        // their own gate / expansion queue); unsatisfiable ones settle.
+        if !held {
+            let mut sweep = Sweep::new(self, &tx).await?;
+            sweep.graphs.insert(record.run_id, graph);
+            sweep.sweep().await?;
+            for (job_id, status) in &sweep.concluded {
+                concluded.push((job_id.clone(), *status, None));
+            }
+            let status = sweep
+                .graphs
+                .get(&record.run_id)
+                .map(|graph| graph.record.status)
+                .unwrap_or(record.status);
+            sweep.flush().await?;
+            final_status = status;
+        } else {
+            graph.resummarize();
+            final_status = graph.record.status;
+            flush_run(&tx, &graph).await?;
+            for (job_id, node) in &graph.nodes {
+                flush_node(&tx, record.run_id, job_id, node).await?;
+            }
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(SubmitOutcome {
+            run_id: record.run_id,
+            run_number: record.run_number,
+            queued_jobs: accepted,
+            status: final_status,
+            concluded,
+            held,
+            rejected: None,
+            queue_depth: self.queue_depth().await?,
+            next_runs_on: self.ready_front_labels().await?,
+            existing: None,
+        })
+    }
+}
+
+impl PgBackend {
+    /// Platform names (`linux` / `macos` / `windows`) some registered runner
+    /// can host — the unhostable-platform check's input.
+    pub(super) async fn registered_platforms(&self) -> Result<Vec<&'static str>, ControlError> {
+        let client = self.reader().await?;
+        let rows = client
+            .query("SELECT labels::text FROM runners", &[])
+            .await
+            .map_err(db)?;
+        let mut platforms = Vec::new();
+        for row in rows {
+            let labels: Vec<String> = codec::from_json(row.get::<_, String>(0).as_str())?;
+            for label in labels {
+                let label = label.to_ascii_lowercase();
+                let os = ["linux", "macos", "windows"]
+                    .into_iter()
+                    .find(|os| label == *os || label.starts_with(os));
+                if let Some(os) = os {
+                    if !platforms.contains(&os) {
+                        platforms.push(os);
+                    }
+                }
+            }
+        }
+        Ok(platforms)
+    }
+
+    /// Ready-queue depth (the node-local gauge the runner supervisor reads).
+    pub(super) async fn queue_depth(&self) -> Result<usize, ControlError> {
+        let client = self.reader().await?;
+        let count = client
+            .query_one("SELECT count(*) FROM jobs WHERE queue_state = 'ready'", &[])
+            .await
+            .map_err(db)?
+            .get::<_, i64>(0);
+        Ok(count.max(0) as usize)
+    }
+
+    /// `runs-on` labels of the ready-queue front, for `next_job_runs_on`.
+    pub(super) async fn ready_front_labels(&self) -> Result<Vec<String>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT runs_on::text FROM jobs WHERE queue_state = 'ready' \
+                 ORDER BY pool_key, priority DESC, run_order, job_order LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(db)?;
+        match row {
+            Some(row) => codec::from_json(row.get::<_, String>(0).as_str()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// A run already produced for this `(webhook delivery, workflow path)` —
+    /// a push delivery legitimately fans out to several workflow files, so the
+    /// match is on the pair, never the delivery alone.
+    pub(super) async fn existing_delivery_run(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunRecord>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT run_id::text FROM runs WHERE webhook_delivery_id = $1 \
+                 AND workflow_path = $2 ORDER BY created_at DESC LIMIT 1",
+                &[&delivery_id, &workflow_path],
+            )
+            .await
+            .map_err(db)?;
+        match row {
+            Some(row) => Ok(Some(
+                self.run_record(codec::run_id(&row.get::<_, String>(0))?)
+                    .await?,
+            )),
+            None => Ok(None),
+        }
+    }
 }
