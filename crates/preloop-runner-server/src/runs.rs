@@ -3734,8 +3734,9 @@ mod tests {
 
         let inner = state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
-        // The counter row is keyed "repository\x1fworkflow_path" per the
-        // agreed (namespace_id, repository, workflow_path) scoping.
+        // The sqlite counter map is keyed `repository\x1fworkflow_path` (the
+        // new signature folds namespace/repository in; no stored column
+        // exists for them on the old backends).
         assert_eq!(
             inner
                 .workflow_run_counters
