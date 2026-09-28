@@ -146,7 +146,7 @@ use preloop_gha_parser::parse_workflow;
 use preloop_gha_protocol::{
     AnnotationLevel, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, PROTOCOL_VERSION,
     RegisteredRunner, RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
-    RunnerSessionRequest, SessionId, WorkflowSubmission, azdo,
+    RunnerSessionRequest, WorkflowSubmission, azdo,
     crypto::{AgentRsaKeypair, AgentRsaPublicKey, SessionEncryption},
     event_to_ndjson,
 };
