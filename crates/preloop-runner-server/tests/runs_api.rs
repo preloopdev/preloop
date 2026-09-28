@@ -1658,6 +1658,15 @@ async fn registration_mint_permissive_only_under_an_explicit_env_opt_in() {
 
 #[tokio::test]
 async fn current_runner_registration_to_broker_job_e2e() {
+    // The job VM injects a real `PRELOOP_GITHUB_TOKEN`. When that ambient PAT
+    // fails scope introspection the server refuses the submission here with
+    // `403 refusing to embed an invalid PAT`, which is not what this e2e
+    // exercises — it is about registration reaching the broker. Hold the env
+    // lock so the unset cannot race a test that needs the token.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let _no_api_url = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_API_URL");
+
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
