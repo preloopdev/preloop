@@ -157,7 +157,8 @@ impl PgBackend {
         lease_duration_secs: u64,
     ) -> Result<Vec<WebhookDeliveryRecord>, ControlError> {
         let now = now_us();
-        let lease_until = now.saturating_add((lease_duration_secs as i64).saturating_mul(1_000_000));
+        let lease_until =
+            now.saturating_add((lease_duration_secs as i64).saturating_mul(1_000_000));
         let client = self.writer().await?;
         let rows = client
             .query(
@@ -208,7 +209,8 @@ impl PgBackend {
             return Ok(false);
         };
         let now = now_us();
-        let lease_until = now.saturating_add((lease_duration_secs as i64).saturating_mul(1_000_000));
+        let lease_until =
+            now.saturating_add((lease_duration_secs as i64).saturating_mul(1_000_000));
         let client = self.writer().await?;
         let renewed = client
             .execute(
@@ -308,7 +310,8 @@ impl PgBackend {
         delivery_id: &str,
     ) -> Result<Option<WebhookDeliveryRecord>, ControlError> {
         let client = self.reader().await?;
-        let sql = format!("SELECT {DELIVERY_COLUMNS} FROM webhook_deliveries WHERE delivery_id = $1");
+        let sql =
+            format!("SELECT {DELIVERY_COLUMNS} FROM webhook_deliveries WHERE delivery_id = $1");
         client
             .query_opt(&sql, &[&delivery_id])
             .await

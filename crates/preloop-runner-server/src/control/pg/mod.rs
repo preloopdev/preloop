@@ -19,6 +19,9 @@
 //!   run numbers, key fingerprint, archival and queue statistics.
 
 mod codec;
+mod dispatch;
+mod graph;
+mod lifecycle;
 mod lookups;
 mod runners;
 mod timelines;
@@ -115,13 +118,17 @@ pub(super) struct Pooled<'a> {
 impl std::ops::Deref for Pooled<'_> {
     type Target = Client;
     fn deref(&self) -> &Client {
-        self.client.as_ref().expect("pooled client present until drop")
+        self.client
+            .as_ref()
+            .expect("pooled client present until drop")
     }
 }
 
 impl std::ops::DerefMut for Pooled<'_> {
     fn deref_mut(&mut self) -> &mut Client {
-        self.client.as_mut().expect("pooled client present until drop")
+        self.client
+            .as_mut()
+            .expect("pooled client present until drop")
     }
 }
 
@@ -289,10 +296,7 @@ async fn ensure_schema(client: &mut Client) -> Result<(), ControlError> {
 /// exist yet.
 async fn stored_schema_version(client: &Client) -> Result<Option<String>, ControlError> {
     let exists: bool = client
-        .query_one(
-            "SELECT to_regclass('control.schema_meta') IS NOT NULL",
-            &[],
-        )
+        .query_one("SELECT to_regclass('control.schema_meta') IS NOT NULL", &[])
         .await
         .map_err(db)?
         .get(0);

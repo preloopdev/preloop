@@ -9,11 +9,11 @@
 use super::codec::{self, us};
 use super::timelines::{step_from_row, STEP_COLUMNS};
 use super::{db, PgBackend};
-use crate::control::types::{
-    check_key_fingerprint, CallbackJob, ControlError, QueueStats, RunConcurrency,
-    RunDispatchInfo, RunDispatchJob, SubmissionFields, DEFAULT_NAMESPACE,
-};
 use crate::control::backend::RequestKey;
+use crate::control::types::{
+    check_key_fingerprint, CallbackJob, ControlError, QueueStats, RunConcurrency, RunDispatchInfo,
+    RunDispatchJob, SubmissionFields, DEFAULT_NAMESPACE,
+};
 use crate::models::{JobDetail, PushState, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,7 +230,10 @@ impl PgBackend {
     /// Statement: `INSERT INTO workflow_run_numbers .. VALUES (.., 1) ON
     /// CONFLICT DO UPDATE SET last_run_number = last_run_number + 1
     /// RETURNING last_run_number`.
-    pub(super) async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
+    pub(super) async fn allocate_run_number(
+        &self,
+        workflow_path: &str,
+    ) -> Result<u64, ControlError> {
         let client = self.writer().await?;
         let number: i64 = client
             .query_one(
@@ -253,7 +256,10 @@ impl PgBackend {
     /// Statements: `INSERT INTO schema_meta ('key_fingerprint', $1) ON
     /// CONFLICT DO NOTHING`; `SELECT value FROM schema_meta WHERE key =
     /// 'key_fingerprint'`.
-    pub(super) async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
+    pub(super) async fn ensure_key_fingerprint(
+        &self,
+        fingerprint: &str,
+    ) -> Result<(), ControlError> {
         let client = self.writer().await?;
         client
             .execute(
@@ -325,7 +331,9 @@ impl PgBackend {
         if self.job_exists(run_id, job_id).await? {
             Ok(false)
         } else {
-            Err(ControlError::NotFound(format!("job {job_id} in run {run_id}")))
+            Err(ControlError::NotFound(format!(
+                "job {job_id} in run {run_id}"
+            )))
         }
     }
 
@@ -377,7 +385,11 @@ impl PgBackend {
     /// Whether the run has a `jobs` row for `job_id`.
     ///
     /// Statement: `SELECT EXISTS (SELECT 1 FROM jobs WHERE run_id, job_id)`.
-    pub(super) async fn job_exists(&self, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+    pub(super) async fn job_exists(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
         let client = self.reader().await?;
         Ok(client
             .query_one(
@@ -525,7 +537,10 @@ impl PgBackend {
                 });
             }
             return Ok(Some(RunDispatchInfo {
-                repository: submission["repository"].as_str().unwrap_or_default().to_owned(),
+                repository: submission["repository"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
                 sha: submission["sha"].as_str().unwrap_or_default().to_owned(),
                 started_at: head.get::<_, Option<i64>>(1).map(codec::us_to_system),
                 completed_at: head.get::<_, Option<i64>>(2).map(codec::us_to_system),
@@ -587,7 +602,10 @@ impl PgBackend {
             })
             .collect::<Result<Vec<_>, ControlError>>()?;
         Ok(Some(RunDispatchInfo {
-            repository: submission["repository"].as_str().unwrap_or_default().to_owned(),
+            repository: submission["repository"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
             sha: submission["sha"].as_str().unwrap_or_default().to_owned(),
             started_at: head.get::<_, Option<i64>>(1).map(codec::us_to_system),
             completed_at: head.get::<_, Option<i64>>(2).map(codec::us_to_system),
@@ -902,7 +920,10 @@ impl PgBackend {
     /// The runner registered under an OAuth client id.
     ///
     /// Statement: `SELECT runner_id FROM runners WHERE client_id = $1`.
-    pub(super) async fn runner_for_client(&self, client_id: &str) -> Result<Option<i64>, ControlError> {
+    pub(super) async fn runner_for_client(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<i64>, ControlError> {
         let client = self.reader().await?;
         Ok(client
             .query_opt(
@@ -999,7 +1020,10 @@ impl PgBackend {
     /// any hold/wait of the run.
     ///
     /// Statement: one `SELECT` of two `EXISTS` disjunctions.
-    pub(super) async fn run_in_concurrency(&self, run_id: RunId) -> Result<RunConcurrency, ControlError> {
+    pub(super) async fn run_in_concurrency(
+        &self,
+        run_id: RunId,
+    ) -> Result<RunConcurrency, ControlError> {
         let client = self.reader().await?;
         let row = client
             .query_one(

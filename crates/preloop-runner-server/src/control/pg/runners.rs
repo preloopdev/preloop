@@ -159,7 +159,10 @@ impl PgBackend {
             .await
             .map_err(db)?;
         let row = tx
-            .query_one(&format!("{REQUEST_SELECT} WHERE q.request_id = $1"), &[&request_id])
+            .query_one(
+                &format!("{REQUEST_SELECT} WHERE q.request_id = $1"),
+                &[&request_id],
+            )
             .await
             .map_err(db)?;
         tx.commit().await.map_err(db)?;
@@ -190,9 +193,12 @@ impl PgBackend {
             .await
             .map_err(db)?;
         if released > 0 {
-            tx.execute("DELETE FROM job_leases WHERE request_id = $1", &[&request_id])
-                .await
-                .map_err(db)?;
+            tx.execute(
+                "DELETE FROM job_leases WHERE request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?;
         }
         tx.commit().await.map_err(db)?;
         Ok(released > 0)
@@ -201,7 +207,9 @@ impl PgBackend {
     /// `release_request` = [`Self::release_claimed_request`] without a
     /// result (an unknown or settled request is a no-op).
     pub(super) async fn release_request(&self, request_id: i64) -> Result<(), ControlError> {
-        self.release_claimed_request(request_id, "").await.map(|_| ())
+        self.release_claimed_request(request_id, "")
+            .await
+            .map(|_| ())
     }
 
     /// Renew an attempt's lease by agent job id for its recorded owner with
@@ -252,14 +260,19 @@ impl PgBackend {
             )
             .await
             .map_err(db)?
-            .map(|row| (row.get::<_, Option<String>>(0), row.get::<_, Option<i64>>(1)));
+            .map(|row| {
+                (
+                    row.get::<_, Option<String>>(0),
+                    row.get::<_, Option<i64>>(1),
+                )
+            });
         let owned_in_flight = matches!(row, Some((None, Some(owner))) if owner == runner_id);
         let miss = renew_miss(row, runner_id)?;
         match expires {
             Err(error) if owned_in_flight => Err(error),
-            Ok(None) if owned_in_flight => Err(ControlError::BadRequest(
-                "empty lockedUntil".to_owned(),
-            )),
+            Ok(None) if owned_in_flight => {
+                Err(ControlError::BadRequest("empty lockedUntil".to_owned()))
+            }
             _ => Ok(miss),
         }
     }
@@ -436,7 +449,10 @@ impl PgBackend {
                 tx.execute(
                     "DELETE FROM session_messages WHERE session_id = $1::text::uuid \
                      AND message_type = $2",
-                    &[session, &preloop_gha_protocol::azdo::message_type::JOB_CANCELLED],
+                    &[
+                        session,
+                        &preloop_gha_protocol::azdo::message_type::JOB_CANCELLED,
+                    ],
                 )
                 .await
                 .map_err(db)?;
@@ -694,14 +710,20 @@ impl PgBackend {
         if !require_on && !pool_on {
             swept += tx
                 .execute(
-                    concat!("DELETE FROM job_assignments WHERE assigned_at < ", ts!("$1")),
+                    concat!(
+                        "DELETE FROM job_assignments WHERE assigned_at < ",
+                        ts!("$1")
+                    ),
                     &[&assignment_cutoff],
                 )
                 .await
                 .map_err(db)?;
             swept += tx
                 .execute(
-                    concat!("DELETE FROM provision_requests WHERE requested_at < ", ts!("$1")),
+                    concat!(
+                        "DELETE FROM provision_requests WHERE requested_at < ",
+                        ts!("$1")
+                    ),
                     &[&assignment_cutoff],
                 )
                 .await
