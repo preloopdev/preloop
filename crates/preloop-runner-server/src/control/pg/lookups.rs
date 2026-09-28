@@ -12,7 +12,7 @@ use super::{db, PgBackend};
 use crate::control::backend::RequestKey;
 use crate::control::types::{
     check_key_fingerprint, CallbackJob, ControlError, QueueStats, RunConcurrency, RunDispatchInfo,
-    RunDispatchJob, SubmissionFields, DEFAULT_NAMESPACE,
+    RunDispatchJob, SubmissionFields,
 };
 use crate::models::{JobDetail, PushState, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
@@ -232,17 +232,19 @@ impl PgBackend {
     /// RETURNING last_run_number`.
     pub(super) async fn allocate_run_number(
         &self,
+        namespace_id: &str,
+        repository: &str,
         workflow_path: &str,
     ) -> Result<u64, ControlError> {
         let client = self.writer().await?;
         let number: i64 = client
             .query_one(
                 "INSERT INTO workflow_run_numbers AS w (namespace_id, repository, workflow_path, \
-                 last_run_number) VALUES ($1, '', $2, 1) \
+                 last_run_number) VALUES ($1, $2, $3, 1) \
                  ON CONFLICT (namespace_id, repository, workflow_path) \
                  DO UPDATE SET last_run_number = w.last_run_number + 1 \
                  RETURNING last_run_number",
-                &[&DEFAULT_NAMESPACE, &workflow_path],
+                &[&namespace_id, &repository, &workflow_path],
             )
             .await
             .map_err(db)?
