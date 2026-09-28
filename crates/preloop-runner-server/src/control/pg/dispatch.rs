@@ -13,11 +13,11 @@ use super::codec::{self, from_json, json, now_us, us};
 use super::graph::{self, queue_state_str, Node, NodeKind, ReusableNodeSpec, RunGraph};
 use super::{db, lookups, PgBackend};
 use crate::concurrency;
-use crate::control::backend::PollRequest;
+use crate::control::backend::{JobCompletionInput, PollRequest};
 use crate::control::logic;
 use crate::control::types::{
-    status_str, ClaimedJob, ControlError, PollOutcome, SessionMessage, SubmitJob, SubmitOutcome,
-    SubmitRun,
+    status_str, ClaimedJob, CompleteOutcome, ControlError, JobSettled, PollOutcome, SessionMessage,
+    SettleJob, SettleJobOutcome, SubmitJob, SubmitOutcome, SubmitRun,
 };
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use crate::runtime_scheduling::{self as sched_helpers, DependencyDecision, SchedulingOutcome};
@@ -3439,9 +3439,12 @@ impl PgBackend {
     ) -> Result<Option<SessionMessage>, ControlError> {
         Ok(tx
             .query_opt(
-                "SELECT message_id, message_type, request_id, body::text \
-                 FROM session_messages WHERE session_id = $1::text::uuid \
-                 ORDER BY message_id LIMIT 1",
+                "SELECT m.message_id, m.message_type, m.request_id, m.body::text, \
+                 s.runner_id IS NULL \
+                 FROM session_messages m \
+                 LEFT JOIN runner_sessions s ON s.session_id = m.session_id \
+                 WHERE m.session_id = $1::text::uuid \
+                 ORDER BY m.message_id LIMIT 1",
                 &[&session_uuid],
             )
             .await
@@ -3451,6 +3454,9 @@ impl PgBackend {
                 message_type: row.get(1),
                 request_id: row.get(2),
                 body: row.get(3),
+                // A session without a runner never did the key exchange, so
+                // its messages stay plaintext (compat/default sessions).
+                plaintext: row.get::<_, Option<bool>>(4).unwrap_or(true),
             }))
     }
 
@@ -3478,6 +3484,7 @@ impl PgBackend {
         &self,
         tx: &Transaction<'_>,
         session_uuid: &str,
+        runner_id: Option<i64>,
         request_id: i64,
         agent_job_id: uuid::Uuid,
     ) -> Result<SessionMessage, ControlError> {
@@ -3508,6 +3515,8 @@ impl PgBackend {
             message_type: azdo::message_type::JOB_CANCELLED.to_owned(),
             request_id: Some(request_id),
             body: Some(body),
+            // Session-less (compat) runners never exchanged a key.
+            plaintext: runner_id.is_none(),
         })
     }
 
@@ -3690,6 +3699,7 @@ impl PgBackend {
         &self,
         tx: &Transaction<'_>,
         session_uuid: &str,
+        runner_id: Option<i64>,
         request_id: i64,
     ) -> Result<SessionMessage, ControlError> {
         let message_id: i64 = tx
@@ -3710,6 +3720,7 @@ impl PgBackend {
             message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_owned(),
             request_id: Some(request_id),
             body: None,
+            plaintext: runner_id.is_none(),
         })
     }
 
@@ -3758,6 +3769,7 @@ impl PgBackend {
                     .queue_cancellation_message(
                         &tx,
                         &session.session_uuid,
+                        session.runner_id,
                         request.request_id,
                         request.agent_job_id,
                     )
@@ -3797,7 +3809,12 @@ impl PgBackend {
             return Ok(PollOutcome::Empty);
         };
         let message = self
-            .queue_job_message(&tx, &session.session_uuid, request.request_id)
+            .queue_job_message(
+                &tx,
+                &session.session_uuid,
+                session.runner_id,
+                request.request_id,
+            )
             .await?;
         let mut graph = match PgBackend::load_graph(self, &tx, run_id).await? {
             Some(graph) => graph,
@@ -3837,5 +3854,465 @@ impl PgBackend {
             queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
         })))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Completion
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What one completion decided, before the caller projects it.
+pub(super) struct CompletionApplied {
+    pub(crate) effective_status: ExecutionStatus,
+    pub(crate) cancelled_siblings: Vec<JobId>,
+    pub(crate) newly_terminal_success: bool,
+    pub(crate) replayed: bool,
+    pub(crate) live_log_key: String,
+}
+
+impl<'a> Sweep<'a> {
+    /// Apply one terminal completion to a node: outputs, the first-verdict
+    /// rule, fail-fast siblings, gate release, request retirement, dependent
+    /// promotion and the run's terminal stamp.
+    ///
+    /// The caller settles the *attempt* (request row) separately — this half
+    /// only owns workflow state.
+    pub(super) async fn complete_node(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+        reported: ExecutionStatus,
+        outputs: &BTreeMap<String, serde_json::Value>,
+        annotations: &[serde_json::Value],
+    ) -> Result<CompletionApplied, ControlError> {
+        let was_terminal_success = self
+            .graphs
+            .get(&run_id)
+            .is_some_and(|graph| graph.record.status == ExecutionStatus::Success);
+        // A terminal job keeps its first verdict, except that a cancellation
+        // reported as success/failure stays cancelled.
+        let (prior, base_id, continue_on_error) = {
+            let Some(graph) = self.graphs.get(&run_id) else {
+                return Err(ControlError::NotFound(format!("run {run_id}")));
+            };
+            let Some(node) = graph.nodes.get(job_id) else {
+                return Err(ControlError::backend(anyhow::anyhow!(
+                    "job {job_id} does not belong to run {run_id}"
+                )));
+            };
+            (
+                node.status,
+                node.base_id.clone(),
+                node.continue_on_error.unwrap_or(false),
+            )
+        };
+        let tolerated = continue_on_error && reported == ExecutionStatus::Failure;
+        let reported = if tolerated {
+            ExecutionStatus::Success
+        } else {
+            reported
+        };
+        let replayed = prior.is_terminal() && prior != ExecutionStatus::Cancelled;
+        let effective = match (prior, reported) {
+            (ExecutionStatus::Cancelled, ExecutionStatus::Success)
+            | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => ExecutionStatus::Cancelled,
+            _ if replayed => prior,
+            _ => reported,
+        };
+        if replayed {
+            return Ok(CompletionApplied {
+                effective_status: effective,
+                cancelled_siblings: Vec::new(),
+                newly_terminal_success: false,
+                replayed: true,
+                live_log_key: attempt_log_key(self.tx, run_id, job_id, None).await?,
+            });
+        }
+        // Outputs + annotations land on the node.
+        if !outputs.is_empty() {
+            let value = serde_json::to_value(outputs).map_err(ControlError::backend)?;
+            if let Some(node) = self.node_mut(run_id, job_id) {
+                node.outputs = Some(value);
+            }
+        }
+        if !annotations.is_empty() {
+            let value = serde_json::to_value(annotations).map_err(ControlError::backend)?;
+            if let Some(node) = self.node_mut(run_id, job_id) {
+                node.annotations = Some(value);
+            }
+        }
+        self.mark(run_id, job_id);
+        // Retire the node's attempts (settled rows stay readable).
+        retire_node_requests(self.tx, run_id, job_id, Retirement::Settle(effective)).await?;
+        // Terminal transition + gate release + dependent decrement.
+        self.settle_node(run_id, job_id, effective).await?;
+        // Fail-fast siblings of a failed matrix leg.
+        let mut cancelled_siblings = Vec::new();
+        if effective == ExecutionStatus::Failure {
+            cancelled_siblings = self.fail_fast_siblings(run_id, job_id, &base_id).await?;
+        }
+        // Reusable callers fold their callee outputs into terminal statuses.
+        let finalized_callers = {
+            let graph = self.graphs.get_mut(&run_id).expect("loaded");
+            let finalized =
+                crate::reusable_workflows::propagate_reusable_outputs(&mut graph.record);
+            for caller_id in &finalized {
+                self.dirty.insert((run_id, caller_id.clone()));
+            }
+            finalized
+        };
+        for caller_id in &finalized_callers {
+            release_concurrency_for_job(self.backend, self.tx, run_id, caller_id).await?;
+        }
+        // Run-level stamps: completion metadata + first terminal success.
+        let newly_terminal_success = {
+            let graph = self.graphs.get_mut(&run_id).expect("loaded");
+            let record = &mut graph.record;
+            if record.started_at.is_none() {
+                record.started_at = Some(chrono::Utc::now());
+            }
+            if record.status.is_terminal() && record.completed_at.is_none() {
+                record.completed_at = Some(chrono::Utc::now());
+                record.conclusion = Some(crate::runtime_scheduling::status_string(record.status));
+            }
+            !was_terminal_success && record.status == ExecutionStatus::Success
+        };
+        // Orphaned in-progress steps of this attempt settle with the job.
+        let orphan_conclusion = crate::runtime_scheduling::status_string(effective);
+        self.tx
+            .execute(
+                concat!(
+                    "UPDATE job_steps SET conclusion = $3, finished_at = COALESCE(finished_at, ",
+                    us!("$4"),
+                    ") WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
+                     WHERE run_id = $1::text::uuid AND job_id = $2 \
+                     ORDER BY request_id DESC LIMIT 1) AND conclusion = 'in_progress'"
+                ),
+                &[
+                    &run_id.0.to_string(),
+                    &job_id.0,
+                    &orphan_conclusion,
+                    &now_us(),
+                ],
+            )
+            .await
+            .map_err(db)?;
+        let live_log_key = attempt_log_key(self.tx, run_id, job_id, None).await?;
+        Ok(CompletionApplied {
+            effective_status: effective,
+            cancelled_siblings,
+            newly_terminal_success,
+            replayed: false,
+            live_log_key,
+        })
+    }
+
+    /// Cancel the failed leg's matrix siblings (fail-fast), queueing runner
+    /// cancellations for the in-flight ones.
+    async fn fail_fast_siblings(
+        &mut self,
+        run_id: RunId,
+        failed: &JobId,
+        base_id: &str,
+    ) -> Result<Vec<JobId>, ControlError> {
+        let fail_fast = self
+            .graphs
+            .get(&run_id)
+            .and_then(|graph| graph.nodes.get(failed))
+            .and_then(|node| node.fail_fast)
+            .unwrap_or(true);
+        if !fail_fast {
+            return Ok(Vec::new());
+        }
+        let siblings: Vec<JobId> = {
+            let graph = self.graphs.get(&run_id).expect("loaded");
+            let rows: Vec<logic::FailFastSibling> = graph
+                .nodes
+                .iter()
+                .map(|(job_id, node)| logic::FailFastSibling {
+                    job_id: job_id.clone(),
+                    base_id: node.base_id.clone(),
+                    status: node.status,
+                    agent_job_id: None,
+                })
+                .collect();
+            logic::matrix_fail_fast(failed, Some(base_id), fail_fast, &rows)
+        };
+        let mut cancelled = Vec::new();
+        for sibling in siblings {
+            let in_flight = self
+                .graphs
+                .get(&run_id)
+                .and_then(|graph| graph.nodes.get(&sibling))
+                .is_some_and(|node| node.status == ExecutionStatus::InProgress);
+            if in_flight {
+                enqueue_cancellation(
+                    self.tx,
+                    self.graphs.get(&run_id).expect("loaded"),
+                    &sibling,
+                    Some("fail_fast"),
+                )
+                .await?;
+            }
+            self.settle_node(run_id, &sibling, ExecutionStatus::Cancelled)
+                .await?;
+            cancelled.push(sibling);
+        }
+        Ok(cancelled)
+    }
+}
+
+/// The live-log key of a job's newest attempt (`agent_job_id`, else the
+/// logical id for a job that never minted one).
+pub(super) async fn attempt_log_key(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    explicit: Option<uuid::Uuid>,
+) -> Result<String, ControlError> {
+    let agent = match explicit {
+        Some(agent) => Some(agent),
+        None => agent_job_id(tx, run_id, job_id).await?,
+    };
+    Ok(agent
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| format!("{}:{}", run_id.0, job_id.0)))
+}
+
+impl PgBackend {
+    /// `complete_job`: settle the attempt, flip the job, propagate outputs and
+    /// dependents, fail-fast siblings.
+    pub(super) async fn complete_job(
+        &self,
+        completion: JobCompletionInput,
+    ) -> Result<CompleteOutcome, ControlError> {
+        let run_id = completion.run_id;
+        let job_id = completion.job_id.clone();
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        if !PgBackend::lock_run(&tx, run_id).await? {
+            return Err(ControlError::NotFound(format!("run {run_id}")));
+        }
+        // Settle this attempt (first result wins on the request row).
+        if let Some(request_id) = self
+            .attempt_request_id(&tx, run_id, &job_id, completion.agent_job_id)
+            .await?
+        {
+            settle_request_tx(&tx, request_id, completion.status).await?;
+        }
+        let mut sweep = Sweep::new(self, &tx).await?;
+        let graph = PgBackend::load_graph(self, &tx, run_id)
+            .await?
+            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+        sweep.graphs.insert(run_id, graph);
+        let applied = sweep
+            .complete_node(run_id, &job_id, completion.status, &completion.outputs, &[])
+            .await?;
+        if !applied.replayed {
+            // The claimed marker is gone once the job is terminal.
+            sweep
+                .tx
+                .execute(
+                    "UPDATE job_assignments SET runner_id = NULL \
+                     WHERE run_id = $1::text::uuid AND job_id = $2",
+                    &[&run_id.0.to_string(), &job_id.0],
+                )
+                .await
+                .map_err(db)?;
+            sweep.sweep().await?;
+        }
+        let scheduling = std::mem::take(&mut sweep.outcome);
+        let queue_nonempty = self.work_pending().await?;
+        let record = sweep
+            .graphs
+            .get(&run_id)
+            .map(|graph| graph.record.clone())
+            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+        sweep.flush().await?;
+        tx.commit().await.map_err(db)?;
+        Ok(CompleteOutcome {
+            record,
+            effective_status: applied.effective_status,
+            newly_terminal_success: applied.newly_terminal_success,
+            cancelled_siblings: applied.cancelled_siblings,
+            scheduling,
+            live_log_key: applied.live_log_key,
+            queue_nonempty,
+            queue_depth: self.queue_depth().await?,
+            replayed: applied.replayed,
+        })
+    }
+
+    /// `settle_job`: the broker-shaped completion (attempt ownership checked
+    /// against the reporting runner) returning the settled projection.
+    pub(super) async fn settle_job(
+        &self,
+        settle: SettleJob,
+    ) -> Result<SettleJobOutcome, ControlError> {
+        let comp = settle.completion.clone();
+        let run_id = comp.run_id;
+        let job_id = comp.job_id.clone();
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        if !PgBackend::lock_run(&tx, run_id).await? {
+            return Err(ControlError::NotFound("run not found".to_owned()));
+        }
+        // Ownership: a broker completion must name an attempt this runner owns
+        // (recorded owner or the session runner).
+        let mut attempt = None;
+        if let Some(settle_attempt) = &settle.settle {
+            let request_id = self
+                .attempt_request_id(&tx, run_id, &job_id, Some(settle_attempt.agent_job_id))
+                .await?
+                .ok_or_else(|| {
+                    ControlError::NotFound("broker complete request not found".to_owned())
+                })?;
+            let owner = self.request_owner(request_id).await?;
+            match owner {
+                Some((Some(owner), _, _)) if owner != settle_attempt.runner_id => {
+                    return Err(ControlError::Forbidden(
+                        "broker request belongs to another runner".to_owned(),
+                    ));
+                }
+                Some((None, Some(session_runner), _))
+                    if session_runner != settle_attempt.runner_id =>
+                {
+                    return Err(ControlError::Forbidden(
+                        "broker request belongs to another runner".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            attempt = Some(request_id);
+        }
+        let mut sweep = Sweep::new(self, &tx).await?;
+        let graph = PgBackend::load_graph(self, &tx, run_id)
+            .await?
+            .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
+        sweep.graphs.insert(run_id, graph);
+        let annotations = {
+            let graph = sweep.graphs.get(&run_id).expect("loaded");
+            crate::distributed_task::mask_completion_annotations(&graph.record, &comp)
+        };
+        let outputs: BTreeMap<String, serde_json::Value> = comp
+            .outputs
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let applied = sweep
+            .complete_node(run_id, &job_id, comp.status, &outputs, &annotations)
+            .await?;
+        if applied.replayed {
+            let record = sweep
+                .graphs
+                .get(&run_id)
+                .map(|graph| graph.record.clone())
+                .expect("loaded");
+            tx.commit().await.map_err(db)?;
+            return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
+        }
+        if let Some(request_id) = attempt {
+            settle_request_tx(&tx, request_id, applied.effective_status).await?;
+            // The attempt's step results land on its manifest.
+            for wire in &comp.step_results {
+                let Some(external_id) = wire.external_id.as_deref() else {
+                    continue;
+                };
+                if let Some(conclusion) = crate::distributed_task::completion_step_conclusion(wire)
+                {
+                    let agent = comp.agent_job_id.ok_or_else(|| {
+                        ControlError::NotFound("settle_job without agent job id".to_owned())
+                    })?;
+                    self.patch_step_conclusion(&tx, agent, external_id, &conclusion)
+                        .await?;
+                }
+            }
+        }
+        sweep.sweep().await?;
+        let scheduling = std::mem::take(&mut sweep.outcome);
+        let (queue_len, next_runs_on) =
+            (self.queue_depth().await?, self.ready_front_labels().await?);
+        let queue_nonempty = queue_len > 0;
+        sweep.flush().await?;
+        tx.commit().await.map_err(db)?;
+        Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
+            effective_status: applied.effective_status,
+            cancelled_siblings: applied.cancelled_siblings,
+            scheduling,
+            queue_nonempty,
+            newly_terminal_success: applied.newly_terminal_success,
+            live_log_key: applied.live_log_key,
+            queue_len,
+            next_runs_on,
+        })))
+    }
+
+    /// The live attempt's request id for a `(run, job)`: the explicit agent
+    /// job id when given, else the newest in-flight attempt.
+    async fn attempt_request_id(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+        explicit: Option<uuid::Uuid>,
+    ) -> Result<Option<i64>, ControlError> {
+        let run = run_id.0.to_string();
+        let row = match explicit {
+            Some(agent) => tx
+                .query_opt(
+                    "SELECT request_id FROM job_requests WHERE agent_job_id = $1::text::uuid \
+                     AND run_id = $2::text::uuid AND job_id = $3 FOR NO KEY UPDATE",
+                    &[&agent.to_string(), &run, &job_id.0],
+                )
+                .await
+                .map_err(db)?,
+            None => tx
+                .query_opt(
+                    "SELECT request_id FROM job_requests WHERE run_id = $1::text::uuid \
+                     AND job_id = $2 AND result IS NULL ORDER BY request_id DESC LIMIT 1 \
+                     FOR NO KEY UPDATE",
+                    &[&run, &job_id.0],
+                )
+                .await
+                .map_err(db)?,
+        };
+        Ok(row.map(|row| row.get::<_, i64>(0)))
+    }
+
+    /// Set one step's conclusion on an attempt's manifest.
+    async fn patch_step_conclusion(
+        &self,
+        tx: &Transaction<'_>,
+        agent_job_id: uuid::Uuid,
+        step_id: &str,
+        conclusion: &str,
+    ) -> Result<(), ControlError> {
+        tx.execute(
+            concat!(
+                "UPDATE job_steps SET conclusion = $3, finished_at = COALESCE(finished_at, ",
+                us!("$4"),
+                ") WHERE agent_job_id = $1::text::uuid AND step_id = $2"
+            ),
+            &[&agent_job_id.to_string(), &step_id, &conclusion, &now_us()],
+        )
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Whether any ready/claimed work or pending cancellation exists.
+    pub(super) async fn work_pending(&self) -> Result<bool, ControlError> {
+        let client = self.reader().await?;
+        let pending: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM jobs \
+                 WHERE queue_state IN ('ready','claimed','pending_expansion','expanding')) \
+                 OR EXISTS (SELECT 1 FROM job_cancellations WHERE delivered_at IS NULL)",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        Ok(pending)
     }
 }
