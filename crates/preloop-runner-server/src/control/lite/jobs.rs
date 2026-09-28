@@ -154,13 +154,12 @@ pub(super) fn spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRow> {
     let oidc_env: Option<String> = row.get(11)?;
     let oidc_ref: Option<String> = row.get(12)?;
     let oidc_sha: Option<String> = row.get(13)?;
-    let oidc_context = (oidc_ref.is_some() || oidc_sha.is_some()).then_some(
-        crate::state::OidcJobContext {
+    let oidc_context =
+        (oidc_ref.is_some() || oidc_sha.is_some()).then_some(crate::state::OidcJobContext {
             environment: oidc_env,
             job_workflow_ref: oidc_ref,
             job_workflow_sha: oidc_sha,
-        },
-    );
+        });
     Ok(SpecRow {
         display_name: row.get(0)?,
         if_condition: row.get(1)?,

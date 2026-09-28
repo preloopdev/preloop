@@ -177,7 +177,13 @@ fn claim_one(
     runner_id: Option<i64>,
     caps: &RunnerCapabilities,
 ) -> Result<Option<(RunId, JobId)>, ControlError> {
-    type ReadyRow = (String, String, Vec<String>, Option<String>, Option<(Option<i64>, bool)>);
+    type ReadyRow = (
+        String,
+        String,
+        Vec<String>,
+        Option<String>,
+        Option<(Option<i64>, bool)>,
+    );
     let rows: Vec<ReadyRow> = {
         let mut stmt = tx
             .prepare_cached(
