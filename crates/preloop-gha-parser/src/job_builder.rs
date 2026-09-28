@@ -682,6 +682,7 @@ pub fn build_agent_job_message_with_normalized_context(
         preloop_snapshot_commit: None,
         preloop_snapshot_token_steps: None,
         preloop_snapshot_origin_rewrite: None,
+        preloop_secret_spec: None,
     })
 }
 
@@ -716,7 +717,11 @@ fn non_empty_services(
     }
 }
 
-fn regex_escape(value: &str) -> String {
+/// Escape `value` into a regex that matches it literally — the form the
+/// runner's `MaskType::Regex` hints expect. `pub` so the server's
+/// acquire-time template fill re-derives the identical hints the builder
+/// produced at submit.
+pub fn regex_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         if matches!(

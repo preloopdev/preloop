@@ -3561,7 +3561,8 @@ async fn step_manifests_are_scoped_per_job_attempt() {
             let agent_job_id = uuid::Uuid::new_v4();
             record.request_id = request_id;
             record.agent_job_id = agent_job_id;
-            record.plan_id = uuid::Uuid::new_v4().to_string();
+            // plan_id is derived from agent_job_id — never an independent id.
+            record.plan_id = agent_job_id.to_string();
             let step_id = uuid::Uuid::new_v4().to_string();
             inner.job_steps.insert(
                 agent_job_id,
@@ -10510,7 +10511,7 @@ async fn fork_job_never_receives_the_configured_pat_override() {
         .static_github_pat()
         .expect("config declares a PAT")
         .to_owned();
-    let _app = app(state.clone(), CancellationToken::new());
+    let app = app(state.clone(), CancellationToken::new());
     // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
     // webhook adapters stamp provenance); stamp it via `submit_run_inner`
     // like the webhook path does.
@@ -10533,7 +10534,7 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     )
     .await
     .expect("fork submission accepted");
-    let fork_run_id = fork.run_id.to_string();
+    let _ = fork.run_id;
     let trusted = crate::submit_run_inner(
         &shared,
         preloop_gha_protocol::WorkflowSubmission {
@@ -10545,31 +10546,33 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     )
     .await
     .expect("trusted submission accepted");
-    let trusted_run_id = trusted.run_id.to_string();
+    let _ = trusted.run_id;
 
-    let inner = state.test_tx().await;
-    let fork_message = queued_message_for(&inner, &fork_run_id);
-    let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    // The stored template carries no token; the broker fills it at claim.
+    // A fork-restricted job receives the job-scoped runtime token — never
+    // the repository-unscoped PAT.
+    let fork_acquired = acquire_queued_job(&app, "fork-runner").await;
+    let fork_job_id = fork_acquired["jobId"].as_str().expect("acquired job id");
+    let fork_plan = fork_acquired["plan"]["planId"]
+        .as_str()
+        .expect("acquired plan id");
+    let runtime_token =
+        state.mint_runtime_token(fork_plan, &uuid::Uuid::parse_str(fork_job_id).unwrap());
     for name in ["system.github.token", "github_token"] {
         assert_eq!(
-            variable_value(&fork_message, name),
+            wire_variable(&fork_acquired, name),
             Some(runtime_token.as_str()),
             "fork job must carry the local runtime token, not the PAT ({name})"
         );
     }
     assert!(
-        variable_value(&fork_message, "GITHUB_TOKEN").is_none(),
+        wire_variable(&fork_acquired, "GITHUB_TOKEN").is_none(),
         "uppercase GITHUB_TOKEN is not part of the official acquire schema"
     );
-    assert_ne!(
-        variable_value(&fork_message, "system.github.token"),
-        Some(pat.as_str()),
-        "the static PAT must not reach a fork-restricted job"
-    );
 
-    let trusted_message = queued_message_for(&inner, &trusted_run_id);
+    let trusted_acquired = acquire_queued_job(&app, "trusted-runner").await;
     assert_eq!(
-        variable_value(&trusted_message, "system.github.token"),
+        wire_variable(&trusted_acquired, "system.github.token"),
         Some(pat.as_str()),
         "trusted jobs still receive the configured PAT"
     );
@@ -10696,16 +10699,22 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
             .is_some_and(|url| !url.is_empty()),
         "webhook-delivered fork PR job gets no OIDC request URL"
     );
-    assert_eq!(
-        variable_value(&message, "REPO_TOKEN"),
-        None,
+    // Secrets denied: the stored template carries an explicit empty spec
+    // (never treated as a legacy fully-formed message) and no secret
+    // variable slots exist to fill.
+    let spec = message
+        .preloop_secret_spec
+        .as_ref()
+        .expect("a secrets-denied job still carries an explicit spec");
+    assert!(
+        spec.names.is_empty() && !spec.inherit && spec.map.is_empty(),
         "stored secrets stay denied for the fork PR job"
     );
     drop(inner);
 
     // Trusted control through the same build path: the same stored secret is
-    // injected and the declared writes survive.
-    let trusted = request_json(
+    // injected at acquire and the declared writes survive.
+    request_json(
         &app,
         Method::POST,
         "/api/v1/runs",
@@ -10716,15 +10725,17 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
         }),
     )
     .await;
-    let inner = state.test_tx().await;
-    let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+    // The fork job is still queued ahead; claim it first so the next acquire
+    // lands the trusted run's job.
+    let _fork_job = acquire_queued_job(&app, "fork-wh-first").await;
+    let acquired = acquire_queued_job(&app, "fork-wh-runner").await;
     assert_eq!(
-        variable_value(&trusted_message, "REPO_TOKEN"),
+        wire_variable(&acquired, "REPO_TOKEN"),
         Some("repo-value"),
         "trusted jobs still receive stored secrets"
     );
     assert_eq!(
-        variable_value(&trusted_message, "system.github.token.permissions"),
+        wire_variable(&acquired, "system.github.token.permissions"),
         Some(r#"{"Checks":"write","Metadata":"read"}"#),
         "trusted jobs keep declared writes and implicit metadata"
     );
@@ -12345,6 +12356,9 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
     )
     .await;
 
+    // The stored message is a secret-free template: `NPM_TOKEN` arrives only
+    // as a *name* in `preloopSecretSpec`, never as a value — so the debug
+    // credential is structurally absent, not merely filtered.
     let wire = {
         let inner = state.test_tx().await;
         let queued = inner.ready().next().expect("job should be queued");
@@ -12355,32 +12369,34 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
         !wire.to_string().contains("debug_worker_token"),
         "the debug credential must not ship anywhere on the job message"
     );
-
-    // Rebuild the official runner's secrets projection over the real message.
-    let variables = wire["variables"]
-        .as_object()
-        .expect("job message variables");
-    let official_secrets: BTreeSet<&str> = variables
+    let spec = &wire["preloopSecretSpec"];
+    let names: BTreeSet<&str> = spec["names"]
+        .as_array()
+        .expect("the template carries its secret-name spec")
         .iter()
-        .filter(|(key, value)| {
-            value["isSecret"].as_bool().unwrap_or(false)
-                && !key.eq_ignore_ascii_case("system.github.token")
-        })
-        .map(|(key, _)| key.as_str())
+        .filter_map(Value::as_str)
         .collect();
-
-    // Non-vacuous: the projection does surface the run's own secrets, so its
-    // silence about the debug credential means absence rather than a broken
-    // filter.
     assert!(
-        official_secrets.contains("NPM_TOKEN"),
-        "the projection must be the real one: {official_secrets:?}"
+        names.contains("NPM_TOKEN"),
+        "the spec must carry the run's own secret names: {names:?}"
     );
     assert!(
-        !official_secrets
-            .iter()
-            .any(|key| key.contains("debug_worker_token")),
-        "an official-style secrets context must not see a debug credential: {official_secrets:?}"
+        !names.iter().any(|name| name.contains("debug_worker_token")),
+        "the debug credential must not be a declared secret name"
+    );
+
+    // The real claim path is what the runner consumes: the filled message's
+    // secret variables are the official runner's secrets context source.
+    let acquired = acquire_queued_job(&app, "debug-token-runner").await;
+    let acquired_wire = serde_json::to_string(&acquired).unwrap();
+    assert!(
+        !acquired_wire.contains("debug_worker_token"),
+        "the acquired message must not expose the debug credential"
+    );
+    assert_eq!(
+        wire_variable(&acquired, "NPM_TOKEN"),
+        Some("npm_LIVE_CREDENTIAL"),
+        "the filled message surfaces the run's secrets at acquire"
     );
 }
 
@@ -15006,6 +15022,86 @@ async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
     .await
 }
 
+/// Claim the next queued job through the real broker path — register the
+/// runner, open its distributedtask session, poll for `runner_request_id`,
+/// then `acquirejob` returns the FILLED message (secrets resolved, tokens
+/// minted). The stored template is not the surface these assertions want:
+/// it is structurally secret-free.
+async fn acquire_queued_job(app: &Router, runner_name: &str) -> Value {
+    let (runner_id, runner_token) =
+        register_runner_with_token(app, runner_name, &["self-hosted"], None).await;
+    let session = request_json_with_bearer(
+        app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_id, "name": runner_name},
+            "ownerName": "acquire test",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json_with_bearer(
+        app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request")
+        .to_owned();
+    request_json_with_bearer(
+        app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await
+}
+
+/// `variables[name]` from a wire job message's value map, handling both the
+/// `{"value": …}` object form and the map-entry form.
+fn wire_variable<'a>(message: &'a Value, name: &str) -> Option<&'a str> {
+    message["variables"]
+        .get(name)
+        .and_then(|variable| variable["value"].as_str())
+        .or_else(|| {
+            message["variables"]["map"]
+                .as_array()?
+                .iter()
+                .find_map(|entry| {
+                    let key = entry
+                        .get("Key")
+                        .or_else(|| entry.get("key"))
+                        .and_then(|k| k.get("lit"))
+                        .and_then(Value::as_str)?;
+                    if key != name {
+                        return None;
+                    }
+                    entry
+                        .get("Value")
+                        .or_else(|| entry.get("value"))
+                        .and_then(|v| v.get("lit"))
+                        .and_then(Value::as_str)
+                })
+        })
+}
+
 #[tokio::test]
 async fn stored_secrets_are_injected_into_native_submissions() {
     let temp = tempfile::tempdir().unwrap();
@@ -15017,40 +15113,24 @@ async fn stored_secrets_are_injected_into_native_submissions() {
         .insert("E2E_TEST_SECRET".to_owned(), "stored-value".to_owned());
     let app = app(state.clone(), CancellationToken::new());
 
-    let accepted = submit_yaml(
+    submit_yaml(
         &app,
         "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n        env:\n          SECRET: ${{ secrets.E2E_TEST_SECRET }}\n",
         "owner/repo",
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap();
 
-    // The job message must carry the stored secret as a secret variable so
-    // the worker republishes it into the `secrets.*` context.
-    let inner = state.test_tx().await;
-    let run = inner
-        .runs
-        .values()
-        .find(|run| run.run_id.to_string() == run_id)
-        .unwrap();
-    let message = inner
-        .ready()
-        .find(|job| job.run_id == run.run_id)
-        .or_else(|| {
-            inner
-                .pending_jobs
-                .iter()
-                .find(|job| job.run_id == run.run_id)
-        })
-        .expect("queued job exists")
-        .message
-        .clone();
-    let secret_var = message
-        .variables
-        .values()
-        .find(|value| value.value.as_deref() == Some("stored-value"))
-        .expect("stored secret present in job message variables");
-    assert_eq!(secret_var.is_secret, Some(true));
+    // The stored message is a secret-free template; the secret arrives at
+    // acquire, resolved through the SecretProvider, as a secret variable —
+    // the runner's `secrets.*` context source.
+    let acquired = acquire_queued_job(&app, "stored-secret-runner").await;
+    let variables = &acquired["variables"];
+    let var = variables
+        .as_object()
+        .and_then(|map| map.get("E2E_TEST_SECRET"))
+        .expect("filled message carries the stored secret variable");
+    assert_eq!(var["value"].as_str(), Some("stored-value"));
+    assert_eq!(var["isSecret"].as_bool(), Some(true));
 }
 
 /// Extract the queued job message for a run, wherever it currently sits.
@@ -15102,22 +15182,21 @@ async fn pat_only_config_supplies_job_github_token() {
     );
     let app = app(state.clone(), CancellationToken::new());
 
-    let accepted = submit_yaml(
+    submit_yaml(
         &app,
         "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
         "owner/repo",
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
-    let inner = state.test_tx().await;
-    let message = queued_message_for(&inner, &run_id);
-    let token = message
-        .variables
-        .get("system.github.token")
-        .expect("job message carries a GitHub token variable");
-    assert_eq!(token.value.as_deref(), Some("github_pat_testvalue"));
-    assert_eq!(token.is_secret, Some(true));
+    // The stored template carries no token; the broker path mints/selects it
+    // at claim — with no App the configured PAT fills `system.github.token`.
+    let acquired = acquire_queued_job(&app, "pat-runner").await;
+    assert_eq!(
+        wire_variable(&acquired, "system.github.token"),
+        Some("github_pat_testvalue"),
+        "the configured PAT reaches the job as GITHUB_TOKEN"
+    );
 }
 
 /// The App-manifest setup flow receives the webhook secret from GitHub and
@@ -15246,43 +15325,37 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
     let workflow =
         "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n";
 
-    // owner/repo: the per-repo tier overrides the global tier per name and
-    // contributes its own names.
-    let accepted = submit_yaml(&app, workflow, "owner/repo").await;
-    let run_id = accepted["run_id"].as_str().unwrap();
-    let inner = state.test_tx().await;
-    let message = queued_message_for(&inner, run_id);
+    // Secrets resolve at acquire through the SecretProvider; the stored
+    // template only names them. Acquire each queued job in submit order.
+    submit_yaml(&app, workflow, "owner/repo").await;
+    let acquired = acquire_queued_job(&app, "scope-runner-a").await;
     assert_eq!(
-        variable_value(&message, "GLOBAL_TOKEN"),
+        wire_variable(&acquired, "GLOBAL_TOKEN"),
         Some("repo-wins"),
         "per-repo secret overrides the global tier"
     );
     assert_eq!(
-        variable_value(&message, "REPO_TOKEN"),
+        wire_variable(&acquired, "REPO_TOKEN"),
         Some("repo-value"),
         "per-repo secret is injected"
     );
-    drop(inner);
 
     // other/repo: only the global tier applies — repo secrets stay scoped.
-    let accepted = submit_yaml(&app, workflow, "other/repo").await;
-    let run_id = accepted["run_id"].as_str().unwrap();
-    let inner = state.test_tx().await;
-    let message = queued_message_for(&inner, run_id);
+    submit_yaml(&app, workflow, "other/repo").await;
+    let acquired = acquire_queued_job(&app, "scope-runner-b").await;
     assert_eq!(
-        variable_value(&message, "GLOBAL_TOKEN"),
+        wire_variable(&acquired, "GLOBAL_TOKEN"),
         Some("global-value"),
         "unscoped repo still gets the global tier"
     );
     assert_eq!(
-        variable_value(&message, "REPO_TOKEN"),
+        wire_variable(&acquired, "REPO_TOKEN"),
         None,
         "repo-scoped secret must not leak into another repository"
     );
-    drop(inner);
 
     // Submission-provided secrets still win over both tiers.
-    let accepted = request_json(
+    request_json(
         &app,
         Method::POST,
         "/api/v1/runs",
@@ -15294,11 +15367,9 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
         }),
     )
     .await;
-    let run_id = accepted["run_id"].as_str().unwrap();
-    let inner = state.test_tx().await;
-    let message = queued_message_for(&inner, run_id);
+    let acquired = acquire_queued_job(&app, "scope-runner-c").await;
     assert_eq!(
-        variable_value(&message, "GLOBAL_TOKEN"),
+        wire_variable(&acquired, "GLOBAL_TOKEN"),
         Some("submitted-value"),
         "submission-provided secrets outrank both stored tiers"
     );
@@ -20201,9 +20272,9 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     );
 }
 
-/// The claim-time re-mint must actually run on the real claim path: a queued
-/// redirected checkout carries the submission-time pinned token, and the job
-/// the runner acquires must carry a freshly minted one.
+/// The claim-time re-mint must actually run on the real claim path: the
+/// stored template carries no checkout token at all (only the pinned step-id
+/// marker), and the job the runner acquires must carry a freshly minted one.
 #[tokio::test]
 async fn claim_remints_snapshot_tokens_on_the_real_claim_path() {
     let temp = tempfile::tempdir().unwrap();
@@ -20225,12 +20296,10 @@ jobs:
         "owner/repo",
     )
     .await;
-    // The re-mint produces a fresh JWT; within the same second it is
-    // byte-identical to the pinned one, so give the clock room to move.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
 
-    // The pinned submission-time token, as it sits on the queued message.
-    let pinned_token = {
+    // The stored template blanks the pinned step's `token` input — nothing
+    // token-shaped persists, only the id marker that drives the re-mint.
+    {
         let inner = state.test_tx().await;
         let queued = inner.ready().next().expect("job should be queued");
         let checkout = queued
@@ -20244,12 +20313,12 @@ jobs:
                     .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"))
             })
             .expect("queued job should contain the redirected checkout step");
-        checkout.inputs.get("token").cloned().expect("pinned token")
-    };
-    assert!(
-        state.verify_local_jwt_claims(&pinned_token).is_some(),
-        "the queued token must be a valid local JWT"
-    );
+        assert_eq!(
+            checkout.inputs.get("token"),
+            None,
+            "the stored template must not persist a checkout token"
+        );
+    }
 
     let session = request_json(
         &app,
@@ -20321,9 +20390,9 @@ jobs:
             })
     }
     let claimed_token = acquired_input(checkout, "token").expect("claimed pinned token");
-    assert_ne!(
-        claimed_token, pinned_token,
-        "claim must replace the submission-time token with a fresh one"
+    assert!(
+        !claimed_token.is_empty(),
+        "claim must stamp a fresh token where the template left the slot blank"
     );
     let claims = state
         .verify_local_jwt_claims(claimed_token)

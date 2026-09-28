@@ -114,6 +114,60 @@ async fn render_session_message(
             .await
             .ok()?;
         let mut msg = ctx.message;
+        // The stored message is a secret-free template: resolve secrets back
+        // in from the SecretProvider, then fill the token slots — the AzDO
+        // path has no App-mint, so the PAT (or the job-scoped runtime token
+        // for fork-restricted tiers) is the credential. Never written back.
+        crate::message_template::fill_template(
+            &mut msg,
+            shared.state.secret_provider.as_ref(),
+            &ctx.repository,
+            &ctx.run_secrets,
+        )
+        .ok()?;
+        let tier = ctx.trust_tier.as_deref().and_then(|tier| {
+            serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
+        });
+        let fork_restricted = crate::events::trust_tier::job_authorization(
+            tier,
+            None,
+            ctx.id_token_granted.unwrap_or(false),
+        )
+        .fork_restricted;
+        let runtime = shared
+            .state
+            .mint_runtime_token(&msg.plan.plan_id, &msg.job_id);
+        let token = if fork_restricted {
+            runtime
+        } else {
+            // The PAT is embedded only when its OAuth scopes were verified
+            // (cached by the submit-time introspection); unverifiable
+            // authority stays withheld and the job keeps the runtime token.
+            shared
+                .state
+                .static_github_pat()
+                .and_then(|pat| {
+                    crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes))
+                })
+                .map(|(pat, scopes)| {
+                    msg.variables.insert(
+                        "system.github.token.pat_scopes".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            crate::runs::pat_scopes_wire_value(&scopes),
+                        ),
+                    );
+                    pat
+                })
+                .unwrap_or(runtime)
+        };
+        crate::broker::apply_minted_token_to_message(
+            &mut msg,
+            &crate::broker::MintedGitHubToken {
+                token,
+                effective_permissions: None,
+            },
+            false,
+        );
         // F030: inject SystemVssConnection so the worker's AzDO reporting
         // context has a server URL, access token, and ResultsServiceUrl —
         // same as broker_acquire_job.

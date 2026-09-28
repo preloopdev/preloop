@@ -34,7 +34,7 @@ use crate::models::{
 use crate::state::JobSetId;
 use crate::store;
 use parking_lot::Mutex;
-use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
+use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, SessionId};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
@@ -550,11 +550,11 @@ impl SqliteBackend {
             let row = conn
                 .query_row(
                     "SELECT jr.request_id, jr.run_id, jr.job_id, jr.agent_job_id, \
-                     jr.plan_id, jr.plan_type, jr.timeline_id, jr.result, jr.locked_until, \
+                     jr.timeline_id, jr.result, jr.locked_until, \
                      jr.claimed_at_us, jr.owner_runner_id, jr.started_at_us, \
                      jr.last_renewed_at_us, jr.timeout_triggered, jr.debug_token_issued, \
                      jr.request_blob, \
-                     sub.submission_json, \
+                     sub.submission_json, sub.secrets_blob, \
                      tok.request_blob, \
                      g.granted, \
                      (sess.session_id IS NOT NULL), sess.runner_id \
@@ -573,22 +573,21 @@ impl SqliteBackend {
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(5)?,
                             row.get::<_, String>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, String>(8)?,
+                            row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
                             row.get::<_, Option<i64>>(9)?,
                             row.get::<_, Option<i64>>(10)?,
-                            row.get::<_, Option<i64>>(11)?,
-                            row.get::<_, Option<i64>>(12)?,
-                            row.get::<_, i64>(13)?,
-                            row.get::<_, i64>(14)?,
-                            row.get::<_, Option<Vec<u8>>>(15)?,
-                            row.get::<_, String>(16)?,
-                            row.get::<_, Option<Vec<u8>>>(17)?,
-                            row.get::<_, Option<i64>>(18)?,
-                            row.get::<_, bool>(19)?,
-                            row.get::<_, Option<i64>>(20)?,
+                            row.get::<_, i64>(11)?,
+                            row.get::<_, i64>(12)?,
+                            row.get::<_, Option<Vec<u8>>>(13)?,
+                            row.get::<_, String>(14)?,
+                            row.get::<_, Vec<u8>>(15)?,
+                            row.get::<_, Option<Vec<u8>>>(16)?,
+                            row.get::<_, Option<i64>>(17)?,
+                            row.get::<_, bool>(18)?,
+                            row.get::<_, Option<i64>>(19)?,
                         ))
                     },
                 )
@@ -599,8 +598,6 @@ impl SqliteBackend {
                 run_id_s,
                 job_id_s,
                 agent_s,
-                plan_id,
-                plan_type,
                 timeline_s,
                 result_s,
                 locked_until,
@@ -612,6 +609,7 @@ impl SqliteBackend {
                 debug_token_issued,
                 message_blob,
                 submission_json,
+                secrets_blob,
                 token_blob,
                 granted,
                 has_session,
@@ -620,13 +618,16 @@ impl SqliteBackend {
             else {
                 return Err(ControlError::NotFound(format!("request {request_id}")));
             };
+            // plan_id/plan_type are derived, not read: plan_id is the
+            // agent_job_id string form, plan_type is always "actions".
+            let agent_job_id = parse_uuid(&agent_s);
             let record = TaskAgentJobRequestRecord {
                 request_id: rid,
                 run_id: parse_run_id(&run_id_s),
                 job_id: JobId(job_id_s),
-                agent_job_id: parse_uuid(&agent_s),
-                plan_id,
-                plan_type,
+                agent_job_id,
+                plan_id: agent_job_id.to_string(),
+                plan_type: "actions".to_owned(),
                 timeline_id: parse_uuid(&timeline_s),
                 result: result_s.as_deref().map(status_parse),
                 locked_until,
@@ -649,11 +650,16 @@ impl SqliteBackend {
                 .ok_or_else(|| ControlError::NotFound(format!("request {request_id} message")))?;
             let message = blob(&self.cipher, &message_blob)?;
             let token_request = token_blob.map(|raw| blob(&self.cipher, &raw)).transpose()?;
+            let secrets_json: serde_json::Value = blob(&self.cipher, &secrets_blob)?;
+            let run_secrets = crate::control::rows::decode_stored_secrets(secrets_json)
+                .map_err(ControlError::backend)?
+                .secrets;
             let submission: preloop_gha_protocol::WorkflowSubmission =
                 serde_json::from_str(&submission_json).map_err(ControlError::backend)?;
             Ok(AcquireContext {
                 request: record,
                 message,
+                run_secrets,
                 token_request,
                 id_token_granted: granted.map(|g| g != 0),
                 repository: submission.repository,
@@ -1072,7 +1078,7 @@ fn load_runs(
                 &preloop_gha_protocol::WorkflowSubmission::default(),
             )
             .map_err(ControlError::backend)?,
-            secrets: std::collections::BTreeMap::new(),
+            secrets: crate::control::rows::StoredSecrets::default(),
             github_json: "null".to_owned(),
             workspace_snapshot_json: None,
         };
@@ -1138,9 +1144,11 @@ fn load_runs(
                 continue;
             };
             let secrets: Vec<u8> = r.get(2).map_err(ControlError::backend)?;
+            let secrets_json: serde_json::Value = blob(cipher, &secrets)?;
             part.submission = RunSubmissionRow {
                 submission_json: r.get(1).map_err(ControlError::backend)?,
-                secrets: blob(cipher, &secrets)?,
+                secrets: crate::control::rows::decode_stored_secrets(secrets_json)
+                    .map_err(ControlError::backend)?,
                 github_json: r.get(3).map_err(ControlError::backend)?,
                 workspace_snapshot_json: r.get(4).map_err(ControlError::backend)?,
             };
@@ -1833,7 +1841,7 @@ fn load_txstate(
             scope.runs.as_ref()
         };
         let (sql, params) = scoped_select(
-            "SELECT request_id, run_id, job_id, agent_job_id, plan_id, plan_type, \
+            "SELECT request_id, run_id, job_id, agent_job_id, \
              timeline_id, result, locked_until, claimed_at_us, owner_runner_id, \
              started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued, \
              request_blob FROM job_requests",
@@ -1850,17 +1858,15 @@ fn load_txstate(
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(5)?,
                     r.get::<_, String>(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                    r.get::<_, String>(8)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
                     r.get::<_, Option<i64>>(9)?,
                     r.get::<_, Option<i64>>(10)?,
-                    r.get::<_, Option<i64>>(11)?,
-                    r.get::<_, Option<i64>>(12)?,
-                    r.get::<_, i64>(13)?,
-                    r.get::<_, i64>(14)?,
-                    r.get::<_, Option<Vec<u8>>>(15)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, i64>(12)?,
+                    r.get::<_, Option<Vec<u8>>>(13)?,
                 ))
             })
             .map_err(ControlError::backend)?;
@@ -1870,8 +1876,6 @@ fn load_txstate(
                 run_id_s,
                 job_id_s,
                 agent_job_id_s,
-                plan_id,
-                plan_type,
                 timeline_id_s,
                 result_s,
                 locked_until,
@@ -1887,11 +1891,13 @@ fn load_txstate(
             if !scope.job_requests_all && !scope.includes_run(&run_id) {
                 continue;
             }
+            let agent_job_id = parse_uuid(&agent_job_id_s);
+            let (plan_id, plan_type) = plan_fields(agent_job_id);
             let record = TaskAgentJobRequestRecord {
                 request_id,
                 run_id,
                 job_id: JobId(job_id_s),
-                agent_job_id: parse_uuid(&agent_job_id_s),
+                agent_job_id,
                 plan_id,
                 plan_type,
                 timeline_id: parse_uuid(&timeline_id_s),
@@ -2113,7 +2119,7 @@ fn load_txstate(
     // Sessions.
     {
         let (sql, params) = scoped_select(
-            "SELECT session_id, runner_id, protocol, encryption_blob, \
+            "SELECT session_id, runner_id, protocol, \
              active_request_id, last_seen_at_us, verified FROM runner_sessions",
             "session_id",
             scope.sessions.as_ref(),
@@ -2126,23 +2132,15 @@ fn load_txstate(
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<Vec<u8>>>(3)?,
+                    r.get::<_, Option<i64>>(3)?,
                     r.get::<_, Option<i64>>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })
             .map_err(ControlError::backend)?;
         for row in rows {
-            let (
-                session_id,
-                runner_id,
-                protocol,
-                encryption_blob,
-                active_request_id,
-                last_seen_at_us,
-                verified,
-            ) = row.map_err(ControlError::backend)?;
+            let (session_id, runner_id, protocol, active_request_id, last_seen_at_us, verified) =
+                row.map_err(ControlError::backend)?;
             match (SessionProtocol::parse(&protocol), runner_id) {
                 (SessionProtocol::Broker, Some(runner_id)) => {
                     tx.broker_session_runners
@@ -2165,15 +2163,9 @@ fn load_txstate(
             if verified != 0 {
                 tx.verified_sessions.insert(session_id.clone());
             }
-            if let Some(key_blob) = encryption_blob {
-                // Session keys are sealed on write; unsealed input is
-                // rejected outright — pre-seal databases are not supported.
-                let restored = cipher
-                    .unseal(&key_blob)
-                    .map(SessionEncryption::from_key)
-                    .map_err(ControlError::backend)?;
-                tx.session_keys.insert(session_id.clone(), restored);
-            }
+            // No key restore: session AES keys are HKDF-derived from the
+            // cluster key + session id (see `state.rs::session_encryption`),
+            // so nothing is persisted.
             if let Some(us) = last_seen_at_us {
                 tx.session_last_seen
                     .insert(session_id.clone(), us_to_system(us));
@@ -2639,7 +2631,7 @@ fn load_archived_txstate(conn: &Connection, tx: &mut TxState) -> Result<(), Cont
     }
     {
         let sql = format!(
-            "SELECT h.request_id,h.run_id,h.job_id,h.agent_job_id,h.plan_id,h.timeline_id,
+            "SELECT h.request_id,h.run_id,h.job_id,h.agent_job_id,h.timeline_id,
                     h.result,h.owner_runner_id,h.claimed_at_us,h.started_at_us
              FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
              WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
@@ -2655,11 +2647,10 @@ fn load_archived_txstate(conn: &Connection, tx: &mut TxState) -> Result<(), Cont
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                     r.get::<_, Option<i64>>(7)?,
                     r.get::<_, Option<i64>>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
                 ))
             })
             .map_err(ControlError::backend)?;
@@ -2669,7 +2660,6 @@ fn load_archived_txstate(conn: &Connection, tx: &mut TxState) -> Result<(), Cont
                 run_id,
                 job_id,
                 agent_id,
-                plan_id,
                 timeline_id,
                 result,
                 owner_runner_id,
@@ -2677,13 +2667,14 @@ fn load_archived_txstate(conn: &Connection, tx: &mut TxState) -> Result<(), Cont
                 started_at,
             ) = row.map_err(ControlError::backend)?;
             let agent_job_id = parse_uuid(&agent_id);
+            let (plan_id, plan_type) = plan_fields(agent_job_id);
             tx.insert_request(TaskAgentJobRequestRecord {
                 request_id,
                 run_id: parse_run_id(&run_id),
                 job_id: JobId(job_id),
                 agent_job_id,
                 plan_id,
-                plan_type: String::new(),
+                plan_type,
                 timeline_id: parse_uuid(&timeline_id),
                 result: result.as_deref().map(status_parse),
                 locked_until: String::new(),
@@ -3258,15 +3249,9 @@ fn write_txstate(
                          protocol: SessionProtocol,
                          tx: &TxState|
      -> Result<(), ControlError> {
-        // Seal the session AES key with the store envelope — a raw key in
-        // the row would let a DB reader decrypt every recorded job message.
-        // The control schema stores it as one sealed blob (version||iv||ct||tag).
-        let encryption = tx
-            .session_keys
-            .get(session_id)
-            .map(|e| cipher.seal(&e.key))
-            .transpose()
-            .map_err(ControlError::backend)?;
+        // No key column: session AES keys are HKDF-derived from the cluster
+        // key + session id (see `state.rs::session_encryption`), so nothing
+        // is persisted.
         let active_request_id = tx.session_active_requests.get(session_id).copied();
         let last_seen_us = tx
             .session_last_seen
@@ -3275,14 +3260,13 @@ fn write_txstate(
         let created_us = now_us;
         let verified = tx.verified_sessions.contains(session_id);
         conn.execute(
-            "INSERT INTO runner_sessions (session_id, runner_id, protocol, encryption_blob, \
+            "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
              active_request_id, last_seen_at_us, verified, created_at_us) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 session_id,
                 runner_id,
                 protocol.as_str(),
-                encryption,
                 active_request_id,
                 last_seen_us,
                 verified as i64,
@@ -3320,7 +3304,6 @@ fn write_txstate(
         .keys()
         .chain(tx.session_last_seen.keys())
         .chain(tx.inflight_messages.keys())
-        .chain(tx.session_keys.keys())
         .filter(|sid| {
             !tx.broker_session_runners.contains_key(*sid) && !tx.sessions.contains_key(*sid)
         })
@@ -3680,37 +3663,23 @@ impl ControlBackend for SqliteBackend {
         self.acquire_impl(request_id, Some(runner_id))
     }
 
-    async fn store_request_message(
+    async fn record_token_request(
         &self,
         run_id: RunId,
         request_id: i64,
-        message: Option<&preloop_gha_protocol::azdo::AgentJobRequestMessage>,
-        token_request: Option<&crate::models::GitHubTokenRequest>,
+        token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError> {
         let _ = run_id; // SQLite serializes on the single writer.
-        let message_blob = message.map(|m| unblob(&self.cipher, m)).transpose()?;
-        let job_timeout = message.and_then(|m| m.job_timeout);
-        let token_blob = token_request.map(|t| unblob(&self.cipher, t)).transpose()?;
+        let token_blob = unblob(&self.cipher, token_request)?;
         run_blocking(move || {
             let mut conn = self.conn.lock();
             let tx = conn.transaction().map_err(ControlError::backend)?;
-            if let Some(message_blob) = message_blob {
-                tx.execute(
-                    "UPDATE job_requests SET request_blob = ?1, \
-                     job_timeout_s = COALESCE(?2, job_timeout_s) \
-                     WHERE request_id = ?3",
-                    params![message_blob, job_timeout, request_id],
-                )
-                .map_err(ControlError::backend)?;
-            }
-            if let Some(blob) = token_blob {
-                tx.execute(
-                    "INSERT INTO github_token_requests (request_id, request_blob) VALUES (?1,?2) \
-                     ON CONFLICT(request_id) DO UPDATE SET request_blob = excluded.request_blob",
-                    params![request_id, blob],
-                )
-                .map_err(ControlError::backend)?;
-            }
+            tx.execute(
+                "INSERT INTO github_token_requests (request_id, request_blob) VALUES (?1,?2) \
+                 ON CONFLICT(request_id) DO UPDATE SET request_blob = excluded.request_blob",
+                params![request_id, token_blob],
+            )
+            .map_err(ControlError::backend)?;
             tx.commit().map_err(ControlError::backend)?;
             Ok(())
         })
@@ -4174,8 +4143,8 @@ impl ControlBackend for SqliteBackend {
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
-        const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
-            plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id,
+        const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id,
+            timeline_id, result, locked_until, claimed_at_us, owner_runner_id,
             started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued
             FROM job_requests";
         self.with_reader(|conn| {
@@ -4185,7 +4154,7 @@ impl ControlBackend for SqliteBackend {
                     vec![Box::new(*id)],
                 ),
                 RequestKey::PlanId(plan) => (
-                    format!("{COLUMNS} WHERE plan_id = ?1 ORDER BY request_id DESC LIMIT 1"),
+                    format!("{COLUMNS} WHERE agent_job_id = ?1 ORDER BY request_id DESC LIMIT 1"),
                     vec![Box::new(plan.clone())],
                 ),
                 RequestKey::AgentJobId(id) => (
@@ -4206,23 +4175,25 @@ impl ControlBackend for SqliteBackend {
             };
             let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
             conn.query_row(&sql, rusqlite::params_from_iter(refs), |row| {
-                let result: Option<String> = row.get(7)?;
+                let result: Option<String> = row.get(5)?;
+                let agent_job_id = parse_uuid(&row.get::<_, String>(3)?);
+                let (plan_id, plan_type) = plan_fields(agent_job_id);
                 Ok(TaskAgentJobRequestRecord {
                     request_id: row.get(0)?,
                     run_id: parse_run_id(&row.get::<_, String>(1)?),
                     job_id: JobId(row.get(2)?),
-                    agent_job_id: parse_uuid(&row.get::<_, String>(3)?),
-                    plan_id: row.get(4)?,
-                    plan_type: row.get(5)?,
-                    timeline_id: parse_uuid(&row.get::<_, String>(6)?),
+                    agent_job_id,
+                    plan_id,
+                    plan_type,
+                    timeline_id: parse_uuid(&row.get::<_, String>(4)?),
                     result: result.as_deref().map(status_parse),
-                    locked_until: row.get(8)?,
-                    claimed_at: row.get::<_, Option<i64>>(9)?.map(us_to_system),
-                    owner_runner_id: row.get(10)?,
-                    started_at: row.get::<_, Option<i64>>(11)?.map(us_to_system),
-                    last_renewed_at: row.get::<_, Option<i64>>(12)?.map(us_to_system),
-                    timeout_triggered: row.get::<_, i64>(13)? != 0,
-                    debug_token_issued: row.get::<_, i64>(14)? != 0,
+                    locked_until: row.get(6)?,
+                    claimed_at: row.get::<_, Option<i64>>(7)?.map(us_to_system),
+                    owner_runner_id: row.get(8)?,
+                    started_at: row.get::<_, Option<i64>>(9)?.map(us_to_system),
+                    last_renewed_at: row.get::<_, Option<i64>>(10)?.map(us_to_system),
+                    timeout_triggered: row.get::<_, i64>(11)? != 0,
+                    debug_token_issued: row.get::<_, i64>(12)? != 0,
                 })
             })
             .optional()
@@ -4471,14 +4442,14 @@ impl ControlBackend for SqliteBackend {
         self.with_reader(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
-                            plan_type, timeline_id, result, locked_until, claimed_at_us,
+                    "SELECT request_id, run_id, job_id, agent_job_id,
+                            timeline_id, result, locked_until, claimed_at_us,
                             owner_runner_id, started_at_us, last_renewed_at_us,
                             timeout_triggered, debug_token_issued
                      FROM job_requests WHERE run_id = ?1
                      UNION ALL
                      SELECT h.request_id, h.run_id, h.job_id, h.agent_job_id,
-                            h.plan_id, '', h.timeline_id, h.result, '', h.claimed_at_us,
+                            h.timeline_id, h.result, '', h.claimed_at_us,
                             h.owner_runner_id, h.started_at_us, NULL, 0, 0
                      FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
                      WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
@@ -4488,23 +4459,25 @@ impl ControlBackend for SqliteBackend {
                 .map_err(ControlError::backend)?;
             let rows = stmt
                 .query_map(params![run], |row| {
-                    let result: Option<String> = row.get(7)?;
+                    let result: Option<String> = row.get(5)?;
+                    let agent_job_id = parse_uuid(&row.get::<_, String>(3)?);
+                    let (plan_id, plan_type) = plan_fields(agent_job_id);
                     Ok(TaskAgentJobRequestRecord {
                         request_id: row.get(0)?,
                         run_id: parse_run_id(&row.get::<_, String>(1)?),
                         job_id: JobId(row.get(2)?),
-                        agent_job_id: parse_uuid(&row.get::<_, String>(3)?),
-                        plan_id: row.get(4)?,
-                        plan_type: row.get(5)?,
-                        timeline_id: parse_uuid(&row.get::<_, String>(6)?),
+                        agent_job_id,
+                        plan_id,
+                        plan_type,
+                        timeline_id: parse_uuid(&row.get::<_, String>(4)?),
                         result: result.as_deref().map(status_parse),
-                        locked_until: row.get(8)?,
-                        claimed_at: row.get::<_, Option<i64>>(9)?.map(us_to_system),
-                        owner_runner_id: row.get(10)?,
-                        started_at: row.get::<_, Option<i64>>(11)?.map(us_to_system),
-                        last_renewed_at: row.get::<_, Option<i64>>(12)?.map(us_to_system),
-                        timeout_triggered: row.get::<_, i64>(13)? != 0,
-                        debug_token_issued: row.get::<_, i64>(14)? != 0,
+                        locked_until: row.get(6)?,
+                        claimed_at: row.get::<_, Option<i64>>(7)?.map(us_to_system),
+                        owner_runner_id: row.get(8)?,
+                        started_at: row.get::<_, Option<i64>>(9)?.map(us_to_system),
+                        last_renewed_at: row.get::<_, Option<i64>>(10)?.map(us_to_system),
+                        timeout_triggered: row.get::<_, i64>(11)? != 0,
+                        debug_token_issued: row.get::<_, i64>(12)? != 0,
                     })
                 })
                 .map_err(ControlError::backend)?
@@ -4542,7 +4515,7 @@ impl ControlBackend for SqliteBackend {
             let tx = conn.transaction().map_err(ControlError::backend)?;
             let row = tx
                 .query_row(
-                    "SELECT request_id, run_id, plan_id, debug_token_issued \
+                    "SELECT request_id, run_id, agent_job_id, debug_token_issued \
                      FROM job_requests WHERE agent_job_id = ?1 AND result IS NULL \
                      ORDER BY request_id DESC LIMIT 1",
                     params![agent],
@@ -4557,11 +4530,12 @@ impl ControlBackend for SqliteBackend {
                 )
                 .optional()
                 .map_err(ControlError::backend)?;
-            let Some((request_id, run_id, plan_id, already_issued)) = row else {
+            let Some((request_id, run_id, agent_s, already_issued)) = row else {
                 return Err(ControlError::NotFound(format!(
                     "no active job request for agent job {agent}"
                 )));
             };
+            let plan_id = agent_s;
             // The runner only builds a pause client under
             // `preloopPreserveOnFailure`, so gating on the same flag issues
             // the credential exactly when it is used, and never otherwise.
@@ -4801,8 +4775,8 @@ impl ControlBackend for SqliteBackend {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT plan_id, run_id FROM job_requests \
-             WHERE plan_id IN ({placeholders}) ORDER BY request_id DESC"
+            "SELECT agent_job_id, run_id FROM job_requests \
+             WHERE agent_job_id IN ({placeholders}) ORDER BY request_id DESC"
         );
         let plan_ids = plan_ids.to_vec();
         self.with_reader(move |conn| {
@@ -5513,8 +5487,8 @@ impl ControlBackend for SqliteBackend {
             conn.query_row(
                 "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id, j.status \
                  FROM job_requests r LEFT JOIN jobs j ON j.run_id = r.run_id AND j.job_id = r.job_id \
-                 WHERE r.plan_id = ?1 OR r.timeline_id = ?2 OR r.agent_job_id = ?3 \
-                 ORDER BY (r.plan_id = ?1) DESC, r.request_id DESC LIMIT 1",
+                 WHERE r.agent_job_id = ?1 OR r.timeline_id = ?2 OR r.agent_job_id = ?3 \
+                 ORDER BY (r.agent_job_id = ?1) DESC, r.request_id DESC LIMIT 1",
                 params![plan_id, timeline, agent],
                 |row| {
                     Ok(CallbackJob {
@@ -5542,8 +5516,10 @@ impl ControlBackend for SqliteBackend {
             .optional()
             .map_err(ControlError::backend)?
             .map(|sealed| {
-                let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
-                Ok(map.into_values().collect())
+                let json: serde_json::Value = blob(&self.cipher, &sealed)?;
+                let stored = crate::control::rows::decode_stored_secrets(json)
+                    .map_err(ControlError::backend)?;
+                Ok(stored.secrets.into_values().collect())
             })
             .transpose()
         })
@@ -5560,8 +5536,10 @@ impl ControlBackend for SqliteBackend {
             let mut values = Vec::new();
             for sealed in rows {
                 let sealed = sealed.map_err(ControlError::backend)?;
-                let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
-                values.extend(map.into_values());
+                let json: serde_json::Value = blob(&self.cipher, &sealed)?;
+                let stored = crate::control::rows::decode_stored_secrets(json)
+                    .map_err(ControlError::backend)?;
+                values.extend(stored.secrets.into_values());
             }
             Ok(values)
         })
@@ -5741,13 +5719,8 @@ impl ControlBackend for SqliteBackend {
         &self,
         session_id: &str,
         runner_id: i64,
-        encryption: &SessionEncryption,
     ) -> Result<(), ControlError> {
         let session_id = session_id.to_owned();
-        let sealed = self
-            .cipher
-            .seal(&encryption.key)
-            .map_err(ControlError::backend)?;
         run_blocking(move || {
             let mut conn = self.conn.lock();
             let tx = conn.transaction().map_err(ControlError::backend)?;
@@ -5769,13 +5742,11 @@ impl ControlBackend for SqliteBackend {
             }
             tx.execute(
                 "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
-                 encryption_blob, created_at_us) VALUES (?1, ?2, 'broker', ?3, ?4) \
-                 ON CONFLICT(session_id) DO UPDATE SET runner_id = excluded.runner_id, \
-                 encryption_blob = excluded.encryption_blob",
+                 created_at_us) VALUES (?1, ?2, 'broker', ?3) \
+                 ON CONFLICT(session_id) DO UPDATE SET runner_id = excluded.runner_id",
                 params![
                     session_id,
                     runner_id,
-                    sealed,
                     system_to_us(std::time::SystemTime::now())
                 ],
             )
@@ -6056,7 +6027,7 @@ impl ControlBackend for SqliteBackend {
     async fn active_plan_ids(&self) -> Result<BTreeSet<String>, ControlError> {
         self.with_reader(|conn| {
             let mut stmt = conn
-                .prepare("SELECT DISTINCT plan_id FROM job_requests WHERE result IS NULL")
+                .prepare("SELECT DISTINCT agent_job_id FROM job_requests WHERE result IS NULL")
                 .map_err(ControlError::backend)?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))

@@ -32,7 +32,7 @@ use crate::models::{
 use crate::state::JobSetId;
 use crate::store;
 use crate::store::Store as _;
-use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
+use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, SessionId};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio_postgres::{Client, NoTls};
@@ -415,7 +415,7 @@ impl PostgresBackend {
             }
             let Some(request_row) = txn
                 .query_opt(
-                    "SELECT request_id, agent_job_id, plan_id, plan_type, timeline_id, \
+                    "SELECT request_id, agent_job_id, timeline_id, \
                      timeout_triggered, debug_token_issued FROM job_requests \
                      WHERE run_id = $1 AND job_id = $2 AND result IS NULL \
                      ORDER BY request_id LIMIT 1 FOR UPDATE SKIP LOCKED",
@@ -488,22 +488,24 @@ impl PostgresBackend {
                 written - locked,
                 started.elapsed() - written,
             );
+            let agent_job_id = parse_uuid(&request_row.get::<_, String>(1));
+            let (plan_id, plan_type) = plan_fields(agent_job_id);
             let request = TaskAgentJobRequestRecord {
                 request_id,
                 run_id: queued.run_id,
                 job_id: queued.job_id.clone(),
-                agent_job_id: parse_uuid(&request_row.get::<_, String>(1)),
-                plan_id: request_row.get(2),
-                plan_type: request_row.get(3),
-                timeline_id: parse_uuid(&request_row.get::<_, String>(4)),
+                agent_job_id,
+                plan_id,
+                plan_type,
+                timeline_id: parse_uuid(&request_row.get::<_, String>(2)),
                 result: None,
                 locked_until,
                 claimed_at: Some(now),
                 owner_runner_id: Some(session_runner),
                 started_at: Some(now),
                 last_renewed_at: Some(now),
-                timeout_triggered: request_row.get::<_, i64>(5) != 0,
-                debug_token_issued: request_row.get::<_, i64>(6) != 0,
+                timeout_triggered: request_row.get::<_, i64>(3) != 0,
+                debug_token_issued: request_row.get::<_, i64>(4) != 0,
             };
             Ok(Some(PollOutcome::Claimed(Box::new(ClaimedJob {
                 queued,
@@ -759,11 +761,11 @@ impl PostgresBackend {
             let row = client
                 .query_opt(
                     "SELECT jr.request_id, jr.run_id, jr.job_id, jr.agent_job_id, \
-                     jr.plan_id, jr.plan_type, jr.timeline_id, jr.result, jr.locked_until, \
+                     jr.timeline_id, jr.result, jr.locked_until, \
                      jr.claimed_at_us, jr.owner_runner_id, jr.started_at_us, \
                      jr.last_renewed_at_us, jr.timeout_triggered, jr.debug_token_issued, \
                      jr.request_blob, \
-                     sub.submission_json, \
+                     sub.submission_json, sub.secrets_blob, \
                      tok.request_blob, \
                      g.granted, \
                      (sess.session_id IS NOT NULL), sess.runner_id \
@@ -779,26 +781,29 @@ impl PostgresBackend {
                 .await
                 .map_err(ControlError::backend)?
                 .ok_or_else(|| ControlError::NotFound(format!("request {request_id}")))?;
+            // plan_id/plan_type are derived, not read: plan_id is the
+            // agent_job_id string form, plan_type is always "actions".
+            let agent_job_id = parse_uuid(&row.get::<_, String>(3));
             let record = TaskAgentJobRequestRecord {
                 request_id: row.get(0),
                 run_id: parse_run_id(&row.get::<_, String>(1)),
                 job_id: JobId(row.get(2)),
-                agent_job_id: parse_uuid(&row.get::<_, String>(3)),
-                plan_id: row.get(4),
-                plan_type: row.get(5),
-                timeline_id: parse_uuid(&row.get::<_, String>(6)),
-                result: row.get::<_, Option<String>>(7).as_deref().map(status_parse),
-                locked_until: row.get(8),
-                claimed_at: row.get::<_, Option<i64>>(9).map(us_to_system),
-                owner_runner_id: row.get(10),
-                started_at: row.get::<_, Option<i64>>(11).map(us_to_system),
-                last_renewed_at: row.get::<_, Option<i64>>(12).map(us_to_system),
-                timeout_triggered: row.get::<_, i64>(13) != 0,
-                debug_token_issued: row.get::<_, i64>(14) != 0,
+                agent_job_id,
+                plan_id: agent_job_id.to_string(),
+                plan_type: "actions".to_owned(),
+                timeline_id: parse_uuid(&row.get::<_, String>(4)),
+                result: row.get::<_, Option<String>>(5).as_deref().map(status_parse),
+                locked_until: row.get(6),
+                claimed_at: row.get::<_, Option<i64>>(7).map(us_to_system),
+                owner_runner_id: row.get(8),
+                started_at: row.get::<_, Option<i64>>(9).map(us_to_system),
+                last_renewed_at: row.get::<_, Option<i64>>(10).map(us_to_system),
+                timeout_triggered: row.get::<_, i64>(11) != 0,
+                debug_token_issued: row.get::<_, i64>(12) != 0,
             };
             if let Some(runner_id) = runner_id {
-                let has_session: bool = row.get(19);
-                let session_runner: Option<i64> = row.get(20);
+                let has_session: bool = row.get(18);
+                let session_runner: Option<i64> = row.get(19);
                 ensure_request_owner(
                     record.owner_runner_id,
                     session_runner,
@@ -811,19 +816,25 @@ impl PostgresBackend {
                     ));
                 }
             }
-            let message_blob: Option<Vec<u8>> = row.get(15);
+            let message_blob: Option<Vec<u8>> = row.get(13);
             let message_blob = message_blob
                 .ok_or_else(|| ControlError::NotFound(format!("request {request_id} message")))?;
             let message = blob(&self.cipher, &message_blob)?;
-            let token_blob: Option<Vec<u8>> = row.get(17);
+            let token_blob: Option<Vec<u8>> = row.get(16);
             let token_request = token_blob.map(|b| blob(&self.cipher, &b)).transpose()?;
-            let granted: Option<i64> = row.get(18);
-            let submission_json: String = row.get(16);
+            let granted: Option<i64> = row.get(17);
+            let secrets_blob: Vec<u8> = row.get(15);
+            let secrets_json: serde_json::Value = blob(&self.cipher, &secrets_blob)?;
+            let run_secrets = super::rows::decode_stored_secrets(secrets_json)
+                .map_err(ControlError::backend)?
+                .secrets;
+            let submission_json: String = row.get(14);
             let submission: preloop_gha_protocol::WorkflowSubmission =
                 serde_json::from_str(&submission_json).map_err(ControlError::backend)?;
             Ok(AcquireContext {
                 request: record,
                 message,
+                run_secrets,
                 token_request,
                 id_token_granted: granted.map(|g| g != 0),
                 repository: submission.repository,
@@ -1331,7 +1342,7 @@ async fn load_runs<C: tokio_postgres::GenericClient + Sync>(
         submission_json:
             serde_json::to_string(&preloop_gha_protocol::WorkflowSubmission::default())
                 .map_err(ControlError::backend)?,
-        secrets: std::collections::BTreeMap::new(),
+        secrets: super::rows::StoredSecrets::default(),
         github_json: "null".to_owned(),
         workspace_snapshot_json: None,
     };
@@ -1408,9 +1419,11 @@ async fn load_runs<C: tokio_postgres::GenericClient + Sync>(
             continue;
         };
         let secrets: Vec<u8> = r.get(2);
+        let secrets_json: serde_json::Value = blob(cipher, &secrets)?;
         part.submission = RunSubmissionRow {
             submission_json: r.get(1),
-            secrets: blob(cipher, &secrets)?,
+            secrets: super::rows::decode_stored_secrets(secrets_json)
+                .map_err(ControlError::backend)?,
             github_json: r.get(3),
             workspace_snapshot_json: r.get(4),
         };
@@ -2339,7 +2352,7 @@ async fn load_txstate(
     for row in conn
         .query(
             &format!(
-                "SELECT request_id, run_id, job_id, agent_job_id, plan_id, plan_type, \
+                "SELECT request_id, run_id, job_id, agent_job_id, \
                  timeline_id, result, locked_until, claimed_at_us, owner_runner_id, \
                  started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued, \
                  request_blob FROM job_requests{req_w}"
@@ -2353,27 +2366,27 @@ async fn load_txstate(
         let run_id_s: String = row.get(1);
         let job_id_s: String = row.get(2);
         let agent_job_id_s: String = row.get(3);
-        let plan_id: String = row.get(4);
-        let plan_type: String = row.get(5);
-        let timeline_id_s: String = row.get(6);
-        let result_s: Option<String> = row.get(7);
-        let locked_until: String = row.get(8);
-        let claimed_at_us: Option<i64> = row.get(9);
-        let owner_runner_id: Option<i64> = row.get(10);
-        let started_at_us: Option<i64> = row.get(11);
-        let last_renewed_at_us: Option<i64> = row.get(12);
-        let timeout_triggered: i64 = row.get(13);
-        let debug_token_issued: i64 = row.get(14);
-        let request_blob: Option<Vec<u8>> = row.get(15);
+        let timeline_id_s: String = row.get(4);
+        let result_s: Option<String> = row.get(5);
+        let locked_until: String = row.get(6);
+        let claimed_at_us: Option<i64> = row.get(7);
+        let owner_runner_id: Option<i64> = row.get(8);
+        let started_at_us: Option<i64> = row.get(9);
+        let last_renewed_at_us: Option<i64> = row.get(10);
+        let timeout_triggered: i64 = row.get(11);
+        let debug_token_issued: i64 = row.get(12);
+        let request_blob: Option<Vec<u8>> = row.get(13);
         let run_id = parse_run_id(&run_id_s);
         if !scope.job_requests_all && !scope.includes_run(&run_id) {
             continue;
         }
+        let agent_job_id = parse_uuid(&agent_job_id_s);
+        let (plan_id, plan_type) = plan_fields(agent_job_id);
         let record = TaskAgentJobRequestRecord {
             request_id,
             run_id,
             job_id: JobId(job_id_s),
-            agent_job_id: parse_uuid(&agent_job_id_s),
+            agent_job_id,
             plan_id,
             plan_type,
             timeline_id: parse_uuid(&timeline_id_s),
@@ -2551,7 +2564,7 @@ async fn load_txstate(
     // Sessions.
     for row in conn
         .query(
-            "SELECT session_id, runner_id, protocol, encryption_blob, \
+            "SELECT session_id, runner_id, protocol, \
              active_request_id, last_seen_at_us, verified FROM runner_sessions",
             &[],
         )
@@ -2567,10 +2580,9 @@ async fn load_txstate(
         }
         let runner_id: Option<i64> = row.get(1);
         let protocol: String = row.get(2);
-        let encryption_blob: Option<Vec<u8>> = row.get(3);
-        let active_request_id: Option<i64> = row.get(4);
-        let last_seen_at_us: Option<i64> = row.get(5);
-        let verified: i64 = row.get(6);
+        let active_request_id: Option<i64> = row.get(3);
+        let last_seen_at_us: Option<i64> = row.get(4);
+        let verified: i64 = row.get(5);
         match (SessionProtocol::parse(&protocol), runner_id) {
             (SessionProtocol::Broker, Some(runner_id)) => {
                 tx.broker_session_runners
@@ -2593,15 +2605,9 @@ async fn load_txstate(
         if verified != 0 {
             tx.verified_sessions.insert(session_id.clone());
         }
-        if let Some(key_blob) = encryption_blob {
-            // Session keys are sealed on write; unsealed input is
-            // rejected outright — pre-seal databases are not supported.
-            let restored = cipher
-                .unseal(&key_blob)
-                .map(SessionEncryption::from_key)
-                .map_err(ControlError::backend)?;
-            tx.session_keys.insert(session_id.clone(), restored);
-        }
+        // No key restore: session AES keys are HKDF-derived from the
+        // cluster key + session id (see `state.rs::session_encryption`),
+        // so nothing is persisted.
         if let Some(us) = last_seen_at_us {
             tx.session_last_seen
                 .insert(session_id.clone(), us_to_system(us));
@@ -2947,7 +2953,7 @@ async fn load_archived_txstate(conn: &Tx<'_>, tx: &mut TxState) -> Result<(), Co
     }
     let attempts = conn
         .query(
-            "SELECT h.request_id,h.run_id,h.job_id,h.agent_job_id,h.plan_id,h.timeline_id,
+            "SELECT h.request_id,h.run_id,h.job_id,h.agent_job_id,h.timeline_id,
                 h.result,h.owner_runner_id,h.claimed_at_us,h.started_at_us
          FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
          WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
@@ -2961,24 +2967,24 @@ async fn load_archived_txstate(conn: &Tx<'_>, tx: &mut TxState) -> Result<(), Co
         let run_id: String = row.get(1);
         let job_id: String = row.get(2);
         let agent_id: String = row.get(3);
-        let plan_id: String = row.get(4);
-        let timeline_id: String = row.get(5);
-        let result: Option<String> = row.get(6);
-        let claimed_at: Option<i64> = row.get(8);
-        let started_at: Option<i64> = row.get(9);
+        let timeline_id: String = row.get(4);
+        let result: Option<String> = row.get(5);
+        let claimed_at: Option<i64> = row.get(7);
+        let started_at: Option<i64> = row.get(8);
         let agent_job_id = parse_uuid(&agent_id);
+        let (plan_id, plan_type) = plan_fields(agent_job_id);
         tx.insert_request(TaskAgentJobRequestRecord {
             request_id: row.get(0),
             run_id: parse_run_id(&run_id),
             job_id: JobId(job_id),
             agent_job_id,
             plan_id,
-            plan_type: String::new(),
+            plan_type,
             timeline_id: parse_uuid(&timeline_id),
             result: result.as_deref().map(status_parse),
             locked_until: String::new(),
             claimed_at: claimed_at.map(us_to_system),
-            owner_runner_id: row.get(7),
+            owner_runner_id: row.get(6),
             started_at: started_at.map(us_to_system),
             last_renewed_at: None,
             timeout_triggered: false,
@@ -3728,26 +3734,21 @@ async fn write_txstate(
                 // foreign keys resolve.
                 (None, SessionProtocol::Compat)
             };
-        // Seal the session AES key (see the SQLite backend's write_session).
-        let encryption = tx
-            .session_keys
-            .get(session_id)
-            .map(|e| cipher.seal(&e.key))
-            .transpose()
-            .map_err(ControlError::backend)?;
+        // No key column: session AES keys are HKDF-derived from the cluster
+        // key + session id (see `state.rs::session_encryption`), so nothing
+        // is persisted.
         conn.execute(
-            "INSERT INTO runner_sessions (session_id, runner_id, protocol, encryption_blob, \
+            "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
              active_request_id, last_seen_at_us, verified, created_at_us) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7) \
              ON CONFLICT(session_id) DO UPDATE SET runner_id=excluded.runner_id, \
-             protocol=excluded.protocol, encryption_blob=excluded.encryption_blob, \
+             protocol=excluded.protocol, \
              active_request_id=excluded.active_request_id, \
              last_seen_at_us=excluded.last_seen_at_us, verified=excluded.verified",
             &[
                 session_id,
                 &runner_id,
                 &protocol.as_str(),
-                &encryption,
                 &tx.session_active_requests.get(session_id).copied(),
                 &tx.session_last_seen
                     .get(session_id)
@@ -4218,41 +4219,28 @@ impl ControlBackend for PostgresBackend {
         self.acquire_impl(request_id, Some(runner_id)).await
     }
 
-    async fn store_request_message(
+    async fn record_token_request(
         &self,
         run_id: RunId,
         request_id: i64,
-        message: Option<&preloop_gha_protocol::azdo::AgentJobRequestMessage>,
-        token_request: Option<&crate::models::GitHubTokenRequest>,
+        token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError> {
-        let message_blob = message.map(|m| unblob(&self.cipher, m)).transpose()?;
-        let job_timeout = message.and_then(|m| m.job_timeout);
-        let token_blob = token_request.map(|t| unblob(&self.cipher, t)).transpose()?;
+        let token_blob = unblob(&self.cipher, token_request)?;
         let mut client = self.checkout_writer().await?;
         let result = async {
             let tx = client.transaction().await.map_err(ControlError::backend)?;
-            // Serializes against any scoped write-back on the request's run.
+            // Serializes against any scoped write-back on the request's run:
+            // a write-back deletes `github_token_requests` rows absent from its
+            // working set, so an unlocked upsert could be lost.
             lock_runs(&tx, std::iter::once(&run_id)).await?;
-            if let Some(message_blob) = message_blob {
-                tx.execute(
-                    "UPDATE job_requests SET request_blob = $1, \
-                     job_timeout_s = COALESCE($2, job_timeout_s) \
-                     WHERE request_id = $3",
-                    &[&message_blob, &job_timeout, &request_id],
-                )
-                .await
-                .map_err(ControlError::backend)?;
-            }
-            if let Some(blob) = token_blob {
-                tx.execute(
-                    "INSERT INTO github_token_requests (request_id, request_blob) \
-                     VALUES ($1,$2) ON CONFLICT(request_id) \
-                     DO UPDATE SET request_blob = excluded.request_blob",
-                    &[&request_id, &blob],
-                )
-                .await
-                .map_err(ControlError::backend)?;
-            }
+            tx.execute(
+                "INSERT INTO github_token_requests (request_id, request_blob) \
+                 VALUES ($1,$2) ON CONFLICT(request_id) \
+                 DO UPDATE SET request_blob = excluded.request_blob",
+                &[&request_id, &token_blob],
+            )
+            .await
+            .map_err(ControlError::backend)?;
             tx.commit().await.map_err(ControlError::backend)
         }
         .await;
@@ -4768,8 +4756,8 @@ impl ControlBackend for PostgresBackend {
     }
 
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError> {
-        const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
-            plan_type, timeline_id, result, locked_until, claimed_at_us, owner_runner_id,
+        const COLUMNS: &str = "SELECT request_id, run_id, job_id, agent_job_id,
+            timeline_id, result, locked_until, claimed_at_us, owner_runner_id,
             started_at_us, last_renewed_at_us, timeout_triggered, debug_token_issued
             FROM job_requests";
         let client = self.checkout_reader().await?;
@@ -4784,7 +4772,7 @@ impl ControlBackend for PostgresBackend {
                     client
                         .query_opt(
                             &format!(
-                                "{COLUMNS} WHERE plan_id = $1 ORDER BY request_id DESC LIMIT 1"
+                                "{COLUMNS} WHERE agent_job_id = $1 ORDER BY request_id DESC LIMIT 1"
                             ),
                             &[plan],
                         )
@@ -4822,22 +4810,24 @@ impl ControlBackend for PostgresBackend {
             }
             .map_err(ControlError::backend)?
             .ok_or_else(|| ControlError::NotFound("request".to_owned()))?;
+            let agent_job_id = parse_uuid(&row.get::<_, String>(3));
+            let (plan_id, plan_type) = plan_fields(agent_job_id);
             Ok(TaskAgentJobRequestRecord {
                 request_id: row.get(0),
                 run_id: parse_run_id(&row.get::<_, String>(1)),
                 job_id: JobId(row.get(2)),
-                agent_job_id: parse_uuid(&row.get::<_, String>(3)),
-                plan_id: row.get(4),
-                plan_type: row.get(5),
-                timeline_id: parse_uuid(&row.get::<_, String>(6)),
-                result: row.get::<_, Option<String>>(7).as_deref().map(status_parse),
-                locked_until: row.get(8),
-                claimed_at: row.get::<_, Option<i64>>(9).map(us_to_system),
-                owner_runner_id: row.get(10),
-                started_at: row.get::<_, Option<i64>>(11).map(us_to_system),
-                last_renewed_at: row.get::<_, Option<i64>>(12).map(us_to_system),
-                timeout_triggered: row.get::<_, i64>(13) != 0,
-                debug_token_issued: row.get::<_, i64>(14) != 0,
+                agent_job_id,
+                plan_id,
+                plan_type,
+                timeline_id: parse_uuid(&row.get::<_, String>(4)),
+                result: row.get::<_, Option<String>>(5).as_deref().map(status_parse),
+                locked_until: row.get(6),
+                claimed_at: row.get::<_, Option<i64>>(7).map(us_to_system),
+                owner_runner_id: row.get(8),
+                started_at: row.get::<_, Option<i64>>(9).map(us_to_system),
+                last_renewed_at: row.get::<_, Option<i64>>(10).map(us_to_system),
+                timeout_triggered: row.get::<_, i64>(11) != 0,
+                debug_token_issued: row.get::<_, i64>(12) != 0,
             })
         }
         .await;
@@ -5094,14 +5084,14 @@ impl ControlBackend for PostgresBackend {
         let result = async {
             let rows = client
                 .query(
-                    "SELECT request_id, run_id, job_id, agent_job_id, plan_id,
-                            plan_type, timeline_id, result, locked_until, claimed_at_us,
+                    "SELECT request_id, run_id, job_id, agent_job_id,
+                            timeline_id, result, locked_until, claimed_at_us,
                             owner_runner_id, started_at_us, last_renewed_at_us,
                             timeout_triggered, debug_token_issued
                      FROM job_requests WHERE run_id=$1
                      UNION ALL
                      SELECT h.request_id, h.run_id, h.job_id, h.agent_job_id,
-                            h.plan_id, '', h.timeline_id, h.result, '', h.claimed_at_us,
+                            h.timeline_id, h.result, '', h.claimed_at_us,
                             h.owner_runner_id, h.started_at_us, NULL::bigint, 0, 0
                      FROM attempt_history h JOIN runs r ON r.run_id=h.run_id
                      WHERE r.archived_at_us IS NOT NULL AND h.run_attempt=r.run_attempt
@@ -5113,22 +5103,26 @@ impl ControlBackend for PostgresBackend {
                 .map_err(ControlError::backend)?;
             Ok(rows
                 .iter()
-                .map(|row| TaskAgentJobRequestRecord {
-                    request_id: row.get(0),
-                    run_id: parse_run_id(&row.get::<_, String>(1)),
-                    job_id: JobId(row.get(2)),
-                    agent_job_id: parse_uuid(&row.get::<_, String>(3)),
-                    plan_id: row.get(4),
-                    plan_type: row.get(5),
-                    timeline_id: parse_uuid(&row.get::<_, String>(6)),
-                    result: row.get::<_, Option<String>>(7).as_deref().map(status_parse),
-                    locked_until: row.get(8),
-                    claimed_at: row.get::<_, Option<i64>>(9).map(us_to_system),
-                    owner_runner_id: row.get(10),
-                    started_at: row.get::<_, Option<i64>>(11).map(us_to_system),
-                    last_renewed_at: row.get::<_, Option<i64>>(12).map(us_to_system),
-                    timeout_triggered: row.get::<_, i64>(13) != 0,
-                    debug_token_issued: row.get::<_, i64>(14) != 0,
+                .map(|row| {
+                    let agent_job_id = parse_uuid(&row.get::<_, String>(3));
+                    let (plan_id, plan_type) = plan_fields(agent_job_id);
+                    TaskAgentJobRequestRecord {
+                        request_id: row.get(0),
+                        run_id: parse_run_id(&row.get::<_, String>(1)),
+                        job_id: JobId(row.get(2)),
+                        agent_job_id,
+                        plan_id,
+                        plan_type,
+                        timeline_id: parse_uuid(&row.get::<_, String>(4)),
+                        result: row.get::<_, Option<String>>(5).as_deref().map(status_parse),
+                        locked_until: row.get(6),
+                        claimed_at: row.get::<_, Option<i64>>(7).map(us_to_system),
+                        owner_runner_id: row.get(8),
+                        started_at: row.get::<_, Option<i64>>(9).map(us_to_system),
+                        last_renewed_at: row.get::<_, Option<i64>>(10).map(us_to_system),
+                        timeout_triggered: row.get::<_, i64>(11) != 0,
+                        debug_token_issued: row.get::<_, i64>(12) != 0,
+                    }
                 })
                 .collect())
         }
@@ -5176,7 +5170,7 @@ impl ControlBackend for PostgresBackend {
             let tx = client.transaction().await.map_err(ControlError::backend)?;
             let Some(row) = tx
                 .query_opt(
-                    "SELECT request_id, run_id, plan_id, debug_token_issued \
+                    "SELECT request_id, run_id, agent_job_id, debug_token_issued \
                      FROM job_requests WHERE agent_job_id=$1 AND result IS NULL \
                      ORDER BY request_id DESC LIMIT 1",
                     &[&agent],
@@ -5466,8 +5460,8 @@ impl ControlBackend for PostgresBackend {
         let result = async {
             let rows = client
                 .query(
-                    "SELECT plan_id, run_id FROM job_requests \
-                     WHERE plan_id = ANY($1) ORDER BY request_id DESC",
+                    "SELECT agent_job_id, run_id FROM job_requests \
+                     WHERE agent_job_id = ANY($1) ORDER BY request_id DESC",
                     &[&plan_ids],
                 )
                 .await
@@ -5682,7 +5676,7 @@ impl ControlBackend for PostgresBackend {
         let result = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM job_requests \
-                 WHERE run_id = $1 AND plan_id = $2 AND agent_job_id = $3)",
+                 WHERE run_id = $1 AND agent_job_id = $3)",
                 &[&run_id.0.to_string(), &plan_id, &agent_job_id.to_string()],
             )
             .await
@@ -5757,7 +5751,7 @@ impl ControlBackend for PostgresBackend {
                     "SELECT q.run_id, q.job_id, j.status = 'cancelled' \
                      FROM job_requests q JOIN jobs j \
                        ON j.run_id = q.run_id AND j.job_id = q.job_id \
-                     WHERE q.plan_id = $1 ORDER BY q.request_id DESC LIMIT 1",
+                     WHERE q.agent_job_id = $1 ORDER BY q.request_id DESC LIMIT 1",
                     &[&plan],
                 )
                 .await
@@ -6198,8 +6192,8 @@ impl ControlBackend for PostgresBackend {
             .query_opt(
                 "SELECT r.request_id, r.run_id, r.job_id, r.agent_job_id, j.status \
                  FROM job_requests r LEFT JOIN jobs j ON j.run_id = r.run_id AND j.job_id = r.job_id \
-                 WHERE r.plan_id = $1 OR r.timeline_id = $2 OR r.agent_job_id = $3 \
-                 ORDER BY (r.plan_id = $1) DESC, r.request_id DESC LIMIT 1",
+                 WHERE r.agent_job_id = $1 OR r.timeline_id = $2 OR r.agent_job_id = $3 \
+                 ORDER BY (r.agent_job_id = $1) DESC, r.request_id DESC LIMIT 1",
                 &[&plan_id, &timeline, &agent],
             )
             .await
@@ -6230,8 +6224,10 @@ impl ControlBackend for PostgresBackend {
             .and_then(|row| {
                 row.map(|row| {
                     let sealed: Vec<u8> = row.get(0);
-                    let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
-                    Ok(map.into_values().collect())
+                    let json: serde_json::Value = blob(&self.cipher, &sealed)?;
+                    let stored =
+                        super::rows::decode_stored_secrets(json).map_err(ControlError::backend)?;
+                    Ok(stored.secrets.into_values().collect())
                 })
                 .transpose()
             });
@@ -6249,8 +6245,10 @@ impl ControlBackend for PostgresBackend {
             let mut values = Vec::new();
             for row in rows {
                 let sealed: Vec<u8> = row.get(0);
-                let map: BTreeMap<String, String> = blob(&self.cipher, &sealed)?;
-                values.extend(map.into_values());
+                let json: serde_json::Value = blob(&self.cipher, &sealed)?;
+                let stored =
+                    super::rows::decode_stored_secrets(json).map_err(ControlError::backend)?;
+                values.extend(stored.secrets.into_values());
             }
             Ok(values)
         }
@@ -6436,12 +6434,7 @@ impl ControlBackend for PostgresBackend {
         &self,
         session_id: &str,
         runner_id: i64,
-        encryption: &SessionEncryption,
     ) -> Result<(), ControlError> {
-        let sealed = self
-            .cipher
-            .seal(&encryption.key)
-            .map_err(ControlError::backend)?;
         let mut client = self.checkout_writer().await?;
         let result = async {
             let tx = client.transaction().await.map_err(ControlError::backend)?;
@@ -6459,13 +6452,11 @@ impl ControlBackend for PostgresBackend {
             }
             tx.execute(
                 "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
-                 encryption_blob, created_at_us) VALUES ($1, $2, 'broker', $3, $4) \
-                 ON CONFLICT(session_id) DO UPDATE SET runner_id = excluded.runner_id, \
-                 encryption_blob = excluded.encryption_blob",
+                 created_at_us) VALUES ($1, $2, 'broker', $3) \
+                 ON CONFLICT(session_id) DO UPDATE SET runner_id = excluded.runner_id",
                 &[
                     &session_id,
                     &runner_id,
-                    &sealed,
                     &system_to_us(std::time::SystemTime::now()),
                 ],
             )
@@ -6821,7 +6812,7 @@ impl ControlBackend for PostgresBackend {
         let client = self.checkout_reader().await?;
         let result = client
             .query(
-                "SELECT DISTINCT plan_id FROM job_requests WHERE result IS NULL",
+                "SELECT DISTINCT agent_job_id FROM job_requests WHERE result IS NULL",
                 &[],
             )
             .await

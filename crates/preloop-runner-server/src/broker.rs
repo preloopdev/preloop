@@ -458,12 +458,12 @@ pub async fn broker_session_root(
         // Authentication and insertion must share a final registration check:
         // the liveness sweep may have purged this runner after token
         // validation but before the insert — so both run in ONE backend
-        // transaction.
-        let encryption = SessionEncryption::generate();
+        // transaction. No key is stored: broker messages are unencrypted and
+        // the AzDO session key is derived from the session id.
         shared
             .state
             .backend
-            .create_broker_session(&session_id, runner_id, &encryption)
+            .create_broker_session(&session_id, runner_id)
             .await
             .map_err(|e| match e {
                 ControlError::Forbidden(m) => ApiError::unauthorized(m),
@@ -816,12 +816,54 @@ pub async fn broker_acquire_job(
     let mut message = ctx.message;
     let github_token_request = ctx.token_request;
     let id_token_granted = ctx.id_token_granted;
-    // *same* conditions the job was built with — the original permission set
-    // (fork profile included) and its fallback restrictions. Rebuilding from
-    // the message would lose both: the default permission set is wider than
-    // many jobs' declared set, and the untrusted flag cannot be recovered.
+    // The stored message is a secret-free template: fill `variables` (plus
+    // value-derived mask hints) from the SecretProvider scoped to the run,
+    // then serialize — the filled message is never written back.
+    let filled = crate::message_template::fill_template(
+        &mut message,
+        shared.state.secret_provider.as_ref(),
+        &ctx.repository,
+        &ctx.run_secrets,
+    )
+    .map_err(|error| ApiError::internal(format!("fill job message template: {error}")))?;
+    if !filled.names.is_empty() {
+        tracing::debug!(
+            request_id,
+            secrets = filled.names.len(),
+            "filled secret variables into job message at acquire"
+        );
+    }
+    // Fork restriction needs the trust tier + declared permissions; both are
+    // recoverable without the build-time request. The submission stores the
+    // tier as a plain kebab-case string ("untrusted-fork-pull-request"), not
+    // JSON — `from_value` on a JSON string value decodes it correctly.
+    let tier = ctx
+        .trust_tier
+        .as_deref()
+        .and_then(|tier| serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok());
+    // The job's resolved permission set lives in the persisted
+    // `system.github.token.permissions` variable (PascalCase wire spelling).
+    // The event payload's `workflow_job` key is absent for push/PR/dispatch
+    // events, so reading it there would fall back to the broad default and
+    // grant scopes the workflow withheld. The wire spelling converts back to
+    // kebab-case — minting with PascalCase keys fails (or falls back to the
+    // broad PAT).
+    let wire_permissions = message
+        .variables
+        .get("system.github.token.permissions")
+        .and_then(|variable| variable.value.as_deref())
+        .and_then(|json| serde_json::from_str::<BTreeMap<String, String>>(json).ok())
+        .map(|permissions| {
+            permissions
+                .into_iter()
+                .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
+                .collect::<BTreeMap<_, _>>()
+        });
+    let mut token_applied = false;
+    let mut token_untrusted = false;
     let token_request = github_token_request;
     if let Some(token_request) = token_request {
+        token_untrusted = token_request.untrusted;
         tracing::info!(
             request_id,
             repository = %token_request.repository,
@@ -847,19 +889,13 @@ pub async fn broker_acquire_job(
                 "minted dispatch GitHub token at claim"
             );
             apply_minted_token_to_message(&mut message, &minted, false);
+            token_applied = true;
         }
         // The token request stays registered for the job's lifetime so a
         // re-claim re-mints under the build-time conditions (permission set
-        // and fallback restrictions). `fail_unclaimable_request`,
-        // `complete_job_inner` (claimed-job completion paths funnel there)
-        // and `retire_node_requests` remove it once the job is terminal;
-        // see the `distributed_task.rs` completion path for the known gap.
-        shared
-            .state
-            .backend
-            .store_request_message(run_id, request_id, Some(&message), None)
-            .await
-            .map_err(ApiError::from)?;
+        // and fallback restrictions). The filled message is NOT stored back:
+        // `request_blob` holds the secret-free template and re-claims
+        // re-fill + re-mint identically.
     } else {
         // A token request registered at build time can be lost when the
         // process dies before the next store snapshot flush (jobs enqueued
@@ -872,40 +908,6 @@ pub async fn broker_acquire_job(
         let derived = if shared.state.github_app.is_none() {
             None
         } else {
-            // The submission stores the tier as a plain kebab-case string
-            // (e.g. "untrusted-fork-pull-request"), not JSON. `from_str`
-            // expects JSON and would reject the bare string, yielding `None`
-            // — which `job_authorization` treats as trusted, silently
-            // un-restricting a fork job's token. Parse via a JSON string
-            // value so the kebab-case variant decodes.
-            let tier = ctx.trust_tier.as_deref().and_then(|tier| {
-                serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
-            });
-            // The job's resolved permission set lives in the persisted
-            // message's `system.github.token.permissions` variable
-            // (PascalCase wire spelling) — the same variable the build path
-            // wrote from `JobPlan` permissions. The event payload's
-            // `workflow_job` key is absent for push/PR/dispatch events, so
-            // reading it there would fall back to the broad default and
-            // grant scopes the workflow withheld. Recover from the message
-            // instead, converting the wire spelling back to kebab-case for
-            // the token request.
-            let wire_permissions = message
-                .variables
-                .get("system.github.token.permissions")
-                .and_then(|variable| variable.value.as_deref())
-                .and_then(|json| serde_json::from_str::<BTreeMap<String, String>>(json).ok());
-            // The wire variable spells scopes PascalCase ("PullRequests");
-            // the installation-token request and `job_authorization` expect
-            // the workflow's kebab-case identities ("pull-requests").
-            // Minting with PascalCase keys fails (or falls back to the broad
-            // PAT), so convert every key before building the request.
-            let wire_permissions = wire_permissions.map(|permissions| {
-                permissions
-                    .into_iter()
-                    .map(|(scope, level)| (wire_scope_to_kebab(&scope), level))
-                    .collect::<BTreeMap<_, _>>()
-            });
             // The wire variable carries repository-token scopes only; the
             // OIDC grant is persisted per job. Fall back to the old wire
             // marker so jobs queued before this renderer change can still
@@ -928,12 +930,14 @@ pub async fn broker_acquire_job(
                 declared.as_ref(),
                 id_token_granted,
             );
-            Some(crate::models::GitHubTokenRequest {
+            let request = crate::models::GitHubTokenRequest {
                 repository: ctx.repository.clone(),
                 permissions: policy.app_permissions,
                 declared: declared.is_some(),
                 untrusted: policy.fork_restricted,
-            })
+            };
+            token_untrusted = request.untrusted;
+            Some(request)
         };
         if let Some(token_request) = derived {
             // Register the derived request so a re-claim after a disconnect
@@ -941,7 +945,7 @@ pub async fn broker_acquire_job(
             shared
                 .state
                 .backend
-                .store_request_message(run_id, request_id, None, Some(&token_request))
+                .record_token_request(run_id, request_id, &token_request)
                 .await
                 .map_err(ApiError::from)?;
             tracing::info!(
@@ -962,14 +966,61 @@ pub async fn broker_acquire_job(
                     "minted re-derived dispatch GitHub token at claim"
                 );
                 apply_minted_token_to_message(&mut message, &minted, true);
-                shared
-                    .state
-                    .backend
-                    .store_request_message(run_id, request_id, Some(&message), None)
-                    .await
-                    .map_err(ApiError::from)?;
+                token_applied = true;
             }
         }
+    }
+    if !token_applied {
+        // The build wrote empty `isSecret` slots for `github_token` /
+        // `system.github.token`; with no App mint (untrusted fork, no App,
+        // or a mint that legitimately answered None) the job keeps its
+        // job-scoped runtime token — the credential a fork job may hold is
+        // this control-plane JWT, never the repository-unscoped PAT.
+        let runtime = shared
+            .state
+            .mint_runtime_token(&message.plan.plan_id, &message.job_id);
+        // Fork-restricted tiers get the runtime token even when no request
+        // exists to say so (no App): `job_authorization` answers
+        // `fork_restricted` for untrusted tiers regardless of declared
+        // permissions.
+        let fork_restricted = token_untrusted
+            || crate::events::trust_tier::job_authorization(
+                tier,
+                wire_permissions.as_ref(),
+                ctx.id_token_granted.unwrap_or(false),
+            )
+            .fork_restricted;
+        let default_token = if fork_restricted {
+            runtime
+        } else {
+            // A static PAT is embedded only when its OAuth scopes were
+            // verified at submit (scope cache warm); unverifiable authority
+            // stays withheld and the job keeps the runtime token.
+            shared
+                .state
+                .static_github_pat()
+                .and_then(|pat| {
+                    crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes))
+                })
+                .map(|(pat, scopes)| {
+                    message.variables.insert(
+                        "system.github.token.pat_scopes".to_owned(),
+                        preloop_gha_protocol::azdo::VariableValue::new(
+                            crate::runs::pat_scopes_wire_value(&scopes),
+                        ),
+                    );
+                    pat
+                })
+                .unwrap_or(runtime)
+        };
+        apply_minted_token_to_message(
+            &mut message,
+            &MintedGitHubToken {
+                token: default_token,
+                effective_permissions: None,
+            },
+            false,
+        );
     }
     // The snapshot checkout token is pinned onto the step at submission,
     // but a job can sit queued well past its ~50-minute lifetime. The
@@ -1104,7 +1155,7 @@ pub struct MintedGitHubToken {
 /// and the re-derived-request fallback, which had already diverged (the
 /// fallback lost the success log). `re_derived` only tailors the log wording:
 /// the derived path historically logged no success line.
-fn apply_minted_token_to_message(
+pub(crate) fn apply_minted_token_to_message(
     message: &mut azdo::AgentJobRequestMessage,
     minted: &MintedGitHubToken,
     re_derived: bool,
