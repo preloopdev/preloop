@@ -691,8 +691,8 @@ impl PgBackend {
     pub(super) async fn sweep_stale_bindings(&self) -> Result<usize, ControlError> {
         let (pool_on, require_on, _) = self.config();
         let now = now_us();
-        let assignment_cutoff = now - crate::control::sched::ASSIGNMENT_TTL.as_micros() as i64;
-        let binding_cutoff = now - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+        let assignment_cutoff = now - crate::control::logic::ASSIGNMENT_TTL.as_micros() as i64;
+        let binding_cutoff = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         let mut swept = 0u64;

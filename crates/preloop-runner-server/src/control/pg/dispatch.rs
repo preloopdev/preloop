@@ -15,7 +15,7 @@ use super::{db, lookups, PgBackend};
 use crate::concurrency;
 use crate::control::backend::{ExpansionApply, JobCompletionInput, PollRequest};
 use crate::control::logic;
-use crate::control::sched::{
+use crate::control::logic::{
     BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan, MatrixExpansionInputs,
     ReusableExpansionInputs,
 };
@@ -1044,7 +1044,7 @@ pub(super) enum GateOutcome {
 }
 
 /// Try to take a concurrency group for `holder`. Mirrors
-/// `sched::try_acquire_concurrency` including the stale-arrival check and
+/// `logic::try_acquire_concurrency` including the stale-arrival check and
 /// queue-mode displacement. Cancelling a foreign holder/parked waiters is
 /// the caller-visible side effect.
 pub(super) async fn acquire_gate(
@@ -4905,7 +4905,7 @@ impl PgBackend {
 ///
 /// Data assembly only: which nodes expand and when is `logic.rs`'s decision
 /// (`ExpansionDecision`), and the subtree itself is built by the shared
-/// `sched::build_expansion` outside the transaction. Needs outputs reuse the
+/// `logic::build_expansion` outside the transaction. Needs outputs reuse the
 /// shared `runtime_scheduling::matching_need_ids` fan-out.
 fn expansion_plan(graph: &RunGraph, job: &QueuedJob) -> Option<ExpansionPlan> {
     let record = &graph.record;

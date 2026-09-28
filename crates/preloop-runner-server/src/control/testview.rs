@@ -221,7 +221,7 @@ impl TestState {
 
     /// Iterate the global ready queue: every persisted ready row
     /// (`ready_index`) followed by jobs this transaction newly enqueued
-    /// (`queue`). Mirrors [`crate::control::sched::ready_jobs`]; the method
+    /// (`queue`). The method
     /// form auto-borrows, so it works on owned and `&mut` receivers alike.
     pub(crate) fn ready(&self) -> impl Iterator<Item = &QueuedJob> {
         self.ready_index.iter().chain(self.queue.iter())

@@ -23,12 +23,10 @@
 pub(crate) use crate::*;
 
 pub mod backend;
-pub mod commands;
 pub(crate) mod lite;
 pub(crate) mod logic;
 pub(crate) mod pg;
 pub mod rows;
-pub mod sched;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

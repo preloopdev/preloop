@@ -1,9 +1,8 @@
 //! The promotion sweep: move blocked jobs to `ready` (or terminal) once
 //! `needs:` settle, evaluating job/jobset gates and max-parallel in SQL.
 //!
-//! Direct translation of `sched::promote_ready_jobs` / `dependency_decision`
-//! / `try_acquire_job_gate` / `caller_jobset_gates` +
-//! `advance_jobset_admission` over the new tables. `jobs.status` carries the
+//! Dependency verdicts come from `logic::dependency_decision`. `jobs.status`
+//! carries the
 //! workflow truth; `queue_state` is the derived dispatch copy.
 
 use super::codec::{self, now_us};

@@ -3,8 +3,7 @@
 //! runs), `sweep_stale_bindings` (dispatch-intent hygiene), and
 //! `status_inputs` (operational status reads).
 //!
-//! Translated from `commands::reap_sweep_tx`/`status_inputs_tx` (the old
-//! TxState model) and the SQLite shapes of the same reads. Starvation
+//! Reaper sweeps and status reads over the agreed tables. Starvation
 //! first-seen marks are node-local (decisions-5 B2): the caller passes them
 //! in `ReapSweep::first_seen`; nothing about them is persisted.
 
@@ -221,7 +220,7 @@ impl LiteBackend {
         })
     }
 
-    /// `reap_sweep` (`commands::reap_sweep_tx` over SQL): starvation verdicts
+    /// `reap_sweep`: starvation verdicts
     /// over the caller's node-local marks, job `timeout-minutes` enforcement (queued
     /// cancellations), lease-expiry failure. Rows outside `sweep.runs` are
     /// never written.
@@ -380,8 +379,8 @@ impl LiteBackend {
         let (pool_on, require_on, _liveness) = self.config();
         self.write(move |tx| {
             let now = now_us();
-            let assignment_cutoff = now - crate::control::sched::ASSIGNMENT_TTL.as_micros() as i64;
-            let binding_cutoff = now - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+            let assignment_cutoff = now - crate::control::logic::ASSIGNMENT_TTL.as_micros() as i64;
+            let binding_cutoff = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
             let mut swept = 0usize;
             if pool_on {
                 for sql in [
@@ -446,7 +445,7 @@ impl LiteBackend {
         })
     }
 
-    /// `status_inputs` (`commands::status_inputs_tx` over SQL): the
+    /// `status_inputs`: the
     /// operational status read — run counts, queue depths, runner
     /// activity, concurrency-group gauges.
     pub(crate) async fn status_inputs(

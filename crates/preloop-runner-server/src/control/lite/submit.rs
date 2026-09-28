@@ -2,8 +2,7 @@
 //! concurrency gate, per-job gates, and the unhostable-platform check, then
 //! run the promotion sweep for `needs:`-gated jobs.
 //!
-//! Translation of `commands::submit_run_tx` over the agreed tables. The
-//! working set is gone: every classification is written directly onto `jobs`
+//! `submit_run` over the agreed tables: every classification is written directly onto `jobs`
 //! (`status` = workflow truth, `queue_state` = dispatch copy).
 
 use super::codec::{self, now_us};
@@ -356,7 +355,7 @@ fn submit_run_tx(
 
         // Unhostable platform: no registered runner can ever take this job.
         let unhostable = if check_hostable {
-            crate::control::sched::unhostable_platform(&job.runs_on, platforms.iter().copied())
+            crate::control::logic::unhostable_platform(&job.runs_on, platforms.iter().copied())
         } else {
             None
         };

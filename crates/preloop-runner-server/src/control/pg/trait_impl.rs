@@ -3,7 +3,7 @@
 //! `dispatch`, `lifecycle`, `graph`).
 
 use crate::control::backend::*;
-use crate::control::sched::SchedulingOutcome;
+use crate::control::logic::SchedulingOutcome;
 use crate::control::types::*;
 use crate::models::{
     PushState, RunRecord, TaskAgentJobRequestRecord, WebhookDeliveryRecord, WebhookDeliveryStatus,

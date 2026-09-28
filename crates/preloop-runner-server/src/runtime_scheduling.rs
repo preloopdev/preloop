@@ -738,7 +738,7 @@ pub async fn drain_expansions(shared: &Arc<SharedState>) -> SchedulingOutcome {
         // one runner message per tx job, mint runtime tokens. Runs against
         // SharedState, never inside the scheduling transaction.
         let built = match claim.plan {
-            Some(plan) => crate::control::sched::build_expansion(shared, plan),
+            Some(plan) => crate::control::logic::build_expansion(shared, plan),
             None => {
                 tracing::warn!(
                     run_id = %claim.job.run_id,

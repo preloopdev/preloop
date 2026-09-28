@@ -4,9 +4,10 @@
 //! This is the only surface the server sees for durable control state.
 //! Handlers parse requests and map domain results onto wire responses; they
 //! never touch a transaction handle, a SQL string, or a mutable record. A
-//! backend runs each command as one transaction: load the working set, run
-//! the shared scheduling logic ([`crate::control::sched`]), write the delta
-//! back, return the domain result.
+//! backend runs each command as one short transaction of targeted SQL
+//! (conditional updates, no working-set load or write-back), calling the
+//! shared decision functions in [`crate::control::logic`] where Rust
+//! evaluation is needed, and returns the domain result.
 //!
 //! SQLite is the default backend (single writer, `BEGIN IMMEDIATE`, WAL).
 //! Postgres implements the identical contract for shared-node deployments
@@ -14,7 +15,7 @@
 //! Both produce the same domain results from the same inputs — the shared
 //! behavioral suite in `control::tests` proves it.
 
-use super::sched::{BuiltExpansion, SchedulingOutcome};
+use super::logic::{BuiltExpansion, SchedulingOutcome};
 use super::types::*;
 use crate::models::{
     JobDetail, PushState, QueuedJob, RunRecord, StepRecord, TaskAgentJobRequestRecord,
@@ -782,7 +783,7 @@ pub(crate) trait ControlBackend: Send + Sync {
     // must call instead of re-deriving it.
 
     /// Pair an engine-authorized, freshly registered runner with the pending
-    /// pool job it can serve (`sched::pair_registered_runner`). No-op unless
+    /// pool job it can serve. No-op unless
     /// pool assignments or strict job assignments are enabled. Otherwise, in
     /// order: mark the runner pool-proven; if the runner row is missing stop
     /// there; (pool assignments only) every assignment whose binding is
@@ -830,7 +831,7 @@ pub(crate) trait ControlBackend: Send + Sync {
     ) -> Result<bool, ControlError>;
 
     /// Check `guard` and purge `runner_id` in one transaction (see
-    /// [`PurgeGuard`]). Purging (`commands::purge_runner_tx`) deletes the
+    /// [`PurgeGuard`]). Purging deletes the
     /// runner, its client ids, RSA key and pool-proven mark, deletes every
     /// session it owns (each like `delete_session`: active request released
     /// for retry, queued messages dropped), requeues every claimed job it
@@ -914,7 +915,7 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Re-derive dispatch intent for every ready job after the effective
     /// scheduling config becomes known at boot: for each ready job in queue
-    /// order apply `sched::on_job_enqueued` (config-gated and idempotent:
+    /// order apply the enqueue binding (config-gated and idempotent:
     /// a job with an assignment is untouched; otherwise bind it to an idle
     /// matching runner that owns a session — pool-proven only when pool
     /// assignments are on — else, with pool assignments on, mark it
@@ -938,7 +939,7 @@ pub(crate) trait ControlBackend: Send + Sync {
     ///    otherwise → `Wait`.
     /// 5. Claim: the runner capabilities of the session's owner (unknown =
     ///    empty) choose a ready job via the claim preference
-    ///    (`sched::choose_claim_position` with `verified_runner_id`); none →
+    ///    (`logic::claim_preference` over `verified_runner_id`); none →
     ///    `Wait`. Otherwise remove it from the ready queue (drop its
     ///    assignment/pending mark), set job and run `in_progress`, bind the
     ///    session's active request to the job's attempt
@@ -977,7 +978,7 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// blocked/held). Job-level concurrency held by the job and by any
     /// finalized reusable caller is released (FIFO promotion of waiters),
     /// dependents are promoted, and every attempt of the job is settled with
-    /// the effective status (`sched::settle_request`: token request dropped,
+    /// the effective status (token request dropped,
     /// session unbound, moot cancellation messages dropped).
     ///
     /// A run whose only concurrency is workflow-level must not need global

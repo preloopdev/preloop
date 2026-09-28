@@ -189,7 +189,7 @@ fn claim_one(
         Option<i64>,
     );
     let now = now_us();
-    let fresh_after = now - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+    let fresh_after = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
     let rows: Vec<ReadyRow> = {
         let mut stmt = tx
             .prepare_cached(
@@ -250,7 +250,7 @@ fn claim_one(
         // only claimable when strict assignments are off.
         let enqueue_ceiling_expired = enqueued_at > 0
             && now.saturating_sub(enqueued_at)
-                >= crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+                >= crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
         // The old model swept stale bindings before checking in permissive
         // mode — a stale assignment/pool_pending row counts as absent there.
         let assignment = if !require_assignments && !assignment_fresh {

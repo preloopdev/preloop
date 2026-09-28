@@ -294,7 +294,7 @@ pub(crate) struct ExpansionClaim {
     pub(crate) job: QueuedJob,
     /// Generation the node was claimed under — the apply is fenced on it.
     pub(crate) generation: i64,
-    pub(crate) plan: Option<crate::control::sched::ExpansionPlan>,
+    pub(crate) plan: Option<crate::control::logic::ExpansionPlan>,
 }
 
 #[derive(Clone)]

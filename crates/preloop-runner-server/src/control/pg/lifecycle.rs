@@ -410,7 +410,7 @@ impl PgBackend {
             runner_group_name: row.get(2),
         };
         // Stale bindings on dead runners release back to the pending set.
-        let stale_ttl = crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+        let stale_ttl = crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
         let cutoff = now_us() - stale_ttl;
         tx.execute(
             concat!(

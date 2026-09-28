@@ -201,7 +201,7 @@ fn pair_runner_tx(
 
     // Release bindings on this runner, stale bindings, and bindings whose
     // runner is gone; each released job rejoins the pool waitlist at now.
-    let stale_cutoff = now_us() - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+    let stale_cutoff = now_us() - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
     let released: Vec<(String, String)> = {
         let mut stmt = tx
             .prepare_cached(

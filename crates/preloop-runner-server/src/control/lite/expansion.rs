@@ -15,7 +15,7 @@ use super::codec::{self, now_us};
 use super::jobs::{self, ReusableSpec};
 use super::{db, promote, settle, submit, LiteBackend};
 use crate::control::backend::ExpansionApply;
-use crate::control::sched::{
+use crate::control::logic::{
     BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan, MatrixExpansionInputs,
     ReusableExpansionInputs,
 };
