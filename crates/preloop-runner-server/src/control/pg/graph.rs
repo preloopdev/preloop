@@ -246,10 +246,7 @@ fn decode_context(text: &str) -> Result<preloop_gha_expressions::Context, Contro
 }
 
 fn decode_matrix(text: &str) -> Result<BTreeMap<String, serde_json::Value>, ControlError> {
-    Ok(
-        serde_json::from_str::<BTreeMap<String, serde_json::Value>>(text)
-            .map_err(ControlError::backend)?,
-    )
+    serde_json::from_str::<BTreeMap<String, serde_json::Value>>(text).map_err(ControlError::backend)
 }
 
 fn decode_reusable(text: &str) -> Result<ReusableNodeSpec, ControlError> {

@@ -13,11 +13,16 @@ use super::codec::{self, from_json, json, now_us, us};
 use super::graph::{self, queue_state_str, Node, NodeKind, ReusableNodeSpec, RunGraph};
 use super::{db, lookups, PgBackend};
 use crate::concurrency;
-use crate::control::backend::{JobCompletionInput, PollRequest};
+use crate::control::backend::{ExpansionApply, JobCompletionInput, PollRequest};
 use crate::control::logic;
+use crate::control::sched::{
+    BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan, MatrixExpansionInputs,
+    ReusableExpansionInputs,
+};
 use crate::control::types::{
-    status_str, ClaimedJob, CompleteOutcome, ControlError, JobSettled, PollOutcome, SessionMessage,
-    SettleJob, SettleJobOutcome, SubmitJob, SubmitOutcome, SubmitRun,
+    status_str, AzdoPoll, AzdoPollOutcome, ClaimedJob, CompleteOutcome, ControlError,
+    ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
+    SubmitJob, SubmitOutcome, SubmitRun,
 };
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use crate::runtime_scheduling::{self as sched_helpers, DependencyDecision, SchedulingOutcome};
@@ -198,13 +203,13 @@ async fn insert_spec_rows(
     let concurrency_json = node
         .concurrency
         .as_ref()
-        .map(|c| serde_json::to_string(c))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(ControlError::backend)?;
     let reusable_json = node
         .reusable
         .as_ref()
-        .map(|r| serde_json::to_string(r))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(ControlError::backend)?;
     tx.execute(
@@ -469,17 +474,16 @@ pub(super) async fn agent_job_id(
     run_id: RunId,
     job_id: &JobId,
 ) -> Result<Option<uuid::Uuid>, ControlError> {
-    Ok(tx
-        .query_opt(
-            "SELECT agent_job_id::text FROM job_requests \
-             WHERE run_id=$1::text::uuid AND job_id=$2 \
-             ORDER BY (result IS NULL) DESC, request_id DESC LIMIT 1",
-            &[&run_id.0.to_string(), &job_id.0],
-        )
-        .await
-        .map_err(db)?
-        .map(|row| codec::uuid(row.get(0)))
-        .transpose()?)
+    tx.query_opt(
+        "SELECT agent_job_id::text FROM job_requests \
+         WHERE run_id=$1::text::uuid AND job_id=$2 \
+         ORDER BY (result IS NULL) DESC, request_id DESC LIMIT 1",
+        &[&run_id.0.to_string(), &job_id.0],
+    )
+    .await
+    .map_err(db)?
+    .map(|row| codec::uuid(row.get(0)))
+    .transpose()
 }
 
 /// Enqueue a `job.cancellation` session message for the runner holding the
@@ -1304,7 +1308,7 @@ async fn promote_waiter(
         concurrency::Holder::Run(run_id) => {
             set_holder(
                 tx,
-                &namespace,
+                namespace,
                 key,
                 key.1.as_str(),
                 &GateHolder {
@@ -1322,7 +1326,7 @@ async fn promote_waiter(
             if !under {
                 park_waiter(
                     tx,
-                    &namespace,
+                    namespace,
                     key,
                     &GateHolder {
                         holder: holder.clone(),
@@ -1334,7 +1338,7 @@ async fn promote_waiter(
             }
             set_holder(
                 tx,
-                &namespace,
+                namespace,
                 key,
                 key.1.as_str(),
                 &GateHolder {
@@ -2476,7 +2480,7 @@ impl<'a> Sweep<'a> {
         job_id: &JobId,
         gates: &[JobSetGate],
     ) -> Result<i64, ControlError> {
-        let ids = serde_json::to_string(&[job_id.0.clone()]).unwrap_or_default();
+        let ids = serde_json::to_string(&[job_id.0.as_str()]).unwrap_or_default();
         let row = self
             .tx
             .query_opt(
@@ -3724,6 +3728,30 @@ impl PgBackend {
         })
     }
 
+    /// A registered runner's capabilities for matching (labels + group).
+    async fn runner_capabilities_row(
+        &self,
+        tx: &Transaction<'_>,
+        runner_id: i64,
+    ) -> Result<Option<RunnerCapabilities>, ControlError> {
+        tx.query_opt(
+            "SELECT labels::text, runner_group_id, runner_group_name \
+             FROM runners WHERE runner_id = $1",
+            &[&runner_id],
+        )
+        .await
+        .map_err(db)?
+        .map(|row| -> Result<RunnerCapabilities, ControlError> {
+            Ok(RunnerCapabilities {
+                known: true,
+                labels: codec::from_json(row.get::<_, String>(0).as_str())?,
+                runner_group_id: row.get(1),
+                runner_group_name: row.get(2),
+            })
+        })
+        .transpose()
+    }
+
     /// `poll_session`: redelivery, cancellation, active request, then a claim.
     pub(super) async fn poll_session(
         &self,
@@ -4315,4 +4343,541 @@ impl PgBackend {
             .get(0);
         Ok(pending)
     }
+}
+
+impl PgBackend {
+    /// `poll_azdo_session`: the distributedtask poll shape — redeliver, cancel,
+    /// then claim — returning the session message row the handler renders.
+    ///
+    /// Statements: session read + touch; `session_messages` oldest; active
+    /// request read; cancellation read/insert; the claim batch and its
+    /// conditional update; `job_requests`/`job_leases`/`job_assignments`
+    /// binding; the job-message insert.
+    pub(super) async fn poll_azdo_session(
+        &self,
+        poll: AzdoPoll,
+    ) -> Result<AzdoPollOutcome, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let Some(session) = self.session_ref(&tx, &poll.session_id).await? else {
+            // An unknown session is answered like a foreign one: the runner
+            // must re-register rather than receive work it cannot decode.
+            return Ok(AzdoPollOutcome::Forbidden);
+        };
+        if let Some(verified) = poll.verified_runner_id {
+            if session.runner_id != Some(verified) {
+                return Ok(AzdoPollOutcome::Forbidden);
+            }
+        }
+        self.touch_session_row(&tx, &session.session_uuid).await?;
+        if let Some(message) = self
+            .oldest_session_message(&tx, &session.session_uuid)
+            .await?
+        {
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Redeliver(message));
+        }
+        if let Some(request) = self
+            .session_active_request(&tx, &session.session_uuid)
+            .await?
+        {
+            if self
+                .pending_cancellation(&tx, request.request_id)
+                .await?
+                .is_some()
+            {
+                let message = self
+                    .queue_cancellation_message(
+                        &tx,
+                        &session.session_uuid,
+                        session.runner_id,
+                        request.request_id,
+                        request.agent_job_id,
+                    )
+                    .await?;
+                tx.commit().await.map_err(db)?;
+                return Ok(AzdoPollOutcome::Cancel(message));
+            }
+            // Still executing: the runner keeps polling until it finishes.
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Wait);
+        }
+        let caps = match session.runner_id {
+            Some(runner_id) => match self.runner_capabilities_row(&tx, runner_id).await? {
+                Some(caps) => caps,
+                None => {
+                    tx.commit().await.map_err(db)?;
+                    return Ok(AzdoPollOutcome::Wait);
+                }
+            },
+            // A compat session has no registered runner: its labels are
+            // unknown, which the shared matcher treats as permissive.
+            None => RunnerCapabilities {
+                known: false,
+                labels: Vec::new(),
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+        };
+        let Some((run_id, job_id)) = self.claim_one(&tx, session.runner_id, &caps).await? else {
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Wait);
+        };
+        let Some(request) = self
+            .bind_claim(
+                &tx,
+                run_id,
+                &job_id,
+                &session.session_uuid,
+                session.runner_id,
+            )
+            .await?
+        else {
+            tx.commit().await.map_err(db)?;
+            return Ok(AzdoPollOutcome::Wait);
+        };
+        let message = self
+            .queue_job_message(
+                &tx,
+                &session.session_uuid,
+                session.runner_id,
+                request.request_id,
+            )
+            .await?;
+        let mut graph = match PgBackend::load_graph(self, &tx, run_id).await? {
+            Some(graph) => graph,
+            None => {
+                tx.commit().await.map_err(db)?;
+                return Ok(AzdoPollOutcome::Wait);
+            }
+        };
+        let stamp = now_us();
+        if let Some(node) = graph.nodes.get_mut(&job_id) {
+            node.claimed_by_runner_id = session.runner_id;
+            node.claimed_at_us = Some(stamp);
+            node.started_at_us = Some(stamp);
+            graph
+                .record
+                .jobs
+                .insert(job_id.clone(), ExecutionStatus::InProgress);
+            graph.touched = true;
+            flush_node(&tx, run_id, &job_id, node).await?;
+        }
+        flush_run(&tx, &graph).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(AzdoPollOutcome::Claimed {
+            message,
+            run_id,
+            job_id,
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Expansion
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The build inputs a deferred node snapshots under its generation fence.
+///
+/// Data assembly only: which nodes expand and when is `logic.rs`'s decision
+/// (`ExpansionDecision`), and the subtree itself is built by the shared
+/// `sched::build_expansion` outside the transaction. Needs outputs reuse the
+/// shared `runtime_scheduling::matching_need_ids` fan-out.
+fn expansion_plan(graph: &RunGraph, job: &QueuedJob) -> Option<ExpansionPlan> {
+    let record = &graph.record;
+    let ctx = ExpansionContext {
+        run_id: job.run_id,
+        submission: graph.submission.clone(),
+        snapshot: record.workspace_snapshot.clone(),
+        github_json: record.github.clone(),
+        workflow_path: record.workflow_path_str.clone(),
+        workflow_ref: record.workflow_ref.clone(),
+        head_sha: record.head_sha.clone(),
+    };
+    let mut needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+    for need in &job.needs {
+        for matched in crate::runtime_scheduling::matching_need_ids(record, need) {
+            if let Some(outputs) = record.job_outputs.get(&matched) {
+                let base = record
+                    .job_base_ids
+                    .get(&matched)
+                    .cloned()
+                    .unwrap_or_else(|| need.0.clone());
+                needs_outputs
+                    .entry(base)
+                    .or_default()
+                    .extend(outputs.clone());
+            }
+        }
+    }
+    if let Some(call) = job.reusable_call.clone() {
+        let caller_plan = record.caller_plans.get(&job.job_id)?.clone();
+        return Some(ExpansionPlan::Reusable(Box::new(ReusableExpansionInputs {
+            ctx,
+            caller_id: job.job_id.clone(),
+            caller_plan,
+            call,
+            needs_outputs,
+        })));
+    }
+    let expression = job.deferred_matrix.clone()?;
+    let workflow_file = record
+        .caller_plans
+        .get(&job.job_id)
+        .and_then(|plan| plan.workflow_file.clone());
+    Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
+        ctx,
+        node_id: job.job_id.clone(),
+        base_id: job.base_id.clone(),
+        expression,
+        needs_outputs,
+        workflow_file,
+    })))
+}
+
+impl PgBackend {
+    /// `claim_expansion`: lease the oldest deferred node for a build.
+    ///
+    /// The lease bumps `expand_generation`; `apply_expansion` refuses a build
+    /// whose generation no longer matches, so a node cancelled or re-leased
+    /// while the build ran cannot fold a stale subtree in.
+    ///
+    /// Statements (one transaction): `SELECT .. FROM jobs WHERE queue_state =
+    /// 'pending_expansion' ORDER BY enqueued_at LIMIT 1 FOR UPDATE SKIP
+    /// LOCKED`; `UPDATE jobs SET queue_state = 'expanding', expand_generation
+    /// = expand_generation + 1 .. RETURNING expand_generation`; the graph load.
+    pub(super) async fn claim_expansion(&self) -> Result<Option<ExpansionClaim>, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let Some(row) = tx
+            .query_opt(
+                "SELECT run_id::text, job_id FROM jobs WHERE queue_state = 'pending_expansion' \
+                 ORDER BY enqueued_at NULLS FIRST, run_id, job_id LIMIT 1 \
+                 FOR UPDATE SKIP LOCKED",
+                &[],
+            )
+            .await
+            .map_err(db)?
+        else {
+            tx.commit().await.map_err(db)?;
+            return Ok(None);
+        };
+        let run_id = codec::run_id(&row.get::<_, String>(0))?;
+        let job_id = codec::job_id(row.get::<_, String>(1));
+        let generation: i64 = tx
+            .query_one(
+                "UPDATE jobs SET queue_state = 'expanding', \
+                 expand_generation = expand_generation + 1 \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 AND queue_state = 'pending_expansion' \
+                 RETURNING expand_generation::int8",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        let graph = match PgBackend::load_graph(self, &tx, run_id).await? {
+            Some(graph) => graph,
+            None => {
+                tx.commit().await.map_err(db)?;
+                return Ok(None);
+            }
+        };
+        let queued = self.queued_job(&tx, &graph, &job_id).await?;
+        let plan = queued.as_ref().and_then(|job| expansion_plan(&graph, job));
+        let job = queued.ok_or_else(|| {
+            // Every submitted/expanded node writes a message template; a
+            // missing one means the row was lost, not that expansion is
+            // optional.
+            ControlError::backend(anyhow::anyhow!("expansion node has no message template"))
+        })?;
+        tx.commit().await.map_err(db)?;
+        Ok(Some(ExpansionClaim {
+            job,
+            generation,
+            plan,
+        }))
+    }
+
+    /// `apply_expansion`: fold a built subtree in under the claim's generation
+    /// fence, then promote what it unblocked.
+    pub(super) async fn apply_expansion(
+        &self,
+        claim: ExpansionApply,
+    ) -> Result<SchedulingOutcome, ControlError> {
+        let run_id = claim.job.run_id;
+        let node_id = claim.job.job_id.clone();
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        if !PgBackend::lock_run(&tx, run_id).await? {
+            return Err(ControlError::NotFound(format!("run {run_id}")));
+        }
+        let current: Option<i64> = tx
+            .query_opt(
+                "SELECT expand_generation::int8 FROM jobs WHERE run_id = $1::text::uuid \
+                 AND job_id = $2 FOR UPDATE",
+                &[&run_id.0.to_string(), &node_id.0],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| row.get(0));
+        let Some(current) = current else {
+            tx.commit().await.map_err(db)?;
+            return Ok(SchedulingOutcome::default());
+        };
+        if current != claim.generation {
+            // Stale lease: the node was cancelled or re-leased while the build
+            // ran. Discard the subtree.
+            tx.commit().await.map_err(db)?;
+            return Ok(SchedulingOutcome::default());
+        }
+        let mut sweep = Sweep::new(self, &tx).await?;
+        let graph = PgBackend::load_graph(self, &tx, run_id)
+            .await?
+            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
+        sweep.graphs.insert(run_id, graph);
+        let built = match claim.built {
+            Ok(built) => built,
+            Err(status) => {
+                sweep.settle_node(run_id, &node_id, status).await?;
+                sweep.outcome.failed.push((run_id, node_id));
+                let outcome = std::mem::take(&mut sweep.outcome);
+                sweep.flush().await?;
+                tx.commit().await.map_err(db)?;
+                return Ok(outcome);
+            }
+        };
+        let jobs = match &built {
+            BuiltExpansion::Matrix { jobs } | BuiltExpansion::Reusable { jobs, .. } => jobs,
+        };
+        let job_count = jobs.len();
+        match built {
+            BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
+                // An empty matrix concludes the node as skipped.
+                sweep
+                    .settle_node(run_id, &node_id, ExecutionStatus::Skipped)
+                    .await?;
+                sweep.outcome.skipped.push((run_id, node_id));
+            }
+            BuiltExpansion::Matrix { jobs } => {
+                let registered = self
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .await?;
+                // The parent leaves the run's status map; its legs take over.
+                if let Some(node) = sweep.node_mut(run_id, &node_id) {
+                    node.has_children = true;
+                    node.queue_state = logic::QueueState::None;
+                }
+                if let Some(graph) = sweep.graphs.get_mut(&run_id) {
+                    rebuild_jobs(graph);
+                    graph.touched = true;
+                }
+                sweep.mark(run_id, &node_id);
+                retirements_ok(
+                    retire_node_requests(&tx, run_id, &node_id, Retirement::Purge).await,
+                )?;
+                debug_assert_eq!(registered, job_count);
+            }
+            BuiltExpansion::Reusable {
+                caller_id,
+                jobs,
+                reusable_calls,
+            } => {
+                let registered = self
+                    .register_expansion_jobs(&tx, &mut sweep, run_id, jobs)
+                    .await?;
+                if let Some(node) = sweep.node_mut(run_id, &caller_id) {
+                    node.status = ExecutionStatus::InProgress;
+                    node.queue_state = logic::QueueState::None;
+                }
+                {
+                    let graph = sweep.graphs.get_mut(&run_id).expect("loaded");
+                    graph.record.reusable_calls.extend(reusable_calls);
+                    if graph.record.started_at.is_none() {
+                        graph.record.started_at = Some(chrono::Utc::now());
+                    }
+                    graph
+                        .record
+                        .jobs
+                        .insert(caller_id.clone(), ExecutionStatus::InProgress);
+                    graph.touched = true;
+                }
+                if let Some(graph) = sweep.graphs.get_mut(&run_id) {
+                    rebuild_jobs(graph);
+                    graph.touched = true;
+                }
+                sweep.mark(run_id, &caller_id);
+                debug_assert_eq!(registered, job_count);
+            }
+        }
+        sweep.sweep().await?;
+        let outcome = std::mem::take(&mut sweep.outcome);
+        sweep.flush().await?;
+        tx.commit().await.map_err(db)?;
+        Ok(outcome)
+    }
+
+    /// Register one built subtree's jobs: `jobs` + `job_specs` + `job_needs` +
+    /// `job_messages` + `job_requests` (+ token request, step manifest).
+    /// New nodes start `pending`/`blocked`; the sweep admits them.
+    async fn register_expansion_jobs(
+        &self,
+        tx: &Transaction<'_>,
+        sweep: &mut Sweep<'_>,
+        run_id: RunId,
+        jobs: Vec<BuiltJob>,
+    ) -> Result<usize, ControlError> {
+        let platforms = self.registered_platforms().await?;
+        let now = now_us();
+        let mut registered = 0usize;
+        for built in jobs {
+            let BuiltJob {
+                plan,
+                condition_context,
+                mut artifacts,
+            } = built;
+            let job_id = plan.id.clone();
+            let unhostable =
+                crate::runtime_scheduling::unhostable_platform(&plan.runs_on, platforms.clone());
+            let display_name = plan.name.clone();
+            let mut node = Node {
+                kind: if plan.reusable_call.is_some() {
+                    NodeKind::ReusableCaller
+                } else if plan.deferred_matrix.is_some() {
+                    NodeKind::MatrixParent
+                } else if !plan.matrix.is_empty() && plan.base_id != job_id.0 {
+                    NodeKind::MatrixLeg
+                } else {
+                    NodeKind::Job
+                },
+                status: ExecutionStatus::Pending,
+                queue_state: logic::QueueState::Blocked,
+                remaining_needs: plan.needs.len() as i32,
+                base_id: plan.base_id.clone(),
+                parent_job_id: node_parent(&plan, &job_id),
+                pool_key: crate::control::types::compute_pool_key(
+                    &plan.runs_on,
+                    plan.runner_group.as_deref(),
+                ),
+                runs_on: plan.runs_on.clone(),
+                runner_group: plan.runner_group.clone(),
+                priority: 0,
+                run_order: 0,
+                job_order: 0,
+                enqueued_at_us: None,
+                claimed_by_runner_id: None,
+                claimed_at_us: None,
+                expand_generation: 0,
+                outputs: None,
+                annotations: None,
+                check_run_id: None,
+                created_at_us: now,
+                deps_ready_at_us: plan.needs.is_empty().then_some(now),
+                concurrency_wait_at_us: None,
+                concurrency_acquired_at_us: None,
+                started_at_us: None,
+                completed_at_us: None,
+                display_name: display_name.clone(),
+                display_order: plan.matrix_index.map(|i| i as i32).unwrap_or(0),
+                if_condition: plan.if_condition.clone(),
+                matrix: plan
+                    .matrix
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                deferred_matrix: plan.deferred_matrix.clone(),
+                max_parallel: plan.max_parallel,
+                environment: plan.environment.clone(),
+                concurrency: concurrency::concurrency_from_plan_fields(
+                    plan.concurrency_group.as_deref(),
+                    plan.concurrency_cancel_in_progress.as_deref(),
+                    plan.concurrency_queue.as_deref(),
+                ),
+                reusable: plan.reusable_call.clone().map(|call| ReusableNodeSpec {
+                    call: Some(call),
+                    meta: None,
+                    plan: Some(plan.clone()),
+                }),
+                fail_fast: Some(plan.fail_fast),
+                continue_on_error: Some(plan.continue_on_error),
+                id_token_granted: artifacts.id_token_granted,
+                oidc: artifacts.oidc_ctx.clone(),
+                needs: plan.needs.clone(),
+                condition_context: condition_context.clone(),
+                secret_names: Vec::new(),
+                has_children: false,
+            };
+            if let Some(platform) = unhostable {
+                node.status = ExecutionStatus::Failure;
+                node.queue_state = logic::QueueState::None;
+                node.completed_at_us = Some(now);
+                tracing::warn!(
+                    run_id = %run_id.0,
+                    job = %job_id.0,
+                    "materialized callee job is unhostable: no {platform} runner"
+                );
+            }
+            let graph = sweep.graphs.get(&run_id).expect("loaded");
+            insert_job_row(tx, graph, &node, &job_id).await?;
+            insert_spec_rows(tx, graph, &node, &job_id, None).await?;
+            if node.queue_state == logic::QueueState::None {
+                // Unhostable: the placeholder request is retired, none minted.
+                sweep
+                    .settle_node(run_id, &job_id, ExecutionStatus::Failure)
+                    .await?;
+                continue;
+            }
+            let (message, secret_names) = {
+                let mut message = artifacts.agent_msg.clone();
+                let names = strip_secret_values(&mut message);
+                (message, names)
+            };
+            let request_id = insert_request_row(
+                tx,
+                graph,
+                &artifacts.job_request,
+                artifacts.github_token_request.as_ref(),
+                &crate::models::StepRecord::manifest(&artifacts.agent_msg.steps),
+            )
+            .await?;
+            artifacts.job_request.request_id = request_id;
+            let mut message = message;
+            message.request_id = request_id;
+            tx.execute(
+                "INSERT INTO job_messages (run_id, job_id, message_template, secret_names, \
+                 condition_context) VALUES ($1::text::uuid,$2,$3::text::jsonb,$4::text::jsonb,\
+                 $5::text::jsonb)",
+                &[
+                    &run_id.0.to_string(),
+                    &job_id.0,
+                    &json(&message)?,
+                    &json(&secret_names)?,
+                    &json(&condition_context)?,
+                ],
+            )
+            .await
+            .map_err(db)?;
+            let graph = sweep.graphs.get_mut(&run_id).expect("loaded");
+            graph.nodes.insert(job_id.clone(), node);
+            graph.touched = true;
+            sweep.mark(run_id, &job_id);
+            registered += 1;
+        }
+        Ok(registered)
+    }
+}
+
+/// A built job's parent: its matrix parent when it expanded from one.
+fn node_parent(plan: &preloop_gha_protocol::JobPlan, job_id: &JobId) -> Option<String> {
+    if plan.base_id != job_id.0 && plan.matrix_index.is_some() {
+        Some(plan.base_id.clone())
+    } else {
+        None
+    }
+}
+
+/// `retire_node_requests` returns the removed log keys; expansion discards
+/// them (the live-log close is driven by the caller's post-commit fan-out).
+fn retirements_ok(result: Result<Vec<String>, ControlError>) -> Result<(), ControlError> {
+    result.map(|_| ())
 }
