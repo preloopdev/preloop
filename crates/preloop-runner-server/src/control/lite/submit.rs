@@ -52,7 +52,7 @@ fn origin_of(record: &crate::models::RunRecord) -> &'static str {
 }
 
 /// `jobs.kind` for a freshly submitted node.
-fn kind_of(job: &QueuedJob) -> &'static str {
+pub(super) fn kind_of(job: &QueuedJob) -> &'static str {
     if job.deferred_matrix.is_some() {
         "matrix_parent"
     } else if job.reusable_call.is_some() {
@@ -75,7 +75,7 @@ fn pull_request_refs(payload: &serde_json::Value) -> (Option<String>, Option<Str
 
 /// The immutable per-job spec fields the run record and the schedulers read
 /// back (`job_specs`).
-fn spec_extras<'a>(
+pub(super) fn spec_extras<'a>(
     record: &crate::models::RunRecord,
     job: &QueuedJob,
     id_token_granted: bool,
@@ -498,7 +498,7 @@ fn submit_run_tx(
 /// Insert one classified job (row + spec + needs) with the run's display
 /// order and the submission's queue sequence.
 #[allow(clippy::too_many_arguments)]
-fn insert_classified_job(
+pub(super) fn insert_classified_job(
     tx: &Transaction<'_>,
     namespace: &str,
     run_id: RunId,
@@ -612,7 +612,7 @@ fn insert_run_row(
 /// Mint the attempt row(s) for a freshly inserted job: the `job_requests`
 /// correlation (with the message's `requestId` patched to match), the
 /// deferred token-mint request, and the declared step manifest.
-fn mint_request(
+pub(super) fn mint_request(
     tx: &Transaction<'_>,
     namespace: &str,
     run_id: RunId,
