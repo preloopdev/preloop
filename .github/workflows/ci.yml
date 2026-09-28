@@ -220,9 +220,21 @@ jobs:
         run: |
           set -uo pipefail
           log="$RUNNER_TEMP/shard-${{ matrix.shard }}.log"
-          test -f "$log" || { echo "no shard log captured"; exit 0; }
           echo "::group::shard ${{ matrix.shard }} verdict"
-          grep -E "^ *FAIL |^ *TRY |^ *SIGSEGV|^ *SIGKILL|^failures:|^test result:|^error(\[|:)|Out of memory|oom-kill|Killed process|Cannot allocate memory" "$log" | tail -80 || true
+          if [ -f "$log" ]; then
+            # A shard killed mid-run (OOM, SIGKILL) prints no FAIL block and no
+            # summary line, so the marker grep alone can come back empty on the
+            # exact failure worth seeing. The tail is the verdict then.
+            grep -E "^ *FAIL |^ *TRY |^ *SIGSEGV|^ *SIGKILL|^failures:|^test result:|^error(\[|:)|Out of memory|oom-kill|Killed process|Cannot allocate memory" "$log" | tail -40 || true
+            echo "--- last lines ---"
+            tail -15 "$log" || true
+          else
+            echo "no shard log captured at $log"
+          fi
+          echo "--- guest kernel (OOM?) ---"
+          sudo dmesg 2>/dev/null | tail -15 || echo "(no dmesg)"
+          echo "--- guest memory ---"
+          free -m 2>/dev/null | head -3 || true
           echo "::endgroup::"
       # The preloop-runner-server integration tests were split out of the lib
       # into separate tests/*.rs crates (the single ~27k-line unit OOMed the
