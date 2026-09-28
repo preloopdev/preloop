@@ -737,6 +737,53 @@ pub(crate) mod suite {
         );
     }
 
+    /// The webhook inbox: enqueue deduplicates by delivery id, a claim is
+    /// fenced by its lease token, the queue stats see the backlog, and
+    /// completion is terminal.
+    pub(crate) async fn webhook_inbox_claim_is_fenced_and_deduplicated(
+        backend: &dyn ControlBackend,
+    ) {
+        use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
+        let delivery = WebhookDeliveryRecord {
+            delivery_id: "d1".to_owned(),
+            event: "push".to_owned(),
+            payload: br#"{"installation":{"id":9},"ref":"refs/heads/main"}"#.to_vec(),
+            received_at_us: 1,
+            state: WebhookDeliveryStatus::Received,
+            attempts: 0,
+            lease_until_us: None,
+            lease_token: None,
+            last_error: None,
+        };
+        assert!(backend.enqueue_webhook_delivery(&delivery).await.unwrap());
+        assert!(!backend.enqueue_webhook_delivery(&delivery).await.unwrap());
+        let stats = backend.webhook_queue_stats().await.unwrap();
+        assert_eq!((stats.received, stats.done), (1, 0));
+
+        let claim = backend.claim_webhook_deliveries(1, 60).await.unwrap();
+        assert_eq!(claim.len(), 1);
+        let token = claim[0].lease_token.clone().unwrap();
+        assert!(!backend
+            .renew_webhook_delivery("d1", "stale", 60)
+            .await
+            .unwrap());
+        assert!(backend
+            .complete_webhook_delivery("d1", &token)
+            .await
+            .unwrap());
+        assert_eq!(
+            backend
+                .get_webhook_delivery("d1")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            WebhookDeliveryStatus::Done
+        );
+        let stats = backend.webhook_queue_stats().await.unwrap();
+        assert_eq!((stats.received, stats.done), (0, 1));
+    }
+
     pub(crate) async fn run_record_round_trips_through_tables(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         // The normalized schema reconstructs the run from the submitted job
@@ -1436,6 +1483,12 @@ mod pg {
         suite::secret_values_never_persist(&backend).await;
     }
 
+    #[tokio::test]
+    async fn webhook_inbox_claim_is_fenced_and_deduplicated() {
+        let (_pg, backend) = backend().await;
+        suite::webhook_inbox_claim_is_fenced_and_deduplicated(&backend).await;
+    }
+
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
         // Distinct `run_number` per submit: the agreed schema keys
         // `runs_number` on (namespace, repo, path, number, attempt), so
@@ -1612,6 +1665,12 @@ mod lite {
     #[tokio::test]
     async fn secret_values_never_persist() {
         suite::secret_values_never_persist(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_inbox_claim_is_fenced_and_deduplicated() {
+        suite::webhook_inbox_claim_is_fenced_and_deduplicated(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

@@ -30,39 +30,6 @@ fn fresh_schema_has_default_namespace_and_rejects_wrong_version() {
 }
 
 #[tokio::test]
-async fn webhook_claim_is_fenced_and_deduplicated() {
-    let backend = LiteBackend::in_memory().unwrap();
-    assert!(backend
-        .enqueue_webhook_delivery(&delivery("d1"))
-        .await
-        .unwrap());
-    assert!(!backend
-        .enqueue_webhook_delivery(&delivery("d1"))
-        .await
-        .unwrap());
-    let claim = backend.claim_webhook_deliveries(1, 60).await.unwrap();
-    assert_eq!(claim.len(), 1);
-    let token = claim[0].lease_token.clone().unwrap();
-    assert!(!backend
-        .renew_webhook_delivery("d1", "stale", 60)
-        .await
-        .unwrap());
-    assert!(backend
-        .complete_webhook_delivery("d1", &token)
-        .await
-        .unwrap());
-    assert_eq!(
-        backend
-            .get_webhook_delivery("d1")
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        WebhookDeliveryStatus::Done
-    );
-}
-
-#[tokio::test]
 async fn run_number_fingerprint_and_unknown_request() {
     let backend = LiteBackend::in_memory().unwrap();
     let workflow = ".github/workflows/ci.yml";

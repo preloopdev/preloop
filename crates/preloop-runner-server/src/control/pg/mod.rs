@@ -31,6 +31,7 @@ mod tests;
 mod testview;
 mod timelines;
 mod trait_impl;
+mod webhooks;
 
 use super::types::ControlError;
 use tokio_postgres::{Client, NoTls};
