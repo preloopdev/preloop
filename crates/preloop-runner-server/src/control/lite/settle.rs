@@ -372,7 +372,7 @@ fn release_jobset(
 
 /// `promote_next_from_group`: hand a freed group slot to its oldest waiter
 /// and make that holder runnable.
-fn promote_next_in_group(
+pub(super) fn promote_next_in_group(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     ns: &str,
