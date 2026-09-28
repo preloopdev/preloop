@@ -73,14 +73,12 @@ fn queue_job_cancellation(
              VALUES (?1,?2,?3,?4)",
         )
         .map_err(db)?
-        .execute(
-            params![
-                session,
-                azdo::message_type::JOB_CANCELLED,
-                request_id,
-                body
-            ],
-        )
+        .execute(params![
+            session,
+            azdo::message_type::JOB_CANCELLED,
+            request_id,
+            body
+        ])
         .map_err(db)?;
     }
     Ok(true)
@@ -148,12 +146,8 @@ impl LiteBackend {
                             request_id: row.get(0)?,
                             run_id: codec::run_id(&row.get::<_, String>(1)?),
                             job_id: JobId(row.get(2)?),
-                            started_at: row
-                                .get::<_, Option<i64>>(3)?
-                                .map(codec::us_to_system),
-                            last_renewed_at: row
-                                .get::<_, Option<i64>>(4)?
-                                .map(codec::us_to_system),
+                            started_at: row.get::<_, Option<i64>>(3)?.map(codec::us_to_system),
+                            last_renewed_at: row.get::<_, Option<i64>>(4)?.map(codec::us_to_system),
                             timeout_triggered: row.get::<_, i64>(5)? != 0,
                             job_timeout_s: row.get(6)?,
                         })
@@ -178,9 +172,7 @@ impl LiteBackend {
                             job_id: JobId(row.get(1)?),
                             runs_on: serde_json::from_str(&row.get::<_, String>(2)?)
                                 .unwrap_or_default(),
-                            enqueued_at_unix_nanos: row
-                                .get::<_, Option<i64>>(3)?
-                                .unwrap_or(0)
+                            enqueued_at_unix_nanos: row.get::<_, Option<i64>>(3)?.unwrap_or(0)
                                 * 1000,
                             observed: row.get(4)?,
                         })
@@ -267,30 +259,20 @@ impl LiteBackend {
                 let candidate = StarvationCandidate {
                     runs_on: &job.runs_on,
                     enqueued_at: std::time::UNIX_EPOCH
-                        + std::time::Duration::from_nanos(
-                            job.enqueued_at_unix_nanos as u64,
-                        ),
+                        + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
                     first_seen: None,
                     any_runner_matches: runner_labels.iter().any(|labels| {
                         crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                     }),
                 };
-                match logic::starvation_verdict(
-                    &candidate,
-                    now,
-                    pool_preparing,
-                    warm_window_open,
-                ) {
+                match logic::starvation_verdict(&candidate, now, pool_preparing, warm_window_open) {
                     StarvationVerdict::ClearMark => {
                         tx.prepare_cached(
                             "UPDATE jobs SET not_before = NULL \
                              WHERE run_id = ?1 AND job_id = ?2",
                         )
                         .map_err(db)?
-                        .execute(params![
-                            codec::run_key(job.run_id),
-                            job.job_id.0
-                        ])
+                        .execute(params![codec::run_key(job.run_id), job.job_id.0])
                         .map_err(db)?;
                     }
                     StarvationVerdict::Mark { .. } => {
@@ -300,11 +282,7 @@ impl LiteBackend {
                              WHERE run_id = ?1 AND job_id = ?2",
                         )
                         .map_err(db)?
-                        .execute(params![
-                            codec::run_key(job.run_id),
-                            job.job_id.0,
-                            now_us()
-                        ])
+                        .execute(params![codec::run_key(job.run_id), job.job_id.0, now_us()])
                         .map_err(db)?;
                     }
                     StarvationVerdict::Starve { reason, grace } => {
@@ -323,12 +301,10 @@ impl LiteBackend {
             // A marked job that left the ready queue clears its mark (the
             // claim fence took it; do not leak a stale mark into a later
             // re-enqueue).
-            tx.prepare_cached(
-                "UPDATE jobs SET not_before = NULL WHERE queue_state <> 'ready'",
-            )
-            .map_err(db)?
-            .execute([])
-            .map_err(db)?;
+            tx.prepare_cached("UPDATE jobs SET not_before = NULL WHERE queue_state <> 'ready'")
+                .map_err(db)?
+                .execute([])
+                .map_err(db)?;
             // ── Timeouts + lease expiry ────────────────────────────────
             let mut cancellations = 0usize;
             let mut expired = Vec::new();
@@ -368,9 +344,7 @@ impl LiteBackend {
                     }
                 }
                 if let Some(last_renewed_at) = request.last_renewed_at {
-                    let elapsed = now
-                        .duration_since(last_renewed_at)
-                        .unwrap_or_default();
+                    let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
                     if elapsed
                         >= std::time::Duration::from_secs(
                             crate::distributed_task::JOB_LEASE_SECONDS,
@@ -400,18 +374,15 @@ impl LiteBackend {
                         .map_err(db)?
                         .execute(params![request_id, now_us()])
                         .map_err(db)?;
-                        tx.prepare_cached(
-                            "DELETE FROM job_leases WHERE request_id = ?1",
-                        )
-                        .map_err(db)?
-                        .execute([request_id])
-                        .map_err(db)?;
+                        tx.prepare_cached("DELETE FROM job_leases WHERE request_id = ?1")
+                            .map_err(db)?
+                            .execute([request_id])
+                            .map_err(db)?;
                         expired.push(ExpiredLease {
                             request_id,
                             run_id,
                             job_id,
-                            agent_job_id: agent
-                                .and_then(|a| uuid::Uuid::parse_str(&a).ok()),
+                            agent_job_id: agent.and_then(|a| uuid::Uuid::parse_str(&a).ok()),
                         });
                     }
                 }
@@ -434,10 +405,8 @@ impl LiteBackend {
         let (pool_on, require_on, _liveness) = self.config();
         self.write(move |tx| {
             let now = now_us();
-            let assignment_cutoff =
-                now - crate::control::sched::ASSIGNMENT_TTL.as_micros() as i64;
-            let binding_cutoff =
-                now - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+            let assignment_cutoff = now - crate::control::sched::ASSIGNMENT_TTL.as_micros() as i64;
+            let binding_cutoff = now - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
             let mut swept = 0usize;
             if pool_on {
                 for sql in [
@@ -453,16 +422,12 @@ impl LiteBackend {
             }
             if !require_on && !pool_on {
                 swept += tx
-                    .prepare_cached(
-                        "DELETE FROM job_assignments WHERE assigned_at < ?1",
-                    )
+                    .prepare_cached("DELETE FROM job_assignments WHERE assigned_at < ?1")
                     .map_err(db)?
                     .execute([assignment_cutoff])
                     .map_err(db)?;
                 swept += tx
-                    .prepare_cached(
-                        "DELETE FROM provision_requests WHERE requested_at < ?1",
-                    )
+                    .prepare_cached("DELETE FROM provision_requests WHERE requested_at < ?1")
                     .map_err(db)?
                     .execute([assignment_cutoff])
                     .map_err(db)?;
@@ -506,7 +471,6 @@ impl LiteBackend {
         })
     }
 
-
     /// `status_inputs` (`commands::status_inputs_tx` over SQL): the
     /// operational status read — run counts, queue depths, runner
     /// activity, concurrency-group gauges.
@@ -519,9 +483,7 @@ impl LiteBackend {
             // Coarse run counts.
             {
                 let mut stmt = tx
-                    .prepare_cached(
-                        "SELECT status, COUNT(*) FROM runs GROUP BY status",
-                    )
+                    .prepare_cached("SELECT status, COUNT(*) FROM runs GROUP BY status")
                     .map_err(db)?;
                 let rows = stmt
                     .query_map([], |row| {
@@ -544,9 +506,7 @@ impl LiteBackend {
                 .query_row([], |row| row.get::<_, u32>(0))
                 .map_err(db)? as usize;
             inputs.pending_expansions_len = tx
-                .prepare_cached(
-                    "SELECT COUNT(*) FROM jobs WHERE queue_state = 'pending_expansion'",
-                )
+                .prepare_cached("SELECT COUNT(*) FROM jobs WHERE queue_state = 'pending_expansion'")
                 .map_err(db)?
                 .query_row([], |row| row.get::<_, u32>(0))
                 .map_err(db)? as usize;
@@ -568,7 +528,9 @@ impl LiteBackend {
                     .prepare_cached("SELECT runner_id, name FROM runners")
                     .map_err(db)?;
                 let rows = stmt
-                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
                     .map_err(db)?;
                 for row in rows {
                     let (id, name) = row.map_err(db)?;
@@ -633,16 +595,16 @@ impl LiteBackend {
                         .flatten()
                         .filter_map(|id| runner_names.get(id).cloned())
                         .collect();
-                    inputs.active_runs.push(
-                        preloop_observability::status::ActiveRunSnapshot {
+                    inputs
+                        .active_runs
+                        .push(preloop_observability::status::ActiveRunSnapshot {
                             run_id: run_id.clone(),
                             workflow,
                             status,
                             event,
                             started_at: started_at.and_then(codec::us_to_utc),
                             assigned_runners,
-                        },
-                    );
+                        });
                 }
                 inputs.active_runs.sort_by(|left, right| {
                     right
@@ -760,9 +722,7 @@ impl LiteBackend {
                             run_id,
                             job_id,
                             assigned_seconds_ago: started_at
-                                .and_then(|us| {
-                                    now.duration_since(codec::us_to_system(us)).ok()
-                                })
+                                .and_then(|us| now.duration_since(codec::us_to_system(us)).ok())
                                 .map(|age| age.as_secs_f64())
                                 .unwrap_or(0.0),
                         },
@@ -778,15 +738,12 @@ impl LiteBackend {
                          ORDER BY enqueued_at LIMIT 1",
                     )
                     .map_err(db)?
-                    .query_row([], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
+                    .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .optional()
                     .map_err(db)?;
                 if let Some((run_id, job_id, enqueued_at)) = oldest {
-                    inputs.oldest_ready_seconds = Some(
-                        (now_us().saturating_sub(enqueued_at)) as f64 / 1_000_000.0,
-                    );
+                    inputs.oldest_ready_seconds =
+                        Some((now_us().saturating_sub(enqueued_at)) as f64 / 1_000_000.0);
                     inputs.oldest_ready_run_id = Some(run_id);
                     inputs.oldest_ready_job_id = Some(job_id);
                 }
@@ -802,8 +759,7 @@ impl LiteBackend {
                 let rows = stmt
                     .query_map([], |row| {
                         Ok((
-                            serde_json::from_str(&row.get::<_, String>(0)?)
-                                .unwrap_or_default(),
+                            serde_json::from_str(&row.get::<_, String>(0)?).unwrap_or_default(),
                             row.get::<_, Option<String>>(1)?,
                         ))
                     })

@@ -39,9 +39,7 @@ fn runner_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunnerRow> {
         rsa_public_key: row
             .get::<_, Option<Vec<u8>>>(5)?
             .and_then(|xml| String::from_utf8(xml).ok())
-            .and_then(|xml| {
-                preloop_gha_protocol::crypto::AgentRsaPublicKey::parse(&xml).ok()
-            }),
+            .and_then(|xml| preloop_gha_protocol::crypto::AgentRsaPublicKey::parse(&xml).ok()),
         client_id: row.get(6)?,
         pool_proven: row.get::<_, i64>(9)? != 0,
         registered_at_us: row.get(10)?,
@@ -69,9 +67,7 @@ pub(super) fn requeue_claimed(
 ) -> Result<bool, ControlError> {
     let run = codec::run_key(run_id);
     let state: Option<String> = tx
-        .prepare_cached(
-            "SELECT queue_state FROM jobs WHERE run_id = ?1 AND job_id = ?2",
-        )
+        .prepare_cached("SELECT queue_state FROM jobs WHERE run_id = ?1 AND job_id = ?2")
         .map_err(db)?
         .query_row(params![run, job_id.0], |row| row.get(0))
         .optional()
@@ -111,12 +107,10 @@ pub(super) fn requeue_claimed(
     .map_err(db)?
     .execute(params![run, job_id.0, now_us()])
     .map_err(db)?;
-    tx.prepare_cached(
-        "DELETE FROM job_assignments WHERE run_id = ?1 AND job_id = ?2",
-    )
-    .map_err(db)?
-    .execute(params![run, job_id.0])
-    .map_err(db)?;
+    tx.prepare_cached("DELETE FROM job_assignments WHERE run_id = ?1 AND job_id = ?2")
+        .map_err(db)?
+        .execute(params![run, job_id.0])
+        .map_err(db)?;
     Ok(true)
 }
 
@@ -278,17 +272,12 @@ fn pair_runner_tx(
     };
     for (run, job, runs_on, runner_group) in pending {
         if crate::runtime_scheduling::job_matches_runner(&runs_on, &caps.labels)
-            && crate::runtime_scheduling::job_matches_runner_group(
-                runner_group.as_deref(),
-                &caps,
-            )
+            && crate::runtime_scheduling::job_matches_runner_group(runner_group.as_deref(), &caps)
         {
-            tx.prepare_cached(
-                "DELETE FROM provision_requests WHERE run_id = ?1 AND job_id = ?2",
-            )
-            .map_err(db)?
-            .execute(params![run, job])
-            .map_err(db)?;
+            tx.prepare_cached("DELETE FROM provision_requests WHERE run_id = ?1 AND job_id = ?2")
+                .map_err(db)?
+                .execute(params![run, job])
+                .map_err(db)?;
             tx.prepare_cached(
                 "INSERT INTO job_assignments (run_id, job_id, runner_id, \
                  assigned_at, first_assigned_at) VALUES (?1, ?2, ?3, ?4, ?4) \
@@ -306,10 +295,7 @@ fn pair_runner_tx(
 
 /// `purge_runner_tx` (pg lifecycle.rs): capture the runner's claimed jobs,
 /// delete the runner (sessions cascade), then requeue each job.
-fn purge_runner_tx(
-    tx: &Transaction<'_>,
-    runner_id: i64,
-) -> Result<(), ControlError> {
+fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlError> {
     let requeue: Vec<(String, String)> = {
         let mut stmt = tx
             .prepare_cached(
@@ -441,9 +427,7 @@ impl LiteBackend {
                          AND verified AND session_id <> ?2",
                     )
                     .map_err(db)?
-                    .query_row(params![runner_id, session_uuid], |row| {
-                        row.get::<_, i64>(0)
-                    })
+                    .query_row(params![runner_id, session_uuid], |row| row.get::<_, i64>(0))
                     .optional()
                     .map_err(db)?
                     .is_some();
@@ -479,9 +463,7 @@ impl LiteBackend {
         let session_uuid = logic::session_uuid(session_id).to_string();
         self.write(|tx| {
             let owner: Option<Option<i64>> = tx
-                .prepare_cached(
-                    "SELECT runner_id FROM runner_sessions WHERE session_id = ?1",
-                )
+                .prepare_cached("SELECT runner_id FROM runner_sessions WHERE session_id = ?1")
                 .map_err(db)?
                 .query_row([session_uuid.as_str()], |row| row.get(0))
                 .optional()
@@ -608,8 +590,7 @@ impl LiteBackend {
         reg: backend::RegisterRunner,
     ) -> Result<RunnerRow, ControlError> {
         self.write(|tx| {
-            let labels =
-                serde_json::to_string(&reg.labels).map_err(ControlError::backend)?;
+            let labels = serde_json::to_string(&reg.labels).map_err(ControlError::backend)?;
             let rsa = reg
                 .rsa_public_key
                 .as_ref()
@@ -681,8 +662,7 @@ impl LiteBackend {
                     .map_err(db)?;
             }
             if let Some(labels) = labels {
-                let labels =
-                    serde_json::to_string(&labels).map_err(ControlError::backend)?;
+                let labels = serde_json::to_string(&labels).map_err(ControlError::backend)?;
                 tx.prepare_cached("UPDATE runners SET labels = ?2 WHERE runner_id = ?1")
                     .map_err(db)?
                     .execute(params![runner_id, labels])
@@ -722,9 +702,7 @@ impl LiteBackend {
                 .is_some();
             let owns_session = || -> Result<bool, ControlError> {
                 Ok(tx
-                    .prepare_cached(
-                        "SELECT 1 FROM runner_sessions WHERE runner_id = ?1",
-                    )
+                    .prepare_cached("SELECT 1 FROM runner_sessions WHERE runner_id = ?1")
                     .map_err(db)?
                     .query_row([runner_id], |row| row.get::<_, i64>(0))
                     .optional()
@@ -756,31 +734,20 @@ impl LiteBackend {
     pub(crate) async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError> {
         self.read(|tx| {
             let mut stmt = tx
-                .prepare_cached(
-                    "SELECT runner_id FROM runners WHERE ephemeral ORDER BY runner_id",
-                )
+                .prepare_cached("SELECT runner_id FROM runners WHERE ephemeral ORDER BY runner_id")
                 .map_err(db)?;
-            let rows = stmt
-                .query_map([], |row| row.get(0))
-                .map_err(db)?;
+            let rows = stmt.query_map([], |row| row.get(0)).map_err(db)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(db)
         })
     }
 
     /// `runner_ids_named` (pg lifecycle.rs).
-    pub(crate) async fn runner_ids_named(
-        &self,
-        name: &str,
-    ) -> Result<Vec<i64>, ControlError> {
+    pub(crate) async fn runner_ids_named(&self, name: &str) -> Result<Vec<i64>, ControlError> {
         self.read(|tx| {
             let mut stmt = tx
-                .prepare_cached(
-                    "SELECT runner_id FROM runners WHERE name = ?1 ORDER BY runner_id",
-                )
+                .prepare_cached("SELECT runner_id FROM runners WHERE name = ?1 ORDER BY runner_id")
                 .map_err(db)?;
-            let rows = stmt
-                .query_map([name], |row| row.get(0))
-                .map_err(db)?;
+            let rows = stmt.query_map([name], |row| row.get(0)).map_err(db)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(db)
         })
     }
@@ -816,8 +783,7 @@ impl LiteBackend {
                 })
                 .optional()
                 .map_err(db)?;
-            let Some((id, name, labels, ephemeral, public_key, group_id, group_name, client)) =
-                row
+            let Some((id, name, labels, ephemeral, public_key, group_id, group_name, client)) = row
             else {
                 return Ok(None);
             };
@@ -826,12 +792,10 @@ impl LiteBackend {
                 None => {
                     let synthesized =
                         format!("{id:08x}-0000-4000-8000-000000000000", id = id as u32);
-                    tx.prepare_cached(
-                        "UPDATE runners SET client_id = ?2 WHERE runner_id = ?1",
-                    )
-                    .map_err(db)?
-                    .execute(params![id, synthesized])
-                    .map_err(db)?;
+                    tx.prepare_cached("UPDATE runners SET client_id = ?2 WHERE runner_id = ?1")
+                        .map_err(db)?
+                        .execute(params![id, synthesized])
+                        .map_err(db)?;
                     synthesized
                 }
             };
@@ -874,22 +838,17 @@ impl LiteBackend {
     pub(crate) async fn runner_rsa_public_key(
         &self,
         runner_id: i64,
-    ) -> Result<Option<preloop_gha_protocol::crypto::AgentRsaPublicKey>, ControlError>
-    {
+    ) -> Result<Option<preloop_gha_protocol::crypto::AgentRsaPublicKey>, ControlError> {
         self.read(|tx| {
             Ok(tx
-                .prepare_cached(
-                    "SELECT rsa_public_key FROM runners WHERE runner_id = ?1",
-                )
+                .prepare_cached("SELECT rsa_public_key FROM runners WHERE runner_id = ?1")
                 .map_err(db)?
                 .query_row([runner_id], |row| row.get::<_, Option<Vec<u8>>>(0))
                 .optional()
                 .map_err(db)?
                 .flatten()
                 .and_then(|xml| String::from_utf8(xml).ok())
-                .and_then(|xml| {
-                    preloop_gha_protocol::crypto::AgentRsaPublicKey::parse(&xml).ok()
-                }))
+                .and_then(|xml| preloop_gha_protocol::crypto::AgentRsaPublicKey::parse(&xml).ok()))
         })
     }
 
@@ -913,8 +872,7 @@ impl LiteBackend {
                 let rows = stmt
                     .query_map([], |row| {
                         let labels: Vec<String> =
-                            serde_json::from_str(&row.get::<_, String>(2)?)
-                                .unwrap_or_default();
+                            serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
                         Ok((
                             RegisteredRunner {
                                 id: row.get(0)?,
@@ -962,13 +920,12 @@ impl LiteBackend {
                     let mut claimable = BTreeSet::new();
                     for (runs_on, runner_group) in &ready {
                         for (runner, caps) in &runners {
-                            if crate::runtime_scheduling::job_matches_runner(
-                                runs_on,
-                                &caps.labels,
-                            ) && crate::runtime_scheduling::job_matches_runner_group(
-                                runner_group.as_deref(),
-                                caps,
-                            ) {
+                            if crate::runtime_scheduling::job_matches_runner(runs_on, &caps.labels)
+                                && crate::runtime_scheduling::job_matches_runner_group(
+                                    runner_group.as_deref(),
+                                    caps,
+                                )
+                            {
                                 claimable.insert(runner.id);
                             }
                         }
@@ -1059,8 +1016,7 @@ impl LiteBackend {
                         &ns,
                         &repo,
                         &group,
-                        concurrency::hold_display_name(tx, &ns, &repo, &group)?
-                            .as_deref(),
+                        concurrency::hold_display_name(tx, &ns, &repo, &group)?.as_deref(),
                     )?;
                 } else {
                     tx.prepare_cached(
@@ -1153,10 +1109,9 @@ impl LiteBackend {
                          WHERE run_id = ?1 AND job_id = ?2)",
                     )
                     .map_err(db)?
-                    .query_row(
-                        params![codec::run_key(job.run_id), job.job_id.0],
-                        |row| row.get::<_, bool>(0),
-                    )
+                    .query_row(params![codec::run_key(job.run_id), job.job_id.0], |row| {
+                        row.get::<_, bool>(0)
+                    })
                     .map_err(db)?;
                 if !exists {
                     promote::on_job_enqueued(tx, self, &job)?;

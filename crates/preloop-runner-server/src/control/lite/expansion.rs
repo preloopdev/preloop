@@ -15,8 +15,10 @@ use super::codec::{self, now_us};
 use super::jobs::{self, ReusableSpec};
 use super::{db, promote, settle, submit, LiteBackend};
 use crate::control::backend::ExpansionApply;
-use crate::control::sched::{BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan,
-    MatrixExpansionInputs, ReusableExpansionInputs};
+use crate::control::sched::{
+    BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan, MatrixExpansionInputs,
+    ReusableExpansionInputs,
+};
 use crate::control::types::*;
 use crate::models::QueuedJob;
 use crate::runtime_scheduling::SchedulingOutcome;
@@ -28,10 +30,7 @@ use std::collections::BTreeMap;
 /// (pg's `expansion_plan`): the run context fields plus every needed job's
 /// resolved outputs. Data assembly only — what expands and when was the
 /// `ExpansionDecision` made by `logic.rs` upstream of `submit`.
-fn expansion_plan(
-    record: &crate::models::RunRecord,
-    job: &QueuedJob,
-) -> Option<ExpansionPlan> {
+fn expansion_plan(record: &crate::models::RunRecord, job: &QueuedJob) -> Option<ExpansionPlan> {
     let ctx = ExpansionContext {
         run_id: job.run_id,
         submission: record.submission.clone(),
@@ -41,8 +40,7 @@ fn expansion_plan(
         workflow_ref: record.workflow_ref.clone(),
         head_sha: record.head_sha.clone(),
     };
-    let mut needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
-        BTreeMap::new();
+    let mut needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
     for need in &job.needs {
         for matched in crate::runtime_scheduling::matching_need_ids(record, need) {
             if let Some(outputs) = record.job_outputs.get(&matched) {
@@ -271,9 +269,7 @@ fn write_reusable_meta(
     let run = codec::run_key(run_id);
     for (job_id, meta) in callee_meta {
         let existing: Option<String> = tx
-            .prepare_cached(
-                "SELECT reusable_call FROM job_specs WHERE run_id = ?1 AND job_id = ?2",
-            )
+            .prepare_cached("SELECT reusable_call FROM job_specs WHERE run_id = ?1 AND job_id = ?2")
             .map_err(db)?
             .query_row(params![run, job_id.as_str()], |row| row.get(0))
             .optional()
@@ -283,8 +279,7 @@ fn write_reusable_meta(
             Some(ReusableSpec::Call(call)) => (Some(call), None),
             None => (None, None),
         };
-        if let Some(json) = ReusableSpec::encode(call.as_ref(), Some(meta), plan.as_ref())
-        {
+        if let Some(json) = ReusableSpec::encode(call.as_ref(), Some(meta), plan.as_ref()) {
             tx.prepare_cached(
                 "UPDATE job_specs SET reusable_call = ?3 \
                  WHERE run_id = ?1 AND job_id = ?2",
@@ -296,9 +291,7 @@ fn write_reusable_meta(
     }
     // The caller's own meta gains its subtree: `inner_job_ids = inner_ids`.
     let existing: Option<String> = tx
-        .prepare_cached(
-            "SELECT reusable_call FROM job_specs WHERE run_id = ?1 AND job_id = ?2",
-        )
+        .prepare_cached("SELECT reusable_call FROM job_specs WHERE run_id = ?1 AND job_id = ?2")
         .map_err(db)?
         .query_row(params![run, caller_id.0], |row| row.get(0))
         .optional()
@@ -310,9 +303,7 @@ fn write_reusable_meta(
     }) = existing.as_deref().map(ReusableSpec::decode)
     {
         meta.inner_job_ids = inner_ids.to_vec();
-        if let Some(encoded) =
-            ReusableSpec::encode(call.as_ref(), Some(&meta), plan.as_ref())
-        {
+        if let Some(encoded) = ReusableSpec::encode(call.as_ref(), Some(&meta), plan.as_ref()) {
             tx.prepare_cached(
                 "UPDATE job_specs SET reusable_call = ?3 \
                  WHERE run_id = ?1 AND job_id = ?2",
@@ -355,11 +346,7 @@ fn splice_matrix_parents(
             plan,
         } = ReusableSpec::decode(&json)
         {
-            if let Some(pos) = meta
-                .inner_job_ids
-                .iter()
-                .position(|id| id == &node_id.0)
-            {
+            if let Some(pos) = meta.inner_job_ids.iter().position(|id| id == &node_id.0) {
                 meta.inner_job_ids
                     .splice(pos..pos + 1, leg_ids.iter().cloned());
                 if let Some(encoded) =
@@ -385,9 +372,7 @@ impl LiteBackend {
     /// The lease bumps `expand_generation`; `apply_expansion` refuses a
     /// build whose generation no longer matches, so a node cancelled or
     /// re-leased while the build ran cannot fold a stale subtree in.
-    pub(crate) async fn claim_expansion(
-        &self,
-    ) -> Result<Option<ExpansionClaim>, ControlError> {
+    pub(crate) async fn claim_expansion(&self) -> Result<Option<ExpansionClaim>, ControlError> {
         self.write(|tx| {
             let Some((run, job)) = tx
                 .prepare_cached(
@@ -421,16 +406,12 @@ impl LiteBackend {
                 return Ok(None);
             };
             let queued = jobs::queued_job(tx, run_id, &job_id)?;
-            let plan = queued
-                .as_ref()
-                .and_then(|job| expansion_plan(&record, job));
+            let plan = queued.as_ref().and_then(|job| expansion_plan(&record, job));
             let job = queued.ok_or_else(|| {
                 // Every submitted/expanded node writes a message template; a
                 // missing one means the row was lost, not that expansion is
                 // optional.
-                ControlError::backend(anyhow::anyhow!(
-                    "expansion node has no message template"
-                ))
+                ControlError::backend(anyhow::anyhow!("expansion node has no message template"))
             })?;
             Ok(Some(ExpansionClaim {
                 job,
@@ -457,9 +438,7 @@ impl LiteBackend {
                      WHERE run_id = ?1 AND job_id = ?2",
                 )
                 .map_err(db)?
-                .query_row(params![codec::run_key(run_id), node_id.0], |row| {
-                    row.get(0)
-                })
+                .query_row(params![codec::run_key(run_id), node_id.0], |row| row.get(0))
                 .optional()
                 .map_err(db)?;
             let Some(current) = current else {
@@ -484,13 +463,7 @@ impl LiteBackend {
             match built {
                 BuiltExpansion::Matrix { jobs } if jobs.is_empty() => {
                     // An empty matrix concludes the node as skipped.
-                    settle::settle_node(
-                        tx,
-                        self,
-                        run_id,
-                        &node_id,
-                        ExecutionStatus::Skipped,
-                    )?;
+                    settle::settle_node(tx, self, run_id, &node_id, ExecutionStatus::Skipped)?;
                     outcome.skipped.push((run_id, node_id));
                 }
                 BuiltExpansion::Matrix { jobs } => {
@@ -508,12 +481,7 @@ impl LiteBackend {
                     .execute(params![codec::run_key(run_id), node_id.0])
                     .map_err(db)?;
                     splice_matrix_parents(tx, run_id, &node_id, &leg_ids)?;
-                    settle::retire_node_requests(
-                        tx,
-                        run_id,
-                        &node_id,
-                        ExecutionStatus::Skipped,
-                    )?;
+                    settle::retire_node_requests(tx, run_id, &node_id, ExecutionStatus::Skipped)?;
                 }
                 BuiltExpansion::Reusable {
                     caller_id,

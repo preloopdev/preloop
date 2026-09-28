@@ -528,13 +528,7 @@ pub(super) fn cancel_holder(
             cancel_job_inner(tx, backend, *run_id, job_id)?;
         }
         Holder::JobSet { run_id, job_ids } => {
-            fail_jobset(
-                tx,
-                backend,
-                *run_id,
-                job_ids,
-                ExecutionStatus::Cancelled,
-            )?;
+            fail_jobset(tx, backend, *run_id, job_ids, ExecutionStatus::Cancelled)?;
         }
     }
     Ok(())

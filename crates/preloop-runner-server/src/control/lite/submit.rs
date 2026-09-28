@@ -215,7 +215,10 @@ fn submit_run_tx(
                             .get(&job.job_id)
                             .map(String::as_str)
                             .unwrap_or(&job.job_id.0),
-                        display_order.get(&job.job_id.0).copied().unwrap_or(index as i64),
+                        display_order
+                            .get(&job.job_id.0)
+                            .copied()
+                            .unwrap_or(index as i64),
                         ExecutionStatus::Cancelled,
                         "none",
                         job.needs.len() as i32,
@@ -360,9 +363,9 @@ fn submit_run_tx(
 
         // `max-parallel` for this matrix base: legs already handed a slot in
         // this submit count against the limit.
-        let max_parallel_ok = job.max_parallel.is_none_or(|limit| {
-            active_by_base.get(&job.base_id).copied().unwrap_or(0) < limit
-        });
+        let max_parallel_ok = job
+            .max_parallel
+            .is_none_or(|limit| active_by_base.get(&job.base_id).copied().unwrap_or(0) < limit);
         if job.reusable_call.is_some() || !job.needs.is_empty() || !max_parallel_ok {
             // Caller placeholders wait as `pending` (the sweep routes them to
             // their jobset gate once their `if:` passes); needs-gated and
@@ -439,7 +442,15 @@ fn submit_run_tx(
         }
         // Mint the attempt's request row and patch the message's requestId
         // to the allocated id (the runner echoes it back on acquire).
-        mint_request(tx, &namespace, run_id, &job_id, request, token_request, step_manifest)?;
+        mint_request(
+            tx,
+            &namespace,
+            run_id,
+            &job_id,
+            request,
+            token_request,
+            step_manifest,
+        )?;
         inserted += 1;
     }
 

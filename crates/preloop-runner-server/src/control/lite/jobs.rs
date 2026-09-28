@@ -168,7 +168,9 @@ pub(super) fn spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRow> {
         if_condition: row.get(1)?,
         matrix: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
         deferred_matrix: row.get(3)?,
-        max_parallel: row.get::<_, Option<i64>>(4)?.and_then(|v| u64::try_from(v).ok()),
+        max_parallel: row
+            .get::<_, Option<i64>>(4)?
+            .and_then(|v| u64::try_from(v).ok()),
         environment: opt_json(&row.get(5)?),
         concurrency: opt_json(&row.get(6)?),
         reusable_call: call,
@@ -246,10 +248,7 @@ pub(super) fn queued_job(
 
 /// Rebuild a `QueuedJob` from its decoded `jobs` row (spec + message +
 /// needs joins).
-pub(super) fn queued_job_of(
-    tx: &Transaction<'_>,
-    job: JobRow,
-) -> Result<QueuedJob, ControlError> {
+pub(super) fn queued_job_of(tx: &Transaction<'_>, job: JobRow) -> Result<QueuedJob, ControlError> {
     let spec = load_spec(tx, job.run_id, &job.job_id)?.unwrap_or_else(|| SpecRow {
         display_name: job.job_id.0.clone(),
         if_condition: None,
@@ -355,7 +354,9 @@ pub(super) fn insert_job(
         job.runner_group,
         run_order,
         job_order,
-        job.enqueued_at_unix_nanos.checked_div(1000).filter(|v| *v > 0),
+        job.enqueued_at_unix_nanos
+            .checked_div(1000)
+            .filter(|v| *v > 0),
         job.dependencies_ready_at_unix_nanos.map(|v| v / 1000),
         job.concurrency_wait_started_at_unix_nanos.map(|v| v / 1000),
         job.concurrency_acquired_at_unix_nanos.map(|v| v / 1000),
@@ -614,7 +615,9 @@ pub(super) fn run_graph(tx: &Transaction<'_>, run_id: RunId) -> Result<RunGraph,
         }
     }
     let mut stmt = tx
-        .prepare_cached("SELECT job_id, needs_job_id FROM job_needs WHERE run_id = ?1 ORDER BY position")
+        .prepare_cached(
+            "SELECT job_id, needs_job_id FROM job_needs WHERE run_id = ?1 ORDER BY position",
+        )
         .map_err(db)?;
     let rows = stmt
         .query_map([&run], |row| {
@@ -657,10 +660,7 @@ impl RunGraph {
 
     /// `ancestor_statuses`: transitively expand needs, collecting statuses.
     pub(super) fn ancestor_statuses(&self, needs: &[JobId]) -> Vec<ExecutionStatus> {
-        let mut pending: Vec<JobId> = needs
-            .iter()
-            .flat_map(|need| self.matching(need))
-            .collect();
+        let mut pending: Vec<JobId> = needs.iter().flat_map(|need| self.matching(need)).collect();
         let mut visited = BTreeSet::new();
         let mut statuses = Vec::new();
         while let Some(job_id) = pending.pop() {
@@ -680,7 +680,9 @@ impl RunGraph {
 
 /// The platform labels every registered runner hosts (for
 /// `unhostable_platform`), deduplicated.
-pub(super) fn registered_platforms(tx: &Transaction<'_>) -> Result<Vec<&'static str>, ControlError> {
+pub(super) fn registered_platforms(
+    tx: &Transaction<'_>,
+) -> Result<Vec<&'static str>, ControlError> {
     let mut stmt = tx
         .prepare_cached("SELECT labels FROM runners")
         .map_err(db)?;
@@ -728,9 +730,7 @@ pub(super) fn run_context(
     run_id: RunId,
 ) -> Result<(serde_json::Value, preloop_gha_protocol::WorkflowSubmission), ControlError> {
     let (github_json, submission_json) = tx
-        .prepare_cached(
-            "SELECT github_context, submission FROM run_submissions WHERE run_id = ?1",
-        )
+        .prepare_cached("SELECT github_context, submission FROM run_submissions WHERE run_id = ?1")
         .map_err(db)?
         .query_row([codec::run_key(run_id)], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -981,8 +981,7 @@ pub(super) fn run_record(
             statuses.insert(id.clone(), status_parse(&status));
             base_ids.insert(id.clone(), base_id);
             if let Some(json) = out {
-                if let Ok(map) =
-                    serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json)
+                if let Ok(map) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json)
                 {
                     outputs.insert(id, map);
                 }
@@ -1041,7 +1040,18 @@ pub(super) fn run_record(
     let mut jobs_list = Vec::new();
     // job_history carries no spec envelope: spec columns project as NULL
     // and display order falls back to job-id order.
-    let spec_rows: Vec<(String, String, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<String>, String, i64, String)> = if archived {
+    let spec_rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+        String,
+    )> = if archived {
         tx.prepare_cached(
             "SELECT job_id, display_name, NULL, NULL, NULL, check_run_id, \
                     annotations, base_id, 0, status FROM job_history \
@@ -1106,7 +1116,8 @@ pub(super) fn run_record(
         base_id,
         _order,
         status,
-    ) in spec_rows {
+    ) in spec_rows
+    {
         let id = JobId(job_id.clone());
         job_names.insert(id.clone(), display_name.clone());
         if let Some(id) = check_run_id {
@@ -1157,16 +1168,18 @@ pub(super) fn run_record(
         })
         .optional()
         .map_err(db)?
-        .map(|(status, error, pr_number, effective_sha)| crate::models::PushState {
-            status: match status.as_str() {
-                "synced" => crate::models::PushStatus::Synced,
-                "blocked" => crate::models::PushStatus::Blocked,
-                _ => crate::models::PushStatus::Pending,
+        .map(
+            |(status, error, pr_number, effective_sha)| crate::models::PushState {
+                status: match status.as_str() {
+                    "synced" => crate::models::PushStatus::Synced,
+                    "blocked" => crate::models::PushStatus::Blocked,
+                    _ => crate::models::PushStatus::Pending,
+                },
+                error,
+                pr_number: pr_number.map(|n| n as u64),
+                effective_sha,
             },
-            error,
-            pr_number: pr_number.map(|n| n as u64),
-            effective_sha,
-        });
+        );
     let record = RunRecord {
         run_id,
         webhook_delivery_id: delivery_id,
@@ -1275,10 +1288,7 @@ pub(super) fn clear_run_dispatch_intent(
 }
 
 /// The namespace a run belongs to (`'default'` when the row is missing).
-pub(super) fn namespace_of(
-    tx: &Transaction<'_>,
-    run_id: RunId,
-) -> Result<String, ControlError> {
+pub(super) fn namespace_of(tx: &Transaction<'_>, run_id: RunId) -> Result<String, ControlError> {
     tx.prepare_cached("SELECT namespace_id FROM runs WHERE run_id = ?1")
         .map_err(db)?
         .query_row([codec::run_key(run_id)], |row| row.get(0))

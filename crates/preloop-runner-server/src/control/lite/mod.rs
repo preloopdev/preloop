@@ -12,6 +12,7 @@
 //! Transitions are still conditional statements (`WHERE status = ..`) so
 //! the SQL mirrors the Postgres backend statement for statement.
 
+mod acquire;
 mod codec;
 mod concurrency;
 mod dispatch;
