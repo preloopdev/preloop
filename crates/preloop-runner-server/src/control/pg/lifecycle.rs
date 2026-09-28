@@ -2,7 +2,7 @@
 //! scheduling state. Each is one short transaction; reads go to the reader
 //! pool (a command that must see its own earlier writes takes a writer).
 
-use super::codec::{self, from_json, json, now_us, us};
+use super::codec::{self, from_json, json, now_us, ts, us};
 use super::{db, lookups, PgBackend};
 use crate::control::backend::RegisterRunner;
 use crate::control::logic;
@@ -107,9 +107,9 @@ impl PgBackend {
                 "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
                  client_id, verified, created_at, last_seen_at) \
                  VALUES ($1::text::uuid,$2,$3,$4,$5,",
-                us!("$6"),
+                ts!("$6"),
                 ",",
-                us!("$6"),
+                ts!("$6"),
                 ")"
             ),
             &[

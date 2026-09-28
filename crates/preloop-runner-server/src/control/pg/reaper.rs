@@ -95,7 +95,7 @@ impl PgBackend {
                         concat!(
                             "UPDATE jobs SET status='failure', queue_state='none', \
                              completed_at=",
-                            us!("$3"),
+                            ts!("$3"),
                             ", claimed_by_runner_id=NULL, claimed_at=NULL \
                              WHERE run_id=$1::text::uuid AND job_id=$2 \
                              AND queue_state='ready'"
