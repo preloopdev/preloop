@@ -4145,15 +4145,26 @@ impl ControlBackend for PostgresBackend {
         .await
     }
 
-    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
+    async fn allocate_run_number(
+        &self,
+        namespace_id: &str,
+        repository: &str,
+        workflow_path: &str,
+    ) -> Result<u64, ControlError> {
         // One atomic upsert: the stored value is the last number handed out.
+        // The legacy `workflow_run_counters` table has a single `key`; fold
+        // `(repository, workflow_path)` in so the counter is unique per
+        // repo+workflow as the agreed schema requires. `namespace_id` is not
+        // a legacy column — single-tenant for now.
+        let _ = namespace_id;
+        let key = format!("{repository}\x1f{workflow_path}");
         let client = self.checkout_writer().await?;
         let result = client
             .query_one(
                 "INSERT INTO workflow_run_counters (key, value) VALUES ($1, 1) \
                  ON CONFLICT(key) DO UPDATE SET value = workflow_run_counters.value + 1 \
                  RETURNING value",
-                &[&workflow_path],
+                &[&key],
             )
             .await
             .map(|row| row.get::<_, i64>(0) as u64)

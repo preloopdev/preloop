@@ -128,9 +128,15 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// counter. Called before the job messages are built (the number is
     /// embedded in `github.run_number`), so it is its own transaction — a
     /// crash between this and `submit_run` burns a number, which is
-    /// acceptable (run numbers may have gaps).
-    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError>;
-
+    /// acceptable (run numbers may have gaps). Scoped by
+    /// `(namespace_id, repository, workflow_path)` to match the agreed
+    /// `workflow_run_numbers` primary key.
+    async fn allocate_run_number(
+        &self,
+        namespace_id: &str,
+        repository: &str,
+        workflow_path: &str,
+    ) -> Result<u64, ControlError>;
     /// Claim the next dispatchable job for a session. Marks the session
     /// seen, picks a ready job the runner may claim (capability + binding
     /// rules), mints its request/message correlation, and returns the
@@ -1328,10 +1334,21 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.submit_run(submit).await,
         }
     }
-    async fn allocate_run_number(&self, workflow_path: &str) -> Result<u64, ControlError> {
+    async fn allocate_run_number(
+        &self,
+        namespace_id: &str,
+        repository: &str,
+        workflow_path: &str,
+    ) -> Result<u64, ControlError> {
         match self {
-            Self::Sqlite(b) => b.allocate_run_number(workflow_path).await,
-            Self::Postgres(b) => b.allocate_run_number(workflow_path).await,
+            Self::Sqlite(b) => {
+                b.allocate_run_number(namespace_id, repository, workflow_path)
+                    .await
+            }
+            Self::Postgres(b) => {
+                b.allocate_run_number(namespace_id, repository, workflow_path)
+                    .await
+            }
         }
     }
     async fn poll_session(&self, poll: PollRequest) -> Result<PollOutcome, ControlError> {

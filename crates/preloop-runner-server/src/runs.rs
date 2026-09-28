@@ -1506,7 +1506,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let run_number = shared
         .state
         .backend
-        .allocate_run_number(&workflow_path)
+        .allocate_run_number(
+            crate::control::types::DEFAULT_NAMESPACE,
+            &submission.repository,
+            &workflow_path,
+        )
         .await
         .map_err(ApiError::from)?;
     if let Some(object) = github.as_object_mut() {
