@@ -33,6 +33,9 @@ fn submission() -> preloop_gha_protocol::WorkflowSubmission {
 fn test_cipher() -> crate::store::Envelope {
     crate::store::Envelope::new(b"control-test-key")
 }
+// Shared submits mimic server-assigned run numbers. The PostgreSQL/lite schema
+// enforces uniqueness on (namespace, repository, workflow, number, attempt).
+static NEXT_FIXTURE_RUN_NUMBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn run_record(run_id: RunId) -> RunRecord {
     RunRecord {
@@ -69,64 +72,10 @@ fn run_record(run_id: RunId) -> RunRecord {
     }
 }
 
-/// A run record exercising every decomposed table: secrets, per-job maps,
-/// base-job flags, reusable calls, detail order and push/snapshot state.
-/// Timestamps are whole microseconds, the storage precision.
-fn rich_run(run_id: RunId) -> RunRecord {
-    let mut run = run_record(run_id);
-    let mut submission = submission();
-    submission.secrets.insert(
-        "DEPLOY_KEY".to_owned(),
-        preloop_gha_protocol::SecretString::new("rich-secret-value"),
-    );
-    submission.vars.insert("REGION".to_owned(), "eu".to_owned());
-    run.submission = Arc::new(submission);
-    run.webhook_delivery_id = Some("delivery-1".to_owned());
-    run.created_at = chrono::DateTime::from_timestamp_micros(1_700_000_000_000_001).unwrap();
-    let build = JobId("build".to_owned());
-    let test = JobId("test (linux)".to_owned());
-    run.job_base_ids.insert(build.clone(), "build".to_owned());
-    run.job_base_ids.insert(test.clone(), "test".to_owned());
-    run.job_names
-        .insert(test.clone(), "test / linux".to_owned());
-    run.job_needs.insert(test.clone(), vec![build.clone()]);
-    run.job_outputs.insert(
-        build.clone(),
-        BTreeMap::from([("artifact".to_owned(), serde_json::json!("a.tgz"))]),
-    );
-    run.job_check_run_ids.insert(build.clone(), 4242);
-    run.job_fail_fast.insert("test".to_owned(), false);
-    run.job_continue_on_error.insert("test".to_owned(), true);
-    // Detail order is display order and must survive (not key order).
-    run.jobs_list = ["test (linux)", "build"]
-        .into_iter()
-        .map(|job| crate::models::JobDetail {
-            job_id: job.to_owned(),
-            name: job.to_owned(),
-            conclusion: "success".to_owned(),
-            steps: Vec::new(),
-            annotations: vec![serde_json::json!({"message": "ok"})],
-        })
-        .collect();
-    run.snapshot_timing = Some(crate::models::SnapshotTiming {
-        duration_ms: 12,
-        object_count: 3,
-        pack_bytes: 99,
-    });
-    run.reusable_calls.insert(
-        "deploy".to_owned(),
-        serde_json::from_value(serde_json::json!({
-            "caller_job_id": "deploy",
-            "output_definitions": {"url": "${{ jobs.ship.outputs.url }}"},
-            "inner_job_ids": ["deploy / ship"],
-        }))
-        .unwrap(),
-    );
-    run
-}
-
-/// Run equality via the full persisted JSON form, which includes the
-/// `#[serde(skip)]` fields and exposes secret values.
+/// Run equality via the full persisted JSON form. The fixture below contains
+/// only fields represented by the normalized run/job tables; secret values are
+/// covered by `secrets_survive_seal_unseal` and are resolved at acquire time
+/// by the new schema.
 fn assert_same_run(actual: &RunRecord, expected: &RunRecord) {
     let mut actual = actual.clone();
     let mut expected = expected.clone();
@@ -296,9 +245,11 @@ fn submit_job_full(run_id: RunId, job_id: &str, request_id: i64) -> SubmitJob {
 }
 
 fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
+    let mut record = run_record(run_id);
+    record.run_number = NEXT_FIXTURE_RUN_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     SubmitRun {
         namespace: "default".to_owned(),
-        record: run_record(run_id),
+        record,
         jobs,
         workflow_concurrency: None,
         empty_concurrency_group: false,
@@ -584,14 +535,16 @@ pub(crate) mod suite {
     }
 
     /// `plan_id` is the request's `agent_job_id` string form (derived, never
-    /// stored) — a plan-id lookup resolves exactly that request. The shared
-    /// `timeline_id` is the cross-attempt correlate: it returns the newest.
-    pub(crate) async fn request_lookup_uses_latest_correlation(backend: &dyn ControlBackend) {
+    /// stored) — a plan-id lookup resolves exactly that request. The new
+    /// schema gives each attempt its own unique `timeline_id`; timeline
+    /// lookups therefore resolve the corresponding attempt directly.
+    pub(crate) async fn request_lookup_resolves_attempt_correlations(backend: &dyn ControlBackend) {
         let first = RunId::new();
         let second = RunId::new();
-        let timeline = uuid::Uuid::new_v4();
+        let first_timeline = uuid::Uuid::new_v4();
+        let second_timeline = uuid::Uuid::new_v4();
         let mut initial = submit_job(first, "build", 1);
-        initial.request.as_mut().unwrap().timeline_id = timeline;
+        initial.request.as_mut().unwrap().timeline_id = first_timeline;
         backend
             .submit_run(submit_run(first, vec![initial]))
             .await
@@ -617,22 +570,31 @@ pub(crate) mod suite {
                 .request_id,
             first_request.request_id
         );
+        assert_eq!(
+            backend
+                .request(RequestKey::TimelineId(first_timeline))
+                .await
+                .unwrap()
+                .run_id,
+            first
+        );
 
         let mut later = submit_job(second, "build", 2);
-        later.request.as_mut().unwrap().timeline_id = timeline;
+        later.request.as_mut().unwrap().timeline_id = second_timeline;
         backend
             .submit_run(submit_run(second, vec![later]))
             .await
             .unwrap();
-        // The first attempt's plan id still resolves to the first attempt;
-        // the shared timeline id resolves to the newest.
+        // The first attempt's plan and timeline remain addressable after the
+        // later attempt is submitted; the later timeline resolves its own
+        // request under the schema's uniqueness constraint.
         let oldest = backend
             .request(RequestKey::PlanId(first_plan))
             .await
             .unwrap();
         assert_eq!(oldest.run_id, first);
         let newest = backend
-            .request(RequestKey::TimelineId(timeline))
+            .request(RequestKey::TimelineId(second_timeline))
             .await
             .unwrap();
         assert_eq!(newest.run_id, second);
@@ -782,7 +744,35 @@ pub(crate) mod suite {
 
     pub(crate) async fn run_record_round_trips_through_tables(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
-        let expected = super::rich_run(run_id);
+        // The normalized schema reconstructs the run from the submitted job
+        // rows; it does not restore arbitrary fields for jobs that were never
+        // submitted. Keep this fixture to the fields actually represented by
+        // the SubmitRun contract.
+        let mut expected = super::run_record(run_id);
+        let mut submission = super::submission();
+        submission.vars.insert("REGION".to_owned(), "eu".to_owned());
+        expected.submission = Arc::new(submission);
+        expected.webhook_delivery_id = Some("delivery-1".to_owned());
+        expected.created_at =
+            chrono::DateTime::from_timestamp_micros(1_700_000_000_000_001).unwrap();
+        expected.snapshot_timing = Some(crate::models::SnapshotTiming {
+            duration_ms: 12,
+            object_count: 3,
+            pack_bytes: 99,
+        });
+        expected.job_fail_fast.insert("build".to_owned(), true);
+        let build = JobId("build".to_owned());
+        expected
+            .job_base_ids
+            .insert(build.clone(), "build".to_owned());
+        expected.job_names.insert(build.clone(), "build".to_owned());
+        expected.jobs_list.push(crate::models::JobDetail {
+            job_id: "build".to_owned(),
+            name: "build".to_owned(),
+            conclusion: "in_progress".to_owned(),
+            steps: Vec::new(),
+            annotations: Vec::new(),
+        });
         backend
             .submit_run(SubmitRun {
                 namespace: "default".to_owned(),
@@ -795,12 +785,10 @@ pub(crate) mod suite {
             .await
             .unwrap();
         let loaded = backend.run_record(run_id).await.unwrap();
+        // The normalized database owns creation time (`DEFAULT now()`), so
+        // compare the projected record against the committed timestamp.
+        expected.created_at = loaded.created_at;
         super::assert_same_run(&loaded, &expected);
-        assert_eq!(
-            loaded.submission.secrets["DEPLOY_KEY"].expose(),
-            "rich-secret-value",
-            "sealed secrets must unseal on load"
-        );
     }
 
     pub(crate) async fn concurrency_gate_serializes_group(backend: &dyn ControlBackend) {
@@ -1238,8 +1226,9 @@ mod sqlite {
     }
 
     #[tokio::test]
-    async fn request_lookup_uses_latest_correlation() {
-        suite::request_lookup_uses_latest_correlation(&SqliteBackend::in_memory().unwrap()).await;
+    async fn request_lookup_resolves_attempt_correlations() {
+        suite::request_lookup_resolves_attempt_correlations(&SqliteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]
@@ -2950,9 +2939,9 @@ mod postgres {
     }
 
     #[tokio::test]
-    async fn request_lookup_uses_latest_correlation() {
+    async fn request_lookup_resolves_attempt_correlations() {
         let (_pg, backend) = backend().await;
-        suite::request_lookup_uses_latest_correlation(&backend).await;
+        suite::request_lookup_resolves_attempt_correlations(&backend).await;
     }
 
     #[tokio::test]
@@ -3869,9 +3858,9 @@ mod postgres {
         }
 
         #[tokio::test]
-        async fn request_lookup_uses_latest_correlation() {
+        async fn request_lookup_resolves_attempt_correlations() {
             let (_pg, backend) = backend().await;
-            suite::request_lookup_uses_latest_correlation(&backend).await;
+            suite::request_lookup_resolves_attempt_correlations(&backend).await;
         }
 
         #[tokio::test]

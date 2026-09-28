@@ -236,8 +236,18 @@ impl PgBackend {
         repository: &str,
         workflow_path: &str,
     ) -> Result<u64, ControlError> {
-        let client = self.writer().await?;
-        let number: i64 = client
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        // `runs` inserts the namespace in its own transaction, but the API
+        // allocates the number before building/submitting that run. Create
+        // the namespace here so the counter's FK is valid on first use.
+        tx.execute(
+            "INSERT INTO namespaces (namespace_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            &[&namespace_id],
+        )
+        .await
+        .map_err(db)?;
+        let number: i64 = tx
             .query_one(
                 "INSERT INTO workflow_run_numbers AS w (namespace_id, repository, workflow_path, \
                  last_run_number) VALUES ($1, $2, $3, 1) \
@@ -249,6 +259,7 @@ impl PgBackend {
             .await
             .map_err(db)?
             .get(0);
+        tx.commit().await.map_err(db)?;
         Ok(number.max(0) as u64)
     }
 
