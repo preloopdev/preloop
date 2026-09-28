@@ -719,3 +719,164 @@ fn archived_attempt_steps(
     rows.map(|row| row.map(|(_, record)| record).map_err(db))
         .collect()
 }
+
+/// An `attempt_history` row decoded into the live-request shape
+/// (`RECORD_COLUMNS` parity: no lease, no timeout/debug flags).
+fn attempt_history_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::models::TaskAgentJobRequestRecord> {
+    let agent_job_id = codec::uuid(&row.get::<_, String>(3)?);
+    Ok(crate::models::TaskAgentJobRequestRecord {
+        request_id: row.get(0)?,
+        run_id: codec::run_id(&row.get::<_, String>(1)?),
+        job_id: JobId(row.get(2)?),
+        agent_job_id,
+        plan_id: codec::plan_id(&agent_job_id),
+        plan_type: codec::PLAN_TYPE.to_owned(),
+        timeline_id: codec::uuid(&row.get::<_, String>(4)?),
+        result: row
+            .get::<_, Option<String>>(5)?
+            .as_deref()
+            .map(status_parse),
+        locked_until: String::new(),
+        claimed_at: row.get::<_, Option<i64>>(6)?.map(codec::us_to_system),
+        owner_runner_id: row.get(7)?,
+        started_at: row.get::<_, Option<i64>>(8)?.map(codec::us_to_system),
+        last_renewed_at: None,
+        timeout_triggered: false,
+        debug_token_issued: false,
+    })
+}
+
+/// The `RECORD_COLUMNS` projection over `attempt_history` (same column
+/// order; lease/flags are absent in history).
+const ATTEMPT_HISTORY_COLUMNS: &str = "q.request_id, q.run_id, q.job_id, q.agent_job_id, \
+     q.timeline_id, q.result, NULL, q.claimed_at, q.runner_id, q.started_at";
+
+const ATTEMPT_HISTORY_FROM: &str = "attempt_history q";
+
+impl LiteBackend {
+    /// `run_record`: the projected run record, live rows first and
+    /// `run_history`/`job_history`/`attempt_history` when archived
+    /// (decision Q10).
+    pub(crate) async fn run_record(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<crate::models::RunRecord>, ControlError> {
+        self.read(move |tx| super::jobs::run_record(tx, run_id))
+    }
+
+    /// `run_requests`: live `job_requests` UNION ALL archived
+    /// `attempt_history`, request_id order (pg lookups.rs parity).
+    pub(crate) async fn run_requests(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<crate::models::TaskAgentJobRequestRecord>, ControlError> {
+        let run = codec::run_key(run_id);
+        self.read(move |tx| {
+            let live = format!(
+                "SELECT {} FROM {} WHERE q.run_id = ?1",
+                super::requests::RECORD_COLUMNS,
+                super::requests::RECORD_FROM
+            );
+            let mut stmt = tx
+                .prepare_cached(&format!(
+                    "{live} UNION ALL \
+                     SELECT {ATTEMPT_HISTORY_COLUMNS} FROM {ATTEMPT_HISTORY_FROM} \
+                     WHERE q.run_id = ?1 ORDER BY 1"
+                ))
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([&run], |row| {
+                    // The UNION must decode through the live decoder; the
+                    // history arm yields NULL lease columns, which
+                    // `record_row` reads as absent.
+                    super::requests::record_row(row)
+                })
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)
+        })
+    }
+
+    /// `list_runs`: id order by `(terminal, last-activity desc)`, filtered
+    /// on workflow/status/event, then each id's `run_record` projection
+    /// (history fallback covers archived runs).
+    pub(crate) async fn list_runs(
+        &self,
+        filter: crate::control::backend::RunListFilter,
+    ) -> Result<Vec<crate::models::RunRecord>, ControlError> {
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT run_id FROM ( \
+                         SELECT run_id, \
+                                CASE WHEN status = 'completed' THEN 1 ELSE 0 END AS terminal_rank, \
+                                COALESCE(completed_at, started_at, created_at) AS sort_at \
+                         FROM runs \
+                         WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
+                           AND (?2 IS NULL OR status = ?2) \
+                           AND (?3 IS NULL OR event = ?3) \
+                         UNION ALL \
+                         SELECT run_id, 1, COALESCE(completed_at, started_at, created_at) \
+                         FROM run_history \
+                         WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
+                           AND (?2 IS NULL OR 'completed' = ?2) \
+                           AND (?3 IS NULL OR event = ?3)) \
+                     ORDER BY terminal_rank, sort_at DESC, run_id LIMIT ?4",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        filter.workflow.as_deref(),
+                        filter.status.as_deref(),
+                        filter.event.as_deref(),
+                        filter.limit.min(200) as i64,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(db)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db)?;
+            let mut runs = Vec::with_capacity(rows.len());
+            for run in rows {
+                if let Some(record) = super::jobs::run_record(tx, codec::run_id(&run))? {
+                    runs.push(record);
+                }
+            }
+            Ok(runs)
+        })
+    }
+
+    /// `runs_for_repository`: every run (live or archived) of one
+    /// repository, repository comparison case-insensitive like the old
+    /// `eq_ignore_ascii_case` filter.
+    pub(crate) async fn runs_for_repository(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<crate::models::RunRecord>, ControlError> {
+        let repository = repository.to_owned();
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT run_id FROM runs WHERE repository = ?1 COLLATE NOCASE \
+                     UNION ALL \
+                     SELECT run_id FROM run_history \
+                     WHERE repository = ?1 COLLATE NOCASE",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([repository.as_str()], |row| row.get::<_, String>(0))
+                .map_err(db)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db)?;
+            let mut runs = Vec::with_capacity(rows.len());
+            for run in rows {
+                if let Some(record) = super::jobs::run_record(tx, codec::run_id(&run))? {
+                    runs.push(record);
+                }
+            }
+            Ok(runs)
+        })
+    }
+}
