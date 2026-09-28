@@ -178,6 +178,22 @@ pub(crate) struct ClaimCandidate {
     pub(crate) claimable: bool,
 }
 
+/// `job_labels_covered_exactly` from sched.rs: every required label present
+/// verbatim (case-insensitive) on the runner. The capability matcher's OS
+/// fallbacks do NOT count — tier three exists to prefer true matches.
+pub(crate) fn job_labels_covered_exactly(job_labels: &[String], runner_labels: &[String]) -> bool {
+    if job_labels.is_empty() {
+        return true;
+    }
+    if runner_labels.is_empty() {
+        return false;
+    }
+    let runner_set: HashSet<String> = runner_labels.iter().map(|l| l.to_lowercase()).collect();
+    job_labels
+        .iter()
+        .all(|required| runner_set.contains(&required.to_lowercase()))
+}
+
 /// Select the candidate index using the production four-tier preference:
 /// fresh assignment to this runner with exact labels, assignment to this
 /// runner, exact labels, then any claimable candidate. Relative order within
@@ -189,9 +205,12 @@ pub(crate) fn claim_preference(
     required_group: Option<&str>,
     runner: &RunnerMatchRow,
 ) -> Option<usize> {
+    // "Exact" is the strict subset match (every job label present verbatim
+    // on the runner) — NOT the capability matcher, which admits the
+    // ubuntu-* -> os-name fallback. `assigned_to_this_runner` in the old
+    // code paired with the exact-label check, never freshness.
     let exact = |candidate: &ClaimCandidate| {
-        candidate.assignment_fresh
-            && runner_labels_match(&candidate.runs_on, runner_labels)
+        job_labels_covered_exactly(&candidate.runs_on, runner_labels)
             && runner_group_matches(candidate.runner_group.as_deref().or(required_group), runner)
     };
     let assigned = |candidate: &ClaimCandidate| {

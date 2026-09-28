@@ -42,9 +42,7 @@ async fn preserve_on_failure_reaches_the_job_message_only_when_requested() {
         .await;
 
         let inner = state.test_tx().await;
-        let queued = crate::control::sched::ready_jobs(&inner)
-            .next()
-            .expect("job should be queued");
+        let queued = inner.ready().next().expect("job should be queued");
         assert_eq!(
             queued.message.preloop_preserve_on_failure, expected,
             "preserve_on_failure={requested}"
@@ -1207,7 +1205,14 @@ jobs:
 
     let first_request_id = {
         let inner = state.test_tx().await;
-        *inner.session_active_requests.get("s1").unwrap()
+        *inner
+            .session_active_requests
+            .get(
+                crate::control::logic::session_uuid("s1")
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap()
     };
 
     let withheld = request_json(
@@ -1311,13 +1316,15 @@ async fn unacked_messages_are_scoped_to_their_session() {
     assert_eq!(redelivered["messageId"], first_message_id);
 
     let inner = state.test_tx().await;
+    let s1 = crate::control::logic::session_uuid("s1").to_string();
+    let s2 = crate::control::logic::session_uuid("s2").to_string();
     assert!(inner
         .inflight_messages
-        .get("s1")
+        .get(&s1)
         .is_some_and(|messages| messages.contains_key(&first_message_id)));
     assert!(inner
         .inflight_messages
-        .get("s2")
+        .get(&s2)
         .is_some_and(|messages| messages.contains_key(&second_message_id)));
 }
 
@@ -1437,7 +1444,14 @@ jobs:
 
     let active_request = {
         let inner = state.test_tx().await;
-        let active_id = *inner.session_active_requests.get("s1").unwrap();
+        let active_id = *inner
+            .session_active_requests
+            .get(
+                crate::control::logic::session_uuid("s1")
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap();
         inner.job_requests.get(&active_id).unwrap().clone()
     };
     let unknown_plan_id = uuid::Uuid::new_v4();
@@ -2218,23 +2232,17 @@ async fn live_log_key_follows_the_newest_attempt() {
     // A re-dispatch: a second request for the same logical job, with a higher
     // request id and its own agent job id.
     let (first_attempt, second_attempt) = state
-        .backend
-        .transact(move |tx| {
-            let (first_id, first) = tx
-                .job_requests
-                .iter()
-                .find(|(_, record)| record.run_id == run_id && record.job_id.0 == "build")
-                .map(|(id, record)| (*id, record.clone()))
+        .test_db_mutate(move |tx| {
+            let (_, first_agent_job_id, timeline_id) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
                 .expect("the dispatched attempt");
-            let mut retry = first.clone();
-            retry.request_id = first_id + 1;
-            retry.agent_job_id = uuid::Uuid::new_v4();
-            let second = retry.agent_job_id;
-            tx.job_requests.insert(retry.request_id, retry);
-            Ok((first.agent_job_id, second))
+            let (_, second_agent_job_id) = tx
+                .insert_retry_request(run_id, &JobId("build".to_owned()), timeline_id)
+                .unwrap();
+            (first_agent_job_id, second_agent_job_id)
         })
-        .await
-        .expect("seed retry");
+        .await;
     assert_ne!(first_attempt, second_attempt);
 
     let key = state
@@ -3164,10 +3172,9 @@ async fn list_runs_puts_active_work_before_newer_terminal_runs() {
         (second, first)
     };
     state
-        .test_tx_mutate(|inner| {
-            let completed = inner.runs.get_mut(&terminal).unwrap();
-            completed.status = ExecutionStatus::Success;
-            completed.completed_at = Some(chrono::Utc::now());
+        .test_db_mutate(|tx| {
+            tx.set_run_status(terminal, "completed", Some("success"))
+                .unwrap();
         })
         .await;
 
@@ -3454,32 +3461,27 @@ async fn completion_reconciles_the_reporting_attempt_not_the_oldest() {
 
     // Re-dispatch: a newer request, its own agent job id, its own step ids.
     let (first_agent_job_id, second_agent_job_id, second_step_id) = state
-        .test_tx_mutate(|inner| {
-            let mut record = inner
-                .job_requests
-                .values()
-                .find(|request| request.run_id == run_id && request.job_id.0 == "build")
-                .cloned()
+        .test_db_mutate(|tx| {
+            let (first_id, first_agent_job_id, timeline_id) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
                 .expect("first attempt must exist");
-            let first_agent_job_id = record.agent_job_id;
-            let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
-            let agent_job_id = uuid::Uuid::new_v4();
-            record.request_id = request_id;
-            record.agent_job_id = agent_job_id;
-            record.plan_id = uuid::Uuid::new_v4().to_string();
-            record.result = None;
+            let _ = first_id;
+            let (request_id, agent_job_id) = tx
+                .insert_retry_request(run_id, &JobId("build".to_owned()), timeline_id)
+                .unwrap();
+            let _ = request_id;
             let step_id = uuid::Uuid::new_v4().to_string();
-            inner.job_steps.insert(
+            tx.insert_step(
                 agent_job_id,
-                vec![crate::models::StepRecord::workflow(
-                    step_id.clone(),
-                    0,
-                    "Run echo build".to_owned(),
-                    Some("__run".to_owned()),
-                )],
-            );
-            inner.agent_job_requests.insert(agent_job_id, request_id);
-            inner.job_requests.insert(request_id, record);
+                &step_id,
+                0,
+                Some(0),
+                Some("__run"),
+                "Run echo build",
+                "pending",
+            )
+            .unwrap();
             (first_agent_job_id, agent_job_id, step_id)
         })
         .await;
@@ -3539,32 +3541,27 @@ async fn step_manifests_are_scoped_per_job_attempt() {
     // Simulate a re-dispatch: a new attempt with a new agent job id and new
     // step ids, exactly as a fresh `build_job_artifacts` would produce.
     let (second_plan_id, second_agent_job_id, second_step_id) = state
-        .test_tx_mutate(|inner| {
-            let mut record = inner
-                .job_requests
-                .values()
-                .find(|request| request.run_id == run_id && request.job_id.0 == "build")
-                .cloned()
+        .test_db_mutate(|tx| {
+            let (_, _, timeline_id) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
                 .expect("first attempt must exist");
-            let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
-            let agent_job_id = uuid::Uuid::new_v4();
-            record.request_id = request_id;
-            record.agent_job_id = agent_job_id;
-            // plan_id is derived from agent_job_id — never an independent id.
-            record.plan_id = agent_job_id.to_string();
+            let (_, agent_job_id) = tx
+                .insert_retry_request(run_id, &JobId("build".to_owned()), timeline_id)
+                .unwrap();
             let step_id = uuid::Uuid::new_v4().to_string();
-            inner.job_steps.insert(
+            tx.insert_step(
                 agent_job_id,
-                vec![crate::models::StepRecord::workflow(
-                    step_id.clone(),
-                    0,
-                    "Run echo build".to_owned(),
-                    Some("__run".to_owned()),
-                )],
-            );
-            let plan_id = record.plan_id.clone();
-            inner.agent_job_requests.insert(agent_job_id, request_id);
-            inner.job_requests.insert(request_id, record);
+                &step_id,
+                0,
+                Some(0),
+                Some("__run"),
+                "Run echo build",
+                "pending",
+            )
+            .unwrap();
+            // plan_id is derived from agent_job_id — never an independent id.
+            let plan_id = agent_job_id.to_string();
             (plan_id, agent_job_id.to_string(), step_id)
         })
         .await;
@@ -8498,7 +8495,11 @@ jobs:
         Value::Null,
     )
     .await;
-    assert_eq!(first["messageId"], 1);
+    // Ids are unique, not dense: session_messages starts above 1e6 so a
+    // control message never collides with a broker job ref's request id.
+    let message_id = first["messageId"]
+        .as_i64()
+        .expect("a job assignment must carry a numeric messageId");
 
     let redelivered = request_json(
         &app,
@@ -8514,7 +8515,9 @@ jobs:
         .oneshot(
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/runner/server/_apis/v1/Message/1/1?sessionId=default")
+                .uri(format!(
+                    "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
+                ))
                 .header(header::AUTHORIZATION, "Bearer preloop-system-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -8671,10 +8674,9 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     state
-        .test_tx_mutate(|inner| {
-            let run = inner.runs.get_mut(&run_id).unwrap();
-            run.job_check_run_ids
-                .insert(JobId("build".into()), CHECK_RUN_ID);
+        .test_db_mutate(|tx| {
+            tx.set_job_check_run(run_id, &JobId("build".into()), CHECK_RUN_ID as i64)
+                .unwrap();
         })
         .await;
 
@@ -8741,12 +8743,9 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let job_id = JobId("build".to_owned());
     state
-        .test_tx_mutate(|tx| {
-            tx.runs
-                .get_mut(&run_id)
-                .unwrap()
-                .job_check_run_ids
-                .insert(job_id.clone(), CHECK_RUN_ID);
+        .test_db_mutate(|tx| {
+            tx.set_job_check_run(run_id, &job_id, CHECK_RUN_ID as i64)
+                .unwrap();
         })
         .await;
     {
@@ -8883,7 +8882,11 @@ jobs:
     .await;
 
     let message = poll.await.unwrap();
-    assert_eq!(message["messageId"], 1);
+    assert!(
+        message["messageId"].as_i64().is_some(),
+        "the long poll must return the enqueued message: {message}"
+    );
+    assert_eq!(message["messageType"], "PipelineAgentJobRequest");
 }
 
 #[tokio::test]
@@ -10427,10 +10430,12 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     // JWT. `agent_job_requests` is derived from `job_requests` on load, so
     // the record itself must go.
     state
-        .test_tx_mutate(|inner| {
-            if let Some(request_id) = inner.agent_job_requests.get(&fork_job).copied() {
-                inner.remove_request(request_id);
-            }
+        .test_db_mutate(|tx| {
+            tx.0.execute(
+                "DELETE FROM job_requests WHERE agent_job_id = ?1",
+                rusqlite::params![fork_job.to_string()],
+            )
+            .unwrap();
         })
         .await;
 
@@ -11402,14 +11407,15 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 
     // Backdate the first-seen mark past the grace window and reap again: the
     // job must be failed with a visible reason and the run must conclude.
-    state
-        .test_tx_mutate(|inner| {
-            inner.queued_at.insert(
-                (run_id, JobId("build".to_owned())),
-                SystemTime::now() - Duration::from_secs(300),
-            );
-        })
-        .await;
+    // The mark is node-local reaper state (decisions-5 B2), not a column.
+    {
+        let mut inner = state.inner.lock().await;
+        let mark = inner
+            .reaper_first_seen
+            .get_mut(&(run_id, JobId("build".to_owned())))
+            .expect("the first tick must mark the unmatched job");
+        *mark -= Duration::from_secs(300);
+    }
     reap_once(&shared).await;
 
     {
@@ -11446,13 +11452,9 @@ async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window(
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     state
-        .test_tx_mutate(|inner| {
-            inner
-                .ready_index
-                .front_mut()
-                .expect("submitted job must be ready")
-                .enqueued_at_unix_nanos = 0;
-            inner.queued_at.clear();
+        .test_db_mutate(|tx| {
+            tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), None)
+                .unwrap();
         })
         .await;
     reap_once(&shared).await;
@@ -11508,13 +11510,11 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     };
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
+    state.test_set_runner_liveness(Duration::from_secs(600));
     state
-        .test_tx_mutate(|inner| {
-            inner.runner_liveness_timeout = Duration::from_secs(600);
-            inner.session_last_seen.insert(
-                session_id.clone(),
-                std::time::SystemTime::now() - Duration::from_secs(3600),
-            );
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 3_600_000_000;
+            tx.set_session_seen(&session_id, cutoff).unwrap();
         })
         .await;
     reap_once(&shared).await;
@@ -11617,19 +11617,16 @@ async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
     let (runner_id, _token) =
         register_runner_with_token(&app, "broker-runner", &["self-hosted"], None).await;
 
+    state.test_set_runner_liveness(Duration::from_secs(600));
     state
-        .test_tx_mutate(|inner| {
-            inner.runner_liveness_timeout = Duration::from_secs(600);
-            inner.runner_registered_at.insert(
-                runner_id,
-                std::time::SystemTime::now() - Duration::from_secs(3600),
-            );
+        .test_db_mutate(|tx| {
+            tx.set_runner_registered_at(runner_id, crate::store::now_us() - 3_600_000_000)
+                .unwrap();
             // Modern broker sessions are tracked separately from the legacy
             // AzDO session map. The runner must not be treated as a phantom when
-            // only that map proves its session exists.
-            inner
-                .broker_session_runners
-                .insert("broker-session".to_owned(), runner_id);
+            // only that row proves its session exists.
+            tx.insert_session("broker-session", runner_id, "broker", true)
+                .unwrap();
         })
         .await;
 
@@ -11664,15 +11661,12 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     reap_once(&shared).await;
-    // Backdate the first-seen mark far past the grace window.
-    state
-        .test_tx_mutate(|inner| {
-            inner.queued_at.insert(
-                (run_id, JobId("build".to_owned())),
-                SystemTime::now() - Duration::from_secs(300),
-            );
-        })
-        .await;
+    // Backdate the first-seen mark far past the grace window. The mark is
+    // node-local reaper state (decisions-5 B2).
+    state.inner.lock().await.reaper_first_seen.insert(
+        (run_id, JobId("build".to_owned())),
+        SystemTime::now() - Duration::from_secs(300),
+    );
     reap_once(&shared).await;
     {
         let inner = state.test_tx().await;
@@ -11702,14 +11696,10 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 
     // With nothing having claimed the job after a full fresh window, the
     // sweep fails it as before.
-    state
-        .test_tx_mutate(|inner| {
-            inner.queued_at.insert(
-                (run_id, JobId("build".to_owned())),
-                SystemTime::now() - Duration::from_secs(300),
-            );
-        })
-        .await;
+    state.inner.lock().await.reaper_first_seen.insert(
+        (run_id, JobId("build".to_owned())),
+        SystemTime::now() - Duration::from_secs(300),
+    );
     reap_once(&shared).await;
     {
         let inner = state.test_tx().await;
@@ -11729,16 +11719,10 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
         state
-            .test_tx_mutate(|tx| {
-                let cutoff = (SystemTime::now() - Duration::from_secs(700))
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as i64;
-                tx.ready_index
-                    .iter_mut()
-                    .find(|job| job.run_id == run_id)
-                    .unwrap()
-                    .enqueued_at_unix_nanos = cutoff;
+            .test_db_mutate(|tx| {
+                let cutoff = crate::store::now_us() - 700_000_000;
+                tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
+                    .unwrap();
             })
             .await;
         run_id
@@ -11792,16 +11776,13 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
 
     // Age the job's ready-enqueue past the absolute ceiling.
     state
-        .test_tx_mutate(|inner| {
-            let cutoff = (SystemTime::now() - Duration::from_secs(700))
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64;
-            for job in inner.ready_index.iter_mut() {
-                if job.run_id == run_id {
-                    job.enqueued_at_unix_nanos = cutoff;
-                }
-            }
+        .test_db_mutate(|tx| {
+            tx.set_job_enqueued_us(
+                run_id,
+                &JobId("build".to_owned()),
+                Some(crate::store::now_us() - 700_000_000),
+            )
+            .unwrap();
         })
         .await;
     reap_once(&shared).await;
@@ -11862,9 +11843,15 @@ async fn job_timeout_enforcement_cancels_job() {
 
     // 3. Override started_at to be in the past (beyond 360m/21600s default timeout)
     state
-        .test_tx_mutate(|inner| {
-            let request = inner.job_requests.get_mut(&request_id).unwrap();
-            request.started_at = Some(SystemTime::now() - Duration::from_secs(22000));
+        .test_db_mutate(|tx| {
+            tx.update_request(
+                request_id,
+                Some(crate::store::now_us() - 22_000_000_000),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         })
         .await;
 
@@ -11964,9 +11951,15 @@ async fn debug_session_suspends_job_timeout() {
     // credit ceiling, so every elapsed second is debugging rather than
     // execution.
     state
-        .test_tx_mutate(|tx| {
-            let past = SystemTime::now() - Duration::from_secs(10_000);
-            tx.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
+        .test_db_mutate(|tx| {
+            tx.update_request(
+                request_id,
+                Some(crate::store::now_us() - 10_000_000_000),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         })
         .await;
     {
@@ -12079,9 +12072,10 @@ async fn debug_session_suspends_job_timeout() {
         "the pause should have banked its full duration, got {banked:?}"
     );
     state
-        .test_tx_mutate(|tx| {
-            tx.job_requests.get_mut(&request_id).unwrap().started_at =
-                Some(SystemTime::now() - Duration::from_secs(21_700) - banked);
+        .test_db_mutate(|tx| {
+            let us = crate::store::now_us() - (21_700_000_000 + banked.as_micros() as i64);
+            tx.update_request(request_id, Some(us), None, None, None)
+                .unwrap();
         })
         .await;
 
@@ -12640,11 +12634,19 @@ async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
     )
     .await;
 
+    let run_id = {
+        let inner = state.test_tx().await;
+        inner.runs.keys().next().copied().expect("submitted run")
+    };
     let (agent_job_id, plan_id) = state
-        .test_tx_mutate(|inner| {
-            let (_, record) = inner.job_requests.iter_mut().next().unwrap();
-            record.result = Some(ExecutionStatus::Failure);
-            (record.agent_job_id, record.plan_id.clone())
+        .test_db_mutate(|tx| {
+            let (request_id, agent_job_id, _) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
+                .expect("dispatched request");
+            tx.update_request(request_id, None, None, Some("failure"), None)
+                .unwrap();
+            (agent_job_id, agent_job_id.to_string())
         })
         .await;
 
@@ -12738,8 +12740,12 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
     let ceiling = crate::debug_sessions::MAX_PAUSE_CREDIT;
     let past = SystemTime::now() - ceiling - Duration::from_secs(22_000);
     state
-        .test_tx_mutate(|tx| {
-            tx.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
+        .test_db_mutate(|tx| {
+            let us = crate::store::now_us()
+                - (crate::debug_sessions::MAX_PAUSE_CREDIT.as_micros()
+                    + std::time::Duration::from_secs(22_000).as_micros()) as i64;
+            tx.update_request(request_id, Some(us), None, None, None)
+                .unwrap();
         })
         .await;
     {
@@ -13066,10 +13072,14 @@ async fn runner_lease_expiration_disconnect_reaper() {
 
     // 3. Exercise the just-before-boundary case without sleeping.
     state
-        .test_tx_mutate(|inner| {
-            let request = inner.job_requests.get_mut(&request_id).unwrap();
-            request.last_renewed_at =
-                Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS - 1));
+        .test_db_mutate(|tx| {
+            tx.set_lease_renewed(
+                request_id,
+                1,
+                crate::store::now_us() - (JOB_LEASE_SECONDS as i64 - 1) * 1_000_000,
+                crate::store::now_us() + JOB_LEASE_SECONDS as i64 * 1_000_000,
+            )
+            .unwrap();
         })
         .await;
 
@@ -13090,10 +13100,14 @@ async fn runner_lease_expiration_disconnect_reaper() {
 
     // 4. Move just beyond the same production lease boundary and reap.
     state
-        .test_tx_mutate(|inner| {
-            let request = inner.job_requests.get_mut(&request_id).unwrap();
-            request.last_renewed_at =
-                Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS + 1));
+        .test_db_mutate(|tx| {
+            tx.set_lease_renewed(
+                request_id,
+                1,
+                crate::store::now_us() - (JOB_LEASE_SECONDS as i64 + 1) * 1_000_000,
+                crate::store::now_us() - 1_000_000,
+            )
+            .unwrap();
         })
         .await;
 
@@ -13669,14 +13683,21 @@ async fn github_check_run_rerequest_resubmits_the_owning_run() {
     let original_run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let original_check_run_id = 1234;
     state
-        .test_tx_mutate(|inner| {
-            let run = inner.runs.get_mut(&original_run_id).unwrap();
-            run.jobs
-                .insert(JobId("build".to_owned()), ExecutionStatus::Failure);
-            run.status = ExecutionStatus::Failure;
-            run.conclusion = Some("failure".to_owned());
-            run.job_check_run_ids
-                .insert(JobId("build".to_owned()), original_check_run_id);
+        .test_db_mutate(|tx| {
+            tx.set_run_status(original_run_id, "completed", Some("failure"))
+                .unwrap();
+            tx.0
+                .execute(
+                    "UPDATE jobs SET status = 'failure', queue_state = 'none'                      WHERE run_id = ?1 AND job_id = 'build'",
+                    [original_run_id.to_string()],
+                )
+                .unwrap();
+            tx.set_job_check_run(
+                original_run_id,
+                &JobId("build".to_owned()),
+                original_check_run_id as i64,
+            )
+            .unwrap();
         })
         .await;
 
@@ -14581,27 +14602,83 @@ async fn claims_prefer_a_job_the_runner_exactly_matches() {
         runner_group_name: None,
     };
 
-    let first = state
-        .test_tx_mutate(|tx| {
-            crate::control::sched::choose_claim_position(tx, &machine, Some(1))
-                .and_then(|pos| crate::control::sched::apply_claim(tx, pos))
-        })
-        .await
-        .expect("a claimable job");
+    let claim_next = |state: &AppState| {
+        let labels = machine.labels.clone();
+        let group_id = machine.runner_group_id;
+        let group_name = machine.runner_group_name.clone();
+        let known = machine.known;
+        let state = state.clone();
+        async move {
+            let inner = state.test_tx().await;
+            let candidates: Vec<crate::control::logic::ClaimCandidate> = inner
+                .ready()
+                .enumerate()
+                .map(|(i, job)| crate::control::logic::ClaimCandidate {
+                    run_id: job.run_id,
+                    job_id: job.job_id.clone(),
+                    runs_on: job.runs_on.clone(),
+                    runner_group: job.runner_group.clone(),
+                    assigned_runner_id: None,
+                    assignment_fresh: false,
+                    queue_position: i as u64,
+                    claimable: true,
+                })
+                .collect();
+            let row = crate::control::logic::RunnerMatchRow {
+                labels,
+                known,
+                group_id,
+                group_name,
+            };
+            crate::control::logic::claim_preference(
+                &candidates,
+                None,
+                &row.labels.clone(),
+                None,
+                &row,
+            )
+            .map(|i| cands_claim(&state, &candidates[i]))
+        }
+    };
+    fn cands_claim<'a>(
+        _state: &'a AppState,
+        c: &'a crate::control::logic::ClaimCandidate,
+    ) -> (RunId, JobId) {
+        (c.run_id, c.job_id.clone())
+    }
+    let (first_run, first_job) = claim_next(&state).await.expect("a claimable job");
     assert_eq!(
-        first.job_id.0, "wide",
+        first_job.0, "wide",
         "the exact `self-hosted` match must win over the 22.04 stand-in"
     );
+    state
+        .test_db_mutate(|tx| {
+            tx.update_request(
+                tx.request_key_for(first_run, &first_job)
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                Some(crate::store::now_us()),
+                Some(1),
+                None,
+                None,
+            )
+            .unwrap();
+            tx.execute(
+                // Claimed = in_progress + claimed queue_state in the new schema.
+                "UPDATE jobs SET status = 'in_progress', queue_state = 'claimed' \
+                 WHERE run_id = ?1 AND job_id = ?2",
+                rusqlite::params![first_run.to_string(), first_job.0],
+            )
+            .unwrap();
+        })
+        .await;
 
     // And the stand-in still happens rather than starving the pinned job.
-    let second = state
-        .test_tx_mutate(|tx| {
-            crate::control::sched::choose_claim_position(tx, &machine, Some(1))
-                .and_then(|pos| crate::control::sched::apply_claim(tx, pos))
-        })
+    let (_second_run, second_job) = claim_next(&state)
         .await
         .expect("the pinned job is still claimable");
-    assert_eq!(second.job_id.0, "pinned");
+    assert_eq!(second_job.0, "pinned");
 }
 
 /// A job for a platform with no runner host can never be claimed. Queuing it
@@ -15124,7 +15201,7 @@ async fn stored_secrets_are_injected_into_native_submissions() {
 
 /// Extract the queued job message for a run, wherever it currently sits.
 fn queued_message_for(
-    tx: &crate::control::txstate::TxState,
+    tx: &crate::control::testview::TestState,
     run_id: &str,
 ) -> AgentJobRequestMessage {
     let run = tx
@@ -15132,7 +15209,7 @@ fn queued_message_for(
         .values()
         .find(|run| run.run_id.to_string() == run_id)
         .unwrap();
-    crate::control::sched::ready_jobs(tx)
+    tx.ready()
         .find(|job| job.run_id == run.run_id)
         .or_else(|| tx.pending_jobs.iter().find(|job| job.run_id == run.run_id))
         .expect("queued job exists")
@@ -16110,8 +16187,12 @@ async fn workflow_steps_update_preserves_duplicate_names_after_restart() {
     assert_eq!(response["ok"], true);
 
     state
-        .test_tx_mutate(|inner| {
-            inner.broker_messages.remove(&request_id);
+        .test_db_mutate(|tx| {
+            tx.0.execute(
+                "DELETE FROM session_messages WHERE request_id = ?1",
+                [request_id],
+            )
+            .unwrap();
         })
         .await;
     let run = get_run_json(&app, &run_id).await;
@@ -19059,20 +19140,7 @@ async fn generated_server_dag_properties_1000_cases() {
 
         for _ in 0..=count {
             let queued = {
-                let inner = state
-                    .test_tx_scoped(&crate::control::txstate::TxScope {
-                        include_archived: false,
-                        runs: Some(std::collections::BTreeSet::from([run_id])),
-                        ready_queue: true,
-                        blocked_jobs: false,
-                        sessions: Some(Default::default()),
-                        concurrency: false,
-                        runs_referenced: false,
-                        job_requests_all: false,
-                        pending_expansions: false,
-                        runs_via_requests: false,
-                    })
-                    .await;
+                let inner = state.test_tx().await;
                 inner
                     .ready()
                     .filter(|job| job.run_id == run_id)
@@ -19097,20 +19165,7 @@ async fn generated_server_dag_properties_1000_cases() {
                 .await;
             }
         }
-        let inner = state
-            .test_tx_scoped(&crate::control::txstate::TxScope {
-                include_archived: false,
-                runs: Some(std::collections::BTreeSet::from([run_id])),
-                ready_queue: false,
-                blocked_jobs: false,
-                sessions: Some(Default::default()),
-                concurrency: false,
-                runs_referenced: false,
-                job_requests_all: false,
-                pending_expansions: false,
-                runs_via_requests: false,
-            })
-            .await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&run_id).unwrap();
         let mut failed_ancestor = vec![false; count];
         for job in 0..count {
@@ -21251,16 +21306,15 @@ async fn failing_provisioning_cannot_starve_a_healthy_runner() {
     // "stale" pairing exactly as the real churn does.
     for round in 0..3 {
         state
-            .test_tx_mutate(|inner| {
-                let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-                for key in keys {
-                    if let Some(record) = inner.job_assignments.get_mut(&key) {
-                        record.at = std::time::SystemTime::now()
-                            - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                            - std::time::Duration::from_secs(1);
-                        record.first_at = record.at;
-                    }
-                }
+            .test_db_mutate(|tx| {
+                let stale = crate::store::now_us()
+                    - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                    - 1_000_000;
+                tx.execute(
+                    "UPDATE job_assignments SET assigned_at = ?1, first_assigned_at = ?1",
+                    [stale],
+                )
+                .unwrap();
             })
             .await;
         let token_name = format!("token-phantom-{round}");
@@ -21285,24 +21339,14 @@ async fn failing_provisioning_cannot_starve_a_healthy_runner() {
     // The established runner must now be able to claim: the job has been
     // bound-and-abandoned for longer than the binding window.
     state
-        .test_tx_mutate(|inner| {
-            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-            for key in keys {
-                if let Some(record) = inner.job_assignments.get_mut(&key) {
-                    record.first_at = std::time::SystemTime::now()
-                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                        - std::time::Duration::from_secs(1);
-                }
-            }
-            let pending: Vec<_> = inner.pool_pending.keys().cloned().collect();
-            for key in pending {
-                inner.pool_pending.insert(
-                    key,
-                    std::time::SystemTime::now()
-                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                        - std::time::Duration::from_secs(1),
-                );
-            }
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                - 1_000_000;
+            tx.execute("UPDATE job_assignments SET first_assigned_at = ?1", [stale])
+                .unwrap();
+            tx.execute("UPDATE provision_requests SET requested_at = ?1", [stale])
+                .unwrap();
         })
         .await;
 
@@ -21347,15 +21391,12 @@ async fn rebinding_churn_cannot_starve_an_established_runner() {
     // binding looks stale, refreshing `at` every round.
     for round in 0..3 {
         state
-            .test_tx_mutate(|inner| {
-                let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-                for key in keys {
-                    if let Some(record) = inner.job_assignments.get_mut(&key) {
-                        record.at = std::time::SystemTime::now()
-                            - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                            - std::time::Duration::from_secs(1);
-                    }
-                }
+            .test_db_mutate(|tx| {
+                let stale = crate::store::now_us()
+                    - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                    - 1_000_000;
+                tx.execute("UPDATE job_assignments SET assigned_at = ?1", [stale])
+                    .unwrap();
             })
             .await;
         let token_name = format!("token-churn-{round}");
@@ -21372,21 +21413,30 @@ async fn rebinding_churn_cannot_starve_an_established_runner() {
     // Every round refreshed `at`, so the binding still looks fresh — but the
     // job has been bound-and-unclaimed since the first round.
     state
-        .test_tx_mutate(|inner| {
-            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-            assert!(!keys.is_empty(), "churn must leave the job bound");
-            for key in keys {
-                if let Some(record) = inner.job_assignments.get_mut(&key) {
-                    assert!(
-                        record.runner_id != Some(established_id),
-                        "churned machine, not the established runner, holds the pairing"
-                    );
-                    record.first_at = std::time::SystemTime::now()
-                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                        - std::time::Duration::from_secs(1);
-                    record.at = std::time::SystemTime::now();
-                }
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                - 1_000_000;
+            let fresh = crate::store::now_us();
+            let holders: Vec<Option<i64>> =
+                tx.0.prepare("SELECT runner_id FROM job_assignments")
+                    .unwrap()
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            assert!(!holders.is_empty(), "churn must leave the job bound");
+            for holder in holders {
+                assert!(
+                    holder != Some(established_id),
+                    "churned machine, not the established runner, holds the pairing"
+                );
             }
+            tx.execute(
+                "UPDATE job_assignments SET first_assigned_at = ?1, assigned_at = ?2",
+                [stale, fresh],
+            )
+            .unwrap();
         })
         .await;
 
@@ -21439,16 +21489,15 @@ async fn stale_binding_requeues_behind_newer_waits() {
     // registers: the stale binding is released, and the earlier wait (job B)
     // is paired — not the dying job re-adopted with priority.
     state
-        .test_tx_mutate(|inner| {
-            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-            for key in keys {
-                if let Some(record) = inner.job_assignments.get_mut(&key) {
-                    record.at = std::time::SystemTime::now()
-                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                        - std::time::Duration::from_secs(1);
-                    record.first_at = record.at;
-                }
-            }
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                - 1_000_000;
+            tx.execute(
+                "UPDATE job_assignments SET assigned_at = ?1, first_assigned_at = ?1",
+                [stale],
+            )
+            .unwrap();
         })
         .await;
     let key_a_first_at = {
@@ -21518,16 +21567,12 @@ async fn stale_pending_mark_is_still_offered_to_a_registering_runner() {
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
     state
-        .test_tx_mutate(|inner| {
-            let pending: Vec<_> = inner.pool_pending.keys().cloned().collect();
-            for key in pending {
-                inner.pool_pending.insert(
-                    key,
-                    std::time::SystemTime::now()
-                        - crate::runtime_scheduling::ASSIGNMENT_TTL
-                        - std::time::Duration::from_secs(1),
-                );
-            }
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::ASSIGNMENT_TTL.as_micros() as i64)
+                - 1_000_000;
+            tx.execute("UPDATE provision_requests SET requested_at = ?1", [stale])
+                .unwrap();
         })
         .await;
     stage_provision_token(&state, "token-a");
@@ -21701,13 +21746,15 @@ async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
     }
     // machine-a dies without claiming; the binding goes stale.
     state
-        .test_tx_mutate(|inner| {
-            for record in inner.job_assignments.values_mut() {
-                record.at = std::time::SystemTime::now()
-                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                    - std::time::Duration::from_secs(1);
-                record.first_at = record.at;
-            }
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64
+                - 1_000_000;
+            tx.execute(
+                "UPDATE job_assignments SET assigned_at = ?1, first_assigned_at = ?1",
+                [stale],
+            )
+            .unwrap();
         })
         .await;
 
@@ -23146,12 +23193,12 @@ async fn stale_assignment_is_taken_over_by_the_next_verified_runner() {
     // Backdate the pairing past the pre-claim window, simulating a machine
     // whose runner died between registration and its first poll.
     state
-        .test_tx_mutate(|inner| {
-            for record in inner.job_assignments.values_mut() {
-                record.at = std::time::SystemTime::now()
-                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                    - std::time::Duration::from_secs(5);
-            }
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64
+                - 5_000_000;
+            tx.execute("UPDATE job_assignments SET assigned_at = ?1", [stale])
+                .unwrap();
         })
         .await;
 
@@ -23572,6 +23619,12 @@ jobs:
         !inner.inflight_requests.contains_key(&request_id),
         "MC-2: placeholder request leaked in inflight_requests after expansion"
     );
+    for (id, r) in &inner.job_requests {
+        eprintln!(
+            "REQ id={id} run={} job={} result={:?}",
+            r.run_id, r.job_id.0, r.result
+        );
+    }
     assert!(
         !inner.job_requests.contains_key(&request_id),
         "MC-2: placeholder job_request record leaked after expansion"
@@ -23716,10 +23769,17 @@ jobs:
     // RenewJob correlation end-state: the broker refuses to renew a request
     // no session owns, so a cancelled placeholder can neither be renewed nor
     // resurrected.
+    let placeholder_agent_job_id = record.agent_job_id;
+    drop(inner);
     assert!(
-        crate::control::commands::ensure_broker_request_owner(&inner, request_id, 1).is_err(),
+        state
+            .backend
+            .renew_broker_request(placeholder_agent_job_id, 1, "")
+            .await
+            .is_err(),
         "MC-3: no runner may renew the cancelled placeholder"
     );
+    let inner = state.test_tx().await;
     // Completion-equivalent grant semantics, verified rather than assumed:
     // nothing outside the Purge arm ever removes these maps, for any job, so
     // a settled placeholder keeps its entries exactly like a completed job.
@@ -23735,7 +23795,6 @@ jobs:
             .contains_key(&(run_id, placeholder.clone())),
         "settled placeholder keeps its OIDC context like a completed job"
     );
-    drop(inner);
 
     let run = get_run_json(&app, &run_id.to_string()).await;
     assert_eq!(run["jobs"]["downstream"], "cancelled");
@@ -23789,10 +23848,10 @@ jobs:
     };
 
     state
-        .test_tx_mutate(|tx| {
-            crate::control::sched::cancel_job_inner(tx, run_id, &placeholder);
-        })
-        .await;
+        .backend
+        .cancel_job(run_id, &placeholder)
+        .await
+        .expect("cancel the placeholder");
 
     let inner = state.test_tx().await;
     let record = inner
@@ -24150,11 +24209,13 @@ jobs:
             .values()
             .find(|r| r.run_id == run_id && r.job_id == nested_caller)
             .expect("nested caller minted a request record at expansion");
-        // The completion path never settles a caller's own record: this is the
-        // pre-existing unsettled state the cancel sweep must not corrupt.
+        // Post-cutover the caller's own record settles at finalize (the
+        // completion path retires placeholder requests with the aggregated
+        // verdict); the cancel sweep must not clobber it to Cancelled.
         assert_eq!(
-            record.result, None,
-            "nested caller's record is unsettled before cancel"
+            record.result,
+            Some(ExecutionStatus::Success),
+            "nested caller's record settled Success at completion"
         );
         record.request_id
     };
@@ -24299,19 +24360,22 @@ async fn store_recovery_preserves_broker_and_inflight_messages() {
     {
         let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
         state
-            .test_tx_mutate(|tx| {
-                tx.inflight_messages
-                    .entry("sess-1".to_owned())
-                    .or_default()
-                    .insert(
-                        7,
-                        azdo::TaskAgentMessage {
-                            message_id: 7,
-                            message_type: "PipelineAgentJobRequest".to_owned(),
-                            body: "e30=".to_owned(),
-                            iv: None,
-                        },
-                    );
+            .test_db_mutate(|tx| {
+                tx.insert_session("sess-1", 1, "broker", true).unwrap();
+                tx.insert_session_message(
+                    "sess-1",
+                    7,
+                    "PipelineAgentJobRequest",
+                    None,
+                    &serde_json::to_string(&azdo::TaskAgentMessage {
+                        message_id: 7,
+                        message_type: "PipelineAgentJobRequest".to_owned(),
+                        body: "e30=".to_owned(),
+                        iv: None,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
             })
             .await;
     }
@@ -24319,7 +24383,11 @@ async fn store_recovery_preserves_broker_and_inflight_messages() {
     let inner = recovered.test_tx().await;
     let session = inner
         .inflight_messages
-        .get("sess-1")
+        .get(
+            crate::control::logic::session_uuid("sess-1")
+                .to_string()
+                .as_str(),
+        )
         .expect("undelivered broker message must survive restart");
     let message = session.get(&7).expect("message id must be preserved");
     assert_eq!(message.message_type, "PipelineAgentJobRequest");
@@ -24337,11 +24405,22 @@ async fn postgres_concurrent_open_serializes_migrations() {
         return;
     };
 
-    let key = b"concurrent-open-root-key";
     let dir = std::path::Path::new("/tmp");
     let (first, second) = tokio::join!(
-        crate::store::open_store(Some(&fresh), dir, key),
-        crate::store::open_store(Some(&fresh), dir, key),
+        crate::control::Backend::open(
+            Some(&fresh),
+            dir,
+            false,
+            false,
+            std::time::Duration::from_secs(600)
+        ),
+        crate::control::Backend::open(
+            Some(&fresh),
+            dir,
+            false,
+            false,
+            std::time::Duration::from_secs(600)
+        ),
     );
     assert!(first.is_ok(), "first opener failed: {:?}", first.err());
     assert!(second.is_ok(), "second opener failed: {:?}", second.err());
@@ -24518,45 +24597,26 @@ async fn store_recovery_preserves_claim_state_across_run_events() {
         // Simulate the broker claiming `build`: dequeued, message parked in
         // the per-session and per-request maps, session claim recorded.
         let (claimed_job, other_job, request_id) = state
-            .test_tx_mutate(|inner| {
-                let claimed = inner
-                    .ready()
-                    .find(|job| job.job_id.0 == "build")
-                    .cloned()
-                    .expect("build job queued");
-                {
-                    inner.ready_index.retain(|job| job.job_id.0 != "build");
-                    inner.queue.retain(|job| job.job_id.0 != "build");
-                };
-                let request = inner
-                    .job_requests
-                    .values()
-                    .find(|record| record.job_id.0 == "build")
-                    .cloned()
+            .test_db_mutate(|tx| {
+                let request = tx
+                    .request_key_for(run_id, &JobId("build".to_owned()))
+                    .unwrap()
                     .expect("build request");
-                inner
-                    .session_active_requests
-                    .insert("sess-1".to_owned(), request.request_id);
-                inner
-                    .inflight_messages
-                    .entry("sess-1".to_owned())
-                    .or_default()
-                    .insert(
-                        99,
-                        azdo::TaskAgentMessage {
-                            message_id: 99,
-                            message_type: "PipelineAgentJobRequest".to_owned(),
-                            body: "e30=".to_owned(),
-                            iv: None,
-                        },
-                    );
-                inner
-                    .broker_messages
-                    .insert(request.request_id, claimed.message.clone());
+                tx.insert_session("sess-1", 1, "broker", true).unwrap();
+                tx.mark_claimed_for_session(
+                    run_id,
+                    &JobId("build".to_owned()),
+                    request.0,
+                    "sess-1",
+                    1,
+                    "{}",
+                    99,
+                )
+                .unwrap();
                 (
-                    claimed.job_id.clone(),
+                    JobId("build".to_owned()),
                     JobId("test".to_owned()),
-                    request.request_id,
+                    request.0,
                 )
             })
             .await;
@@ -24579,7 +24639,11 @@ async fn store_recovery_preserves_claim_state_across_run_events() {
     assert!(
         inner
             .inflight_messages
-            .get("sess-1")
+            .get(
+                crate::control::logic::session_uuid("sess-1")
+                    .to_string()
+                    .as_str()
+            )
             .and_then(|messages| messages.get(&99))
             .is_some(),
         "undelivered broker message must survive a store_run_event restart"
@@ -24589,7 +24653,11 @@ async fn store_recovery_preserves_claim_state_across_run_events() {
         "per-request job message must survive a store_run_event restart"
     );
     assert_eq!(
-        inner.session_active_requests.get("sess-1"),
+        inner.session_active_requests.get(
+            crate::control::logic::session_uuid("sess-1")
+                .to_string()
+                .as_str()
+        ),
         Some(&request_id),
         "session claim must survive a store_run_event restart"
     );
@@ -24632,47 +24700,50 @@ async fn store_recovery_preserves_pool_pairing_and_oauth_client_ids() {
                     .min(u64::MAX as u128) as u64,
             );
         state
-            .test_tx_mutate(|tx| {
+            .test_db_mutate(|tx| {
                 // `runner_client_ids` is derived from `runners.client_id` —
                 // register the runner so the mapping has a row to live on.
-                tx.runners.insert(
+                tx.insert_runner(
                     42,
-                    preloop_gha_protocol::RegisteredRunner {
-                        id: 42,
-                        name: "runner-42".to_owned(),
-                        labels: vec!["self-hosted".to_owned()],
-                        ephemeral: false,
-                        public_key: None,
-                        runner_group_id: None,
-                        runner_group_name: None,
-                    },
-                );
-                tx.runner_client_ids.insert("client-abc".to_owned(), 42);
+                    "runner-42",
+                    &["self-hosted".to_owned()],
+                    false,
+                    Some("client-abc"),
+                    None,
+                    false,
+                )
+                .unwrap();
                 // `pool_proven_runners` is derived from `runners.pool_proven`
                 // — register runner 7 so the proof has a row to live on.
-                tx.runners.insert(
+                tx.insert_runner(
                     7,
-                    preloop_gha_protocol::RegisteredRunner {
-                        id: 7,
-                        name: "runner-7".to_owned(),
-                        labels: vec!["self-hosted".to_owned()],
-                        ephemeral: false,
-                        public_key: None,
-                        runner_group_id: None,
-                        runner_group_name: None,
-                    },
-                );
-                tx.pool_proven_runners.insert(7);
-                tx.job_assignments.insert(
-                    (run_id, JobId("build".to_owned())),
-                    AssignmentRecord {
-                        runner_id: Some(7),
-                        at: now,
-                        first_at: now,
-                    },
-                );
-                tx.pool_pending
-                    .insert((run_id, JobId("build".to_owned())), now);
+                    "runner-7",
+                    &["self-hosted".to_owned()],
+                    false,
+                    None,
+                    None,
+                    true,
+                )
+                .unwrap();
+                let us = now
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64;
+                tx.set_assignment_times(
+                    run_id,
+                    &JobId("build".to_owned()),
+                    Some(7),
+                    Some(us),
+                    Some(us),
+                )
+                .unwrap();
+                tx.set_provision_requested_us(
+                    run_id,
+                    &JobId("build".to_owned()),
+                    &["ubuntu-latest".to_owned()],
+                    us,
+                )
+                .unwrap();
             })
             .await;
 
@@ -24759,7 +24830,7 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
     let config_path = crate::config::config_path();
     let workflow =
         "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 1\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo 2\n";
-    let (claimed_job, other_job, request_id) = {
+    let (claimed_job, other_job, request_id, session_id) = {
         let state = AppState::new_with_store(
             temp.path().to_path_buf(),
             config_path.clone(),
@@ -24777,49 +24848,31 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
         .await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-        let (claimed_job, other_job, request_id) = state
-            .test_tx_mutate(|inner| {
-                let claimed = inner
-                    .ready()
-                    .find(|job| job.job_id.0 == "build")
-                    .cloned()
-                    .expect("build job queued");
-                {
-                    inner.ready_index.retain(|job| job.job_id.0 != "build");
-                    inner.queue.retain(|job| job.job_id.0 != "build");
-                };
-                let request = inner
-                    .job_requests
-                    .values()
-                    .find(|record| record.job_id.0 == "build")
-                    .cloned()
-                    .expect("build request");
-                inner
-                    .session_active_requests
-                    .insert("sess-pg".to_owned(), request.request_id);
-                inner
-                    .inflight_messages
-                    .entry("sess-pg".to_owned())
-                    .or_default()
-                    .insert(
-                        99,
-                        azdo::TaskAgentMessage {
-                            message_id: 99,
-                            message_type: "PipelineAgentJobRequest".to_owned(),
-                            body: "e30=".to_owned(),
-                            iv: None,
-                        },
-                    );
-                inner
-                    .broker_messages
-                    .insert(request.request_id, claimed.message.clone());
-                (
-                    claimed.job_id.clone(),
-                    JobId("test".to_owned()),
-                    request.request_id,
-                )
-            })
-            .await;
+        // Claim `build` through the real broker path so the seed is
+        // backend-neutral: register, open a session, poll once — the message
+        // lands unacked, exactly the stored shape a crash leaves.
+        let (runner_id, token) =
+            register_runner_with_token(&app, "machine-pg", &["ubuntu-latest"], None).await;
+        let (_, session) = create_disttask_session(&app, &token, runner_id).await;
+        let session_id = session["sessionId"].as_str().unwrap().to_owned();
+        let delivered = poll_message(&app, &token, &session_id).await;
+        assert!(
+            delivered["messageType"].as_str().is_some(),
+            "the claim poll must deliver the job: {delivered}"
+        );
+        let request_id = {
+            let inner = state.test_tx().await;
+            *inner
+                .session_active_requests
+                .get(&session_id)
+                .expect("the poll parks the request on the session")
+        };
+        let (claimed_job, other_job, request_id, session_id) = (
+            JobId("build".to_owned()),
+            JobId("test".to_owned()),
+            request_id,
+            session_id,
+        );
         state
             .emit(NdjsonEvent::JobStatus {
                 run_id,
@@ -24828,7 +24881,7 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
                 reason: None,
             })
             .await;
-        (claimed_job, other_job, request_id)
+        (claimed_job, other_job, request_id, session_id)
     };
 
     let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
@@ -24838,9 +24891,9 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
     assert!(
         inner
             .inflight_messages
-            .get("sess-pg")
-            .and_then(|messages| messages.get(&99))
-            .is_some(),
+            .get(&session_id)
+            .map(|messages| !messages.is_empty())
+            .unwrap_or(false),
         "undelivered broker message must survive a store_run_event restart (PG)"
     );
     assert!(
@@ -24848,7 +24901,7 @@ async fn postgres_recovery_preserves_claim_state_across_run_events() {
         "per-request job message must survive a store_run_event restart (PG)"
     );
     assert_eq!(
-        inner.session_active_requests.get("sess-pg"),
+        inner.session_active_requests.get(&session_id),
         Some(&request_id),
         "session claim must survive a store_run_event restart (PG)"
     );
@@ -24883,38 +24936,32 @@ async fn startup_fails_claims_orphaned_by_a_restart() {
     // A pool machine claimed `build`, then the control plane restarted: the
     // pin survives, its session does not.
     let (claimed_request, queued_request) = state
-        .test_tx_mutate(|inner| {
-            let claimed = inner
-                .ready()
-                .find(|job| job.job_id.0 == "build")
-                .cloned()
-                .expect("build job queued");
-            {
-                inner.ready_index.retain(|job| job.job_id.0 != "build");
-                inner.queue.retain(|job| job.job_id.0 != "build");
-            };
-            let claimed_request = inner
-                .job_requests
-                .values()
-                .find(|record| record.job_id.0 == "build")
-                .map(|record| record.request_id)
-                .expect("build request");
-            let queued_request = inner
-                .job_requests
-                .values()
-                .find(|record| record.job_id.0 == "test")
-                .map(|record| record.request_id)
-                .expect("test request");
-            inner
-                .session_active_requests
-                .insert("dead-session".to_owned(), claimed_request);
-            inner
-                .broker_messages
-                .insert(claimed_request, claimed.message.clone());
-            assert!(
-                inner.sessions.is_empty(),
-                "no session survives the restart in this scenario"
-            );
+        .test_db_mutate(|tx| {
+            let claimed_request = tx
+                .request_key_for(_run_id, &JobId("build".to_owned()))
+                .unwrap()
+                .expect("build request")
+                .0;
+            let queued_request = tx
+                .request_key_for(_run_id, &JobId("test".to_owned()))
+                .unwrap()
+                .expect("test request")
+                .0;
+            // Claimed shape without a live session: queue_state claimed,
+            // request bound to a session id no runner_sessions row owns.
+            tx.execute(
+                "UPDATE jobs SET queue_state = 'claimed'                  WHERE run_id = ?1 AND job_id = 'build'",
+                [_run_id.to_string()],
+            )
+            .unwrap();
+            tx.update_request(
+                claimed_request,
+                None,
+                Some(7),
+                None,
+                Some("dead-session"),
+            )
+            .unwrap();
             (claimed_request, queued_request)
         })
         .await;
@@ -24969,16 +25016,20 @@ async fn startup_releases_an_orphaned_request_whose_job_was_requeued() {
     let job_id = JobId("build".to_owned());
 
     let request_id = state
-        .test_tx_mutate(|inner| {
-            let request_id = inner
-                .job_requests
-                .values()
-                .find(|record| record.run_id == run_id && record.job_id == job_id)
-                .map(|record| record.request_id)
-                .expect("queued job request");
-            let record = inner.job_requests.get_mut(&request_id).unwrap();
-            record.owner_runner_id = Some(99);
-            record.started_at = Some(SystemTime::now() - Duration::from_secs(300));
+        .test_db_mutate(|tx| {
+            let request_id = tx
+                .request_key_for(run_id, &job_id)
+                .unwrap()
+                .expect("queued job request")
+                .0;
+            tx.update_request(
+                request_id,
+                Some(crate::store::now_us() - 300_000_000),
+                Some(99),
+                None,
+                None,
+            )
+            .unwrap();
             request_id
         })
         .await;
@@ -25177,12 +25228,9 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     // 3. Terminal run: the sync verifies the tree, creates the draft PR,
     //    and marks the run pushed.
     state
-        .test_tx_mutate(|inner| {
-            let run = inner
-                .runs
-                .get_mut(&run_id.parse::<RunId>().unwrap())
+        .test_db_mutate(|tx| {
+            tx.set_run_status(run_id.parse().unwrap(), "completed", Some("success"))
                 .unwrap();
-            run.conclusion = Some("success".to_owned());
         })
         .await;
     let pushed = request_json(
@@ -25228,12 +25276,9 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     let accepted = submit_push_run(&app, SHA, "cccccccccccccccccccccccccccccccccccccccc").await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     state
-        .test_tx_mutate(|inner| {
-            let run = inner
-                .runs
-                .get_mut(&run_id.parse::<RunId>().unwrap())
+        .test_db_mutate(|tx| {
+            tx.set_run_status(run_id.parse().unwrap(), "completed", Some("success"))
                 .unwrap();
-            run.conclusion = Some("success".to_owned());
         })
         .await;
     let (status, _) = request_json_status(
@@ -25292,12 +25337,15 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         .parse::<RunId>()
         .unwrap();
     state
-        .test_tx_mutate(|inner| {
-            let run = inner.runs.get_mut(&published_id).unwrap();
-            run.conclusion = Some("success".to_owned());
-            let mut submission = (*run.submission).clone();
-            submission.workflow_path = Some(PUBLISHED_WORKFLOW.to_owned());
-            run.submission = Arc::new(submission);
+        .test_db_mutate(|tx| {
+            tx.set_run_status(published_id, "completed", Some("success"))
+                .unwrap();
+            tx.set_submission_json(
+                published_id,
+                "workflow_path",
+                serde_json::json!(PUBLISHED_WORKFLOW),
+            )
+            .unwrap();
         })
         .await;
     let shared = Arc::new(SharedState {
@@ -25360,15 +25408,22 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         .parse::<RunId>()
         .unwrap();
     state
-        .test_tx_mutate(|inner| {
-            let run = inner.runs.get_mut(&dirty_id).unwrap();
-            run.conclusion = Some("success".to_owned());
-            run.push_state = Some(crate::models::PushState {
-                status: crate::models::PushStatus::Synced,
-                error: None,
-                pr_number: Some(7),
-                effective_sha: Some(MATERIALIZED_SHA.to_owned()),
-            });
+        .test_db_mutate(|tx| {
+            tx.set_run_status(dirty_id, "completed", Some("success"))
+                .unwrap();
+            tx.execute(
+                "INSERT INTO run_push_states \
+                 (run_id, status, error, pr_number, effective_sha, updated_at) \
+                 VALUES (?1, 'synced', NULL, 7, ?2, ?3) \
+                 ON CONFLICT (run_id) DO UPDATE SET status = 'synced', \
+                 error = NULL, pr_number = 7, effective_sha = ?2, updated_at = ?3",
+                rusqlite::params![
+                    dirty_id.to_string(),
+                    MATERIALIZED_SHA,
+                    crate::store::now_us()
+                ],
+            )
+            .unwrap();
         })
         .await;
     assert_eq!(
@@ -25493,14 +25548,16 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
         assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Pending);
     }
     state
-        .test_tx_mutate(|inner| {
-            let run = inner
-                .runs
-                .get_mut(&run_id.parse::<RunId>().unwrap())
+        .test_db_mutate(|tx| {
+            let rid: RunId = run_id.parse().unwrap();
+            tx.set_run_status(rid, "completed", Some("success"))
                 .unwrap();
-            run.conclusion = Some("success".to_owned());
-            run.jobs
-                .insert(JobId("build".to_owned()), ExecutionStatus::Success);
+            tx.execute(
+                "UPDATE jobs SET status = 'success', queue_state = 'none' \
+                 WHERE run_id = ?1 AND job_id = 'build'",
+                [rid.to_string()],
+            )
+            .unwrap();
         })
         .await;
 

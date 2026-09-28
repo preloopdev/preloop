@@ -192,6 +192,13 @@ fn submit_run_tx(
             &record.workflow_path_str,
         )?;
     }
+    // `runs.namespace_id` FKs into `namespaces`; the namespace upsert mirrors
+    // pg's `allocate_run_number` so a first-seen tenant cannot violate the
+    // constraint.
+    tx.prepare_cached("INSERT INTO namespaces (namespace_id) VALUES (?1) ON CONFLICT DO NOTHING")
+        .map_err(db)?
+        .execute(params![namespace])
+        .map_err(db)?;
     insert_run_row(tx, &record, &namespace, workflow_concurrency.as_ref())?;
 
     // A run's jobs all share one queue sequence number; `created_at` is
@@ -228,8 +235,10 @@ fn submit_run_tx(
             cg::AcqOutcome::Parked => held = true,
             cg::AcqOutcome::ArrivalCancelled => {
                 // Cancelled on arrival (queue overflow, or a newer event
-                // supersedes this one): every job lands terminal. No request
-                // rows are minted — the run never dispatched.
+                // supersedes this one): every job lands terminal. Request
+                // correlation was minted at submit (placeholder requests
+                // exist even for nodes that never dispatch), so mint then
+                // settle each as cancelled rather than leaking inflight rows.
                 for (index, submit_job) in submit_jobs.iter().enumerate() {
                     let job = &submit_job.queued;
                     jobs::insert_job(
@@ -260,7 +269,30 @@ fn submit_run_tx(
                             submit_job.oidc_context.as_ref(),
                         ),
                     )?;
+                    jobs::insert_job_message(
+                        tx,
+                        run_id,
+                        &job.job_id,
+                        &job.message,
+                        &job.condition_context,
+                    )?;
+                    mint_request(
+                        tx,
+                        &namespace,
+                        run_id,
+                        &job.job_id,
+                        submit_job.request.clone(),
+                        submit_job.token_request.clone(),
+                        submit_job.step_manifest.clone(),
+                    )?;
                 }
+                tx.prepare_cached(
+                    "UPDATE job_requests SET result = 'cancelled', finished_at = ?2 \
+                     WHERE run_id = ?1 AND result IS NULL",
+                )
+                .map_err(db)?
+                .execute(params![codec::run_key(run_id), now_us()])
+                .map_err(db)?;
                 tx.prepare_cached(
                     "UPDATE runs SET status = 'completed', conclusion = 'cancelled', \
                          completed_at = ?2, started_at = COALESCE(started_at, ?2) \
@@ -386,6 +418,16 @@ fn submit_run_tx(
                 "held",
                 &spec,
             )?;
+            jobs::insert_job_message(tx, run_id, &job_id, &job.message, &job.condition_context)?;
+            mint_request(
+                tx,
+                &namespace,
+                run_id,
+                &job_id,
+                request,
+                token_request,
+                step_manifest,
+            )?;
             inserted += 1;
             continue;
         }
@@ -416,6 +458,19 @@ fn submit_run_tx(
                 status,
                 "blocked",
                 &spec,
+            )?;
+            // The template lands even while the job waits on needs/gates:
+            // promotion hydrates it (needs context), and the acquire path
+            // refuses a job with no message row.
+            jobs::insert_job_message(tx, run_id, &job_id, &job.message, &job.condition_context)?;
+            mint_request(
+                tx,
+                &namespace,
+                run_id,
+                &job_id,
+                request,
+                token_request,
+                step_manifest,
             )?;
             inserted += 1;
             continue;
@@ -643,10 +698,22 @@ fn insert_run_row(
         record.completed_at.map(|at| at.timestamp_micros()),
     ])
     .map_err(db)?;
+    // A push-request submission owns a 'pending' push state from the start:
+    // `already_published`'s echo check JOINs this row, so it must exist before
+    // the first sync writes 'synced'.
+    if submission.push.is_some() {
+        tx.prepare_cached(
+            "INSERT INTO run_push_states (run_id, status) VALUES (?1, 'pending') \
+             ON CONFLICT (run_id) DO NOTHING",
+        )
+        .map_err(db)?
+        .execute(params![codec::run_key(record.run_id)])
+        .map_err(db)?;
+    }
     // Submission is stored WITH its secrets: the single-node SQLite
-    // backend keeps the sealed-at-rest values so `run_secret_values` /
-    // `all_secret_values` (mask_log_bytes_cached) can serve them. The
-    // agreed `secret_refs` column still names them (`{name: scope}`).
+    // backend keeps the sealed-at-rest values so acquire (`run_secrets`) and
+    // the log masker (`run_record`) survive a restart. The agreed
+    // `secret_refs` column still names them (`{name: scope}`).
     let secret_refs: serde_json::Value = record
         .submission
         .secrets

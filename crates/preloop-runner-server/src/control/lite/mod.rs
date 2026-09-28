@@ -30,6 +30,10 @@ mod settle;
 mod steps;
 mod submit;
 #[cfg(test)]
+pub(crate) mod testview;
+#[cfg(test)]
+pub(crate) use testview::TestDb;
+#[cfg(test)]
 mod tests;
 mod timelines;
 mod webhooks;
@@ -90,7 +94,7 @@ pub(super) fn db(error: rusqlite::Error) -> ControlError {
 }
 
 /// Per-connection settings every connection needs.
-fn configure(conn: &Connection) -> Result<(), ControlError> {
+fn configure(conn: &mut Connection) -> Result<(), ControlError> {
     // Foreign keys default OFF per connection; the schema's cascades and
     // deferred FKs only fire with them on.
     conn.pragma_update(None, "foreign_keys", true).map_err(db)?;
@@ -148,6 +152,15 @@ fn ensure_schema(conn: &mut Connection) -> Result<(), ControlError> {
         )));
     }
     tx.execute_batch(SCHEMA_SQL).map_err(db)?;
+    // Session-message ids occupy the >=1_000_001 space so a JobCancellation
+    // messageId can never collide with a broker job ref's request_id
+    // (broker_job_ref_root carries request_id as messageId; the runner's
+    // in-memory dedup would drop a same-id cancel).
+    tx.execute(
+        "INSERT INTO sqlite_sequence (name, seq)          VALUES ('session_messages', 1000000)",
+        [],
+    )
+    .map_err(db)?;
     tx.execute(
         "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
         [SCHEMA_VERSION.as_bytes()],
@@ -178,7 +191,7 @@ impl LiteBackend {
                 .map_err(ControlError::backend)?;
         }
         let mut writer = Connection::open(path).map_err(db)?;
-        configure(&writer)?;
+        configure(&mut writer)?;
         writer
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(db)?;
@@ -188,8 +201,8 @@ impl LiteBackend {
         ensure_schema(&mut writer)?;
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
-            let reader = Connection::open(path).map_err(db)?;
-            configure(&reader)?;
+            let mut reader = Connection::open(path).map_err(db)?;
+            configure(&mut reader)?;
             // A write through a reader is a hard error, never silent.
             reader.pragma_update(None, "query_only", true).map_err(db)?;
             readers.push(reader);
@@ -216,7 +229,7 @@ impl LiteBackend {
     #[cfg(test)]
     pub(crate) fn in_memory() -> Result<Self, ControlError> {
         let mut writer = Connection::open_in_memory().map_err(db)?;
-        configure(&writer)?;
+        configure(&mut writer)?;
         ensure_schema(&mut writer)?;
         Ok(Self::from_parts(
             writer,

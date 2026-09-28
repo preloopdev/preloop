@@ -274,9 +274,23 @@ pub(super) fn queued_job_of(tx: &Transaction<'_>, job: JobRow) -> Result<QueuedJ
         .optional()
         .map_err(db)?
         .unwrap_or_else(|| ("{}".to_owned(), "{}".to_owned()));
+    // Caller placeholders store no runnable message (the row is `{}`). The
+    // view still needs a `QueuedJob.message`; synthesize a placeholder.
     let message: preloop_gha_protocol::azdo::AgentJobRequestMessage =
-        serde_json::from_str(&template)
-            .map_err(|e| ControlError::backend(anyhow::anyhow!("job message decode: {e}")))?;
+        serde_json::from_str(&template).unwrap_or_else(|_| {
+            serde_json::from_value(serde_json::json!({
+                "jobId": uuid::Uuid::nil(),
+                "requestId": 0,
+                "plan": {"planId": "", "planType": "", "version": 0,
+                         "artifactUri": "", "artifactLocation": ""},
+                "timeline": {"id": uuid::Uuid::nil(), "changeId": 0,
+                             "location": null},
+                "jobName": job.job_id.0,
+                "lockedUntil": "",
+                "resources": {"endpoints": []}
+            }))
+            .expect("placeholder message shape is fixed")
+        });
     let condition_context: preloop_gha_expressions::Context =
         serde_json::from_str(&context_json).unwrap_or_default();
     let needs = job_needs(tx, job.run_id, &job.job_id)?;
@@ -939,9 +953,12 @@ pub(super) fn run_record(
     else {
         return Ok(None);
     };
-    let submission: preloop_gha_protocol::WorkflowSubmission =
-        serde_json::from_str(&submission_json.unwrap_or_else(|| "{}".to_owned()))
-            .map_err(|e| ControlError::backend(anyhow::anyhow!("submission decode: {e}")))?;
+    // Runs seeded without run_submissions (test hooks, partially seeded
+    // states) carry no submission: decode a default rather than failing the
+    // whole record read.
+    let submission: preloop_gha_protocol::WorkflowSubmission = submission_json
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
     let github: serde_json::Value =
         serde_json::from_str(&github_json.unwrap_or_else(|| "{}".to_owned()))
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -1037,13 +1054,13 @@ pub(super) fn run_record(
         Option<i64>,
         Option<String>,
         String,
-        i64,
+        Option<i64>,
         String,
     );
     let spec_rows: Vec<SpecDetail> = if archived {
         tx.prepare_cached(
             "SELECT job_id, display_name, NULL, NULL, NULL, check_run_id, \
-                    annotations, base_id, 0, status FROM job_history \
+                    annotations, base_id, CAST(NULL AS INTEGER), status FROM job_history \
              WHERE run_id = ?1 AND run_created_at = ( \
                  SELECT MAX(run_created_at) FROM job_history WHERE run_id = ?1) \
              ORDER BY job_id",
@@ -1059,7 +1076,7 @@ pub(super) fn run_record(
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(8)?,
                 row.get::<_, String>(9)?,
             ))
         })
@@ -1068,12 +1085,16 @@ pub(super) fn run_record(
         .map_err(db)?
     } else {
         tx.prepare_cached(
-            "SELECT s.job_id, s.display_name, s.reusable_call, s.fail_fast, \
-                    s.continue_on_error, j.check_run_id, j.annotations, \
-                    j.base_id, s.display_order, j.status \
-             FROM job_specs s JOIN jobs j \
-               ON j.run_id = s.run_id AND j.job_id = s.job_id \
-             WHERE s.run_id = ?1 ORDER BY s.display_order",
+            // LEFT JOIN: jobs seeded without a spec row (partial seeds,
+            // debug fixtures) still project into jobs_list with name=job_id
+            // and no workflow extras; ORDER BY keeps spec order first.
+            "SELECT j.job_id, COALESCE(s.display_name, j.job_id), s.reusable_call, \
+                    s.fail_fast, s.continue_on_error, j.check_run_id, \
+                    j.annotations, j.base_id, s.display_order, j.status \
+             FROM jobs j LEFT JOIN job_specs s \
+               ON s.run_id = j.run_id AND s.job_id = j.job_id \
+             WHERE j.run_id = ?1 ORDER BY s.display_order IS NULL, s.display_order, \
+             j.job_id",
         )
         .map_err(db)?
         .query_map([&run], |row| {
@@ -1086,7 +1107,7 @@ pub(super) fn run_record(
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(8)?,
                 row.get::<_, String>(9)?,
             ))
         })
@@ -1131,11 +1152,18 @@ pub(super) fn run_record(
         if let Some(flag) = continue_on_error {
             job_continue_on_error.insert(job_id.clone(), flag != 0);
         }
+        // Steps live in the attempt-scoped manifest (job_steps for live,
+        // step_history once archived); jobs never dispatched show `[]`.
+        let steps = if archived {
+            super::steps::archived_attempt_steps(tx, &run, &job_id)?
+        } else {
+            super::steps::latest_attempt_steps(tx, &run, &job_id)?
+        };
         jobs_list.push(crate::models::JobDetail {
             job_id: job_id.clone(),
             name: display_name,
             conclusion: crate::runtime_scheduling::status_string(status_parse(&status)),
-            steps: Vec::new(),
+            steps,
             annotations: annotations
                 .and_then(|j| serde_json::from_str::<Vec<serde_json::Value>>(&j).ok())
                 .unwrap_or_default(),

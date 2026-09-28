@@ -331,25 +331,6 @@ impl PgBackend {
             .collect())
     }
 
-    /// A job's detail is derived from its rows, so it is never "missing"
-    /// while the job exists: `false` for a job with a `jobs` row, `NotFound`
-    /// otherwise.
-    ///
-    /// Statement: `SELECT EXISTS (jobs WHERE run_id, job_id)`.
-    pub(super) async fn job_detail_missing(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-    ) -> Result<bool, ControlError> {
-        if self.job_exists(run_id, job_id).await? {
-            Ok(false)
-        } else {
-            Err(ControlError::NotFound(format!(
-                "job {job_id} in run {run_id}"
-            )))
-        }
-    }
-
     /// Record a job's GitHub check-run id. Writes nothing when the job has
     /// no `jobs` row; returns whether the stored id changed.
     ///
@@ -890,6 +871,26 @@ impl PgBackend {
                    AND (s.submission->>'sha' = $2 OR p.effective_sha = $2) \
                  ORDER BY r.run_id LIMIT 1",
                 &[&repository, &sha, &workflow_path],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| codec::run_id(row.get(0)))
+            .transpose()
+    }
+
+    /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path)`
+    /// point read over live runs; `None` when no committed run exists yet.
+    pub(super) async fn run_for_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        let client = self.reader().await?;
+        client
+            .query_opt(
+                "SELECT run_id::text FROM runs WHERE webhook_delivery_id = $1 \
+                 AND workflow_path = $2",
+                &[&delivery_id, &workflow_path],
             )
             .await
             .map_err(db)?

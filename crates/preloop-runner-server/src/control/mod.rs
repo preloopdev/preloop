@@ -8,12 +8,12 @@
 //!
 //! Layout:
 //! - [`types`]: backend-neutral domain types, command inputs/outputs, errors.
-//! - [`txstate`]: the transaction-scoped working set (`TxState`) that mirrors
-//!   the old `InnerState` scheduling fields.
-//! - [`sched`]: the scheduling state machine ported to run on `TxState`.
-//! - [`schema`]: the unified table families both backends implement.
+//! - [`lite`] / [`pg`]: the two `ControlBackend` implementations (SQLite is
+//!   the default; Postgres serves shared-node deployments).
+//! - [`sched`] / [`commands`]: shared, backend-neutral helpers the backends
+//!   and callers reuse (label matching, file commands, TTL constants).
 //! - [`rows`]: backend-neutral row codecs for decomposed families (steps).
-//! - [`sqlite`] / [`postgres`]: the two `ControlBackend` implementations.
+//! - [`logic`]: pure decision functions both backends share.
 
 // The submodules use `use super::*` to reach the crate prelude, matching how
 // `runtime_scheduling.rs` (the module this replaces) sees the whole crate
@@ -24,21 +24,16 @@ pub(crate) use crate::*;
 
 pub mod backend;
 pub mod commands;
-#[allow(dead_code)]
 pub(crate) mod lite;
 pub(crate) mod logic;
-// New PostgreSQL backend (agreed schema); unused until cutover.
-#[allow(dead_code)]
 pub(crate) mod pg;
-pub mod postgres;
 pub mod rows;
 pub mod sched;
-pub mod schema;
-pub mod sqlite;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod testview;
 pub(crate) mod txn_stats;
-pub mod txstate;
 pub mod types;
 pub(crate) mod wake;
 

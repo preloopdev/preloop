@@ -26,6 +26,12 @@ pub(crate) trait SecretProvider: Send + Sync {
     /// environment > repository > global, per name.
     fn resolve(&self, scope: SecretScope<'_>) -> anyhow::Result<BTreeMap<String, SecretString>>;
 
+    /// Union of every stored secret value across all tiers (global +
+    /// every repository + every environment), exposed values only. Used by
+    /// the log masker's fallback for plan ids that never resolved to a run —
+    /// best-effort over-masking, not a secrecy boundary.
+    fn resolve_all(&self) -> anyhow::Result<Vec<String>>;
+
     /// Backend name for diagnostics.
     fn name(&self) -> &'static str;
 }
@@ -58,6 +64,22 @@ impl SecretProvider for BuiltinSecretProvider {
             .chain(env)
             .flatten()
             .map(|(name, value)| (name.clone(), SecretString::new(value.clone())))
+            .collect())
+    }
+
+    fn resolve_all(&self) -> anyhow::Result<Vec<String>> {
+        let store = self.store.read();
+        Ok(store
+            .global
+            .values()
+            .chain(store.repo.values().flat_map(|repo| repo.values()))
+            .chain(
+                store
+                    .env
+                    .values()
+                    .flat_map(|envs| envs.values().flat_map(|env| env.values())),
+            )
+            .cloned()
             .collect())
     }
 

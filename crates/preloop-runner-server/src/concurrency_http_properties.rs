@@ -588,10 +588,18 @@ pub mod http_sequences {
         // Bind the legacy session to the runner before polling so the claimed
         // request records the same owner the runtime token must prove.
         {
+            // Session ids are stored mapped (`logic::session_uuid`: legacy
+            // non-uuid ids become a v5 uuid), exactly as a real create does.
+            let stored_id = crate::control::logic::session_uuid("sess-broker").to_string();
             state
-                .test_tx_mutate(|tx| {
-                    tx.broker_session_runners
-                        .insert("sess-broker".to_owned(), 1);
+                .test_db_mutate(move |tx| {
+                    tx.execute(
+                        "INSERT INTO runner_sessions \
+                         (session_id, runner_id, protocol, verified) \
+                         VALUES (?1, 1, 'broker', 1)",
+                        [stored_id.as_str()],
+                    )
+                    .unwrap();
                 })
                 .await;
         }

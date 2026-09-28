@@ -330,7 +330,10 @@ CREATE TABLE runners (
 
 CREATE TABLE runner_sessions (
     session_id              TEXT PRIMARY KEY,
-    runner_id               INTEGER REFERENCES runners(runner_id) ON DELETE CASCADE,
+    -- Declared agent.id on unverified creates can name a runner that has not
+    -- registered yet (legacy order); no FK — session_owner LEFT JOINs runners
+    -- so dangling ids read as unknown capabilities until registration lands.
+    runner_id               INTEGER,
     protocol                TEXT NOT NULL CHECK (protocol IN ('broker','azdo')),
     client_id               TEXT,
     verified                INTEGER NOT NULL DEFAULT 0,
@@ -342,6 +345,9 @@ CREATE INDEX runner_sessions_runner ON runner_sessions(runner_id);
 CREATE INDEX runner_sessions_liveness ON runner_sessions(last_seen_at);
 
 CREATE TABLE session_messages (
+    -- Ids start above 1e6 (seeded at open via sqlite_sequence): broker job
+    -- refs carry request_id as messageId; a cancel in the same range would
+    -- collide in the runner's in-memory dedup and be silently dropped.
     message_id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id              TEXT NOT NULL REFERENCES runner_sessions(session_id) ON DELETE CASCADE,
     message_type            TEXT NOT NULL,

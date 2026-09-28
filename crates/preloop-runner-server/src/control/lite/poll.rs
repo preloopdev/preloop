@@ -175,47 +175,116 @@ fn pending_cancellation(
 fn claim_one(
     tx: &Transaction<'_>,
     runner_id: Option<i64>,
+    verified_runner_id: Option<i64>,
     caps: &RunnerCapabilities,
+    require_assignments: bool,
 ) -> Result<Option<(RunId, JobId)>, ControlError> {
     type ReadyRow = (
         String,
         String,
         Vec<String>,
         Option<String>,
-        Option<(Option<i64>, bool)>,
+        i64,
+        Option<(Option<i64>, bool, bool, bool)>,
+        Option<i64>,
     );
+    let now = now_us();
+    let fresh_after = now - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
     let rows: Vec<ReadyRow> = {
         let mut stmt = tx
             .prepare_cached(
                 "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
-                 a.runner_id, (a.assigned_at IS NOT NULL AND a.assigned_at > ?1) \
+                 j.enqueued_at, \
+                 a.runner_id, \
+                 (a.run_id IS NOT NULL), \
+                 (a.assigned_at IS NOT NULL AND a.assigned_at > ?1), \
+                 (a.first_assigned_at IS NOT NULL AND a.first_assigned_at > ?1), \
+                 (a.runner_id IS NOT NULL AND EXISTS( \
+                    SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id)), \
+                 p.requested_at \
                  FROM jobs j \
                  LEFT JOIN job_assignments a ON a.run_id = j.run_id \
                     AND a.job_id = j.job_id \
+                 LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                    AND p.job_id = j.job_id \
                  WHERE j.queue_state = 'ready' \
                  ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
                  LIMIT 64",
             )
             .map_err(db)?;
-        let fresh_after = now_us() - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
         let rows = stmt
             .query_map(params![fresh_after], |row| {
-                let assigned: Option<Option<i64>> = row.get(4)?;
-                let fresh: Option<bool> = row.get(5)?;
+                let assigned: Option<i64> = row.get(5)?;
+                let assignment_exists: bool = row.get(6)?;
+                let fresh: bool = row.get(7)?;
+                let first_fresh: bool = row.get(8)?;
+                let registered: bool = row.get(9)?;
+                let enqueued: Option<i64> = row.get(4)?;
+                // Raw `p.requested_at`: NULL marks a non-matching LEFT JOIN
+                // (no provision row) — `provision_fresh` is tri-state in Rust.
+                let provision_at: Option<i64> = row.get(10)?;
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
                     row.get::<_, Option<String>>(3)?,
-                    assigned.map(|a| (a, fresh.unwrap_or(false))),
+                    enqueued.unwrap_or(0),
+                    assignment_exists.then_some((assigned, fresh, first_fresh, registered)),
+                    provision_at,
                 ))
             })
             .map_err(db)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db)?
     };
+    let verified = verified_runner_id.is_some();
     let mut candidates = Vec::with_capacity(rows.len());
-    for (position, (run, job, runs_on, runner_group, assignment)) in rows.into_iter().enumerate() {
-        let (assigned_runner_id, assignment_fresh) = assignment.unwrap_or((None, false));
+    for (position, (run, job, runs_on, runner_group, enqueued_at, assignment, provision_at)) in
+        rows.into_iter().enumerate()
+    {
+        let provision_fresh = provision_at.map(|at| at > fresh_after);
+        let (assigned_runner_id, assignment_fresh, first_assigned_fresh, runner_registered) =
+            assignment.unwrap_or((None, false, false, false));
+        // `claim_permitted` verbatim: assignment rows bind verified sessions
+        // while fresh, stale/orphaned bindings open to any verified caller,
+        // a fresh pool-pending row blocks everyone, and unassigned jobs are
+        // only claimable when strict assignments are off.
+        let enqueue_ceiling_expired = enqueued_at > 0
+            && now.saturating_sub(enqueued_at)
+                >= crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+        // The old model swept stale bindings before checking in permissive
+        // mode — a stale assignment/pool_pending row counts as absent there.
+        let assignment = if !require_assignments && !assignment_fresh {
+            None
+        } else {
+            assignment
+        };
+        let provision_fresh = if !require_assignments && provision_fresh == Some(false) {
+            None
+        } else {
+            provision_fresh
+        };
+        let claimable = if assignment.is_some() {
+            if !first_assigned_fresh || enqueue_ceiling_expired {
+                verified
+            } else {
+                match assigned_runner_id {
+                    None => verified,
+                    Some(id) => {
+                        if !runner_registered || !assignment_fresh {
+                            verified
+                        } else {
+                            Some(id) == verified_runner_id
+                        }
+                    }
+                }
+            }
+        } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
+            false
+        } else if provision_fresh.is_some() {
+            verified
+        } else {
+            !require_assignments
+        };
         candidates.push(logic::ClaimCandidate {
             run_id: codec::run_id(&run),
             job_id: JobId(job),
@@ -224,7 +293,7 @@ fn claim_one(
             assigned_runner_id,
             assignment_fresh,
             queue_position: position as u64,
-            claimable: true,
+            claimable,
         });
     }
     let runner_match = logic::RunnerMatchRow {
@@ -233,9 +302,15 @@ fn claim_one(
         group_id: caps.runner_group_id,
         group_name: caps.runner_group_name.clone(),
     };
-    let Some(index) =
-        logic::claim_preference(&candidates, runner_id, &caps.labels, None, &runner_match)
-    else {
+    // `assigned_to_this_runner` keys off the proven runner id: an unverified
+    // session cannot satisfy an assignment binding even by name.
+    let Some(index) = logic::claim_preference(
+        &candidates,
+        verified_runner_id,
+        &caps.labels,
+        None,
+        &runner_match,
+    ) else {
         return Ok(None);
     };
     let chosen = candidates.swap_remove(index);
@@ -412,6 +487,7 @@ impl LiteBackend {
         &self,
         poll: PollRequest,
     ) -> Result<PollOutcome, ControlError> {
+        let (_, require_assignments, _) = self.config();
         self.write(|tx| {
             // Ownership is revalidated inside the claim transaction: the
             // handler caches the runner across a long poll, and a liveness
@@ -460,7 +536,14 @@ impl LiteBackend {
             if poll.busy {
                 return Ok(PollOutcome::Empty);
             }
-            let Some((run_id, job_id)) = claim_one(tx, session.runner_id, &poll.runner)? else {
+            let Some((run_id, job_id)) = claim_one(
+                tx,
+                session.runner_id,
+                session.runner_id,
+                &poll.runner,
+                require_assignments,
+            )?
+            else {
                 return Ok(PollOutcome::Empty);
             };
             let Some(request) = bind_claim(
@@ -498,12 +581,34 @@ impl LiteBackend {
         &self,
         poll: AzdoPoll,
     ) -> Result<AzdoPollOutcome, ControlError> {
+        let (_, require_assignments, _) = self.config();
         self.write(|tx| {
-            let Some(session) = session_ref(tx, &poll.session_id)? else {
-                // An unknown session is answered like a foreign one: the
-                // runner must re-register rather than receive work it
+            let session = match session_ref(tx, &poll.session_id)? {
+                Some(session) => session,
+                None if poll.session_id.parse::<uuid::Uuid>().is_err() => {
+                    // The implicit compat session (legacy `sessionId=default`,
+                    // any non-UUID id) owns no runner: its row is materialized
+                    // lazily so `session_messages`/`job_requests` foreign keys
+                    // resolve, and `plaintext` rendering keeps messages
+                    // decodable without a key exchange.
+                    let uuid = logic::session_uuid(&poll.session_id).to_string();
+                    tx.prepare_cached(
+                        "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
+                         verified, created_at, last_seen_at) \
+                         VALUES (?1, NULL, 'azdo', 0, ?2, ?2) ON CONFLICT DO NOTHING",
+                    )
+                    .map_err(db)?
+                    .execute(params![uuid, now_us()])
+                    .map_err(db)?;
+                    SessionRef {
+                        session_uuid: uuid,
+                        runner_id: None,
+                    }
+                }
+                // An unknown keyed session is answered like a foreign one:
+                // the runner must re-register rather than receive work it
                 // cannot decode.
-                return Ok(AzdoPollOutcome::Forbidden);
+                None => return Ok(AzdoPollOutcome::Forbidden),
             };
             if let Some(verified) = poll.verified_runner_id {
                 if session.runner_id != Some(verified) {
@@ -530,9 +635,17 @@ impl LiteBackend {
                 return Ok(AzdoPollOutcome::Wait);
             }
             let caps = match session.runner_id {
+                // A session can name a runner id whose registration has not
+                // landed (or is gone): capabilities stay unknown, matching the
+                // old model — permissive matching, no `Wait` starvation.
                 Some(runner_id) => match runner_capabilities(tx, runner_id)? {
                     Some(caps) => caps,
-                    None => return Ok(AzdoPollOutcome::Wait),
+                    None => RunnerCapabilities {
+                        known: false,
+                        labels: Vec::new(),
+                        runner_group_id: None,
+                        runner_group_name: None,
+                    },
                 },
                 // A compat session has no registered runner: its labels are
                 // unknown, which the shared matcher treats as permissive.
@@ -543,7 +656,14 @@ impl LiteBackend {
                     runner_group_name: None,
                 },
             };
-            let Some((run_id, job_id)) = claim_one(tx, session.runner_id, &caps)? else {
+            let Some((run_id, job_id)) = claim_one(
+                tx,
+                session.runner_id,
+                poll.verified_runner_id,
+                &caps,
+                require_assignments,
+            )?
+            else {
                 return Ok(AzdoPollOutcome::Wait);
             };
             let Some(request) = bind_claim(

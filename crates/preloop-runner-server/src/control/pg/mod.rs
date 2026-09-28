@@ -27,6 +27,8 @@ mod reaper;
 mod runners;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod testview;
 mod timelines;
 mod trait_impl;
 

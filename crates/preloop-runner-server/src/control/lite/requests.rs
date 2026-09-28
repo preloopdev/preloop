@@ -98,6 +98,13 @@ fn stamp_result(
 ) -> Result<bool, ControlError> {
     let expires_at = codec::parse_lease(locked_until)?;
     let now = now_us();
+    // `result` is CHECK-constrained to terminal verdicts; a non-terminal
+    // retire (the reusable caller's placeholder request marked InProgress
+    // while its subtree runs) only tightens the lease row.
+    if !result.is_terminal() {
+        set_lease(tx, request_id, expires_at, now)?;
+        return Ok(true);
+    }
     let settled = tx
         .prepare_cached(
             "UPDATE job_requests SET result = ?2, finished_at = ?3 \
@@ -591,12 +598,13 @@ impl LiteBackend {
         session_id: &str,
         message_id: i64,
     ) -> Result<(), ControlError> {
+        let session_uuid = crate::control::logic::session_uuid(session_id).to_string();
         self.write(|tx| {
             tx.prepare_cached(
                 "DELETE FROM session_messages WHERE session_id = ?1 AND message_id = ?2",
             )
             .map_err(db)?
-            .execute(params![session_id, message_id])
+            .execute(params![session_uuid, message_id])
             .map_err(db)?;
             Ok(())
         })

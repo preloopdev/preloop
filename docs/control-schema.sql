@@ -1,7 +1,6 @@
--- Preloop control plane — target production schema (greenfield, v1).
+-- Preloop control plane 
 --
--- Source of truth for docs/control-schema-chartdb.json and
--- docs/control-schema.{dot,png}. Postgres is the production backend; the
+
 -- SQLite backend mirrors every table with the obvious type mapping
 -- (uuid/text -> TEXT, timestamptz -> INTEGER µs, jsonb -> TEXT, bytea -> BLOB,
 -- identity -> INTEGER PRIMARY KEY) and skips partitioning.
@@ -397,7 +396,10 @@ CREATE INDEX runner_sessions_liveness ON runner_sessions(last_seen_at);
 
 -- Per-session outbound messages (queue). Poll: oldest for session, ack = DELETE.
 CREATE TABLE session_messages (
-    message_id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- Ids start above 1e6: broker job refs carry request_id (small ints) as
+    -- messageId; a cancel in the same range would collide in the runner's
+    -- in-memory dedup and be silently dropped.
+    message_id              bigint GENERATED ALWAYS AS IDENTITY (START WITH 1000001) PRIMARY KEY,
     session_id              uuid NOT NULL REFERENCES runner_sessions(session_id) ON DELETE CASCADE,
     message_type            text NOT NULL,
     -- job assignments carry only request_id; the real message is built and

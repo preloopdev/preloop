@@ -4,11 +4,9 @@
 //! `status_inputs` (operational status reads).
 //!
 //! Translated from `commands::reap_sweep_tx`/`status_inputs_tx` (the old
-//! TxState model) and the SQLite shapes of the same reads. The starvation
-//! first-seen mark is `jobs.not_before`: `NULL` = never observed
-//! unmatched, a timestamp = the persisted mark. Its claim predicate
-//! (`queue_state = 'ready'`) is unaffected — `not_before` is a reaper-only
-//! column on this schema (same role as the old `reaper_first_seen_us`).
+//! TxState model) and the SQLite shapes of the same reads. Starvation
+//! first-seen marks are node-local (decisions-5 B2): the caller passes them
+//! in `ReapSweep::first_seen`; nothing about them is persisted.
 
 use super::codec::{self, now_us};
 use super::jobs;
@@ -96,7 +94,7 @@ fn starve_job(
     let run = codec::run_key(run_id);
     tx.prepare_cached(
         "UPDATE jobs SET status = 'failure', queue_state = 'none', \
-         completed_at = ?3, not_before = NULL \
+         completed_at = ?3 \
          WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
     )
     .map_err(db)?
@@ -160,8 +158,8 @@ impl LiteBackend {
             {
                 let mut stmt = tx
                     .prepare_cached(
-                        "SELECT run_id, job_id, runs_on, enqueued_at, \
-                         not_before IS NOT NULL FROM jobs WHERE queue_state = 'ready' \
+                        "SELECT run_id, job_id, runs_on, enqueued_at \
+                         FROM jobs WHERE queue_state = 'ready' \
                          ORDER BY priority DESC, run_order, job_order, run_id, job_id",
                     )
                     .map_err(db)?;
@@ -174,7 +172,6 @@ impl LiteBackend {
                                 .unwrap_or_default(),
                             enqueued_at_unix_nanos: row.get::<_, Option<i64>>(3)?.unwrap_or(0)
                                 * 1000,
-                            observed: row.get(4)?,
                         })
                     })
                     .map_err(db)?;
@@ -224,8 +221,8 @@ impl LiteBackend {
         })
     }
 
-    /// `reap_sweep` (`commands::reap_sweep_tx` over SQL): starvation marks
-    /// (`jobs.not_before`), job `timeout-minutes` enforcement (queued
+    /// `reap_sweep` (`commands::reap_sweep_tx` over SQL): starvation verdicts
+    /// over the caller's node-local marks, job `timeout-minutes` enforcement (queued
     /// cancellations), lease-expiry failure. Rows outside `sweep.runs` are
     /// never written.
     pub(crate) async fn reap_sweep(
@@ -244,6 +241,7 @@ impl LiteBackend {
                 paused,
                 pool_preparing,
                 warm_window_open,
+                first_seen,
             } = sweep;
             let runner_labels = runner_label_sets(tx)?;
             // Only runs in scope may change.
@@ -260,31 +258,15 @@ impl LiteBackend {
                     runs_on: &job.runs_on,
                     enqueued_at: std::time::UNIX_EPOCH
                         + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
-                    first_seen: None,
+                    first_seen: first_seen.get(&(job.run_id, job.job_id.clone())).copied(),
                     any_runner_matches: runner_labels.iter().any(|labels| {
                         crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                     }),
                 };
                 match logic::starvation_verdict(&candidate, now, pool_preparing, warm_window_open) {
-                    StarvationVerdict::ClearMark => {
-                        tx.prepare_cached(
-                            "UPDATE jobs SET not_before = NULL \
-                             WHERE run_id = ?1 AND job_id = ?2",
-                        )
-                        .map_err(db)?
-                        .execute(params![codec::run_key(job.run_id), job.job_id.0])
-                        .map_err(db)?;
-                    }
-                    StarvationVerdict::Mark { .. } => {
-                        // Keep an existing mark; otherwise stamp now.
-                        tx.prepare_cached(
-                            "UPDATE jobs SET not_before = COALESCE(not_before, ?3) \
-                             WHERE run_id = ?1 AND job_id = ?2",
-                        )
-                        .map_err(db)?
-                        .execute(params![codec::run_key(job.run_id), job.job_id.0, now_us()])
-                        .map_err(db)?;
-                    }
+                    // Marks are node-local (decisions-5 B2): the caller
+                    // owns stamping/clearing; nothing persists here.
+                    StarvationVerdict::ClearMark | StarvationVerdict::Mark { .. } => {}
                     StarvationVerdict::Starve { reason, grace } => {
                         tracing::warn!(
                             run_id = %job.run_id,
@@ -298,13 +280,6 @@ impl LiteBackend {
                     }
                 }
             }
-            // A marked job that left the ready queue clears its mark (the
-            // claim fence took it; do not leak a stale mark into a later
-            // re-enqueue).
-            tx.prepare_cached("UPDATE jobs SET not_before = NULL WHERE queue_state <> 'ready'")
-                .map_err(db)?
-                .execute([])
-                .map_err(db)?;
             // ── Timeouts + lease expiry ────────────────────────────────
             let mut cancellations = 0usize;
             let mut expired = Vec::new();

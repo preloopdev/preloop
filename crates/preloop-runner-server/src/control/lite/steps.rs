@@ -225,3 +225,23 @@ pub(super) fn latest_attempt_steps(
     rows.map(|row| row.map(|(_, record)| record).map_err(db))
         .collect()
 }
+
+/// The newest archived attempt's steps for one job.
+pub(crate) fn archived_attempt_steps(
+    tx: &rusqlite::Transaction<'_>,
+    run: &str,
+    job: &str,
+) -> Result<Vec<crate::models::StepRecord>, ControlError> {
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "SELECT {} FROM step_history WHERE agent_job_id = ( \
+                 SELECT agent_job_id FROM attempt_history WHERE run_id = ?1 AND job_id = ?2 \
+                 ORDER BY request_id DESC LIMIT 1) \
+             ORDER BY position",
+            STEP_COLUMNS
+        ))
+        .map_err(db)?;
+    let rows = stmt.query_map(params![run, job], step_row).map_err(db)?;
+    rows.map(|row| row.map(|(_, record)| record).map_err(db))
+        .collect()
+}

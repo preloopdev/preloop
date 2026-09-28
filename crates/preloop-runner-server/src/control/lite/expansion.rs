@@ -24,7 +24,7 @@ use crate::models::QueuedJob;
 use crate::runtime_scheduling::SchedulingOutcome;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use rusqlite::{params, OptionalExtension, Transaction};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The build inputs a deferred node snapshots under its generation fence
 /// (pg's `expansion_plan`): the run context fields plus every needed job's
@@ -159,6 +159,48 @@ fn built_queued_job(run_id: RunId, built: &BuiltJob) -> QueuedJob {
 /// `callee_meta` is the `BuiltExpansion::Reusable` metadata map, keyed by
 /// callee job id; it lands in the callee spec envelopes since SQL has no
 /// in-session record to carry it. Returns the registered count.
+/// Append each expanded job's resolved display name to
+/// `record_details.job_names` — the field is verbatim record detail (submit
+/// writes only the declared jobs), so runtime-materialized legs would render
+/// as raw ids without this.
+fn merge_expanded_job_names(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    names: &[(String, String)],
+) -> Result<(), ControlError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let run = codec::run_key(run_id);
+    let mut details: serde_json::Value = tx
+        .prepare_cached("SELECT record_details FROM run_submissions WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([&run], |row| row.get::<_, Option<String>>(0))
+        .optional()
+        .map_err(db)?
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let entry = details
+        .as_object_mut()
+        .expect("record_details is a JSON object")
+        .entry("job_names".to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(map) = entry.as_object_mut() {
+        for (job_id, name) in names {
+            map.insert(job_id.clone(), serde_json::Value::String(name.clone()));
+        }
+    }
+    tx.prepare_cached("UPDATE run_submissions SET record_details = ?2 WHERE run_id = ?1")
+        .map_err(db)?
+        .execute(params![
+            run,
+            serde_json::to_string(&details).map_err(ControlError::backend)?
+        ])
+        .map_err(db)?;
+    Ok(())
+}
+
 fn register_built_jobs(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
@@ -169,6 +211,34 @@ fn register_built_jobs(
 ) -> Result<usize, ControlError> {
     let platforms = jobs::registered_platforms(tx)?;
     let mut registered = 0usize;
+    // Matrix legs reference their base as `parent_job_id` — an FK target.
+    // Materialize a `matrix_parent` row for any covered parent first (the
+    // callee subtree's legs replaced it at build time, so it never mints a
+    // request); the run graph excludes it via the has-children predicate.
+    let mut parents_needed: BTreeSet<String> = BTreeSet::new();
+    for built in &jobs {
+        if let Some(parent) = node_parent(&built.plan, &built.plan.id) {
+            parents_needed.insert(parent);
+        }
+    }
+    for parent_id in parents_needed {
+        tx.prepare_cached(
+            "INSERT INTO jobs (run_id, job_id, namespace_id, kind, \
+                 parent_job_id, base_id, status, queue_state, remaining_needs, \
+                 pool_key, runs_on, priority, run_order, job_order, created_at) \
+             SELECT ?1, ?2, ?3, 'matrix_parent', NULL, ?2, 'pending', 'none', 0, \
+                    '', '[]', 0, 0, 0, ?4 \
+             WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE run_id = ?1 AND job_id = ?2)",
+        )
+        .map_err(db)?
+        .execute(params![
+            codec::run_key(run_id),
+            parent_id,
+            namespace,
+            now_us()
+        ])
+        .map_err(db)?;
+    }
     for built in jobs {
         let plan = built.plan.clone();
         let job_id = plan.id.clone();
@@ -456,6 +526,10 @@ impl LiteBackend {
                 Err(status) => {
                     settle::settle_node(tx, self, run_id, &node_id, status)?;
                     outcome.failed.push((run_id, node_id));
+                    // Children materialize *after* the caller's own needs may have
+                    // settled (they inherit them): recompute before promoting, same
+                    // as the submit path.
+                    jobs::refresh_run_remaining_needs(tx, run_id)?;
                     promote::promote_run(tx, self, run_id, &mut outcome)?;
                     return Ok(outcome);
                 }
@@ -469,7 +543,12 @@ impl LiteBackend {
                 BuiltExpansion::Matrix { jobs } => {
                     let leg_ids: Vec<String> =
                         jobs.iter().map(|job| job.plan.id.0.clone()).collect();
+                    let names: Vec<(String, String)> = jobs
+                        .iter()
+                        .map(|j| (j.plan.id.0.clone(), j.plan.name.clone()))
+                        .collect();
                     register_built_jobs(tx, self, run_id, &namespace, jobs, &BTreeMap::new())?;
+                    merge_expanded_job_names(tx, run_id, &names)?;
                     // The parent leaves the run's status map; its legs take
                     // over (`has_children` is derived: `run_graph` excludes
                     // a matrix parent with a child row, so no flag exists).
@@ -481,7 +560,10 @@ impl LiteBackend {
                     .execute(params![codec::run_key(run_id), node_id.0])
                     .map_err(db)?;
                     splice_matrix_parents(tx, run_id, &node_id, &leg_ids)?;
-                    settle::retire_node_requests(tx, run_id, &node_id, ExecutionStatus::Skipped)?;
+                    // The placeholder's request row is deleted (not settled):
+                    // plan/agent-job correlation must not resolve to a node
+                    // the subtree replaced.
+                    settle::purge_node_requests(tx, run_id, &node_id)?;
                 }
                 BuiltExpansion::Reusable {
                     caller_id,
@@ -490,7 +572,12 @@ impl LiteBackend {
                 } => {
                     let inner_ids: Vec<String> =
                         jobs.iter().map(|job| job.plan.id.0.clone()).collect();
+                    let names: Vec<(String, String)> = jobs
+                        .iter()
+                        .map(|j| (j.plan.id.0.clone(), j.plan.name.clone()))
+                        .collect();
                     register_built_jobs(tx, self, run_id, &namespace, jobs, &reusable_calls)?;
+                    merge_expanded_job_names(tx, run_id, &names)?;
                     // The caller is now executing inside its subtree: its
                     // row is `in_progress`/unqueued; the callee metadata and
                     // `inner_job_ids` land in the spec envelopes.
@@ -517,6 +604,10 @@ impl LiteBackend {
                     )?;
                 }
             }
+            // Children materialize *after* the caller's own needs may have
+            // settled (they inherit them): recompute before promoting, same
+            // as the submit path.
+            jobs::refresh_run_remaining_needs(tx, run_id)?;
             promote::promote_run(tx, self, run_id, &mut outcome)?;
             Ok(outcome)
         })

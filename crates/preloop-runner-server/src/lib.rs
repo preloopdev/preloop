@@ -98,7 +98,7 @@ pub mod store;
 use store::*;
 pub mod bootstrap;
 pub mod store_pg;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[allow(unused_imports)]
 use bootstrap::reap_once;
 pub use bootstrap::{SelfSignedCert, ServerConfig, TlsMode, generate_self_signed_cert, serve};
@@ -116,8 +116,6 @@ pub mod scheduling;
 
 #[cfg(test)]
 mod concurrency_http_properties;
-#[cfg(test)]
-mod concurrency_properties;
 #[cfg(test)]
 mod dispatch_tests;
 /// GitHub-compatible OIDC id-token provider.

@@ -106,7 +106,13 @@ async fn render_session_message(
     session_id: &str,
     message: crate::control::types::SessionMessage,
 ) -> Option<azdo::TaskAgentMessage> {
-    let body_json = if let Some(request_id) = message.request_id {
+    // Control messages (JobCancellation and friends) carry their own
+    // `body`; a request_id on them is correlation, not a job payload. Only
+    // the assignment itself is rendered from the stored template.
+    let body_json = if let Some(request_id) = message
+        .request_id
+        .filter(|_| message.message_type == azdo::message_type::PIPELINE_AGENT_JOB_REQUEST)
+    {
         let ctx = shared
             .state
             .backend
@@ -118,13 +124,28 @@ async fn render_session_message(
         // in from the SecretProvider, then fill the token slots — the AzDO
         // path has no App-mint, so the PAT (or the job-scoped runtime token
         // for fork-restricted tiers) is the credential. Never written back.
-        crate::message_template::fill_template(
+        let filled = crate::message_template::fill_template(
             &mut msg,
             shared.state.secret_provider.as_ref(),
             &ctx.repository,
             &ctx.run_secrets,
         )
         .ok()?;
+        // Merge the freshly resolved values (env-tier secrets included) into
+        // the node masker entry seeded at submit.
+        if !filled.values.is_empty() {
+            let plan_id = msg.plan.plan_id.clone();
+            let mut inner = shared.state.inner.lock().await;
+            let mut merged: Vec<String> = inner
+                .plan_secret_masker
+                .get(&plan_id)
+                .map(|v| (**v).clone())
+                .unwrap_or_default();
+            merged.extend(filled.values.values().cloned());
+            merged.sort();
+            merged.dedup();
+            inner.plan_secret_masker.insert(plan_id, Arc::new(merged));
+        }
         let tier = ctx.trust_tier.as_deref().and_then(|tier| {
             serde_json::from_value(serde_json::Value::String(tier.to_owned())).ok()
         });

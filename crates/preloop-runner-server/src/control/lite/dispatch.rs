@@ -373,7 +373,10 @@ impl LiteBackend {
             }
             // Ownership: a broker completion must name an attempt this
             // runner owns (recorded owner or the session runner).
-            let mut attempt = None;
+            // The legacy compat PATCH names no attempt — settle whatever
+            // unsettled request the job holds (`settle=None` path); an
+            // explicit broker settle is ownership-checked above.
+            let mut attempt = attempt_request_id(tx, run_id, &job_id, comp.agent_job_id)?;
             if let Some(settle_attempt) = &settle.settle {
                 let request_id =
                     attempt_request_id(tx, run_id, &job_id, Some(settle_attempt.agent_job_id))?
@@ -430,8 +433,18 @@ impl LiteBackend {
             }
             if let Some(request_id) = attempt {
                 settle_request_tx(tx, request_id, applied.effective_status)?;
-                // The attempt's step results land on its manifest.
-                if let Some(agent) = comp.agent_job_id {
+                // The attempt's step results land on its manifest. The compat
+                // path names only the job — the settled row's own agent_job_id
+                // addresses the attempt.
+                let agent = comp.agent_job_id.or_else(|| {
+                    tx.prepare_cached("SELECT agent_job_id FROM job_requests WHERE request_id = ?1")
+                        .ok()?
+                        .query_row([request_id], |row| row.get::<_, String>(0))
+                        .optional()
+                        .ok()?
+                        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+                });
+                if let Some(agent) = agent {
                     for wire in &comp.step_results {
                         let Some(external_id) = wire.external_id.as_deref() else {
                             continue;

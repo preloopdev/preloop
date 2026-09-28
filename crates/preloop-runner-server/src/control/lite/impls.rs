@@ -212,21 +212,6 @@ impl ControlBackend for LiteBackend {
     async fn run_job_ids(&self, run_id: RunId) -> Result<Vec<String>, ControlError> {
         self.run_job_ids(run_id).await
     }
-    async fn job_detail_missing(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-    ) -> Result<bool, ControlError> {
-        self.job_detail_missing(run_id, job_id).await
-    }
-    async fn ensure_job_detail(
-        &self,
-        run_id: RunId,
-        job_id: &JobId,
-        conclusion: Option<&str>,
-    ) -> Result<(), ControlError> {
-        self.ensure_job_detail(run_id, job_id, conclusion).await
-    }
     async fn set_job_check_run(
         &self,
         run_id: RunId,
@@ -331,6 +316,14 @@ impl ControlBackend for LiteBackend {
     ) -> Result<Option<RunId>, ControlError> {
         self.published_run(repository, sha, workflow_path).await
     }
+    async fn run_for_webhook_delivery(
+        &self,
+        delivery_id: &str,
+        workflow_path: &str,
+    ) -> Result<Option<RunId>, ControlError> {
+        self.run_for_webhook_delivery(delivery_id, workflow_path)
+            .await
+    }
     async fn run_held(&self, run_id: RunId) -> Result<bool, ControlError> {
         self.run_held(run_id).await
     }
@@ -356,12 +349,6 @@ impl ControlBackend for LiteBackend {
         agent_job_id: Option<uuid::Uuid>,
     ) -> Result<Option<CallbackJob>, ControlError> {
         self.callback_job(plan_id, timeline_id, agent_job_id).await
-    }
-    async fn run_secret_values(&self, run_id: RunId) -> Result<Option<Vec<String>>, ControlError> {
-        self.run_secret_values(run_id).await
-    }
-    async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
-        self.all_secret_values().await
     }
     async fn sole_inflight_request(
         &self,
