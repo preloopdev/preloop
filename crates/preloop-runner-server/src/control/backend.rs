@@ -1121,10 +1121,12 @@ impl Backend {
     /// `#[cfg(test)]` working-set snapshot for pre-cutover assertions. Each
     /// backend rebuilds the old field names from its own tables.
     #[cfg(test)]
-    pub(crate) fn test_working_set(&self) -> Result<super::testview::TestState, ControlError> {
+    pub(crate) async fn test_working_set(
+        &self,
+    ) -> Result<super::testview::TestState, ControlError> {
         match self {
             Self::Sqlite(b) => b.test_working_set(),
-            Self::Postgres(b) => b.test_working_set(),
+            Self::Postgres(b) => b.test_working_set().await,
         }
     }
     /// Open the backend selected by `store_url`: `postgres://…` → PostgreSQL,

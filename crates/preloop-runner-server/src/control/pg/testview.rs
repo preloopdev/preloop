@@ -18,18 +18,10 @@ use preloop_gha_protocol::{azdo, JobId, RegisteredRunner, RunnerSession, Session
 use std::collections::{BTreeMap, BTreeSet};
 
 impl PgBackend {
-    /// Snapshot every scheduling table into a [`TestState`]. Runs one read
-    /// per table on a single pooled connection — commit-consistent enough
-    /// for test assertions (commands in tests are awaited before reads).
-    pub(crate) fn test_working_set(&self) -> Result<TestState, ControlError> {
-        // `block_in_place` requires a multi-thread runtime; pg tests run on
-        // one, so drive the async loader through a nested handle instead.
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.test_working_set_inner())
-        })
-    }
-
-    async fn test_working_set_inner(&self) -> Result<TestState, ControlError> {
+    /// Snapshot every scheduling table into a [`TestState`] inside one read
+    /// transaction on a pooled connection — commit-consistent for test
+    /// assertions (commands in tests are awaited before reads).
+    pub(crate) async fn test_working_set(&self) -> Result<TestState, ControlError> {
         let mut pooled = self.writer().await?;
         let tx = pooled.transaction().await.map_err(db)?;
         let client = &tx;
@@ -66,14 +58,17 @@ impl PgBackend {
         }
         for row in client
             .query(
-                "SELECT workflow_path, next_number FROM workflow_run_numbers",
+                "SELECT repository, workflow_path, last_run_number FROM workflow_run_numbers",
                 &[],
             )
             .await
             .map_err(db)?
         {
-            t.workflow_run_counters
-                .insert(row.get::<_, String>(0), row.get::<_, i64>(1) as u64);
+            let (repository, path): (String, String) = (row.get(0), row.get(1));
+            t.workflow_run_counters.insert(
+                format!("{repository}\x1f{path}"),
+                row.get::<_, i64>(2) as u64,
+            );
         }
 
         // ── Jobs: graph → QueuedJob per node ─────────────────────────
@@ -95,8 +90,11 @@ impl PgBackend {
             }
             if let Some(graph) = self.load_graph(client, run_id).await? {
                 if let Some(node) = graph.nodes.get(&key.1) {
-                    if let Some(us) = node.enqueued_at_us {
-                        t.queued_at.insert(key.clone(), codec::us_to_system(us));
+                    // `queued_at` only while the job sits in the ready queue.
+                    if state == "ready" {
+                        if let Some(us) = node.enqueued_at_us {
+                            t.queued_at.insert(key.clone(), codec::us_to_system(us));
+                        }
                     }
                     let Some(message) =
                         Self::node_message(client, run_id, &key.1).await?
@@ -105,13 +103,15 @@ impl PgBackend {
                     };
                     let job = queued_of(&key.1, run_id, node, message);
                     match state.as_str() {
-                        "ready" | "claimed" => {
+                        "ready" => {
                             if job.enqueued_at_unix_nanos > 0 || job.created_at_unix_nanos > 0 {
-                                t.ready_index.push_back(job.clone());
+                                t.ready_index.push_back(job);
                             }
-                            if state == "claimed" {
-                                t.claimed_jobs.insert(key.clone(), job);
-                            }
+                        }
+                        // Claimed jobs are off the ready queue (the runner
+                        // owns the claim); `claimed_jobs` holds them.
+                        "claimed" => {
+                            t.claimed_jobs.insert(key.clone(), job);
                         }
                         "blocked" => t.pending_jobs.push_back(job),
                         "held" => {
@@ -158,7 +158,7 @@ impl PgBackend {
         }
         for row in client
             .query(
-                "SELECT session_id, request_id FROM job_requests \
+                "SELECT session_id::text, request_id FROM job_requests \
                  WHERE result IS NULL AND session_id IS NOT NULL",
                 &[],
             )
@@ -262,7 +262,7 @@ impl PgBackend {
                     labels: serde_json::from_str(&labels).unwrap_or_default(),
                     ephemeral: row.get(3),
                     public_key: public_key.clone(),
-                    runner_group_id: row.get::<_, Option<i32>>(4).map(|v| v as i64),
+                    runner_group_id: row.get::<_, Option<i64>>(4),
                     runner_group_name: row.get(5),
                 },
             );
@@ -284,7 +284,7 @@ impl PgBackend {
         for row in client
             .query(
                 &format!(
-                    "SELECT session_id, runner_id, protocol, verified, {} \
+                    "SELECT session_id::text, runner_id, protocol, verified, {} \
                      FROM runner_sessions",
                     us!("last_seen_at")
                 ),
@@ -319,7 +319,7 @@ impl PgBackend {
         }
         for row in client
             .query(
-                "SELECT message_id, session_id, message_type, body \
+                "SELECT message_id, session_id::text, message_type, body::text \
                  FROM session_messages ORDER BY message_id",
                 &[],
             )
@@ -348,11 +348,13 @@ impl PgBackend {
         // ── Steps ────────────────────────────────────────────────────
         for row in client
             .query(
-                "SELECT agent_job_id::text, step_id, kind, workflow_index, \
-                        runner_number, context_name, name, conclusion, \
-                        EXTRACT(EPOCH FROM started_at)*1000000::int8, \
-                        EXTRACT(EPOCH FROM finished_at)*1000000::int8 \
-                 FROM job_steps ORDER BY agent_job_id, position",
+                &format!(
+                    "SELECT agent_job_id::text, step_id, kind, workflow_index, \
+                            runner_number, context_name, name, conclusion, {}, {} \
+                     FROM job_steps ORDER BY agent_job_id, position",
+                    us!("started_at"),
+                    us!("finished_at")
+                ),
                 &[],
             )
             .await

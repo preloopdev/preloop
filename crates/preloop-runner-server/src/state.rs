@@ -288,6 +288,7 @@ impl AppState {
     pub(crate) async fn test_tx(&self) -> crate::control::testview::TestState {
         self.backend
             .test_working_set()
+            .await
             .expect("test_working_set failed")
     }
 
