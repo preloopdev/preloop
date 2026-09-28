@@ -11,8 +11,12 @@
 //! system bin, or `initdb` on `PATH`).
 
 use super::PgBackend;
-use crate::control::backend::{CreateSession, PollRequest, RegisterRunner, RequestKey};
-use crate::control::types::{PollOutcome, SessionProtocol, SubmitJob, SubmitRun};
+use crate::control::backend::{
+    CreateSession, JobCompletionInput, PollRequest, RegisterRunner, RequestKey,
+};
+use crate::control::types::{
+    ControlError, PollOutcome, SessionProtocol, StepPatch, SubmitJob, SubmitRun,
+};
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
 use std::collections::BTreeMap;
@@ -470,4 +474,227 @@ async fn concurrent_polls_claim_once() {
         .filter(|o| matches!(o, PollOutcome::Claimed(_)))
         .count();
     assert_eq!(claims, 1, "one job must be claimed exactly once");
+}
+
+fn timeline_record(id: u128, name: &str) -> azdo::TimelineRecord {
+    serde_json::from_value(serde_json::json!({
+        "id": uuid::Uuid::from_u128(id),
+        "name": name,
+        "type": "Task",
+        "state": "completed",
+        "result": "succeeded",
+    }))
+    .unwrap()
+}
+
+/// Submit a run, claim its job, and return the request's correlation ids.
+/// Timelines and steps are per attempt, so every test needs a real request
+/// row behind them.
+async fn submit_and_claim(
+    node: &PgBackend,
+    run_id: RunId,
+) -> (crate::models::TaskAgentJobRequestRecord, i64) {
+    let runner = node.register_runner(register_runner("r1")).await.unwrap();
+    let session = node
+        .create_session(create_session(runner.runner.id))
+        .await
+        .unwrap();
+    node.submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+        .await
+        .unwrap();
+    let outcome = node
+        .poll_session(poll(&session.session_id, runner.runner.id))
+        .await
+        .unwrap();
+    let PollOutcome::Claimed(claimed) = outcome else {
+        panic!("expected a claim, got {outcome:?}");
+    };
+    (claimed.request, runner.runner.id)
+}
+
+/// PATCH on node A and GET on node B share one counter and one row set;
+/// concurrent PATCHes never reuse a change id. Unknown timelines are
+/// `NotFound` (a PATCH must not create a timeline for a request that does
+/// not exist).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timelines_are_shared_and_bounded_across_nodes() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
+    let key = format!("{}/{}", request.plan_id, request.timeline_id);
+
+    // No request owns this key: PATCH refuses, GET reads as empty.
+    let missing = format!("{}/{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    assert!(matches!(
+        node_a
+            .patch_timeline(&missing, vec![timeline_record(1, "x")])
+            .await,
+        Err(ControlError::NotFound(_))
+    ));
+    let (id, rows) = node_a.get_timeline(&missing, 0, 50).await.unwrap();
+    assert_eq!(id, 0);
+    assert!(rows.is_empty());
+
+    let (first, _) = node_a
+        .patch_timeline(&key, vec![timeline_record(1, "one")])
+        .await
+        .unwrap();
+    let (second, stored) = node_b
+        .patch_timeline(
+            &key,
+            vec![timeline_record(2, "two"), timeline_record(1, "uno")],
+        )
+        .await
+        .unwrap();
+    assert_eq!((first, second), (1, 2));
+    assert_eq!(stored.len(), 2, "upsert by record id, not append");
+    let (change_id, records) = node_a.get_timeline(&key, 0, usize::MAX).await.unwrap();
+    assert_eq!(change_id, 2);
+    let names: Vec<_> = records.iter().filter_map(|r| r.name.clone()).collect();
+    assert_eq!(names, ["uno", "two"], "node A sees node B's upsert");
+
+    // Interleaved PATCHes from both nodes allocate one counter sequence.
+    let mut ids: Vec<i32> = Vec::new();
+    let handles: Vec<_> = (0..20)
+        .map(|i| {
+            let node = if i % 2 == 0 { &node_a } else { &node_b };
+            let key = key.clone();
+            async move {
+                node.patch_timeline(&key, vec![timeline_record(10 + i as u128, "x")])
+                    .await
+            }
+        })
+        .collect();
+    for result in futures::future::join_all(handles).await {
+        ids.push(result.unwrap().0);
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (3..23).collect::<Vec<_>>());
+}
+
+/// `prune_timelines` removes only timelines whose request settled before
+/// the cutoff; a live request's timeline survives.
+#[tokio::test]
+async fn prune_timelines_drops_settled_attempts() {
+    let (_pg, node_a, _node_b) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, runner_id) = submit_and_claim(&node_a, run_id).await;
+    let key = format!("{}/{}", request.plan_id, request.timeline_id);
+    node_a
+        .patch_timeline(&key, vec![timeline_record(1, "one")])
+        .await
+        .unwrap();
+
+    // Unsettled: prune is a no-op.
+    assert_eq!(
+        node_a
+            .prune_timelines(chrono::Utc::now().timestamp_micros())
+            .await
+            .unwrap(),
+        0
+    );
+    node_a
+        .complete_job(JobCompletionInput {
+            run_id,
+            job_id: JobId("build".to_owned()),
+            agent_job_id: Some(request.agent_job_id),
+            status: ExecutionStatus::Success,
+            outputs: BTreeMap::new(),
+            runner_id: Some(runner_id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        node_a
+            .prune_timelines(chrono::Utc::now().timestamp_micros() + 1_000_000)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(node_a.get_timeline(&key, 0, 50).await.unwrap().1.len(), 0);
+}
+
+/// `patch_steps` upserts runner patches keyed by step id: a new id appends
+/// in position order; a repeat merges name/conclusion and only fills
+/// timestamps forward. Unknown attempts write nothing.
+#[tokio::test]
+async fn patch_steps_upserts_synthetic_steps() {
+    let (_pg, node_a, _node_b) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
+    let agent = request.agent_job_id;
+    let now = chrono::Utc::now().timestamp_micros();
+
+    node_a
+        .patch_steps(
+            agent,
+            vec![StepPatch {
+                id: "step-1".to_owned(),
+                name: "Build".to_owned(),
+                conclusion: "success".to_owned(),
+                started_at_us: Some(now),
+                finished_at_us: Some(now + 5),
+                observed_us: now,
+            }],
+        )
+        .await
+        .unwrap();
+    // Repeat id: merges, does not append a second row.
+    node_a
+        .patch_steps(
+            agent,
+            vec![StepPatch {
+                id: "step-1".to_owned(),
+                name: "Build (renamed)".to_owned(),
+                conclusion: "success".to_owned(),
+                started_at_us: None,
+                finished_at_us: None,
+                observed_us: now + 10,
+            }],
+        )
+        .await
+        .unwrap();
+    // Unknown attempt: silently no-op (dropped report).
+    node_a
+        .patch_steps(
+            uuid::Uuid::new_v4(),
+            vec![StepPatch {
+                id: "x".to_owned(),
+                name: "x".to_owned(),
+                conclusion: "success".to_owned(),
+                started_at_us: None,
+                finished_at_us: None,
+                observed_us: now,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let manifests = node_a.run_step_manifests(run_id).await.unwrap();
+    let steps = manifests.get(&agent).expect("manifest for the attempt");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].id, "step-1");
+    assert_eq!(steps[0].name, "Build (renamed)");
+    assert_eq!(steps[0].started_at.map(|t| t.timestamp_micros()), Some(now));
+}
+
+/// Log ids are per plan, 1-based, and arbitrated across nodes by the
+/// `(plan_id, log_id)` unique constraint — two racing appenders on different
+/// nodes get distinct ids.
+#[tokio::test]
+async fn create_log_allocates_per_plan_across_nodes() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
+    let plan = request.agent_job_id.to_string();
+
+    assert!(matches!(
+        node_a.create_log(&uuid::Uuid::new_v4().to_string()).await,
+        Err(ControlError::NotFound(_))
+    ));
+    let (a, b) = tokio::join!(node_a.create_log(&plan), node_b.create_log(&plan));
+    let mut ids = [a.unwrap(), b.unwrap()];
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2], "one log id per allocation, loser retries");
+    assert_eq!(node_a.create_log(&plan).await.unwrap(), 3);
 }
