@@ -17,20 +17,20 @@ pub async fn register_dap_port(
         ));
     }
     // Backend: run + job status. Node-local: `dap_ports` registration.
-    let (run_exists, status) = {
-        let job_id = payload.job_id.clone();
-        shared
-            .state
-            .backend
-            .read(move |tx| {
-                let run = tx.runs.get(&run_id);
-                Ok((
-                    run.is_some(),
-                    run.and_then(|run| run.jobs.get(&job_id).copied()),
-                ))
-            })
-            .await
-            .map_err(ApiError::from)?
+    let statuses = shared
+        .state
+        .backend
+        .run_job_statuses(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let (run_exists, status) = match statuses {
+        None => (false, None),
+        Some(jobs) => (
+            true,
+            jobs.into_iter()
+                .find(|(job_id, _)| *job_id == payload.job_id)
+                .map(|(_, status)| status),
+        ),
     };
     if !run_exists {
         return Err(ApiError::not_found("run not found"));

@@ -20,166 +20,37 @@ pub async fn next_message(
     // One window per request (see `broker::next_message_broker_ref`).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
 
-    enum NextPoll {
-        Forbidden,
-        Deliver(azdo::TaskAgentMessage, StatusCode),
-        /// A terminal empty response (e.g. message build failed).
-        Empty(StatusCode),
-        Wait,
-        /// Claimed a job: message built, run marked InProgress, emit events.
-        Claimed {
-            message: azdo::TaskAgentMessage,
-            run_id: RunId,
-            job_id: JobId,
-        },
-    }
-
     loop {
-        let sid = session_id.clone();
-        let ident = identity.clone();
-        let shared_for_mint = shared.clone();
-        let step = shared
+        let outcome = shared
             .state
             .backend
-            .transact(move |tx| {
-                if let Some(runner_id) = verified {
-                    if tx.runner_id_for_session(&sid) != Some(runner_id) {
-                        return Ok(NextPoll::Forbidden);
-                    }
-                }
-                tx.mark_session_seen(&sid);
-                if let Some(message) = tx
-                    .inflight_messages
-                    .get(&sid)
-                    .and_then(|messages| messages.values().next().cloned())
-                {
-                    return Ok(NextPoll::Deliver(message, StatusCode::ACCEPTED));
-                }
-
-                if let Some(request_id) = tx.session_active_requests.get(&sid).copied() {
-                    let request_finished = tx
-                        .job_requests
-                        .get(&request_id)
-                        .is_none_or(|request| request.result.is_some());
-                    if request_finished {
-                        tx.session_active_requests.remove(&sid);
-                    } else {
-                        let cancellation_pos =
-                            tx.job_requests.get(&request_id).and_then(|request| {
-                                tx.cancellation_queue.iter().position(|cancellation| {
-                                    cancellation.run_id == request.run_id
-                                        && cancellation.job_id == request.job_id
-                                })
-                            });
-                        if let Some(pos) = cancellation_pos {
-                            let cancellation = tx
-                                .cancellation_queue
-                                .remove(pos)
-                                .expect("cancellation position was found in the queue");
-                            let body_json = concurrency::job_cancel_body(cancellation.agent_job_id);
-                            return Ok(
-                                match build_task_agent_message(
-                                    tx,
-                                    &sid,
-                                    azdo::message_type::JOB_CANCELLED,
-                                    body_json,
-                                ) {
-                                    Ok(message) => NextPoll::Deliver(message, StatusCode::OK),
-                                    Err(_) => NextPoll::Empty(StatusCode::ACCEPTED),
-                                },
-                            );
-                        }
-                        return Ok(NextPoll::Wait);
-                    }
-                }
-
-                let runner = tx.runner_capabilities_for_session(&sid);
-                let verified_claim = effective_claim_runner(
-                    ident.as_ref().map(|axum::Extension(id)| id),
-                    tx.runner_id_for_session(&sid),
-                );
-                let claimed =
-                    crate::control::sched::choose_claim_position(tx, &runner, verified_claim)
-                        .and_then(|pos| crate::control::sched::apply_claim(tx, pos));
-                let Some(queued) = claimed else {
-                    return Ok(NextPoll::Wait);
-                };
-
-                let claimed_at = std::time::SystemTime::now();
-                if let Some(run) = tx.runs.get_mut(&queued.run_id) {
-                    run.status = ExecutionStatus::InProgress;
-                    run.jobs
-                        .insert(queued.job_id.clone(), ExecutionStatus::InProgress);
-                }
-
-                // F030: inject SystemVssConnection so the worker's AzDO
-                // reporting context has a server URL, access token, and
-                // ResultsServiceUrl — same as broker_acquire_job.
-                let mut msg = queued.message.clone();
-                for endpoint in &mut msg.resources.endpoints {
-                    if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
-                        endpoint.url = Some(runner_server_url());
-                        endpoint.authorization.parameters.insert(
-                            "AccessToken".to_owned(),
-                            // node-local crypto on SharedState — safe inside
-                            // the tx (does not touch `inner`).
-                            shared_for_mint
-                                .state
-                                .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
-                        );
-                        endpoint.data.insert(
-                            "ResultsServiceUrl".to_owned(),
-                            format!("{}/", runner_base_url()),
-                        );
-                        endpoint
-                            .data
-                            .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
-                        endpoint.data.insert(
-                            "CacheServerUrl".to_owned(),
-                            format!("{}/", runner_base_url()),
-                        );
-                    }
-                }
-                let body_json = serde_json::to_string(&msg).map_err(|e| {
-                    crate::control::ControlError::Backend(anyhow::anyhow!(
-                        "serialize job message: {e}"
-                    ))
-                })?;
-                let request_id = queued.message.request_id;
-                let owner_runner_id = verified_claim.or_else(|| tx.runner_id_for_session(&sid));
-                tx.session_active_requests.insert(sid.clone(), request_id);
-                if let Some(request) = tx.job_requests.get_mut(&request_id) {
-                    request.owner_runner_id = owner_runner_id;
-                    request.claimed_at = Some(claimed_at);
-                    request.started_at = Some(claimed_at);
-                    request.last_renewed_at = Some(claimed_at);
-                }
-                let message = build_task_agent_message(
-                    tx,
-                    &sid,
-                    azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
-                    body_json,
-                )
-                .map_err(|_| {
-                    crate::control::ControlError::Backend(anyhow::anyhow!("build message failed"))
-                })?;
-                Ok(NextPoll::Claimed {
-                    message,
-                    run_id: queued.run_id,
-                    job_id: queued.job_id.clone(),
-                })
+            .poll_azdo_session(crate::control::types::AzdoPoll {
+                session_id: session_id.clone(),
+                verified_runner_id: verified,
             })
             .await;
-
-        let step = match step {
-            Ok(s) => s,
+        let outcome = match outcome {
+            Ok(o) => o,
             Err(_) => return (StatusCode::ACCEPTED, Json(None)),
         };
-        match step {
-            NextPoll::Forbidden => return (StatusCode::FORBIDDEN, Json(None)),
-            NextPoll::Deliver(message, status) => return (status, Json(Some(message))),
-            NextPoll::Empty(status) => return (status, Json(None)),
-            NextPoll::Claimed {
+
+        match outcome {
+            crate::control::types::AzdoPollOutcome::Forbidden => {
+                return (StatusCode::FORBIDDEN, Json(None));
+            }
+            crate::control::types::AzdoPollOutcome::Redeliver(message) => {
+                return match render_session_message(&shared, &session_id, message).await {
+                    Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
+                    None => (StatusCode::ACCEPTED, Json(None)),
+                };
+            }
+            crate::control::types::AzdoPollOutcome::Cancel(message) => {
+                return match render_session_message(&shared, &session_id, message).await {
+                    Some(rendered) => (StatusCode::OK, Json(Some(rendered))),
+                    None => (StatusCode::ACCEPTED, Json(None)),
+                };
+            }
+            crate::control::types::AzdoPollOutcome::Claimed {
                 message,
                 run_id,
                 job_id,
@@ -194,9 +65,12 @@ pub async fn next_message(
                         reason: None,
                     })
                     .await;
-                return (StatusCode::ACCEPTED, Json(Some(message)));
+                return match render_session_message(&shared, &session_id, message).await {
+                    Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
+                    None => (StatusCode::ACCEPTED, Json(None)),
+                };
             }
-            NextPoll::Wait => {
+            crate::control::types::AzdoPollOutcome::Wait => {
                 if wait_seconds == 0 {
                     return (StatusCode::OK, Json(None));
                 }
@@ -212,66 +86,79 @@ pub async fn next_message(
     }
 }
 
+/// Render a queued [`crate::control::types::SessionMessage`] into the wire
+/// `TaskAgentMessage` at delivery time.
+///
+/// Job assignments carry only `request_id`: the body is the stored job-message
+/// template (`acquire_context`) with the `SystemVssConnection` endpoint filled
+/// in and a fresh runtime token minted now — so no token or secret sits in the
+/// queued row. Control messages (`JobCancellation`, …) carry their small
+/// plaintext `body` directly. Everything is session-AES encrypted with the key
+/// derived from `session_id`.
+async fn render_session_message(
+    shared: &Arc<SharedState>,
+    session_id: &str,
+    message: crate::control::types::SessionMessage,
+) -> Option<azdo::TaskAgentMessage> {
+    let body_json = if let Some(request_id) = message.request_id {
+        let ctx = shared
+            .state
+            .backend
+            .acquire_context(request_id)
+            .await
+            .ok()?;
+        let mut msg = ctx.message;
+        // F030: inject SystemVssConnection so the worker's AzDO reporting
+        // context has a server URL, access token, and ResultsServiceUrl —
+        // same as broker_acquire_job.
+        for endpoint in &mut msg.resources.endpoints {
+            if endpoint.name.eq_ignore_ascii_case("SystemVssConnection") {
+                endpoint.url = Some(runner_server_url());
+                endpoint.authorization.parameters.insert(
+                    "AccessToken".to_owned(),
+                    shared
+                        .state
+                        .mint_runtime_token(&msg.plan.plan_id, &msg.job_id),
+                );
+                endpoint.data.insert(
+                    "ResultsServiceUrl".to_owned(),
+                    format!("{}/", runner_base_url()),
+                );
+                endpoint
+                    .data
+                    .insert("PipelinesServiceUrl".to_owned(), runner_server_url());
+                endpoint.data.insert(
+                    "CacheServerUrl".to_owned(),
+                    format!("{}/", runner_base_url()),
+                );
+            }
+        }
+        serde_json::to_string(&msg).ok()?
+    } else {
+        message.body.clone().unwrap_or_default()
+    };
+
+    // Session key is derived from the cluster key + session id (never stored):
+    // every node encrypts with the same key.
+    let session_enc = shared.state.session_encryption(session_id);
+    let (encrypted_body, iv) = if !session_enc.key.is_empty() {
+        session_enc.encrypt(body_json.as_bytes()).ok()?
+    } else {
+        (body_json.into_bytes(), vec![0u8; 16])
+    };
+    Some(azdo::TaskAgentMessage {
+        message_id: message.message_id,
+        message_type: message.message_type,
+        body: BASE64_STANDARD.encode(&encrypted_body),
+        iv: Some(BASE64_STANDARD.encode(&iv)),
+    })
+}
+
 pub async fn delete_session_message(
     State(shared): State<Arc<SharedState>>,
     Path((session_id, message_id)): Path<(String, i64)>,
 ) -> StatusCode {
     ack_message(shared, &session_id, message_id).await
-}
-
-pub fn build_task_agent_message(
-    tx: &mut crate::control::txstate::TxState,
-    session_id: &str,
-    message_type: &str,
-    body_json: String,
-) -> Result<azdo::TaskAgentMessage, ApiError> {
-    let session_key = tx
-        .session_keys
-        .get(session_id)
-        .map(|s| s.key.clone())
-        .unwrap_or_default();
-    let (encrypted_body, iv) = if !session_key.is_empty() {
-        let enc = SessionEncryption::from_key(session_key);
-        enc.encrypt(body_json.as_bytes())
-            .map_err(|e| ApiError::bad_request(format!("encryption failed: {e}")))?
-    } else {
-        (body_json.into_bytes(), vec![0u8; 16])
-    };
-
-    tx.next_message_id += 1;
-    let message_id = tx.next_message_id;
-    let message = azdo::TaskAgentMessage {
-        message_id,
-        message_type: message_type.to_owned(),
-        body: BASE64_STANDARD.encode(&encrypted_body),
-        iv: Some(BASE64_STANDARD.encode(&iv)),
-    };
-    tx.inflight_messages
-        .entry(session_id.to_owned())
-        .or_default()
-        .insert(message_id, message.clone());
-    Ok(message)
-}
-
-pub fn build_broker_plaintext_message(
-    tx: &mut crate::control::txstate::TxState,
-    session_id: &str,
-    message_type: &str,
-    body_json: String,
-) -> azdo::TaskAgentMessage {
-    tx.next_message_id += 1;
-    let message_id = tx.next_message_id;
-    let message = azdo::TaskAgentMessage {
-        message_id,
-        message_type: message_type.to_owned(),
-        body: body_json,
-        iv: None,
-    };
-    tx.inflight_messages
-        .entry(session_id.to_owned())
-        .or_default()
-        .insert(message_id, message.clone());
-    message
 }
 
 pub async fn delete_pool_message(
@@ -626,46 +513,6 @@ pub fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
     }
 }
 
-pub fn resolve_callback_job(
-    tx: &crate::control::txstate::TxState,
-    plan_id: &str,
-    timeline_id: Option<uuid::Uuid>,
-    agent_job_id: Option<uuid::Uuid>,
-) -> Option<(i64, RunId, JobId)> {
-    let request_id = tx
-        .plan_requests
-        .get(plan_id)
-        .copied()
-        .or_else(|| timeline_id.and_then(|id| tx.timeline_requests.get(&id).copied()))
-        .or_else(|| agent_job_id.and_then(|id| tx.agent_job_requests.get(&id).copied()))?;
-    let request = tx.job_requests.get(&request_id)?;
-    Some((request_id, request.run_id, request.job_id.clone()))
-}
-
-pub fn sole_active_unfinished_request(tx: &crate::control::txstate::TxState) -> Option<i64> {
-    let mut active = tx
-        .session_active_requests
-        .values()
-        .copied()
-        .filter(|request_id| {
-            tx.job_requests
-                .get(request_id)
-                .is_some_and(|request| request.result.is_none())
-        });
-    let request_id = active.next()?;
-    if active.next().is_none() {
-        return Some(request_id);
-    }
-    None
-}
-pub fn job_request_tuple(
-    tx: &crate::control::txstate::TxState,
-    request_id: i64,
-) -> Option<(i64, RunId, JobId)> {
-    let request = tx.job_requests.get(&request_id)?;
-    Some((request_id, request.run_id, request.job_id.clone()))
-}
-
 /// Mask job-completion annotations with the run's canonical secret masker
 /// before persisting them. Crash annotations (the official runner's
 /// worker-crash detail from `ForceFailJob`) embed worker stdout/stderr, which
@@ -730,15 +577,19 @@ pub async fn complete_job_inner(
 
 /// A runner's own completion report: settle the attempt it owns inside the
 /// completion transaction instead of a separate one.
-#[derive(Clone, Copy)]
-pub(crate) struct AttemptSettle {
-    pub(crate) agent_job_id: uuid::Uuid,
-    pub(crate) runner_id: i64,
-}
+pub(crate) use crate::control::types::AttemptSettle;
 
 /// Complete a job. With `settle`, the reporting runner's attempt is verified,
 /// marked finished and released from its session in the same transaction; a
 /// duplicate or already-released report returns the run unchanged.
+///
+/// The whole scheduling transition — status flip, concurrency release,
+/// dependent promotion, workflow-group widen — lives in
+/// `ControlBackend::settle_job` (one targeted transaction per attempt, widening
+/// internally when a completion finishes a workflow-gated run). This handler
+/// only runs the post-commit side-effects the backend deliberately does not
+/// own: live-log close, pool-wake gauges, deferred expansion, check-run and
+/// event fan-out, terminal workspace cleanup.
 pub(crate) async fn complete_job_settling(
     shared: Arc<SharedState>,
     completion: JobCompletion,
@@ -749,377 +600,34 @@ pub(crate) async fn complete_job_settling(
             "job completion status must be terminal",
         ));
     }
-    // Everything the post-commit side-effects need, produced inside one
-    // scheduling transaction.
-    struct CompletionTx {
-        early: Option<RunRecord>,
-        effective_status: ExecutionStatus,
-        cancelled_siblings: Vec<JobId>,
-        scheduling: runtime_scheduling::SchedulingOutcome,
-        queue_nonempty: bool,
-        newly_terminal_success: bool,
-        finalized_callers: Vec<JobId>,
-        live_log_key: String,
-        /// Committed ready-queue depth and next job labels (pool wake).
-        queue_len: usize,
-        next_labels: Vec<String>,
-    }
-
-    let comp = completion.clone();
-    // `runs: {run_id}` + `runs_referenced` — the completion mutates its own
-    // run plus the queued jobs' runs it promotes (`promote_ready_jobs`
-    // summarizes them). `concurrency: true` widens `runs` with every holder's
-    // run (a released gate can cancel or promote a different run).
-    // `sessions: {owner}` — `settle_request` drops the moot cancellation from
-    // the owner session's inflight messages; the owner is resolved before
-    // the transaction.
-    let sessions = match comp.agent_job_id {
-        Some(id) => shared
-            .state
-            .backend
-            .find_session_by_agent_job_id(id)
-            .await
-            .map_err(ApiError::from)?
-            .into_iter()
-            .collect(),
-        // Test/internal completions carry no `agent_job_id`; resolve every
-        // session owning a request of this run so `settle_request` can still
-        // drop the moot cancellation from each owner session's inflight.
-        None => shared
-            .state
-            .backend
-            .find_sessions_by_run(comp.run_id)
-            .await
-            .map_err(ApiError::from)?,
-    };
-    let in_concurrency = shared
+    let outcome = shared
         .state
         .backend
-        .run_in_concurrency(comp.run_id)
+        .settle_job(crate::control::types::SettleJob {
+            completion: completion.clone(),
+            settle,
+        })
         .await
         .map_err(ApiError::from)?;
-    // A workflow-level group changes only when the whole run turns terminal,
-    // so such a run first settles under its own run lock and widens to the
-    // global scope only if this completion finishes the run. Sibling
-    // completions serialize on that run lock, so "did this finish the run"
-    // is decided against current state. Job-level gates always go global.
-    let mut widen = in_concurrency == crate::control::types::RunConcurrency::Gated;
-    let tx_out = loop {
-        // Narrow pass of a workflow-grouped run: must not finish the run.
-        let guard_terminal =
-            !widen && in_concurrency == crate::control::types::RunConcurrency::WorkflowOnly;
-        let scope = crate::control::txstate::TxScope {
-            include_archived: false,
-            runs: Some(std::collections::BTreeSet::from([comp.run_id])),
-            // `ready_queue`/`blocked_jobs` stay unloaded: `complete_job`
-            // promotes `pending_jobs`, and `needs:` never cross runs, so this
-            // run's own pending rows already load via the `runs` clause.
-            // Loading every queued/blocked job payload is O(#queued) per
-            // completion for no benefit. `queue_nonempty`/`next_runs_on` read
-            // the O(1) `ready_index`/`next_queue_labels` snapshots.
-            ready_queue: false,
-            blocked_jobs: false,
-            sessions: Some(sessions.clone()),
-            // Only a completion that can release a gate needs every holder's
-            // run (a released gate can wake another run).
-            concurrency: widen,
-            runs_referenced: true,
-            job_requests_all: false,
-            pending_expansions: false,
-            runs_via_requests: false,
-        };
-        let comp = comp.clone();
-        let attempt = shared
-            .state
-            .backend
-            .transact_scoped(&scope, move |tx| {
-                if let Some(settle) = settle {
-                    let skip = |tx: &crate::control::txstate::TxState| {
-                        let run = tx.runs.get(&comp.run_id).cloned().ok_or_else(|| {
-                            crate::control::ControlError::NotFound("run not found".to_owned())
-                        })?;
-                        Ok(CompletionTx {
-                            early: Some(run),
-                            effective_status: comp.status,
-                            cancelled_siblings: Vec::new(),
-                            scheduling: runtime_scheduling::SchedulingOutcome::default(),
-                            queue_nonempty: false,
-                            newly_terminal_success: false,
-                            finalized_callers: Vec::new(),
-                            live_log_key: String::new(),
-                            queue_len: 0,
-                            next_labels: Vec::new(),
-                        })
-                    };
-                    let request_id = tx
-                        .agent_job_requests
-                        .get(&settle.agent_job_id)
-                        .copied()
-                        .ok_or_else(|| {
-                            crate::control::ControlError::NotFound(
-                                "broker complete request not found".to_owned(),
-                            )
-                        })?;
-                    crate::broker::ensure_broker_request_owner(tx, request_id, settle.runner_id)?;
-                    if tx
-                        .job_requests
-                        .get(&request_id)
-                        .is_some_and(|record| record.result.is_some())
-                    {
-                        tracing::info!(
-                            request_id,
-                            "broker complete: ignoring duplicate completion"
-                        );
-                        return skip(tx);
-                    }
-                    if let Some(record) = tx.job_requests.get_mut(&request_id) {
-                        record.result = Some(comp.status);
-                        record.locked_until = agent_request_locked_until();
-                    }
-                    // Free the session so the next poll can take a new job now.
-                    tx.session_active_requests
-                        .retain(|_, &mut rid| rid != request_id);
-                    if tx.inflight_requests.remove(&request_id).is_none() {
-                        tracing::warn!(
-                            request_id,
-                            "broker complete: no inflight_requests entry found"
-                        );
-                        return skip(tx);
-                    }
-                }
-                let mut newly_terminal_success = false;
-                tx.claimed_jobs.remove(&(comp.run_id, comp.job_id.clone()));
-                let finalized_callers: Vec<JobId>;
-                {
-                    let run = tx.runs.get_mut(&comp.run_id).ok_or_else(|| {
-                        crate::control::ControlError::NotFound("run not found".to_owned())
-                    })?;
-                    let prior = run.jobs.get(&comp.job_id).copied().ok_or_else(|| {
-                        crate::control::ControlError::Backend(anyhow::anyhow!(
-                            "job does not belong to run"
-                        ))
-                    })?;
-                    if prior.is_terminal() && prior != ExecutionStatus::Cancelled {
-                        return Ok(CompletionTx {
-                            early: Some(run.clone()),
-                            effective_status: prior,
-                            cancelled_siblings: Vec::new(),
-                            scheduling: runtime_scheduling::SchedulingOutcome::default(),
-                            queue_nonempty: false,
-                            newly_terminal_success: false,
-                            finalized_callers: Vec::new(),
-                            live_log_key: String::new(),
-                            queue_len: 0,
-                            next_labels: Vec::new(),
-                        });
-                    }
-                    let tolerated = run
-                        .job_continue_on_error
-                        .get(&comp.job_id.to_string())
-                        .copied()
-                        .unwrap_or(false);
-                    let reported_status = if tolerated && comp.status == ExecutionStatus::Failure {
-                        ExecutionStatus::Success
-                    } else {
-                        comp.status
-                    };
-                    let effective = match (prior, reported_status) {
-                        (ExecutionStatus::Cancelled, ExecutionStatus::Success)
-                        | (ExecutionStatus::Cancelled, ExecutionStatus::Failure) => {
-                            ExecutionStatus::Cancelled
-                        }
-                        _ => reported_status,
-                    };
-                    run.jobs.insert(comp.job_id.clone(), effective);
-                    let job_name = comp.job_id.0.clone();
-                    let annotations = mask_completion_annotations(run, &comp);
-                    if let Some(detail) = JobDetail::find(&mut run.jobs_list, &job_name) {
-                        detail.conclusion = format!("{:?}", effective).to_lowercase();
-                        if !comp.annotations.is_empty() {
-                            detail.annotations = annotations;
-                        }
-                    } else {
-                        run.jobs_list.push(JobDetail {
-                            job_id: job_name.clone(),
-                            name: job_name,
-                            conclusion: format!("{:?}", effective).to_lowercase(),
-                            steps: Vec::new(),
-                            annotations,
-                        });
-                    }
-                    run.job_outputs.insert(
-                        comp.job_id.clone(),
-                        comp.outputs
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    );
-                    finalized_callers = propagate_reusable_outputs(run);
-                    run.status = summarize_run(run.jobs.values().copied());
-                    if run.started_at.is_none() {
-                        run.started_at = Some(chrono::Utc::now());
-                    }
-                    if matches!(
-                        run.status,
-                        ExecutionStatus::Success
-                            | ExecutionStatus::Failure
-                            | ExecutionStatus::Cancelled
-                            | ExecutionStatus::Skipped
-                    ) && run.completed_at.is_none()
-                    {
-                        run.completed_at = Some(chrono::Utc::now());
-                        run.conclusion = Some(status_string(run.status));
-                        newly_terminal_success = run.status == ExecutionStatus::Success;
-                    }
-                }
-                let live_log_key = comp
-                    .agent_job_id
-                    .or_else(|| {
-                        tx.job_requests
-                            .values()
-                            .filter(|record| {
-                                record.run_id == comp.run_id && record.job_id == comp.job_id
-                            })
-                            .max_by_key(|record| record.request_id)
-                            .map(|record| record.agent_job_id)
-                    })
-                    .map(|agent_job_id| agent_job_id.to_string())
-                    .unwrap_or_else(|| comp.job_id.0.clone());
-                let effective_status = tx
-                    .runs
-                    .get(&comp.run_id)
-                    .and_then(|r| r.jobs.get(&comp.job_id).copied())
-                    .unwrap_or(comp.status);
-                if let Some(agent_job_id) = comp.agent_job_id.or_else(|| {
-                    tx.job_requests
-                        .values()
-                        .filter(|record| {
-                            record.run_id == comp.run_id && record.job_id == comp.job_id
-                        })
-                        .max_by_key(|record| record.request_id)
-                        .map(|record| record.agent_job_id)
-                }) {
-                    if let Some(manifest) = tx.job_steps.get_mut(&agent_job_id) {
-                        for wire in &comp.step_results {
-                            let Some(external_id) = wire.external_id.as_deref() else {
-                                continue;
-                            };
-                            let Some(pos) = StepRecord::find_by_id(manifest, external_id) else {
-                                continue;
-                            };
-                            if let Some(conclusion) = completion_step_conclusion(wire) {
-                                manifest[pos].conclusion = conclusion;
-                            }
-                            if let Some(number) = wire.number.and_then(|n| u32::try_from(n).ok()) {
-                                manifest[pos].runner_number = Some(number);
-                            }
-                        }
-                        let orphan_conclusion = status_string(effective_status);
-                        for step in manifest.iter_mut() {
-                            if step.conclusion == "in_progress" {
-                                step.conclusion = orphan_conclusion.clone();
-                                step.finished_at = step.finished_at.or(Some(chrono::Utc::now()));
-                            }
-                        }
-                    }
-                }
-                let cancelled_siblings = if effective_status == ExecutionStatus::Failure {
-                    crate::control::sched::apply_matrix_fail_fast(tx, comp.run_id, &comp.job_id)
-                } else {
-                    Vec::new()
-                };
-                tx.retain_ready(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
-                tx.pending_jobs
-                    .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
-                tx.concurrency_blocked
-                    .retain(|job| !(job.run_id == comp.run_id && job.job_id == comp.job_id));
-                if let Some(held) = tx.held_runs.get_mut(&comp.run_id) {
-                    held.retain(|job| job.job_id != comp.job_id);
-                    if held.is_empty() {
-                        tx.held_runs.remove(&comp.run_id);
-                    }
-                }
-                crate::control::sched::release_concurrency_for_job(tx, comp.run_id, &comp.job_id);
-                for caller_id in &finalized_callers {
-                    crate::control::sched::release_concurrency_for_job(tx, comp.run_id, caller_id);
-                }
-                let scheduling = crate::control::sched::promote_ready_jobs(tx);
-                let finished_request_ids: Vec<i64> = tx
-                    .job_requests
-                    .iter()
-                    .filter(|(_, r)| r.run_id == comp.run_id && r.job_id == comp.job_id)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for request_id in &finished_request_ids {
-                    // Shared settlement also clears the session's moot
-                    // `JobCancellation` inflight message so it is not redelivered
-                    // on the post-completion busy poll.
-                    crate::control::sched::settle_request(tx, *request_id, effective_status);
-                }
-                // `ready_count` is the O(1) pre-tx global count; `ready_index`
-                // holds this tx's promotions under the narrow scope.
-                let queue_nonempty = tx.ready_count > 0
-                    || !tx.ready_index.is_empty()
-                    || !tx.cancellation_queue.is_empty();
-                let queue_len = tx.ready_count.max(0) as usize;
-                // The load-time queue front, or this completion's first promotion
-                // when the queue was empty.
-                let next_labels = match crate::control::sched::next_job_labels(tx) {
-                    labels if labels.is_empty() => tx
-                        .queue
-                        .front()
-                        .map(|job| job.runs_on.clone())
-                        .unwrap_or_default(),
-                    labels => labels,
-                };
-                // This completion finished the run: its workflow-level hold must
-                // be released, which needs every group and holder run. Roll back
-                // and rerun under the global scope.
-                if guard_terminal
-                    && tx.runs.get(&comp.run_id).is_some_and(|run| {
-                        crate::concurrency::holder_is_terminal(
-                            &crate::concurrency::Holder::Run(comp.run_id),
-                            &run.jobs,
-                        )
-                    })
-                {
-                    return Err(crate::control::ControlError::WidenScope);
-                }
-                Ok(CompletionTx {
-                    early: None,
-                    queue_len,
-                    next_labels,
-                    effective_status,
-                    cancelled_siblings,
-                    scheduling,
-                    queue_nonempty,
-                    newly_terminal_success,
-                    finalized_callers,
-                    live_log_key,
-                })
-            })
-            .await;
-        match attempt {
-            Err(crate::control::ControlError::WidenScope) if !widen => widen = true,
-            other => break other.map_err(ApiError::from)?,
-        }
-    };
 
-    if let Some(run) = tx_out.early {
-        return Ok(Json(run));
-    }
-    let CompletionTx {
+    let settled = match outcome {
+        // Duplicate / already-released attempt, or a job already holding a
+        // terminal verdict: report the current run unchanged.
+        crate::control::types::SettleJobOutcome::Unchanged(run) => {
+            return Ok(Json(*run));
+        }
+        crate::control::types::SettleJobOutcome::Settled(settled) => *settled,
+    };
+    let crate::control::types::JobSettled {
         effective_status,
         cancelled_siblings,
         mut scheduling,
         queue_nonempty,
         newly_terminal_success,
-        finalized_callers: _,
         live_log_key,
         queue_len: tx_queue_len,
-        next_labels: tx_next_labels,
-        ..
-    } = tx_out;
+        next_runs_on: tx_next_labels,
+    } = settled;
 
     // Node-local bookkeeping that does not belong to the scheduling tx:
     // close the live-log feed and drop the run's DAP port registration.

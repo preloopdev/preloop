@@ -367,6 +367,35 @@ fn workflow_concurrency(group: &str, cancel_in_progress: bool) -> WorkflowConcur
 pub(crate) mod suite {
     use super::*;
 
+    /// A registered runner without a session (a pre-provisioned successor)
+    /// cannot poll, so it is not idle capacity; once a session exists and it
+    /// holds no active request, it is.
+    pub(crate) async fn sessionless_runner_is_not_idle_capacity(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner("successor"))
+            .await
+            .unwrap();
+        let stale_after = std::time::Duration::from_secs(15);
+        let inputs = backend.status_inputs(stale_after).await.unwrap();
+        assert_eq!(inputs.registered, 1);
+        assert_eq!(
+            inputs.runner_idle, 0,
+            "a configured successor cannot poll until its slot starts it"
+        );
+
+        backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let inputs = backend.status_inputs(stale_after).await.unwrap();
+        assert_eq!(inputs.sessions, 1);
+        assert_eq!(
+            inputs.runner_idle, 1,
+            "a session-backed runner with no active request is idle"
+        );
+        assert_eq!((inputs.runner_busy, inputs.runner_stale), (0, 0));
+    }
+
     pub(crate) async fn submit_poll_complete_lifecycle(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -1175,6 +1204,11 @@ mod sqlite {
     #[tokio::test]
     async fn submit_poll_complete_lifecycle() {
         suite::submit_poll_complete_lifecycle(&SqliteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_runner_is_not_idle_capacity() {
+        suite::sessionless_runner_is_not_idle_capacity(&SqliteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -2652,6 +2686,12 @@ mod postgres {
     async fn submit_poll_complete_lifecycle() {
         let (_pg, backend) = backend().await;
         suite::submit_poll_complete_lifecycle(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_runner_is_not_idle_capacity() {
+        let (_pg, backend) = backend().await;
+        suite::sessionless_runner_is_not_idle_capacity(&backend).await;
     }
 
     #[tokio::test]

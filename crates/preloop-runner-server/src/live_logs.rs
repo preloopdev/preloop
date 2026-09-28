@@ -283,56 +283,6 @@ pub fn live_log_sse_event(wrapper: &LiveLogFeedLinesWrapper) -> Event {
     Event::default().event("live-log").data(data)
 }
 
-pub fn live_log_key_for_job(
-    tx: &crate::control::txstate::TxState,
-    run_id: RunId,
-    job_id: &str,
-) -> Option<String> {
-    let run = tx.runs.get(&run_id)?;
-    // `job_requests` is keyed by monotonic request id, so `find` would return
-    // the oldest attempt and follow a dead feed after a re-dispatch. A logical
-    // job key means "the current attempt"; an explicit agent job id matches one
-    // record either way.
-    if let Some(record) = tx
-        .job_requests
-        .values()
-        .filter(|record| {
-            record.run_id == run_id
-                && (record.job_id.0 == job_id || record.agent_job_id.to_string() == job_id)
-        })
-        .max_by_key(|record| record.request_id)
-    {
-        return Some(record.agent_job_id.to_string());
-    }
-    // A logical job key is valid without a request only when it belongs to
-    // this run. Never accept an arbitrary globally present live-log key:
-    // UUIDs are only scoped by their job request and otherwise could leak a
-    // different run's output.
-    run.jobs
-        .contains_key(&JobId(job_id.to_owned()))
-        .then(|| job_id.to_owned())
-}
-
-/// Whether the run or the logical job has reached a terminal state — the
-/// backend half of `live_log_is_closed`. The node-local `live_log_closed`
-/// mark is checked separately under `inner`.
-fn live_log_run_terminal(
-    tx: &crate::control::txstate::TxState,
-    run_id: RunId,
-    job_id: &str,
-) -> bool {
-    let run_terminal = tx
-        .runs
-        .get(&run_id)
-        .is_some_and(|run| run.status.is_terminal());
-    let logical_job_terminal = tx
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.jobs.get(&JobId(job_id.to_owned())))
-        .is_some_and(|status| status.is_terminal());
-    run_terminal || logical_job_terminal
-}
-
 pub fn live_log_sender(
     inner: &mut InnerState,
     key: &str,

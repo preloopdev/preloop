@@ -55,45 +55,17 @@ pub async fn oidc_token(
     // Authoritative lookups (plan binding, job request, id-token grant, OIDC
     // context, run) come from the backend; the signing keypair and issuer are
     // node-local.
-    let (run_id, resolved_job_id, granted, oidc_context, run) = shared
+    let crate::control::types::OidcGrant {
+        run,
+        job_id: resolved_job_id,
+        granted,
+        context: oidc_context,
+    } = shared
         .state
         .backend
-        .read(move |tx| {
-            let request_id = tx.plan_requests.get(&plan_id).copied().ok_or_else(|| {
-                crate::control::types::ControlError::NotFound("OIDC: plan not found".to_owned())
-            })?;
-            let request = tx.job_requests.get(&request_id).ok_or_else(|| {
-                crate::control::types::ControlError::NotFound(
-                    "OIDC: job request not found".to_owned(),
-                )
-            })?;
-            if request.agent_job_id != requested_job_id {
-                return Err(crate::control::types::ControlError::NotFound(
-                    "OIDC: plan and job do not match".to_owned(),
-                ));
-            }
-            let run_id = request.run_id;
-            let resolved_job_id = request.job_id.clone();
-            let granted = tx
-                .id_token_grants
-                .get(&(run_id, resolved_job_id.clone()))
-                .copied()
-                .unwrap_or(false);
-            let oidc_context = tx
-                .oidc_job_contexts
-                .get(&(run_id, resolved_job_id.clone()))
-                .cloned()
-                .ok_or_else(|| {
-                    crate::control::types::ControlError::Backend(anyhow::anyhow!(
-                        "OIDC context missing for dispatched job"
-                    ))
-                })?;
-            let run = tx.runs.get(&run_id).cloned().ok_or_else(|| {
-                crate::control::types::ControlError::NotFound("OIDC: run not found".to_owned())
-            })?;
-            Ok((run_id, resolved_job_id, granted, oidc_context, run))
-        })
+        .oidc_grant(&plan_id, requested_job_id)
         .await?;
+    let run_id = run.run_id;
     if !granted {
         return Err(ApiError::forbidden(
             "id-token: write permission is required to request an OIDC token",

@@ -922,26 +922,25 @@ pub async fn open_session(
 
     // Keyed on the agent job GUID: it is what the worker knows itself as, and
     // it disambiguates matrix legs that share a workflow-level job id.
-    let request_id = shared
+    let active = match shared
         .state
         .backend
-        .read(move |tx| {
-            tx.agent_job_requests
-                .get(&agent_job_id)
-                .copied()
-                .filter(|id| {
-                    tx.job_requests
-                        .get(id)
-                        .is_some_and(|record| record.result.is_none())
-                })
-                .ok_or_else(|| {
-                    crate::control::ControlError::NotFound(format!(
-                        "no active job request for agent job {agent_job_id}"
-                    ))
-                })
-        })
+        .request(crate::control::backend::RequestKey::AgentJobId(
+            agent_job_id,
+        ))
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(record) => Some(record).filter(|record| record.result.is_none()),
+        Err(crate::control::ControlError::NotFound(_)) => None,
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    let request_id = active
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no active job request for agent job {agent_job_id}"
+            ))
+        })?
+        .request_id;
 
     let mut inner = shared.state.inner.lock().await;
 
@@ -1035,17 +1034,16 @@ pub async fn poll_verdict(
                         .get(&session_id)
                         .map(|record| (record.request_id, record.agent_job_id));
                     if let Some((request_id, agent_job_id)) = record {
-                        let plan_id = shared
+                        let plan_id = match shared
                             .state
                             .backend
-                            .read(move |tx| {
-                                Ok(tx
-                                    .job_requests
-                                    .get(&request_id)
-                                    .map(|request| request.plan_id.clone()))
-                            })
+                            .request(crate::control::backend::RequestKey::Id(request_id))
                             .await
-                            .map_err(ApiError::from)?;
+                        {
+                            Ok(request) => Some(request.plan_id),
+                            Err(crate::control::ControlError::NotFound(_)) => None,
+                            Err(error) => return Err(ApiError::from(error)),
+                        };
                         if let Some(plan_id) = plan_id {
                             response.snapshot_token =
                                 Some(shared.state.mint_runtime_token(&plan_id, &agent_job_id));

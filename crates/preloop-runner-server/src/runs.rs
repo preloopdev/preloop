@@ -2618,28 +2618,6 @@ pub fn build_job_artifacts(
     })
 }
 
-/// The step records of a job's most recent attempt.
-///
-/// Attempts are ordered by `request_id`, which is a monotonic allocation, so
-/// the highest one is the newest dispatch. `None` when the job was never
-/// dispatched (skipped or cancelled before a request was built).
-pub fn latest_attempt_steps(
-    tx: &crate::control::txstate::TxState,
-    run_id: RunId,
-    job_id: &JobId,
-) -> Option<Vec<StepRecord>> {
-    let agent_job_id = tx
-        .job_requests
-        .values()
-        .filter(|request| request.run_id == run_id && request.job_id == *job_id)
-        .max_by_key(|request| request.request_id)
-        .map(|request| request.agent_job_id)?;
-    let mut steps = tx.job_steps.get(&agent_job_id).cloned()?;
-    // The stored vector is seeded-then-appended, so it is not execution order.
-    StepRecord::sort_execution_order(&mut steps);
-    Some(steps)
-}
-
 /// Project a stored run into its API shape.
 ///
 /// Shared by the single-run and list endpoints. Step records live in the
@@ -2726,13 +2704,6 @@ pub fn project_run_data(
     run
 }
 
-/// `project_run_data` reading its inputs from a transaction snapshot.
-pub fn project_run(tx: &crate::control::txstate::TxState, run: RunRecord) -> RunRecord {
-    let held = tx.held_runs.contains_key(&run.run_id);
-    project_run_data(run, held, &|run_id, job_id| {
-        latest_attempt_steps(tx, run_id, job_id)
-    })
-}
 pub async fn get_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
@@ -3285,42 +3256,24 @@ pub async fn cancel_run(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunRecord>, ApiError> {
-    let (cancellation_count, cancelled_jobs, record, queue_depth, next_runs_on) = shared
+    let crate::control::types::CancelOutcome {
+        cancellations: cancellation_count,
+        record,
+        cancelled_jobs,
+        queue_depth,
+        next_runs_on,
+        ..
+    } = shared
         .state
         .backend
-        .transact(move |tx| {
-            if !tx.runs.contains_key(&run_id) {
-                return Err(crate::control::ControlError::NotFound(
-                    "run not found".to_owned(),
-                ));
-            }
-            let cancellation_count = crate::control::sched::cancel_run_inner(tx, run_id, None);
-            let cancelled_jobs = tx
-                .runs
-                .get(&run_id)
-                .map(|run| {
-                    run.jobs
-                        .iter()
-                        .filter(|(_, status)| **status == ExecutionStatus::Cancelled)
-                        .map(|(job_id, _)| job_id.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let record = tx.runs.get(&run_id).cloned().ok_or_else(|| {
-                crate::control::ControlError::NotFound("run not found".to_owned())
-            })?;
-            let queue_depth = tx.ready_index.len();
-            let next_runs_on = crate::control::sched::next_job_labels(tx);
-            Ok((
-                cancellation_count,
-                cancelled_jobs,
-                record,
-                queue_depth,
-                next_runs_on,
-            ))
-        })
+        .cancel_run(run_id, None)
         .await
         .map_err(ApiError::from)?;
+    let record = record.ok_or_else(|| {
+        ApiError::from(crate::control::ControlError::NotFound(
+            "run not found".to_owned(),
+        ))
+    })?;
     shared
         .state
         .queue_depth
