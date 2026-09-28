@@ -336,7 +336,6 @@ fn create_session(runner_id: i64) -> CreateSession {
         runner_id,
         protocol: SessionProtocol::Broker,
         client_id: None,
-        encryption: None,
     }
 }
 

@@ -129,7 +129,7 @@ impl PgBackend {
             runner_id: session.runner_id,
             protocol: session.protocol,
             client_id: session.client_id,
-                        active_request_id: None,
+            active_request_id: None,
             last_seen_at_us: Some(now),
         })
     }
@@ -768,12 +768,12 @@ impl PgBackend {
 
     // ── Broker-session facade (legacy trait surface) ─────────────────
 
-    /// `create_broker_session` folds into `open_runner_session`.
+    /// `create_broker_session` folds into `open_runner_session`. The AES key
+    /// is caller-derived (`AppState::session_encryption`) — never stored.
     pub(super) async fn create_broker_session(
         &self,
         session_id: &str,
         runner_id: i64,
-        _encryption: &preloop_gha_protocol::crypto::SessionEncryption,
     ) -> Result<(), ControlError> {
         self.open_runner_session(OpenRunnerSession {
             session_id: session_id.to_owned(),
@@ -897,59 +897,39 @@ impl PgBackend {
         self.acquire_context(request_id).await
     }
 
-    /// `store_request_message`: overwrite the job's message template with the
-    /// per-attempt minted message; upsert the token request.
-    pub(super) async fn store_request_message(
+    /// `record_token_request`: upsert the deferred `github_token_requests`
+    /// row. The `FOR UPDATE` on the run row serializes the insert against
+    /// archival — `archive_finished_runs` selects candidates `FOR UPDATE
+    /// SKIP LOCKED`, so a run locked here cannot vanish under the FK.
+    pub(super) async fn record_token_request(
         &self,
         run_id: RunId,
         request_id: i64,
-        message: Option<&azdo::AgentJobRequestMessage>,
-        token_request: Option<&crate::models::GitHubTokenRequest>,
+        token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
-        // Lock the run row so a concurrent scoped write of the same request
-        // serializes behind us.
         tx.execute(
             "SELECT 1 FROM runs WHERE run_id=$1::text::uuid FOR UPDATE",
             &[&run_id.0.to_string()],
         )
         .await
         .map_err(db)?;
-        let job_id: Option<String> = tx
-            .query_opt(
-                "SELECT job_id FROM job_requests WHERE request_id=$1",
-                &[&request_id],
-            )
-            .await
-            .map_err(db)?
-            .map(|row| row.get(0));
-        if let (Some(job_id), Some(message)) = (job_id, message) {
-            tx.execute(
-                "UPDATE job_messages SET message_template=$3::text::jsonb \
-                 WHERE run_id=$1::text::uuid AND job_id=$2",
-                &[&run_id.0.to_string(), &job_id, &json(message)?],
-            )
-            .await
-            .map_err(db)?;
-        }
-        if let Some(token) = token_request {
-            tx.execute(
-                "INSERT INTO github_token_requests (request_id, repository, \
-                 permissions, declared, untrusted) VALUES ($1,$2,$3::text::jsonb,$4,$5) \
-                 ON CONFLICT (request_id) DO UPDATE SET repository=$2, \
-                 permissions=$3::text::jsonb, declared=$4, untrusted=$5",
-                &[
-                    &request_id,
-                    &token.repository,
-                    &json(&token.permissions)?,
-                    &token.declared,
-                    &token.untrusted,
-                ],
-            )
-            .await
-            .map_err(db)?;
-        }
+        tx.execute(
+            "INSERT INTO github_token_requests (request_id, repository, \
+             permissions, declared, untrusted) VALUES ($1,$2,$3::text::jsonb,$4,$5) \
+             ON CONFLICT (request_id) DO UPDATE SET repository=$2, \
+             permissions=$3::text::jsonb, declared=$4, untrusted=$5",
+            &[
+                &request_id,
+                &token_request.repository,
+                &json(&token_request.permissions)?,
+                &token_request.declared,
+                &token_request.untrusted,
+            ],
+        )
+        .await
+        .map_err(db)?;
         tx.commit().await.map_err(db)
     }
 
@@ -1033,6 +1013,31 @@ impl PgBackend {
                 job_workflow_sha: row.get(5),
             },
         })
+    }
+
+    /// `run_secret_values`: the run's stored secret values. The new schema
+    /// stores names/scopes only (`secret_refs`); values resolve through the
+    /// provider at acquire. `None` when the run is unknown or archived,
+    /// `Some(vec![])` otherwise — an empty map is the durable truth.
+    pub(super) async fn run_secret_values(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<Vec<String>>, ControlError> {
+        let client = self.reader().await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM run_submissions WHERE run_id=$1::text::uuid",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .map_err(db)?
+            .map(|_| Vec::new()))
+    }
+
+    /// `all_secret_values`: union of every live run's stored secrets — empty
+    /// (values are never persisted; see `run_secret_values`).
+    pub(super) async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
+        Ok(Vec::new())
     }
 
     // ── Events / archive / reconcile ─────────────────────────────────

@@ -299,12 +299,6 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// Allocate a plan-local log id and create its empty durable row.
     async fn create_log(&self, plan_id: &str) -> Result<i64, ControlError>;
 
-    /// Persist node-local artifact/cache/timeline metadata as one sealed value.
-    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError>;
-
-    /// Restore node-local metadata after restart.
-    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError>;
-
     /// Record the cluster key fingerprint on first use; afterwards, refuse a
     /// node whose key differs (it would seal rows no other node can read).
     async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError>;
@@ -1546,18 +1540,7 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.create_log(plan_id).await,
         }
     }
-    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
-        match self {
-            Self::Sqlite(b) => b.store_meta(meta).await,
-            Self::Postgres(b) => b.store_meta(meta).await,
-        }
-    }
-    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
-        match self {
-            Self::Sqlite(b) => b.load_meta().await,
-            Self::Postgres(b) => b.load_meta().await,
-        }
-    }
+
     async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
         match self {
             Self::Sqlite(b) => b.ensure_key_fingerprint(fingerprint).await,

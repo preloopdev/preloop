@@ -387,22 +387,6 @@ impl LiteBackend {
             Ok(number as u64)
         })
     }
-
-    /// Temporary (decision round 1, Q2): node-local metadata has no table in
-    /// the agreed schema; core removes this method.
-    pub(crate) async fn store_meta(
-        &self,
-        _meta: &crate::store::MetaSnapshot,
-    ) -> Result<(), ControlError> {
-        Ok(())
-    }
-
-    /// Temporary (decision round 1, Q2); see [`LiteBackend::store_meta`].
-    pub(crate) async fn load_meta(
-        &self,
-    ) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
-        Ok(None)
-    }
 }
 
 #[cfg(test)]

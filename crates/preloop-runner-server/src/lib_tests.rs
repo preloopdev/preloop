@@ -133,20 +133,6 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                 .await
                 .unwrap();
             state.log_segments.flush_all().await.unwrap();
-            inner.cache_v2_pending.insert(
-                "cache-upload".to_owned(),
-                CacheV2Pending {
-                    key: "cache-key".to_owned(),
-                    version: "cache-version".to_owned(),
-                    job_backend_id: String::new(),
-                    created_unix: 0,
-                },
-            );
-            state
-                .backend
-                .store_meta(&crate::store::build_local_meta_snapshot(&inner))
-                .await
-                .unwrap();
         }
         (
             accepted["run_id"].as_str().unwrap().to_owned(),
@@ -169,7 +155,10 @@ async fn sqlite_recovery_restores_queued_runs_and_next_run_number() {
                 .unwrap(),
             b"durable log\n"
         );
-        assert_eq!(inner.cache_v2_pending["cache-upload"].key, "cache-key");
+        // `cache_v2_pending` is node-local in-memory state (the meta snapshot
+        // that persisted it was removed with `store_meta`); the run +
+        // live-log segments + run-number sequence are what must recover.
+        assert!(inner.cache_v2_pending.is_empty());
     }
     let recovered_app = app(recovered, CancellationToken::new());
     let accepted = request_json(
@@ -24335,72 +24324,6 @@ async fn store_recovery_preserves_broker_and_inflight_messages() {
     let message = session.get(&7).expect("message id must be preserved");
     assert_eq!(message.message_type, "PipelineAgentJobRequest");
     assert_eq!(message.body, "e30=");
-}
-
-/// The in-flight cache payload must never enter the runtime snapshot. It is a
-/// `Vec<u8>` holding the whole upload, and the snapshot is cloned, serialized
-/// and AES-sealed on every `store_meta_only` — putting it there made
-/// `cache_upload` quadratic in cache size with the global state lock held.
-#[tokio::test]
-async fn cache_upload_payload_stays_out_of_the_runtime_snapshot() {
-    let temp = tempfile::tempdir().unwrap();
-    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let app = app(state.clone(), CancellationToken::new());
-
-    let reserve = request_json(
-        &app,
-        Method::POST,
-        "/_apis/artifactcache/cache",
-        json!({"key": "big", "version": "v1"}),
-    )
-    .await;
-    let cache_id = reserve["cacheId"].as_i64().unwrap();
-
-    let payload = vec![b'x'; 1 << 20]; // 1 MiB (under the default body limit)
-    let upload = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::PATCH)
-                .uri(format!("/_apis/artifactcache/cache/{cache_id}"))
-                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
-                .body(Body::from(payload.clone()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(upload.status(), StatusCode::ACCEPTED);
-
-    // Force a snapshot with the upload still buffered in memory.
-    {
-        let inner = state.inner.lock().await;
-        assert_eq!(
-            inner.pending_caches.get(&cache_id).map(|c| c.bytes.len()),
-            Some(payload.len()),
-            "the upload is buffered in memory"
-        );
-        state
-            .backend
-            .store_meta(&crate::store::build_local_meta_snapshot(&inner))
-            .await
-            .unwrap();
-    }
-
-    let db = temp.path().join("preloop.db");
-    let connection = rusqlite::Connection::open(&db).unwrap();
-    let blob_len: i64 = connection
-        .query_row(
-            "SELECT length(meta_blob) FROM runtime_snapshots WHERE snapshot_id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        blob_len < 64 * 1024,
-        "runtime snapshot is {blob_len} bytes after a {} byte upload — the cache \
-         payload leaked into the meta blob",
-        payload.len()
-    );
 }
 
 /// Two servers booting against one Postgres database must both start.

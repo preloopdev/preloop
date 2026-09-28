@@ -988,7 +988,7 @@ impl AppState {
             ),
             ..Default::default()
         };
-        let mut inner = inner;
+
         let local_workspace = std::env::var("PRELOOP_LOCAL_WORKSPACE")
             .ok()
             .map(PathBuf::from);
@@ -1172,9 +1172,6 @@ impl AppState {
             });
         }
         crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
-        if let Some(meta) = crate::control::backend::ControlBackend::load_meta(&*backend).await? {
-            crate::store::apply_local_meta_snapshot(&mut inner, meta);
-        }
         let log_segments = LiveLogSegments::new(state_dir.join("live-logs"));
         let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
             crate::control::backend::ControlBackend::terminal_jobs(&*backend).await?,
