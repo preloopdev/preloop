@@ -294,10 +294,14 @@ async fn sqlite_recovery_restores_post_restart_state() {
     let recovered_tx = recovered.test_tx().await;
     let recovered_inner = recovered.inner.lock().await;
 
-    // C1: session_keys restored.
-    assert!(
-        recovered_tx.session_keys.contains_key(&session_id),
-        "session_keys must survive restart"
+    // C1: the session's runner binding survives on its own; its AES key is
+    // never stored — every node re-derives it from the cluster HMAC key +
+    // session id. The disttask compat path records the binding in
+    // `broker_session_runners`.
+    assert_eq!(
+        recovered_tx.broker_session_runners.get(&session_id),
+        Some(&runner_id),
+        "session runner binding must survive restart"
     );
 
     // C2: runner_rsa_public_keys restored.
@@ -504,8 +508,9 @@ async fn postgres_recovery_restores_post_restart_state() {
             "session active request must survive"
         );
 
-        // Runner + sealed session survive (authoritative); RSA key + sealed
-        // session key + log bytes are node-local.
+        // Runner + session binding survive (authoritative); RSA key + log
+        // bytes are node-local. The AES key is never stored — every node
+        // re-derives it from the cluster HMAC key + session id.
         assert!(tx.runners.contains_key(&runner_id));
         assert_eq!(
             tx.broker_session_runners.get(&session_id),
@@ -520,11 +525,6 @@ async fn postgres_recovery_restores_post_restart_state() {
             Some(public_xml.clone()),
             "RSA public key must survive restart"
         );
-        assert!(
-            tx.session_keys.contains_key(&session_id),
-            "session_keys must survive restart"
-        );
-
         // Log segments survive.
         assert_eq!(
             recovered

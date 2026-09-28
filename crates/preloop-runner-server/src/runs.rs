@@ -3734,10 +3734,13 @@ mod tests {
 
         let inner = state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
+        // The sqlite counter map is keyed `repository\x1fworkflow_path` (the
+        // new signature folds namespace/repository in; no stored column
+        // exists for them on the old backends).
         assert_eq!(
             inner
                 .workflow_run_counters
-                .get(".github/workflows/build.yml"),
+                .get("owner/repo\x1f.github/workflows/build.yml"),
             Some(&1),
             "a replay that reused the run must not advance the counter"
         );

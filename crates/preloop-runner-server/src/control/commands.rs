@@ -1361,6 +1361,11 @@ pub(crate) fn rebuild_dispatch_intent_tx(tx: &mut TxState) {
 /// Queue a per-session message in the working set's inflight map. Job
 /// assignments store only the request id (as the body) so the handler builds
 /// and encrypts the message when it answers the poll.
+///
+/// `plaintext` is true when the session has no key yet (compat polls before
+/// any session creation carry the implicit `default` session id). The
+/// renderer passes such bodies through unencrypted; the runner cannot
+/// decrypt without a key exchange.
 fn queue_session_message(
     tx: &mut TxState,
     session_id: &str,
@@ -1368,6 +1373,9 @@ fn queue_session_message(
     request_id: Option<i64>,
     body: Option<String>,
 ) -> SessionMessage {
+    let plaintext = !tx.broker_session_runners.contains_key(session_id)
+        && !tx.sessions.contains_key(session_id)
+        && !tx.azdo_sessions.contains(session_id);
     tx.next_message_id += 1;
     let message_id = tx.next_message_id;
     let stored = azdo::TaskAgentMessage {
@@ -1388,17 +1396,30 @@ fn queue_session_message(
         message_type: message_type.to_owned(),
         request_id,
         body,
+        plaintext,
     }
 }
 
 /// Decode an inflight message queued by [`queue_session_message`].
-fn session_message_of(stored: &azdo::TaskAgentMessage) -> SessionMessage {
+/// Redelivered messages keep the original key decision: a session that has
+/// since completed the key exchange still receives its queued messages in
+/// the form they were queued in (the runner cannot renegotiate mid-queue).
+fn session_message_of(
+    session_id: &str,
+    tx: &TxState,
+    stored: &azdo::TaskAgentMessage,
+) -> SessionMessage {
     let is_job = stored.message_type == azdo::message_type::PIPELINE_AGENT_JOB_REQUEST;
     SessionMessage {
         message_id: stored.message_id,
         message_type: stored.message_type.clone(),
         request_id: is_job.then(|| stored.body.parse().ok()).flatten(),
         body: (!is_job).then(|| stored.body.clone()),
+        // The stored row keeps only the request id / body; recompute the
+        // same key decision the queue path would make now.
+        plaintext: !tx.broker_session_runners.contains_key(session_id)
+            && !tx.sessions.contains_key(session_id)
+            && !tx.azdo_sessions.contains(session_id),
     }
 }
 
@@ -1415,8 +1436,9 @@ pub(crate) fn poll_azdo_session_tx(tx: &mut TxState, poll: AzdoPoll) -> AzdoPoll
         .inflight_messages
         .get(&sid)
         .and_then(|messages| messages.values().next())
+        .cloned()
     {
-        return AzdoPollOutcome::Redeliver(session_message_of(stored));
+        return AzdoPollOutcome::Redeliver(session_message_of(&sid, tx, &stored));
     }
     if let Some(request_id) = tx.session_active_requests.get(&sid).copied() {
         let request_finished = tx
