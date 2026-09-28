@@ -285,11 +285,7 @@ pub async fn twirp_create_step_summary_metadata(
             line_count: 0,
         },
     );
-    let meta = crate::store::build_local_meta_snapshot(&inner);
     drop(inner);
-    if let Err(error) = shared.state.backend.store_meta(&meta).await {
-        tracing::warn!(?error, "failed to persist step summary metadata");
-    }
 
     Ok(Json(json!({"ok": true})))
 }
@@ -338,11 +334,7 @@ pub async fn twirp_create_step_logs_metadata(
             line_count: line_count_usize,
         },
     );
-    let meta = crate::store::build_local_meta_snapshot(&inner);
     drop(inner);
-    if let Err(error) = shared.state.backend.store_meta(&meta).await {
-        tracing::warn!(?error, "failed to persist step log metadata");
-    }
 
     Ok(Json(json!({"ok": true})))
 }
@@ -389,11 +381,7 @@ pub async fn twirp_create_job_logs_metadata(
             line_count: line_count_usize,
         },
     );
-    let meta = crate::store::build_local_meta_snapshot(&inner);
     drop(inner);
-    if let Err(error) = shared.state.backend.store_meta(&meta).await {
-        tracing::warn!(?error, "failed to persist job log metadata");
-    }
 
     Ok(Json(json!({"ok": true})))
 }
@@ -845,10 +833,7 @@ pub async fn twirp_cache_v2_create(
                     created_unix: now_unix(),
                 },
             );
-            let meta = crate::store::build_local_meta_snapshot(&inner);
-            if let Err(error) = shared.state.backend.store_meta(&meta).await {
-                tracing::warn!(?error, "failed to persist cache v2 reservation");
-            }
+
             false
         }
     };
@@ -995,10 +980,6 @@ pub async fn twirp_cache_v2_finalize(
     {
         let mut inner = shared.state.inner.lock().await;
         inner.cache_v2_pending.remove(&token);
-        let meta = crate::store::build_local_meta_snapshot(&inner);
-        if let Err(error) = shared.state.backend.store_meta(&meta).await {
-            tracing::warn!(?error, "failed to persist cache v2 finalization");
-        }
     }
 
     // Clean up staging directory.

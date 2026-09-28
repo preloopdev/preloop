@@ -397,7 +397,7 @@ impl LiteBackend {
                 runner_id: session.runner_id,
                 protocol: session.protocol,
                 client_id: session.client_id,
-                                active_request_id: None,
+                active_request_id: None,
                 last_seen_at_us: Some(now),
             })
         })

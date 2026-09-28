@@ -4829,18 +4829,6 @@ impl ControlBackend for SqliteBackend {
         })
     }
 
-    async fn store_meta(&self, meta: &crate::store::MetaSnapshot) -> Result<(), ControlError> {
-        crate::store::Store::store_meta_only(self.auxiliary()?, meta)
-            .await
-            .map_err(ControlError::backend)
-    }
-
-    async fn load_meta(&self) -> Result<Option<crate::store::MetaSnapshot>, ControlError> {
-        crate::store::Store::load_meta_only(self.auxiliary()?)
-            .await
-            .map_err(ControlError::backend)
-    }
-
     async fn ensure_key_fingerprint(&self, fingerprint: &str) -> Result<(), ControlError> {
         run_blocking(|| {
             let conn = self.conn.lock();
