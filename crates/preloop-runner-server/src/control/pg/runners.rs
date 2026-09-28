@@ -751,6 +751,8 @@ impl PgBackend {
                 .map_err(db)?;
         }
         tx.commit().await.map_err(db)?;
+        self.released_bindings
+            .fetch_add(swept, std::sync::atomic::Ordering::Relaxed);
         Ok(swept as usize)
     }
 }

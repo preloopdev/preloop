@@ -1304,9 +1304,7 @@ impl PgBackend {
                         .jobs
                         .entry(JobId(row.get::<_, String>(0)))
                         .or_insert_with(|| {
-                            crate::control::types::status_parse(
-                                row.get::<_, String>(1).as_str(),
-                            )
+                            crate::control::types::status_parse(row.get::<_, String>(1).as_str())
                         });
                 }
                 record

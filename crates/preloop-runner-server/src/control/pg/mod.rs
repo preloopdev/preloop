@@ -23,9 +23,9 @@ mod dispatch;
 mod graph;
 mod lifecycle;
 mod lookups;
+mod reaper;
 mod runners;
 mod timelines;
-mod webhooks;
 
 use super::types::ControlError;
 use tokio_postgres::{Client, NoTls};
@@ -149,6 +149,9 @@ pub(crate) struct PgBackend {
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
+    /// Stale claim bindings released since boot (`tx.released_bindings_count`
+    /// parity — process-local, reset on restart).
+    released_bindings: std::sync::atomic::AtomicU64,
     wakes: tokio::sync::broadcast::Sender<super::wake::Wake>,
 }
 
@@ -175,6 +178,7 @@ impl PgBackend {
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
                 runner_liveness_timeout.as_nanos() as u64,
             ),
+            released_bindings: std::sync::atomic::AtomicU64::new(0),
             wakes: super::wake::spawn_listener(url.to_owned()),
         })
     }
