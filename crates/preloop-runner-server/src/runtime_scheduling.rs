@@ -3704,6 +3704,14 @@ pub fn summarize_run(statuses: impl Iterator<Item = ExecutionStatus>) -> Executi
         ExecutionStatus::Failure
     } else if statuses.contains(&ExecutionStatus::Cancelled) {
         ExecutionStatus::Cancelled
+    } else if !statuses.is_empty()
+        && statuses
+            .iter()
+            .all(|status| *status == ExecutionStatus::Skipped)
+    {
+        // Every job was gated off: GitHub reports the run itself as skipped,
+        // not green, so a run of `if:`-excluded jobs cannot read as a pass.
+        ExecutionStatus::Skipped
     } else {
         ExecutionStatus::Success
     }

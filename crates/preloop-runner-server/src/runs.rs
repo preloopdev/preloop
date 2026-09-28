@@ -1815,7 +1815,17 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // Workflow-level concurrency is isolated by the run's provenance.
         // The display name remains the workflow's evaluated group; only the
         // internal admission key gains the trust namespace.
-        if let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
+        //
+        // A submission with nothing runnable — every job gated off by its `if:`
+        // — takes no admission and never parks on a busy group. Taking one here
+        // would outlive the run: a workless run completes inside this function,
+        // never through the completion path that releases run-level holders,
+        // and the leaked `Holder::Run` then parks every later submission in
+        // that group forever. That is how a burst of `issue_comment` events
+        // whose job gate excluded them left a group permanently held and every
+        // later comment waiting behind it.
+        let has_runnable_jobs = statuses.values().any(|status| !status.is_terminal());
+        if has_runnable_jobs && let Some((group, cancel, queue, raw)) = &workflow_concurrency_eval {
             let tier = crate::events::trust_tier::tier_of(&submission);
             let key = concurrency::concurrency_key_for_tier(&submission.repository, group, tier);
             match try_acquire_concurrency(
@@ -1862,7 +1872,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     for job in &built_jobs {
                         statuses.insert(job.job_id.clone(), ExecutionStatus::Cancelled);
                     }
-                    let queued_jobs = statuses.len();
+                    let queued_jobs = statuses
+                        .values()
+                        .filter(|status| !status.is_terminal())
+                        .count();
                     inner.runs.insert(
                         run_id,
                         RunRecord {
@@ -1956,7 +1969,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 statuses.insert(job.job_id.clone(), ExecutionStatus::Pending);
             }
             inner.held_runs.insert(run_id, built_jobs);
-            let queued_jobs = statuses.len();
+            let queued_jobs = statuses
+                .values()
+                .filter(|status| !status.is_terminal())
+                .count();
             inner.runs.insert(
                 run_id,
                 RunRecord {
@@ -2086,13 +2102,13 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             // needs-gated job on an unhostable platform concludes too and its
             // dependents see a terminal status.
             //
-            // The conclusion is `Failure`, never `Skipped`. A skipped job folds
-            // into `summarize_run` as success, so a workflow whose macOS leg
-            // could not run anywhere would report green while its steps never
-            // executed — the worst outcome available, and worse than the
-            // indefinite queue GitHub would leave behind. Failing is loud,
-            // and the annotation below puts the reason where the user reads it
-            // rather than only in the server log.
+            // The conclusion is `Failure`, never `Skipped`. A skipped job
+            // leaves the run reading `skipped`, which says "nothing to do
+            // here" rather than "this deployment cannot run your workflow":
+            // the operator would be told nothing by a run that never executed
+            // a step. Failing is loud, and the annotation below puts the
+            // reason where the user reads it rather than only in the server
+            // log.
             let platforms = runtime_scheduling::registered_runner_platforms(&inner);
             if let Some(platform) =
                 runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
@@ -2241,7 +2257,14 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         }
 
-        let queued_jobs = statuses.len();
+        // Only jobs with a runner left to wait for are queued. A job gated off
+        // by its `if:` is already terminal, and counting it told the submitter
+        // — and the `RunAccepted` event — that work was scheduled when none
+        // was.
+        let queued_jobs = statuses
+            .values()
+            .filter(|status| !status.is_terminal())
+            .count();
         // C-05: derive the initial run status from job statuses so that eval
         // failures (Failure) are reflected immediately rather than leaving the
         // run permanently Queued. summarize_run returns InProgress for any mix
@@ -2312,6 +2335,16 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // anything polling for completion waits forever.
         if let Some(run) = inner.runs.get_mut(&run_id) {
             runtime_scheduling::finalize_run_if_complete(run);
+        }
+        // The same run never reaches the completion path that releases
+        // run-level concurrency either: a holder taken for a run that concluded
+        // on arrival would park every later submission in its group.
+        if inner
+            .runs
+            .get(&run_id)
+            .is_some_and(|run| run.status.is_terminal())
+        {
+            runtime_scheduling::release_concurrency_for_run(&mut inner, run_id);
         }
         // The on-demand runner supervisor uses this atomic as its wake-up
         // signal. Refresh it when submission makes work runnable; updating it
@@ -4834,6 +4867,108 @@ mod tests {
         assert!(
             inner.runs.contains_key(&accepted.run_id),
             "a logged-not-blocked submission must still create a run"
+        );
+    }
+
+    /// A submission whose only job is gated off by its `if:` has no runner
+    /// work to do, so it must finish at submit: terminal status, `completed_at`
+    /// stamped, nothing reported as queued. A run that keeps a non-terminal
+    /// status here is a permanent queue ghost — an `issue_comment` burst whose
+    /// job-level gate excluded the comment left 17 of them, one holding the
+    /// workflow's single-flight concurrency group and the rest parked behind
+    /// it, with every later comment queuing behind the whole set.
+    #[tokio::test]
+    async fn run_whose_only_job_is_gated_off_finishes_at_submit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  gated:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/gated.yml".to_owned()),
+            workflow_file: Some("gated.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let accepted = submit_run_inner(&shared, submission).await.unwrap();
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+        assert_eq!(run.jobs.len(), 1, "the gated job stays in the run");
+        assert!(
+            run.jobs.values().all(|status| status.is_terminal()),
+            "a gated-off job is terminal, got {:?}",
+            run.jobs
+        );
+        assert!(
+            run.status.is_terminal(),
+            "run must not stay {:?} with every job terminal",
+            run.status
+        );
+        assert!(
+            run.completed_at.is_some(),
+            "a run with no work left must be stamped complete"
+        );
+        assert_eq!(
+            run.conclusion.as_deref(),
+            Some("skipped"),
+            "GitHub reports a run whose every job was skipped as skipped"
+        );
+        assert_eq!(accepted.queued_jobs, 0, "nothing was queued to a runner");
+    }
+
+    /// The same workless submission must not take the workflow's concurrency
+    /// admission, and must not park on a busy group: a `Holder::Run` taken for
+    /// a run that concludes on arrival is never released (completion runs
+    /// inside submit), so it parks every later submission in that group
+    /// forever. An `issue_comment` burst whose job gate excluded it left a
+    /// group permanently held that way, with every later comment queued behind
+    /// it and nothing running.
+    #[tokio::test]
+    async fn workless_run_takes_no_workflow_concurrency_and_leaves_none_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\nconcurrency:\n  group: gated-group\n  cancel-in-progress: false\njobs:\n  gated:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/gated.yml".to_owned()),
+            workflow_file: Some("gated.yml".to_owned()),
+            actor: "alice".to_owned(),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+
+        let first = submit_run_inner(&shared, submission.clone()).await.unwrap();
+        let second = submit_run_inner(&shared, submission).await.unwrap();
+        let inner = state.inner.lock().await;
+
+        for accepted in [&first, &second] {
+            let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+            assert!(
+                run.status.is_terminal(),
+                "run {} must not wait on a group: {:?}",
+                accepted.run_id,
+                run.status
+            );
+        }
+        assert!(
+            inner.concurrency_groups.is_empty(),
+            "a workless run must not leave its group held: {:?}",
+            inner.concurrency_groups.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            inner.held_runs.is_empty(),
+            "a workless run must not park on a busy group: {:?}",
+            inner.held_runs.keys().collect::<Vec<_>>()
         );
     }
 }
