@@ -136,56 +136,41 @@ impl LiteBackend {
         self.acquire_context(request_id).await
     }
 
-    /// `store_request_message`: overwrite the job's message template with
-    /// the per-attempt minted message; upsert the token request.
-    pub(crate) async fn store_request_message(
+    /// `record_token_request`: upsert the derived token-mint request for a
+    /// re-claim. Under M2 the stored template is never rewritten after
+    /// claim (the minted message is secret-filled in memory only), so this
+    /// is the whole method — the old `store_request_message` message half
+    /// is dead. pg locks the run row; the single writer covers it.
+    pub(crate) async fn record_token_request(
         &self,
-        run_id: RunId,
+        _run_id: RunId,
         request_id: i64,
-        message: Option<&azdo::AgentJobRequestMessage>,
-        token_request: Option<&crate::models::GitHubTokenRequest>,
+        token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError> {
-        let run = codec::run_key(run_id);
-        let message_json = message
-            .map(|msg| serde_json::to_string(msg))
-            .transpose()
-            .map_err(ControlError::backend)?;
+        let repository = token_request.repository.clone();
+        let permissions =
+            serde_json::to_string(&token_request.permissions).unwrap_or_else(|_| "{}".to_owned());
+        let declared = token_request.declared as i64;
+        let untrusted = token_request.untrusted as i64;
         self.write(move |tx| {
-            let job_id: Option<String> = tx
-                .prepare_cached("SELECT job_id FROM job_requests WHERE request_id = ?1")
-                .map_err(db)?
-                .query_row([request_id], |row| row.get(0))
-                .optional()
-                .map_err(db)?;
-            if let (Some(job_id), Some(json)) = (job_id, message_json) {
-                tx.prepare_cached(
-                    "UPDATE job_messages SET message_template = ?3 \
-                     WHERE run_id = ?1 AND job_id = ?2",
-                )
-                .map_err(db)?
-                .execute(params![run, job_id, json])
-                .map_err(db)?;
-            }
-            if let Some(token) = token_request {
-                tx.prepare_cached(
-                    "INSERT INTO github_token_requests (request_id, repository, \
-                     permissions, declared, untrusted) VALUES (?1,?2,?3,?4,?5) \
-                     ON CONFLICT (request_id) DO UPDATE SET \
-                         repository = excluded.repository, \
-                         permissions = excluded.permissions, \
-                         declared = excluded.declared, \
-                         untrusted = excluded.untrusted",
-                )
-                .map_err(db)?
-                .execute(params![
-                    request_id,
-                    token.repository,
-                    serde_json::to_string(&token.permissions).unwrap_or_else(|_| "{}".to_owned()),
-                    token.declared as i64,
-                    token.untrusted as i64,
-                ])
-                .map_err(db)?;
-            }
+            tx.prepare_cached(
+                "INSERT INTO github_token_requests (request_id, repository, \
+                 permissions, declared, untrusted) VALUES (?1,?2,?3,?4,?5) \
+                 ON CONFLICT (request_id) DO UPDATE SET \
+                     repository = excluded.repository, \
+                     permissions = excluded.permissions, \
+                     declared = excluded.declared, \
+                     untrusted = excluded.untrusted",
+            )
+            .map_err(db)?
+            .execute(params![
+                request_id,
+                repository,
+                permissions,
+                declared,
+                untrusted
+            ])
+            .map_err(db)?;
             Ok(())
         })
     }
@@ -243,6 +228,70 @@ impl LiteBackend {
                     job_workflow_sha: oidc_sha,
                 },
             })
+        })
+    }
+}
+
+impl LiteBackend {
+    /// `run_secret_values`: the exposed secret values of one run's stored
+    /// submission (`mask_log_bytes_cached` unions them into the plan's
+    /// mask set). `None` only when the run does not exist at all; an
+    /// existing run with no secrets yields `Some([])`.
+    pub(crate) async fn run_secret_values(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<Vec<String>>, ControlError> {
+        let run = codec::run_key(run_id);
+        self.read(move |tx| {
+            let json: Option<String> = tx
+                .prepare_cached("SELECT submission FROM run_submissions WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([&run], |row| row.get(0))
+                .optional()
+                .map_err(db)?;
+            let Some(json) = json else {
+                // A run row without a submission still exists — `None` only
+                // when the run is gone entirely (masker falls back to
+                // `all_secret_values`).
+                let exists = tx
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1 UNION ALL \
+                         SELECT 1 FROM run_history WHERE run_id = ?1)",
+                    )
+                    .map_err(db)?
+                    .query_row([&run], |row| row.get::<_, bool>(0))
+                    .map_err(db)?;
+                return Ok(exists.then_some(Vec::new()));
+            };
+            let submission: preloop_gha_protocol::WorkflowSubmission =
+                serde_json::from_str(&json).map_err(ControlError::backend)?;
+            Ok(Some(
+                submission
+                    .secrets
+                    .values()
+                    .map(|v| v.expose().to_owned())
+                    .collect(),
+            ))
+        })
+    }
+
+    /// `all_secret_values`: the masker's fallback union — every live run's
+    /// stored submission secrets.
+    pub(crate) async fn all_secret_values(&self) -> Result<Vec<String>, ControlError> {
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached("SELECT submission FROM run_submissions")
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db)?;
+            let mut values = Vec::new();
+            for row in rows {
+                let submission: preloop_gha_protocol::WorkflowSubmission =
+                    serde_json::from_str(&row.map_err(db)?).map_err(ControlError::backend)?;
+                values.extend(submission.secrets.values().map(|v| v.expose().to_owned()));
+            }
+            Ok(values)
         })
     }
 }

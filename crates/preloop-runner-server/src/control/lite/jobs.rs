@@ -98,6 +98,7 @@ pub(super) struct SpecRow {
 /// expansion (`"call"`), the caller metadata the run record projects
 /// (`"meta"`), or the caller `JobPlan` an expandable node rebuilds from
 /// (`"plan"`). One column, three roles — a caller node writes all it has.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub(super) enum ReusableSpec {
@@ -138,7 +139,7 @@ impl ReusableSpec {
     }
 }
 
-fn opt_json<'a, T: serde::de::DeserializeOwned>(value: &'a Option<String>) -> Option<T> {
+fn opt_json<T: serde::de::DeserializeOwned>(value: &Option<String>) -> Option<T> {
     value.as_deref().and_then(|v| serde_json::from_str(v).ok())
 }
 
@@ -153,16 +154,13 @@ pub(super) fn spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRow> {
     let oidc_env: Option<String> = row.get(11)?;
     let oidc_ref: Option<String> = row.get(12)?;
     let oidc_sha: Option<String> = row.get(13)?;
-    #[allow(clippy::redundant_clone)]
-    let oidc_context = match (oidc_env, oidc_ref, oidc_sha) {
-        (environment, reference, sha) => {
-            (reference.is_some() || sha.is_some()).then_some(crate::state::OidcJobContext {
-                environment,
-                job_workflow_ref: reference,
-                job_workflow_sha: sha,
-            })
-        }
-    };
+    let oidc_context = (oidc_ref.is_some() || oidc_sha.is_some()).then_some(
+        crate::state::OidcJobContext {
+            environment: oidc_env,
+            job_workflow_ref: oidc_ref,
+            job_workflow_sha: oidc_sha,
+        },
+    );
     Ok(SpecRow {
         display_name: row.get(0)?,
         if_condition: row.get(1)?,
@@ -785,11 +783,11 @@ pub(super) fn summarize_run_row(
             _ => "queued",
         };
         tx.prepare_cached(
-            "UPDATE runs SET status = ?2, started_at = COALESCE(started_at, ?3) \
+            "UPDATE runs SET status = ?2 \
              WHERE run_id = ?1 AND status <> 'completed'",
         )
         .map_err(db)?
-        .execute(params![codec::run_key(run_id), wire, now])
+        .execute(params![codec::run_key(run_id), wire])
         .map_err(db)?;
     }
     Ok(status)
@@ -827,7 +825,7 @@ pub(super) fn emit_outbox(
     .map_err(db)?
     .execute(params![
         namespace_id,
-        run_id.map(|r| codec::run_key(r)),
+        run_id.map(codec::run_key),
         run_seq,
         topic,
         payload.to_string(),
@@ -855,7 +853,7 @@ pub(super) fn run_record(
             "SELECT 'completed', r.conclusion, r.run_number, r.run_attempt, \
                     r.run_name, r.event, r.head_sha, r.workflow_path, \
                     NULL, r.created_at, r.started_at, r.completed_at, \
-                    r.workflow_path, r.submission, NULL, NULL, NULL \
+                    r.workflow_path, r.submission, NULL, NULL, NULL, r.record_details \
              FROM run_history r WHERE r.run_id = ?1",
         )
         .map_err(db)?
@@ -878,6 +876,7 @@ pub(super) fn run_record(
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
             ))
         })
         .optional()
@@ -888,7 +887,7 @@ pub(super) fn run_record(
                     r.run_name, r.event, r.head_sha, r.workflow_ref, \
                     r.webhook_delivery_id, r.created_at, r.started_at, r.completed_at, \
                     r.workflow_path, s.submission, s.github_context, \
-                    s.workspace_snapshot, s.snapshot_timing \
+                    s.workspace_snapshot, s.snapshot_timing, s.record_details \
              FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
              WHERE r.run_id = ?1",
         )
@@ -912,6 +911,7 @@ pub(super) fn run_record(
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
             ))
         })
         .optional()
@@ -935,6 +935,7 @@ pub(super) fn run_record(
         github_json,
         snapshot_json,
         timing_json,
+        details_json,
     )) = head
     else {
         return Ok(None);
@@ -1005,7 +1006,7 @@ pub(super) fn run_record(
             .map_err(db)?
             .query_row([&run], |row| row.get::<_, bool>(0))
             .map_err(db)?;
-    let mut record_status = match (status.as_str(), conclusion.as_deref()) {
+    let record_status = match (status.as_str(), conclusion.as_deref()) {
         ("completed", Some("success")) => ExecutionStatus::Success,
         ("completed", Some("failure")) | ("completed", Some("timed_out")) => {
             ExecutionStatus::Failure
@@ -1017,18 +1018,6 @@ pub(super) fn run_record(
         _ if held => ExecutionStatus::Pending,
         _ => ExecutionStatus::Queued,
     };
-    if record_status == ExecutionStatus::InProgress
-        && !graph
-            .statuses
-            .values()
-            .any(|s| *s == ExecutionStatus::InProgress)
-    {
-        record_status = if held {
-            ExecutionStatus::Pending
-        } else {
-            ExecutionStatus::Queued
-        };
-    }
     // Per-job workflow facts the record carries: base ids, names, needs,
     // outputs, check runs, caller plans, reusable metadata, detail order.
     let mut job_names = BTreeMap::new();
@@ -1040,7 +1029,7 @@ pub(super) fn run_record(
     let mut jobs_list = Vec::new();
     // job_history carries no spec envelope: spec columns project as NULL
     // and display order falls back to job-id order.
-    let spec_rows: Vec<(
+    type SpecDetail = (
         String,
         String,
         Option<String>,
@@ -1051,7 +1040,8 @@ pub(super) fn run_record(
         String,
         i64,
         String,
-    )> = if archived {
+    );
+    let spec_rows: Vec<SpecDetail> = if archived {
         tx.prepare_cached(
             "SELECT job_id, display_name, NULL, NULL, NULL, check_run_id, \
                     annotations, base_id, 0, status FROM job_history \
@@ -1187,22 +1177,33 @@ pub(super) fn run_record(
         submission: std::sync::Arc::new(submission),
         jobs: graph.statuses,
         status: record_status,
-        job_outputs: graph.outputs,
-        job_base_ids: graph.base_ids,
-        job_needs: graph.needs,
-        caller_plans,
-        job_names,
+        // Record-level detail maps live in `run_submissions.record_details`
+        // (the agreed schema covers only scheduled jobs); live rows overlay
+        // stored values, stored keys with no `jobs` row pass through.
+        job_outputs: merge_details(&details_json, "job_outputs", graph.outputs),
+        job_base_ids: merge_details(&details_json, "job_base_ids", graph.base_ids),
+        job_needs: merge_details(&details_json, "job_needs", graph.needs),
+        caller_plans: merge_details(&details_json, "caller_plans", caller_plans),
+        // `job_names` is verbatim record detail — not the union of display
+        // names. A submitted job with no `job_names` entry contributes none.
+        job_names: detail_map(&details_json, "job_names"),
         github,
         head_sha,
         workflow_ref,
         workspace_snapshot: snapshot_json
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
-        job_fail_fast,
-        job_continue_on_error,
-        job_check_run_ids,
-        reusable_calls,
-        jobs_list,
+        job_fail_fast: merge_details(&details_json, "job_fail_fast", job_fail_fast),
+        job_continue_on_error: merge_details(
+            &details_json,
+            "job_continue_on_error",
+            job_continue_on_error,
+        ),
+        job_check_run_ids: merge_details(&details_json, "job_check_run_ids", job_check_run_ids),
+        reusable_calls: merge_details(&details_json, "reusable_calls", reusable_calls),
+        // Stored detail order is authoritative; derived entries append for
+        // job ids the submit record never declared.
+        jobs_list: merge_details_list(&details_json, jobs_list),
         created_at: codec::us_to_utc(created_at).unwrap_or_default(),
         started_at: started_at.and_then(codec::us_to_utc),
         completed_at: completed_at.and_then(codec::us_to_utc),
@@ -1268,6 +1269,33 @@ pub(super) fn refresh_remaining_needs(
     Ok(())
 }
 
+/// Whole-run recompute of `remaining_needs` — the submit path applies it
+/// once after every job row exists, since a dependent inserted *after* its
+/// terminal (initially-skipped/unhostable) parent was seeded with the raw
+/// declared-need count. Mirrors `refresh_remaining_needs` without the
+/// single-settled-edge restriction.
+pub(super) fn refresh_run_remaining_needs(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+) -> Result<(), ControlError> {
+    tx.prepare_cached(
+        "UPDATE jobs SET remaining_needs = ( \
+             SELECT COUNT(*) FROM job_needs n WHERE n.run_id = jobs.run_id \
+               AND n.job_id = jobs.job_id AND EXISTS ( \
+                 SELECT 1 FROM jobs d WHERE d.run_id = n.run_id \
+                   AND (d.job_id = n.needs_job_id OR d.base_id = n.needs_job_id) \
+                   AND NOT (d.kind = 'matrix_parent' AND EXISTS ( \
+                       SELECT 1 FROM jobs c WHERE c.run_id = d.run_id \
+                         AND c.parent_job_id = d.job_id)) \
+                   AND d.status NOT IN ('success','failure','cancelled','skipped'))) \
+         WHERE run_id = ?1 AND queue_state <> 'none'",
+    )
+    .map_err(db)?
+    .execute([codec::run_key(run_id)])
+    .map_err(db)?;
+    Ok(())
+}
+
 /// Delete the run's dispatch bookkeeping (assignments + provisioning
 /// intents) — a cancelled run must not be offered to a pool.
 pub(super) fn clear_run_dispatch_intent(
@@ -1295,4 +1323,68 @@ pub(super) fn namespace_of(tx: &Transaction<'_>, run_id: RunId) -> Result<String
         .optional()
         .map_err(db)
         .map(|value: Option<String>| value.unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned()))
+}
+
+/// Overlay a live-derived map onto the stored `record_details` map: stored
+/// keys with no live row pass through (record detail is broader than the
+/// scheduling table — a run_jobs entry may never have been dispatched),
+/// live values win where both exist.
+fn merge_details<K, V>(
+    details_json: &Option<String>,
+    key: &str,
+    live: BTreeMap<K, V>,
+) -> BTreeMap<K, V>
+where
+    K: for<'de> serde::Deserialize<'de> + Ord,
+    V: for<'de> serde::Deserialize<'de>,
+{
+    let mut merged: BTreeMap<K, V> = details_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|v| v.get(key).cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    for (k, v) in live {
+        merged.insert(k, v);
+    }
+    merged
+}
+
+/// `jobs_list` order is a declared record fact (`detail_position` in the
+/// old schema): stored entries keep their verbatim order; derived entries
+/// for undeclared job ids append behind them.
+fn merge_details_list(
+    details_json: &Option<String>,
+    live: Vec<crate::models::JobDetail>,
+) -> Vec<crate::models::JobDetail> {
+    let mut stored: Vec<crate::models::JobDetail> = details_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|v| v.get("jobs_list").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let declared: std::collections::BTreeSet<String> =
+        stored.iter().map(|d| d.job_id.clone()).collect();
+    for detail in live {
+        if !declared.contains(&detail.job_id) {
+            stored.push(detail);
+        }
+    }
+    stored
+}
+
+/// Read a stored `record_details` map verbatim — used for fields that are
+/// record-level declarations, not live scheduling state (e.g. `job_names`:
+/// a submitted job with no declared name contributes no entry).
+fn detail_map<K, V>(details_json: &Option<String>, key: &str) -> BTreeMap<K, V>
+where
+    K: for<'de> serde::Deserialize<'de> + Ord,
+    V: for<'de> serde::Deserialize<'de>,
+{
+    details_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|v| v.get(key).cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
 }

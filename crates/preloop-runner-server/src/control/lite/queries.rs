@@ -638,12 +638,14 @@ impl LiteBackend {
                 for sql in [
                     "INSERT INTO run_history (run_id, namespace_id, repository, workflow_path, \
                          run_number, run_attempt, run_name, event, ref, ref_type, head_ref, \
-                         base_ref, head_sha, conclusion, submission, created_at, started_at, \
-                         completed_at) \
+                         base_ref, head_sha, conclusion, submission, record_details, \
+                         created_at, started_at, completed_at) \
                      SELECT r.run_id, r.namespace_id, r.repository, r.workflow_path, \
                          r.run_number, r.run_attempt, r.run_name, r.event, r.ref, r.ref_type, \
                          r.head_ref, r.base_ref, r.head_sha, r.conclusion, \
-                         COALESCE(s.submission, '{}'), r.created_at, r.started_at, \
+                         COALESCE(s.submission, '{}'), \
+                         COALESCE(s.record_details, '{}'), \
+                         r.created_at, r.started_at, \
                          r.completed_at \
                      FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
                      WHERE r.run_id = ?1",

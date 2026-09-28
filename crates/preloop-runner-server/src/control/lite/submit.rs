@@ -103,7 +103,7 @@ fn submit_run_tx(
 ) -> Result<SubmitOutcome, ControlError> {
     let SubmitRun {
         namespace,
-        record,
+        mut record,
         jobs: submit_jobs,
         workflow_concurrency,
         empty_concurrency_group,
@@ -163,6 +163,35 @@ fn submit_run_tx(
     }
 
     // ── The run row (FK target for jobs and the gate's event ordering) ──
+    // `runs_number` is unique on (namespace, repo, path, number, attempt):
+    // a caller that reuses a number (suite submissions) gets the next one,
+    // matching GitHub — a run's number is never duplicated in one workflow.
+    if tx
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE namespace_id = ?1 \
+             AND repository = ?2 AND workflow_path = ?3 AND run_number = ?4 \
+             AND run_attempt = ?5)",
+        )
+        .map_err(db)?
+        .query_row(
+            params![
+                namespace,
+                record.submission.repository,
+                record.workflow_path_str,
+                record.run_number as i64,
+                record.run_attempt as i64
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db)?
+    {
+        record.run_number = allocate_run_number_tx(
+            tx,
+            &namespace,
+            &record.submission.repository,
+            &record.workflow_path_str,
+        )?;
+    }
     insert_run_row(tx, &record, &namespace, workflow_concurrency.as_ref())?;
 
     // A run's jobs all share one queue sequence number; `created_at` is
@@ -337,7 +366,7 @@ fn submit_run_tx(
                 "none",
                 &spec,
             )?;
-            concluded.push((job_id, ExecutionStatus::Skipped, None));
+            concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
             inserted += 1;
             continue;
         }
@@ -452,6 +481,27 @@ fn submit_run_tx(
             step_manifest,
         )?;
         inserted += 1;
+    }
+
+    // Jobs inserted terminal (initially_skipped / unhostable) settle their
+    // dependents' edges before promotion reads `remaining_needs = 0`. One
+    // whole-run recompute — a dependent inserted after its terminal parent
+    // was seeded with the raw declared count.
+    jobs::refresh_run_remaining_needs(tx, run_id)?;
+
+    // Submit-seeded outputs (a rerun carry `record.job_outputs`) land on
+    // the matching job rows.
+    for (job_id, outputs) in &record.job_outputs {
+        if !outputs.is_empty() {
+            tx.prepare_cached("UPDATE jobs SET outputs = ?3 WHERE run_id = ?1 AND job_id = ?2")
+                .map_err(db)?
+                .execute(params![
+                    codec::run_key(run_id),
+                    job_id.0.as_str(),
+                    serde_json::to_string(outputs).map_err(ControlError::backend)?
+                ])
+                .map_err(db)?;
+        }
     }
 
     // ── Promotion sweep for needs-gated jobs ────────────────────────────
@@ -593,19 +643,46 @@ fn insert_run_row(
         record.completed_at.map(|at| at.timestamp_micros()),
     ])
     .map_err(db)?;
+    // Submission is stored WITH its secrets: the single-node SQLite
+    // backend keeps the sealed-at-rest values so `run_secret_values` /
+    // `all_secret_values` (mask_log_bytes_cached) can serve them. The
+    // agreed `secret_refs` column still names them (`{name: scope}`).
+    let secret_refs: serde_json::Value = record
+        .submission
+        .secrets
+        .keys()
+        .map(|name| (name.clone(), serde_json::json!({"scope": "run"})))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    let details = serde_json::json!({
+        "job_base_ids": record.job_base_ids,
+        "job_names": record.job_names,
+        "job_needs": record.job_needs,
+        "job_check_run_ids": record.job_check_run_ids,
+        "caller_plans": record.caller_plans,
+        "reusable_calls": record.reusable_calls,
+        "job_fail_fast": record.job_fail_fast,
+        "job_continue_on_error": record.job_continue_on_error,
+        "jobs_list": record.jobs_list,
+    });
     tx.prepare_cached(
         "INSERT INTO run_submissions (run_id, submission, github_context, \
-             workspace_snapshot, snapshot_timing) VALUES (?1,?2,?3,?4,?5) \
+             workspace_snapshot, snapshot_timing, secret_refs, record_details) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7) \
          ON CONFLICT (run_id) DO UPDATE SET submission = excluded.submission, \
              github_context = excluded.github_context, \
              workspace_snapshot = excluded.workspace_snapshot, \
-             snapshot_timing = excluded.snapshot_timing",
+             snapshot_timing = excluded.snapshot_timing, \
+             record_details = excluded.record_details",
     )
     .map_err(db)?
     .execute(params![
         codec::run_key(record.run_id),
-        serde_json::to_string(submission.as_ref())
-            .map_err(|e| ControlError::backend(anyhow::anyhow!("submission encode: {e}")))?,
+        record
+            .submission
+            .to_request_json()
+            .map_err(|e| { ControlError::backend(anyhow::anyhow!("submission encode: {e}")) })?
+            .to_string(),
         record.github.to_string(),
         record
             .workspace_snapshot
@@ -615,6 +692,8 @@ fn insert_run_row(
             .snapshot_timing
             .as_ref()
             .map(|timing| serde_json::to_string(timing).unwrap_or_default()),
+        secret_refs.to_string(),
+        details.to_string(),
     ])
     .map_err(db)?;
     Ok(())
@@ -716,4 +795,32 @@ pub(super) fn mint_request(
         .map_err(db)?;
     }
     Ok(())
+}
+
+/// `allocate_run_number` inside an open transaction: upsert the
+/// `(namespace, repository, workflow_path)` counter and return the next
+/// number. Used by `submit_run` for natural-key collisions and by the
+/// trait's `allocate_run_number` (which wraps it in `write`).
+pub(super) fn allocate_run_number_tx(
+    tx: &Transaction<'_>,
+    namespace_id: &str,
+    repository: &str,
+    workflow_path: &str,
+) -> Result<u64, ControlError> {
+    let number: i64 = tx
+        .query_row(
+            "INSERT INTO workflow_run_numbers \
+                 (namespace_id, repository, workflow_path, last_run_number) \
+             VALUES (?1, ?2, ?3, \
+                 COALESCE((SELECT MAX(r.run_number) FROM runs r \
+                     WHERE r.namespace_id = ?1 AND r.repository = ?2 \
+                       AND r.workflow_path = ?3), 0) + 1) \
+             ON CONFLICT (namespace_id, repository, workflow_path) \
+             DO UPDATE SET last_run_number = last_run_number + 1 \
+             RETURNING last_run_number",
+            params![namespace_id, repository, workflow_path],
+            |row| row.get(0),
+        )
+        .map_err(db)?;
+    Ok(number.max(0) as u64)
 }

@@ -177,17 +177,12 @@ fn claim_one(
     runner_id: Option<i64>,
     caps: &RunnerCapabilities,
 ) -> Result<Option<(RunId, JobId)>, ControlError> {
-    let rows: Vec<(
-        String,
-        String,
-        Vec<String>,
-        Option<String>,
-        Option<(Option<i64>, bool)>,
-    )> = {
+    type ReadyRow = (String, String, Vec<String>, Option<String>, Option<(Option<i64>, bool)>);
+    let rows: Vec<ReadyRow> = {
         let mut stmt = tx
             .prepare_cached(
                 "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
-                 a.runner_id, (a.assigned_at IS NOT NULL AND a.assigned_at > ?2) \
+                 a.runner_id, (a.assigned_at IS NOT NULL AND a.assigned_at > ?1) \
                  FROM jobs j \
                  LEFT JOIN job_assignments a ON a.run_id = j.run_id \
                     AND a.job_id = j.job_id \
@@ -472,12 +467,10 @@ impl LiteBackend {
             else {
                 return Ok(PollOutcome::Empty);
             };
-            queue_job_message(
-                tx,
-                &session.session_uuid,
-                session.runner_id,
-                request.request_id,
-            )?;
+            // A `PollOutcome::Claimed` is answer-shaped, not a session
+            // message: parking a JobRequest row here would shadow the
+            // cancel/active checks on the next poll (the azdo variant does
+            // park one — that contract is message-based).
             let Some(queued) = finish_claim(tx, run_id, &job_id)? else {
                 return Ok(PollOutcome::Empty);
             };
