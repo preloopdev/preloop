@@ -134,7 +134,10 @@ async fn flush_run(tx: &Transaction<'_>, graph: &RunGraph) -> Result<(), Control
 ///
 /// Statements: one aggregate `SELECT` over `jobs`, then one conditional
 /// `UPDATE runs` (a `completed` run is never resurrected).
-pub(super) async fn summarize_run_tx(tx: &Transaction<'_>, run_id: RunId) -> Result<(), ControlError> {
+pub(super) async fn summarize_run_tx(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+) -> Result<(), ControlError> {
     let run = run_id.0.to_string();
     let summary = tx
         .query_one(
@@ -1902,8 +1905,13 @@ async fn cancel_run_tx(
     .await
     .map_err(db)?;
     for job_id in &expandable {
-        retire_node_requests(tx, run_id, job_id, Retirement::Settle(ExecutionStatus::Cancelled))
-            .await?;
+        retire_node_requests(
+            tx,
+            run_id,
+            job_id,
+            Retirement::Settle(ExecutionStatus::Cancelled),
+        )
+        .await?;
     }
     // A cancelled run is terminal: stamp completion metadata so the record
     // carries `completed_at`/`conclusion` like a settled run does.
@@ -2002,8 +2010,8 @@ async fn cancel_job_tx(
     let Some(row) = row else { return Ok(0) };
     let status: String = row.get(0);
     let queue_state: String = row.get(1);
-    let expandable: bool = row.get::<_, bool>(2)
-        || matches!(queue_state.as_str(), "pending_expansion" | "expanding");
+    let expandable: bool =
+        row.get::<_, bool>(2) || matches!(queue_state.as_str(), "pending_expansion" | "expanding");
     let now = now_us();
     let mut count = 0;
     // Only a running attempt can be interrupted; queued/blocked jobs simply

@@ -16,7 +16,9 @@ use super::dispatch::{
 };
 use super::{db, PgBackend};
 use crate::control::logic::{starvation_verdict, StarvationCandidate, StarvationVerdict};
-use crate::control::types::{ControlError, ExpiredLease, ReapSweep, ReapSweepOutcome, StatusInputs};
+use crate::control::types::{
+    ControlError, ExpiredLease, ReapSweep, ReapSweepOutcome, StatusInputs,
+};
 use preloop_gha_protocol::ExecutionStatus;
 
 impl PgBackend {
@@ -154,10 +156,7 @@ impl PgBackend {
                 if request.timeout_triggered {
                     continue;
                 }
-                let paused_s = paused
-                    .get(&request.request_id)
-                    .copied()
-                    .unwrap_or_default();
+                let paused_s = paused.get(&request.request_id).copied().unwrap_or_default();
                 let elapsed = now
                     .duration_since(started_at)
                     .unwrap_or_default()
@@ -403,8 +402,7 @@ impl PgBackend {
             .map_err(db)?;
         if let Some(oldest) = oldest {
             let enqueued: i64 = oldest.get(2);
-            out.oldest_ready_seconds =
-                Some((now_us() - enqueued).max(0) as f64 / 1_000_000.0);
+            out.oldest_ready_seconds = Some((now_us() - enqueued).max(0) as f64 / 1_000_000.0);
             out.oldest_ready_run_id = Some(oldest.get(0));
             out.oldest_ready_job_id = Some(oldest.get(1));
         }
@@ -436,8 +434,7 @@ impl PgBackend {
             .map(|row| {
                 Ok(crate::models::RunnerCapabilities {
                     known: true,
-                    labels: codec::from_json::<Vec<String>>(row.get(0))
-                        .unwrap_or_default(),
+                    labels: codec::from_json::<Vec<String>>(row.get(0)).unwrap_or_default(),
                     runner_group_id: row.get::<_, Option<i64>>(1),
                     runner_group_name: row.get(2),
                 })

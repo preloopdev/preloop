@@ -1341,7 +1341,10 @@ impl PgBackend {
             let archived: bool = row.get(1);
             let run_wait: bool = row.get(2);
             let (record, mut jobs) = if archived {
-                (archived_record_tx(&tx, run_id).await?, archived_job_rows(&tx, run_id).await?)
+                (
+                    archived_record_tx(&tx, run_id).await?,
+                    archived_job_rows(&tx, run_id).await?,
+                )
             } else {
                 match PgBackend::load_graph(self, &tx, run_id).await? {
                     Some(graph) => (graph.record, live_job_rows(&tx, run_id).await?),
@@ -1657,4 +1660,3 @@ pub(super) async fn archived_record_tx(
         snapshot_timing: None,
     })
 }
-
