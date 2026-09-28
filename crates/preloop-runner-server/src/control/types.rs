@@ -925,14 +925,25 @@ pub(crate) struct AzdoPoll {
 
 /// A queued per-session message. Job assignments carry only `request_id`:
 /// the handler builds and session-encrypts the job message from the stored
-/// template when it answers the poll. Other messages carry a small
-/// non-secret plaintext `body`.
+/// template when it answers the poll — but only when the session exchanged
+/// a key (a real runner session). Other messages carry a small non-secret
+/// plaintext `body`.
+///
+/// `plaintext` marks messages queued for a session that has no key yet (the
+/// implicit `default`/compat session polls before any session creation).
+/// The renderer passes these bodies through unencrypted
+/// (base64-plaintext + zero IV): without a key exchange the runner cannot
+/// decrypt, so encrypting would make cancellations undecodable and changes
+/// the AzDO wire contract for legacy polls. Sessions that completed the
+/// key exchange (`broker`/`azdo` rows) are always rendered encrypted with
+/// the derived key, never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionMessage {
     pub(crate) message_id: i64,
     pub(crate) message_type: String,
     pub(crate) request_id: Option<i64>,
     pub(crate) body: Option<String>,
+    pub(crate) plaintext: bool,
 }
 
 /// What an AzDO poll produced.

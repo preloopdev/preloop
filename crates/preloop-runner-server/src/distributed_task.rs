@@ -93,8 +93,14 @@ pub async fn next_message(
 /// template (`acquire_context`) with the `SystemVssConnection` endpoint filled
 /// in and a fresh runtime token minted now — so no token or secret sits in the
 /// queued row. Control messages (`JobCancellation`, …) carry their small
-/// plaintext `body` directly. Everything is session-AES encrypted with the key
-/// derived from `session_id`.
+/// plaintext `body` directly.
+///
+/// Key decision: sessions that completed the key exchange (`broker`/`azdo`
+/// rows) are session-AES encrypted with the key derived from `session_id`
+/// (never stored). Messages queued while the session had no key yet
+/// (`plaintext`, the implicit `default`/compat session) pass through as
+/// base64-plaintext + zero IV: without a key exchange the runner cannot
+/// decrypt, so encrypting would make cancellations undecodable.
 async fn render_session_message(
     shared: &Arc<SharedState>,
     session_id: &str,
@@ -138,13 +144,17 @@ async fn render_session_message(
         message.body.clone().unwrap_or_default()
     };
 
-    // Session key is derived from the cluster key + session id (never stored):
-    // every node encrypts with the same key.
-    let session_enc = shared.state.session_encryption(session_id);
-    let (encrypted_body, iv) = if !session_enc.key.is_empty() {
-        session_enc.encrypt(body_json.as_bytes()).ok()?
-    } else {
+    // Keyed sessions encrypt with the derived key; compat/default sessions
+    // (no key exchange) stay base64-plaintext so the runner can decode them.
+    let (encrypted_body, iv) = if message.plaintext {
         (body_json.into_bytes(), vec![0u8; 16])
+    } else {
+        let session_enc = shared.state.session_encryption(session_id);
+        if session_enc.key.is_empty() {
+            (body_json.into_bytes(), vec![0u8; 16])
+        } else {
+            session_enc.encrypt(body_json.as_bytes()).ok()?
+        }
     };
     Some(azdo::TaskAgentMessage {
         message_id: message.message_id,
