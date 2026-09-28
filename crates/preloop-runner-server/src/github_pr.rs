@@ -34,49 +34,14 @@ pub async fn maybe_open_pr(shared: Arc<SharedState>, run_id: RunId) {
 /// Quiet no-ops (policy skip, run not applicable) return `Ok(false)`; only
 /// real failures (missing credentials, GitHub refusing) propagate.
 async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow::Result<bool> {
-    // Snapshot the fields we need under the lock, then drop it before any
-    // network I/O.
-    let snap = shared
-        .state
-        .backend
-        .read(move |tx| {
-            let run = match tx.runs.get(&run_id) {
-                Some(run) => run.clone(),
-                None => return Ok(None),
-            };
-            if run.conclusion.as_deref() != Some("success") {
-                return Ok(None);
-            }
-            if run.event != "push" {
-                return Ok(None);
-            }
-            // Only webhook-delivered runs carry a trust tier (the dispatcher
-            // stamps it). A native `/api/v1/runs` caller setting `event =
-            // "push"` is a local submission, not a GitHub push, and must not
-            // trigger auto-PR.
-            if crate::events::trust_tier::tier_of(&run.submission).is_none() {
-                return Ok(None);
-            }
-            // Push-back runs are client-managed: `github_push.rs` owns their PR.
-            if run.submission.push.is_some() {
-                return Ok(None);
-            }
-            // A local-only submission (no real `owner/repo` slug) can never
-            // have a PR opened for it.
-            let Some((owner, repo)) = run.submission.repository.split_once('/') else {
-                return Ok(None);
-            };
-            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-                return Ok(None);
-            }
-            Ok(Some((
-                run.submission.repository.clone(),
-                run.submission.git_ref.clone(),
-                run.submission.payload.clone(),
-            )))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // Snapshot the run before any network I/O.
+    use crate::control::backend::ControlBackend as _;
+    let run = match shared.state.backend.run_record(run_id).await {
+        Ok(run) => run,
+        Err(crate::control::types::ControlError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(anyhow::anyhow!(error)),
+    };
+    let snap = auto_pr_candidate(&run);
     let Some((repository, git_ref, payload)) = snap else {
         return Ok(false);
     };
@@ -171,6 +136,33 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
     let number = pr.get("number").and_then(Value::as_u64).unwrap_or_default();
     tracing::info!(%run_id, %branch, %default_branch, draft, number, "auto-PR opened");
     Ok(true)
+}
+
+/// The `(repository, git_ref, payload)` of a run that qualifies for auto-PR,
+/// or `None` when policy-independent preconditions rule it out.
+fn auto_pr_candidate(run: &crate::models::RunRecord) -> Option<(String, String, Value)> {
+    if run.conclusion.as_deref() != Some("success") || run.event != "push" {
+        return None;
+    }
+    // Only webhook-delivered runs carry a trust tier (the dispatcher stamps
+    // it). A native `/api/v1/runs` caller setting `event = "push"` is a local
+    // submission, not a GitHub push, and must not trigger auto-PR.
+    crate::events::trust_tier::tier_of(&run.submission)?;
+    // Push-back runs are client-managed: `github_push.rs` owns their PR.
+    if run.submission.push.is_some() {
+        return None;
+    }
+    // A local-only submission (no real `owner/repo` slug) can never have a PR
+    // opened for it.
+    let (owner, repo) = run.submission.repository.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((
+        run.submission.repository.clone(),
+        run.submission.git_ref.clone(),
+        run.submission.payload.clone(),
+    ))
 }
 
 /// Head-commit labels parsed from the push payload's head commit message.

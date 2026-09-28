@@ -1167,27 +1167,10 @@ pub(crate) fn reap_sweep_tx(tx: &mut TxState, sweep: ReapSweep) -> ReapSweepOutc
     }
 }
 
-fn count_run_statuses(statuses: impl IntoIterator<Item = ExecutionStatus>) -> (u32, u32, u32) {
-    let mut queued = 0;
-    let mut in_progress = 0;
-    let mut completed = 0;
-    for status in statuses {
-        match status {
-            ExecutionStatus::Queued => queued += 1,
-            ExecutionStatus::Pending | ExecutionStatus::InProgress => in_progress += 1,
-            ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Skipped
-            | ExecutionStatus::Cancelled => completed += 1,
-        }
-    }
-    (queued, in_progress, completed)
-}
-
 /// `ControlBackend::status_inputs` over the working set.
 pub(crate) fn status_inputs_tx(tx: &TxState, stale_after: std::time::Duration) -> StatusInputs {
     let (runs_queued, runs_in_progress, runs_completed) =
-        count_run_statuses(tx.runs.values().map(|run| run.status));
+        super::logic::count_run_statuses(tx.runs.values().map(|run| run.status));
     let mut runner_ids_by_run: BTreeMap<RunId, std::collections::BTreeSet<i64>> = BTreeMap::new();
     for (key, assignment) in &tx.job_assignments {
         if let Some(runner_id) = assignment.runner_id {

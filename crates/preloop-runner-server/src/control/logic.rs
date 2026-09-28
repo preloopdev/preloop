@@ -223,21 +223,29 @@ pub(crate) fn claim_preference(
         .or_else(|| candidates.iter().position(eligible))
 }
 /// Aggregate dependency status with GitHub's precedence: failure, cancelled,
-/// skipped, all-success; `None` means missing or non-terminal.
+/// skipped, all-success. `None` means the set is empty or *any* dependency is
+/// still non-terminal — a job's needs are undecided until every declared
+/// dependency reaches a terminal state, so a failure among unfinished needs
+/// does not conclude the aggregation early.
 pub(crate) fn aggregate_needs_status(statuses: &[ExecutionStatus]) -> Option<ExecutionStatus> {
+    if statuses.is_empty() || statuses.iter().any(|status| !status.is_terminal()) {
+        return None;
+    }
+    // Every status is terminal here; precedence decides the verdict.
     if statuses.contains(&ExecutionStatus::Failure) {
         Some(ExecutionStatus::Failure)
     } else if statuses.contains(&ExecutionStatus::Cancelled) {
         Some(ExecutionStatus::Cancelled)
     } else if statuses.contains(&ExecutionStatus::Skipped) {
         Some(ExecutionStatus::Skipped)
-    } else if !statuses.is_empty()
-        && statuses
-            .iter()
-            .all(|status| *status == ExecutionStatus::Success)
+    } else if statuses
+        .iter()
+        .all(|status| *status == ExecutionStatus::Success)
     {
         Some(ExecutionStatus::Success)
     } else {
+        // Terminal but none of the four — unreachable for the closed
+        // ExecutionStatus set; keep the total function honest.
         None
     }
 }
@@ -568,24 +576,31 @@ pub(crate) enum ConcurrencyAdmission {
 
 /// Decide hold admission. The backend performs the insert; this function
 /// decides the outcome from the existing holder, FIFO waiters, and the new
-/// arrival's cancel-in-progress flag. A same-run arrival is never cancelled.
+/// arrival's cancel-in-progress flag.
+///
+/// Same-run rules (matching `sched::try_acquire_concurrency`): a different job
+/// of the *same run* never grants admission on its own — with
+/// `cancel_in_progress` unset it waits behind the group like any other
+/// arrival. The same-run exclusion only suppresses *cancellation*: when the
+/// arrival does displace a holder (cancel-in-progress), a holder belonging to
+/// the same run is replaced without being cancelled.
 pub(crate) fn concurrency_admission(
     arrival: &ConcurrencyRow,
     holder: Option<&ConcurrencyRow>,
-    waiters: &[ConcurrencyRow],
 ) -> ConcurrencyAdmission {
-    if holder.is_none() {
+    let Some(current) = holder else {
         return ConcurrencyAdmission::Acquired;
-    }
-    if holder.is_some_and(|current| current.run_id == arrival.run_id) {
-        return ConcurrencyAdmission::Acquired;
-    }
+    };
     if arrival.cancel_in_progress {
-        return ConcurrencyAdmission::CancelCurrent(holder.cloned().expect("checked above"));
+        if current.run_id == arrival.run_id {
+            // Same run already holds the group: the new job takes over the hold
+            // with no cancellation emitted (the old holder is this same run).
+            return ConcurrencyAdmission::Acquired;
+        }
+        return ConcurrencyAdmission::CancelCurrent(current.clone());
     }
-    if waiters.iter().any(|waiter| waiter.run_id == arrival.run_id) {
-        return ConcurrencyAdmission::Waiting;
-    }
+    // No holder-free path and no cancel-in-progress: park regardless of
+    // whether a same-run waiter already exists — FIFO order decides.
     ConcurrencyAdmission::Waiting
 }
 
@@ -803,6 +818,26 @@ pub(crate) fn dependent_promotions(
         .collect()
 }
 
+/// Coarse `(queued, in_progress, completed)` run counts for status: `Queued`
+/// is queued, `Pending` (held) and `InProgress` are in progress, every
+/// terminal status is completed.
+pub(crate) fn count_run_statuses(
+    statuses: impl IntoIterator<Item = ExecutionStatus>,
+) -> (u32, u32, u32) {
+    let mut counts = (0, 0, 0);
+    for status in statuses {
+        match status {
+            ExecutionStatus::Queued => counts.0 += 1,
+            ExecutionStatus::Pending | ExecutionStatus::InProgress => counts.1 += 1,
+            ExecutionStatus::Success
+            | ExecutionStatus::Failure
+            | ExecutionStatus::Skipped
+            | ExecutionStatus::Cancelled => counts.2 += 1,
+        }
+    }
+    counts
+}
+
 #[cfg(test)]
 mod decision_tests {
     use super::*;
@@ -815,6 +850,20 @@ mod decision_tests {
     }
     fn labels(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn pending_runs_count_as_in_progress() {
+        let counts = count_run_statuses([
+            ExecutionStatus::Queued,
+            ExecutionStatus::Pending,
+            ExecutionStatus::InProgress,
+            ExecutionStatus::Success,
+            ExecutionStatus::Failure,
+            ExecutionStatus::Skipped,
+            ExecutionStatus::Cancelled,
+        ]);
+        assert_eq!(counts, (1, 2, 4));
     }
 
     fn starvation_candidate<'a>(
@@ -1047,7 +1096,7 @@ mod decision_tests {
             cancel_in_progress: false,
         };
         assert!(matches!(
-            concurrency_admission(&arrival, Some(&holder), &[]),
+            concurrency_admission(&arrival, Some(&holder)),
             ConcurrencyAdmission::CancelCurrent(_)
         ));
         assert_eq!(
@@ -1161,6 +1210,88 @@ mod decision_tests {
         });
         assert!(
             decision.replayed && decision.release_workflow_hold && !decision.promote_dependents
+        );
+    }
+
+    #[test]
+    fn aggregate_needs_status_waits_for_all_terminal() {
+        // Mixed terminal + non-terminal must not conclude: a failure among
+        // still-running needs does not aggregate early (the job cannot run
+        // until every dependency settles).
+        assert_eq!(
+            aggregate_needs_status(&[ExecutionStatus::Failure, ExecutionStatus::InProgress]),
+            None
+        );
+        assert_eq!(
+            aggregate_needs_status(&[ExecutionStatus::Success, ExecutionStatus::Pending]),
+            None
+        );
+        assert_eq!(aggregate_needs_status(&[]), None);
+        // All-terminal precedence still holds.
+        assert_eq!(
+            aggregate_needs_status(&[ExecutionStatus::Success, ExecutionStatus::Failure]),
+            Some(ExecutionStatus::Failure)
+        );
+        assert_eq!(
+            aggregate_needs_status(&[ExecutionStatus::Skipped, ExecutionStatus::Cancelled]),
+            Some(ExecutionStatus::Cancelled)
+        );
+        assert_eq!(
+            aggregate_needs_status(&[ExecutionStatus::Success, ExecutionStatus::Success]),
+            Some(ExecutionStatus::Success)
+        );
+    }
+
+    #[test]
+    fn concurrency_admission_same_run_waits_without_cancel_in_progress() {
+        // Two jobs of one run sharing a group: with cancel_in_progress unset
+        // the second job must WAIT on the group, not acquire it. The same-run
+        // exclusion only suppresses cancellation, never grants admission.
+        let holder = ConcurrencyRow {
+            group: "g".into(),
+            run_id: rid(1),
+            job_id: Some(jid("job-a")),
+            wait_id: 1,
+            cancel_in_progress: false,
+        };
+        let same_run_arrival = ConcurrencyRow {
+            group: "g".into(),
+            run_id: rid(1), // same run as the holder
+            job_id: Some(jid("job-b")),
+            wait_id: 2,
+            cancel_in_progress: false,
+        };
+        assert_eq!(
+            concurrency_admission(&same_run_arrival, Some(&holder)),
+            ConcurrencyAdmission::Waiting
+        );
+
+        // Same run + cancel_in_progress: the arrival takes over the hold with
+        // no CancelCurrent emitted for the same-run holder.
+        let cancelling_same_run = ConcurrencyRow {
+            cancel_in_progress: true,
+            ..same_run_arrival.clone()
+        };
+        assert_eq!(
+            concurrency_admission(&cancelling_same_run, Some(&holder)),
+            ConcurrencyAdmission::Acquired
+        );
+
+        // Different run + cancel_in_progress: holder is cancelled.
+        let foreign_cancel = ConcurrencyRow {
+            run_id: rid(2),
+            cancel_in_progress: true,
+            ..same_run_arrival.clone()
+        };
+        assert!(matches!(
+            concurrency_admission(&foreign_cancel, Some(&holder)),
+            ConcurrencyAdmission::CancelCurrent(_)
+        ));
+
+        // No holder: acquires regardless of run.
+        assert_eq!(
+            concurrency_admission(&same_run_arrival, None),
+            ConcurrencyAdmission::Acquired
         );
     }
 }

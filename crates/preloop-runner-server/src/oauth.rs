@@ -252,30 +252,26 @@ pub async fn oauth2_token(
 
     // Look up the runner and its public key
     let (runner_id, pubkey) = {
-        let cid = client_id.to_owned();
-        let looked_up = shared
-            .state
-            .backend
-            .read(move |tx| {
-                let id = tx.runner_client_ids.get(&cid).copied();
-                let pubkey = id.and_then(|id| tx.runner_rsa_public_keys.get(&id).cloned());
-                Ok((id, pubkey))
-            })
+        let backend = &shared.state.backend;
+        let Some(id) = backend
+            .runner_for_client(client_id)
             .await
-            .map_err(ApiError::from)?;
-        match looked_up {
-            (Some(id), Some(pubkey)) => (id, pubkey),
-            (Some(id), None) => {
-                return Err(ApiError::unauthorized(format!(
-                    "runner {id} missing registered public key"
-                )))
-            }
-            (None, _) => {
-                return Err(ApiError::unauthorized(format!(
-                    "client ID not registered: {client_id}"
-                )))
-            }
-        }
+            .map_err(ApiError::from)?
+        else {
+            return Err(ApiError::unauthorized(format!(
+                "client ID not registered: {client_id}"
+            )));
+        };
+        let Some(pubkey) = backend
+            .runner_rsa_public_key(id)
+            .await
+            .map_err(ApiError::from)?
+        else {
+            return Err(ApiError::unauthorized(format!(
+                "runner {id} missing registered public key"
+            )));
+        };
+        (id, pubkey)
     };
 
     // Verify signature
