@@ -25,6 +25,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use crate::control::backend::ControlBackend as _;
 use crate::dispatch_auth::DispatchIdentity;
 use crate::events::EventAdapter;
 use crate::events::trust_tier::TrustTier;
@@ -282,14 +283,7 @@ pub async fn list_actions_runs(
     let mut runs: Vec<crate::models::RunRecord> = shared
         .state
         .backend
-        .read(move |tx| {
-            Ok(tx
-                .runs
-                .values()
-                .filter(|run| run.submission.repository.eq_ignore_ascii_case(&repository))
-                .cloned()
-                .collect())
-        })
+        .runs_for_repository(&repository)
         .await
         .map_err(ApiError::from)?;
     // github.com lists the newest runs first.
@@ -564,34 +558,30 @@ async fn submit_and_report(
     let jobs = shared
         .state
         .backend
-        .read(move |tx| {
-            Ok(tx
-                .runs
-                .get(&run_id)
-                .map(|run| run.jobs.keys().cloned().collect::<Vec<_>>()))
-        })
+        .run_job_statuses(run_id)
         .await
         .map_err(ApiError::from)?;
     if let Some(jobs) = jobs {
-        for job_id in jobs {
+        for (job_id, _) in jobs {
             if let Err(error) =
                 crate::github::report_check_run_queued(shared, repository, sha, &job_id, run_id)
                     .await
             {
                 warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-            let jid = job_id.clone();
+            // Re-read after the (slow) GitHub call: the job may have settled
+            // meanwhile, and its completed check run must follow the queued one.
             let status = shared
                 .state
                 .backend
-                .read(move |tx| {
-                    Ok(tx
-                        .runs
-                        .get(&run_id)
-                        .and_then(|run| run.jobs.get(&jid).copied()))
-                })
+                .run_job_statuses(run_id)
                 .await
-                .map_err(ApiError::from)?;
+                .map_err(ApiError::from)?
+                .and_then(|jobs| {
+                    jobs.into_iter()
+                        .find(|(id, _)| *id == job_id)
+                        .map(|(_, status)| status)
+                });
             if let Some(status) = status.filter(|status| status.is_terminal()) {
                 crate::github::report_check_run_completed(shared, run_id, &job_id, status).await;
             }

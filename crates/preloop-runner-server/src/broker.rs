@@ -240,19 +240,6 @@ pub fn broker_job_ref_root(
     })
 }
 
-/// Allocate a session-unique broker message id that cannot collide with
-/// `request_id` values used as RunnerJobRequest messageIds.
-pub fn next_broker_message_id(tx: &mut crate::control::txstate::TxState) -> i64 {
-    // request_ids start at 1 and increase; keep message ids in a separate high
-    // range so cancels never reuse a past/future request_id.
-    const MESSAGE_ID_BASE: i64 = 1_000_000;
-    if tx.next_message_id < MESSAGE_ID_BASE {
-        tx.next_message_id = MESSAGE_ID_BASE;
-    }
-    tx.next_message_id += 1;
-    tx.next_message_id
-}
-
 /// Return the runner-compatible deprecation response used by the official
 /// message endpoint. `AccessDeniedException` with `errorCode: 1` is mapped by
 /// Runner.Listener to its `RunnerVersionDeprecated` exit code (7) when the
@@ -670,57 +657,6 @@ pub async fn authenticated_runner_id_for_job(
         ));
     }
     Ok(expected_runner_id)
-}
-
-pub fn ensure_broker_request_owner(
-    tx: &crate::control::txstate::TxState,
-    request_id: i64,
-    runner_id: i64,
-) -> Result<(), ControlError> {
-    // Prefer the immutable owner recorded when the request was claimed. This
-    // survives session teardown/rebind and keeps late broker retries bound to
-    // the runner that actually received the job.
-    if let Some(owner) = tx
-        .job_requests
-        .get(&request_id)
-        .and_then(|request| request.owner_runner_id)
-    {
-        return if owner == runner_id {
-            Ok(())
-        } else {
-            Err(ControlError::Forbidden(
-                "broker request belongs to another runner".to_owned(),
-            ))
-        };
-    }
-    let session_id =
-        tx.session_active_requests
-            .iter()
-            .find_map(|(session_id, active_request_id)| {
-                (*active_request_id == request_id).then_some(session_id.clone())
-            });
-    let has_session = session_id.is_some();
-    let owner = session_id.and_then(|sid| {
-        tx.broker_session_runners
-            .get(&sid)
-            .copied()
-            .or_else(|| tx.sessions.get(&sid).map(|s| s.runner_id))
-    });
-    match owner {
-        Some(owner) if owner == runner_id => Ok(()),
-        Some(_) => Err(ControlError::Forbidden(
-            "broker request belongs to another runner".to_owned(),
-        )),
-        // If the request is assigned to a session but the session is not in
-        // broker_session_runners or sessions (e.g. conformance replay with
-        // golden session IDs), accept it as long as the token's runner_id
-        // matches the path. This preserves backward compat for test/replay
-        // flows where session creation and broker paths use different IDs.
-        None if has_session => Ok(()),
-        None => Err(ControlError::NotFound(
-            "broker request is not assigned to a session".to_owned(),
-        )),
-    }
 }
 
 pub async fn next_message_broker_ref_root(
