@@ -128,7 +128,7 @@ async fn render_session_message(
             &mut msg,
             shared.state.secret_provider.as_ref(),
             &ctx.repository,
-            &ctx.run_secrets,
+            ctx.request.run_id,
         )
         .ok()?;
         // Merge the freshly resolved values (env-tier secrets included) into
@@ -598,21 +598,35 @@ pub fn task_result_status(result: azdo::TaskResult) -> ExecutionStatus {
     }
 }
 
-/// Mask job-completion annotations with the run's canonical secret masker
-/// before persisting them. Crash annotations (the official runner's
-/// worker-crash detail from `ForceFailJob`) embed worker stdout/stderr, which
-/// can contain secret values; the raw `JobCompletion` is the protocol boundary
-/// and is not safe to store or return as-is.
+/// Mask job-completion annotations before they are persisted or returned.
+/// Crash annotations (the official runner's worker-crash detail from
+/// `ForceFailJob`) embed worker stdout/stderr, which can contain secret
+/// values; the raw `JobCompletion` is the protocol boundary and is not safe
+/// to store or return as-is. Values come from the SecretProvider: every
+/// stored tier (over-masking another repository's value is harmless) plus
+/// this run's submission-supplied tier.
 pub(crate) fn mask_completion_annotations(
-    run: &RunRecord,
+    shared: &SharedState,
     completion: &JobCompletion,
-) -> Vec<serde_json::Value> {
-    preloop_gha_protocol::mask_annotations(
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let provider = shared.state.secret_provider.as_ref();
+    let provider_error = |error: anyhow::Error| {
+        ApiError::internal(format!(
+            "secret provider `{}` failed: {error}",
+            provider.name()
+        ))
+    };
+    let mut values = provider.resolve_all().map_err(provider_error)?;
+    values.extend(preloop_gha_protocol::masking::expose_values(
+        provider
+            .run_tier(completion.run_id)
+            .map_err(provider_error)?
+            .values(),
+    ));
+    Ok(preloop_gha_protocol::mask_annotations(
         completion.annotations.clone(),
-        preloop_gha_protocol::masking::expose_values(run.submission.secrets.values())
-            .iter()
-            .map(String::as_str),
-    )
+        values.iter().map(String::as_str),
+    ))
 }
 
 /// Map a `completejob` stepResult's status + conclusion to the run record's
@@ -677,7 +691,7 @@ pub(crate) use crate::control::types::AttemptSettle;
 /// event fan-out, terminal workspace cleanup.
 pub(crate) async fn complete_job_settling(
     shared: Arc<SharedState>,
-    completion: JobCompletion,
+    mut completion: JobCompletion,
     settle: Option<AttemptSettle>,
 ) -> Result<Json<RunRecord>, ApiError> {
     if !completion.status.is_terminal() {
@@ -685,6 +699,7 @@ pub(crate) async fn complete_job_settling(
             "job completion status must be terminal",
         ));
     }
+    completion.annotations = mask_completion_annotations(&shared, &completion)?;
     let outcome = shared
         .state
         .backend

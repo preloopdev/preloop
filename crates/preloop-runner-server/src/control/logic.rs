@@ -1705,15 +1705,11 @@ fn build_jobs<F>(
     condition_context: F,
 ) -> Result<Vec<BuiltJob>, ExecutionStatus>
 where
-    F: Fn(
-        &preloop_gha_protocol::JobPlan,
-        &BTreeMap<String, String>,
-    ) -> preloop_gha_expressions::Context,
+    F: Fn(&preloop_gha_protocol::JobPlan) -> preloop_gha_expressions::Context,
 {
     let base_url = crate::broker::runner_base_url();
     let normalized_github =
         preloop_gha_parser::job_builder::normalize_github_context(&ctx.github_json);
-    let secrets_exposed = preloop_gha_protocol::masking::expose_all(&ctx.submission.secrets);
     let mut built = Vec::with_capacity(plans.len());
     for plan in plans {
         let artifacts = crate::runs::build_job_artifacts(
@@ -1724,7 +1720,6 @@ where
             &ctx.workflow_ref,
             &ctx.head_sha,
             &normalized_github,
-            &secrets_exposed,
             &base_url,
             ctx.snapshot.as_ref(),
             plan,
@@ -1740,7 +1735,7 @@ where
         })?;
         built.push(BuiltJob {
             plan: plan.clone(),
-            condition_context: condition_context(plan, &secrets_exposed),
+            condition_context: condition_context(plan),
             artifacts,
         });
     }
@@ -1846,7 +1841,7 @@ fn build_reusable_expansion(
 
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
-    let jobs = build_jobs(shared, &ctx, &expanded.jobs, |plan, _secrets| {
+    let jobs = build_jobs(shared, &ctx, &expanded.jobs, |plan| {
         preloop_gha_parser::eval::build_context(
             &github_json,
             &BTreeMap::new(),
@@ -1902,7 +1897,7 @@ fn build_matrix_expansion(
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
     let submission_inputs = ctx.submission.inputs.clone();
-    let jobs = build_jobs(shared, &ctx, &plans, |plan, _secrets| {
+    let jobs = build_jobs(shared, &ctx, &plans, |plan| {
         preloop_gha_parser::eval::build_context(
             &github_json,
             &BTreeMap::new(),

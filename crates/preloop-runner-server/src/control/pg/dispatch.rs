@@ -3375,20 +3375,15 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
-        // The submission record minus secrets (`secret_refs` names them).
+        // The submission record. Secret values never reach the database
+        // (the SecretProvider holds them); clear defensively at the boundary.
         let mut stored_submission = (*record.submission).clone();
-        let secret_refs: serde_json::Value = stored_submission
-            .secrets
-            .keys()
-            .map(|name| (name.clone(), serde_json::json!({"scope": "run"})))
-            .collect::<serde_json::Map<_, _>>()
-            .into();
         stored_submission.secrets.clear();
         tx.execute(
             "INSERT INTO run_submissions (run_id, submission, github_context, \
-             workspace_snapshot, snapshot_timing, secret_refs) \
+             workspace_snapshot, snapshot_timing) \
              VALUES ($1::text::uuid,$2::text::jsonb,$3::text::jsonb,$4::text::jsonb,\
-             $5::text::jsonb,$6::text::jsonb)",
+             $5::text::jsonb)",
             &[
                 &run,
                 &json(&stored_submission)?,
@@ -3402,7 +3397,6 @@ impl PgBackend {
                     .snapshot_timing
                     .as_ref()
                     .map(|t| serde_json::to_string(t).unwrap_or_default()),
-                &secret_refs.to_string(),
             ],
         )
         .await
@@ -4631,10 +4625,8 @@ impl PgBackend {
             .await?
             .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
         sweep.graphs.insert(run_id, graph);
-        let annotations = {
-            let graph = sweep.graphs.get(&run_id).expect("loaded");
-            crate::distributed_task::mask_completion_annotations(&graph.record, &comp)
-        };
+        // The handler masked `comp.annotations` against the provider.
+        let annotations = comp.annotations.clone();
         let outputs: BTreeMap<String, serde_json::Value> = comp
             .outputs
             .iter()

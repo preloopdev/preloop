@@ -73,9 +73,8 @@ fn run_record(run_id: RunId) -> RunRecord {
 }
 
 /// Run equality via the full persisted JSON form. The fixture below contains
-/// only fields represented by the normalized run/job tables; secret values are
-/// covered by `secrets_survive_seal_unseal` and are resolved at acquire time
-/// by the new schema.
+/// only fields represented by the normalized run/job tables; secret values
+/// never reach the database (`secret_values_never_persist`).
 fn assert_same_run(actual: &RunRecord, expected: &RunRecord) {
     let mut actual = actual.clone();
     let mut expected = expected.clone();
@@ -708,18 +707,17 @@ pub(crate) mod suite {
         }
     }
 
-    pub(crate) async fn secrets_survive_seal_unseal(backend: &dyn ControlBackend) {
-        // Regression: a naive serde round-trip turns every SecretString into
-        // the literal "<redacted>". The run blob must carry real values.
+    /// Secret values are never written to the control database: a record
+    /// that still carries values (a caller bug) is stored without them, so
+    /// `run_record` returns an empty secrets map. Values live in the
+    /// SecretProvider and are resolved when a runner acquires the job.
+    pub(crate) async fn secret_values_never_persist(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let mut record = run_record(run_id);
-        let mut secrets = preloop_gha_protocol::SecretMap::new();
-        secrets.insert(
+        Arc::make_mut(&mut record.submission).secrets.insert(
             "TOKEN".to_owned(),
             preloop_gha_protocol::SecretString::new("s3cr3t-value"),
         );
-        Arc::make_mut(&mut record.submission).secrets = secrets;
-
         backend
             .submit_run(SubmitRun {
                 namespace: "default".to_owned(),
@@ -733,13 +731,10 @@ pub(crate) mod suite {
             .unwrap();
 
         let restored = backend.run_record(run_id).await.unwrap();
-        let secret = restored
-            .submission
-            .secrets
-            .get("TOKEN")
-            .expect("secret must survive the round-trip");
-        assert_eq!(secret.expose(), "s3cr3t-value");
-        assert_ne!(secret.expose(), "<redacted>");
+        assert!(
+            restored.submission.secrets.is_empty(),
+            "secret values must never round-trip through the control database"
+        );
     }
 
     pub(crate) async fn run_record_round_trips_through_tables(backend: &dyn ControlBackend) {
@@ -1435,36 +1430,10 @@ mod pg {
         suite::cancel_in_progress_submit_reports_surviving_depth(&backend).await;
     }
 
-    /// Secret names survive in `secret_refs`, but values are never
-    /// written to the control database: the submission is stored minus
-    /// secrets, so `run_record` returns an empty secrets map. Values are
-    /// resolved by the provider at acquire, not read back from here.
     #[tokio::test]
     async fn secret_values_never_persist() {
         let (_pg, backend) = backend().await;
-        let run_id = RunId::new();
-        let mut record = run_record(run_id);
-        Arc::make_mut(&mut record.submission).secrets.insert(
-            "TOKEN".to_owned(),
-            preloop_gha_protocol::SecretString::new("s3cr3t-value"),
-        );
-        backend
-            .submit_run(SubmitRun {
-                namespace: "default".to_owned(),
-                record,
-                jobs: vec![submit_job(run_id, "build", 1)],
-                workflow_concurrency: None,
-                empty_concurrency_group: false,
-                check_hostable: false,
-            })
-            .await
-            .unwrap();
-
-        let restored = backend.run_record(run_id).await.unwrap();
-        assert!(
-            restored.submission.secrets.is_empty(),
-            "secret values must never round-trip through the control database"
-        );
+        suite::secret_values_never_persist(&backend).await;
     }
 
     async fn submit_many(node: &PgBackend, count: usize) -> Vec<uuid::Uuid> {
@@ -1592,10 +1561,7 @@ mod pg {
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
 // The shared `suite::*` functions run against `LiteBackend` via
-// `&dyn ControlBackend`. Suite tests pinning the pre-M2 secrets-at-rest
-// model (`secrets_survive_seal_unseal`, `run_record_round_trips_through_tables`
-// via its sealed-secrets assertion) are excluded: M2 stores no secret
-// values (`secret_refs` names them; the provider resolves at acquire).
+// `&dyn ControlBackend`.
 mod lite {
     use super::suite;
     use crate::control::backend::ControlBackend;
@@ -1644,8 +1610,8 @@ mod lite {
     }
 
     #[tokio::test]
-    async fn secrets_survive_round_trip() {
-        suite::secrets_survive_seal_unseal(&LiteBackend::in_memory().unwrap()).await;
+    async fn secret_values_never_persist() {
+        suite::secret_values_never_persist(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

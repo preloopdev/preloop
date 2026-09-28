@@ -578,8 +578,18 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
             _ = interval.tick() => {
                 loop {
                     match shared.state.backend.archive_finished_runs(32).await {
-                        Ok(32) => continue,
-                        Ok(_) => break,
+                        Ok(archived) => {
+                            // Submission-supplied secrets live exactly as long
+                            // as the run's live rows.
+                            for run_id in &archived {
+                                if let Err(error) = shared.state.secret_provider.delete_run(*run_id) {
+                                    tracing::warn!(%run_id, %error, "failed to drop archived run's secrets");
+                                }
+                            }
+                            if archived.len() < 32 {
+                                break;
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(?error, "run history archive failed; will retry");
                             break;

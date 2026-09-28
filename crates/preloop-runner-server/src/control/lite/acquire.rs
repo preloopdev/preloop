@@ -90,11 +90,7 @@ impl LiteBackend {
                 .optional()
                 .map_err(db)?
                 .unwrap_or_default();
-            // The stored submission's secrets blob: submission-provided
-            // values merged over the submit-time repo/global snapshot —
-            // `fill_template` serves `spec.provided` names from it and falls
-            // back for names the provider no longer serves.
-            let stored_submission = tx
+            let trust_tier = tx
                 .prepare_cached("SELECT submission FROM run_submissions WHERE run_id = ?1")
                 .map_err(db)?
                 .query_row([&run], |row| row.get::<_, String>(0))
@@ -102,17 +98,11 @@ impl LiteBackend {
                 .map_err(db)?
                 .and_then(|json| {
                     serde_json::from_str::<preloop_gha_protocol::WorkflowSubmission>(&json).ok()
-                });
-            let trust_tier = stored_submission
-                .as_ref()
-                .and_then(|submission| submission.trust_tier.clone());
-            let run_secrets = stored_submission
-                .map(|submission| preloop_gha_protocol::masking::expose_all(&submission.secrets))
-                .unwrap_or_default();
+                })
+                .and_then(|submission| submission.trust_tier);
             Ok(AcquireContext {
                 request,
                 message,
-                run_secrets,
                 token_request,
                 id_token_granted,
                 repository,

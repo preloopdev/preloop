@@ -563,15 +563,18 @@ async fn run_apis_never_return_submitted_secret_values() {
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
-    // The server must still receive the real values: they are what the job runs with.
-    {
-        let inner = state.test_tx().await;
-        let run = inner.runs.get(&run_id.parse::<RunId>().unwrap()).unwrap();
-        assert_eq!(
-            run.submission.secrets["NPM_TOKEN"].expose(),
-            "npm_LIVE_CREDENTIAL"
-        );
-    }
+    // The job still runs with the real values: they sit in the provider's
+    // run tier, where acquire resolves them.
+    let run_uuid = run_id.parse::<RunId>().unwrap();
+    let resolved = state
+        .secret_provider
+        .resolve(crate::secret_provider::SecretScope {
+            repository: "owner/repo",
+            environment: None,
+            run_id: Some(run_uuid),
+        })
+        .unwrap();
+    assert_eq!(resolved["NPM_TOKEN"].expose(), "npm_LIVE_CREDENTIAL");
 
     // ...but no run-facing response may echo them back.
     for uri in [
@@ -584,10 +587,6 @@ async fn run_apis_never_return_submitted_secret_values() {
         assert!(
             !body.contains("npm_LIVE_CREDENTIAL") && !body.contains("deploy_LIVE_CREDENTIAL"),
             "{uri} leaked a secret value: {body}"
-        );
-        assert!(
-            body.contains("NPM_TOKEN"),
-            "{uri} should still expose secret names: {body}"
         );
     }
 }
@@ -24265,10 +24264,9 @@ jobs:
 // dimension at all.
 // ---------------------------------------------------------------------------
 
-/// Secrets must come back as themselves. `SecretString::Serialize` emits the
-/// literal `"<redacted>"`, so any persistence path that does not go through
-/// `WorkflowSubmission::to_request_json` silently substitutes the redaction
-/// marker for every secret and the resumed run authenticates with garbage.
+/// Secrets a submission supplies must come back as themselves after a
+/// restart — from the SecretProvider's sealed run tier, where acquire
+/// resolves them — and must never be written into the control database.
 #[tokio::test]
 async fn store_recovery_preserves_run_secrets() {
     let temp = tempfile::tempdir().unwrap();
@@ -24297,20 +24295,55 @@ async fn store_recovery_preserves_run_secrets() {
     };
 
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let inner = recovered.test_tx().await;
-    let secrets = &inner
-        .runs
-        .get(&run_id)
-        .expect("run survives restart")
-        .submission
-        .secrets;
+    assert_run_secrets_outside_database(&recovered, run_id, "owner/repo").await;
+    let provider = recovered.secret_provider.as_ref();
+    let resolved = provider
+        .resolve(crate::secret_provider::SecretScope {
+            repository: "owner/repo",
+            environment: None,
+            run_id: Some(run_id),
+        })
+        .unwrap();
     assert_eq!(
-        secrets.get("MY_TOKEN").map(|s| s.expose()),
-        Some("s3cr3t-value")
-    );
-    assert_eq!(
-        secrets.get("OTHER").map(|s| s.expose()),
+        resolved.get("OTHER").map(|s| s.expose()),
         Some("second-value")
+    );
+    // The SQLite files never hold a value, sealed or not.
+    for file in ["preloop.db", "preloop.db-wal"] {
+        if let Ok(bytes) = std::fs::read(temp.path().join(file)) {
+            for value in ["s3cr3t-value", "second-value"] {
+                assert!(
+                    !bytes.windows(value.len()).any(|w| w == value.as_bytes()),
+                    "{file} contains a submitted secret value"
+                );
+            }
+        }
+    }
+}
+
+/// Submission-supplied secrets survive a restart in the SecretProvider's run
+/// tier (where acquire resolves them) and never in the control database.
+async fn assert_run_secrets_outside_database(state: &AppState, run_id: RunId, repository: &str) {
+    let record = state
+        .backend
+        .run_record(run_id)
+        .await
+        .expect("run survives restart");
+    assert!(
+        record.submission.secrets.is_empty(),
+        "the control database must not hold secret values"
+    );
+    let resolved = state
+        .secret_provider
+        .resolve(crate::secret_provider::SecretScope {
+            repository,
+            environment: None,
+            run_id: Some(run_id),
+        })
+        .unwrap();
+    assert_eq!(
+        resolved.get("MY_TOKEN").map(|s| s.expose()),
+        Some("s3cr3t-value")
     );
 }
 
@@ -24426,8 +24459,8 @@ async fn postgres_concurrent_open_serializes_migrations() {
     assert!(second.is_ok(), "second opener failed: {:?}", second.err());
 }
 
-/// Postgres twin of `store_recovery_preserves_run_secrets`. The redaction bug
-/// lived in the shared serialization path, so both backends have to prove it.
+/// Postgres twin of `store_recovery_preserves_run_secrets`: values survive a
+/// restart in the provider's run tier, never in the shared database.
 #[tokio::test]
 async fn postgres_recovery_preserves_run_secrets() {
     let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
@@ -24469,18 +24502,7 @@ async fn postgres_recovery_preserves_run_secrets() {
     let recovered = AppState::new_with_store(temp.path().to_path_buf(), config_path, Some(&pg_url))
         .await
         .unwrap();
-    let inner = recovered.test_tx().await;
-    assert_eq!(
-        inner
-            .runs
-            .get(&run_id)
-            .expect("run survives restart")
-            .submission
-            .secrets
-            .get("MY_TOKEN")
-            .map(|s| s.expose()),
-        Some("s3cr3t-value")
-    );
+    assert_run_secrets_outside_database(&recovered, run_id, "owner/pg-secrets").await;
 }
 
 // ---------------------------------------------------------------------------

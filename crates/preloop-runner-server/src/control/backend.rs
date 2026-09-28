@@ -273,8 +273,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError>;
 
     /// Move a bounded batch of settled runs from active scheduling tables to
-    /// immutable job/attempt history in one transaction per batch.
-    async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError>;
+    /// immutable job/attempt history in one transaction per batch. Returns
+    /// the archived run ids (their run-tier secrets can be dropped).
+    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError>;
 
     /// Append one durable control event. This never reads or rewrites run
     /// state: the command that produced the event already committed it.
@@ -1411,7 +1412,7 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.terminal_jobs().await,
         }
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError> {
+    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
         match self {
             Self::Sqlite(b) => b.archive_finished_runs(limit).await,
             Self::Postgres(b) => b.archive_finished_runs(limit).await,

@@ -405,13 +405,8 @@ impl LiteBackend {
                 }
                 attempt = Some(request_id);
             }
-            // Mask annotations with the run's stored (redacted) secrets —
-            // the values are unavailable at rest, so this strips only what
-            // plaintext the submission still carries.
-            let annotations = {
-                let record = jobs::run_record(tx, run_id)?.expect("existence checked");
-                crate::distributed_task::mask_completion_annotations(&record, &comp)
-            };
+            // The handler masked `comp.annotations` against the provider.
+            let annotations = comp.annotations.clone();
             let outputs: BTreeMap<String, serde_json::Value> = comp
                 .outputs
                 .iter()

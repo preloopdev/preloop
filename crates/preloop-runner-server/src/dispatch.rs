@@ -15,7 +15,7 @@
 //! (workflow exists but is not `workflow_dispatch`-triggered), 422 (input
 //! validation, missing `event_type`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -503,7 +503,6 @@ fn submission_from_effective(
         local_workspace: None,
         vars: BTreeMap::new(),
         secrets: BTreeMap::new(),
-        submission_names: BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
         reusable_workflow_shas: BTreeMap::new(),
         enable_debugger: false,

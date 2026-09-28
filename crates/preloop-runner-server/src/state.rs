@@ -1095,9 +1095,12 @@ impl AppState {
             env: config.env_secrets,
             environments: config.environments,
         }));
-        let secret_provider: Arc<dyn crate::secret_provider::SecretProvider> = Arc::new(
-            crate::secret_provider::BuiltinSecretProvider::new(secrets.clone()),
-        );
+        let secret_provider: Arc<dyn crate::secret_provider::SecretProvider> =
+            Arc::new(crate::secret_provider::BuiltinSecretProvider::new(
+                secrets.clone(),
+                state_dir.join("run-secrets"),
+                crate::store::Envelope::new(&local_jwt_key),
+            ));
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let mut pr_config = config.github.pr.clone();

@@ -221,7 +221,7 @@ pub(crate) fn plan_fields(agent_job_id: uuid::Uuid) -> (String, String) {
 }
 /// Everything `acquirejob` needs in one read: the request record, its stored
 /// job-message TEMPLATE (secrets/tokens stripped; `preloop_secret_spec`
-/// carries what to resolve), the run's stored secret map, the id-token grant
+/// carries what to resolve through the SecretProvider), the id-token grant
 /// and the deferred token-mint request.
 #[derive(Debug)]
 pub(crate) struct AcquireContext {
@@ -230,11 +230,6 @@ pub(crate) struct AcquireContext {
     /// The caller resolves `preloop_secret_spec` and fills it in memory —
     /// the filled message must never be written back.
     pub(crate) message: azdo::AgentJobRequestMessage,
-    /// The run's stored secret map (`secrets_blob`): submission-provided
-    /// values merged over the submit-time repo/global tiers. The fill path
-    /// uses it for `spec.provided` names and as the fallback for names the
-    /// provider no longer serves.
-    pub(crate) run_secrets: std::collections::BTreeMap<String, String>,
     pub(crate) token_request: Option<crate::models::GitHubTokenRequest>,
     /// `id_token_grants` row for the attempt's job: `Some` = recorded grant,
     /// `None` = no row (the caller falls back to wire markers).

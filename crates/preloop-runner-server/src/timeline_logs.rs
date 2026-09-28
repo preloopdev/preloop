@@ -350,13 +350,9 @@ pub async fn mask_log_bytes_cached(
 
     // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
     // only when the plan mapped to a concrete run row, so the fallback
-    // union is never cached as if it were the run's real masker.
-    // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
-    // only when the plan mapped to a concrete run row, so the fallback
-    // union is never cached as if it were the run's real masker. Secret
-    // values come from the SecretProvider (the submission row no longer
-    // stores values); provided names already sit in `plan_secret_masker`
-    // from submit, so a resolved run also unions every node-cached entry.
+    // union is never cached as if it were the run's real masker. Values come
+    // from the SecretProvider (run > repo > global); environment-tier values
+    // join the node cache when a job is acquired.
     let resolved_run_id = shared
         .state
         .backend
@@ -369,15 +365,18 @@ pub async fn mask_log_bytes_cached(
     let provider = shared.state.secret_provider.as_ref();
     let (secrets, resolved) = match resolved_run_id {
         Some(run_id) => {
-            let record = shared.state.backend.run_record(run_id).await.ok();
-            let repository = record
-                .as_ref()
+            let repository = shared
+                .state
+                .backend
+                .run_record(run_id)
+                .await
                 .map(|record| record.submission.repository.clone())
                 .unwrap_or_default();
             let mut values: Vec<String> = provider
                 .resolve(crate::secret_provider::SecretScope {
                     repository: &repository,
                     environment: None,
+                    run_id: Some(run_id),
                 })
                 .map(|map| {
                     preloop_gha_protocol::masking::expose_all(&map)
@@ -385,14 +384,6 @@ pub async fn mask_log_bytes_cached(
                         .collect()
                 })
                 .unwrap_or_default();
-            // Backends that still persist the sealed submission blob (lite)
-            // can serve provided values after a restart; pg keeps none.
-            if let Some(record) = record {
-                values.extend(
-                    preloop_gha_protocol::masking::expose_all(&record.submission.secrets)
-                        .into_values(),
-                );
-            }
             values.sort();
             values.dedup();
             (values, true)

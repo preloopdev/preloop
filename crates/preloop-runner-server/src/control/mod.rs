@@ -26,7 +26,6 @@ pub mod backend;
 pub(crate) mod lite;
 pub(crate) mod logic;
 pub(crate) mod pg;
-pub mod rows;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -837,26 +837,24 @@ impl PgBackend {
             .await
             .map_err(db)?
             .map(|row| row.get(0));
-        let repository = client
+        let (repository, trust_tier): (String, Option<String>) = client
             .query_opt(
-                "SELECT repository FROM runs WHERE run_id=$1::text::uuid",
+                "SELECT r.repository, s.submission->>'trust_tier' \
+                 FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
+                 WHERE r.run_id=$1::text::uuid",
                 &[&request.run_id.0.to_string()],
             )
             .await
             .map_err(db)?
-            .map(|row| row.get(0))
+            .map(|row| (row.get(0), row.get(1)))
             .unwrap_or_default();
         Ok(AcquireContext {
             request,
             message,
-            // No secret values at rest in the new schema: the fill path
-            // resolves everything from the provider; `provided` names the
-            // worker trusts come from the caller's request, not storage.
-            run_secrets: std::collections::BTreeMap::new(),
             token_request,
             id_token_granted: grant,
             repository,
-            trust_tier: None,
+            trust_tier,
         })
     }
 
@@ -1026,7 +1024,10 @@ impl PgBackend {
     /// 'completed' AND completed_at <= now() - 60s AND NOT EXISTS (pending
     /// push-back state) ORDER BY completed_at LIMIT $1 FOR UPDATE SKIP
     /// LOCKED`; four `INSERT INTO *_history .. SELECT`; `DELETE FROM runs`.
-    pub(super) async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError> {
+    pub(super) async fn archive_finished_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         let limit = codec::limit(limit);
@@ -1044,7 +1045,7 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-        let mut archived = 0usize;
+        let mut archived = Vec::new();
         for row in runs {
             let run_id: String = row.get(0);
             tx.execute(
@@ -1110,10 +1111,13 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-            archived += tx
+            let deleted = tx
                 .execute("DELETE FROM runs WHERE run_id = $1::text::uuid", &[&run_id])
                 .await
-                .map_err(db)? as usize;
+                .map_err(db)?;
+            if deleted > 0 {
+                archived.push(codec::run_id(&run_id)?);
+            }
         }
         tx.commit().await.map_err(db)?;
         Ok(archived)

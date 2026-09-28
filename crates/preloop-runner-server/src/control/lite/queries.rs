@@ -599,7 +599,10 @@ impl LiteBackend {
     /// cascades). A candidate completed at least a minute ago, has no
     /// in-flight attempt, no session-bound attempt, no undelivered
     /// cancellation, and no push state that echo dedup may still need.
-    pub(crate) async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError> {
+    pub(crate) async fn archive_finished_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError> {
         self.write(|tx| {
             let now = now_us();
             let run_ids: Vec<String> = {
@@ -682,7 +685,7 @@ impl LiteBackend {
                         .map_err(db)?;
                 }
             }
-            Ok(run_ids.len())
+            Ok(run_ids.iter().map(|run| codec::run_id(run)).collect())
         })
     }
 }

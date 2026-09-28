@@ -2755,7 +2755,6 @@ async fn process_delivery_payload_with_lease(
                 local_workspace: None,
                 vars: BTreeMap::new(),
                 secrets: BTreeMap::new(),
-                submission_names: BTreeSet::new(),
                 reusable_workflows: BTreeMap::new(),
                 reusable_workflow_shas: BTreeMap::new(),
                 enable_debugger: false,

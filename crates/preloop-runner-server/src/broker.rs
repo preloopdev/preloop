@@ -823,7 +823,7 @@ pub async fn broker_acquire_job(
         &mut message,
         shared.state.secret_provider.as_ref(),
         &ctx.repository,
-        &ctx.run_secrets,
+        ctx.request.run_id,
     )
     .map_err(|error| ApiError::internal(format!("fill job message template: {error}")))?;
     if !filled.names.is_empty() {

@@ -365,6 +365,56 @@ pub async fn warm_pat_scope_cache(pat: &str) {
                 "PRELOOP_GITHUB_TOKEN was rejected by the GitHub API at startup; jobs keep the \
                  job-scoped runtime token and any step that needs GitHub fails."
             );
+fn secret_provider_error(shared: &SharedState, error: anyhow::Error) -> ApiError {
+    ApiError::internal(format!(
+        "secret provider `{}` failed: {error}",
+        shared.state.secret_provider.name()
+    ))
+}
+
+/// A submission's run-tier secrets, written before the run commits and
+/// deleted again on drop unless [`RunSecretsGuard::keep`] marks the run as
+/// committed (a failed build, a rejected submit, or a replayed webhook that
+/// resolved to an existing run all leave no values behind).
+struct RunSecretsGuard<'a> {
+    provider: &'a dyn crate::secret_provider::SecretProvider,
+    run_id: RunId,
+    armed: bool,
+}
+
+impl<'a> RunSecretsGuard<'a> {
+    fn put(
+        provider: &'a dyn crate::secret_provider::SecretProvider,
+        run_id: RunId,
+        secrets: &preloop_gha_protocol::SecretMap,
+    ) -> Result<Self, ApiError> {
+        let armed = !secrets.is_empty();
+        if armed {
+            provider.put_run(run_id, secrets).map_err(|error| {
+                ApiError::internal(format!(
+                    "secret provider `{}` failed to store run secrets: {error}",
+                    provider.name()
+                ))
+            })?;
+        }
+        Ok(Self {
+            provider,
+            run_id,
+            armed,
+        })
+    }
+
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunSecretsGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(error) = self.provider.delete_run(self.run_id) {
+                tracing::warn!(run_id = %self.run_id, %error, "failed to drop run secrets of an uncommitted run");
+            }
         }
     }
 }
@@ -731,39 +781,16 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             object.insert("inputs".to_owned(), inputs_value);
         }
     }
-    // Native submissions carry no trust tier (the webhook path sets it) and
-    // pass secrets through unmodified — None is therefore trusted. Mirror
-    // GitHub org/repo/environment secrets: stored secrets are available to
-    // every trusted job, with submission-provided values winning per name.
-    let allow_secrets = submission_allows_secrets(&submission);
-    if !allow_secrets {
-        submission.secrets.clear();
+    // Native submissions carry no trust tier (the webhook path sets it) —
+    // None is therefore trusted. Caller-supplied secret values never ride
+    // on the run: they move into the SecretProvider's run tier once the run
+    // id exists (below), and untrusted tiers receive none at all.
+    let provided_secrets = std::mem::take(&mut submission.secrets);
+    let provided_secrets = if submission_allows_secrets(&submission) {
+        provided_secrets
     } else {
-        // Precedence per name: submission-provided > stored tiers (resolved
-        // by the provider as repo > global) — mirroring GitHub, where repo
-        // secrets override org secrets of the same name.
-        let stored = shared
-            .state
-            .secret_provider
-            .resolve(crate::secret_provider::SecretScope {
-                repository: &submission.repository,
-                environment: None,
-            })
-            .map_err(|error| {
-                ApiError::internal(format!(
-                    "secret provider `{}` failed: {error}",
-                    shared.state.secret_provider.name()
-                ))
-            })?;
-        let submission_names: BTreeSet<String> = submission.secrets.keys().cloned().collect();
-        // Remember the caller-provided names so per-job environment overlays
-        // (applied later, in `build_job_artifacts`) keep these values
-        // winning per name over the stored environment tier.
-        submission.submission_names = submission_names;
-        for (name, value) in stored {
-            submission.secrets.entry(name).or_insert(value);
-        }
-    }
+        Default::default()
+    };
     let secrets_ms = t_parse.elapsed().as_secs_f64() * 1000.0 - remote_ms;
     let (branch, tag) = {
         let (default_branch, default_tag) = git_ref_context(&submission.git_ref);
@@ -985,6 +1012,14 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     }
 
     let run_id = RunId::new();
+    // Durable before the run commits: any node may acquire its jobs later.
+    // Dropped again unless the submit commits a new run.
+    let run_secrets = RunSecretsGuard::put(
+        shared.state.secret_provider.as_ref(),
+        run_id,
+        &provided_secrets,
+    )?;
+    drop(provided_secrets);
     let repository_owner = submission
         .repository
         .split('/')
@@ -1477,8 +1512,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // `submit_run` transaction below.
     let base_url = runner_base_url();
     let normalized_github = preloop_gha_parser::job_builder::normalize_github_context(&github);
-    let secrets_exposed: BTreeMap<String, String> =
-        preloop_gha_protocol::masking::expose_all(&submission.secrets);
+    // Every value this run's jobs can see (run > repo > global), for the
+    // masker cache only; the builder below takes names.
+    let secrets_exposed: BTreeMap<String, String> = if submission_allows_secrets(&submission) {
+        preloop_gha_protocol::masking::expose_all(
+            &shared
+                .state
+                .secret_provider
+                .resolve(crate::secret_provider::SecretScope {
+                    repository: &submission.repository,
+                    environment: None,
+                    run_id: Some(run_id),
+                })
+                .map_err(|error| secret_provider_error(shared, error))?,
+        )
+    } else {
+        BTreeMap::new()
+    };
 
     struct PrebuiltJob {
         job: preloop_gha_protocol::JobPlan,
@@ -1572,7 +1622,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             &workflow_ref,
             &sha,
             &normalized_github,
-            &secrets_exposed,
             &base_url,
             workspace_snapshot.as_ref(),
             &job,
@@ -1760,10 +1809,10 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             });
         }
 
-        // Masker cache: provided + merged secret values for this run, keyed
-        // by run_id (log URI scope) and by every job's agent_job_id (the
-        // runner-facing plan id). `mask_log_bytes_cached` reads these so no
-        // secret blob is ever read back at log-append time.
+        run_secrets.keep();
+        // Masker cache: every value this run's jobs can see, keyed by run_id
+        // (log URI scope) and by every job's agent_job_id (the runner-facing
+        // plan id), so log appends need no provider round trip.
         if !secrets_exposed.is_empty() {
             let values = Arc::new(secrets_exposed.values().cloned().collect::<Vec<String>>());
             let mut inner = shared.state.inner.lock().await;
@@ -2143,8 +2192,7 @@ fn job_source_identity(
 /// runtime expansion of reusable-workflow callee subtrees (which cannot be
 /// built at submission: they exist only after the caller's `if:` gate passes).
 /// Names only — the built message is a secret-free template; values are
-/// resolved through the SecretProvider at acquire. `secrets_exposed` callers
-/// pass the run's merged map; this function reads only its keys.
+/// resolved through the SecretProvider at acquire.
 #[allow(clippy::too_many_arguments)]
 pub fn build_job_artifacts(
     shared: &SharedState,
@@ -2154,7 +2202,6 @@ pub fn build_job_artifacts(
     workflow_ref: &str,
     sha: &str,
     normalized_github: &serde_json::Value,
-    secrets_exposed: &BTreeMap<String, String>,
     base_url: &str,
     workspace_snapshot: Option<&WorkspaceSnapshot>,
     job: &preloop_gha_protocol::JobPlan,
@@ -2201,42 +2248,25 @@ pub fn build_job_artifacts(
     }
 
     // Environment secrets are per-job: a job's `environment:` selects the
-    // tier, so the overlay happens here, not in the submission-level merge.
-    // Precedence per name: submission-provided > environment > repo > global,
-    // mirroring GitHub's env-over-repo-over-org rule with the local
-    // `--secret` escape hatch kept on top. Only the NAME SET matters: the
-    // stored message is a secret-free template and the fill path re-resolves
-    // values at acquire through the provider, so this block keeps only keys.
-    let mut env_overlay: Option<BTreeSet<String>> = None;
-    if policy.allows_secrets {
-        if let Some(env_name) = job.oidc_environment.as_deref() {
-            let scoped = shared
-                .state
-                .secret_provider
-                .resolve(crate::secret_provider::SecretScope {
-                    repository: &submission.repository,
-                    environment: Some(env_name),
-                })
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "secret provider `{}` failed: {error}",
-                        shared.state.secret_provider.name()
-                    ))
-                })?;
-            // `scoped` is env > repo > global by name; submission-provided
-            // names keep winning over the environment tier.
-            let mut merged: BTreeSet<String> = secrets_exposed.keys().cloned().collect();
-            for name in scoped.keys() {
-                if !submission.submission_names.contains(name) {
-                    merged.insert(name.clone());
-                }
-            }
-            env_overlay = Some(merged);
-        }
-    }
-    let merged_names: BTreeSet<String> = env_overlay
-        .clone()
-        .unwrap_or_else(|| secrets_exposed.keys().cloned().collect());
+    // tier. Precedence per name is run > environment > repo > global
+    // (resolved by the provider). Only the NAME SET matters here: the stored
+    // message is a secret-free template and the fill path re-resolves values
+    // at acquire.
+    let merged_names: BTreeSet<String> = if policy.allows_secrets {
+        shared
+            .state
+            .secret_provider
+            .resolve(crate::secret_provider::SecretScope {
+                repository: &submission.repository,
+                environment: job.oidc_environment.as_deref(),
+                run_id: Some(run_id),
+            })
+            .map_err(|error| secret_provider_error(shared, error))?
+            .into_keys()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
 
     // The builder needs secret *names* (for `secrets.*` contexts and
     // `secrets: inherit` key sets) but never values — the stored message is
@@ -2501,18 +2531,8 @@ pub fn build_job_artifacts(
     // snapshot credentials (`redirect_primary_checkout` minted a pinned
     // token so the template records WHERE it goes, not its value). The spec
     // rides inside the template so the fill path is self-contained.
-    let provided: BTreeSet<String> = submission
-        .submission_names
-        .iter()
-        .filter(|name| merged_names.contains(*name))
-        .cloned()
-        .collect();
     agent_msg.preloop_secret_spec = if policy.allows_secrets {
-        Some(crate::message_template::secret_spec_for(
-            job,
-            &merged_names,
-            &provided,
-        ))
+        Some(crate::message_template::secret_spec_for(job, &merged_names))
     } else {
         // A secrets-denied job still carries an explicit (empty) spec so the
         // fill path injects only tokens — never treated as a legacy
@@ -3396,13 +3416,20 @@ pub async fn rerun_run_inner(
     run_id: RunId,
     reused_check_run: Option<(JobId, u64)>,
 ) -> Result<RunAccepted, ApiError> {
-    let submission = shared
+    let mut submission = shared
         .state
         .backend
         .run_record(run_id)
         .await
         .map(|run| (*run.submission).clone())
         .map_err(ApiError::from)?;
+    // A re-run sees the values the original submission supplied; they live
+    // in the provider's run tier until the original run is archived.
+    submission.secrets = shared
+        .state
+        .secret_provider
+        .run_tier(run_id)
+        .map_err(|error| secret_provider_error(shared, error))?;
     let accepted = submit_run_inner(shared, submission).await?;
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {

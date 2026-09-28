@@ -709,17 +709,10 @@ fn insert_run_row(
         .execute(params![codec::run_key(record.run_id)])
         .map_err(db)?;
     }
-    // Submission is stored WITH its secrets: the single-node SQLite
-    // backend keeps the sealed-at-rest values so acquire (`run_secrets`) and
-    // the log masker (`run_record`) survive a restart. The agreed
-    // `secret_refs` column still names them (`{name: scope}`).
-    let secret_refs: serde_json::Value = record
-        .submission
-        .secrets
-        .keys()
-        .map(|name| (name.clone(), serde_json::json!({"scope": "run"})))
-        .collect::<serde_json::Map<_, _>>()
-        .into();
+    // Secret values never reach the database (the SecretProvider holds
+    // them); clear defensively at the boundary.
+    let mut stored_submission = (*record.submission).clone();
+    stored_submission.secrets.clear();
     let details = serde_json::json!({
         "job_base_ids": record.job_base_ids,
         "job_names": record.job_names,
@@ -733,8 +726,8 @@ fn insert_run_row(
     });
     tx.prepare_cached(
         "INSERT INTO run_submissions (run_id, submission, github_context, \
-             workspace_snapshot, snapshot_timing, secret_refs, record_details) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7) \
+             workspace_snapshot, snapshot_timing, record_details) \
+         VALUES (?1,?2,?3,?4,?5,?6) \
          ON CONFLICT (run_id) DO UPDATE SET submission = excluded.submission, \
              github_context = excluded.github_context, \
              workspace_snapshot = excluded.workspace_snapshot, \
@@ -744,8 +737,7 @@ fn insert_run_row(
     .map_err(db)?
     .execute(params![
         codec::run_key(record.run_id),
-        record
-            .submission
+        stored_submission
             .to_request_json()
             .map_err(|e| { ControlError::backend(anyhow::anyhow!("submission encode: {e}")) })?
             .to_string(),
@@ -758,7 +750,6 @@ fn insert_run_row(
             .snapshot_timing
             .as_ref()
             .map(|timing| serde_json::to_string(timing).unwrap_or_default()),
-        secret_refs.to_string(),
         details.to_string(),
     ])
     .map_err(db)?;

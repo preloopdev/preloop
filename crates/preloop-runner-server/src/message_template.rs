@@ -5,9 +5,9 @@
 //! build_job_artifacts` with secret *names* only — values are structurally
 //! absent) plus a `preloop_secret_spec` inside it saying what to resolve.
 //! When a runner claims the job, [`fill_template`] resolves real values
-//! through the [`SecretProvider`] (with the run's stored secret map as the
-//! submission-provided/fallback tier) and stamps them into the in-memory
-//! message — which is then discarded, never written back.
+//! through the [`SecretProvider`] (run > environment > repository > global)
+//! and stamps them into the in-memory message — which is then discarded,
+//! never written back.
 //!
 //! Tokens (`system.github.token`, `github_token`) arrive already minted per
 //! claim via [`template_token_fill`] — the broker mints a fresh App token or
@@ -41,17 +41,11 @@ pub(crate) struct FillOutcome {
 
 /// Build the [`MessageSecretSpec`] for a job at submit.
 ///
-/// `names` is the caller-scope name set (post env-overlay); `provided` is the
-/// subset the submission itself supplied. Reusable callees never come through
+/// `names` is the caller-scope name set. Reusable callees never come through
 /// here carrying a name set — their surface is `inherit`/`map` on `job`.
-pub(crate) fn secret_spec_for(
-    job: &JobPlan,
-    names: &BTreeSet<String>,
-    provided: &BTreeSet<String>,
-) -> MessageSecretSpec {
+pub(crate) fn secret_spec_for(job: &JobPlan, names: &BTreeSet<String>) -> MessageSecretSpec {
     MessageSecretSpec {
         names: names.clone(),
-        provided: provided.clone(),
         environment: job.oidc_environment.clone(),
         inherit: job.workflow_file.is_some() && job.secrets_inherit,
         map: if job.workflow_file.is_some() && !job.secrets_inherit {
@@ -103,10 +97,8 @@ pub(crate) fn strip_template(msg: &mut AgentJobRequestMessage, secret_hints: usi
 
 /// Fill a stored template with the secret surface its spec describes.
 ///
-/// `repository` scopes the provider call; `stored` is the run's sealed
-/// `secrets_blob` map — the submission-provided tier plus the submit-time
-/// merged repo/global snapshot, used for `spec.provided` names (they beat the
-/// live provider) and as fallback for names the provider no longer serves.
+/// `repository` and `run_id` scope the provider call: the run tier holds the
+/// values the submission supplied, outranking every stored tier.
 ///
 /// `None` spec = pre-M2 fully-formed message: filled as-is (no secret slot
 /// exists to populate) and `spec` left `None`.
@@ -114,44 +106,30 @@ pub(crate) fn fill_template(
     msg: &mut AgentJobRequestMessage,
     provider: &dyn SecretProvider,
     repository: &str,
-    stored: &BTreeMap<String, String>,
+    run_id: preloop_gha_protocol::RunId,
 ) -> anyhow::Result<FillOutcome> {
     let Some(spec) = msg.preloop_secret_spec.clone() else {
         return Ok(FillOutcome::default());
     };
 
-    // Resolve the scope once: env > repo > global, merged by the provider.
+    // Resolve the scope once: run > env > repo > global, merged by the
+    // provider.
     let scoped = provider.resolve(SecretScope {
         repository,
         environment: spec.environment.as_deref(),
+        run_id: Some(run_id),
     })?;
     let scoped: BTreeMap<String, String> = preloop_gha_protocol::masking::expose_all(&scoped);
 
-    // Value precedence per name: submission-provided (stored) > provider
-    // (fresh, env-aware) > stored merged snapshot.
-    let lookup = |name: &str| -> Option<String> {
-        if spec.provided.contains(name) {
-            stored.get(name).cloned()
-        } else {
-            scoped
-                .get(name)
-                .cloned()
-                .or_else(|| stored.get(name).cloned())
-        }
+    let mut resolved: BTreeMap<String, String> = if spec.inherit {
+        // `secrets: inherit`: every name in scope.
+        scoped.clone()
+    } else {
+        BTreeMap::new()
     };
-
-    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
-    if spec.inherit {
-        // `secrets: inherit`: every name in scope + every provided name.
-        for name in scoped.keys().chain(stored.keys()).collect::<BTreeSet<_>>() {
-            if let Some(value) = lookup(name) {
-                resolved.insert(name.clone(), value);
-            }
-        }
-    }
     for name in &spec.names {
-        if let Some(value) = lookup(name) {
-            resolved.insert(name.clone(), value);
+        if let Some(value) = scoped.get(name) {
+            resolved.insert(name.clone(), value.clone());
         }
     }
     if !spec.map.is_empty() {

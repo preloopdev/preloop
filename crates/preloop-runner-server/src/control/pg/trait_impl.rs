@@ -116,7 +116,7 @@ impl ControlBackend for PgBackend {
     ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError> {
         self.terminal_jobs().await
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<usize, ControlError> {
+    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
         self.archive_finished_runs(limit).await
     }
     async fn append_event(&self, event: &NdjsonEvent) -> Result<(), ControlError> {

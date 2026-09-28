@@ -255,11 +255,9 @@ pub struct AgentJobRequestMessage {
 /// - `names`: caller-scope secret names the job receives verbatim as
 ///   `variables[<name>]` secret entries (regular jobs; reusable calls with
 ///   `secrets: inherit` set `inherit` instead).
-/// - `provided`: the subset of `names` the submission itself supplied —
-///   submission values beat every stored tier even across restarts.
 /// - `environment`: the job's resolved `environment:` name, i.e. the
 ///   SecretProvider scope tier `names` resolve against.
-/// - `inherit`: take every resolved scope + submission name (callee of
+/// - `inherit`: take every name resolved in scope (callee of
 ///   `secrets: inherit`).
 /// - `map`: reusable-call `secrets:` mapping — callee name -> caller-side
 ///   expression string, evaluated at fill time.
@@ -272,8 +270,6 @@ pub struct AgentJobRequestMessage {
 pub struct MessageSecretSpec {
     /// Names resolved through the SecretProvider scope at acquire.
     pub names: std::collections::BTreeSet<String>,
-    /// Names whose value the submission provided (overrides every tier).
-    pub provided: std::collections::BTreeSet<String>,
     /// Deployment-environment tier name for provider scope resolution.
     pub environment: Option<String>,
     /// Reusable call with `secrets: inherit` — fill with every resolved name.
