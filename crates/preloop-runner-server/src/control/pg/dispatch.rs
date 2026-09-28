@@ -13,9 +13,13 @@ use super::codec::{self, from_json, json, now_us, us};
 use super::graph::{self, queue_state_str, Node, NodeKind, ReusableNodeSpec, RunGraph};
 use super::{db, lookups, PgBackend};
 use crate::concurrency;
+use crate::control::backend::PollRequest;
 use crate::control::logic;
-use crate::control::types::{status_str, ControlError, SubmitJob, SubmitOutcome, SubmitRun};
-use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
+use crate::control::types::{
+    status_str, ClaimedJob, ControlError, PollOutcome, SessionMessage, SubmitJob, SubmitOutcome,
+    SubmitRun,
+};
+use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use crate::runtime_scheduling::{self as sched_helpers, DependencyDecision, SchedulingOutcome};
 use crate::state::JobSetGate;
 use preloop_gha_parser::ConcurrencyQueue;
@@ -3371,5 +3375,467 @@ impl PgBackend {
             )),
             None => Ok(None),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Claim path
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One session row's identity as the claim path needs it.
+pub(super) struct SessionRef {
+    pub(crate) session_uuid: String,
+    pub(crate) runner_id: Option<i64>,
+    pub(crate) protocol: &'static str,
+    pub(crate) live: bool,
+}
+
+impl PgBackend {
+    /// The session's row (mapped id), or `None` when it is unknown/expired.
+    pub(super) async fn session_ref(
+        &self,
+        tx: &Transaction<'_>,
+        session_id: &str,
+    ) -> Result<Option<SessionRef>, ControlError> {
+        let uuid = logic::session_uuid(session_id).to_string();
+        Ok(tx
+            .query_opt(
+                "SELECT runner_id, protocol FROM runner_sessions WHERE session_id = $1::text::uuid",
+                &[&uuid],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| SessionRef {
+                session_uuid: uuid,
+                runner_id: row.get(0),
+                protocol: match row.get::<_, String>(1).as_str() {
+                    "broker" => "broker",
+                    _ => "azdo",
+                },
+                live: true,
+            }))
+    }
+
+    /// Touch a session's liveness stamp (a poll proves the runner is alive).
+    pub(super) async fn touch_session_row(
+        &self,
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+    ) -> Result<(), ControlError> {
+        tx.execute(
+            "UPDATE runner_sessions SET last_seen_at = now() WHERE session_id = $1::text::uuid",
+            &[&session_uuid],
+        )
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// The oldest unacknowledged message of a session (redelivery-first).
+    pub(super) async fn oldest_session_message(
+        &self,
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+    ) -> Result<Option<SessionMessage>, ControlError> {
+        Ok(tx
+            .query_opt(
+                "SELECT message_id, message_type, request_id, body::text \
+                 FROM session_messages WHERE session_id = $1::text::uuid \
+                 ORDER BY message_id LIMIT 1",
+                &[&session_uuid],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| SessionMessage {
+                message_id: row.get(0),
+                message_type: row.get(1),
+                request_id: row.get(2),
+                body: row.get(3),
+            }))
+    }
+
+    /// The session's live request, when it holds one.
+    pub(super) async fn session_active_request(
+        &self,
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+    ) -> Result<Option<TaskAgentJobRequestRecord>, ControlError> {
+        let select = format!(
+            "{} WHERE q.session_id = $1::text::uuid AND q.result IS NULL \
+             ORDER BY q.request_id DESC LIMIT 1",
+            lookups::REQUEST_SELECT
+        );
+        match tx.query_opt(&select, &[&session_uuid]).await.map_err(db)? {
+            Some(row) => Ok(Some(lookups::request_from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Queue a `JobCancellation` for a session's active attempt: the
+    /// cancellation row is marked delivered and a session message carrying the
+    /// official body is appended.
+    pub(super) async fn queue_cancellation_message(
+        &self,
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+        request_id: i64,
+        agent_job_id: uuid::Uuid,
+    ) -> Result<SessionMessage, ControlError> {
+        tx.execute(
+            "UPDATE job_cancellations SET delivered_at = now() \
+             WHERE request_id = $1 AND delivered_at IS NULL",
+            &[&request_id],
+        )
+        .await
+        .map_err(db)?;
+        let body = concurrency::job_cancel_body(agent_job_id);
+        let message_id: i64 = tx
+            .query_one(
+                "INSERT INTO session_messages (session_id, message_type, request_id, body) \
+                 VALUES ($1::text::uuid,$2,$3,$4::text::jsonb) RETURNING message_id",
+                &[
+                    &session_uuid,
+                    &azdo::message_type::JOB_CANCELLED,
+                    &request_id,
+                    &body,
+                ],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        Ok(SessionMessage {
+            message_id,
+            message_type: azdo::message_type::JOB_CANCELLED.to_owned(),
+            request_id: Some(request_id),
+            body: Some(body),
+        })
+    }
+
+    /// A pending (undelivered) cancellation for the attempt, if any.
+    async fn pending_cancellation(
+        &self,
+        tx: &Transaction<'_>,
+        request_id: i64,
+    ) -> Result<Option<u64>, ControlError> {
+        Ok(tx
+            .query_opt(
+                "SELECT request_id FROM job_cancellations \
+                 WHERE request_id = $1 AND delivered_at IS NULL LIMIT 1",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| row.get::<_, i64>(0).max(0) as u64))
+    }
+
+    /// `claim_position`: the ready job this runner should take, using the
+    /// shared four-tier preference over a `SKIP LOCKED` candidate batch.
+    ///
+    /// Statements: `SELECT .. FROM jobs WHERE queue_state='ready' AND
+    /// pool_key = ANY(..) ORDER BY priority DESC, run_order, job_order LIMIT
+    /// 64 FOR UPDATE SKIP LOCKED` (pool filter), the assignment read, then the
+    /// candidate's conditional claim.
+    async fn claim_one(
+        &self,
+        tx: &Transaction<'_>,
+        runner_id: Option<i64>,
+        caps: &RunnerCapabilities,
+    ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        // The pool key prunes by label set; the shared matcher still decides.
+        let rows = tx
+            .query(
+                "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, j.base_id \
+                 FROM jobs j WHERE j.queue_state = 'ready' \
+                 ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+                 LIMIT 64 FOR UPDATE OF j SKIP LOCKED",
+                &[],
+            )
+            .await
+            .map_err(db)?;
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let runs_on: Vec<String> = codec::from_json(row.get::<_, String>(2).as_str())?;
+            let runner_group: Option<String> = row.get(3);
+            let run_id = codec::run_id(&row.get::<_, String>(0))?;
+            let job_id = JobId(row.get::<_, String>(1));
+            let assignment = tx
+                .query_opt(
+                    "SELECT runner_id, (assigned_at > now() - interval '120 seconds') \
+                     FROM job_assignments WHERE run_id = $1::text::uuid AND job_id = $2",
+                    &[&row.get::<_, String>(0), &job_id.0],
+                )
+                .await
+                .map_err(db)?
+                .map(|row| (row.get::<_, Option<i64>>(0), row.get::<_, bool>(1)));
+            let (assigned_runner_id, assignment_fresh) = assignment.unwrap_or((None, false));
+            candidates.push(logic::ClaimCandidate {
+                run_id,
+                job_id,
+                runs_on,
+                runner_group,
+                assigned_runner_id,
+                assignment_fresh,
+                queue_position: position as u64,
+                claimable: true,
+            });
+        }
+        let runner_match = logic::RunnerMatchRow {
+            labels: caps.labels.clone(),
+            known: caps.known,
+            group_id: caps.runner_group_id,
+            group_name: caps.runner_group_name.clone(),
+        };
+        let Some(index) =
+            logic::claim_preference(&candidates, runner_id, &caps.labels, None, &runner_match)
+        else {
+            return Ok(None);
+        };
+        let chosen = candidates.swap_remove(index);
+        let claimed = tx
+            .execute(
+                "UPDATE jobs SET queue_state = 'claimed', status = 'in_progress', \
+                 claimed_by_runner_id = $3, claimed_at = now() \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 AND queue_state = 'ready'",
+                &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
+            )
+            .await
+            .map_err(db)?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        Ok(Some((chosen.run_id, chosen.job_id)))
+    }
+
+    /// Bind the claimed attempt: request owner/session/start stamps, the lease
+    /// row, the run's `in_progress` transition and the job's assignment drop.
+    async fn bind_claim(
+        &self,
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+        session_uuid: &str,
+        runner_id: Option<i64>,
+    ) -> Result<Option<TaskAgentJobRequestRecord>, ControlError> {
+        let run = run_id.0.to_string();
+        let request = tx
+            .query_opt(
+                &format!(
+                    "{} WHERE q.run_id = $1::text::uuid AND q.job_id = $2 AND q.result IS NULL \
+                     ORDER BY q.request_id DESC LIMIT 1 FOR NO KEY UPDATE OF q",
+                    lookups::REQUEST_SELECT
+                ),
+                &[&run, &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        let Some(row) = request else {
+            return Ok(None);
+        };
+        let record = lookups::request_from_row(&row)?;
+        tx.execute(
+            "UPDATE job_requests SET session_id = $2::text::uuid, runner_id = $3, \
+             claimed_at = now(), started_at = now() WHERE request_id = $1",
+            &[&record.request_id, &session_uuid, &runner_id],
+        )
+        .await
+        .map_err(db)?;
+        // The lease is the heartbeat target; only claimed attempts carry one.
+        if let Some(runner_id) = runner_id {
+            let expires =
+                codec::locked_until_us(&crate::distributed_task::agent_request_locked_until())?
+                    .ok_or_else(|| {
+                        ControlError::backend(anyhow::anyhow!("empty lease deadline"))
+                    })?;
+            tx.execute(
+                "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \
+                 VALUES ($1,$2,$3::int8::text::timestamptz,now()) \
+                 ON CONFLICT (request_id) DO UPDATE SET runner_id = EXCLUDED.runner_id, \
+                 expires_at = EXCLUDED.expires_at, renewed_at = EXCLUDED.renewed_at",
+                &[&record.request_id, &runner_id, &expires],
+            )
+            .await
+            .map_err(db)?;
+        }
+        tx.execute(
+            "DELETE FROM job_assignments WHERE run_id = $1::text::uuid AND job_id = $2",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute(
+            "DELETE FROM provision_requests WHERE run_id = $1::text::uuid AND job_id = $2",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute(
+            "UPDATE runs SET status = 'in_progress', started_at = COALESCE(started_at, now()) \
+             WHERE run_id = $1::text::uuid AND status = 'queued'",
+            &[&run],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute(
+            "UPDATE runner_sessions SET last_seen_at = now() \
+             WHERE session_id = $1::text::uuid",
+            &[&session_uuid],
+        )
+        .await
+        .map_err(db)?;
+        Ok(Some(record))
+    }
+
+    /// Append the job-request session message a poll answers with.
+    async fn queue_job_message(
+        &self,
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+        request_id: i64,
+    ) -> Result<SessionMessage, ControlError> {
+        let message_id: i64 = tx
+            .query_one(
+                "INSERT INTO session_messages (session_id, message_type, request_id) \
+                 VALUES ($1::text::uuid,$2,$3) RETURNING message_id",
+                &[
+                    &session_uuid,
+                    &azdo::message_type::PIPELINE_AGENT_JOB_REQUEST,
+                    &request_id,
+                ],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        Ok(SessionMessage {
+            message_id,
+            message_type: azdo::message_type::PIPELINE_AGENT_JOB_REQUEST.to_owned(),
+            request_id: Some(request_id),
+            body: None,
+        })
+    }
+
+    /// `poll_session`: redelivery, cancellation, active request, then a claim.
+    pub(super) async fn poll_session(
+        &self,
+        poll: PollRequest,
+    ) -> Result<PollOutcome, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        // Ownership is revalidated inside the claim transaction: the handler
+        // caches the runner across a long poll, and a liveness sweep can purge
+        // the session while it waits.
+        let Some(session) = self.session_ref(&tx, &poll.session_id).await? else {
+            return Err(ControlError::Forbidden(
+                "session has no runner owner".to_owned(),
+            ));
+        };
+        if poll.verified_runner_id.is_some() && poll.verified_runner_id != session.runner_id {
+            return Err(ControlError::Forbidden(
+                "session belongs to another runner".to_owned(),
+            ));
+        }
+        self.touch_session_row(&tx, &session.session_uuid).await?;
+        if let Some(message) = self
+            .oldest_session_message(&tx, &session.session_uuid)
+            .await?
+        {
+            tx.commit().await.map_err(db)?;
+            return Ok(PollOutcome::Inflight(azdo::TaskAgentMessage {
+                message_id: message.message_id,
+                message_type: message.message_type,
+                body: message
+                    .request_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                iv: None,
+            }));
+        }
+        if let Some(request) = self
+            .session_active_request(&tx, &session.session_uuid)
+            .await?
+        {
+            if let Some(_pending) = self.pending_cancellation(&tx, request.request_id).await? {
+                let message = self
+                    .queue_cancellation_message(
+                        &tx,
+                        &session.session_uuid,
+                        request.request_id,
+                        request.agent_job_id,
+                    )
+                    .await?;
+                tx.commit().await.map_err(db)?;
+                return Ok(PollOutcome::Cancel(azdo::TaskAgentMessage {
+                    message_id: message.message_id,
+                    message_type: message.message_type,
+                    body: message.body.unwrap_or_default(),
+                    iv: None,
+                }));
+            }
+            let runner_id = session.runner_id.unwrap_or(0);
+            tx.commit().await.map_err(db)?;
+            return Ok(PollOutcome::ActiveRequest { request, runner_id });
+        }
+        if poll.busy {
+            tx.commit().await.map_err(db)?;
+            return Ok(PollOutcome::Empty);
+        }
+        let Some((run_id, job_id)) = self.claim_one(&tx, session.runner_id, &poll.runner).await?
+        else {
+            tx.commit().await.map_err(db)?;
+            return Ok(PollOutcome::Empty);
+        };
+        let Some(request) = self
+            .bind_claim(
+                &tx,
+                run_id,
+                &job_id,
+                &session.session_uuid,
+                session.runner_id,
+            )
+            .await?
+        else {
+            tx.commit().await.map_err(db)?;
+            return Ok(PollOutcome::Empty);
+        };
+        let message = self
+            .queue_job_message(&tx, &session.session_uuid, request.request_id)
+            .await?;
+        let mut graph = match PgBackend::load_graph(self, &tx, run_id).await? {
+            Some(graph) => graph,
+            None => {
+                tx.commit().await.map_err(db)?;
+                return Ok(PollOutcome::Empty);
+            }
+        };
+        let queued = match self.queued_job(&tx, &graph, &job_id).await? {
+            Some(queued) => queued,
+            None => {
+                tx.commit().await.map_err(db)?;
+                return Ok(PollOutcome::Empty);
+            }
+        };
+        let node = graph
+            .nodes
+            .get_mut(&job_id)
+            .expect("graph holds the claimed job");
+        node.claimed_by_runner_id = session.runner_id;
+        node.claimed_at_us = Some(now_us());
+        node.started_at_us = Some(now_us());
+        graph
+            .record
+            .jobs
+            .insert(job_id.clone(), ExecutionStatus::InProgress);
+        graph.touched = true;
+        flush_node(&tx, run_id, &job_id, node).await?;
+        flush_run(&tx, &graph).await?;
+        let runner_id = session.runner_id.unwrap_or(0);
+        tx.commit().await.map_err(db)?;
+        let _ = message;
+        Ok(PollOutcome::Claimed(Box::new(ClaimedJob {
+            queued,
+            request,
+            runner_id,
+            queue_depth: self.queue_depth().await?,
+            next_runs_on: self.ready_front_labels().await?,
+        })))
     }
 }
