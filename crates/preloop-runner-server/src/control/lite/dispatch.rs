@@ -42,18 +42,14 @@ fn settle_request_tx(
     .map_err(db)?
     .execute([request_id])
     .map_err(db)?;
-    tx.prepare_cached(
-        "DELETE FROM session_messages WHERE request_id = ?1 AND message_type = ?2",
-    )
-    .map_err(db)?
-    .execute(params![request_id, azdo::message_type::JOB_CANCELLED])
-    .map_err(db)?;
-    tx.prepare_cached(
-        "UPDATE job_requests SET session_id = NULL WHERE request_id = ?1",
-    )
-    .map_err(db)?
-    .execute([request_id])
-    .map_err(db)?;
+    tx.prepare_cached("DELETE FROM session_messages WHERE request_id = ?1 AND message_type = ?2")
+        .map_err(db)?
+        .execute(params![request_id, azdo::message_type::JOB_CANCELLED])
+        .map_err(db)?;
+    tx.prepare_cached("UPDATE job_requests SET session_id = NULL WHERE request_id = ?1")
+        .map_err(db)?
+        .execute([request_id])
+        .map_err(db)?;
     requests::stamp_result_row(
         tx,
         request_id,
@@ -78,10 +74,9 @@ fn attempt_request_id(
                  AND run_id = ?2 AND job_id = ?3",
             )
             .map_err(db)?
-            .query_row(
-                params![agent.to_string(), run, job_id.0],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row(params![agent.to_string(), run, job_id.0], |row| {
+                row.get::<_, i64>(0)
+            })
             .optional()
             .map_err(db)?,
         None => tx
@@ -230,28 +225,24 @@ fn complete_node(
     }
     // Outputs + annotations land on the node (masked by the caller).
     if !outputs.is_empty() {
-        tx.prepare_cached(
-            "UPDATE jobs SET outputs = ?3 WHERE run_id = ?1 AND job_id = ?2",
-        )
-        .map_err(db)?
-        .execute(params![
-            codec::run_key(run_id),
-            job_id.0,
-            serde_json::to_string(outputs).map_err(ControlError::backend)?
-        ])
-        .map_err(db)?;
+        tx.prepare_cached("UPDATE jobs SET outputs = ?3 WHERE run_id = ?1 AND job_id = ?2")
+            .map_err(db)?
+            .execute(params![
+                codec::run_key(run_id),
+                job_id.0,
+                serde_json::to_string(outputs).map_err(ControlError::backend)?
+            ])
+            .map_err(db)?;
     }
     if !annotations.is_empty() {
-        tx.prepare_cached(
-            "UPDATE jobs SET annotations = ?3 WHERE run_id = ?1 AND job_id = ?2",
-        )
-        .map_err(db)?
-        .execute(params![
-            codec::run_key(run_id),
-            job_id.0,
-            serde_json::to_string(annotations).map_err(ControlError::backend)?
-        ])
-        .map_err(db)?;
+        tx.prepare_cached("UPDATE jobs SET annotations = ?3 WHERE run_id = ?1 AND job_id = ?2")
+            .map_err(db)?
+            .execute(params![
+                codec::run_key(run_id),
+                job_id.0,
+                serde_json::to_string(annotations).map_err(ControlError::backend)?
+            ])
+            .map_err(db)?;
     }
     // Terminal transition + gate release + dependents' needs (settle_node
     // internally applies fail-fast, settles every request of the job,
@@ -292,9 +283,7 @@ fn complete_node(
 
 /// Ready-queue gauges a completion/cancellation reports back: depth,
 /// front labels, and whether any work (or pending cancellation) remains.
-fn queue_gauges(
-    tx: &Transaction<'_>,
-) -> Result<(usize, Vec<String>, bool), ControlError> {
+fn queue_gauges(tx: &Transaction<'_>) -> Result<(usize, Vec<String>, bool), ControlError> {
     let depth = jobs::ready_count(tx)?;
     let next = jobs::next_ready_labels(tx)?;
     let nonempty = jobs::queue_nonempty(tx)?
@@ -386,15 +375,11 @@ impl LiteBackend {
             // runner owns (recorded owner or the session runner).
             let mut attempt = None;
             if let Some(settle_attempt) = &settle.settle {
-                let request_id = attempt_request_id(
-                    tx,
-                    run_id,
-                    &job_id,
-                    Some(settle_attempt.agent_job_id),
-                )?
-                .ok_or_else(|| {
-                    ControlError::NotFound("broker complete request not found".to_owned())
-                })?;
+                let request_id =
+                    attempt_request_id(tx, run_id, &job_id, Some(settle_attempt.agent_job_id))?
+                        .ok_or_else(|| {
+                            ControlError::NotFound("broker complete request not found".to_owned())
+                        })?;
                 let owner: Option<(Option<i64>, Option<i64>, bool)> = tx
                     .prepare_cached(
                         "SELECT q.runner_id, s.runner_id, s.session_id IS NOT NULL \
@@ -600,9 +585,8 @@ impl LiteBackend {
                     "request {request_id} not owned by runner {runner_id}"
                 )));
             }
-            let expires_at = codec::parse_lease(
-                &crate::distributed_task::agent_request_locked_until(),
-            )?;
+            let expires_at =
+                codec::parse_lease(&crate::distributed_task::agent_request_locked_until())?;
             let now = now_us();
             tx.prepare_cached(
                 "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \

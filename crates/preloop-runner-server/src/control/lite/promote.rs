@@ -37,10 +37,9 @@ fn dependency_decision(
     if direct.is_empty() || direct.iter().any(|status| !status.is_terminal()) {
         return Ok(DependencyDecision::Wait);
     }
-    let aggregate = crate::runtime_scheduling::aggregate_need_status(
-        &graph.ancestor_statuses(needs),
-    )
-    .unwrap_or(ExecutionStatus::Skipped);
+    let aggregate =
+        crate::runtime_scheduling::aggregate_need_status(&graph.ancestor_statuses(needs))
+            .unwrap_or(ExecutionStatus::Skipped);
     let mut context = condition_context.clone().with_status(
         aggregate == ExecutionStatus::Success,
         aggregate == ExecutionStatus::Failure,
@@ -142,9 +141,7 @@ pub(super) fn acquire_job_gate(
     let namespace_id: String = tx
         .prepare_cached("SELECT namespace_id FROM jobs WHERE run_id = ?1 AND job_id = ?2")
         .map_err(db)?
-        .query_row(params![codec::run_key(run_id), job_id.0], |row| {
-            row.get(0)
-        })
+        .query_row(params![codec::run_key(run_id), job_id.0], |row| row.get(0))
         .map_err(db)?;
     let mut cancel = super::settle::canceler(backend);
     match cg::acquire(
@@ -208,7 +205,9 @@ fn hydrate_message(
              WHERE run_id = ?1 AND job_id = ?2",
         )
         .map_err(db)?
-        .query_row(params![run, job.job_id.0], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_row(params![run, job.job_id.0], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()
         .map_err(db)?;
     let Some((template, _ctx)) = row else {
@@ -234,9 +233,7 @@ fn hydrate_message(
         let mut entry = BTreeMap::new();
         entry.insert(
             "result".to_owned(),
-            azdo::PipelineContextData::String(
-                crate::runtime_scheduling::status_string(result),
-            ),
+            azdo::PipelineContextData::String(crate::runtime_scheduling::status_string(result)),
         );
         entry.insert(
             "outputs".to_owned(),
@@ -316,12 +313,10 @@ pub(super) fn on_job_enqueued(
         return Ok(());
     }
     // Drop any pool-pending mark: the job is being assigned now.
-    tx.prepare_cached(
-        "DELETE FROM provision_requests WHERE run_id = ?1 AND job_id = ?2",
-    )
-    .map_err(db)?
-    .execute(params![run, job.job_id.0])
-    .map_err(db)?;
+    tx.prepare_cached("DELETE FROM provision_requests WHERE run_id = ?1 AND job_id = ?2")
+        .map_err(db)?
+        .execute(params![run, job.job_id.0])
+        .map_err(db)?;
 
     // Busy runners: claimed assignments plus sessions holding live requests.
     let mut busy: BTreeSet<i64> = BTreeSet::new();
@@ -527,9 +522,10 @@ fn caller_jobset_gates(
                     queue,
                 };
                 // merge_jobset_gate: same key folds (OR cancel; single wins).
-                if let Some(existing) = gates.iter_mut().find(|g| {
-                    g.repository == decl.repository && g.group_name == decl.group_name
-                }) {
+                if let Some(existing) = gates
+                    .iter_mut()
+                    .find(|g| g.repository == decl.repository && g.group_name == decl.group_name)
+                {
                     existing.cancel_in_progress |= decl.cancel_in_progress;
                     if decl.queue == preloop_gha_parser::ConcurrencyQueue::Single {
                         existing.queue = preloop_gha_parser::ConcurrencyQueue::Single;
@@ -658,7 +654,9 @@ pub(super) fn advance_jobset(
                 .map_err(db)?;
             }
             cg::AcqOutcome::Parked => return Ok(Advance::Blocked),
-            cg::AcqOutcome::ArrivalCancelled => return Ok(Advance::Fail(ExecutionStatus::Cancelled)),
+            cg::AcqOutcome::ArrivalCancelled => {
+                return Ok(Advance::Fail(ExecutionStatus::Cancelled))
+            }
             cg::AcqOutcome::Failed => return Ok(Advance::Fail(ExecutionStatus::Failure)),
         }
     }
@@ -702,7 +700,11 @@ fn ensure_jobset(
 
 /// Whether this job's jobset is already parked (a wait row naming it) —
 /// the promote loop leaves it blocked until the gate frees.
-fn jobset_parked(tx: &Transaction<'_>, run_id: RunId, job_id: &JobId) -> Result<bool, ControlError> {
+fn jobset_parked(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<bool, ControlError> {
     let set_id: Option<i64> = tx
         .prepare_cached(
             "SELECT jobset_id FROM jobsets WHERE run_id = ?1 \
@@ -715,12 +717,10 @@ fn jobset_parked(tx: &Transaction<'_>, run_id: RunId, job_id: &JobId) -> Result<
     let Some(set_id) = set_id else {
         return Ok(false);
     };
-    tx.prepare_cached(
-        "SELECT EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_jobset_id = ?1)",
-    )
-    .map_err(db)?
-    .query_row([set_id], |row| row.get(0))
-    .map_err(db)
+    tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM concurrency_waits WHERE holder_jobset_id = ?1)")
+        .map_err(db)?
+        .query_row([set_id], |row| row.get(0))
+        .map_err(db)
 }
 
 /// `promote_ready_jobs` for one run: sweep `queue_state='blocked'` +
@@ -771,19 +771,12 @@ pub(super) fn promote_run(
                     .optional()
                     .map_err(db)?
                     .unwrap_or_else(|| "{}".to_owned());
-                (
-                    spec.and_then(|s| s.if_condition),
-                    ctx,
-                )
+                (spec.and_then(|s| s.if_condition), ctx)
             };
             let condition_context: preloop_gha_expressions::Context =
                 serde_json::from_str(&ctx_json).unwrap_or_default();
-            let decision = dependency_decision(
-                &graph,
-                &needs,
-                if_condition.as_deref(),
-                &condition_context,
-            )?;
+            let decision =
+                dependency_decision(&graph, &needs, if_condition.as_deref(), &condition_context)?;
             if decision == DependencyDecision::Run {
                 tx.prepare_cached(
                     "UPDATE jobs SET deps_ready_at = COALESCE(deps_ready_at, ?3) \
@@ -836,11 +829,7 @@ pub(super) fn promote_run(
                                  WHERE run_id = ?1 AND job_id = ?2",
                             )
                             .map_err(db)?
-                            .execute(params![
-                                codec::run_key(run_id),
-                                job.job_id.0,
-                                now_us()
-                            ])
+                            .execute(params![codec::run_key(run_id), job.job_id.0, now_us()])
                             .map_err(db)?;
                         }
                         Advance::Fail(status) => {
@@ -877,7 +866,14 @@ pub(super) fn promote_run(
                     hydrate_message(tx, &graph, &job)?;
                     match acquire_job_gate(tx, backend, run_id, &job.job_id)? {
                         GateOutcome::Proceed => {
-                            enqueue_ready(tx, backend, &job, spec.as_ref().map(|s| s.concurrency.is_some()).unwrap_or(false))?;
+                            enqueue_ready(
+                                tx,
+                                backend,
+                                &job,
+                                spec.as_ref()
+                                    .map(|s| s.concurrency.is_some())
+                                    .unwrap_or(false),
+                            )?;
                             outcome.promoted += 1;
                         }
                         GateOutcome::Parked => {
@@ -887,11 +883,7 @@ pub(super) fn promote_run(
                                  WHERE run_id = ?1 AND job_id = ?2",
                             )
                             .map_err(db)?
-                            .execute(params![
-                                codec::run_key(run_id),
-                                job.job_id.0,
-                                now_us()
-                            ])
+                            .execute(params![codec::run_key(run_id), job.job_id.0, now_us()])
                             .map_err(db)?;
                         }
                         GateOutcome::Failed(status) => {
@@ -931,7 +923,12 @@ pub(super) fn under_max_parallel_job(
     job: &JobRow,
     spec: Option<&jobs::SpecRow>,
 ) -> Result<bool, ControlError> {
-    under_max_parallel(tx, job.run_id, &job.base_id, spec.and_then(|s| s.max_parallel))
+    under_max_parallel(
+        tx,
+        job.run_id,
+        &job.base_id,
+        spec.and_then(|s| s.max_parallel),
+    )
 }
 
 /// `enqueue_ready` for the gate-promotion path.

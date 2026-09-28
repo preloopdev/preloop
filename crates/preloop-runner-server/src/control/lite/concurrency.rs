@@ -9,8 +9,8 @@
 //! jobset via `holder_jobset_id`.
 
 use super::codec;
-use super::jobs;
 use super::db;
+use super::jobs;
 use crate::concurrency::{self, Holder};
 use crate::control::logic::{self, ConcurrencyRow};
 use crate::control::types::*;
@@ -26,12 +26,9 @@ fn holder_columns(
 ) -> Result<(&'static str, String, Option<String>, Option<i64>), ControlError> {
     match holder {
         Holder::Run(run_id) => Ok(("run", run_id.to_string(), None, None)),
-        Holder::Job { run_id, job_id } => Ok((
-            "job",
-            run_id.to_string(),
-            Some(job_id.0.clone()),
-            None,
-        )),
+        Holder::Job { run_id, job_id } => {
+            Ok(("job", run_id.to_string(), Some(job_id.0.clone()), None))
+        }
         Holder::JobSet { run_id, job_ids } => {
             let set_id = jobset_id(tx, *run_id, job_ids)?;
             Ok(("jobset", run_id.to_string(), None, Some(set_id)))
@@ -124,8 +121,7 @@ pub(super) fn hold_row(
     let Some((kind, run_id, job_id, set_id, display)) = row else {
         return Ok(None);
     };
-    Ok(holder_of(tx, &kind, &run_id, job_id.as_deref(), set_id)?
-        .map(|holder| (holder, display)))
+    Ok(holder_of(tx, &kind, &run_id, job_id.as_deref(), set_id)?.map(|holder| (holder, display)))
 }
 
 /// FIFO waiters of a group, oldest first.
@@ -322,9 +318,7 @@ pub(super) fn run_waits(
         )
         .map_err(db)?;
     let rows = stmt
-        .query_map([run], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+        .query_map([run], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(db)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(db)
 }
@@ -413,10 +407,7 @@ pub(super) fn job_holds(
 /// `run_stuck_on_external_hosts`: the holder's run has no claimable work
 /// except external-host jobs (macos/windows) that no runner can serve.
 /// Missing run = stuck. `queue_state='ready'` is the claimable check.
-fn run_stuck_on_external_hosts(
-    tx: &Transaction<'_>,
-    run_id: RunId,
-) -> Result<bool, ControlError> {
+fn run_stuck_on_external_hosts(tx: &Transaction<'_>, run_id: RunId) -> Result<bool, ControlError> {
     let external_host_available = jobs::registered_platforms(tx)?
         .iter()
         .any(|os| *os == "macos" || *os == "windows");
@@ -435,9 +426,7 @@ fn run_stuck_on_external_hosts(
     // Stuck iff every job is terminal, or its claimable copy (queue_state
     // 'ready') is present only when its labels need an external host.
     let mut stmt = tx
-        .prepare_cached(
-            "SELECT status, queue_state, runs_on FROM jobs WHERE run_id = ?1",
-        )
+        .prepare_cached("SELECT status, queue_state, runs_on FROM jobs WHERE run_id = ?1")
         .map_err(db)?;
     let rows = stmt
         .query_map([run], |row| {
@@ -479,9 +468,8 @@ fn event_order_of(
     let Some(json) = submission_json else {
         return Ok(None);
     };
-    let submission: preloop_gha_protocol::WorkflowSubmission =
-        serde_json::from_str(&json)
-            .map_err(|e| ControlError::backend(anyhow::anyhow!("submission decode: {e}")))?;
+    let submission: preloop_gha_protocol::WorkflowSubmission = serde_json::from_str(&json)
+        .map_err(|e| ControlError::backend(anyhow::anyhow!("submission decode: {e}")))?;
     Ok(concurrency::event_order(
         &submission.event,
         &submission.repository,
@@ -548,8 +536,7 @@ pub(super) fn acquire(
     // would displace someone, its triggering event must not be older than
     // every existing holder's. (`try_acquire_concurrency`'s superseded
     // check, verbatim.)
-    let displacement = cancel_in_progress
-        || queue == preloop_gha_parser::ConcurrencyQueue::Single;
+    let displacement = cancel_in_progress || queue == preloop_gha_parser::ConcurrencyQueue::Single;
     if displacement {
         if let Some(arrival) = event_order_of(tx, holder)? {
             let mut superseded = false;
@@ -640,9 +627,7 @@ pub(super) fn acquire(
                 })
                 .collect();
             let mode = match queue {
-                preloop_gha_parser::ConcurrencyQueue::Single => {
-                    logic::ConcurrencyQueueMode::Single
-                }
+                preloop_gha_parser::ConcurrencyQueue::Single => logic::ConcurrencyQueueMode::Single,
                 preloop_gha_parser::ConcurrencyQueue::Max => logic::ConcurrencyQueueMode::Max,
             };
             let decision = logic::concurrency_queue_decision(mode, &existing);
@@ -681,7 +666,9 @@ pub(super) fn hold_display_name(
          WHERE namespace_id = ?1 AND repository = ?2 AND group_name = ?3",
     )
     .map_err(db)?
-    .query_row(params![namespace_id, repository, group_name], |row| row.get(0))
+    .query_row(params![namespace_id, repository, group_name], |row| {
+        row.get(0)
+    })
     .optional()
     .map_err(db)
 }
@@ -699,10 +686,7 @@ pub(super) fn first_waiter(
 }
 
 /// Drop one wait row by its primary key.
-pub(super) fn remove_wait_by_id(
-    tx: &Transaction<'_>,
-    wait_id: i64,
-) -> Result<(), ControlError> {
+pub(super) fn remove_wait_by_id(tx: &Transaction<'_>, wait_id: i64) -> Result<(), ControlError> {
     tx.prepare_cached("DELETE FROM concurrency_waits WHERE wait_id = ?1")
         .map_err(db)?
         .execute([wait_id])
@@ -813,9 +797,7 @@ pub(super) fn jobset_holds(
         )
         .map_err(db)?;
     let rows = stmt
-        .query_map([set_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+        .query_map([set_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(db)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(db)
 }

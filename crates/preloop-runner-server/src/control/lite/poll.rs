@@ -23,52 +23,43 @@ struct SessionRef {
 }
 
 /// The session's row (mapped id), or `None` when it is unknown/expired.
-fn session_ref(
-    tx: &Transaction<'_>,
-    session_id: &str,
-) -> Result<Option<SessionRef>, ControlError> {
+fn session_ref(tx: &Transaction<'_>, session_id: &str) -> Result<Option<SessionRef>, ControlError> {
     let uuid = logic::session_uuid(session_id).to_string();
-    tx.prepare_cached(
-        "SELECT runner_id FROM runner_sessions WHERE session_id = ?1",
-    )
-    .map_err(db)?
-    .query_row([uuid.as_str()], |row| row.get::<_, Option<i64>>(0))
-    .optional()
-    .map_err(db)
-    .map(|runner_id| {
-        runner_id.map(|runner_id| SessionRef {
-            session_uuid: uuid.clone(),
-            runner_id,
+    tx.prepare_cached("SELECT runner_id FROM runner_sessions WHERE session_id = ?1")
+        .map_err(db)?
+        .query_row([uuid.as_str()], |row| row.get::<_, Option<i64>>(0))
+        .optional()
+        .map_err(db)
+        .map(|runner_id| {
+            runner_id.map(|runner_id| SessionRef {
+                session_uuid: uuid.clone(),
+                runner_id,
+            })
         })
-    })
-    .map(|opt| {
-        opt.or_else(|| {
-            tx.prepare_cached(
-                "SELECT runner_id FROM runner_sessions WHERE session_id = ?1",
-            )
-            .ok()
-            .and_then(|mut stmt| {
-                stmt.query_row([uuid.as_str()], |row| row.get::<_, Option<i64>>(0))
-                    .optional()
+        .map(|opt| {
+            opt.or_else(|| {
+                tx.prepare_cached("SELECT runner_id FROM runner_sessions WHERE session_id = ?1")
                     .ok()
-                    .flatten()
-                    .map(|_| SessionRef {
-                        session_uuid: uuid.clone(),
-                        runner_id: None,
+                    .and_then(|mut stmt| {
+                        stmt.query_row([uuid.as_str()], |row| row.get::<_, Option<i64>>(0))
+                            .optional()
+                            .ok()
+                            .flatten()
+                            .map(|_| SessionRef {
+                                session_uuid: uuid.clone(),
+                                runner_id: None,
+                            })
                     })
             })
         })
-    })
 }
 
 /// Touch a session's liveness stamp (a poll proves the runner is alive).
 fn touch_session_row(tx: &Transaction<'_>, session_uuid: &str) -> Result<(), ControlError> {
-    tx.prepare_cached(
-        "UPDATE runner_sessions SET last_seen_at = ?2 WHERE session_id = ?1",
-    )
-    .map_err(db)?
-    .execute(params![session_uuid, now_us()])
-    .map_err(db)?;
+    tx.prepare_cached("UPDATE runner_sessions SET last_seen_at = ?2 WHERE session_id = ?1")
+        .map_err(db)?
+        .execute(params![session_uuid, now_us()])
+        .map_err(db)?;
     Ok(())
 }
 
@@ -186,7 +177,13 @@ fn claim_one(
     runner_id: Option<i64>,
     caps: &RunnerCapabilities,
 ) -> Result<Option<(RunId, JobId)>, ControlError> {
-    let rows: Vec<(String, String, Vec<String>, Option<String>, Option<(Option<i64>, bool)>)> = {
+    let rows: Vec<(
+        String,
+        String,
+        Vec<String>,
+        Option<String>,
+        Option<(Option<i64>, bool)>,
+    )> = {
         let mut stmt = tx
             .prepare_cached(
                 "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
@@ -199,8 +196,7 @@ fn claim_one(
                  LIMIT 64",
             )
             .map_err(db)?;
-        let fresh_after =
-            now_us() - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
+        let fresh_after = now_us() - crate::control::sched::CLAIM_BINDING_TTL.as_micros() as i64;
         let rows = stmt
             .query_map(params![fresh_after], |row| {
                 let assigned: Option<Option<i64>> = row.get(4)?;
@@ -217,8 +213,7 @@ fn claim_one(
         rows.collect::<Result<Vec<_>, _>>().map_err(db)?
     };
     let mut candidates = Vec::with_capacity(rows.len());
-    for (position, (run, job, runs_on, runner_group, assignment)) in rows.into_iter().enumerate()
-    {
+    for (position, (run, job, runs_on, runner_group, assignment)) in rows.into_iter().enumerate() {
         let (assigned_runner_id, assignment_fresh) = assignment.unwrap_or((None, false));
         candidates.push(logic::ClaimCandidate {
             run_id: codec::run_id(&run),
@@ -299,8 +294,7 @@ fn bind_claim(
     .map_err(db)?;
     // The lease is the heartbeat target; only claimed attempts carry one.
     if let Some(runner_id) = runner_id {
-        let expires =
-            codec::parse_lease(&crate::distributed_task::agent_request_locked_until())?;
+        let expires = codec::parse_lease(&crate::distributed_task::agent_request_locked_until())?;
         tx.prepare_cached(
             "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \
              VALUES (?1, ?2, ?3, ?4) \
@@ -311,18 +305,14 @@ fn bind_claim(
         .execute(params![record.request_id, runner_id, expires, now])
         .map_err(db)?;
     }
-    tx.prepare_cached(
-        "DELETE FROM job_assignments WHERE run_id = ?1 AND job_id = ?2",
-    )
-    .map_err(db)?
-    .execute(params![run, job_id.0])
-    .map_err(db)?;
-    tx.prepare_cached(
-        "DELETE FROM provision_requests WHERE run_id = ?1 AND job_id = ?2",
-    )
-    .map_err(db)?
-    .execute(params![run, job_id.0])
-    .map_err(db)?;
+    tx.prepare_cached("DELETE FROM job_assignments WHERE run_id = ?1 AND job_id = ?2")
+        .map_err(db)?
+        .execute(params![run, job_id.0])
+        .map_err(db)?;
+    tx.prepare_cached("DELETE FROM provision_requests WHERE run_id = ?1 AND job_id = ?2")
+        .map_err(db)?
+        .execute(params![run, job_id.0])
+        .map_err(db)?;
     tx.prepare_cached(
         "UPDATE runs SET status = 'in_progress', \
          started_at = COALESCE(started_at, ?2) \
@@ -430,9 +420,7 @@ impl LiteBackend {
                     "session has no runner owner".to_owned(),
                 ));
             };
-            if poll.verified_runner_id.is_some()
-                && poll.verified_runner_id != session.runner_id
-            {
+            if poll.verified_runner_id.is_some() && poll.verified_runner_id != session.runner_id {
                 return Err(ControlError::Forbidden(
                     "session belongs to another runner".to_owned(),
                 ));
@@ -471,12 +459,16 @@ impl LiteBackend {
             if poll.busy {
                 return Ok(PollOutcome::Empty);
             }
-            let Some((run_id, job_id)) = claim_one(tx, session.runner_id, &poll.runner)?
-            else {
+            let Some((run_id, job_id)) = claim_one(tx, session.runner_id, &poll.runner)? else {
                 return Ok(PollOutcome::Empty);
             };
-            let Some(request) =
-                bind_claim(tx, run_id, &job_id, &session.session_uuid, session.runner_id)?
+            let Some(request) = bind_claim(
+                tx,
+                run_id,
+                &job_id,
+                &session.session_uuid,
+                session.runner_id,
+            )?
             else {
                 return Ok(PollOutcome::Empty);
             };
@@ -555,8 +547,13 @@ impl LiteBackend {
             let Some((run_id, job_id)) = claim_one(tx, session.runner_id, &caps)? else {
                 return Ok(AzdoPollOutcome::Wait);
             };
-            let Some(request) =
-                bind_claim(tx, run_id, &job_id, &session.session_uuid, session.runner_id)?
+            let Some(request) = bind_claim(
+                tx,
+                run_id,
+                &job_id,
+                &session.session_uuid,
+                session.runner_id,
+            )?
             else {
                 return Ok(AzdoPollOutcome::Wait);
             };
