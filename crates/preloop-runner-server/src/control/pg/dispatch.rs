@@ -3558,6 +3558,10 @@ impl PgBackend {
             graph.nodes.insert(job_id, node);
         }
 
+        // Submit-time conclusions (unhostable, `if: false`) stay out of the
+        // sweep, so `settle_node` never emits `job.completed.v1` for them —
+        // split them from the sweep's own conclusions to emit only once.
+        let submit_concluded = concluded.len();
         // One promotion sweep: needs-satisfied nodes enqueue (or park behind
         // their own gate / expansion queue); unsatisfiable ones settle.
         if !held {
@@ -3567,11 +3571,16 @@ impl PgBackend {
             for (job_id, status) in &sweep.concluded {
                 concluded.push((job_id.clone(), *status, None));
             }
-            let status = sweep
+            // `finalize_run_if_complete` parity: even when the sweep settled
+            // nothing (every job concluded at submit time), the run's own
+            // status must be resummarized and the row flushed.
+            let graph = sweep
                 .graphs
-                .get(&record.run_id)
-                .map(|graph| graph.record.status)
-                .unwrap_or(record.status);
+                .get_mut(&record.run_id)
+                .expect("inserted above");
+            graph.resummarize();
+            graph.touched = true;
+            let status = graph.record.status;
             sweep.flush().await?;
             final_status = status;
         } else {
@@ -3581,6 +3590,28 @@ impl PgBackend {
             for (job_id, node) in &graph.nodes {
                 flush_node(&tx, record.run_id, job_id, node).await?;
             }
+        }
+        for (job_id, status, _) in &concluded[..submit_concluded] {
+            emit_outbox(
+                &tx,
+                Some(record.run_id),
+                "job.completed.v1",
+                serde_json::json!({"job_id": job_id.0, "status": status_str(*status)}),
+            )
+            .await?;
+        }
+        // `settle_node` already emitted `run.completed.v1` for a run the
+        // sweep turned terminal; emit only when nothing settled in the
+        // sweep (all conclusions were submit-time, or the run was held).
+        let sweep_settled = !held && concluded.len() > submit_concluded;
+        if final_status.is_terminal() && !sweep_settled {
+            emit_outbox(
+                &tx,
+                Some(record.run_id),
+                "run.completed.v1",
+                serde_json::json!({"conclusion": status_str(final_status)}),
+            )
+            .await?;
         }
         tx.commit().await.map_err(db)?;
         Ok(SubmitOutcome {
