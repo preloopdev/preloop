@@ -134,7 +134,7 @@ async fn flush_run(tx: &Transaction<'_>, graph: &RunGraph) -> Result<(), Control
 ///
 /// Statements: one aggregate `SELECT` over `jobs`, then one conditional
 /// `UPDATE runs` (a `completed` run is never resurrected).
-async fn summarize_run_tx(tx: &Transaction<'_>, run_id: RunId) -> Result<(), ControlError> {
+pub(super) async fn summarize_run_tx(tx: &Transaction<'_>, run_id: RunId) -> Result<(), ControlError> {
     let run = run_id.0.to_string();
     let summary = tx
         .query_one(
@@ -1805,7 +1805,7 @@ pub(super) async fn on_job_enqueued(
 }
 
 /// `clear_assignment`: drop the assignment/pool-pending rows for a job.
-async fn clear_assignment(
+pub(super) async fn clear_assignment(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
@@ -1947,7 +1947,7 @@ async fn cancel_run_tx(
 /// row would redeliver a bogus `request_id` body and refire
 /// `pending_cancellation`. `true` when the live attempt is now pending
 /// cancellation.
-async fn enqueue_cancellation_job(
+pub(super) async fn enqueue_cancellation_job(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
