@@ -943,13 +943,13 @@ impl LiteBackend {
     }
 
     /// `create_broker_session` (pg lifecycle.rs): a broker `runner_sessions`
-    /// row owned by `runner_id`; the `encryption` argument is not stored
-    /// (session keys are derived, not persisted).
+    /// row owned by `runner_id`. M2 dropped the encryption argument — the
+    /// session key is caller-derived (`AppState::session_encryption`) and
+    /// never stored.
     pub(crate) async fn create_broker_session(
         &self,
         session_id: &str,
         runner_id: i64,
-        _encryption: &preloop_gha_protocol::crypto::SessionEncryption,
     ) -> Result<(), ControlError> {
         self.open_runner_session(OpenRunnerSession {
             session_id: session_id.to_owned(),

@@ -18,12 +18,13 @@ use preloop_gha_protocol::{JobId, RunId};
 use rusqlite::{params, OptionalExtension, Transaction};
 use std::collections::BTreeSet;
 
+/// `(holder_kind, holder_run_id, holder_job_id, holder_jobset_id)` for the
+/// holds/waits columns.
+type HolderColumns = (&'static str, String, Option<String>, Option<i64>);
+
 /// Encode a holder into `(holder_kind, holder_run_id, holder_job_id,
 /// holder_jobset_id)`; a `JobSet` must already have its `jobsets` row.
-fn holder_columns(
-    tx: &Transaction<'_>,
-    holder: &Holder,
-) -> Result<(&'static str, String, Option<String>, Option<i64>), ControlError> {
+fn holder_columns(tx: &Transaction<'_>, holder: &Holder) -> Result<HolderColumns, ControlError> {
     match holder {
         Holder::Run(run_id) => Ok(("run", run_id.to_string(), None, None)),
         Holder::Job { run_id, job_id } => {

@@ -17,6 +17,7 @@ mod codec;
 mod concurrency;
 mod dispatch;
 mod expansion;
+mod impls;
 mod jobs;
 mod lifecycle;
 mod poll;
@@ -371,21 +372,7 @@ impl LiteBackend {
         repository: &str,
         workflow_path: &str,
     ) -> Result<u64, ControlError> {
-        self.write(|tx| {
-            let number: i64 = tx
-                .query_row(
-                    "INSERT INTO workflow_run_numbers \
-                         (namespace_id, repository, workflow_path, last_run_number) \
-                     VALUES (?1, ?2, ?3, 1) \
-                     ON CONFLICT (namespace_id, repository, workflow_path) \
-                     DO UPDATE SET last_run_number = last_run_number + 1 \
-                     RETURNING last_run_number",
-                    rusqlite::params![namespace_id, repository, workflow_path],
-                    |row| row.get(0),
-                )
-                .map_err(db)?;
-            Ok(number as u64)
-        })
+        self.write(|tx| submit::allocate_run_number_tx(tx, namespace_id, repository, workflow_path))
     }
 }
 

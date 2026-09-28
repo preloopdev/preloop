@@ -4103,3 +4103,185 @@ mod postgres {
         }
     }
 }
+
+// ── New SQLite backend (`control::lite`) ────────────────────────────────
+//
+// The shared `suite::*` functions run against `LiteBackend` via
+// `&dyn ControlBackend`. Suite tests pinning the pre-M2 secrets-at-rest
+// model (`secrets_survive_seal_unseal`, `run_record_round_trips_through_tables`
+// via its sealed-secrets assertion) are excluded: M2 stores no secret
+// values (`secret_refs` names them; the provider resolves at acquire).
+mod lite {
+    use super::suite;
+    use crate::control::backend::ControlBackend;
+    use crate::control::lite::LiteBackend;
+    use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
+
+    #[tokio::test]
+    async fn submit_poll_complete_lifecycle() {
+        suite::submit_poll_complete_lifecycle(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn sessionless_runner_is_not_idle_capacity() {
+        suite::sessionless_runner_is_not_idle_capacity(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn step_reports_merge_into_manifest() {
+        suite::step_reports_merge_into_manifest(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_replay_is_idempotent() {
+        suite::webhook_replay_is_idempotent(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn request_lookup_uses_latest_correlation() {
+        suite::request_lookup_uses_latest_correlation(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn push_state_only_changes_its_run_column() {
+        suite::push_state_only_changes_its_run_column(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_run_queues_cancellation() {
+        suite::cancel_run_queues_cancellation(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_scopes_map_plan_ids_to_latest_run() {
+        suite::artifact_scopes_map_plan_ids_to_latest_run(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn secrets_survive_round_trip() {
+        suite::secrets_survive_seal_unseal(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn run_record_round_trips_through_tables() {
+        suite::run_record_round_trips_through_tables(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrency_gate_serializes_group() {
+        suite::concurrency_gate_serializes_group(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_recovers_orphaned_claim() {
+        suite::reconcile_recovers_orphaned_claim(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn purge_requeues_claimed_as_queued() {
+        suite::purge_requeues_claimed_as_queued(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn purge_requeues_ownerless_claim() {
+        suite::purge_requeues_ownerless_claim(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn check_run_mapping() {
+        suite::check_run_mapping(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn submit_unhostable_job_persists_failure() {
+        suite::submit_unhostable_job_persists_failure(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn submit_skipped_parent_settles_child() {
+        suite::submit_skipped_parent_settles_child(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_in_progress_submit_reports_surviving_depth() {
+        suite::cancel_in_progress_submit_reports_surviving_depth(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    /// A file-backed LiteBackend proves durability: submit, drop, reopen,
+    /// and the job is still claimable — the DB is the authority.
+    #[tokio::test]
+    async fn state_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("preloop-lite-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control.db");
+
+        let run_id = RunId::new();
+        {
+            let backend =
+                LiteBackend::open(&path, false, false, std::time::Duration::from_secs(300))
+                    .unwrap();
+            backend
+                .register_runner(super::register_runner("r1"))
+                .await
+                .unwrap();
+            backend
+                .submit_run(super::submit_run(
+                    run_id,
+                    vec![super::submit_job(run_id, "build", 1)],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let backend =
+            LiteBackend::open(&path, false, false, std::time::Duration::from_secs(300)).unwrap();
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!(stats.ready, 1, "queued job must survive reopen");
+
+        // The trait impl maps a missing run to NotFound; the inherent
+        // `Option` return is what `pg`'s lookup uses internally.
+        let record = ControlBackend::run_record(&backend, run_id).await.unwrap();
+        assert_eq!(record.status, ExecutionStatus::Queued);
+        assert_eq!(
+            record.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Queued)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Greenfield schema_meta: a database holding foreign tables with no
+    /// `schema_meta` is refused; a stamped wrong version is refused.
+    #[test]
+    fn opening_a_foreign_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE foreign_table (id INTEGER)")
+            .unwrap();
+        let error = LiteBackend::open(&path, false, false, std::time::Duration::from_secs(300))
+            .err()
+            .expect("a foreign database must be refused");
+        assert!(error.to_string().contains("predates"), "{error}");
+
+        // A fresh file opens and is stamped with the agreed version.
+        let fresh = dir.path().join("fresh.db");
+        LiteBackend::open(&fresh, false, false, std::time::Duration::from_secs(300)).unwrap();
+        let version: Vec<u8> = rusqlite::Connection::open(&fresh)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(version).unwrap(),
+            crate::control::lite::SCHEMA_VERSION
+        );
+    }
+}

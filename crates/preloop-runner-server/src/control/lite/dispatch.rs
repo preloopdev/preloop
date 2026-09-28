@@ -154,7 +154,7 @@ fn finalize_reusable_callers(
         let outputs = record
             .job_outputs
             .get(caller_id)
-            .map(|map| serde_json::to_string(map))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(ControlError::backend)?;
         tx.prepare_cached(

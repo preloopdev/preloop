@@ -114,7 +114,12 @@ CREATE TABLE run_submissions (
     github_context          TEXT NOT NULL,
     workspace_snapshot      TEXT,
     snapshot_timing         TEXT,
-    secret_refs             TEXT NOT NULL DEFAULT '{}'
+    secret_refs             TEXT NOT NULL DEFAULT '{}',
+    -- Record-level per-job maps the agreed schema has no table for
+    -- (old backend's run_jobs): job_base_ids, job_names, job_needs,
+    -- job_check_run_ids, caller_plans, jobs_list, reusable_calls,
+    -- fail_fast/continue_on_error. Jobs without a `jobs` row live here.
+    record_details          TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE run_push_states (
@@ -229,7 +234,9 @@ CREATE TABLE job_requests (
     job_id                  TEXT NOT NULL,
     namespace_id            TEXT NOT NULL,
     agent_job_id            TEXT NOT NULL UNIQUE,
-    timeline_id             TEXT NOT NULL UNIQUE,
+    -- shared cross-attempt correlate: the same timeline_id can appear on
+    -- several requests (one per retry/run); NOT UNIQUE, lookup picks newest.
+    timeline_id             TEXT NOT NULL,
     runner_id               INTEGER,
     session_id              TEXT,
     result                  TEXT CHECK (result IN
@@ -276,7 +283,10 @@ CREATE TABLE job_steps (
 );
 
 CREATE TABLE timelines (
-    timeline_id             TEXT PRIMARY KEY REFERENCES job_requests(timeline_id) ON DELETE CASCADE,
+    -- job_requests.timeline_id is not unique (cross-attempt correlate), so
+    -- this PK cannot FK to it; lifecycle is owned by the request that mints
+    -- it and pruned with its run.
+    timeline_id             TEXT PRIMARY KEY,
     change_id               INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE timeline_records (
@@ -538,6 +548,7 @@ CREATE TABLE run_history (
     head_sha                TEXT NOT NULL,
     conclusion              TEXT,
     submission              TEXT NOT NULL,
+    record_details          TEXT NOT NULL DEFAULT '{}',
     created_at              INTEGER NOT NULL,
     started_at              INTEGER,
     completed_at            INTEGER,
