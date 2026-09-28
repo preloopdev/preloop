@@ -17,7 +17,7 @@ use crate::models::{
 };
 use crate::state::{JobSetAdmission, JobSetId, OidcJobContext};
 use preloop_gha_protocol::azdo;
-use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
+use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{JobId, RegisteredRunner, RunId, RunnerSession};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
@@ -101,8 +101,6 @@ pub(crate) struct TxState {
     pub(crate) sessions: BTreeMap<String, RunnerSession>,
     /// Broker-protocol session → runner.
     pub(crate) broker_session_runners: BTreeMap<String, i64>,
-    /// Session crypto material, sealed into `runner_sessions` on write-back.
-    pub(crate) session_keys: BTreeMap<String, SessionEncryption>,
     pub(crate) session_last_seen: BTreeMap<String, std::time::SystemTime>,
     pub(crate) session_active_requests: BTreeMap<String, i64>,
     pub(crate) azdo_sessions: HashSet<String>,
@@ -773,7 +771,6 @@ pub(crate) fn session_ids(tx: &TxState) -> BTreeSet<String> {
         .chain(tx.session_active_requests.keys())
         .chain(tx.session_last_seen.keys())
         .chain(tx.inflight_messages.keys())
-        .chain(tx.session_keys.keys())
         .cloned()
         .collect()
 }
@@ -783,7 +780,6 @@ pub(crate) fn session_sig(tx: &TxState, session_id: &str) -> u64 {
     sig_of(&[
         &tx.broker_session_runners.get(session_id),
         &tx.sessions.get(session_id),
-        &tx.session_keys.get(session_id).map(|k| &k.key),
         &tx.session_active_requests.get(session_id),
         &tx.session_last_seen.get(session_id),
         &tx.verified_sessions.contains(session_id),

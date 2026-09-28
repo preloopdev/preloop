@@ -610,12 +610,11 @@ impl Store for InstrumentedStore {
 pub struct StoreSnapshot {
     pub runs: Vec<RunRecord>,
     /// (queue_kind, job, global queue position within the kind).
-    pub jobs: Vec<(&'static str, QueuedJob, i64)>,
-    pub runners: Vec<RegisteredRunner>,
-    pub rsa_public_keys: Vec<(i64, AgentRsaPublicKey)>,
-    pub sessions: Vec<RunnerSession>,
-    pub session_keys: Vec<(String, SessionEncryption)>,
-    pub requests: Vec<TaskAgentJobRequestRecord>,
+    pub(crate) jobs: Vec<(&'static str, QueuedJob, i64)>,
+    pub(crate) runners: Vec<RegisteredRunner>,
+    pub(crate) rsa_public_keys: Vec<(i64, AgentRsaPublicKey)>,
+    pub(crate) sessions: Vec<RunnerSession>,
+    pub(crate) requests: Vec<TaskAgentJobRequestRecord>,
     /// (session_id, message_id, undelivered message).
     pub inflight: Vec<(String, i64, azdo::TaskAgentMessage)>,
     /// session_id → currently claimed request id.
@@ -645,11 +644,6 @@ impl StoreSnapshot {
                 .map(|(id, key)| (*id, key.clone()))
                 .collect(),
             sessions: tx.sessions.values().cloned().collect(),
-            session_keys: tx
-                .session_keys
-                .iter()
-                .map(|(id, enc)| (id.clone(), enc.clone()))
-                .collect(),
             requests: tx.job_requests.values().cloned().collect(),
             inflight: tx
                 .inflight_messages
@@ -1581,24 +1575,6 @@ pub fn apply_meta_snapshot_tx(
         .collect();
 }
 
-/// Seal a session AES key for storage. Returns `(ciphertext, iv, tag)`.
-pub fn seal_session_key(cipher: &Envelope, enc: &SessionEncryption) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let payload = serde_json::to_vec(&SessionKeyPayload(enc.key.clone()))
-        .expect("SessionKeyPayload is always serializable");
-    cipher.encrypt_sealed(&payload)
-}
-
-/// Unseal + parse a session AES key blob written by [`seal_session_key`].
-pub fn restore_session_key(
-    cipher: &Envelope,
-    key_blob: &[u8],
-    iv: &[u8],
-    tag: &[u8],
-) -> anyhow::Result<SessionEncryption> {
-    let plaintext = cipher.decrypt_sealed(key_blob, iv, tag)?;
-    let payload: SessionKeyPayload = serde_json::from_slice(&plaintext)?;
-    Ok(SessionEncryption::from_key(payload.0))
-}
 
 /// Bound the WAL after a commit, and fail loudly when the checkpoint could not
 /// complete.
@@ -1994,32 +1970,6 @@ impl SqliteStore {
             let (runner_id, label) = label?;
             if let Some(runner) = tx.runners.get_mut(&runner_id) {
                 runner.labels.push(label);
-            }
-        }
-        // Restore session encryption keys (sealed). Without these, every
-        // post-restart session is `encrypted:false` regardless of the runner's
-        // RSA key — the AES session key is sent in plaintext to the runner.
-        let mut session_keys_stmt = connection.prepare(
-            "SELECT session_id, session_key_blob, session_iv, session_tag
-             FROM runner_sessions
-             WHERE closed_at_us IS NULL AND session_key_blob IS NOT NULL",
-        )?;
-        for row in session_keys_stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-            ))
-        })? {
-            let (session_id, key_blob, iv, tag) = row?;
-            match restore_session_key(&self.cipher, &key_blob, &iv, &tag) {
-                Ok(enc) => {
-                    tx.session_keys.insert(session_id.clone(), enc);
-                }
-                Err(error) => {
-                    tracing::warn!(%session_id, %error, "failed to restore session_key on load");
-                }
             }
         }
         let mut session_stmt = connection.prepare(
@@ -2430,11 +2380,6 @@ impl SqliteStore {
             .iter()
             .map(|(id, key)| (*id, key))
             .collect();
-        let session_keys: std::collections::BTreeMap<String, &SessionEncryption> = snapshot
-            .session_keys
-            .iter()
-            .map(|(id, key)| (id.clone(), key))
-            .collect();
         for runner in &snapshot.runners {
             // `OR REPLACE` so re-registration (same `runner_id`, new name)
             // overwrites the row in place. Without it, `UNIQUE(name)` would
@@ -2476,40 +2421,18 @@ impl SqliteStore {
         }
         for session in &snapshot.sessions {
             // `session_id` is the natural primary key; a re-persist
-            // overwrites the same row.
-            let key_blob = session_keys
-                .get(&session.session_id.0.to_string())
-                .map(|enc| seal_session_key(&self.cipher, enc));
-            match key_blob {
-                Some((ct, iv, tag)) => {
-                    tx.execute(
-                    "INSERT OR REPLACE INTO runner_sessions(session_id, runner_id, protocol,
-                                                            session_key_blob, session_iv, session_tag,
-                                                            created_at_us, last_seen_at_us)
-                     VALUES (?1, ?2, 'broker', ?3, ?4, ?5, ?6, ?6)",
-                    params![
-                        session.session_id.0.to_string(),
-                        session.runner_id,
-                        ct,
-                        iv,
-                        tag,
-                        now_us()
-                    ],
-                    )?;
-                }
-                None => {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO runner_sessions(session_id, runner_id, protocol,
+            // overwrites the same row. Session AES keys are HKDF-derived
+            // (cluster key + session id), never stored.
+            tx.execute(
+                "INSERT OR REPLACE INTO runner_sessions(session_id, runner_id, protocol,
                                                             created_at_us, last_seen_at_us)
                      VALUES (?1, ?2, 'broker', ?3, ?3)",
-                        params![
-                            session.session_id.0.to_string(),
-                            session.runner_id,
-                            now_us()
-                        ],
-                    )?;
-                }
-            }
+                params![
+                    session.session_id.0.to_string(),
+                    session.runner_id,
+                    now_us()
+                ],
+            )?;
         }
         for record in &snapshot.requests {
             self.insert_request_tx(&tx, record)?;
@@ -3918,8 +3841,6 @@ impl Store for SqliteStore {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SessionKeyPayload(pub Vec<u8>);
 
 const MIGRATIONS: &[(u32, &str, &str)] = &[
     (

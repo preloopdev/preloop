@@ -219,13 +219,26 @@ fn assert_same_job(actual: &QueuedJob, expected: &QueuedJob) {
 }
 
 fn request_record(run_id: RunId, job_id: &str, request_id: i64) -> TaskAgentJobRequestRecord {
+    request_record_with_agent(run_id, job_id, request_id, uuid::Uuid::new_v4())
+}
+
+/// `plan_id`/`plan_type` are derived from `agent_job_id` (the agreed schema
+/// has no such columns), so fixtures build them via the same `plan_fields`
+/// the backends use.
+fn request_record_with_agent(
+    run_id: RunId,
+    job_id: &str,
+    request_id: i64,
+    agent_job_id: uuid::Uuid,
+) -> TaskAgentJobRequestRecord {
+    let (plan_id, plan_type) = plan_fields(agent_job_id);
     TaskAgentJobRequestRecord {
         request_id,
         run_id,
         job_id: JobId(job_id.to_owned()),
-        agent_job_id: uuid::Uuid::new_v4(),
-        plan_id: "plan".to_owned(),
-        plan_type: "build".to_owned(),
+        agent_job_id,
+        plan_id,
+        plan_type,
         timeline_id: uuid::Uuid::new_v4(),
         result: None,
         locked_until: String::new(),
@@ -321,7 +334,6 @@ fn create_session(runner_id: i64) -> CreateSession {
         runner_id,
         protocol: SessionProtocol::Broker,
         client_id: None,
-        encryption: None,
     }
 }
 
@@ -571,6 +583,9 @@ pub(crate) mod suite {
         assert_eq!(second.queued_jobs, 0);
     }
 
+    /// `plan_id` is the request's `agent_job_id` string form (derived, never
+    /// stored) — a plan-id lookup resolves exactly that request. The shared
+    /// `timeline_id` is the cross-attempt correlate: it returns the newest.
     pub(crate) async fn request_lookup_uses_latest_correlation(backend: &dyn ControlBackend) {
         let first = RunId::new();
         let second = RunId::new();
@@ -581,11 +596,17 @@ pub(crate) mod suite {
             .submit_run(submit_run(first, vec![initial]))
             .await
             .unwrap();
-        let first_request = backend
-            .request(RequestKey::PlanId("plan".into()))
-            .await
-            .unwrap();
+        let first_request = backend.request(RequestKey::Id(1)).await.unwrap();
         assert_eq!(first_request.run_id, first);
+        let first_plan = first_request.plan_id.clone();
+        assert_eq!(
+            backend
+                .request(RequestKey::PlanId(first_plan.clone()))
+                .await
+                .unwrap()
+                .request_id,
+            first_request.request_id
+        );
         assert_eq!(
             backend
                 .request(RequestKey::AgentJobId(first_request.agent_job_id))
@@ -601,27 +622,18 @@ pub(crate) mod suite {
             .submit_run(submit_run(second, vec![later]))
             .await
             .unwrap();
+        // The first attempt's plan id still resolves to the first attempt;
+        // the shared timeline id resolves to the newest.
+        let oldest = backend
+            .request(RequestKey::PlanId(first_plan))
+            .await
+            .unwrap();
+        assert_eq!(oldest.run_id, first);
         let newest = backend
-            .request(RequestKey::PlanId("plan".into()))
+            .request(RequestKey::TimelineId(timeline))
             .await
             .unwrap();
         assert_eq!(newest.run_id, second);
-        assert_eq!(
-            backend
-                .request(RequestKey::TimelineId(timeline))
-                .await
-                .unwrap()
-                .request_id,
-            newest.request_id
-        );
-        assert_eq!(
-            backend
-                .request(RequestKey::Id(first_request.request_id))
-                .await
-                .unwrap()
-                .run_id,
-            first
-        );
     }
 
     pub(crate) async fn push_state_only_changes_its_run_column(backend: &dyn ControlBackend) {
@@ -667,8 +679,9 @@ pub(crate) mod suite {
         assert_eq!(run.jobs[&JobId("build".into())], ExecutionStatus::Queued);
     }
 
-    /// Artifact scope resolution: plan ids map to their latest attempt's run;
-    /// unknown ids are omitted so callers keep the raw backend id.
+    /// Artifact scope resolution: a plan id (the request's `agent_job_id`
+    /// string form) maps to the run owning that attempt; unknown ids are
+    /// omitted so callers keep the raw backend id.
     pub(crate) async fn artifact_scopes_map_plan_ids_to_latest_run(backend: &dyn ControlBackend) {
         let run_a = RunId::new();
         let run_b = RunId::new();
@@ -680,11 +693,12 @@ pub(crate) mod suite {
             .submit_run(submit_run(run_b, vec![submit_job(run_b, "build", 2)]))
             .await
             .unwrap();
+        let plan_b = backend.request(RequestKey::Id(2)).await.unwrap().plan_id;
         let scopes = backend
-            .artifact_scopes(&["plan".to_owned(), "unknown".to_owned()])
+            .artifact_scopes(&[plan_b.clone(), "unknown".to_owned()])
             .await
             .unwrap();
-        assert_eq!(scopes.get("plan"), Some(&run_b));
+        assert_eq!(scopes.get(&plan_b), Some(&run_b));
         assert!(!scopes.contains_key("unknown"));
         assert!(backend.artifact_scopes(&[]).await.unwrap().is_empty());
     }
@@ -2546,7 +2560,9 @@ mod postgres {
                     "-D".into(),
                     data.clone().into_os_string().into_string().unwrap(),
                     "-o".into(),
-                    format!("-p {port} -k {}", dir.display()),
+                    // Six concurrent backend pools must fit: writers+readers+2
+                    // each ≈ 204 connections > initdb's default 100.
+                    format!("-p {port} -k {} -c max_connections=300", dir.display()),
                     "-l".into(),
                     dir.join("log").to_string_lossy().into_owned(),
                     "-w".into(),

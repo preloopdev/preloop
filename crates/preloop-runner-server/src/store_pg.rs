@@ -754,31 +754,6 @@ impl Store for PgStore {
                 runner.labels.push(label);
             }
         }
-        // Restore session encryption keys (sealed). Without these, every
-        // post-restart session is `encrypted:false` regardless of the runner's
-        // RSA key — the AES session key is sent in plaintext to the runner.
-        let rows = client
-            .query(
-                "SELECT session_id, session_key_blob, session_iv, session_tag
-                 FROM runner_sessions
-                 WHERE closed_at_us IS NULL AND session_key_blob IS NOT NULL",
-                &[],
-            )
-            .await?;
-        for row in rows {
-            let session_id: String = row.get(0);
-            let key_blob: Vec<u8> = row.get(1);
-            let iv: Vec<u8> = row.get(2);
-            let tag: Vec<u8> = row.get(3);
-            match restore_session_key(&self.cipher, &key_blob, &iv, &tag) {
-                Ok(enc) => {
-                    tx.session_keys.insert(session_id.clone(), enc);
-                }
-                Err(error) => {
-                    tracing::warn!(%session_id, %error, "failed to restore session_key on load");
-                }
-            }
-        }
         let rows = client
             .query(
                 "SELECT session_id, runner_id FROM runner_sessions WHERE closed_at_us IS NULL",
@@ -1041,11 +1016,6 @@ impl Store for PgStore {
             .iter()
             .map(|(id, key)| (*id, key))
             .collect();
-        let session_keys: std::collections::BTreeMap<String, &SessionEncryption> = snapshot
-            .session_keys
-            .iter()
-            .map(|(id, key)| (id.clone(), key))
-            .collect();
         for (kind, job, position) in &snapshot.jobs {
             self.insert_job(&tx, job, kind, *position).await?;
         }
@@ -1115,56 +1085,26 @@ impl Store for PgStore {
         }
         for session in &snapshot.sessions {
             // `session_id` is the natural primary key; a re-persist
-            // overwrites the same row.
-            let key_blob = session_keys
-                .get(&session.session_id.0.to_string())
-                .map(|enc| seal_session_key(&self.cipher, enc));
-            match key_blob {
-                Some((ct, iv, tag)) => {
-                    tx.execute(
-                        "INSERT INTO runner_sessions(session_id, runner_id, protocol,
-                                                     session_key_blob, session_iv, session_tag,
-                                                     created_at_us, last_seen_at_us)
-                         VALUES ($1, $2, 'broker', $3, $4, $5, $6, $6)
-                         ON CONFLICT(session_id) DO UPDATE SET
-                           runner_id = EXCLUDED.runner_id,
-                           protocol = EXCLUDED.protocol,
-                           session_key_blob = EXCLUDED.session_key_blob,
-                           session_iv = EXCLUDED.session_iv,
-                           session_tag = EXCLUDED.session_tag,
-                           last_seen_at_us = EXCLUDED.last_seen_at_us",
-                        &[
-                            &session.session_id.0.to_string(),
-                            &session.runner_id,
-                            &ct,
-                            &iv,
-                            &tag,
-                            &now_us(),
-                        ],
-                    )
-                    .await?;
-                }
-                None => {
-                    tx.execute(
-                        "INSERT INTO runner_sessions(session_id, runner_id, protocol,
-                                                     created_at_us, last_seen_at_us)
-                         VALUES ($1, $2, 'broker', $3, $3)
-                         ON CONFLICT(session_id) DO UPDATE SET
-                           runner_id = EXCLUDED.runner_id,
-                           protocol = EXCLUDED.protocol,
-                           session_key_blob = NULL,
-                           session_iv = NULL,
-                           session_tag = NULL,
-                           last_seen_at_us = EXCLUDED.last_seen_at_us",
-                        &[
-                            &session.session_id.0.to_string(),
-                            &session.runner_id,
-                            &now_us(),
-                        ],
-                    )
-                    .await?;
-                }
-            }
+            // overwrites the same row. Session AES keys are HKDF-derived
+            // (cluster key + session id), never stored.
+            tx.execute(
+                "INSERT INTO runner_sessions(session_id, runner_id, protocol,
+                                                 created_at_us, last_seen_at_us)
+                     VALUES ($1, $2, 'broker', $3, $3)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       runner_id = EXCLUDED.runner_id,
+                       protocol = EXCLUDED.protocol,
+                       session_key_blob = NULL,
+                       session_iv = NULL,
+                       session_tag = NULL,
+                       last_seen_at_us = EXCLUDED.last_seen_at_us",
+                &[
+                    &session.session_id.0.to_string(),
+                    &session.runner_id,
+                    &now_us(),
+                ],
+            )
+            .await?;
         }
         for record in &snapshot.requests {
             self.insert_request_tx(&tx, record).await?;

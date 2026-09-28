@@ -231,6 +231,65 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub preloop_snapshot_origin_rewrite: Option<SnapshotOriginRewrite>,
+
+    /// Preloop extension: what the acquire-time fill resolves back into this
+    /// stored template (secret names/scopes + reusable-call mappings).
+    ///
+    /// `None` on the wire and on legacy rows written before message
+    /// templates: a `None` spec means the message was persisted complete
+    /// (old format) and is delivered as-is.
+    #[serde(
+        rename = "preloopSecretSpec",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preloop_secret_spec: Option<MessageSecretSpec>,
+}
+
+/// What the acquire-time fill must inject into a stored job-message template.
+///
+/// The control plane persists `AgentJobRequestMessage` minus every secret
+/// value and token (the "message template"); this spec rides inside it so the
+/// fill path needs no side table to reconstruct the secret surface:
+///
+/// - `names`: caller-scope secret names the job receives verbatim as
+///   `variables[<name>]` secret entries (regular jobs; reusable calls with
+///   `secrets: inherit` set `inherit` instead).
+/// - `provided`: the subset of `names` the submission itself supplied —
+///   submission values beat every stored tier even across restarts.
+/// - `environment`: the job's resolved `environment:` name, i.e. the
+///   SecretProvider scope tier `names` resolve against.
+/// - `inherit`: take every resolved scope + submission name (callee of
+///   `secrets: inherit`).
+/// - `map`: reusable-call `secrets:` mapping — callee name -> caller-side
+///   expression string, evaluated at fill time.
+///
+/// The spec is a server-internal carrier: it is removed from the message
+/// before the payload is serialized onto the wire (the runner derives its
+/// `secrets` context from the filled `variables` instead).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MessageSecretSpec {
+    /// Names resolved through the SecretProvider scope at acquire.
+    pub names: std::collections::BTreeSet<String>,
+    /// Names whose value the submission provided (overrides every tier).
+    pub provided: std::collections::BTreeSet<String>,
+    /// Deployment-environment tier name for provider scope resolution.
+    pub environment: Option<String>,
+    /// Reusable call with `secrets: inherit` — fill with every resolved name.
+    pub inherit: bool,
+    /// Reusable call `secrets:` map — callee name -> caller expression.
+    pub map: std::collections::BTreeMap<String, String>,
+}
+
+impl MessageSecretSpec {
+    /// True when the spec carries no secret surface at all.
+    pub fn is_empty(&self) -> bool {
+        !self.inherit
+            && self.names.is_empty()
+            && self.map.is_empty()
+            && self.environment.is_none()
+    }
 }
 
 /// Where to send git traffic a workflow aimed at the forge, and how to

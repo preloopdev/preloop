@@ -21,7 +21,6 @@ use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
     WebhookRedeliveryRecord, WebhookWatchdogCursor,
 };
-use preloop_gha_protocol::azdo;
 use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -157,17 +156,22 @@ pub(crate) trait ControlBackend: Send + Sync {
         runner_id: i64,
     ) -> Result<AcquireContext, ControlError>;
 
-    /// Persist the agent-job message minted at claim for `request_id`
-    /// (`None` leaves `request_blob`/`job_timeout_s` untouched), and upsert
-    /// `token_request` when supplied. Runs under the run's advisory lock — a
-    /// concurrent scoped write-back that snapshots the same `request_id`
-    /// would otherwise clobber the row.
-    async fn store_request_message(
+    /// Upsert the deferred GitHub-token mint request for `request_id`
+    /// (`github_token_requests` row). Called at submit (the request row is
+    /// written alongside the message template) and at acquire when the
+    /// broker re-derives a request lost to a pre-snapshot crash.
+    ///
+    /// `run_id` scopes the transaction's advisory lock so the upsert cannot
+    /// race a scoped write-back that would otherwise delete the row.
+    ///
+    /// The job message itself has no write path here by contract: stored
+    /// `request_blob` is a secret-free *template*; the acquire-time fill must
+    /// never be persisted.
+    async fn record_token_request(
         &self,
         run_id: RunId,
         request_id: i64,
-        message: Option<&azdo::AgentJobRequestMessage>,
-        token_request: Option<&crate::models::GitHubTokenRequest>,
+        token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError>;
 
     /// Record a runner's job completion: flip the job (and run) status,
@@ -618,12 +622,12 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Create a broker (`runner_sessions`) row owned by `runner_id`.
     /// `Forbidden` when the runner registration no longer exists — the
-    /// liveness check and the insert run in one transaction.
+    /// liveness check and the insert run in one transaction. The session AES
+    /// key is caller-derived (`AppState::session_encryption`) and never stored.
     async fn create_broker_session(
         &self,
         session_id: &str,
         runner_id: i64,
-        encryption: &preloop_gha_protocol::crypto::SessionEncryption,
     ) -> Result<(), ControlError>;
 
     /// Delete a broker session owned by `runner_id`; `Forbidden` when the
@@ -1065,13 +1069,12 @@ pub(crate) struct RegisterRunner {
     pub(crate) pool_proven: bool,
 }
 
-/// Session creation input.
+/// Session creation input. The session AES key is NOT part of this input:
+/// it is derived from the cluster key + session id and never stored.
 pub(crate) struct CreateSession {
     pub(crate) runner_id: i64,
     pub(crate) protocol: SessionProtocol,
     pub(crate) client_id: Option<String>,
-    /// Session crypto material, sealed into the row.
-    pub(crate) encryption: Option<preloop_gha_protocol::crypto::SessionEncryption>,
 }
 
 /// An expansion apply: the claim's identity plus the build result.
@@ -1086,6 +1089,10 @@ pub(crate) struct ExpansionApply {
 #[derive(Debug)]
 pub(crate) enum RequestKey {
     Id(i64),
+    /// The runner-protocol "plan id" — the request's `agent_job_id` in
+    /// string form (derived, never a stored column). Same row as
+    /// `AgentJobId`; the string key is the plan-addressed surface the
+    /// runner actually sends.
     PlanId(String),
     AgentJobId(uuid::Uuid),
     TimelineId(uuid::Uuid),
@@ -1373,20 +1380,19 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.acquire_for_runner(request_id, runner_id).await,
         }
     }
-    async fn store_request_message(
+    async fn record_token_request(
         &self,
         run_id: RunId,
         request_id: i64,
-        message: Option<&azdo::AgentJobRequestMessage>,
-        token_request: Option<&crate::models::GitHubTokenRequest>,
+        token_request: &crate::models::GitHubTokenRequest,
     ) -> Result<(), ControlError> {
         match self {
             Self::Sqlite(b) => {
-                b.store_request_message(run_id, request_id, message, token_request)
+                b.record_token_request(run_id, request_id, token_request)
                     .await
             }
             Self::Postgres(b) => {
-                b.store_request_message(run_id, request_id, message, token_request)
+                b.record_token_request(run_id, request_id, token_request)
                     .await
             }
         }
@@ -1838,17 +1844,10 @@ impl ControlBackend for Backend {
         &self,
         session_id: &str,
         runner_id: i64,
-        encryption: &preloop_gha_protocol::crypto::SessionEncryption,
     ) -> Result<(), ControlError> {
         match self {
-            Self::Sqlite(b) => {
-                b.create_broker_session(session_id, runner_id, encryption)
-                    .await
-            }
-            Self::Postgres(b) => {
-                b.create_broker_session(session_id, runner_id, encryption)
-                    .await
-            }
+            Self::Sqlite(b) => b.create_broker_session(session_id, runner_id).await,
+            Self::Postgres(b) => b.create_broker_session(session_id, runner_id).await,
         }
     }
     async fn run_dispatch_info(

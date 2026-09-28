@@ -251,13 +251,50 @@ pub(crate) struct RunScalars {
 }
 
 /// `submission_json` never contains secret values (the `secrets` key is
-/// removed); `secrets` holds the exposed values the backend seals.
+/// removed); `secrets` holds the sealed-side payload the backend stores.
+///
+/// `secrets.secrets` is the submit-time merged map (submission-provided
+/// values winning over repo/global); `secrets.provided` are the names the
+/// submission itself supplied, so a restarted acquire still lets
+/// submission values outrank the live environment tier.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct StoredSecrets {
+    /// Submission-provided names (precedence marker for acquire-time fill).
+    pub(crate) provided: std::collections::BTreeSet<String>,
+    /// name -> value, merged at submit (submission > repo > global).
+    pub(crate) secrets: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RunSubmissionRow {
     pub(crate) submission_json: String,
-    pub(crate) secrets: std::collections::BTreeMap<String, String>,
+    pub(crate) secrets: StoredSecrets,
     pub(crate) github_json: String,
     pub(crate) workspace_snapshot_json: Option<String>,
+}
+
+/// Decode a sealed secrets blob: post-M2 rows hold [`StoredSecrets`]
+/// (`{"provided": […], "secrets": {…}}`); pre-M2 rows hold a bare
+/// `name -> value` map (kept readable — in-flight runs on an old row must
+/// still acquire). The shape is detected structurally: a plain map must not
+/// parse through `serde(default)` as an empty StoredSecrets.
+pub(crate) fn decode_stored_secrets(
+    value: serde_json::Value,
+) -> Result<StoredSecrets, serde_json::Error> {
+    let is_new_shape = value
+        .as_object()
+        .is_some_and(|map| map.contains_key("provided") && map.contains_key("secrets"));
+    if is_new_shape {
+        serde_json::from_value(value)
+    } else {
+        serde_json::from_value::<std::collections::BTreeMap<String, String>>(value).map(|secrets| {
+            StoredSecrets {
+                provided: Default::default(),
+                secrets,
+            }
+        })
+    }
 }
 
 /// Per-job workflow facts. Each field is `None` when the corresponding
@@ -356,7 +393,10 @@ impl RunParts {
             },
             submission: RunSubmissionRow {
                 submission_json: submission.to_string(),
-                secrets: preloop_gha_protocol::masking::expose_all(&run.submission.secrets),
+                secrets: StoredSecrets {
+                    provided: run.submission.submission_names.clone(),
+                    secrets: preloop_gha_protocol::masking::expose_all(&run.submission.secrets),
+                },
                 github_json: run.github.to_string(),
                 workspace_snapshot_json: run.workspace_snapshot.as_ref().map(to_json),
             },
@@ -383,9 +423,11 @@ impl RunParts {
         submission.secrets = self
             .submission
             .secrets
+            .secrets
             .into_iter()
             .map(|(name, value)| (name, preloop_gha_protocol::SecretString::new(value)))
             .collect();
+        submission.submission_names = self.submission.secrets.provided;
         let workspace_snapshot = self
             .submission
             .workspace_snapshot_json

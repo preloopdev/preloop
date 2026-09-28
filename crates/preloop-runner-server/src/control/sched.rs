@@ -2198,11 +2198,6 @@ where
     let normalized_github =
         preloop_gha_parser::job_builder::normalize_github_context(&ctx.github_json);
     let secrets_exposed = preloop_gha_protocol::masking::expose_all(&ctx.submission.secrets);
-    let pat_override = if shared.state.github_app.is_none() {
-        shared.state.static_github_pat()
-    } else {
-        None
-    };
     let mut built = Vec::with_capacity(plans.len());
     for plan in plans {
         let artifacts = crate::runs::build_job_artifacts(
@@ -2217,7 +2212,6 @@ where
             &base_url,
             ctx.snapshot.as_ref(),
             plan,
-            pat_override.clone(),
         )
         .map_err(|error| {
             tracing::warn!(

@@ -35,6 +35,7 @@ pub mod secrets_api;
 use secrets_api::*;
 pub mod execution_protection_api;
 use execution_protection_api::*;
+mod message_template;
 pub mod reusable_workflows;
 pub mod secret_provider;
 #[cfg(test)]

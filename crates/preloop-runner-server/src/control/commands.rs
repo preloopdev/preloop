@@ -706,7 +706,6 @@ pub(crate) fn create_session_tx(
     session: CreateSession,
 ) -> Result<SessionRow, ControlError> {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let encryption = session.encryption;
     match session.protocol {
         SessionProtocol::Broker => {
             tx.broker_session_runners
@@ -727,16 +726,14 @@ pub(crate) fn create_session_tx(
         // foreign keys, so no runner map is populated.
         SessionProtocol::Compat => {}
     }
-    if let Some(enc) = &encryption {
-        tx.session_keys.insert(session_id.clone(), enc.clone());
-    }
+    // Session AES keys are derived (HKDF over cluster key + session id), never
+    // stored — the caller derives with `AppState::session_encryption`.
     tx.mark_session_seen(&session_id);
     Ok(SessionRow {
         session_id,
         runner_id: session.runner_id,
         protocol: session.protocol,
         client_id: session.client_id,
-        encryption,
         active_request_id: None,
         last_seen_at_us: Some(system_to_us(std::time::SystemTime::now())),
     })
@@ -752,7 +749,6 @@ pub(crate) fn delete_session_tx(tx: &mut TxState, session_id: &str) {
     tx.sessions.remove(session_id);
     tx.azdo_sessions.remove(session_id);
     tx.verified_sessions.remove(session_id);
-    tx.session_keys.remove(session_id);
     tx.session_last_seen.remove(session_id);
     tx.inflight_messages.remove(session_id);
 }

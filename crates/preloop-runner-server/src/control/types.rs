@@ -8,7 +8,7 @@
 use super::*;
 use crate::models::{QueuedJob, RunRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::azdo;
-use preloop_gha_protocol::crypto::{AgentRsaPublicKey, SessionEncryption};
+use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 
 use preloop_gha_protocol::{ExecutionStatus, JobId, RegisteredRunner, RunId};
 
@@ -212,12 +212,29 @@ pub(crate) struct ClaimedJob {
     pub(crate) next_runs_on: Vec<String>,
 }
 
-/// Everything `acquirejob` needs in one read: request, message, grant and
-/// the token-mint request.
+/// `(plan_id, plan_type)` for a request record: derived, never read from a
+/// `plan_id`/`plan_type` column (the agreed schema has none; the old
+/// backends' columns are write-only legacy). `plan_id` is the `agent_job_id`
+/// string form; `plan_type` is always `"actions"`.
+pub(crate) fn plan_fields(agent_job_id: uuid::Uuid) -> (String, String) {
+    (agent_job_id.to_string(), "actions".to_owned())
+}
+/// Everything `acquirejob` needs in one read: the request record, its stored
+/// job-message TEMPLATE (secrets/tokens stripped; `preloop_secret_spec`
+/// carries what to resolve), the run's stored secret map, the id-token grant
+/// and the deferred token-mint request.
 #[derive(Debug)]
 pub(crate) struct AcquireContext {
     pub(crate) request: TaskAgentJobRequestRecord,
+    /// The stored template: `variables`/`mask_hints`/tokens are stripped.
+    /// The caller resolves `preloop_secret_spec` and fills it in memory —
+    /// the filled message must never be written back.
     pub(crate) message: azdo::AgentJobRequestMessage,
+    /// The run's stored secret map (`secrets_blob`): submission-provided
+    /// values merged over the submit-time repo/global tiers. The fill path
+    /// uses it for `spec.provided` names and as the fallback for names the
+    /// provider no longer serves.
+    pub(crate) run_secrets: std::collections::BTreeMap<String, String>,
     pub(crate) token_request: Option<crate::models::GitHubTokenRequest>,
     /// `id_token_grants` row for the attempt's job: `Some` = recorded grant,
     /// `None` = no row (the caller falls back to wire markers).
@@ -288,15 +305,14 @@ pub(crate) struct RunnerRow {
     pub(crate) pool_proven: bool,
     pub(crate) registered_at_us: i64,
 }
-/// A live session row.
+/// A live session row. No crypto material: the AES key is derived from the
+/// cluster key + session id and never stored.
 #[derive(Clone)]
 pub(crate) struct SessionRow {
     pub(crate) session_id: String,
     pub(crate) runner_id: i64,
     pub(crate) protocol: SessionProtocol,
     pub(crate) client_id: Option<String>,
-    /// Sealed session crypto material (AES key/iv state).
-    pub(crate) encryption: Option<SessionEncryption>,
     pub(crate) active_request_id: Option<i64>,
     pub(crate) last_seen_at_us: Option<i64>,
 }

@@ -532,7 +532,7 @@ pub fn enforce_pat_permissions(
 /// stated here. `system.github.token.permissions` keeps its documented
 /// `{"<Permission>": "<level>"}` map shape, so consumers that parse it are not
 /// surprised by a key that is not a permission and a value that is prose.
-fn pat_scopes_wire_value(scopes: &[String]) -> String {
+pub(crate) fn pat_scopes_wire_value(scopes: &[String]) -> String {
     if scopes.is_empty() {
         // The header was present but listed nothing: the token carries no
         // classic scopes, which is narrower than any declaration. Distinct from
@@ -1413,11 +1413,12 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         }
     }
 
-    // PATs are static and can be embedded now. GitHub App installation tokens
-    // are deliberately minted later, when the broker dispatches each job, so
-    // downstream jobs cannot sit in the queue until a short-lived token
-    // expires.
-    let mut github_tokens: BTreeMap<JobId, PatToken> = BTreeMap::new();
+    // PATs are static and the token is minted at acquire. GitHub App
+    // installation tokens are likewise minted later, when the broker
+    // dispatches each job, so downstream jobs cannot sit in the queue until a
+    // short-lived token expires. The scope check runs here, at submit,
+    // because a PAT broader than the declared `permissions:` refuses the run
+    // before it occupies queue slots.
     if shared.state.github_app.is_none()
         && let Some(pat) = shared.state.static_github_pat()
     {
@@ -1426,7 +1427,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // non-fork job authority the workflow never claimed. Introspect
         // the PAT's classic OAuth scopes and refuse the run on mismatch;
         // an invalid PAT is refused outright, and a PAT whose bounds
-        // cannot be verified is withheld rather than embedded.
+        // cannot be verified is withheld rather than embedded at acquire.
         match pat_oauth_scopes(&pat).await {
             PatScopeOutcome::Known(scopes) => {
                 enforce_pat_permissions(&jobs, &submission, &scopes)?;
@@ -1437,12 +1438,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                      NOT enforced in PAT mode; the PAT above is embedded verbatim. Configure a \
                      GitHub App to mint least-privilege installation tokens."
                 );
-                github_tokens.extend(jobs.iter().map(|job| {
-                    (
-                        job.id.clone(),
-                        PatToken::with_scopes(pat.clone(), scopes.clone()),
-                    )
-                }));
             }
             PatScopeOutcome::Unverifiable { reason } => {
                 tracing::warn!(
@@ -1454,10 +1449,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                      needs GitHub fails. Configure a GitHub App to mint least-privilege installation \
                      tokens, or make the GitHub API reachable so the scopes can be verified."
                 );
-                github_tokens.extend(
-                    jobs.iter()
-                        .map(|job| (job.id.clone(), PatToken::withheld())),
-                );
             }
             PatScopeOutcome::Invalid(error) => {
                 return Err(ApiError::forbidden(format!(
@@ -1468,7 +1459,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             }
         }
     }
-
     // Reserve the workflow run number only after rechecking the durable
     // delivery identity under the same state lock used for run insertion.
     // A competing replay therefore returns before advancing the counter.
@@ -1624,7 +1614,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             &base_url,
             workspace_snapshot.as_ref(),
             &job,
-            github_tokens.remove(&job.id),
         )?;
 
         prebuilt.push(PrebuiltJob {
@@ -2191,6 +2180,9 @@ fn job_source_identity(
 /// Pure computation shared by the submission prebuild and the scheduler's
 /// runtime expansion of reusable-workflow callee subtrees (which cannot be
 /// built at submission: they exist only after the caller's `if:` gate passes).
+/// Names only — the built message is a secret-free template; values are
+/// resolved through the SecretProvider at acquire. `secrets_exposed` callers
+/// pass the run's merged map; this function reads only its keys.
 #[allow(clippy::too_many_arguments)]
 pub fn build_job_artifacts(
     shared: &SharedState,
@@ -2204,7 +2196,7 @@ pub fn build_job_artifacts(
     base_url: &str,
     workspace_snapshot: Option<&WorkspaceSnapshot>,
     job: &preloop_gha_protocol::JobPlan,
-    github_token_override: Option<PatToken>,
+
 ) -> Result<BuiltJobArtifacts, ApiError> {
     // One policy drives every job-facing authority decision for this tier:
     // stored secrets, the runner-visible `system.github.token.permissions`
@@ -2250,10 +2242,10 @@ pub fn build_job_artifacts(
     // tier, so the overlay happens here, not in the submission-level merge.
     // Precedence per name: submission-provided > environment > repo > global,
     // mirroring GitHub's env-over-repo-over-org rule with the local
-    // `--secret` escape hatch kept on top.
-    // Only jobs with an `environment:` get an overlay; the rest borrow the
-    // submission-level map directly instead of copying it per job.
-    let mut env_overlay: Option<BTreeMap<String, String>> = None;
+    // `--secret` escape hatch kept on top. Only the NAME SET matters: the
+    // stored message is a secret-free template and the fill path re-resolves
+    // values at acquire through the provider, so this block keeps only keys.
+    let mut env_overlay: Option<BTreeSet<String>> = None;
     if policy.allows_secrets {
         if let Some(env_name) = job.oidc_environment.as_deref() {
             let scoped = shared
@@ -2269,24 +2261,36 @@ pub fn build_job_artifacts(
                         shared.state.secret_provider.name()
                     ))
                 })?;
-            // `scoped` is env > repo > global; submission-provided names
-            // keep their value on top.
-            let mut merged = secrets_exposed.clone();
-            for (name, value) in preloop_gha_protocol::masking::expose_all(&scoped) {
-                if !submission.submission_names.contains(&name) {
-                    merged.insert(name, value);
+            // `scoped` is env > repo > global by name; submission-provided
+            // names keep winning over the environment tier.
+            let mut merged: BTreeSet<String> = secrets_exposed.keys().cloned().collect();
+            for name in scoped.keys() {
+                if !submission.submission_names.contains(name) {
+                    merged.insert(name.clone());
                 }
             }
             env_overlay = Some(merged);
         }
     }
-    let merged_secrets = env_overlay.as_ref().unwrap_or(secrets_exposed);
+    let merged_names: BTreeSet<String> = env_overlay
+        .clone()
+        .unwrap_or_else(|| secrets_exposed.keys().cloned().collect());
+
+    // The builder needs secret *names* (for `secrets.*` contexts and
+    // `secrets: inherit` key sets) but never values — the stored message is
+    // a template: `build_context` masks values, and the only fields that
+    // would carry a real value (`variables`, `mask_hints`) are stripped
+    // below. Keys-only input makes a value leak structurally impossible.
+    let secret_names: BTreeMap<String, String> = merged_names
+        .iter()
+        .map(|name| (name.clone(), String::new()))
+        .collect();
 
     let mut agent_msg =
         preloop_gha_parser::job_builder::build_agent_job_message_with_normalized_context(
             job,
             normalized_github,
-            merged_secrets,
+            &secret_names,
             &submission.vars,
         )
         .map_err(|e| ApiError::bad_request(format!("failed to build job message: {e}")))?;
@@ -2367,9 +2371,14 @@ pub fn build_job_artifacts(
     // fetch anonymously through the engine's forge relay when no GitHub
     // credential exists — otherwise actions/checkout writes a bogus
     // `x-access-token:` header and the fetch dies at github.com. With an App
-    // or an embeddable PAT the step keeps direct forge access.
+    // or an embeddable PAT (classic OAuth scopes verified at submit) the step
+    // keeps direct forge access.
     let has_forge_credential = shared.state.github_app.is_some()
-        || matches!(github_token_override.as_ref(), Some(PatToken::Embed { .. }));
+        || shared
+            .state
+            .static_github_pat()
+            .and_then(|pat| cached_pat_scopes(&pat))
+            .is_some();
     let rerouted = crate::snapshots::reroute_forge_checkouts(
         &mut agent_msg,
         base_url,
@@ -2403,67 +2412,10 @@ pub fn build_job_artifacts(
         }
     }
 
-    // The PAT override (used when no GitHub App is configured) is a static,
-    // repository-unscoped credential: embedding it in a fork-restricted job's
-    // message would hand hostile code authority GitHub would never grant the
-    // fork. Such jobs keep the local job-scoped runtime token, which
-    // authenticates only against this control plane.
-    let github_token = if policy.fork_restricted {
-        runtime_token.clone()
-    } else if let Some(pat) = github_token_override {
-        // PAT mode: the token carries the PAT's OAuth scopes, not the
-        // workflow's declared `permissions:`. `system.github.token.permissions`
-        // keeps its documented map shape (the declared set, as the message
-        // builder wrote it) so consumers that parse it are not surprised; the
-        // token's real authority goes in its own variable, which the runner
-        // prints inside the same `GITHUB_TOKEN Permissions` group.
-        let (token, authority) = match &pat {
-            PatToken::Embed { token, scopes } => {
-                // The github context predates PAT selection, so
-                // `${{ github.token }}` inputs (checkout's token, persist-
-                // credentials) resolve empty unless the PAT is patched in —
-                // same hole apply_minted_token_to_message fills for App mints.
-                if let Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) =
-                    agent_msg.context_data.get_mut("github")
-                {
-                    github.insert(
-                        "token".to_owned(),
-                        preloop_gha_protocol::azdo::PipelineContextData::String(token.clone()),
-                    );
-                }
-                (token.clone(), pat_scopes_wire_value(scopes))
-            }
-            // H3: unverifiable authority means no PAT is embedded. The job
-            // keeps the runtime token, which authenticates only against this
-            // control plane, so a step that needs GitHub fails at the point of
-            // use rather than running with authority nobody could bound.
-            PatToken::Withheld => (
-                runtime_token.clone(),
-                "withheld: PAT authority unverifiable; NOT the declared `permissions:` set"
-                    .to_owned(),
-            ),
-        };
-        agent_msg.variables.insert(
-            "system.github.token.pat_scopes".to_owned(),
-            preloop_gha_protocol::azdo::VariableValue::new(authority),
-        );
-        token
-    } else {
-        // No GitHub App and no PAT: `system.github.token` stays the
-        // job-scoped runtime JWT — engine endpoints (snapshots, forge relay,
-        // results) authenticate against it. It does NOT reach api.github.com:
-        // `${{ github.token }}` inputs resolve from the context (empty), and
-        // the runner no longer back-fills GITHUB_TOKEN from this variable.
-        runtime_token.clone()
-    };
-    agent_msg.variables.insert(
-        "system.github.token".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-    );
-    agent_msg.variables.insert(
-        "github_token".to_owned(),
-        preloop_gha_protocol::azdo::VariableValue::secret(github_token.clone()),
-    );
+    // Token variables are minted at acquire: the stored template carries the
+    // `isSecret` slots empty and the acquire path fills them (runtime token
+    // by default; the PAT override or a minted App token where applicable —
+    // see `message_template::template_github_token` and `broker_acquire_job`).
     agent_msg.variables.insert(
         "actions_runner_allow_artifacts_file".to_owned(),
         preloop_gha_protocol::azdo::VariableValue::new("false"),
@@ -2580,6 +2532,46 @@ pub fn build_job_artifacts(
             });
         }
     }
+    // Turn the built message into its stored template: strip every secret
+    // variable (the names-only build leaves values empty, and the token pair
+    // sits empty from `populate_runner_variables`), drop the value-derived
+    // mask hints (re-derived from live values at acquire), and blank the
+    // snapshot credentials (`redirect_primary_checkout` minted a pinned
+    // token so the template records WHERE it goes, not its value). The spec
+    // rides inside the template so the fill path is self-contained.
+    let provided: BTreeSet<String> = submission
+        .submission_names
+        .iter()
+        .filter(|name| merged_names.contains(*name))
+        .cloned()
+        .collect();
+    agent_msg.preloop_secret_spec = if policy.allows_secrets {
+        Some(crate::message_template::secret_spec_for(
+            job,
+            &merged_names,
+            &provided,
+        ))
+    } else {
+        // A secrets-denied job still carries an explicit (empty) spec so the
+        // fill path injects only tokens — never treated as a legacy
+        // fully-formed message.
+        Some(preloop_gha_protocol::azdo::MessageSecretSpec {
+            environment: job.oidc_environment.clone(),
+            ..Default::default()
+        })
+    };
+    // The builder appends value-derived mask hints last, one per non-empty
+    // secret variable; counting them here reproduces that count without
+    // exporting the builder's internals.
+    let secret_hint_count = agent_msg
+        .variables
+        .values()
+        .filter(|value| {
+            value.is_secret == Some(true) && !value.value.as_deref().unwrap_or("").is_empty()
+        })
+        .count();
+    crate::message_template::strip_template(&mut agent_msg, secret_hint_count);
+
     let oidc_ctx = OidcJobContext {
         environment: job.oidc_environment.clone(),
         job_workflow_ref: job.oidc_job_workflow_ref.clone(),
