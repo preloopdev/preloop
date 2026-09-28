@@ -26,6 +26,15 @@
 CREATE SCHEMA IF NOT EXISTS control;
 SET search_path = control;
 
+-- Cell-local boot invariants. `schema_version` is exactly 1 (greenfield;
+-- other values are refused) and `key_fingerprint` fences nodes with
+-- different cluster HMAC keys from sharing the same database.
+CREATE TABLE schema_meta (
+    key                     text PRIMARY KEY,
+    value                   bytea NOT NULL
+);
+
+
 -- ── Tenancy ──────────────────────────────────────────────────────────
 -- The cell-local copy of what the platform decided for a tenant. Only the
 -- values the control engine enforces in its own transactions (submit,
@@ -340,13 +349,18 @@ CREATE TABLE timeline_records (
     PRIMARY KEY (timeline_id, record_id)
 ) WITH (fillfactor = 80);
 
--- Per-log counters for results-service reads (content lives in file segments).
+-- Per-plan log ids fit the official runner's 32-bit TaskLog.Id and remain
+-- stable across nodes. The unique pair arbitrates concurrent allocations.
+-- Content lives in file segments; this row tracks result-service counters.
 CREATE TABLE log_files (
     log_key                 text PRIMARY KEY,
     run_id                  uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    plan_id                 uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
+    log_id                  integer NOT NULL CHECK (log_id > 0),
     byte_count              bigint NOT NULL DEFAULT 0,
     line_count              bigint NOT NULL DEFAULT 0,
-    updated_at              timestamptz NOT NULL DEFAULT now()
+    updated_at              timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (plan_id, log_id)
 );
 CREATE INDEX log_files_run ON log_files(run_id);
 
