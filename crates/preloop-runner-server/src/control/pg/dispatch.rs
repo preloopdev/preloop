@@ -9,7 +9,7 @@
 //! foreign run it cancels/promotes — group-before-run order, always, so two
 //! cross-run commands cannot deadlock.
 
-use super::codec::{self, from_json, json, now_us, us};
+use super::codec::{self, from_json, json, now_us, ts};
 use super::graph::{self, queue_state_str, Node, NodeKind, ReusableNodeSpec, RunGraph};
 use super::{db, lookups, PgBackend};
 use crate::concurrency;
@@ -48,19 +48,19 @@ async fn flush_node(
         concat!(
             "UPDATE jobs SET status=$3, queue_state=$4, remaining_needs=$5, \
              claimed_by_runner_id=$6, claimed_at=",
-            us!("$7"),
+            ts!("$7"),
             ", enqueued_at=",
-            us!("$8"),
+            ts!("$8"),
             ", deps_ready_at=",
-            us!("$9"),
+            ts!("$9"),
             ", concurrency_wait_at=",
-            us!("$10"),
+            ts!("$10"),
             ", concurrency_acquired_at=",
-            us!("$11"),
+            ts!("$11"),
             ", started_at=",
-            us!("$12"),
+            ts!("$12"),
             ", completed_at=",
-            us!("$13"),
+            ts!("$13"),
             ", outputs=$14::text::jsonb, annotations=$15::text::jsonb, \
              check_run_id=$16, expand_generation=$17 \
              WHERE run_id=$1::text::uuid AND job_id=$2"
@@ -106,9 +106,9 @@ async fn flush_run(tx: &Transaction<'_>, graph: &RunGraph) -> Result<(), Control
     tx.execute(
         concat!(
             "UPDATE runs SET status=$3, conclusion=$4, started_at=",
-            us!("$5"),
+            ts!("$5"),
             ", completed_at=",
-            us!("$6"),
+            ts!("$6"),
             " WHERE run_id=$1::text::uuid AND namespace_id=$2"
         ),
         &[
@@ -214,19 +214,19 @@ async fn insert_job_row(
              started_at, completed_at) \
              VALUES ($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::jsonb,\
              $12,$13,$14,$15,",
-            us!("$16"),
+            ts!("$16"),
             ",",
-            us!("$17"),
+            ts!("$17"),
             ",",
-            us!("$18"),
+            ts!("$18"),
             ",",
-            us!("$19"),
+            ts!("$19"),
             ",$20,$21::text::jsonb,$22::text::jsonb,$23,",
-            us!("$24"),
+            ts!("$24"),
             ",",
-            us!("$25"),
+            ts!("$25"),
             ",",
-            us!("$26"),
+            ts!("$26"),
             ")"
         ),
         &[
@@ -342,8 +342,9 @@ async fn insert_spec_rows(
     Ok(())
 }
 
-/// Mint a `job_requests` row (identity `request_id`), a `job_leases` row and
-/// the step manifest. Returns the minted id.
+/// Mint a `job_requests` row (identity `request_id`) and the step manifest.
+/// No `job_leases` row: the schema's lease exists only while an attempt is
+/// claimed (`bind_claim` inserts it); the row is NOT NULL on runner/expiry.
 async fn insert_request_row(
     tx: &Transaction<'_>,
     graph: &RunGraph,
@@ -370,13 +371,7 @@ async fn insert_request_row(
         .await
         .map_err(db)?
         .get(0);
-    tx.execute(
-        "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \
-         VALUES ($1, NULL, NULL, NULL) ON CONFLICT DO NOTHING",
-        &[&request_id],
-    )
-    .await
-    .map_err(db)?;
+
     if let Some(token) = token {
         tx.execute(
             "INSERT INTO github_token_requests (request_id, repository, \
@@ -404,9 +399,9 @@ async fn insert_request_row(
                  workflow_index, runner_number, context_name, name, conclusion, \
                  started_at, finished_at) \
                  VALUES ($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9,",
-                us!("$10"),
+                ts!("$10"),
                 ",",
-                us!("$11"),
+                ts!("$11"),
                 ") ON CONFLICT (agent_job_id, step_id) DO NOTHING"
             ),
             &[
@@ -1893,9 +1888,9 @@ async fn cancel_run_tx(
         concat!(
             "UPDATE jobs SET status='cancelled', queue_state='none', \
              completed_at=",
-            us!("$2"),
+            ts!("$2"),
             ", started_at=COALESCE(started_at,",
-            us!("$2"),
+            ts!("$2"),
             "), claimed_by_runner_id=NULL, claimed_at=NULL \
              WHERE run_id=$1::text::uuid AND status NOT IN \
              ('success','failure','cancelled','skipped','timed_out')"
@@ -2028,9 +2023,9 @@ async fn cancel_job_tx(
             concat!(
                 "UPDATE jobs SET status='cancelled', queue_state='none', \
                  completed_at=",
-                us!("$3"),
+                ts!("$3"),
                 ", started_at=COALESCE(started_at,",
-                us!("$3"),
+                ts!("$3"),
                 "), claimed_by_runner_id=NULL, claimed_at=NULL \
                  WHERE run_id=$1::text::uuid AND job_id=$2"
             ),
@@ -3314,9 +3309,9 @@ impl PgBackend {
                  actor, tree_digest, concurrency_group, concurrency_cancel_in_progress, \
                  created_at, started_at) VALUES ($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9,\
                  $10,$11,$12,$13,$14,'queued',$15,$16,$17,$18,$19,$20,",
-                us!("$21"),
+                ts!("$21"),
                 ",",
-                us!("$22"),
+                ts!("$22"),
                 ")"
             ),
             &[
@@ -3990,7 +3985,7 @@ impl PgBackend {
                     })?;
             tx.execute(
                 "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \
-                 VALUES ($1,$2,$3::int8::text::timestamptz,now()) \
+                 VALUES ($1,$2,(timestamptz 'epoch' + $3::int8 * interval '1 microsecond'),now()) \
                  ON CONFLICT (request_id) DO UPDATE SET runner_id = EXCLUDED.runner_id, \
                  expires_at = EXCLUDED.expires_at, renewed_at = EXCLUDED.renewed_at",
                 &[&record.request_id, &runner_id, &expires],
@@ -4351,7 +4346,7 @@ impl<'a> Sweep<'a> {
             .execute(
                 concat!(
                     "UPDATE job_steps SET conclusion = $3, finished_at = COALESCE(finished_at, ",
-                    us!("$4"),
+                    ts!("$4"),
                     ") WHERE agent_job_id = (SELECT agent_job_id FROM job_requests \
                      WHERE run_id = $1::text::uuid AND job_id = $2 \
                      ORDER BY request_id DESC LIMIT 1) AND conclusion = 'in_progress'"
@@ -4658,7 +4653,7 @@ impl PgBackend {
         tx.execute(
             concat!(
                 "UPDATE job_steps SET conclusion = $3, finished_at = COALESCE(finished_at, ",
-                us!("$4"),
+                ts!("$4"),
                 ") WHERE agent_job_id = $1::text::uuid AND step_id = $2"
             ),
             &[&agent_job_id.to_string(), &step_id, &conclusion, &now_us()],

@@ -25,6 +25,8 @@ mod lifecycle;
 mod lookups;
 mod reaper;
 mod runners;
+#[cfg(test)]
+mod tests;
 mod timelines;
 
 use super::types::ControlError;

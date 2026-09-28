@@ -1,0 +1,434 @@
+//! Multi-node safety tests against a disposable PostgreSQL cluster.
+//!
+//! These run the new-backend commands through two `PgBackend` instances on
+//! ONE database — the shape of two engine nodes sharing a cell — and prove
+//! the conditional-`UPDATE` transitions never double-claim or double-mint.
+//! The suite in `control/tests.rs` (driven via `&dyn ControlBackend`) joins
+//! this module once the trait is wired.
+//!
+//! A `PRELOOP_TEST_POSTGRES_URL`-provided server is used when set; otherwise
+//! each test starts its own `initdb`'d cluster (Postgres.app / Homebrew /
+//! system bin, or `initdb` on `PATH`).
+
+use super::PgBackend;
+use crate::control::backend::{CreateSession, PollRequest, RegisterRunner, RequestKey};
+use crate::control::types::{PollOutcome, SessionProtocol, SubmitJob, SubmitRun};
+use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
+use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+
+// ── disposable cluster ──────────────────────────────────────────────────
+
+/// A throwaway PostgreSQL cluster in a temp dir: `initdb`, `postgres` on a
+/// free port, `pg_ctl stop` on drop. Each test gets its own cluster, so
+/// tests are isolated and parallel-safe.
+struct DisposablePg {
+    dir: PathBuf,
+    port: u16,
+}
+
+impl DisposablePg {
+    fn start() -> Self {
+        let bin = pg_bin();
+        // Short path: the `-k` Unix socket lives inside `dir`, and
+        // `std::env::temp_dir()` + a UUID exceeds the 104-byte `sun_path`
+        // limit. `/tmp` keeps it well under.
+        let short = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let dir = PathBuf::from(format!("/tmp/preloop-newpg-{short}"));
+        let data = dir.join("data");
+        let port = free_port();
+        run(
+            bin.join("initdb"),
+            &[
+                "-D".into(),
+                data.clone().into_os_string().into_string().unwrap(),
+                "-U".into(),
+                "postgres".into(),
+                "--auth=trust".into(),
+                "-E".into(),
+                "UTF8".into(),
+            ],
+        );
+        run(
+            bin.join("pg_ctl"),
+            &[
+                "-D".into(),
+                data.clone().into_os_string().into_string().unwrap(),
+                "-o".into(),
+                format!("-p {port} -k {}", dir.display()),
+                "-l".into(),
+                dir.join("log").to_string_lossy().into_owned(),
+                "-w".into(),
+                "start".into(),
+            ],
+        );
+        Self { dir, port }
+    }
+
+    fn url(&self) -> String {
+        format!("postgres://postgres@127.0.0.1:{}/postgres", self.port)
+    }
+}
+
+impl Drop for DisposablePg {
+    fn drop(&mut self) {
+        let bin = pg_bin();
+        let _ = Command::new(bin.join("pg_ctl"))
+            .args([
+                "-D".into(),
+                self.dir.join("data").to_string_lossy().into_owned(),
+                "stop".into(),
+                "-m".into(),
+                "fast".into(),
+            ])
+            .output();
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+fn run(bin: PathBuf, args: &[String]) {
+    let out = Command::new(&bin)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("{} failed to spawn: {e}", bin.display()));
+    assert!(
+        out.status.success(),
+        "{} failed: {}",
+        bin.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Locate a PostgreSQL bin dir: Postgres.app, Homebrew, system, or PATH.
+fn pg_bin() -> PathBuf {
+    let candidates = [
+        "/Applications/Postgres.app/Contents/Versions/latest/bin",
+        "/opt/homebrew/opt/postgresql@18/bin",
+        "/opt/homebrew/opt/postgresql@17/bin",
+        "/opt/homebrew/opt/postgresql@16/bin",
+        "/usr/local/opt/postgresql@18/bin",
+        "/usr/local/opt/postgresql@17/bin",
+        "/usr/local/opt/postgresql@16/bin",
+        "/usr/lib/postgresql/18/bin",
+        "/usr/lib/postgresql/17/bin",
+        "/usr/lib/postgresql/16/bin",
+    ];
+    for dir in candidates {
+        let bin = PathBuf::from(dir);
+        if bin.join("initdb").exists() {
+            return bin;
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.join("initdb").exists() {
+                return dir;
+            }
+        }
+    }
+    panic!(
+        "no PostgreSQL binaries found: set PRELOOP_TEST_POSTGRES_URL to a \
+         disposable database, or install Postgres.app / postgresql"
+    );
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn connect(url: &str) -> PgBackend {
+    PgBackend::connect(url, false, false, std::time::Duration::from_secs(300))
+        .await
+        .expect("test database connection failed")
+}
+
+/// Two independent backends (separate writer pools) on ONE database: the
+/// shape of two engine nodes sharing a cell, for race tests.
+async fn backend_pair() -> (DisposablePg, PgBackend, PgBackend) {
+    let (guard, url) = fresh_database().await;
+    let first = connect(&url).await;
+    let second = connect(&url).await;
+    (guard, first, second)
+}
+
+async fn fresh_database() -> (DisposablePg, String) {
+    // A shared server (PRELOOP_TEST_POSTGRES_URL) is honored by the suite
+    // harness; the pg unit tests always isolate via a disposable cluster so
+    // they also run without configuration.
+    if let Some((_db, url)) = crate::test_pg::fresh_database().await {
+        // The suite's guard drops the database; DisposablePg::start is a
+        // no-op here — reuse the guard slot by pointing it at nothing.
+        return (
+            DisposablePg {
+                dir: PathBuf::from("/tmp/preloop-newpg-shared"),
+                port: 0,
+            },
+            url,
+        );
+    }
+    let pg = DisposablePg::start();
+    let url = pg.url();
+    (pg, url)
+}
+
+// ── submission builders (self-contained; suite helpers are private) ─────
+
+fn submission() -> preloop_gha_protocol::WorkflowSubmission {
+    preloop_gha_protocol::WorkflowSubmission {
+        repository: "owner/repo".to_owned(),
+        event: "push".to_owned(),
+        sha: "abc123".to_owned(),
+        ..Default::default()
+    }
+}
+
+fn run_record(run_id: RunId) -> RunRecord {
+    RunRecord {
+        run_id,
+        webhook_delivery_id: None,
+        run_name: Some("ci".to_owned()),
+        submission: Arc::new(submission()),
+        jobs: BTreeMap::new(),
+        status: ExecutionStatus::Queued,
+        job_outputs: BTreeMap::new(),
+        job_base_ids: BTreeMap::new(),
+        job_needs: BTreeMap::new(),
+        caller_plans: BTreeMap::new(),
+        job_names: BTreeMap::new(),
+        github: serde_json::json!({"sha": "abc123"}),
+        head_sha: "abc123".to_owned(),
+        workflow_ref: "owner/repo/.github/workflows/ci.yml@refs/heads/main".to_owned(),
+        workspace_snapshot: None,
+        job_fail_fast: BTreeMap::new(),
+        job_continue_on_error: BTreeMap::new(),
+        job_check_run_ids: BTreeMap::new(),
+        reusable_calls: BTreeMap::new(),
+        jobs_list: Vec::new(),
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        completed_at: None,
+        run_number: 1,
+        run_attempt: 1,
+        workflow_path_str: ".github/workflows/ci.yml".to_owned(),
+        event: "push".to_owned(),
+        conclusion: None,
+        push_state: None,
+        snapshot_timing: None,
+    }
+}
+
+fn job_message(job_id: &str, request_id: i64) -> azdo::AgentJobRequestMessage {
+    serde_json::from_value(serde_json::json!({
+        "jobId": uuid::Uuid::new_v4(),
+        "requestId": request_id,
+        "plan": {"planId": "plan", "planType": "build", "version": 1, "artifactUri": "", "artifactLocation": ""},
+        "timeline": {"id": uuid::Uuid::new_v4(), "changeId": 0, "location": null},
+        "jobName": job_id,
+        "lockedUntil": "",
+        "resources": {"endpoints": []},
+        "steps": [],
+        "snapshot": null
+    }))
+    .unwrap()
+}
+
+fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
+    let nanos = crate::models::now_unix_nanos();
+    QueuedJob {
+        run_id,
+        job_id: JobId(job_id.to_owned()),
+        base_id: job_id.to_owned(),
+        created_at_unix_nanos: nanos,
+        dependencies_ready_at_unix_nanos: Some(nanos),
+        concurrency_wait_started_at_unix_nanos: None,
+        concurrency_acquired_at_unix_nanos: None,
+        enqueued_at_unix_nanos: nanos,
+        needs: Vec::new(),
+        if_condition: None,
+        condition_context: preloop_gha_expressions::Context::default(),
+        max_parallel: None,
+        runs_on: vec!["self-hosted".to_owned()],
+        runner_group: None,
+        environment: None,
+        message: job_message(job_id, request_id),
+        concurrency: None,
+        matrix: BTreeMap::new(),
+        deferred_matrix: None,
+        reusable_call: None,
+    }
+}
+
+fn request_record(run_id: RunId, job_id: &str, request_id: i64) -> TaskAgentJobRequestRecord {
+    TaskAgentJobRequestRecord {
+        request_id,
+        run_id,
+        job_id: JobId(job_id.to_owned()),
+        agent_job_id: uuid::Uuid::new_v4(),
+        plan_id: "plan".to_owned(),
+        plan_type: "build".to_owned(),
+        timeline_id: uuid::Uuid::new_v4(),
+        result: None,
+        locked_until: String::new(),
+        claimed_at: None,
+        owner_runner_id: None,
+        started_at: None,
+        last_renewed_at: None,
+        timeout_triggered: false,
+        debug_token_issued: false,
+    }
+}
+
+fn submit_job(run_id: RunId, job_id: &str, request_id: i64) -> SubmitJob {
+    SubmitJob {
+        queued: queued_job(run_id, job_id, request_id),
+        request: Some(request_record(run_id, job_id, request_id)),
+        token_request: None,
+        id_token_granted: false,
+        oidc_context: None,
+        step_manifest: Vec::new(),
+        initially_skipped: false,
+    }
+}
+
+fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
+    SubmitRun {
+        namespace: "default".to_owned(),
+        record: run_record(run_id),
+        jobs,
+        workflow_concurrency: None,
+        empty_concurrency_group: false,
+        check_hostable: false,
+    }
+}
+
+fn capabilities() -> RunnerCapabilities {
+    RunnerCapabilities {
+        known: true,
+        labels: vec!["self-hosted".to_owned()],
+        runner_group_id: None,
+        runner_group_name: None,
+    }
+}
+
+fn register_runner(name: &str) -> RegisterRunner {
+    RegisterRunner {
+        name: name.to_owned(),
+        labels: vec!["self-hosted".to_owned()],
+        ephemeral: false,
+        public_key: None,
+        rsa_public_key: None,
+        client_id: Some(format!("client-{name}")),
+        runner_group_id: None,
+        runner_group_name: None,
+        pool_proven: false,
+    }
+}
+
+fn create_session(runner_id: i64) -> CreateSession {
+    CreateSession {
+        runner_id,
+        protocol: SessionProtocol::Broker,
+        client_id: None,
+        encryption: None,
+    }
+}
+
+fn poll(session_id: &str, runner_id: i64) -> PollRequest {
+    PollRequest {
+        session_id: session_id.to_owned(),
+        verified_runner_id: Some(runner_id),
+        runner: capabilities(),
+        busy: false,
+        wait_ms: 0,
+    }
+}
+
+// ── races ────────────────────────────────────────────────────────────────
+
+async fn submit_many(node: &PgBackend, count: usize, base_run_number: u64) -> Vec<uuid::Uuid> {
+    let submits: Vec<_> = (0..count)
+        .map(|i| {
+            let run_id = RunId::new();
+            let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", 0)]);
+            // The caller owns run_number allocation (`allocate_run_number`);
+            // two nodes must not collide on the unique key.
+            submit.record.run_number = base_run_number + i as u64;
+            submit
+        })
+        .collect();
+    let agents = submits
+        .iter()
+        .map(|s| s.jobs[0].request.as_ref().unwrap().agent_job_id)
+        .collect();
+    let results = futures::future::join_all(submits.into_iter().map(|s| node.submit_run(s))).await;
+    for result in results {
+        result.unwrap();
+    }
+    agents
+}
+
+/// Submits on different runs overlap across two nodes. The request id each
+/// mints must still be unique — it is the cross-node correlation key.
+#[tokio::test]
+async fn concurrent_submits_mint_distinct_request_ids() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    const PER_NODE: usize = 24;
+    let (agents_a, agents_b) = tokio::join!(
+        submit_many(&node_a, PER_NODE, 1_000),
+        submit_many(&node_b, PER_NODE, 100_000)
+    );
+
+    let mut request_ids = std::collections::BTreeSet::new();
+    for agent in agents_a.into_iter().chain(agents_b) {
+        let request = node_a
+            .request(RequestKey::AgentJobId(agent))
+            .await
+            .unwrap_or_else(|e| panic!("attempt {agent} lost its request row: {e:?}"));
+        assert!(
+            request_ids.insert(request.request_id),
+            "request id {} was minted twice",
+            request.request_id
+        );
+    }
+    assert_eq!(request_ids.len(), PER_NODE * 2);
+}
+
+/// N sessions on N nodes poll for ONE ready job at the same instant.
+/// Exactly one `PollOutcome::Claimed` may come back — the conditional claim
+/// `UPDATE` is the mutual exclusion, and it must hold across nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_polls_claim_once() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let runner = node_a.register_runner(register_runner("r1")).await.unwrap();
+    // Two sessions on two nodes, all polling the same queue.
+    let session_a = node_a
+        .create_session(create_session(runner.runner.id))
+        .await
+        .unwrap();
+    let session_b = node_b
+        .create_session(create_session(runner.runner.id))
+        .await
+        .unwrap();
+    let run_id = RunId::new();
+    node_a
+        .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+        .await
+        .unwrap();
+
+    let poll_a = poll(&session_a.session_id, runner.runner.id);
+    let poll_b = poll(&session_b.session_id, runner.runner.id);
+    let (out_a, out_b) = tokio::join!(node_a.poll_session(poll_a), node_b.poll_session(poll_b));
+    let claims = [out_a, out_b]
+        .into_iter()
+        .map(|r| r.unwrap())
+        .filter(|o| matches!(o, PollOutcome::Claimed(_)))
+        .count();
+    assert_eq!(claims, 1, "one job must be claimed exactly once");
+}
