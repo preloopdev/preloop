@@ -1,8 +1,14 @@
 name: release-golden
 
+# Manual/emergency golden bake. Releases do NOT bake: a golden's content is
+# keyed by the official-image pin (official-image.toml), the toolchain pins
+# (versions.toml), and the apt-index bake date — none of which move with an
+# engine release — and the runtime runner bundle is mounted from the engine at
+# job time, so a per-release bake buys nothing while costing a hosted runner
+# >110 GiB of staging. Production bakes are host-driven: x86_64 on an x86_64
+# host with KVM and disk, aarch64 on macstudio. `release.yml` seeds each
+# release with the newest complete golden pair (payload + sidecars).
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -49,78 +55,9 @@ jobs:
             --clobber \
             --repo "$GITHUB_REPOSITORY"
 
-  build-and-publish-linux-binaries:
-    name: Build Linux ${{ matrix.arch }} release
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            target: x86_64-unknown-linux-musl
-          - arch: aarch64
-            target: aarch64-unknown-linux-musl
-    permissions:
-      contents: write
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          persist-credentials: false
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: "1.97"
-          targets: ${{ matrix.target }}
-
-      - name: Set up Zig cross toolchain
-        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
-        with:
-          version: 0.14.1
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
-        with:
-          tool: cargo-zigbuild@0.23.0
-
-      - name: Build release binaries
-        env:
-          TARGET: ${{ matrix.target }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          cargo zigbuild --release \
-            --target "$TARGET" \
-            -p preloop-cli \
-            -p preloop-runner-server \
-            -p preloop-runner
-          mkdir -p "dist/preloop-$ARCH"
-          cp "target/$TARGET/release/preloop" \
-            "target/$TARGET/release/preloop-server" \
-            "target/$TARGET/release/preloop-runner" \
-            "dist/preloop-$ARCH/"
-          tar -C dist -czf \
-            "dist/preloop-$ARCH-linux-musl.tar.gz" \
-            "preloop-$ARCH"
-          sha256sum "dist/preloop-$ARCH-linux-musl.tar.gz" \
-            > "dist/preloop-$ARCH-linux-musl.tar.gz.sha256"
-
-      - name: Upload Linux binaries to release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.event.release.tag_name }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          gh release upload "$TAG_NAME" \
-            "dist/preloop-$ARCH-linux-musl.tar.gz" \
-            "dist/preloop-$ARCH-linux-musl.tar.gz.sha256" \
-            --clobber
-
   build-and-publish-golden:
     name: Build & Publish Golden MicroVM Artifact
-    if: (github.event_name == 'workflow_dispatch' && !inputs.reuse_previous_goldens) || github.event_name == 'release'
+    if: ${{ !inputs.reuse_previous_goldens }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -377,10 +314,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOLDEN_NAME: preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
           REQUESTED_TAG: ${{ inputs.release_tag }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          TARGET_TAG="${EVENT_TAG:-$REQUESTED_TAG}"
+          TARGET_TAG="$REQUESTED_TAG"
           if [ -z "$TARGET_TAG" ]; then
             TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
           fi

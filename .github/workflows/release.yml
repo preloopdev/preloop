@@ -314,17 +314,23 @@ jobs:
       # `gh attestation verify <asset> --repo preloopdev/preloop` works without a
       # key to distribute. This complements the detached RSA signature the
       # signing step writes (`<asset>.sig`, verified by `preloop update` against
-      # its pinned public key). Golden packs are attested by release-golden.yml
-      # when it uploads the fresh bake.
+      # its pinned public key). Seeded goldens ride this step; a golden baked
+      # by its own host (cpane for x86_64, macstudio for aarch64) is attested by
+      # that host when it uploads.
       - name: Attest release artifacts (build provenance)
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: artifacts/*
-      # Engines resolve the golden at their own release tag. Seed the new
-      # release with the newest complete pair before publishing; the
-      # release-golden workflow then replaces each asset with a fresh bake.
-      # This keeps a failed or unsupported fresh bake visible without ever
-      # leaving the released engine on a guaranteed 404.
+      # Engines resolve the golden at their own release tag, so a release must
+      # carry a complete, verifiable golden pair — but goldens are baked by
+      # their own hosts (x86_64 on an x86_64 KVM host, aarch64 on macstudio),
+      # never by this pipeline: a golden's content is keyed by the official
+      # image pin, the toolchain pins and the apt-index bake date, and the
+      # runner bundle is mounted from the engine at job time, so a per-release
+      # bake would ship an identical artifact for >110 GiB of staging.
+      # Seed the newest pair that exists, sidecars included, so a release is
+      # never a guaranteed 404 (golden_url_candidates prefers the own tag) and
+      # never claims a checksum it cannot prove.
       - name: Seed golden assets from the newest complete release
         run: |
           source_tag=""
@@ -333,8 +339,8 @@ jobs:
             rm -rf "$golden_dir"
             mkdir -p "$golden_dir"
             if gh release download "$tag" \
-                --pattern preloop-ubuntu-24.04-x86_64 \
-                --pattern preloop-ubuntu-24.04-aarch64 \
+                --pattern 'preloop-ubuntu-24.04-x86_64*' \
+                --pattern 'preloop-ubuntu-24.04-aarch64*' \
                 --dir "$golden_dir" &&
               test -s "$golden_dir/preloop-ubuntu-24.04-x86_64" &&
               test -s "$golden_dir/preloop-ubuntu-24.04-aarch64"; then
@@ -343,8 +349,18 @@ jobs:
             fi
           done
           test -n "$source_tag"
-          cp "$golden_dir"/preloop-ubuntu-24.04-{x86_64,aarch64} artifacts/
-          echo "Seeded golden assets from $source_tag"
+          # Payload plus whatever sidecars the source release had: .sha256,
+          # .bundle, .provenance.json, .base-provenance.json, .base-sbom.spdx.json.
+          cp "$golden_dir"/preloop-ubuntu-24.04-* artifacts/
+          # A pack published without a checksum makes the engine download it
+          # unverified (`no golden checksum published`); compute what the
+          # source release never carried.
+          for arch in x86_64 aarch64; do
+            golden="artifacts/preloop-ubuntu-24.04-$arch"
+            [ -f "$golden.sha256" ] || sha256sum "$golden" > "$golden.sha256"
+          done
+          echo "Seeded golden assets from $source_tag:"
+          ls -l artifacts/preloop-ubuntu-24.04-*
       # M1: the updater pins the matching public key
       # (crates/preloop-cli/src/update.rs) and refuses any asset without a
       # valid detached signature. Sign every published asset with
