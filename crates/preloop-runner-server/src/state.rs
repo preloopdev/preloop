@@ -235,6 +235,14 @@ impl AppState {
         .expect("fixed local JWT claims must serialize")
     }
 
+    /// The AES session key for `session_id`, derived rather than stored:
+    /// `HKDF-SHA256(ikm = cluster HMAC key, info = "preloop-session-key-v1"
+    /// || session_id)`. Every node sharing the cluster key derives the same
+    /// key, so no session key is ever written to the database.
+    pub(crate) fn session_encryption(&self, session_id: &str) -> SessionEncryption {
+        derive_session_encryption(&self.local_jwt_key, session_id)
+    }
+
     /// Mint the token the runner process uses to speak for a job's debug
     /// session, kept separate from the runtime token that workflow code sees.
     ///
@@ -1367,6 +1375,17 @@ impl AppState {
 fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64) -> String {
     serde_json::to_string(&("action-archive", owner, repo, git_ref, expires_at))
         .expect("a tuple of strings and an integer always serializes")
+}
+
+/// HKDF-SHA256 session-key derivation (see [`AppState::session_encryption`]).
+pub(crate) fn derive_session_encryption(cluster_key: &[u8], session_id: &str) -> SessionEncryption {
+    let mut info = b"preloop-session-key-v1".to_vec();
+    info.extend_from_slice(session_id.as_bytes());
+    let mut key = vec![0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(None, cluster_key)
+        .expand(&info, &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    SessionEncryption::from_key(key)
 }
 
 #[cfg(any(test, feature = "test-support"))]

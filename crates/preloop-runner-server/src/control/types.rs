@@ -261,6 +261,14 @@ pub(crate) struct CancelOutcome {
     pub(crate) run_status: Option<ExecutionStatus>,
     /// Whether the queue is non-empty after the transition.
     pub(crate) queue_nonempty: bool,
+    /// The run record after the transition.
+    pub(crate) record: Option<RunRecord>,
+    /// Every job of the run whose status is now `Cancelled`, in job-id order.
+    pub(crate) cancelled_jobs: Vec<JobId>,
+    /// Global ready-queue depth after the transition.
+    pub(crate) queue_depth: usize,
+    /// `runs-on` labels of the ready-queue front after the transition.
+    pub(crate) next_runs_on: Vec<String>,
 }
 
 /// A leased expansion node: the queue entry plus the immutable inputs the
@@ -700,4 +708,260 @@ pub(crate) fn step_report(
         started_at_us: (!terminal).then_some(observed_us),
         finished_at_us: terminal.then_some(observed_us),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Handler command inputs/outputs (one per former `TxState` closure site)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Registered runners plus, when a run was named, that run's claimability
+/// (`list_runners`).
+#[derive(Debug, Default)]
+pub(crate) struct RunnerListing {
+    /// Every registered runner, ordered by runner id ascending.
+    pub(crate) runners: Vec<RegisteredRunner>,
+    /// `Some` iff the caller named a run.
+    pub(crate) run_queue: Option<RunQueueClaimability>,
+}
+
+/// How many of a run's ready jobs exist and how many runners could take one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunQueueClaimability {
+    /// The run's jobs in the ready queue (`queue_state = ready`).
+    pub(crate) queued: usize,
+    /// Registered runners whose capabilities
+    /// (`crate::runtime_scheduling::job_matches_runner_capabilities`) match at
+    /// least one of those ready jobs. 0 when `queued` is 0.
+    pub(crate) claimable: usize,
+}
+
+/// Insert a runner session row (`open_runner_session`).
+#[derive(Debug, Clone)]
+pub(crate) struct OpenRunnerSession {
+    /// Caller-minted session id (a UUID string).
+    pub(crate) session_id: String,
+    /// Owning runner. `None` (legacy body-less compat create) writes nothing.
+    pub(crate) runner_id: Option<i64>,
+    /// `Broker` or `Azdo`; `Compat` is not accepted here.
+    pub(crate) protocol: SessionProtocol,
+    /// The session was created under a listen token naming `runner_id`.
+    /// Verified sessions are exclusive per runner (409 on a second one).
+    pub(crate) verified: bool,
+}
+
+/// Who is asking to purge a runner identity, which decides the guard
+/// `purge_runner_guarded` applies before purging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PurgeGuard {
+    /// Engine/system credential: purge unconditionally (missing = no-op).
+    System,
+    /// A runner listen token: only its own identity (`Forbidden` otherwise).
+    Runner(i64),
+    /// A registration (runner-manager) token: `Forbidden` while the target
+    /// runner owns any session.
+    RegistrationToken,
+    /// Liveness phantom sweep: purge only when the runner still exists and
+    /// owns no session; otherwise purge nothing and report `false`.
+    IfPhantom,
+}
+
+/// One reaper sweep over the runs with something due (`reap_sweep`). Built by
+/// the reaper from [`ReapInputs`] plus node-local facts.
+#[derive(Debug, Clone)]
+pub(crate) struct ReapSweep {
+    /// Wall clock of this tick.
+    pub(crate) now: std::time::SystemTime,
+    /// Runs whose rows the sweep may touch (timeouts, expired leases,
+    /// starvation candidates). Rows of other runs are never written.
+    pub(crate) runs: std::collections::BTreeSet<RunId>,
+    /// Ready-queue snapshot the starvation sweep decides over (from
+    /// `reap_inputs().ready`).
+    pub(crate) ready: Vec<ReadyRow>,
+    /// Unfinished attempts the timeout/lease checks decide over (from
+    /// `reap_inputs().active`).
+    pub(crate) active: Vec<ActiveRequest>,
+    /// Debug-pause credit per request id (time paused at a failed step does
+    /// not count toward `timeout-minutes`).
+    pub(crate) paused: std::collections::BTreeMap<i64, std::time::Duration>,
+    /// A co-hosted pool is preparing/provisioning a runner.
+    pub(crate) pool_preparing: bool,
+    /// This process started less than `MAX_QUEUED_GRACE` ago.
+    pub(crate) warm_window_open: bool,
+}
+
+/// An attempt whose lease expired in `reap_sweep`; the reaper completes its
+/// job as `Failure` afterwards through `settle_job` (no attempt settle).
+#[derive(Debug, Clone)]
+pub(crate) struct ExpiredLease {
+    pub(crate) request_id: i64,
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) agent_job_id: Option<uuid::Uuid>,
+}
+
+/// What `reap_sweep` changed.
+#[derive(Debug, Default)]
+pub(crate) struct ReapSweepOutcome {
+    /// Timeout cancellations enqueued for the attempts' runners.
+    pub(crate) cancellations: usize,
+    /// Attempts failed for an expired lease, in `ReapSweep::active` order.
+    pub(crate) expired: Vec<ExpiredLease>,
+    /// Ready jobs failed for starvation: `(run, job, reason)`.
+    pub(crate) starved: Vec<(RunId, JobId, String)>,
+}
+
+/// Operational-status inputs derived from durable control state
+/// (`status_inputs`). Node-local facts (debug sessions, pool, GitHub) are
+/// added by the caller.
+#[derive(Debug, Default)]
+pub(crate) struct StatusInputs {
+    /// Ready-queue depth.
+    pub(crate) queue_len: usize,
+    /// Jobs waiting on `needs:` / max-parallel (`queue_state = blocked`).
+    pub(crate) pending_jobs_len: usize,
+    /// Expansion nodes not yet leased.
+    pub(crate) pending_expansions_len: usize,
+    /// Expansion nodes leased and building.
+    pub(crate) expanding_len: usize,
+    /// Live runs by coarse status (`Queued` / `Pending|InProgress` /
+    /// terminal).
+    pub(crate) runs_queued: u32,
+    pub(crate) runs_in_progress: u32,
+    pub(crate) runs_completed: u32,
+    /// Non-terminal runs, newest `started_at` first (ties: run id desc),
+    /// with the names of runners bound to them (assignment or unfinished
+    /// owned attempt).
+    pub(crate) active_runs: Vec<preloop_observability::status::ActiveRunSnapshot>,
+    /// `in_progress` runs with no assigned runner and no queued, claimed or
+    /// blocked job.
+    pub(crate) orphaned_run_ids: Vec<String>,
+    /// Registered runners.
+    pub(crate) registered: u32,
+    /// Distinct live sessions.
+    pub(crate) sessions: u32,
+    /// Runners with ≥1 session, none busy, not stale.
+    pub(crate) runner_idle: u32,
+    /// Runners one of whose sessions holds an active request.
+    pub(crate) runner_busy: u32,
+    /// Runners whose every session last polled more than `stale_after` ago
+    /// (a session never seen is not stale).
+    pub(crate) runner_stale: u32,
+    /// Live runner → job pairings from claimed unfinished attempts.
+    pub(crate) runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
+    /// Age, run and job of the oldest ready job with a known enqueue time.
+    pub(crate) oldest_ready_seconds: Option<f64>,
+    pub(crate) oldest_ready_run_id: Option<String>,
+    pub(crate) oldest_ready_job_id: Option<String>,
+    /// Per ready job in queue order: `runs-on` labels and runner group.
+    pub(crate) queue_runner_reqs: Vec<(Vec<String>, Option<String>)>,
+    /// Capabilities of every registered runner.
+    pub(crate) runner_caps: Vec<crate::models::RunnerCapabilities>,
+    /// Jobs parked behind job-level concurrency gates.
+    pub(crate) concurrency_blocked: u32,
+    /// Groups with a holder / with waiters, total waiters, deepest queue.
+    pub(crate) concurrency_groups_active: u32,
+    pub(crate) concurrency_groups_contended: u32,
+    pub(crate) concurrency_pending_holders: u32,
+    pub(crate) concurrency_deepest_group_pending: u32,
+    /// Stale bindings released since the counter was created.
+    pub(crate) released_bindings: u64,
+}
+
+/// A runner's own completion report: its attempt is verified, settled and
+/// released from its session inside `settle_job`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttemptSettle {
+    pub(crate) agent_job_id: uuid::Uuid,
+    pub(crate) runner_id: i64,
+}
+
+/// `settle_job` input: a terminal job completion, optionally carrying the
+/// reporting runner's attempt.
+#[derive(Debug, Clone)]
+pub(crate) struct SettleJob {
+    /// `status` must be terminal (the handler rejects anything else).
+    pub(crate) completion: preloop_gha_protocol::JobCompletion,
+    pub(crate) settle: Option<AttemptSettle>,
+}
+
+/// What `settle_job` did.
+#[derive(Debug)]
+pub(crate) enum SettleJobOutcome {
+    /// Nothing was written (duplicate/released attempt, or the job already
+    /// holds a terminal non-cancelled verdict): the current run record.
+    Unchanged(Box<RunRecord>),
+    Settled(Box<JobSettled>),
+}
+
+/// The effects of a settled completion the handler fans out.
+#[derive(Debug)]
+pub(crate) struct JobSettled {
+    /// The status the job now holds.
+    pub(crate) effective_status: ExecutionStatus,
+    /// Matrix siblings fail-fast cancelled by this completion.
+    pub(crate) cancelled_siblings: Vec<JobId>,
+    /// Jobs promoted / skipped / failed by the dependent sweep.
+    pub(crate) scheduling: crate::runtime_scheduling::SchedulingOutcome,
+    /// Ready or cancellation work exists after the transition.
+    pub(crate) queue_nonempty: bool,
+    /// This completion first made the run terminal with `success`.
+    pub(crate) newly_terminal_success: bool,
+    /// Live-log key of the attempt (agent job id, else logical job id).
+    pub(crate) live_log_key: String,
+    /// Ready-queue depth after the transition and the `runs-on` of its
+    /// front job.
+    pub(crate) queue_len: usize,
+    pub(crate) next_runs_on: Vec<String>,
+}
+
+/// AzDO long-poll input (`poll_azdo_session`).
+#[derive(Debug, Clone)]
+pub(crate) struct AzdoPoll {
+    pub(crate) session_id: String,
+    /// Runner proven by the listen token; `None` for unauthenticated compat
+    /// polls.
+    pub(crate) verified_runner_id: Option<i64>,
+}
+
+/// A queued per-session message. Job assignments carry only `request_id`:
+/// the handler builds and session-encrypts the job message from the stored
+/// template when it answers the poll. Other messages carry a small
+/// non-secret plaintext `body`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionMessage {
+    pub(crate) message_id: i64,
+    pub(crate) message_type: String,
+    pub(crate) request_id: Option<i64>,
+    pub(crate) body: Option<String>,
+}
+
+/// What an AzDO poll produced.
+#[derive(Debug)]
+pub(crate) enum AzdoPollOutcome {
+    /// The verified runner does not own the session.
+    Forbidden,
+    /// The oldest unacknowledged message, delivered again (HTTP 202).
+    Redeliver(SessionMessage),
+    /// A queued cancellation for the session's active attempt, now queued as
+    /// a `JobCancellation` session message (HTTP 200).
+    Cancel(SessionMessage),
+    /// A job was claimed: the new `PipelineAgentJobRequest` session message
+    /// (HTTP 202) and the job it assigns.
+    Claimed {
+        message: SessionMessage,
+        run_id: RunId,
+        job_id: JobId,
+    },
+    /// Nothing to deliver now; the handler may long-poll.
+    Wait,
+}
+
+/// Everything the OIDC token endpoint needs for one attempt (`oidc_grant`).
+#[derive(Debug, Clone)]
+pub(crate) struct OidcGrant {
+    pub(crate) run: RunRecord,
+    pub(crate) job_id: JobId,
+    /// `id-token: write` was granted to the job (missing grant row = false).
+    pub(crate) granted: bool,
+    pub(crate) context: crate::state::OidcJobContext,
 }
