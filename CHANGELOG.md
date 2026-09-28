@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.33.7] - 2026-09-28
+
 ### Added
 
 - Homebrew and npm install channels: `brew install preloopdev/tap/preloop` and
@@ -29,6 +31,33 @@ Releases before v0.27.0 predate the changelog.
   directory) and no workflow touches it. The CLI itself is not published to
   crates.io: it embeds the server, and the workspace's path dependencies and
   `build.rs` version pins make it unpackable there.
+- **Runner version end-of-life lookup API** (`09e1f2b6`, #335):
+  `GET /api/v3/actions/runners/deprecations/<version>`, plus the
+  `/orgs/<org>/` and `/repos/<owner>/<repo>/` spellings, matching the route
+  GitHub announced in September 2026. Preloop runs no brownouts and gates no
+  runner version out of registration, so the schedule it reports is the
+  published one; the org and repo segments are accepted and ignored. System
+  token only, like the neighbouring runner-registration routes.
+- **Run, check, and status retention** (`c26b1f0e`, #333): a new
+  `retention_days` server setting (default 90, `PRELOOP_RETENTION_DAYS`) plus a
+  sweep that runs at startup and then hourly, deleting terminal runs and their
+  check-run records, commit statuses, artifacts, and logs from memory and from
+  the durable store so a restart cannot resurrect them. Queued, pending, and
+  in-progress runs are never touched. `github.retention_days` now reports the
+  effective window instead of a hard-coded 90. Documented in
+  `docs/self-hosting.md`.
+- **Execution-protection rules REST API** (`6d3e4071`, #332): a system-token
+  API under `/api/v1/execution-protection` to read the policy, flip
+  evaluate/enforce mode, and list, create, update, or delete event and actor
+  deny rules. Mutations rewrite the operator config file atomically — rules
+  stay file-owned and survive restarts — and the shipped default is GitHub's
+  own unscoped `pull_request_target` deny in evaluate (log-only) mode.
+  `DELETE /api/v1/execution-protection/rules/event-0`, or an explicit empty
+  `event_rules`, removes it.
+- **Standalone runner install** (`d32d7416`): `install.sh --runner` fetches
+  just `preloop-runner` — no control plane, no SmolVM — and `docs/setup.md`
+  grows a full standalone guide (install, registration token, configure, run)
+  with the runner container image documented next to it.
 
 ### Changed
 
@@ -40,6 +69,91 @@ Releases before v0.27.0 predate the changelog.
   discovers.
 - `preloop update` and the `preloop-vm` socket-mount error point at the SmolVM
   releases instead of telling users to run `curl … | bash`.
+- **Node 12, 16, and 20 are no longer action runtimes** (`66116cd8`, #331):
+  GitHub removed them for JavaScript actions on 2026-09-23 and deleted the
+  `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out, so a job using them now
+  fails the step with an actionable error instead of running on an unsupported
+  runtime. Unknown or empty `runs.using` values fall back to `node24`, Linux
+  ARM32 fails with a clear "no Node runtime available" message, and the
+  migration-era machinery (`FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`, the
+  `usenode24bydefault`/`warnonnode20`/`requirenode24` variables, the node20
+  deprecation warning) is gone.
+- **Workspace migrated to Rust edition 2024** (`78362347`): mechanical
+  `cargo fix` migrations plus a `collapsible_if` clippy sweep. The workspace
+  lint moves `unsafe_code` from `forbid` to `deny` — edition 2024 makes
+  `std::env::set_var`/`remove_var` unsafe and the environment-mutating test
+  fixtures need targeted `#[allow(unsafe_code)]` — while production code stays
+  unsafe-free.
+
+### Fixed
+
+- **Concurrency keys are namespaced per trust tier** (`7c002776`, `bd1225f4`,
+  #337): a group key now carries the run's trust tier, encoded in the key's
+  repo component with a `\x1f` separator so a workflow that literally names its
+  group `trusted::deploy` cannot share a slot, and restored `JobSet`
+  admissions are rekeyed before reconcile/promote. A fork-controlled
+  `pull_request_target` run can no longer collide with and cancel a trusted
+  deployment's concurrency group, across restarts included.
+- **`job.workflow_*` reports the defining workflow for reusable jobs**
+  (`134f8e15`, #336): `job.workflow_ref`, `workflow_sha`,
+  `workflow_repository`, and `workflow_file_path` now describe the callee
+  workflow instead of the caller that triggered the run, and the runner
+  surfaces `job.workflow_file_path` in the expression context at all. Caller
+  placeholder nodes and top-level jobs still report the run's own workflow.
+- **Internal job variables no longer reach step processes** (`47841a07`,
+  #329): host steps are spawned by clearing the inherited environment instead
+  of extending it, so `system.*`, `DistributedTask.*`, and lowercase
+  `actions_*` bookkeeping can no longer be read by running `env` in a step.
+  Uppercase `ACTIONS_*` plumbing (`ACTIONS_RUNTIME_URL`, `ACTIONS_STEP_DEBUG`,
+  …) is deliberately preserved.
+- **Orphaned engine state is swept at startup** (`d2b32c8b`, #322): workspace
+  snapshots whose run is gone or whose discard timer died with a restart,
+  `.tmp-golden-*` staging files left behind by a crash between pack and rename,
+  and golden payloads stranded by an environment-fingerprint change are
+  reclaimed instead of accumulating in `state/snapshots/` and `vms/`.
+- **Golden downloads resume and fall back** (`f88cc076`, `1e3d50ad`, #342): a
+  multi-gigabyte transfer that dies partway now resumes from a `.partial` file
+  across retries and engine restarts, and an engine whose own release carries
+  no golden resolves the newest release that actually has one (GitHub API,
+  cached five minutes) before falling back to the `/releases/latest/` URL and
+  finally baking locally. Both install paths verify first — checksum for a
+  release asset, layer digest for the OCI blob — so a resumed transfer cannot
+  publish a mixed image.
+- **`vulnerability-alerts` is a real `GITHUB_TOKEN` scope** (`4c5dbb80`,
+  #330): it joins `PERMISSION_SCOPES`, so `permissions: read-all` grants it and
+  explicit declarations flow into effective permissions, the runner's
+  token-permission map, and the App setup checklist. `write-all` caps it at
+  read, because GitHub defines no write level for the scope.
+- **Node-migration variables restored in the broker's job message**
+  (`0dc451e9`, `bd7ee7bb`): GitHub's service still sends
+  `actions.runner.usenode24bydefault`, `actions.runner.warnonnode20`,
+  `actions.runner.requirenode24`, and `actions_runner_node20_removal_date` in
+  the acquirejob response, so the server keeps emitting them — matched to the
+  live v2.336.0 capture — even though the runner no longer acts on them.
+  Conformance is back to 36/36.
+- **Release legs off the retired `macos-13` image** (`86f95685`, #325): the
+  `x86_64-apple-darwin` runner build moves to `macos-15-intel`, and the
+  supply-chain policy guard diffs the merge base (`465c320b`, #323) so it no
+  longer fails on shallow fetches.
+
+### Merged pull requests
+
+- #342 — Resume golden downloads and resolve the newest release that carries one
+- #339 — Restore Rust jobs from the shared R2 content-addressed cache
+- #338 — Sweep stale claims across docs
+- #337 — Isolate concurrency group keys by trust tier
+- #336 — Report the defining workflow in `job.workflow_*` for reusable jobs
+- #335 — Runner version end-of-life lookup API
+- #333 — Run, check, and status retention lifecycle
+- #332 — REST management API for execution-protection rules
+- #331 — Remove Node 12/16/20 runtimes for JavaScript actions
+- #330 — Support the `vulnerability-alerts` `GITHUB_TOKEN` permission
+- #329 — Filter internal job variables from step environments
+- #327 — Consolidate duplicated test helpers and replace weak `run_job` tests
+- #326 — Allow the runner image push on `workflow_dispatch`
+- #325 — Move `x86_64-apple-darwin` off the retired `macos-13` image
+- #323 — Diff the merge base in the supply-chain policy guard
+- #322 — Sweep orphaned preloop state at startup
 
 ## [0.33.6] - 2026-09-24
 
@@ -1040,6 +1154,7 @@ installers for macOS and Linux).
 [0.29.0]: https://github.com/preloopdev/preloop/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/preloopdev/preloop/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/preloopdev/preloop/releases/tag/v0.27.0
-[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.6...HEAD
+[Unreleased]: https://github.com/preloopdev/preloop/compare/v0.33.7...HEAD
+[0.33.7]: https://github.com/preloopdev/preloop/compare/v0.33.6...v0.33.7
 [0.33.6]: https://github.com/preloopdev/preloop/compare/v0.33.5...v0.33.6
 [0.33.5]: https://github.com/preloopdev/preloop/compare/v0.33.2...v0.33.5
