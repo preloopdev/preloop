@@ -3734,10 +3734,12 @@ mod tests {
 
         let inner = state.test_tx().await;
         assert_eq!(inner.runs.len(), 1);
+        // The counter row is keyed "repository\x1fworkflow_path" per the
+        // agreed (namespace_id, repository, workflow_path) scoping.
         assert_eq!(
             inner
                 .workflow_run_counters
-                .get(".github/workflows/build.yml"),
+                .get("owner/repo\x1f.github/workflows/build.yml"),
             Some(&1),
             "a replay that reused the run must not advance the counter"
         );
