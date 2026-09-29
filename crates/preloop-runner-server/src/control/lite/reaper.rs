@@ -9,7 +9,7 @@
 
 use super::codec::{self, now_us};
 use super::jobs;
-use super::{LiteBackend, db};
+use super::{LiteBackend, db, runners};
 use crate::control::logic::{self, StarvationCandidate, StarvationVerdict};
 use crate::control::types::*;
 use preloop_gha_protocol::{JobId, RunId, azdo};
@@ -690,42 +690,10 @@ impl LiteBackend {
                     }
                 }
             }
-            // Live runner -> job pairings from unfinished owned attempts.
-            {
-                let now = std::time::SystemTime::now();
-                let mut stmt = tx
-                    .prepare_cached(
-                        "SELECT q.runner_id, q.run_id, q.job_id, q.started_at \
-                         FROM job_requests q \
-                         WHERE q.result IS NULL AND q.runner_id IS NOT NULL \
-                         ORDER BY q.runner_id",
-                    )
-                    .map_err(db)?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, Option<i64>>(3)?,
-                        ))
-                    })
-                    .map_err(db)?;
-                for row in rows {
-                    let (runner_id, run_id, job_id, started_at) = row.map_err(db)?;
-                    inputs.runner_assignments.push(
-                        preloop_observability::status::RunnerAssignment {
-                            runner_id,
-                            run_id,
-                            job_id,
-                            assigned_seconds_ago: started_at
-                                .and_then(|us| now.duration_since(codec::us_to_system(us)).ok())
-                                .map(|age| age.as_secs_f64())
-                                .unwrap_or(0.0),
-                        },
-                    );
-                }
-            }
+            // Live runner -> job pairings: the same rows the status page's
+            // `live_assignments` reads (a live session must still own the
+            // attempt).
+            inputs.runner_assignments = runners::live_assignments_tx(tx)?;
             // Oldest ready job.
             {
                 let oldest: Option<(String, String, i64)> = tx
