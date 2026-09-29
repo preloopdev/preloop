@@ -211,7 +211,9 @@ impl PgBackend {
                 "session belongs to another runner".to_owned(),
             ));
         }
-        // Release the session's live request so the job can be retried.
+        // Release the session's live request so the job can be retried. The
+        // recorded owner survives (see below), so only that runner may still
+        // complete/renew the attempt.
         let requests = tx
             .query(
                 "SELECT request_id FROM job_requests WHERE session_id=$1::text::uuid \
@@ -228,8 +230,12 @@ impl PgBackend {
         .map_err(db)?;
         for row in requests {
             let request_id: i64 = row.get(0);
+            // runner_id stays: the attempt's owner survives session teardown
+            // so only that runner may still complete/renew it (legacy
+            // AgentRequest semantics — verified by
+            // legacy_agent_requests_are_bound_to_runner_identity).
             tx.execute(
-                "UPDATE job_requests SET session_id = NULL, runner_id = NULL, \
+                "UPDATE job_requests SET session_id = NULL, \
                  started_at = NULL, timeout_triggered = false \
                  WHERE request_id = $1 AND result IS NULL",
                 &[&request_id],

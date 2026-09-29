@@ -8465,6 +8465,65 @@ async fn legacy_agent_requests_are_bound_to_runner_identity() {
     let _ = runner_b;
 }
 
+/// A released attempt is in flight but unowned: boot reconcile hands an
+/// orphaned claim whose run went back to the ready queue to
+/// `release_claimed_request`, which clears the owner and the session
+/// binding. No registered runner may then read or settle it — treating
+/// "never assigned" as owned let any runner forge that attempt's result.
+#[tokio::test]
+async fn released_agent_requests_are_not_settleable_by_other_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "released-request-a", &["self-hosted"], None).await;
+    let (_runner_b, token_b) =
+        register_runner_with_token(&app, "released-request-b", &["self-hosted"], None).await;
+    let (session_status, session) = create_disttask_session(&app, &token_a, runner_a).await;
+    assert_eq!(session_status, StatusCode::CREATED);
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let _accepted = submit_simple_run(&app).await;
+    let message = poll_message(&app, &token_a, &session_id).await;
+    assert_eq!(
+        message["messageType"],
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+    );
+    let request_id = {
+        let inner = state.test_tx().await;
+        *inner.session_active_requests.get(&session_id).unwrap()
+    };
+
+    state
+        .backend
+        .release_claimed_request(
+            request_id,
+            &crate::distributed_task::agent_request_locked_until(),
+        )
+        .await
+        .unwrap();
+
+    for (method, body) in [
+        (Method::GET, Value::Null),
+        (Method::POST, Value::Null),
+        (Method::PATCH, json!({"result": "succeeded"})),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(
+                &app,
+                method.clone(),
+                &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+                body,
+                &token_b,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not address a released agent request with {method}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn legacy_provision_token_is_consumed_atomically() {
     let temp = tempfile::tempdir().unwrap();
