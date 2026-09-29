@@ -246,50 +246,10 @@ pub async fn run_node_action(
         }
     }
 
-    let runner_root =
-        runner_root_for_externals(Path::new(workspace), Path::new(LEGACY_BAKED_EXTERNALS_ROOT));
-    let bundled_node = if cfg!(target_os = "windows") {
-        runner_root
-            .join("externals")
-            .join(node_version)
-            .join("node.exe")
-    } else {
-        runner_root
-            .join("externals")
-            .join(node_version)
-            .join("bin")
-            .join("node")
-    };
-    // The official runner invokes the bundled Node by absolute path and never
-    // prepends its directory to PATH. Child processes inherit the job's PATH
-    // unchanged — this is what lets setup-node's toolcache entry win.
-    let node_path = if bundled_node.is_file() {
-        bundled_node.to_string_lossy().to_string()
-    } else {
-        // Bundled externals are missing (--no-externals). Fall back to system
-        // Node, but enforce that its major version matches what the action
-        // declared. Without this, a node24 action silently runs on Node 20.
-        let required = required_major_from_version(node_version);
-        let path = "node";
-        let major = system_node_major(path).with_context(|| {
-            format!(
-                "bundled {node_version} is missing at {} and system node is unusable; \
-                 run `configure` without --no-externals to download it",
-                bundled_node.display()
-            )
-        })?;
-        if let Some(req) = required
-            && major != req
-        {
-            anyhow::bail!(
-                "bundled {node_version} is missing at {}; system Node is v{major} \
-                     but the action requires Node {req}",
-                bundled_node.display()
-            );
-        }
-        info!("Bundled {node_version} not found, using system Node v{major} (--no-externals)");
-        path.to_owned()
-    };
+    // The host-side bundled-Node probe and its system-Node fallback live
+    // *after* the container branch below: a container job runs Node inside
+    // the container, and a probe against the runner's own filesystem must not
+    // decide whether that path can run.
 
     // Set GITHUB_ACTION_PATH
     env.insert(
@@ -302,7 +262,8 @@ pub async fn run_node_action(
     // `/__e`. Running the host binary against container paths fails two ways:
     // the action cannot see its inputs at their advertised locations, and the
     // host-side externals probe reports `bundled nodeXX is missing` whenever
-    // the resolved runner root differs from the mount source.
+    // the runner process cannot read the mount source, killing the job before
+    // the container ever gets a chance. The container path runs first.
     let job_container_id = ctx
         .job
         .container_state
@@ -315,26 +276,22 @@ pub async fn run_node_action(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         // `/__e` is the read-only externals mount, sourced from
-        // `{runner_work}/../externals` (steps_runner.rs). Probe that exact
-        // host dir — not the walked runner root — so the check answers
-        // "what will the container see". That is the check that failed as
-        // `bundled node24 is missing` when the mount source was absent.
-        let mounted_node = Path::new(workspace)
-            .parent()
-            .map(|runner_work| {
-                runner_work
-                    .join("..")
-                    .join("externals")
-                    .join(node_version)
-                    .join("bin")
-                    .join("node")
-            })
-            .unwrap_or_else(|| bundled_node.clone());
+        // `{runner_work}/../externals` (steps_runner.rs) — and `host_work` is
+        // that same runner work root, so this is exactly the path docker
+        // mounts. The probe is *advisory*: `is_file()` cannot distinguish an
+        // EACCES'd directory from an absent one, and the container (which the
+        // daemon mounts as root) may see the runtime regardless. Log and let
+        // docker exec produce the real error instead of failing here.
+        let mounted_node = Path::new(&host_work)
+            .join("..")
+            .join("externals")
+            .join(node_version)
+            .join("bin")
+            .join("node");
         if !mounted_node.is_file() {
-            anyhow::bail!(
-                "bundled {node_version} is missing at {}; job containers have no \
-                 system Node fallback — fix the runner bundle",
-                mounted_node.display()
+            tracing::warn!(
+                path = %mounted_node.display(),
+                "container externals probe cannot see the bundled Node; trying docker exec anyway"
             );
         }
         let container_node = format!("/__e/{node_version}/bin/node");
@@ -390,6 +347,54 @@ pub async fn run_node_action(
         }
         return Ok(());
     }
+
+    // Not a container job: resolve the bundled Node on the runner's own
+    // filesystem. `runner_root_for_externals` walks up from the workspace to
+    // the runner root that carries `externals/`.
+    let runner_root =
+        runner_root_for_externals(Path::new(workspace), Path::new(LEGACY_BAKED_EXTERNALS_ROOT));
+    let bundled_node = if cfg!(target_os = "windows") {
+        runner_root
+            .join("externals")
+            .join(node_version)
+            .join("node.exe")
+    } else {
+        runner_root
+            .join("externals")
+            .join(node_version)
+            .join("bin")
+            .join("node")
+    };
+    // The official runner invokes the bundled Node by absolute path and never
+    // prepends its directory to PATH. Child processes inherit the job's PATH
+    // unchanged — this is what lets setup-node's toolcache entry win.
+    let node_path = if bundled_node.is_file() {
+        bundled_node.to_string_lossy().to_string()
+    } else {
+        // Bundled externals are missing (--no-externals). Fall back to system
+        // Node, but enforce that its major version matches what the action
+        // declared. Without this, a node24 action silently runs on Node 20.
+        let required = required_major_from_version(node_version);
+        let path = "node";
+        let major = system_node_major(path).with_context(|| {
+            format!(
+                "bundled {node_version} is missing at {} and system node is unusable; \
+                 run `configure` without --no-externals to download it",
+                bundled_node.display()
+            )
+        })?;
+        if let Some(req) = required
+            && major != req
+        {
+            anyhow::bail!(
+                "bundled {node_version} is missing at {}; system Node is v{major} \
+                     but the action requires Node {req}",
+                bundled_node.display()
+            );
+        }
+        info!("Bundled {node_version} not found, using system Node v{major} (--no-externals)");
+        path.to_owned()
+    };
 
     info!("Running node action: {node_path} {}", entry_point.display());
     let ctx_ref = &mut *ctx;

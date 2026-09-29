@@ -3159,9 +3159,15 @@ fn eval_step_input_template(
         let end = preloop_gha_protocol::expr_scan::find_expression_end(remaining)?;
         let expr = remaining[..end].trim();
         let referenced = preloop_gha_expressions::collect_contexts(expr).ok()?;
+        // `needs` is present from the start but empty: `hydrate_needs_context`
+        // fills it only after the dependency completes. Evaluating against the
+        // empty shell would prove a dynamic dependency output (`ref: ${{
+        // needs.build.outputs.sha }}`) to be `""` and misclassify it as the
+        // default checkout, permanently rewriting it to the snapshot before
+        // the real value is known. Treat it as unprovable here.
         if !referenced
             .iter()
-            .all(|root| context_data.contains_key(root.as_str()))
+            .all(|root| root != "needs" && context_data.contains_key(root.as_str()))
         {
             return None;
         }
@@ -3398,10 +3404,14 @@ pub fn redirect_primary_checkout(
     if let Some(head) = snapshot.head_sha.as_deref() {
         default_ref_candidates.push(head.to_owned());
     }
-    if let Some(branch) = snapshot.default_branch.as_deref() {
-        default_ref_candidates.push(branch.to_owned());
-        default_ref_candidates.push(format!("refs/heads/{branch}"));
-    }
+    // `snapshot.default_branch` is deliberately absent: it names the
+    // *repository's* default branch from the event payload, which on a cached
+    // remote run of a feature branch or PR is not the branch this run tests.
+    // Counting it would make an explicit `ref: main` look like the default
+    // checkout and silently rewrite the step to the run's commit. Only refs
+    // that identify `snapshot.commit_sha` (or the real commit it is based on)
+    // are candidates — a literal branch name stays on the forge, where it
+    // resolves to the branch the workflow actually asked for.
     let mut redirected = 0;
     let mut pinned = Vec::new();
     for step in &mut message.steps {
@@ -3494,7 +3504,24 @@ pub fn redirect_primary_checkout(
                 }
             }
         });
-        if !(repository_default && server_url_default && ref_default && history_compatible) {
+        // A step that supplies its own `token` authenticates with a
+        // credential the server cannot reproduce — often a secret that is
+        // unprovable here. Redirecting would overwrite it with the snapshot's
+        // runtime token and strip the workflow's authority, and
+        // `actions/checkout` persists that token for later Git commands. Only
+        // a provably empty token is the action's default.
+        let token = resolve_step_input(step, "token", &context_data);
+        let token_default = !token.present
+            || token
+                .value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty());
+        if !(repository_default
+            && server_url_default
+            && ref_default
+            && history_compatible
+            && token_default)
+        {
             continue;
         }
         step.inputs
@@ -3614,13 +3641,18 @@ pub fn reroute_forge_checkouts(
         if token.present {
             continue;
         }
-        // SSH checkouts never hit the relay; leave them on the forge.
+        // SSH checkouts never hit the relay; leave them on the forge. A key
+        // we cannot evaluate (`${{ secrets.DEPLOY_KEY }}`) is still a key:
+        // rerouting would rewrite `github-server-url` to the engine, which
+        // serves no SSH, breaking a checkout that authenticated fine before.
+        // Only an absent or provably empty `ssh-key` can ride the relay.
         let ssh_key = resolve_step_input(step, "ssh-key", &context_data);
-        if ssh_key
-            .value
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
+        let ssh_unused = !ssh_key.present
+            || ssh_key
+                .value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty());
+        if !ssh_unused {
             continue;
         }
         step.inputs
@@ -4068,21 +4100,45 @@ fn snapshot_authorization_token(value: &str) -> Option<String> {
     Some(token.to_owned())
 }
 
+/// Validate an `owner`/`repo` segment before it is interpolated into a relay
+/// URL.
+///
+/// Axum percent-decodes path parameters, so a decoded value can carry `/`,
+/// `?`, `#`, or a whole dot segment (`%2e%2e%2f..%2fusers%2fx%3F`). The URL
+/// crate normalizes `.`/`..` while parsing, which would let such a segment
+/// escape the configured path prefix — `forge_api_repo` has no literal tail
+/// to anchor it. Anything but a plain name is refused.
+fn valid_repo_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('.')
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// Headers the forge relay copies inbound — everything else (notably
 /// `authorization`, `host`, `cookie`) is dropped so the upstream request is
 /// anonymous by construction.
+///
+/// `accept-encoding` is deliberately absent: the workspace's `reqwest` is
+/// built without compression codecs, so an encoded body would be relayed
+/// verbatim while the client cannot decode it. Leaving the header off makes
+/// the forge answer identity.
 const FORGE_RELAY_FORWARD_HEADERS: &[&str] = &[
     "accept",
     "content-type",
     "content-encoding",
     "git-protocol",
     "user-agent",
-    "accept-encoding",
 ];
 
 /// Headers the relay copies back out of the forge's response.
+///
+/// `content-encoding` is carried so an upstream that encodes anyway stays
+/// decodable end to end (the snapshot path has the same hazard).
 const FORGE_RELAY_RESPONSE_HEADERS: &[&str] = &[
     "content-type",
+    "content-encoding",
     "git-protocol",
     "cache-control",
     "expires",
@@ -4109,6 +4165,19 @@ fn authorize_forge_relay(state: &AppState, request: &Request) -> Result<(), Box<
     }
 }
 
+/// Concurrent forge-relay streams the engine will hold open, process-wide.
+///
+/// The relay is authenticated per job but otherwise unmetered: without a
+/// bound one workflow could hold unlimited upstream connections and make the
+/// engine proxy arbitrary public-Git traffic. Requests over the bound are
+/// refused with 503 rather than queued. Response *bytes* are deliberately not
+/// capped — a deep-history pack (`fetch-depth: 0`) is legitimately large, and
+/// truncating it would break the checkouts the relay exists to serve.
+const FORGE_RELAY_MAX_CONCURRENCY: usize = 64;
+
+static FORGE_RELAY_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(FORGE_RELAY_MAX_CONCURRENCY));
+
 /// Relay one request to the configured forge with credentials stripped.
 ///
 /// `upstream` is the full URL including path and query. Returns the upstream
@@ -4117,6 +4186,9 @@ fn authorize_forge_relay(state: &AppState, request: &Request) -> Result<(), Box<
 /// (private repo) surfaces to the job as a fetch failure, not a git
 /// credential prompt.
 async fn forge_relay_forward(request: Request, upstream: &str) -> Result<Response<Body>, ApiError> {
+    let permit = FORGE_RELAY_PERMITS
+        .try_acquire()
+        .map_err(|_| ApiError::service_unavailable("forge relay is at capacity; retry shortly"))?;
     let method = request.method().clone();
     let mut builder = LFS_FORGE_CLIENT.request(method.clone(), upstream);
     for name in FORGE_RELAY_FORWARD_HEADERS {
@@ -4140,6 +4212,13 @@ async fn forge_relay_forward(request: Request, upstream: &str) -> Result<Respons
         }
     }
     let stream = response.bytes_stream();
+    // The permit rides the response stream: it is released when the body is
+    // dropped, which is exactly when the relay stops holding the upstream
+    // connection.
+    let stream = futures::StreamExt::map(stream, move |chunk| {
+        let _keep_alive = &permit;
+        chunk
+    });
     out.body(Body::from_stream(stream))
         .map_err(|error| ApiError::internal(format!("failed to build relay response: {error}")))
 }
@@ -4176,13 +4255,8 @@ pub async fn forge_git_http(
     }
     // Repo slugs are path segments — no traversal characters allowed through
     // to the upstream URL.
-    for segment in [&org, repo] {
-        if segment
-            .bytes()
-            .any(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'-' | b'_' | b'.'))
-        {
-            return Err(ApiError::bad_request("invalid repository path"));
-        }
+    if !valid_repo_segment(&org) || !valid_repo_segment(repo) {
+        return Err(ApiError::bad_request("invalid repository path"));
     }
     let query = request.uri().query().unwrap_or_default();
     let upstream = format!(
@@ -4216,6 +4290,12 @@ pub async fn forge_api_repo(
     if let Err(response) = authorize_forge_relay(&shared.state, &request) {
         return Ok(*response);
     }
+    // Same segment rules as `forge_git_http`: without them a decoded
+    // `%2e%2e%2f..%2fusers%2fx%3F` reaches a URL with no literal tail to
+    // anchor it, and any job token could drive arbitrary GETs on the API host.
+    if !valid_repo_segment(&owner) || !valid_repo_segment(&repo) {
+        return Err(ApiError::bad_request("invalid repository path"));
+    }
     // The API base is the forge's own api host (`api.github.com` for the
     // github.com default), never the server URL.
     let api_base = shared
@@ -4231,6 +4311,19 @@ pub async fn forge_api_repo(
 #[cfg(test)]
 mod auth_scoping_tests {
     use super::*;
+
+    /// Decoded path parameters can carry separators or dot segments;
+    /// `url`/`reqwest` normalize `..` while parsing, so a segment that slips
+    /// through escapes the configured path prefix (SSRF).
+    #[test]
+    fn relay_segments_reject_traversal() {
+        for bad in ["", ".", "..", ".git", "a/b", "a?b", "a#b", "..%2fusers"] {
+            assert!(!valid_repo_segment(bad), "{bad:?} must be refused");
+        }
+        for good in ["owner", "repo.js", "some-repo_name", "node-24.x"] {
+            assert!(valid_repo_segment(good), "{good:?} must be allowed");
+        }
+    }
 
     #[test]
     fn gzipped_git_body_decodes_and_plain_passes_through() {
@@ -4540,7 +4633,11 @@ mod deepen_and_redirect_tests {
                             ]}}
                         ]}}
                     ]}}
-                ]}
+                ]},
+                // Present from the start but empty until
+                // `hydrate_needs_context` runs after the dependency
+                // completes — the shape that must stay unprovable.
+                "needs": {"t": 2, "d": []}
             }
         }))
         .unwrap()
@@ -4668,6 +4765,34 @@ mod deepen_and_redirect_tests {
             redirect_count(serde_json::json!({"fetch-depth": "${{ inputs.depth }}"})),
             0,
             "an unevaluatable depth is unprovable and stays on the forge"
+        );
+    }
+
+    /// Workflow-supplied credentials and dependency outputs keep the step on
+    /// the forge: the redirect replaces the `token` input with the snapshot
+    /// runtime token and pins the commit, neither of which is right when the
+    /// workflow named its own authority or a `needs` output.
+    #[test]
+    fn redirect_keeps_workflow_credentials_and_needs_outputs() {
+        assert_eq!(
+            redirect_count(serde_json::json!({"token": "${{ secrets.DEPLOY_KEY }}"})),
+            0,
+            "an explicit secret token is the workflow's credential, not ours to replace"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"token": "ghp_literal"})),
+            0,
+            "a literal token authenticates the checkout and must survive"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"token": "${{ github.token }}"})),
+            1,
+            "the action's own empty-token default is still the default checkout"
+        );
+        assert_eq!(
+            redirect_count(serde_json::json!({"ref": "${{ needs.build.outputs.sha }}"})),
+            0,
+            "needs is empty at submission; its outputs are unprovable here"
         );
     }
 
@@ -4802,6 +4927,27 @@ mod deepen_and_redirect_tests {
 
         // A different forge's URL cannot ride the relay.
         let mut message = make(serde_json::json!({"repository": "https://git.example.com/o/r"}));
+        assert_eq!(
+            reroute_forge_checkouts(&mut message, "http://127.0.0.1:9090", "jwt", false),
+            0
+        );
+
+        // An SSH checkout stays on the forge even though its key cannot be
+        // evaluated here; only a provably empty key is "no SSH".
+        let mut message = make(serde_json::json!({"ssh-key": "${{ secrets.DEPLOY_KEY }}"}));
+        assert_eq!(
+            reroute_forge_checkouts(&mut message, "http://127.0.0.1:9090", "jwt", false),
+            0
+        );
+        assert!(!message.steps[0].inputs.contains_key("github-server-url"));
+        let mut message = make(serde_json::json!({"ssh-key": ""}));
+        assert_eq!(
+            reroute_forge_checkouts(&mut message, "http://127.0.0.1:9090", "jwt", false),
+            1
+        );
+
+        // A workflow-supplied token already authenticates the fetch.
+        let mut message = make(serde_json::json!({"token": "${{ secrets.PAT }}"}));
         assert_eq!(
             reroute_forge_checkouts(&mut message, "http://127.0.0.1:9090", "jwt", false),
             0

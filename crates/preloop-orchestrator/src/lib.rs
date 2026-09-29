@@ -1686,6 +1686,57 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Guest script that hands the runner account ownership of every path a job
+/// writes, without touching the image's privilege policy.
+///
+/// Ownership only, deliberately: account creation, the `/etc/sudoers.d` rule,
+/// and docker-group membership stay in [`runner_account_script`], which the
+/// curated bake runs as part of building an image. Installing that policy on
+/// an image which never had it would hand blanket root — and the container
+/// daemon — to whatever a fork executes.
+///
+/// The script first decides whether anything is actually wrong (`needs`), so
+/// an already-correct machine pays exactly one exec round trip. Only when work
+/// is needed does it escalate — directly when the exec landed on root, else
+/// through passwordless sudo — and an escalation that cannot run is reported
+/// as a failure rather than masked, because a machine with root-owned
+/// `/usr/local/rustup` fails every rustup step at job time.
+pub fn runner_ownership_reconcile_script(uid: u32) -> String {
+    // The privileged half, applied only after `needs=1`. `set -e` makes every
+    // required operation fail the script: this is the ownership jobs depend
+    // on, so a partial apply must not report success.
+    let apply = format!(
+        "set -e; \
+         for d in /usr/local/rustup /usr/local/cargo; do \
+           if [ -e \"$d\" ]; then chown -R {uid}:{uid} \"$d\"; fi; \
+         done; \
+         if [ -d /opt/hostedtoolcache ]; then \
+           [ \"$(stat -c %a /opt/hostedtoolcache)\" = \"777\" ] || chmod -R 777 /opt/hostedtoolcache; \
+         fi; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
+         mkdir -p /run/user/{uid}; \
+         chown {uid}:{uid} /run/user/{uid}"
+    );
+    use base64::Engine as _;
+    let apply_b64 = base64::engine::general_purpose::STANDARD.encode(&apply);
+    format!(
+        "needs=0; \
+         for d in /usr/local/rustup /usr/local/cargo; do \
+           if [ -e \"$d\" ]; then \
+             [ \"$(stat -c %u \"$d\" 2>/dev/null)\" = \"{uid}\" ] || needs=1; \
+           fi; \
+         done; \
+         if [ -d /opt/hostedtoolcache ]; then \
+           [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || needs=1; \
+         fi; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || needs=1; \
+         if [ \"$needs\" = \"0\" ]; then echo 'runner ownership already reconciled'; exit 0; fi; \
+         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh; \
+         else printf %s '{apply_b64}' | base64 -d | sudo -n sh; fi"
+    )
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -5646,30 +5697,34 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
 
-    // Reconcile the unprivileged runner account on every machine, whatever its
-    // provenance: curated stock bases, custom/official images, and forked
-    // goldens alike. `base_install_script` runs this only inside the curated
-    // bake, so custom bases reached jobs with root-owned `/usr/local/rustup`,
-    // `/usr/local/cargo`, and `/opt/hostedtoolcache` — and any step that
-    // writes them (`rustup component add`, `cargo fmt`, toolcache drops) died
-    // with EACCES. The script is idempotent, so re-running it on an
-    // already-prepared image costs one exec round trip.
+    // Reconcile ownership of the paths a job writes on every machine, whatever
+    // its provenance: curated stock bases, custom/official images, and forked
+    // goldens alike. `base_install_script` runs the full account script only
+    // inside the curated bake, so custom bases reached jobs with root-owned
+    // `/usr/local/rustup`, `/usr/local/cargo`, and `/opt/hostedtoolcache` — and
+    // any step that writes them (`rustup component add`, `cargo fmt`, toolcache
+    // drops) died with EACCES. This is the ownership half only: privilege
+    // policy stays where it was baked. One exec round trip, and the script
+    // itself no-ops when the machine is already correct.
     {
-        let runner_user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
         let runner_uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
-        let account_script = runner_account_script(runner_user, runner_uid);
+        let reconcile = runner_ownership_reconcile_script(runner_uid);
         let output = provider
-            .exec(name, &["sh".to_owned(), "-c".to_owned(), account_script])
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), reconcile])
             .await?;
         if output.exit_code != 0 {
             return Err(OrchestratorError::Config(format!(
-                "runner-account reconciliation failed on {} (exit {}): {}",
+                "runner-ownership reconciliation failed on {} (exit {}): {} — \
+                 /usr/local/rustup, /usr/local/cargo, and /opt/hostedtoolcache must be \
+                 writable by uid {}; the engine could not escalate (image user is not \
+                 root and passwordless sudo is unavailable)",
                 name.as_str(),
                 output.exit_code,
                 String::from_utf8_lossy(&output.stderr)
                     .lines()
                     .last()
-                    .unwrap_or("unknown")
+                    .unwrap_or("unknown"),
+                runner_uid
             )));
         }
     }
@@ -6905,6 +6960,32 @@ chmod +x "$dest/bin/node"
         assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
         assert!(env.contains(&"PRELOOP_CONTROL_UPSTREAM=http://10.0.0.161:9090".to_owned()));
         assert!(!env.iter().any(|v| v.starts_with("PRELOOP_CONTROL_SOCKET")));
+    }
+
+    /// The always-run ownership reconciliation must not install privilege
+    /// policy — the security review's P1: custom/official images that never
+    /// had blanket sudo must not gain it just because a job runs there — and
+    /// it must not mask failures the way the account script's `|| true` tail
+    /// does.
+    #[test]
+    fn ownership_reconcile_script_keeps_privilege_policy_out() {
+        let script = runner_ownership_reconcile_script(1001);
+        assert!(!script.contains("NOPASSWD"), "{script}");
+        assert!(!script.contains("usermod"), "{script}");
+        assert!(!script.contains("sudoers"), "{script}");
+        assert!(!script.contains("docker"), "{script}");
+        assert!(
+            script.contains("needs=0"),
+            "an already-correct machine must skip the privileged half: {script}"
+        );
+        assert!(
+            script.contains("sudo -n sh"),
+            "a machine that needs changes must escalate: {script}"
+        );
+        assert!(
+            !script.contains("|| true"),
+            "escalation and chown failures must stay observable: {script}"
+        );
     }
 
     #[test]
