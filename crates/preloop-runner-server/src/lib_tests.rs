@@ -16868,6 +16868,103 @@ jobs:
     );
 }
 
+/// A whitespace-only workflow `concurrency.group` passes the expression
+/// evaluation (the string is not empty) but is trimmed to nothing, so the
+/// submission is rejected at run level. The backend flags that rejection with a
+/// synthetic job id `"*"`, which must not be published as a `JobStatus` — that
+/// would describe a failed job that is absent from `run.jobs`. The merge base
+/// emitted only `RunAccepted` + `RunStatus` for this case.
+#[tokio::test]
+async fn whitespace_workflow_concurrency_group_emits_no_synthetic_job_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // Subscribe before submitting: `submit` broadcasts its events and a
+    // rejected run is never persisted, so there is no stream to re-read.
+    let mut events = state.events.subscribe();
+
+    let accepted = submit_yaml(
+        &app,
+        "on: push\nconcurrency:\n  group: \"   \"\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let mut saw_run_status_failure = false;
+    while let Ok(event) = events.try_recv() {
+        if event.run_id() != run_id {
+            continue;
+        }
+        match &event {
+            NdjsonEvent::JobStatus { job_id, .. } => {
+                assert_ne!(
+                    job_id.0, "*",
+                    "a synthetic `*` job must not reach the event stream: {event:?}"
+                );
+            }
+            NdjsonEvent::RunStatus { status, reason, .. } => {
+                saw_run_status_failure = *status == ExecutionStatus::Failure
+                    && reason.as_deref() == Some("concurrency group name must not be empty");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_run_status_failure,
+        "the run-level rejection must still be emitted"
+    );
+}
+
+/// The run row, its jobs and its concurrency keys must live in the same
+/// namespace as the `workflow_run_numbers` counter row `allocate_run_number`
+/// wrote. `runs.rs` used to file the run under the repository slug while
+/// allocating the number under `DEFAULT_NAMESPACE`, leaving two disagreeing
+/// tenants for one run.
+#[tokio::test]
+async fn submitted_run_shares_the_namespace_of_its_run_number_counter() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let accepted = submit_yaml(
+        &app,
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        "owner/repo",
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+
+    state
+        .test_db_mutate(move |tx| {
+            let run_namespace: String = tx
+                .0
+                .query_row(
+                    "SELECT namespace_id FROM runs WHERE run_id = ?1",
+                    [run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("submitted run row");
+            assert_eq!(
+                run_namespace,
+                crate::control::types::DEFAULT_NAMESPACE,
+                "the run must live in the local tenant"
+            );
+            let counter_namespace: String = tx
+                .0
+                .query_row(
+                    "SELECT namespace_id FROM workflow_run_numbers WHERE repository = ?1",
+                    ["owner/repo"],
+                    |row| row.get(0),
+                )
+                .expect("run-number counter row");
+            assert_eq!(
+                run_namespace, counter_namespace,
+                "the run and its number counter must agree on the namespace"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn concurrency_chaos_interleaved_submits_and_completes() {
     let temp = tempfile::tempdir().unwrap();
@@ -20447,6 +20544,93 @@ jobs:
     assert!(
         claims["exp"].as_u64().unwrap() > now,
         "the claimed token must not be expired"
+    );
+}
+
+/// The verdict poll re-mints a replacement snapshot token by reading the
+/// request row through the backend. That read must happen *after* the
+/// node-local `inner` lock is released: on Postgres a reader checkout can wait
+/// on the pool, and holding the global lock across it stalls every other
+/// `inner` user on the node. The handler is polled exactly once, into the
+/// outstanding backend read, and the lock must be free while that read is in
+/// flight. Regression guard for the cutover that held the guard across it.
+#[tokio::test]
+async fn verdict_poll_releases_inner_before_the_backend_read() {
+    let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new_with_store(
+        temp.path().to_path_buf(),
+        crate::config::config_path(),
+        Some(&pg_url),
+    )
+    .await
+    .unwrap();
+
+    // A paused session with a queued retry verdict, built entirely in the
+    // node-local registry: the verdict poll needs no run row, only a session
+    // record and the agent job id that owns it.
+    let (session_id, agent_job_id) = {
+        use preloop_gha_protocol::debug_session::{
+            SessionLeaseRequest, SessionOperation, SessionOperationRequest,
+        };
+        let mut inner = state.inner.lock().await;
+        let request = crate::debug_sessions::test_open_request(
+            preloop_gha_protocol::RunId::new(),
+            preloop_gha_protocol::JobId("build".to_owned()),
+        );
+        let agent_job_id = request.agent_job_id;
+        let session = inner
+            .debug_sessions
+            .open(7, request, std::time::SystemTime::now());
+        let session_id = session.session_id.clone();
+        let lease = inner
+            .debug_sessions
+            .acquire_controller_lease(
+                &session_id,
+                &SessionLeaseRequest {
+                    controller: "test".to_owned(),
+                    capabilities: Vec::new(),
+                },
+            )
+            .expect("lease");
+        inner
+            .debug_sessions
+            .session_operation(
+                &session_id,
+                SessionOperationRequest {
+                    request_id: "t-retry".to_owned(),
+                    expected_version: lease.session_version,
+                    lease_id: lease.lease_id.clone(),
+                    operation: SessionOperation::Retry {
+                        revert: Default::default(),
+                        source_revision: None,
+                    },
+                },
+            )
+            .expect("retry operation");
+        (session_id, agent_job_id)
+    };
+
+    // Poll the handler exactly once: it reaches the backend read and parks
+    // there. While that read is outstanding the node-local lock must not be
+    // held, so a concurrent `inner` user is not stalled behind a slow reader
+    // pool or a blocking query.
+    let mut fut = Box::pin(crate::debug_sessions::poll_verdict(
+        axum::extract::State(state.shared()),
+        axum::Extension(crate::auth::WorkerJob(agent_job_id)),
+        axum::extract::Path(session_id),
+        axum::extract::Query(crate::debug_sessions::VerdictPollQuery { wait: Some(0) }),
+    ));
+    assert!(
+        futures::poll!(fut.as_mut()).is_pending(),
+        "the verdict poll must still be awaiting the backend read after one poll"
+    );
+    assert!(
+        state.inner.try_lock().is_ok(),
+        "the node-local lock must be released before the backend read is awaited"
     );
 }
 
@@ -24457,6 +24641,142 @@ async fn postgres_concurrent_open_serializes_migrations() {
     );
     assert!(first.is_ok(), "first opener failed: {:?}", first.err());
     assert!(second.is_ok(), "second opener failed: {:?}", second.err());
+}
+
+/// `PRELOOP_STORE_URL` selects the control backend when no explicit URL is
+/// given — the documented `preloop engine`/systemd configuration, which has no
+/// `--store` flag at all. Regression: the cutover dropped the env fallback, so
+/// the engine silently ran on local SQLite while `/api/v1/status` still
+/// reported `postgres` (the label path kept reading the env).
+#[tokio::test]
+async fn store_url_env_selects_the_control_backend() {
+    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let env_db = dir.path().join("from-env.db");
+    let _env = crate::state::TestEnvVar::set(
+        crate::store::STORE_URL_ENV,
+        format!("sqlite://{}", env_db.display()),
+    );
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let backend = crate::control::Backend::open(
+        None,
+        &state_dir,
+        false,
+        false,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .expect("env-selected backend must open");
+    assert!(matches!(backend, crate::control::Backend::Sqlite(_)));
+    assert!(
+        env_db.exists(),
+        "PRELOOP_STORE_URL must select the database"
+    );
+    assert!(
+        !state_dir.join("preloop.db").exists(),
+        "the state-dir default must not be opened when the env selects a database"
+    );
+}
+
+/// Explicit URL wins over the environment — the precedence the merge base had.
+#[tokio::test]
+async fn explicit_store_url_wins_over_env() {
+    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let env_db = dir.path().join("from-env.db");
+    let explicit_db = dir.path().join("explicit.db");
+    let _env = crate::state::TestEnvVar::set(
+        crate::store::STORE_URL_ENV,
+        format!("sqlite://{}", env_db.display()),
+    );
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let backend = crate::control::Backend::open(
+        Some(&format!("sqlite://{}", explicit_db.display())),
+        &state_dir,
+        false,
+        false,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(backend, crate::control::Backend::Sqlite(_)));
+    assert!(explicit_db.exists());
+    assert!(!env_db.exists());
+    assert!(!state_dir.join("preloop.db").exists());
+}
+
+/// `Backend::open` must parse store URLs with the same grammar as the status
+/// label: `sqlite:` (single slash) is valid, a whitespace-only value means
+/// "unset", and an unknown scheme is rejected outright rather than becoming a
+/// bogus relative path.
+#[tokio::test]
+async fn store_url_parsing_matches_the_label_path() {
+    // The whitespace case falls back to `PRELOOP_STORE_URL`, so this test has
+    // to serialize with the other env-mutating tests and pin the variable
+    // unset — otherwise a sibling's temp database leaks in and is gone.
+    let _guard = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _env = crate::state::TestEnvVar::unset(crate::store::STORE_URL_ENV);
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+
+    // `sqlite:` single-slash form (the merge base accepted it).
+    let single = dir.path().join("single.db");
+    let backend = crate::control::Backend::open(
+        Some(&format!("sqlite:{}", single.display())),
+        &state_dir,
+        false,
+        false,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .expect("sqlite: single-slash form must be accepted");
+    assert!(matches!(backend, crate::control::Backend::Sqlite(_)));
+    assert!(single.exists());
+
+    // A whitespace-only value is "unset": the state-dir default is opened, and
+    // no database file literally named " " appears in the working directory.
+    let ws_dir = tempfile::tempdir().unwrap();
+    let ws_state = ws_dir.path().join("state");
+    fs::create_dir_all(&ws_state).unwrap();
+    let backend = crate::control::Backend::open(
+        Some("   "),
+        &ws_state,
+        false,
+        false,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(backend, crate::control::Backend::Sqlite(_)));
+    assert!(
+        ws_state.join("preloop.db").exists(),
+        "a whitespace-only URL must fall back to <state_dir>/preloop.db"
+    );
+    assert!(
+        !std::path::Path::new(" ").exists(),
+        "a whitespace-only URL must not create a file named ' '"
+    );
+
+    // Unknown scheme: explicit rejection, not an I/O error on a relative path.
+    let error = match crate::control::Backend::open(
+        Some("mysql://host/db"),
+        &state_dir,
+        false,
+        false,
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    {
+        Ok(_) => panic!("unknown scheme must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("unsupported store URL"),
+        "unexpected error: {error}"
+    );
 }
 
 /// Postgres twin of `store_recovery_preserves_run_secrets`: values survive a
