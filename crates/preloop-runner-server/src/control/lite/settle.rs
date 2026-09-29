@@ -267,7 +267,7 @@ pub(super) fn apply_fail_fast(
         if status == "in_progress"
             && let Some(request_id) = request_id
         {
-            queue_cancellation(tx, request_id)?;
+            queue_cancellation(tx, request_id, Some("fail_fast"))?;
         }
         let job_id = JobId(job_id);
         finish_job_row(tx, run_id, &job_id, ExecutionStatus::Cancelled)?;
@@ -285,14 +285,20 @@ pub(super) fn apply_fail_fast(
 }
 
 /// Queue one `JobCancellation` for an in-flight attempt (deduplicated).
-fn queue_cancellation(tx: &Transaction<'_>, request_id: i64) -> Result<(), ControlError> {
+/// `reason` matches pg's `job_cancellations.reason` (`fail_fast` for a
+/// fail-fast sibling, `None` elsewhere).
+fn queue_cancellation(
+    tx: &Transaction<'_>,
+    request_id: i64,
+    reason: Option<&str>,
+) -> Result<(), ControlError> {
     tx.prepare_cached(
         "INSERT INTO job_cancellations (request_id, reason) \
-         SELECT ?1, 'concurrency_cancelled' WHERE NOT EXISTS ( \
+         SELECT ?1, ?2 WHERE NOT EXISTS ( \
              SELECT 1 FROM job_cancellations WHERE request_id = ?1 AND delivered_at IS NULL)",
     )
     .map_err(db)?
-    .execute([request_id])
+    .execute(params![request_id, reason])
     .map_err(db)?;
     Ok(())
 }
@@ -583,7 +589,7 @@ pub(super) fn cancel_run_inner(
     let mut cancellations = 0;
     for (_, request_id) in &in_flight {
         if let Some(request_id) = request_id {
-            queue_cancellation(tx, *request_id)?;
+            queue_cancellation(tx, *request_id, None)?;
             cancellations += 1;
         }
     }
@@ -672,7 +678,7 @@ pub(super) fn cancel_job_inner(
     if job.status == ExecutionStatus::InProgress
         && let Some(request_id) = live_request
     {
-        queue_cancellation(tx, request_id)?;
+        queue_cancellation(tx, request_id, None)?;
         count = 1;
     }
     // A cancelled node's in-flight expansion lease is stale: bumping the
