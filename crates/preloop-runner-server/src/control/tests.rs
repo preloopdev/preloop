@@ -1460,6 +1460,535 @@ pub(crate) mod suite {
         let record_a = backend.run_record(run_a).await.unwrap();
         assert_eq!(record_a.status, ExecutionStatus::Cancelled);
     }
+
+    /// Strict assignments refuse an unassigned job: the queue-time pairing
+    /// never happened, so no runner may take the job (the `claim_permitted`
+    /// ladder both backends must share). Requires `set_config(false, true, _)`
+    /// from the wrapper.
+    pub(crate) async fn strict_assignments_refuse_an_unassigned_job(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        // Submitted with no idle session: nothing pairs the job.
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Empty),
+            "strict mode: an unassigned job is never dispatched, got {outcome:?}"
+        );
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!(stats.ready, 1, "the job stays queued");
+    }
+
+    /// A fresh pool-pending row blocks every runner until it goes stale or the
+    /// enqueue ceiling passes. Requires `set_config(true, false, _)`.
+    pub(crate) async fn fresh_pool_pending_blocks_claim(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        // No session exists at enqueue: the job is marked pool-pending.
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Empty),
+            "a fresh pool-pending row blocks everyone until the ceiling, got {outcome:?}"
+        );
+    }
+
+    /// A fresh assignment is exclusive to its paired runner: an equally
+    /// labelled runner may not steal it. Requires `set_config(true, false, _)`.
+    pub(crate) async fn fresh_assignment_is_exclusive_to_its_runner(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        // A pool-proven idle runner is paired at enqueue.
+        let mut registration = register_runner("a");
+        registration.pool_proven = true;
+        let runner_a = backend.register_runner(registration).await.unwrap();
+        backend
+            .create_session(create_session(runner_a.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+
+        // A second, equally labelled runner must not take the fresh pairing.
+        let runner_b = backend
+            .register_runner(register_runner("b"))
+            .await
+            .unwrap();
+        let session_b = backend
+            .create_session(create_session(runner_b.runner.id))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Empty),
+            "a fresh assignment is exclusive to its runner, got {outcome:?}"
+        );
+
+        // The paired runner still takes it.
+        let session_a = backend
+            .create_session(create_session(runner_a.runner.id))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session_a.session_id, runner_a.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Claimed(_)),
+            "the paired runner claims its own job, got {outcome:?}"
+        );
+    }
+
+    /// The claim scan must reach a matching job anywhere in the ready queue:
+    /// a 64-row candidate window sorted by pool cannot hide a job a runner can
+    /// serve behind unrelated pools (unbounded cross-pool starvation).
+    pub(crate) async fn claim_scan_finds_a_matching_job_past_the_window(
+        backend: &dyn ControlBackend,
+    ) {
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let zzz = RunnerCapabilities {
+            known: true,
+            labels: vec!["zzz".to_owned()],
+            runner_group_id: None,
+            runner_group_name: None,
+        };
+        let zzz_poll = |session_id: &str| PollRequest {
+            session_id: session_id.to_owned(),
+            verified_runner_id: Some(runner.runner.id),
+            runner: zzz.clone(),
+            busy: false,
+            wait_ms: 0,
+        };
+        let fillers = |run_id: RunId, count: usize, base_request: i64| {
+            (0..count)
+                .map(|i| {
+                    let mut job =
+                        submit_job(run_id, &format!("filler-{i}"), base_request + i as i64);
+                    job.queued.runs_on = vec!["alpha".to_owned()];
+                    job
+                })
+                .collect::<Vec<_>>()
+        };
+        let target = |run_id: RunId, request_id: i64| {
+            let mut job = submit_job(run_id, "target", request_id);
+            job.queued.runs_on = vec!["zzz".to_owned()];
+            job
+        };
+
+        // Control: the matching job sits inside the first candidate window.
+        let small = RunId::new();
+        let mut jobs = fillers(small, 63, 1);
+        jobs.push(target(small, 100));
+        backend.submit_run(submit_run(small, jobs)).await.unwrap();
+        let outcome = backend
+            .poll_session(zzz_poll(&session.session_id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a matching job inside the window must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("target".to_owned()));
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id: small,
+                job_id: JobId("target".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+
+        // The same job, now the 66th ready row: it must still be found.
+        let big = RunId::new();
+        let mut jobs = fillers(big, 65, 200);
+        jobs.push(target(big, 300));
+        backend.submit_run(submit_run(big, jobs)).await.unwrap();
+        let outcome = backend
+            .poll_session(zzz_poll(&session.session_id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a matching job past the 64-row window must be dispatched, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("target".to_owned()));
+        assert_eq!(claimed.queued.run_id, big);
+    }
+
+    /// A settled attempt's deferred token-mint recipe must not outlive its
+    /// job: the completion drops the `github_token_requests` row, so a later
+    /// `acquire_context` no longer sees it.
+    pub(crate) async fn settle_drops_the_deferred_token_request(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_full(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let request_id = claimed.request.request_id;
+        assert!(
+            backend
+                .acquire_context(request_id)
+                .await
+                .unwrap()
+                .token_request
+                .is_some(),
+            "the deferred recipe exists while the job may still run"
+        );
+
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .acquire_context(request_id)
+                .await
+                .unwrap()
+                .token_request
+                .is_none(),
+            "the deferred App-token recipe must not outlive the terminal job"
+        );
+    }
+
+    /// An attempt no runner and no live session owns cannot be settled: the
+    /// ownership ladder ends in `NotFound`, exactly like `renew_broker_request`.
+    pub(crate) async fn settle_refuses_an_unowned_attempt(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let agent = claimed.request.agent_job_id;
+        assert!(
+            backend
+                .release_claimed_request(claimed.request.request_id, "")
+                .await
+                .unwrap(),
+            "the claim is released for redelivery"
+        );
+
+        let outcome = backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id,
+                    job_id: JobId("build".to_owned()),
+                    agent_job_id: Some(agent),
+                    status: ExecutionStatus::Success,
+                    outputs: preloop_gha_protocol::OutputMap::new(),
+                    annotations: Vec::new(),
+                    step_results: Vec::new(),
+                },
+                settle: Some(AttemptSettle {
+                    agent_job_id: agent,
+                    runner_id: runner.runner.id,
+                }),
+            })
+            .await;
+        assert!(
+            matches!(outcome, Err(ControlError::NotFound(_))),
+            "an attempt with no owner and no live session cannot be settled, got {outcome:?}"
+        );
+    }
+
+    /// `settle_job` applies the reported step's runner number to the attempt's
+    /// manifest (`conclusion` + `runner number` per the trait doc).
+    pub(crate) async fn completion_applies_the_reported_step_number(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_full(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let agent = claimed.request.agent_job_id;
+
+        let outcome = backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id,
+                    job_id: JobId("build".to_owned()),
+                    agent_job_id: Some(agent),
+                    status: ExecutionStatus::Success,
+                    outputs: preloop_gha_protocol::OutputMap::new(),
+                    annotations: Vec::new(),
+                    step_results: vec![preloop_gha_protocol::CompletionStepResult {
+                        external_id: Some("step-1".to_owned()),
+                        number: Some(4),
+                        name: None,
+                        status: Some(serde_json::json!("completed")),
+                        conclusion: Some(serde_json::json!("succeeded")),
+                    }],
+                },
+                settle: Some(AttemptSettle {
+                    agent_job_id: agent,
+                    runner_id: runner.runner.id,
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SettleJobOutcome::Settled(_)),
+            "the completion settles the job, got {outcome:?}"
+        );
+        let manifests = backend.run_step_manifests(run_id).await.unwrap();
+        let steps = manifests.get(&agent).expect("manifest for the attempt");
+        let step = steps.iter().find(|s| s.id == "step-1").expect("step-1");
+        assert_eq!(
+            step.runner_number,
+            Some(4),
+            "the reported step's runner number must persist"
+        );
+    }
+
+    /// A settled attempt keeps its final lease expiry: the record reports a
+    /// non-empty `lockedUntil` (`now + lease`), never a dropped lease row.
+    pub(crate) async fn settle_refreshes_the_attempt_lease(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let request_id = claimed.request.request_id;
+        assert!(
+            !backend
+                .request(RequestKey::Id(request_id))
+                .await
+                .unwrap()
+                .locked_until
+                .is_empty(),
+            "a claimed attempt holds a lease"
+        );
+
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !backend
+                .request(RequestKey::Id(request_id))
+                .await
+                .unwrap()
+                .locked_until
+                .is_empty(),
+            "the settled attempt keeps its final lease expiry"
+        );
+    }
+
+    /// A reusable caller's resolved outputs must survive a reload: the fold
+    /// writes them onto the caller's job row (both backends).
+    pub(crate) async fn reusable_caller_outputs_survive_a_reload(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "caller/inner", 1)]);
+        {
+            let mut caller = submit_job(run_id, "caller", 2);
+            caller.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
+                uses: "./.github/workflows/callee.yml".to_owned(),
+                workflow_file: "callee.yml".to_owned(),
+                workflow_sha: None,
+                workflow_repository: None,
+                depth: 1,
+            });
+            submit.jobs.push(caller);
+            // The caller node's own plan (the real submit path keeps one for
+            // every `reusable_call`) — pg keys the node's reusable spec on it.
+            submit.record.caller_plans.insert(
+                JobId("caller".to_owned()),
+                serde_json::from_value(serde_json::json!({
+                    "id": "caller",
+                    "base_id": "caller",
+                    "name": "caller",
+                    "runs_on": ["self-hosted"],
+                }))
+                .expect("a minimal caller plan"),
+            );
+            submit.record.reusable_calls.insert(
+                "caller".to_owned(),
+                preloop_gha_parser::ReusableCallMetadata {
+                    caller_job_id: "caller".to_owned(),
+                    output_definitions: BTreeMap::from([(
+                        "out".to_owned(),
+                        "${{ jobs.inner.outputs.val }}".to_owned(),
+                    )]),
+                    inner_job_ids: vec!["caller/inner".to_owned()],
+                    inputs: BTreeMap::new(),
+                    caller_concurrency: None,
+                    embedded_concurrency: None,
+                    matrix: BTreeMap::new(),
+                    if_condition: None,
+                    workflow_sha: None,
+                    workflow_repository: None,
+                },
+            );
+        }
+        backend.submit_run(submit).await.unwrap();
+
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected the callee job to be claimable, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("caller/inner".to_owned()));
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("caller/inner".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([(
+                    "val".to_owned(),
+                    serde_json::Value::String("hi".to_owned()),
+                )]),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+
+        // A fresh reload: the caller's resolved outputs come from its job row.
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.job_outputs.get(&JobId("caller".to_owned())),
+            Some(&BTreeMap::from([(
+                "out".to_owned(),
+                serde_json::Value::String("hi".to_owned())
+            )])),
+            "the reusable caller's resolved outputs must persist"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────

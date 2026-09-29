@@ -170,8 +170,10 @@ fn pending_cancellation(
 }
 
 /// `claim_one` (pg dispatch.rs): the ready job this runner should take,
-/// chosen by the shared four-tier preference over a bounded candidate
-/// batch (queue order). The conditional UPDATE is the claim fence.
+/// chosen by the shared four-tier preference over the ready queue in
+/// dispatch order. The queue is read in pages until a candidate matches —
+/// a 64-row window must not hide a job a runner can serve. The conditional
+/// UPDATE is the claim fence.
 fn claim_one(
     tx: &Transaction<'_>,
     runner_id: Option<i64>,
@@ -190,57 +192,69 @@ fn claim_one(
     );
     let now = now_us();
     let fresh_after = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
-    let rows: Vec<ReadyRow> = {
-        let mut stmt = tx
-            .prepare_cached(
-                "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
-                 j.enqueued_at, \
-                 a.runner_id, \
-                 (a.run_id IS NOT NULL), \
-                 (a.assigned_at IS NOT NULL AND a.assigned_at > ?1), \
-                 (a.first_assigned_at IS NOT NULL AND a.first_assigned_at > ?1), \
-                 (a.runner_id IS NOT NULL AND EXISTS( \
-                    SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id)), \
-                 p.requested_at \
-                 FROM jobs j \
-                 LEFT JOIN job_assignments a ON a.run_id = j.run_id \
-                    AND a.job_id = j.job_id \
-                 LEFT JOIN provision_requests p ON p.run_id = j.run_id \
-                    AND p.job_id = j.job_id \
-                 WHERE j.queue_state = 'ready' \
-                 ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
-                 LIMIT 64",
-            )
-            .map_err(db)?;
-        let rows = stmt
-            .query_map(params![fresh_after], |row| {
-                let assigned: Option<i64> = row.get(5)?;
-                let assignment_exists: bool = row.get(6)?;
-                let fresh: bool = row.get(7)?;
-                let first_fresh: bool = row.get(8)?;
-                let registered: bool = row.get(9)?;
-                let enqueued: Option<i64> = row.get(4)?;
-                // Raw `p.requested_at`: NULL marks a non-matching LEFT JOIN
-                // (no provision row) — `provision_fresh` is tri-state in Rust.
-                let provision_at: Option<i64> = row.get(10)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
-                    row.get::<_, Option<String>>(3)?,
-                    enqueued.unwrap_or(0),
-                    assignment_exists.then_some((assigned, fresh, first_fresh, registered)),
-                    provision_at,
-                ))
-            })
-            .map_err(db)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(db)?
-    };
     let verified = verified_runner_id.is_some();
-    let mut candidates = Vec::with_capacity(rows.len());
-    for (position, (run, job, runs_on, runner_group, enqueued_at, assignment, provision_at)) in
-        rows.into_iter().enumerate()
-    {
+    let runner_match = logic::RunnerMatchRow {
+        labels: caps.labels.clone(),
+        known: caps.known,
+        group_id: caps.runner_group_id,
+        group_name: caps.runner_group_name.clone(),
+    };
+    // Page the ready queue in dispatch order until a candidate matches or the
+    // ready set is exhausted: a runner whose own pool sorts past the first
+    // batch must still see the jobs it can serve.
+    let mut offset: i64 = 0;
+    loop {
+        let rows: Vec<ReadyRow> = {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
+                     j.enqueued_at, \
+                     a.runner_id, \
+                     (a.run_id IS NOT NULL), \
+                     (a.assigned_at IS NOT NULL AND a.assigned_at > ?1), \
+                     (a.first_assigned_at IS NOT NULL AND a.first_assigned_at > ?1), \
+                     (a.runner_id IS NOT NULL AND EXISTS( \
+                        SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id)), \
+                     p.requested_at \
+                     FROM jobs j \
+                     LEFT JOIN job_assignments a ON a.run_id = j.run_id \
+                        AND a.job_id = j.job_id \
+                     LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                        AND p.job_id = j.job_id \
+                     WHERE j.queue_state = 'ready' \
+                     ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+                     LIMIT 64 OFFSET ?2",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![fresh_after, offset], |row| {
+                    let assigned: Option<i64> = row.get(5)?;
+                    let assignment_exists: bool = row.get(6)?;
+                    let fresh: bool = row.get(7)?;
+                    let first_fresh: bool = row.get(8)?;
+                    let registered: bool = row.get(9)?;
+                    let enqueued: Option<i64> = row.get(4)?;
+                    // Raw `p.requested_at`: NULL marks a non-matching LEFT JOIN
+                    // (no provision row) — `provision_fresh` is tri-state in Rust.
+                    let provision_at: Option<i64> = row.get(10)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
+                        row.get::<_, Option<String>>(3)?,
+                        enqueued.unwrap_or(0),
+                        assignment_exists.then_some((assigned, fresh, first_fresh, registered)),
+                        provision_at,
+                    ))
+                })
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+        };
+        let exhausted = rows.len() < 64;
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (position, (run, job, runs_on, runner_group, enqueued_at, assignment, provision_at)) in
+            rows.into_iter().enumerate()
+        {
         let provision_fresh = provision_at.map(|at| at > fresh_after);
         let (assigned_runner_id, assignment_fresh, first_assigned_fresh, runner_registered) =
             assignment.unwrap_or((None, false, false, false));
@@ -295,43 +309,43 @@ fn claim_one(
             queue_position: position as u64,
             claimable,
         });
+        }
+        // `assigned_to_this_runner` keys off the proven runner id: an
+        // unverified session cannot satisfy an assignment binding even by
+        // name.
+        let Some(index) = logic::claim_preference(
+            &candidates,
+            verified_runner_id,
+            &caps.labels,
+            None,
+            &runner_match,
+        ) else {
+            if exhausted {
+                return Ok(None);
+            }
+            offset += 64;
+            continue;
+        };
+        let chosen = candidates.swap_remove(index);
+        let claimed = tx
+            .prepare_cached(
+                "UPDATE jobs SET queue_state = 'claimed', status = 'in_progress', \
+                 claimed_by_runner_id = ?3, claimed_at = ?4 \
+                 WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
+            )
+            .map_err(db)?
+            .execute(params![
+                codec::run_key(chosen.run_id),
+                chosen.job_id.0,
+                runner_id,
+                now_us()
+            ])
+            .map_err(db)?;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        return Ok(Some((chosen.run_id, chosen.job_id)));
     }
-    let runner_match = logic::RunnerMatchRow {
-        labels: caps.labels.clone(),
-        known: caps.known,
-        group_id: caps.runner_group_id,
-        group_name: caps.runner_group_name.clone(),
-    };
-    // `assigned_to_this_runner` keys off the proven runner id: an unverified
-    // session cannot satisfy an assignment binding even by name.
-    let Some(index) = logic::claim_preference(
-        &candidates,
-        verified_runner_id,
-        &caps.labels,
-        None,
-        &runner_match,
-    ) else {
-        return Ok(None);
-    };
-    let chosen = candidates.swap_remove(index);
-    let claimed = tx
-        .prepare_cached(
-            "UPDATE jobs SET queue_state = 'claimed', status = 'in_progress', \
-             claimed_by_runner_id = ?3, claimed_at = ?4 \
-             WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'ready'",
-        )
-        .map_err(db)?
-        .execute(params![
-            codec::run_key(chosen.run_id),
-            chosen.job_id.0,
-            runner_id,
-            now_us()
-        ])
-        .map_err(db)?;
-    if claimed == 0 {
-        return Ok(None);
-    }
-    Ok(Some((chosen.run_id, chosen.job_id)))
 }
 
 /// `bind_claim` (pg dispatch.rs): bind the claimed attempt — request

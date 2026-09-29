@@ -447,11 +447,11 @@ async fn insert_request_row(
     Ok(request_id)
 }
 
-/// Settle one request whose job is terminal: stamp the verdict, drop the
-/// lease, unbind the session and retire undelivered cancellation messages
-/// for that session (the runner already stopped the work — a queued
-/// `job.cancellation` must not redeliver). Settled requests keep their row
-/// (acquire reads remain routable).
+/// Settle one request whose job is terminal: stamp the verdict, move the
+/// lease expiry to `now + lease`, unbind the session and retire undelivered
+/// cancellation messages for that session (the runner already stopped the
+/// work — a queued `job.cancellation` must not redeliver). Settled requests
+/// keep their row (acquire reads remain routable).
 async fn settle_request_tx(
     tx: &Transaction<'_>,
     request_id: i64,
@@ -473,9 +473,36 @@ async fn settle_request_tx(
     )
     .await
     .map_err(db)?;
-    tx.execute("DELETE FROM job_leases WHERE request_id=$1", &[&request_id])
+    // The settled attempt keeps a lease row carrying its final expiry, so the
+    // record still reports `lockedUntil` (lite's `set_lease`). An attempt with
+    // no recorded owner has none to stamp: `job_leases.runner_id` is NOT NULL.
+    let lease = codec::locked_until_us(&crate::distributed_task::agent_request_locked_until())?;
+    if let Some(expires) = lease {
+        tx.execute(
+            concat!(
+                "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \
+                 SELECT q.request_id, q.runner_id, ",
+                ts!("$2"),
+                ", ",
+                ts!("$3"),
+                " FROM job_requests q \
+                 WHERE q.request_id = $1 AND q.runner_id IS NOT NULL \
+                 ON CONFLICT (request_id) DO UPDATE SET expires_at = EXCLUDED.expires_at, \
+                   renewed_at = EXCLUDED.renewed_at"
+            ),
+            &[&request_id, &expires, &now_us()],
+        )
         .await
         .map_err(db)?;
+    }
+    // The job is terminal, so its deferred App-token request must not
+    // outlive it (lite drops the same row in `settle_request_tx`).
+    tx.execute(
+        "DELETE FROM github_token_requests WHERE request_id=$1",
+        &[&request_id],
+    )
+    .await
+    .map_err(db)?;
     if let Some(session_id) = session {
         // Both the cancelled-but-undelivered marker shape and a delivered
         // JobCancellation must not redeliver for settled work.
@@ -1737,6 +1764,14 @@ async fn resume_held_node(
         serde_json::json!({"job_id": job_id.0, "status": "queued"}),
     )
     .await?;
+    notify_wake(
+        tx,
+        crate::control::wake::Wake {
+            ready: 1,
+            broadcast: false,
+        },
+    )
+    .await?;
     on_job_enqueued(backend, tx, graph, job_id).await?;
     Ok(())
 }
@@ -2027,6 +2062,16 @@ pub(super) async fn enqueue_cancellation_job(
     )
     .await
     .map_err(db)?;
+    // The owning runner must poll to learn about the cancellation: wake every
+    // waiter on every node (a hint; the poll re-reads its own session).
+    notify_wake(
+        tx,
+        crate::control::wake::Wake {
+            ready: 0,
+            broadcast: true,
+        },
+    )
+    .await?;
     Ok(true)
 }
 
@@ -2586,6 +2631,14 @@ impl<'a> Sweep<'a> {
             serde_json::json!({"job_id": job_id.0, "status": "queued"}),
         )
         .await?;
+        notify_wake(
+            self.tx,
+            crate::control::wake::Wake {
+                ready: 1,
+                broadcast: false,
+            },
+        )
+        .await?;
         let graph = self.graphs.get(&run_id).expect("loaded");
         on_job_enqueued(self.backend, self.tx, graph, job_id).await
     }
@@ -3031,6 +3084,24 @@ pub(super) async fn emit_outbox(
     Ok(())
 }
 
+/// Publish a wake hint for work this transaction made available. `pg_notify`
+/// delivers at COMMIT, so every node's `LISTEN` connection
+/// ([`crate::control::wake`]) wakes its long-poll waiters exactly when the
+/// work becomes visible. Waiters on this node are woken by the handler; the
+/// notification is what reaches the others.
+pub(super) async fn notify_wake(
+    tx: &Transaction<'_>,
+    wake: crate::control::wake::Wake,
+) -> Result<(), ControlError> {
+    tx.execute(
+        "SELECT pg_notify($1, $2)",
+        &[&crate::control::wake::CHANNEL, &wake.encode()],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 /// Append one durable event to the transactional outbox (insert-only).
 /// `run_seq` is the run's next sequence; events without a run carry none.
 /// The versioned topic is the event's serde tag (`job_status` ->
@@ -3280,6 +3351,25 @@ fn submit_node(
     (node, message, secret_names)
 }
 
+/// The committed run for this `(delivery, workflow path)` as seen INSIDE a
+/// write transaction: the replay check has to share the inserting
+/// transaction's snapshot so two nodes cannot both pass it.
+async fn delivery_run_in_tx(
+    tx: &Transaction<'_>,
+    delivery_id: &str,
+    workflow_path: &str,
+) -> Result<Option<RunId>, ControlError> {
+    tx.query_opt(
+        "SELECT run_id::text FROM runs WHERE webhook_delivery_id = $1 \
+         AND workflow_path = $2",
+        &[&delivery_id, &workflow_path],
+    )
+    .await
+    .map_err(db)?
+    .map(|row| codec::run_id(&row.get::<_, String>(0)))
+    .transpose()
+}
+
 impl PgBackend {
     /// `submit_run`: one transaction that records the run, its jobs and their
     /// dispatch state, acquires the workflow-level gate, and runs the first
@@ -3303,24 +3393,19 @@ impl PgBackend {
             check_hostable,
         } = submit;
         // A webhook delivery that already produced a run for this workflow
-        // path replays that run instead of duplicating it.
+        // path replays that run instead of duplicating it. The check must see
+        // the inserting transaction's snapshot: a redelivery racing on another
+        // node has to be caught by `runs_delivery`, never as a duplicate-key
+        // failure.
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
         if let Some(delivery_id) = &record.webhook_delivery_id {
-            let existing = self
-                .existing_delivery_run(delivery_id, &record.workflow_path_str)
-                .await?;
+            let existing = delivery_run_in_tx(&tx, delivery_id, &record.workflow_path_str).await?;
             if let Some(existing) = existing {
-                return Ok(SubmitOutcome {
-                    run_id: existing.run_id,
-                    run_number: existing.run_number,
-                    queued_jobs: 0,
-                    status: existing.status,
-                    concluded: Vec::new(),
-                    held: existing.status == ExecutionStatus::Pending,
-                    rejected: None,
-                    queue_depth: self.queue_depth().await?,
-                    next_runs_on: self.ready_front_labels().await?,
-                    existing: Some(Box::new(existing)),
-                });
+                drop(tx);
+                drop(client);
+                let existing = self.run_record(existing).await?;
+                return self.replay_outcome(existing).await;
             }
         }
         // Reject outright on an empty concurrency group (nothing persists).
@@ -3343,8 +3428,6 @@ impl PgBackend {
             });
         }
 
-        let mut client = self.writer().await?;
-        let tx = client.transaction().await.map_err(db)?;
         let now = now_us();
         let run = record.run_id.0.to_string();
         tx.execute(
@@ -3353,23 +3436,38 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
-        tx.execute(
-            concat!(
-                "INSERT INTO runs (run_id, namespace_id, repository, workflow_path, \
-                 run_number, run_attempt, run_name, event, ref, ref_type, head_ref, \
-                 base_ref, head_sha, workflow_ref, status, webhook_delivery_id, origin, \
-                 actor, tree_digest, concurrency_group, concurrency_cancel_in_progress, \
-                 fork_approval_pending, fork_approval_requested_at, \
-                 fork_approval_approved_at, fork_approval_note, \
-                 reports_check_runs, \
-                 created_at, started_at) VALUES ($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9,\
-                 $10,$11,$12,$13,$14,'queued',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,",
-                ts!("$26"),
-                ",",
-                ts!("$27"),
-                ")"
-            ),
-            &[
+        // With a delivery id the insert tolerates the winner of a concurrent
+        // redelivery (it waits for that transaction, then does nothing); the
+        // `runs_delivery` index is the arbiter. Without one, the plain insert
+        // keeps reporting every conflict as an error. The index is partial, so
+        // the inference predicate must repeat it.
+        let conflict = if record.webhook_delivery_id.is_some() {
+            " ON CONFLICT (webhook_delivery_id, workflow_path) \
+              WHERE webhook_delivery_id IS NOT NULL DO NOTHING"
+        } else {
+            ""
+        };
+        let inserted = tx
+            .execute(
+                &format!(
+                    "{}{conflict}",
+                    concat!(
+                        "INSERT INTO runs (run_id, namespace_id, repository, workflow_path, \
+                         run_number, run_attempt, run_name, event, ref, ref_type, head_ref, \
+                         base_ref, head_sha, workflow_ref, status, webhook_delivery_id, origin, \
+                         actor, tree_digest, concurrency_group, concurrency_cancel_in_progress, \
+                         fork_approval_pending, fork_approval_requested_at, \
+                         fork_approval_approved_at, fork_approval_note, \
+                         reports_check_runs, \
+                         created_at, started_at) VALUES ($1::text::uuid,$2,$3,$4,$5,$6,$7,$8,$9,\
+                         $10,$11,$12,$13,$14,'queued',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,",
+                        ts!("$26"),
+                        ",",
+                        ts!("$27"),
+                        ")"
+                    )
+                ),
+                &[
                 &run,
                 &namespace,
                 &record.submission.repository,
@@ -3403,6 +3501,25 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
+        if inserted == 0 {
+            // A concurrent redelivery of the same delivery won: its run is
+            // the answer for this one too.
+            let delivery_id = record
+                .webhook_delivery_id
+                .as_deref()
+                .expect("a conflict is only tolerated for a delivery id");
+            let existing = delivery_run_in_tx(&tx, delivery_id, &record.workflow_path_str)
+                .await?
+                .ok_or_else(|| {
+                    ControlError::backend(anyhow::anyhow!(
+                        "run insert conflicted with no conflicting delivery"
+                    ))
+                })?;
+            drop(tx);
+            drop(client);
+            let existing = self.run_record(existing).await?;
+            return self.replay_outcome(existing).await;
+        }
         // The submission record. Secret values never reach the database
         // (the SecretProvider holds them); clear defensively at the boundary.
         let mut stored_submission = (*record.submission).clone();
@@ -3815,32 +3932,21 @@ impl PgBackend {
         }
     }
 
-    /// A run already produced for this `(webhook delivery, workflow path)` —
-    /// a push delivery legitimately fans out to several workflow files, so the
-    /// match is on the pair, never the delivery alone.
-    pub(super) async fn existing_delivery_run(
-        &self,
-        delivery_id: &str,
-        workflow_path: &str,
-    ) -> Result<Option<RunRecord>, ControlError> {
-        let client = self.reader().await?;
-        let row = client
-            .query_opt(
-                "SELECT run_id::text FROM runs WHERE webhook_delivery_id = $1 \
-                 AND workflow_path = $2 ORDER BY created_at DESC LIMIT 1",
-                &[&delivery_id, &workflow_path],
-            )
-            .await
-            .map_err(db)?;
-        // Never hold one pooled connection while checking out another.
-        drop(client);
-        match row {
-            Some(row) => Ok(Some(
-                self.run_record(codec::run_id(&row.get::<_, String>(0))?)
-                    .await?,
-            )),
-            None => Ok(None),
-        }
+    /// The answer to a redelivered webhook: the run the delivery already
+    /// produced, with no new work queued.
+    async fn replay_outcome(&self, existing: RunRecord) -> Result<SubmitOutcome, ControlError> {
+        Ok(SubmitOutcome {
+            run_id: existing.run_id,
+            run_number: existing.run_number,
+            queued_jobs: 0,
+            status: existing.status,
+            concluded: Vec::new(),
+            held: existing.status == ExecutionStatus::Pending,
+            rejected: None,
+            queue_depth: self.queue_depth().await?,
+            next_runs_on: self.ready_front_labels().await?,
+            existing: Some(Box::new(existing)),
+        })
     }
 }
 
@@ -4006,81 +4112,171 @@ impl PgBackend {
     /// `claim_position`: the ready job this runner should take, using the
     /// shared four-tier preference over the current ready batch.
     ///
-    /// Statements: one read of the ready batch (`LIMIT 64`, assignments
-    /// joined in), then the preferred candidate's claim. The claim locks
-    /// the job row with `FOR UPDATE SKIP LOCKED`: concurrent pollers collapse
-    /// onto the same head candidate, and a row another poller is claiming
-    /// must be skipped at once — a plain conditional `UPDATE` would queue on
-    /// that row until the winner's whole transaction commits, then match
-    /// nothing. No lock is taken on the rest of the batch.
+    /// Statements: a read of the ready batch (`LIMIT 64` in queue order with
+    /// assignments and pool-pending rows joined in), then the preferred
+    /// candidate's claim. The claim locks the job row with `FOR UPDATE SKIP
+    /// LOCKED`: concurrent pollers collapse onto the same head candidate, and
+    /// a row another poller is claiming must be skipped at once — a plain
+    /// conditional `UPDATE` would queue on that row until the winner's whole
+    /// transaction commits, then match nothing. No lock is taken on the rest
+    /// of the batch. The batch is paged until a candidate matches or the
+    /// ready set is exhausted: a runner whose pool sorts past the first batch
+    /// must still see the jobs it can serve.
     async fn claim_one(
         &self,
         tx: &Transaction<'_>,
         runner_id: Option<i64>,
+        verified_runner_id: Option<i64>,
         caps: &RunnerCapabilities,
+        require_assignments: bool,
     ) -> Result<Option<(RunId, JobId)>, ControlError> {
+        let verified = verified_runner_id.is_some();
+        let runner_match = logic::RunnerMatchRow {
+            labels: caps.labels.clone(),
+            known: caps.known,
+            group_id: caps.runner_group_id,
+            group_name: caps.runner_group_name.clone(),
+        };
         for _attempt in 0..CLAIM_ATTEMPTS {
-            // The pool key prunes by label set; the shared matcher still decides.
-            let rows = tx
-                .query(
-                    "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, \
-                            a.runner_id, \
-                            COALESCE(a.assigned_at > now() - interval '120 seconds', false) \
-                     FROM jobs j \
-                     LEFT JOIN job_assignments a ON a.run_id = j.run_id AND a.job_id = j.job_id \
-                     WHERE j.queue_state = 'ready' \
-                     ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
-                     LIMIT 64",
-                    &[],
-                )
-                .await
-                .map_err(db)?;
-            let mut candidates = Vec::with_capacity(rows.len());
-            for (position, row) in rows.iter().enumerate() {
-                candidates.push(logic::ClaimCandidate {
-                    run_id: codec::run_id(&row.get::<_, String>(0))?,
-                    job_id: JobId(row.get::<_, String>(1)),
-                    runs_on: codec::from_json(row.get::<_, String>(2).as_str())?,
-                    runner_group: row.get(3),
-                    assigned_runner_id: row.get(4),
-                    assignment_fresh: row.get(5),
-                    queue_position: position as u64,
-                    claimable: true,
-                });
-            }
-            let runner_match = logic::RunnerMatchRow {
-                labels: caps.labels.clone(),
-                known: caps.known,
-                group_id: caps.runner_group_id,
-                group_name: caps.runner_group_name.clone(),
-            };
-            // Walk the candidates in preference order, claiming the first
-            // whose row lock lands. A skipped (locked) or already-claimed row
-            // advances to the next-eligible candidate.
-            while let Some(index) =
-                logic::claim_preference(&candidates, runner_id, &caps.labels, None, &runner_match)
-            {
-                let chosen = candidates.swap_remove(index);
-                let claimed = tx
-                    .execute(
-                        "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
-                         claimed_by_runner_id = $3, claimed_at = now() \
-                         FROM (SELECT run_id, job_id FROM jobs \
-                               WHERE run_id = $1::text::uuid AND job_id = $2 \
-                                 AND queue_state = 'ready' \
-                               FOR UPDATE SKIP LOCKED) c \
-                         WHERE j.run_id = c.run_id AND j.job_id = c.job_id",
-                        &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
+            let mut offset: i64 = 0;
+            loop {
+                // The pool key prunes by label set; the shared eligibility
+                // ladder and matcher still decide.
+                let rows = tx
+                    .query(
+                        "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, \
+                                a.runner_id, \
+                                COALESCE(a.assigned_at > now() - interval '120 seconds', false), \
+                                COALESCE(a.first_assigned_at > now() - interval '120 seconds', \
+                                         false), \
+                                COALESCE(a.runner_id IS NOT NULL AND EXISTS( \
+                                    SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id), \
+                                    false), \
+                                a.run_id IS NOT NULL, \
+                                (j.enqueued_at IS NOT NULL \
+                                 AND j.enqueued_at <= now() - interval '120 seconds'), \
+                                (p.requested_at > now() - interval '120 seconds') \
+                         FROM jobs j \
+                         LEFT JOIN job_assignments a ON a.run_id = j.run_id \
+                            AND a.job_id = j.job_id \
+                         LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                            AND p.job_id = j.job_id \
+                         WHERE j.queue_state = 'ready' \
+                         ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+                         LIMIT 64 OFFSET $1",
+                        &[&offset],
                     )
                     .await
                     .map_err(db)?;
-                if claimed > 0 {
-                    return Ok(Some((chosen.run_id, chosen.job_id)));
+                let exhausted = rows.len() < 64;
+                let mut candidates = Vec::with_capacity(rows.len());
+                for (position, row) in rows.iter().enumerate() {
+                    let assigned: Option<i64> = row.get(4);
+                    let assignment_fresh: bool = row.get(5);
+                    let first_assigned_fresh: bool = row.get(6);
+                    let registered: bool = row.get(7);
+                    let assignment = row.get::<_, bool>(8).then_some((
+                        assigned,
+                        assignment_fresh,
+                        first_assigned_fresh,
+                        registered,
+                    ));
+                    let enqueue_ceiling_expired: bool = row.get(9);
+                    // A NULL marks a non-matching LEFT JOIN (no provision
+                    // row); `provision_fresh` is tri-state.
+                    let provision_fresh: Option<bool> = row.get(10);
+                    // `claim_permitted` verbatim (lite/poll.rs): assignment
+                    // rows bind verified sessions while fresh, stale/orphaned
+                    // bindings open to any verified caller, a fresh
+                    // pool-pending row blocks everyone, and unassigned jobs
+                    // are only claimable when strict assignments are off.
+                    // The old model swept stale bindings before checking in
+                    // permissive mode — a stale assignment/pool_pending row
+                    // counts as absent there.
+                    let assignment = if !require_assignments && !assignment_fresh {
+                        None
+                    } else {
+                        assignment
+                    };
+                    let provision_fresh = if !require_assignments && provision_fresh == Some(false)
+                    {
+                        None
+                    } else {
+                        provision_fresh
+                    };
+                    let claimable = if assignment.is_some() {
+                        if !first_assigned_fresh || enqueue_ceiling_expired {
+                            verified
+                        } else {
+                            match assigned {
+                                None => verified,
+                                Some(id) => {
+                                    if !registered || !assignment_fresh {
+                                        verified
+                                    } else {
+                                        Some(id) == verified_runner_id
+                                    }
+                                }
+                            }
+                        }
+                    } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
+                        false
+                    } else if provision_fresh.is_some() {
+                        verified
+                    } else {
+                        !require_assignments
+                    };
+                    candidates.push(logic::ClaimCandidate {
+                        run_id: codec::run_id(&row.get::<_, String>(0))?,
+                        job_id: JobId(row.get::<_, String>(1)),
+                        runs_on: codec::from_json(row.get::<_, String>(2).as_str())?,
+                        runner_group: row.get(3),
+                        assigned_runner_id: assigned,
+                        assignment_fresh,
+                        queue_position: position as u64,
+                        claimable,
+                    });
                 }
+                // Walk the candidates in preference order, claiming the first
+                // whose row lock lands. A skipped (locked) or already-claimed
+                // row advances to the next-eligible candidate.
+                let mut raced = false;
+                while let Some(index) = logic::claim_preference(
+                    &candidates,
+                    verified_runner_id,
+                    &caps.labels,
+                    None,
+                    &runner_match,
+                ) {
+                    let chosen = candidates.swap_remove(index);
+                    let claimed = tx
+                        .execute(
+                            "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
+                             claimed_by_runner_id = $3, claimed_at = now() \
+                             FROM (SELECT run_id, job_id FROM jobs \
+                                   WHERE run_id = $1::text::uuid AND job_id = $2 \
+                                     AND queue_state = 'ready' \
+                                   FOR UPDATE SKIP LOCKED) c \
+                             WHERE j.run_id = c.run_id AND j.job_id = c.job_id",
+                            &[&chosen.run_id.0.to_string(), &chosen.job_id.0, &runner_id],
+                        )
+                        .await
+                        .map_err(db)?;
+                    if claimed > 0 {
+                        return Ok(Some((chosen.run_id, chosen.job_id)));
+                    }
+                    raced = true;
+                }
+                if raced {
+                    // A concurrent claim moved rows under us: re-read from the
+                    // head of the queue instead of paging past a shifted set.
+                    break;
+                }
+                if exhausted {
+                    return Ok(None);
+                }
+                offset += 64;
             }
-            // Every candidate in the ready set lost a concurrent claim;
-            // re-read once more before reporting empty.
-            continue;
         }
         Ok(None)
     }
@@ -4284,7 +4480,16 @@ impl PgBackend {
             tx.commit().await.map_err(db)?;
             return Ok(PollOutcome::Empty);
         }
-        let Some((run_id, job_id)) = self.claim_one(&tx, session.runner_id, &poll.runner).await?
+        let (_, require_assignments, _) = self.config();
+        let Some((run_id, job_id)) = self
+            .claim_one(
+                &tx,
+                session.runner_id,
+                session.runner_id,
+                &poll.runner,
+                require_assignments,
+            )
+            .await?
         else {
             tx.commit().await.map_err(db)?;
             return Ok(PollOutcome::Empty);
@@ -4454,16 +4659,39 @@ impl<'a> Sweep<'a> {
             cancelled_siblings = self.fail_fast_siblings(run_id, job_id, &base_id).await?;
         }
         // Reusable callers fold their callee outputs into terminal statuses.
+        let now = self.now;
         let finalized_callers = {
             let graph = self.graphs.get_mut(&run_id).expect("loaded");
             let finalized =
                 crate::reusable_workflows::propagate_reusable_outputs(&mut graph.record);
+            // The fold lands in the record; project it onto the caller nodes
+            // so the flush persists the resolved outputs, the aggregate
+            // status and the queue exit (lite writes the same columns).
             for caller_id in &finalized {
-                self.dirty.insert((run_id, caller_id.clone()));
+                let status = graph
+                    .record
+                    .jobs
+                    .get(caller_id)
+                    .copied()
+                    .unwrap_or(ExecutionStatus::Failure);
+                let outputs = graph
+                    .record
+                    .job_outputs
+                    .get(caller_id)
+                    .map(|outputs| serde_json::to_value(outputs).unwrap_or_default());
+                if let Some(node) = graph.nodes.get_mut(caller_id) {
+                    node.status = status;
+                    node.outputs = outputs;
+                    node.queue_state = logic::QueueState::None;
+                    if node.completed_at_us.is_none() {
+                        node.completed_at_us = Some(now);
+                    }
+                }
             }
             finalized
         };
         for caller_id in &finalized_callers {
+            self.dirty.insert((run_id, caller_id.clone()));
             release_concurrency_for_job(self.backend, self.tx, run_id, caller_id).await?;
         }
         // Run-level stamps: completion metadata + first terminal success.
@@ -4671,20 +4899,16 @@ impl PgBackend {
                     ControlError::NotFound("broker complete request not found".to_owned())
                 })?;
             let owner = Self::request_owner_on(&tx, request_id).await?;
-            match owner {
-                Some((Some(owner), _, _)) if owner != settle_attempt.runner_id => {
-                    return Err(ControlError::Forbidden(
-                        "broker request belongs to another runner".to_owned(),
-                    ));
-                }
-                Some((None, Some(session_runner), _))
-                    if session_runner != settle_attempt.runner_id =>
-                {
-                    return Err(ControlError::Forbidden(
-                        "broker request belongs to another runner".to_owned(),
-                    ));
-                }
-                _ => {}
+            // The same ladder `renew_broker_request` uses: an attempt with
+            // neither a recorded owner nor a live session is unknown to the
+            // broker path (`NotFound`), never free for anyone to settle.
+            if let Some((owner, session_runner, has_session)) = owner {
+                crate::control::types::ensure_request_owner(
+                    owner,
+                    session_runner,
+                    has_session,
+                    settle_attempt.runner_id,
+                )?;
             }
             attempt = Some(request_id);
         }
@@ -4724,7 +4948,8 @@ impl PgBackend {
                     let agent = comp.agent_job_id.ok_or_else(|| {
                         ControlError::NotFound("settle_job without agent job id".to_owned())
                     })?;
-                    self.patch_step_conclusion(&tx, agent, external_id, &conclusion)
+                    let number = wire.number.and_then(|number| i32::try_from(number).ok());
+                    self.patch_step_conclusion(&tx, agent, external_id, &conclusion, number)
                         .await?;
                 }
             }
@@ -4789,14 +5014,23 @@ impl PgBackend {
         agent_job_id: uuid::Uuid,
         step_id: &str,
         conclusion: &str,
+        runner_number: Option<i32>,
     ) -> Result<(), ControlError> {
         tx.execute(
             concat!(
-                "UPDATE job_steps SET conclusion = $3, finished_at = COALESCE(finished_at, ",
+                "UPDATE job_steps SET conclusion = $3, \
+                 runner_number = COALESCE($5::int4, runner_number), \
+                 finished_at = COALESCE(finished_at, ",
                 ts!("$4"),
                 ") WHERE agent_job_id = $1::text::uuid AND step_id = $2"
             ),
-            &[&agent_job_id.to_string(), &step_id, &conclusion, &now_us()],
+            &[
+                &agent_job_id.to_string(),
+                &step_id,
+                &conclusion,
+                &now_us(),
+                &runner_number,
+            ],
         )
         .await
         .map_err(db)?;
@@ -4898,7 +5132,17 @@ impl PgBackend {
                 runner_group_name: None,
             },
         };
-        let Some((run_id, job_id)) = self.claim_one(&tx, session.runner_id, &caps).await? else {
+        let (_, require_assignments, _) = self.config();
+        let Some((run_id, job_id)) = self
+            .claim_one(
+                &tx,
+                session.runner_id,
+                poll.verified_runner_id,
+                &caps,
+                require_assignments,
+            )
+            .await?
+        else {
             tx.commit().await.map_err(db)?;
             return Ok(AzdoPollOutcome::Wait);
         };
