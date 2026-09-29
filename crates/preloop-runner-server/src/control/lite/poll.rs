@@ -553,7 +553,9 @@ impl LiteBackend {
             let Some((run_id, job_id)) = claim_one(
                 tx,
                 session.runner_id,
-                session.runner_id,
+                // Only a token-verified identity may satisfy a binding: the
+                // session's self-declared id is not proof (see the azdo twin).
+                poll.verified_runner_id,
                 &poll.runner,
                 require_assignments,
             )?
