@@ -1670,38 +1670,91 @@ async fn job_under_max_parallel(
     Ok(active < limit as i64)
 }
 
-/// A run-waiter promoted: its held jobs resume through the normal path.
+/// A run-waiter promoted: the jobs it parked behind its own workflow gate go
+/// back to `blocked` and the normal promotion sweep decides what may run
+/// (needs, job-level gates, max-parallel) — mirroring lite's
+/// `held_jobs_of_run` → `promote_run`.
 async fn resume_held_run(
     backend: &PgBackend,
     tx: &Transaction<'_>,
     run_id: RunId,
 ) -> Result<(), ControlError> {
-    let mut graph = match backend.load_graph(tx, run_id).await? {
-        Some(graph) => graph,
+    let Some(graph) = backend.load_graph(tx, run_id).await? else {
         // Foreign run not loadable in this transaction's scope → leave the
         // wait consumed; the run's own commands re-park if still needed
         // (matches the old "foreign run stays parked" behavior).
-        None => return Ok(()),
+        return Ok(());
     };
-    let now = now_us();
-    let mut promoted = Vec::new();
-    for (job_id, node) in graph.nodes.iter_mut() {
-        if node.queue_state == logic::QueueState::Held && node.status == ExecutionStatus::Pending {
-            promoted.push(job_id.clone());
+    // Only the jobs parked behind this run's workflow gate: a job with its
+    // own wait row stays with that gate.
+    let parked = held_jobs_of_run(tx, run_id).await?;
+    let mut sweep = Sweep::new(backend, tx).await?;
+    sweep.graphs.insert(run_id, graph);
+    let now = sweep.now;
+    let jobs_status = sweep
+        .graphs
+        .get(&run_id)
+        .expect("inserted")
+        .record
+        .jobs
+        .clone();
+    {
+        let Sweep {
+            graphs, dirty, ..
+        } = &mut sweep;
+        let graph = graphs.get_mut(&run_id).expect("inserted");
+        for job_id in &parked {
+            let Some(node) = graph.nodes.get_mut(job_id) else {
+                continue;
+            };
+            // Recount from the graph: submit skipped the retiming pass for a
+            // held run, so a need that was already terminal at submit would
+            // otherwise keep the node out of the sweep forever.
+            let unsettled = node
+                .needs
+                .iter()
+                .filter(|need| jobs_status.get(*need).is_none_or(|status| !status.is_terminal()))
+                .count() as i32;
+            node.remaining_needs = unsettled;
+            if unsettled == 0 {
+                node.deps_ready_at_us = Some(now);
+            }
+            node.queue_state = logic::QueueState::Blocked;
+            dirty.insert((run_id, job_id.clone()));
         }
+        graph.resummarize();
     }
-    for job_id in promoted {
-        resume_held_node(backend, tx, &mut graph, &job_id, now).await?;
-    }
-    if graph.record.status == ExecutionStatus::Pending {
-        graph.record.status = ExecutionStatus::InProgress;
-    }
-    graph.resummarize();
-    flush_run(tx, &graph).await?;
-    for (job_id, node) in &graph.nodes {
-        flush_node(tx, run_id, job_id, node).await?;
-    }
+    sweep.sweep().await?;
+    sweep.flush().await?;
     Ok(())
+}
+
+/// The jobs a run parked behind its own workflow gate (no per-job wait row
+/// of their own), in `job_order`.
+async fn held_jobs_of_run(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+) -> Result<Vec<JobId>, ControlError> {
+    Ok(tx
+        .query(
+            "SELECT j.job_id FROM jobs j WHERE j.run_id=$1::text::uuid \
+             AND j.queue_state='held' AND j.status='pending' \
+             AND NOT EXISTS (SELECT 1 FROM concurrency_waits w \
+                   WHERE w.holder_run_id = j.run_id \
+                     AND (w.holder_kind = 'run' \
+                          OR (w.holder_kind = 'job' AND w.holder_job_id = j.job_id) \
+                          OR (w.holder_kind = 'jobset' AND EXISTS ( \
+                              SELECT 1 FROM jobsets s \
+                              WHERE s.jobset_id = w.holder_jobset_id \
+                                AND s.job_ids ? j.job_id)))) \
+             ORDER BY j.job_order",
+            &[&run_id.0.to_string()],
+        )
+        .await
+        .map_err(db)?
+        .iter()
+        .map(|row| JobId(row.get::<_, String>(0)))
+        .collect())
 }
 
 /// A job-waiter promoted: hydrate, stamp, enqueue.
