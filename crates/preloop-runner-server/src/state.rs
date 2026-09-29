@@ -1169,6 +1169,21 @@ impl AppState {
             &key_fingerprint(&local_jwt_key),
         )
         .await?;
+        // A shared control database with a node-local secret provider means a
+        // runner on another node cannot resolve this node's run tiers: it
+        // would either fail the acquire (loudly, since the names are recorded)
+        // or, for config tiers, miss values entirely. Multi-node deployments
+        // must plug in a shared provider.
+        if matches!(&*backend, crate::control::Backend::Postgres(_))
+            && secret_provider.name() == "builtin"
+        {
+            tracing::warn!(
+                provider = secret_provider.name(),
+                "Postgres control backend with the node-local builtin secret provider: \
+                 secret values live on this node only; configure a shared SecretProvider \
+                 before running more than one node"
+            );
+        }
         let message_notify = Arc::new(Notify::new());
         // Cross-node wake-ups (Postgres LISTEN): a job committed through any
         // node wakes runners long-polling this one.

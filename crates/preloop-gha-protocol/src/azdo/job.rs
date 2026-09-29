@@ -261,6 +261,11 @@ pub struct AgentJobRequestMessage {
 ///   `secrets: inherit`).
 /// - `map`: reusable-call `secrets:` mapping — callee name -> caller-side
 ///   expression string, evaluated at fill time.
+/// - `run_names`: the non-secret names the submission supplied for the run
+///   tier. Values live only in the SecretProvider; the names are recorded so
+///   the fill can tell "this run declared no submission secrets" from "the
+///   run tier can no longer be resolved", which must fail loudly instead of
+///   delivering empty `secrets.*` values.
 ///
 /// The spec is a server-internal carrier: it is removed from the message
 /// before the payload is serialized onto the wire (the runner derives its
@@ -276,12 +281,19 @@ pub struct MessageSecretSpec {
     pub inherit: bool,
     /// Reusable call `secrets:` map — callee name -> caller expression.
     pub map: std::collections::BTreeMap<String, String>,
+    /// Names the submission supplied for the run tier (values are never
+    /// persisted). Every name must resolve at fill time.
+    pub run_names: std::collections::BTreeSet<String>,
 }
 
 impl MessageSecretSpec {
     /// True when the spec carries no secret surface at all.
     pub fn is_empty(&self) -> bool {
-        !self.inherit && self.names.is_empty() && self.map.is_empty() && self.environment.is_none()
+        !self.inherit
+            && self.names.is_empty()
+            && self.map.is_empty()
+            && self.run_names.is_empty()
+            && self.environment.is_none()
     }
 }
 

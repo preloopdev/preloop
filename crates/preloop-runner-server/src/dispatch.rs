@@ -503,6 +503,7 @@ fn submission_from_effective(
         local_workspace: None,
         vars: BTreeMap::new(),
         secrets: BTreeMap::new(),
+        run_secret_names: std::collections::BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
         reusable_workflow_shas: BTreeMap::new(),
         enable_debugger: false,

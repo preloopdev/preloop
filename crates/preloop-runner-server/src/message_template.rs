@@ -41,18 +41,24 @@ pub(crate) struct FillOutcome {
 
 /// Build the [`MessageSecretSpec`] for a job at submit.
 ///
-/// `names` is the caller-scope name set. Reusable callees never come through
-/// here carrying a name set — their surface is `inherit`/`map` on `job`.
-pub(crate) fn secret_spec_for(job: &JobPlan, names: &BTreeSet<String>) -> MessageSecretSpec {
+/// `names` is the caller-scope name set; `run_names` is the submission's
+/// run-tier name set (non-secret, recorded for every job of the run).
+pub(crate) fn secret_spec_for(
+    job: &JobPlan,
+    names: &BTreeSet<String>,
+    run_names: &BTreeSet<String>,
+) -> MessageSecretSpec {
+    let callee = job.workflow_file.is_some();
     MessageSecretSpec {
         names: names.clone(),
         environment: job.oidc_environment.clone(),
-        inherit: job.workflow_file.is_some() && job.secrets_inherit,
-        map: if job.workflow_file.is_some() && !job.secrets_inherit {
+        inherit: callee && job.secrets_inherit,
+        map: if callee && !job.secrets_inherit {
             job.secrets_map.clone()
         } else {
             BTreeMap::new()
         },
+        run_names: run_names.clone(),
     }
 }
 
@@ -127,6 +133,28 @@ pub(crate) fn fill_template(
         run_id: Some(run_id),
     })?;
     let scoped: BTreeMap<String, String> = preloop_gha_protocol::masking::expose_all(&scoped);
+
+    // Every submission-supplied name must resolve from the run tier. A
+    // missing tier (a node that never saw the submission, a lost or pruned
+    // file) must fail loudly here — otherwise the job would silently run
+    // with empty `secrets.*` values. Checked against the run tier alone:
+    // the merged scope could otherwise mask the gap with a coarser tier's
+    // value of the same name.
+    if !spec.run_names.is_empty() {
+        let run_tier = provider.run_tier(run_id)?;
+        let missing: Vec<&str> = spec
+            .run_names
+            .iter()
+            .filter(|name| !run_tier.contains_key(*name))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "run {run_id} declared submission secrets that cannot be resolved: {}",
+                missing.join(", ")
+            );
+        }
+    }
 
     let mut resolved: BTreeMap<String, String> = if spec.inherit {
         // `secrets: inherit`: every name in scope.
@@ -271,4 +299,69 @@ fn env_expr_ctx(
 /// shipping the template raw.
 fn resolve_token_expr(expr: &str, ctx: &preloop_gha_expressions::Context) -> String {
     preloop_gha_parser::eval::resolve_string(&format!("${{{{ {expr} }}}}"), ctx).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secret_provider::BuiltinSecretProvider;
+    use preloop_gha_protocol::azdo::AgentJobRequestMessage;
+    use preloop_gha_protocol::{RunId, SecretString};
+
+    fn provider(dir: &std::path::Path) -> BuiltinSecretProvider {
+        BuiltinSecretProvider::new(
+            std::sync::Arc::new(parking_lot::RwLock::new(crate::state::SecretStore::default())),
+            dir.join("run-secrets"),
+            crate::store::Envelope::new(b"test-cluster-key"),
+        )
+    }
+
+    /// A stored template that records `names` as both the scope names and the
+    /// run-tier names, the way `secret_spec_for` does at submit.
+    fn template(names: &[&str]) -> AgentJobRequestMessage {
+        let names: Vec<&str> = names.to_vec();
+        serde_json::from_value(serde_json::json!({
+            "jobId": "00000000-0000-0000-0000-000000000000",
+            "requestId": 1,
+            "plan": {
+                "planId": "plan",
+                "planType": "actions",
+                "version": 0,
+                "artifactUri": "",
+                "artifactLocation": ""
+            },
+            "timeline": {"id": "00000000-0000-0000-0000-000000000000", "changeId": 0},
+            "jobName": "__job",
+            "lockedUntil": "0001-01-01T00:00:00",
+            "resources": {"endpoints": []},
+            "preloopSecretSpec": {"names": names, "runNames": names}
+        }))
+        .expect("template decodes")
+    }
+
+    #[test]
+    fn unresolvable_run_tier_is_an_error_not_an_empty_secret() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        provider(dir_a.path())
+            .put_run(
+                run_id,
+                &BTreeMap::from([("TOKEN".to_owned(), SecretString::new("s3cr3t"))]),
+            )
+            .unwrap();
+
+        // A node that never saw the submission (different run-secrets dir,
+        // same cluster key) cannot resolve the run tier. The fill must fail
+        // loudly instead of delivering an empty `secrets.TOKEN`.
+        let mut other_node = template(&["TOKEN"]);
+        let error = fill_template(&mut other_node, &provider(dir_b.path()), "o/r", run_id)
+            .expect_err("an unresolvable run tier must be an error");
+        assert!(error.to_string().contains("TOKEN"), "{error}");
+
+        // The node that owns the tier fills the real value.
+        let mut owner = template(&["TOKEN"]);
+        let filled = fill_template(&mut owner, &provider(dir_a.path()), "o/r", run_id).unwrap();
+        assert_eq!(filled.values.get("TOKEN").map(String::as_str), Some("s3cr3t"));
+    }
 }

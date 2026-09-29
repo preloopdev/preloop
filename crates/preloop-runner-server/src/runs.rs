@@ -795,6 +795,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     } else {
         Default::default()
     };
+    // The run-tier values are non-secret references once stored: record the
+    // names on the submission (they persist with the run, unlike the values)
+    // so a re-run can tell "no secrets were supplied" apart from "the tier is
+    // gone", and so every job template can name what the fill must resolve.
+    submission.run_secret_names = provided_secrets.keys().cloned().collect();
     let secrets_ms = t_parse.elapsed().as_secs_f64() * 1000.0 - remote_ms;
     let (branch, tag) = {
         let (default_branch, default_tag) = git_ref_context(&submission.git_ref);
@@ -2578,7 +2583,11 @@ pub(crate) fn build_job_artifacts(
     // token so the template records WHERE it goes, not its value). The spec
     // rides inside the template so the fill path is self-contained.
     agent_msg.preloop_secret_spec = if policy.allows_secrets {
-        Some(crate::message_template::secret_spec_for(job, &merged_names))
+        Some(crate::message_template::secret_spec_for(
+            job,
+            &merged_names,
+            &submission.run_secret_names,
+        ))
     } else {
         // A secrets-denied job still carries an explicit (empty) spec so the
         // fill path injects only tokens — never treated as a legacy
@@ -3434,7 +3443,7 @@ pub async fn rerun_run_inner(
         .map(|run| (*run.submission).clone())
         .map_err(ApiError::from)?;
     // A re-run sees the values the original submission supplied; they live
-    // in the provider's run tier until the original run is archived.
+    // in the provider's run tier while the run's history survives.
     submission.secrets = shared
         .state
         .secret_provider

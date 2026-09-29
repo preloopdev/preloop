@@ -238,6 +238,13 @@ pub struct WorkflowSubmission {
     /// persists them with the run.
     #[serde(default)]
     pub secrets: SecretMap,
+    /// Names of the run-tier secrets the submission supplied, recorded by the
+    /// server at submit. Values live only in the SecretProvider's run tier;
+    /// this is the non-secret reference list a re-run uses to tell "the
+    /// submission declared no secrets" from "the run tier can no longer be
+    /// resolved", which must fail loudly rather than run without secrets.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub run_secret_names: BTreeSet<String>,
     /// Local reusable workflow YAML keyed by repository-relative path.
     #[serde(default)]
     pub reusable_workflows: BTreeMap<String, String>,

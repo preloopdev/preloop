@@ -9,8 +9,8 @@
 //! Secret values never enter the control database. Jobs carry secret names;
 //! values are resolved here when a runner acquires the job. Values a caller
 //! supplies with a submission (`preloop --secret`) are written to the run
-//! tier ([`SecretProvider::put_run`]) at submit and dropped when the run is
-//! archived.
+//! tier ([`SecretProvider::put_run`]) at submit and live as long as the run's
+//! history, so a re-run re-resolves them.
 
 use crate::state::SecretStore;
 use crate::store::Envelope;
@@ -169,7 +169,8 @@ impl SecretProvider for BuiltinSecretProvider {
 }
 
 /// One sealed JSON map per run, cached in memory after first read. A missing
-/// file is an empty tier.
+/// file is an empty tier (and is deliberately not cached: a run tier may
+/// appear after another node's `put_run`).
 struct RunTierFiles {
     dir: PathBuf,
     cipher: Envelope,
@@ -186,8 +187,18 @@ impl RunTierFiles {
         std::fs::create_dir_all(&self.dir)?;
         let path = self.path(run_id);
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, sealed)?;
+        // Durable before the run commits: any node may acquire the run's jobs
+        // at any later time, so the write must survive a crash between here
+        // and the commit. fsync the file, then the directory that carries the
+        // rename.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&sealed)?;
+            file.sync_all()?;
+        }
         std::fs::rename(&tmp, &path)?;
+        std::fs::File::open(&self.dir)?.sync_all()?;
         self.cache.write().insert(run_id, Arc::new(values));
         Ok(())
     }
@@ -198,7 +209,13 @@ impl RunTierFiles {
         }
         let values = match std::fs::read(self.path(run_id)) {
             Ok(sealed) => serde_json::from_slice(&self.cipher.unseal(&sealed)?)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            // A missing file is an empty tier, but it must not be cached as
+            // one: another node may still be writing this run's tier, and a
+            // cached empty value would hide the later write for the life of
+            // the process (the whole point of `put_run`'s durability).
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Arc::new(BTreeMap::new()))
+            }
             Err(error) => return Err(error.into()),
         };
         let values = Arc::new(values);
@@ -242,7 +259,8 @@ mod tests {
     }
 
     fn get(values: &BTreeMap<String, SecretString>, name: &str) -> Option<String> {
-        values.get(name).map(|value| value.expose().to_owned())
+        let value = values.get(name)?;
+        Some(value.expose().to_owned())
     }
 
     fn scope<'a>(
