@@ -558,15 +558,34 @@ fn read_engine_token_file(path: &Path) -> Result<Option<String>> {
 }
 
 fn write_engine_token_file(path: &Path, token: &str) -> Result<()> {
+    write_private_file(path, token)
+}
+
+fn remove_engine_token_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// Write `contents` to `path` so the value is never observable in a
+/// non-private file, and never written through a pre-existing file.
+///
+/// A fresh temp file is created `0600` (ignoring the process umask), synced,
+/// then renamed over the target: the target either does not exist or is the
+/// fully written private file, and a handle opened on an older version keeps
+/// reading that older version instead of the new secret.
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write as _;
 
-    let parent = path
-        .parent()
-        .context("engine token file has no parent directory")?;
-    let temporary = parent.join(format!(
-        ".{ENGINE_TOKEN_FILE}.{:016x}.tmp",
-        rand::random::<u64>()
-    ));
+    let parent = path.parent().context("file has no parent directory")?;
+    let file_name = path
+        .file_name()
+        .context("file has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    let temporary = parent.join(format!(".{file_name}.{:016x}.tmp", rand::random::<u64>()));
     let write_result = (|| -> Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.create_new(true).write(true);
@@ -579,7 +598,7 @@ fn write_engine_token_file(path: &Path, token: &str) -> Result<()> {
             .open(&temporary)
             .with_context(|| format!("create {}", temporary.display()))?;
         set_private_file_permissions(&temporary)?;
-        file.write_all(token.as_bytes())
+        file.write_all(contents.as_bytes())
             .with_context(|| format!("write {}", temporary.display()))?;
         file.sync_all()
             .with_context(|| format!("sync {}", temporary.display()))?;
@@ -587,7 +606,8 @@ fn write_engine_token_file(path: &Path, token: &str) -> Result<()> {
         if path.exists() {
             std::fs::remove_file(path).with_context(|| format!("replace {}", path.display()))?;
         }
-        std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("replace {}", path.display()))?;
         set_private_file_permissions(path)?;
         Ok(())
     })();
@@ -597,12 +617,22 @@ fn write_engine_token_file(path: &Path, token: &str) -> Result<()> {
     write_result
 }
 
-fn remove_engine_token_file(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+/// Create `dir` private from the start. `DirBuilder::mode` covers the
+/// directories it creates (a fresh directory is never briefly readable to
+/// other users); the explicit chmod still tightens a directory that already
+/// existed with a looser mode.
+fn create_private_directory(dir: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
     }
+    builder
+        .create(dir)
+        .with_context(|| format!("create credential dir {}", dir.display()))?;
+    set_private_directory_permissions(dir)
 }
 
 #[cfg(unix)]
@@ -718,14 +748,10 @@ impl CredentialStore for FileCredentialStore {
         if value.expose().is_empty() {
             anyhow::bail!("refusing to store an empty credential");
         }
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("create credential dir {}", self.dir.display()))?;
-        set_private_directory_permissions(&self.dir)?;
+        create_private_directory(&self.dir)?;
         let path = self.path_for(reference);
-        std::fs::write(&path, value.expose())
-            .with_context(|| format!("write credential file {}", path.display()))?;
-        set_private_file_permissions(&path)?;
-        Ok(())
+        write_private_file(&path, value.expose())
+            .with_context(|| format!("write credential file {}", path.display()))
     }
 
     fn delete(&self, reference: &CredentialRef) -> Result<()> {
@@ -1118,5 +1144,51 @@ mod tests {
         // this is the property that lets a rebuilt binary skip the keychain.
         let reopened = FileCredentialStore::new(&cred_dir);
         assert_eq!(reopened.get(&reference).unwrap().unwrap().expose(), "tok");
+    }
+
+    /// R2b-4. The file store must never write a secret through an existing
+    /// (possibly world-readable) file handle: the mode-based protection
+    /// cannot close the window between creating the file and tightening its
+    /// permissions, so a writer has to create privately and rename. A reader
+    /// that won that race holds a handle on the old file and must not see a
+    /// later rotation.
+    #[cfg(unix)]
+    #[test]
+    fn file_store_creates_private_and_never_writes_through_and_handle() {
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(dir.path().join("credentials"));
+        let reference = CredentialRef::new("webhook-secret").unwrap();
+        store.set(&reference, &SecretString::new("first")).unwrap();
+        let path = store.path_for(&reference);
+
+        // Stand in for the reader that opened the file before any chmod ran.
+        let mut raced = std::fs::File::open(&path).unwrap();
+
+        store.set(&reference, &SecretString::new("rotated")).unwrap();
+        assert_eq!(store.get(&reference).unwrap().unwrap().expose(), "rotated");
+
+        let mut seen = String::new();
+        raced.read_to_string(&mut seen).unwrap();
+        assert_eq!(
+            seen, "first",
+            "the rotated secret must not be visible through a handle opened before it was written"
+        );
+
+        // The replacement is private from creation, not after a chmod.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(store.dir.clone())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }
