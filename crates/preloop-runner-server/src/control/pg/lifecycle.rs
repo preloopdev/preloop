@@ -1038,28 +1038,64 @@ impl PgBackend {
 
     // ── Small reads/writes ───────────────────────────────────────────
 
-    /// `issue_debug_token`: one token per attempt (monotonic flag flip),
-    /// returning `(run_id, job_id)` for the minted credential's subject.
+    /// `issue_debug_token`: the trait doc's gates in one transaction —
+    /// `NotFound` when no in-flight request owns the attempt, `Forbidden`
+    /// when the run did not opt into pause-on-failure, `Conflict` on a
+    /// second issue. Returns `(run_id, plan_id)`; the plan id is the
+    /// attempt's `agent_job_id`.
     pub(super) async fn issue_debug_token(
         &self,
         agent_job_id: uuid::Uuid,
     ) -> Result<(RunId, String), ControlError> {
-        let client = self.writer().await?;
-        let row = client
+        let agent = agent_job_id.to_string();
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let row = tx
             .query_opt(
-                "UPDATE job_requests SET debug_token_issued=true \
-                 WHERE agent_job_id=$1::text::uuid AND NOT debug_token_issued \
-                 RETURNING run_id::text, job_id",
-                &[&agent_job_id.to_string()],
+                "SELECT q.request_id, q.run_id::text, q.debug_token_issued, \
+                 coalesce(s.submission->>'preserve_on_failure', 'false') = 'true' \
+                 FROM job_requests q \
+                 LEFT JOIN run_submissions s ON s.run_id = q.run_id \
+                 WHERE q.agent_job_id = $1::text::uuid AND q.result IS NULL \
+                 FOR UPDATE OF q",
+                &[&agent],
             )
             .await
             .map_err(db)?;
         let Some(row) = row else {
-            return Err(ControlError::Forbidden(
-                "debug token already issued or unknown attempt".to_owned(),
-            ));
+            return Err(ControlError::NotFound(format!(
+                "no active job request for agent job {agent}"
+            )));
         };
-        Ok((codec::run_id(row.get(0))?, row.get(1)))
+        let request_id: i64 = row.get(0);
+        let run_id = codec::run_id(row.get(1))?;
+        let issued: bool = row.get(2);
+        if !row.get::<_, bool>(3) {
+            return Err(ControlError::Forbidden(
+                "this run did not enable pause-on-failure".to_owned(),
+            ));
+        }
+        if issued {
+            return Err(ControlError::Conflict(format!(
+                "debug-worker token already issued for agent job {agent}"
+            )));
+        }
+        // Conditional flip: two racing issuers cannot both succeed.
+        let flipped = tx
+            .execute(
+                "UPDATE job_requests SET debug_token_issued = true \
+                 WHERE request_id = $1 AND debug_token_issued = false",
+                &[&request_id],
+            )
+            .await
+            .map_err(db)?;
+        if flipped == 0 {
+            return Err(ControlError::Conflict(format!(
+                "debug-worker token already issued for agent job {agent}"
+            )));
+        }
+        tx.commit().await.map_err(db)?;
+        Ok((run_id, agent))
     }
 
     /// `oidc_grant`: the attempt's run + job's recorded grant/context.
