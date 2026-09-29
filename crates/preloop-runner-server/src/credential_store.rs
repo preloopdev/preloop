@@ -606,8 +606,7 @@ fn write_private_file(path: &Path, contents: &str) -> Result<()> {
         if path.exists() {
             std::fs::remove_file(path).with_context(|| format!("replace {}", path.display()))?;
         }
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("replace {}", path.display()))?;
+        std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
         set_private_file_permissions(path)?;
         Ok(())
     })();
@@ -1167,7 +1166,9 @@ mod tests {
         // Stand in for the reader that opened the file before any chmod ran.
         let mut raced = std::fs::File::open(&path).unwrap();
 
-        store.set(&reference, &SecretString::new("rotated")).unwrap();
+        store
+            .set(&reference, &SecretString::new("rotated"))
+            .unwrap();
         assert_eq!(store.get(&reference).unwrap().unwrap().expose(), "rotated");
 
         let mut seen = String::new();
