@@ -309,6 +309,16 @@ CREATE TABLE timeline_records (
     record                  TEXT NOT NULL,
     PRIMARY KEY (timeline_id, record_id)
 );
+-- The timeline goes with the last request that referenced it: the FK pg
+-- declares (a timeline belongs to one attempt) cannot be expressed on a
+-- shared column, and the run archive deletes `job_requests` rows through
+-- several cascade levels, so no Rust-side delete can cover every path.
+CREATE TRIGGER job_requests_timeline_cascade
+AFTER DELETE ON job_requests
+WHEN NOT EXISTS (SELECT 1 FROM job_requests WHERE timeline_id = OLD.timeline_id)
+BEGIN
+    DELETE FROM timelines WHERE timeline_id = OLD.timeline_id;
+END;
 
 -- Contract addition (decision round 1, Q3): per-plan log ids. `log_key` is
 -- '{plan_id}/{log_id}'; UNIQUE (plan_id, log_id) arbitrates allocation.

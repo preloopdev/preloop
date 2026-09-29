@@ -1174,6 +1174,75 @@ pub(crate) mod suite {
         assert!(!b.status.is_terminal(), "the held run must stay live");
     }
 
+    /// A parked cancellation is redelivered with its stored protocol body
+    /// (`{"jobId":..}`), never as the bare request id: `request_id` addresses
+    /// only the job assignment. A runner that polls again before it reports
+    /// the cancelled job must not be handed a body it can only ignore.
+    pub(crate) async fn redelivered_cancellation_keeps_its_body(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(c) => c,
+            other => panic!("expected claim, got {other:?}"),
+        };
+        backend.cancel_run(run_id, None).await.unwrap();
+
+        // The protocol body: `{"jobId": .., "timeout": ..}`. Compare parsed
+        // JSON — PostgreSQL stores the body as `jsonb` and normalizes its
+        // text on the way out.
+        let expected: serde_json::Value =
+            serde_json::from_str(&crate::concurrency::job_cancel_body(
+                claimed.request.agent_job_id,
+            ))
+            .unwrap();
+        let body_of = |message: &preloop_gha_protocol::azdo::TaskAgentMessage| {
+            serde_json::from_str::<serde_json::Value>(&message.body)
+                .unwrap_or_else(|error| panic!("body is not the protocol JSON: {error}"))
+        };
+        let first = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Cancel(message) => message,
+            other => panic!("expected the cancellation, got {other:?}"),
+        };
+        assert_eq!(body_of(&first), expected);
+
+        // The runner has not acknowledged the message yet: the same
+        // cancellation comes back, still carrying its body.
+        let again = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Inflight(message) => message,
+            other => panic!("expected a redelivery of the parked message, got {other:?}"),
+        };
+        assert_eq!(again.message_id, first.message_id);
+        assert_eq!(again.message_type, "JobCancellation");
+        assert_eq!(
+            body_of(&again),
+            expected,
+            "a redelivered cancellation carries its stored body, not the request id"
+        );
+    }
+
     /// Secret values are never written to the control database: a record
     /// that still carries values (a caller bug) is stored without them, so
     /// `run_record` returns an empty secrets map. Values live in the
@@ -2972,6 +3041,12 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn redelivered_cancellation_keeps_its_body() {
+        let (_pg, backend) = backend().await;
+        suite::redelivered_cancellation_keeps_its_body(&backend).await;
+    }
+
+    #[tokio::test]
     async fn artifact_scopes_map_plan_ids_to_latest_run() {
         let (_pg, backend) = backend().await;
         suite::artifact_scopes_map_plan_ids_to_latest_run(&backend).await;
@@ -3565,6 +3640,11 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn redelivered_cancellation_keeps_its_body() {
+        suite::redelivered_cancellation_keeps_its_body(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
     async fn artifact_scopes_map_plan_ids_to_latest_run() {
         suite::artifact_scopes_map_plan_ids_to_latest_run(&LiteBackend::in_memory().unwrap()).await;
     }
@@ -3652,6 +3732,86 @@ mod lite {
             &LiteBackend::in_memory().unwrap(),
         )
         .await;
+    }
+
+    /// A timed-out session-bound attempt is cancelled through the marker
+    /// only: the runner's next poll delivers one `JobCancellation` carrying
+    /// the official body — never an eagerly parked message whose body the
+    /// poll path replaces with the bare request id.
+    #[tokio::test]
+    async fn reaper_timeout_delivers_a_well_formed_cancellation() {
+        use crate::control::types::{PollOutcome, ReapSweep};
+
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(super::register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(super::poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+
+        // Backdate the attempt past `timeout-minutes` (default 6h).
+        let started = crate::models::now_unix_nanos() / 1000 - 7 * 3600 * 1_000_000;
+        backend
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE job_requests SET started_at = ?1 WHERE request_id = ?2",
+                    (started, claimed.request.request_id),
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        let inputs = backend.reap_inputs().await.unwrap();
+        let outcome = backend
+            .reap_sweep(ReapSweep {
+                now: std::time::SystemTime::now(),
+                runs: [run_id].into_iter().collect(),
+                ready: Vec::new(),
+                active: inputs.active,
+                paused: Default::default(),
+                pool_preparing: false,
+                warm_window_open: false,
+                first_seen: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.cancellations, 1,
+            "the timed-out attempt queues one cancellation"
+        );
+
+        let poll = backend
+            .poll_session(super::poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Cancel(message) = poll else {
+            panic!("the next poll must deliver the cancellation, got {poll:?}")
+        };
+        assert_eq!(message.message_type, "JobCancellation");
+        assert_eq!(
+            message.body,
+            crate::concurrency::job_cancel_body(claimed.request.agent_job_id),
+            "the cancellation carries its official body, not the request id"
+        );
     }
 
     #[tokio::test]

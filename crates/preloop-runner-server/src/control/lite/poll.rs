@@ -520,11 +520,8 @@ impl LiteBackend {
             if let Some(message) = oldest_session_message(tx, &session.session_uuid)? {
                 return Ok(PollOutcome::Inflight(azdo::TaskAgentMessage {
                     message_id: message.message_id,
-                    message_type: message.message_type,
-                    body: message
-                        .request_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_default(),
+                    message_type: message.message_type.clone(),
+                    body: message.runner_body(),
                     iv: None,
                 }));
             }

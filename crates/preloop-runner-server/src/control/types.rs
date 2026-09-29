@@ -1023,6 +1023,23 @@ pub(crate) struct SessionMessage {
     pub(crate) plaintext: bool,
 }
 
+impl SessionMessage {
+    /// The body a poll answers with: the job assignment is addressed by its
+    /// `request_id` (the broker fetches the real message), while a control
+    /// message (a cancellation) carries its own stored `body` — the same
+    /// rule `render_session_message` applies to the AzDO poll. This is what
+    /// `queue_job_message` and `queue_cancellation_message` store.
+    pub(crate) fn runner_body(&self) -> String {
+        if self.message_type == azdo::message_type::PIPELINE_AGENT_JOB_REQUEST {
+            self.request_id
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        } else {
+            self.body.clone().unwrap_or_default()
+        }
+    }
+}
+
 /// What an AzDO poll produced.
 #[derive(Debug)]
 pub(crate) enum AzdoPollOutcome {

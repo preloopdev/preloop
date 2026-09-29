@@ -12,7 +12,7 @@ use super::jobs;
 use super::{LiteBackend, db, runners};
 use crate::control::logic::{self, StarvationCandidate, StarvationVerdict};
 use crate::control::types::*;
-use preloop_gha_protocol::{JobId, RunId, azdo};
+use preloop_gha_protocol::{JobId, RunId};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
@@ -31,28 +31,28 @@ fn runner_label_sets(tx: &Transaction<'_>) -> Result<Vec<Vec<String>>, ControlEr
     .collect()
 }
 
-/// Queue a `JobCancellation` for a job's unfinished attempt: the
-/// cancellation row plus the session message when the attempt is bound to
-/// a session.
+/// Queue a `JobCancellation` marker for a job's unfinished attempt
+/// (deduplicated while undelivered). The poll path turns the marker into the
+/// runner-facing `JobCancellation` message carrying the official body — an
+/// eager `session_messages` row here would be redelivered with a bogus
+/// `request_id` body and leave the marker undelivered (pg's rule).
 fn queue_job_cancellation(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
 ) -> Result<bool, ControlError> {
     let run = codec::run_key(run_id);
-    let attempt: Option<(i64, Option<String>, Option<String>)> = tx
+    let attempt: Option<i64> = tx
         .prepare_cached(
-            "SELECT request_id, session_id, agent_job_id FROM job_requests \
+            "SELECT request_id FROM job_requests \
              WHERE run_id = ?1 AND job_id = ?2 AND result IS NULL \
              ORDER BY request_id DESC LIMIT 1",
         )
         .map_err(db)?
-        .query_row(params![run, job_id.0], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+        .query_row(params![run, job_id.0], |row| row.get(0))
         .optional()
         .map_err(db)?;
-    let Some((request_id, session, agent)) = attempt else {
+    let Some(request_id) = attempt else {
         return Ok(false);
     };
     tx.prepare_cached(
@@ -62,22 +62,6 @@ fn queue_job_cancellation(
     .map_err(db)?
     .execute(params![request_id, now_us()])
     .map_err(db)?;
-    if let (Some(session), Some(agent)) = (session, agent) {
-        let agent = uuid::Uuid::parse_str(&agent).unwrap_or_default();
-        let body = crate::concurrency::job_cancel_body(agent);
-        tx.prepare_cached(
-            "INSERT INTO session_messages (session_id, message_type, request_id, body) \
-             VALUES (?1,?2,?3,?4)",
-        )
-        .map_err(db)?
-        .execute(params![
-            session,
-            azdo::message_type::JOB_CANCELLED,
-            request_id,
-            body
-        ])
-        .map_err(db)?;
-    }
     Ok(true)
 }
 
