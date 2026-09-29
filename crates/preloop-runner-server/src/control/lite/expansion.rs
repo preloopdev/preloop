@@ -97,6 +97,13 @@ fn node_parent(plan: &preloop_gha_protocol::JobPlan, job_id: &JobId) -> Option<S
 fn strip_secret_values(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
 ) -> Vec<String> {
+    // The builder emits its baseline regexes first and appends one hint per
+    // non-empty secret value last: only that tail encodes a value. Count it
+    // before blanking the values, then drop exactly it (the rule
+    // `message_template::strip_template` applies) — the acquire path only
+    // re-adds value-derived hints, so a full clear would deliver every
+    // materialized leg with no baseline mask.
+    let derived_hints = crate::message_template::secret_hint_count(message);
     let mut names = Vec::new();
     for (name, value) in message.variables.iter_mut() {
         if value.is_secret == Some(true) {
@@ -104,7 +111,9 @@ fn strip_secret_values(
             value.value = None;
         }
     }
-    message.mask_hints.clear();
+    message
+        .mask_hints
+        .truncate(message.mask_hints.len().saturating_sub(derived_hints));
     for endpoint in &mut message.resources.endpoints {
         endpoint.authorization.parameters.clear();
     }

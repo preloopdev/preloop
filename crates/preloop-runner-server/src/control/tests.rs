@@ -1281,6 +1281,49 @@ pub(crate) mod suite {
         );
     }
 
+    /// A stored template keeps the builder's baseline mask hints.
+    ///
+    /// The builder emits its baseline regexes first and one hint per
+    /// non-empty secret value last; only that tail encodes a value, so
+    /// storage must drop the tail and keep the baseline — the acquire fill
+    /// re-adds value-derived hints only. A template stored with none delivers
+    /// a job whose runner cannot redact credential shapes the workflow never
+    /// declared.
+    pub(crate) async fn baseline_mask_hints_survive_template_storage(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let plan: preloop_gha_protocol::JobPlan = serde_json::from_value(serde_json::json!({
+            "id": "build",
+            "base_id": "build",
+            "name": "build",
+            "runs_on": ["self-hosted"],
+        }))
+        .unwrap();
+        let message = preloop_gha_parser::job_builder::build_agent_job_message(
+            &plan,
+            &serde_json::json!({"repository": "owner/repo", "sha": "abc123"}),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let baseline = message.mask_hints.len();
+        assert!(
+            baseline >= 18,
+            "the builder must emit its baseline hint set with no secret values, got {baseline}"
+        );
+        let mut job = submit_job(run_id, "build", 1);
+        job.queued.message = message;
+        backend.submit_run(submit_run(run_id, vec![job])).await.unwrap();
+
+        let ctx = backend.acquire_context(1).await.unwrap();
+        assert_eq!(
+            ctx.message.mask_hints.len(),
+            baseline,
+            "the baseline mask hints must survive template storage"
+        );
+    }
+
     /// The webhook inbox: enqueue deduplicates by delivery id, a claim is
     /// fenced by its lease token, the queue stats see the backlog, and
     /// completion is terminal.
@@ -3667,6 +3710,12 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn baseline_mask_hints_survive_template_storage() {
+        let (_pg, backend) = backend().await;
+        suite::baseline_mask_hints_survive_template_storage(&backend).await;
+    }
+
+    #[tokio::test]
     async fn webhook_inbox_claim_is_fenced_and_deduplicated() {
         let (_pg, backend) = backend().await;
         suite::webhook_inbox_claim_is_fenced_and_deduplicated(&backend).await;
@@ -4119,6 +4168,12 @@ mod lite {
     #[tokio::test]
     async fn secret_values_never_persist() {
         suite::secret_values_never_persist(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn baseline_mask_hints_survive_template_storage() {
+        suite::baseline_mask_hints_survive_template_storage(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

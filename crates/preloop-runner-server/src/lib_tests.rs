@@ -3101,6 +3101,102 @@ jobs:
     );
 }
 
+/// A materialized expansion leg must be stored with the builder's baseline
+/// mask hints.
+///
+/// The legs are built by the same `build_job_artifacts` as a submitted job,
+/// but the lite expansion path stripped the whole `mask_hints` list before
+/// persisting them, so every deferred-matrix and reusable-callee leg was
+/// delivered with no baseline regexes — the acquire fill only re-adds
+/// value-derived hints.
+#[tokio::test]
+async fn expansion_legs_keep_the_baseline_mask_hints() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        run: echo matrix
+  fan:
+    needs: [gen]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.gen.outputs.matrix) }}
+    steps:
+      - run: echo leg
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let baseline = {
+        let inner = state.test_tx().await;
+        let gen = inner
+            .ready()
+            .find(|job| job.job_id.0 == "gen")
+            .expect("gen should be queued");
+        let baseline = gen.message.mask_hints.len();
+        assert!(
+            baseline >= 18,
+            "the builder must emit its baseline hint set, got {baseline}"
+        );
+        baseline
+    };
+
+    let _completed = crate::distributed_task::complete_job_inner(
+        state.shared(),
+        preloop_gha_protocol::JobCompletion {
+            run_id,
+            job_id: preloop_gha_protocol::JobId("gen".to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: [(
+                "matrix".to_owned(),
+                serde_json::json!("{\"leg\":[1,2]}"),
+            )]
+            .into_iter()
+            .collect(),
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        },
+    )
+    .await
+    .expect("completing gen must succeed");
+
+    let legs: Vec<(String, usize)> = {
+        let inner = state.test_tx().await;
+        inner
+            .ready()
+            .chain(inner.pending_jobs.iter())
+            .filter(|job| job.run_id == run_id && job.job_id.0.starts_with("fan"))
+            .map(|job| (job.job_id.0.clone(), job.message.mask_hints.len()))
+            .collect()
+    };
+    assert_eq!(
+        legs.len(),
+        2,
+        "the deferred node must expand into two legs, got {:?}",
+        legs.iter().map(|(job_id, _)| job_id).collect::<Vec<_>>()
+    );
+    for (job_id, hints) in legs {
+        assert_eq!(
+            hints, baseline,
+            "leg {job_id} must keep the baseline mask hints"
+        );
+    }
+}
+
 /// The list endpoint projects steps like the single-run endpoint.
 ///
 /// Step records live in the attempt manifest, not in the stored run, so a
