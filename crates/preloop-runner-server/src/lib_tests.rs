@@ -4482,7 +4482,7 @@ async fn log_append_fails_closed_when_the_secret_provider_errors() {
     {
         let inner = state.inner.lock().await;
         assert!(
-            inner.logs.get(&format!("{plan_id}/log-1")).is_none(),
+            !inner.logs.contains_key(&format!("{plan_id}/log-1")),
             "the failed append must not be buffered"
         );
     }
