@@ -967,7 +967,7 @@ pub async fn open_session(
 pub struct VerdictPollQuery {
     /// Seconds to hold the request open. Clamped to [`VERDICT_POLL_MAX`].
     #[serde(default)]
-    wait: Option<u64>,
+    pub(crate) wait: Option<u64>,
 }
 
 /// Confirm the caller owns the session it named, and return its canonical id.
@@ -1028,11 +1028,15 @@ pub async fn poll_verdict(
                 // the time a human answers. Mint a replacement now so the
                 // replayed checkout authenticates. The worker only applies
                 // it to steps the message marks as pinned.
+                let record = inner
+                    .debug_sessions
+                    .get(&session_id)
+                    .map(|record| (record.request_id, record.agent_job_id));
+                // Drop the node-local lock before touching the backend: a
+                // Postgres reader checkout can wait on the pool, and every
+                // other `inner` user on this node would stall behind us.
+                drop(inner);
                 if response.verdict == Some(Verdict::Retry) && response.snapshot_token.is_none() {
-                    let record = inner
-                        .debug_sessions
-                        .get(&session_id)
-                        .map(|record| (record.request_id, record.agent_job_id));
                     if let Some((request_id, agent_job_id)) = record {
                         let plan_id = match shared
                             .state

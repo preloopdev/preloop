@@ -1342,7 +1342,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                 }
             }
         }
-        let inner = state.inner.lock().await;
+        // Read the node-local liveness timeout under the lock, then release it:
+        // `rebuild_dispatch_intent` runs a transaction per ready job and must
+        // not hold the global `inner` mutex while awaiting the backend.
+        let runner_liveness_timeout = state.inner.lock().await.runner_liveness_timeout;
         // `pool_assignments_enabled`/`require_job_assignments`: the
         // authoritative backend reads these flags from its own config on
         // every transaction (`with_config`); mirror the effective values into
@@ -1351,7 +1354,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         state.backend.set_config(
             pool_managed,
             config.require_job_assignments,
-            inner.runner_liveness_timeout,
+            runner_liveness_timeout,
         );
         // Environment protection rules are pure config the backend evaluates
         // inside its promotion and reaper transactions (where the job rows
