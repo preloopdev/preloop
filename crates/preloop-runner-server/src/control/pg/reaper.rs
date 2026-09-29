@@ -155,30 +155,32 @@ impl PgBackend {
                 continue;
             }
             if let Some(started_at) = request.started_at {
-                if request.timeout_triggered {
-                    continue;
-                }
-                let paused_s = paused.get(&request.request_id).copied().unwrap_or_default();
-                let elapsed = now
-                    .duration_since(started_at)
-                    .unwrap_or_default()
-                    .saturating_sub(paused_s);
-                let job_timeout = request.job_timeout_s.unwrap_or(21600).max(0) as u64;
-                if elapsed >= std::time::Duration::from_secs(job_timeout) {
-                    // Conditional: only the first sweep flags the attempt.
-                    let flagged = tx
-                        .execute(
-                            "UPDATE job_requests SET timeout_triggered = true \
-                             WHERE request_id = $1 AND result IS NULL \
-                             AND timeout_triggered = false",
-                            &[&request.request_id],
-                        )
-                        .await
-                        .map_err(db)?;
-                    if flagged > 0
-                        && enqueue_cancellation_job(&tx, request.run_id, &request.job_id).await?
-                    {
-                        outcome.cancellations += 1;
+                // Already timed out: the arm is spent, but the lease check
+                // below still applies (trait doc `reap_sweep` step 3 is
+                // unconditional), so this must not skip it.
+                if !request.timeout_triggered {
+                    let paused_s = paused.get(&request.request_id).copied().unwrap_or_default();
+                    let elapsed = now
+                        .duration_since(started_at)
+                        .unwrap_or_default()
+                        .saturating_sub(paused_s);
+                    let job_timeout = request.job_timeout_s.unwrap_or(21600).max(0) as u64;
+                    if elapsed >= std::time::Duration::from_secs(job_timeout) {
+                        // Conditional: only the first sweep flags the attempt.
+                        let flagged = tx
+                            .execute(
+                                "UPDATE job_requests SET timeout_triggered = true \
+                                 WHERE request_id = $1 AND result IS NULL \
+                                 AND timeout_triggered = false",
+                                &[&request.request_id],
+                            )
+                            .await
+                            .map_err(db)?;
+                        if flagged > 0
+                            && enqueue_cancellation_job(&tx, request.run_id, &request.job_id).await?
+                        {
+                            outcome.cancellations += 1;
+                        }
                     }
                 }
             }

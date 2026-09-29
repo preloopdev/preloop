@@ -2813,6 +2813,96 @@ pub(crate) mod suite {
         );
     }
 
+    /// One reaper tick over `run_id` at `now`, fed by a fresh
+    /// `reap_inputs` snapshot.
+    fn sweep_at(now: std::time::SystemTime, run_id: RunId, inputs: ReapInputs) -> ReapSweep {
+        ReapSweep {
+            now,
+            runs: [run_id].into_iter().collect(),
+            ready: inputs.ready,
+            active: inputs.active,
+            paused: BTreeMap::new(),
+            pool_preparing: false,
+            warm_window_open: false,
+            first_seen: BTreeMap::new(),
+        }
+    }
+
+    /// The timeout arm and the lease arm of `reap_sweep` are independent
+    /// (trait doc steps 2 and 3): an attempt that already hit its
+    /// `timeout-minutes` and whose runner then went silent must still have
+    /// its lease expired and settle as a failure on the next tick.
+    pub(crate) async fn timeout_then_lease_expiry_settles_attempt(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let mut job = submit_job(run_id, "build", 1);
+        // 10 minutes: the timeout must fire well before the 45-minute lease.
+        job.queued.message.job_timeout = Some(600);
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let inputs = backend.reap_inputs().await.unwrap();
+        let started = inputs
+            .active
+            .iter()
+            .find(|active| active.request_id == claimed.request.request_id)
+            .and_then(|active| active.started_at)
+            .expect("the claim stamps started_at");
+
+        // Tick 1: the job timeout fires; the lease is still live.
+        let inputs = backend.reap_inputs().await.unwrap();
+        let outcome = backend
+            .reap_sweep(sweep_at(started + std::time::Duration::from_secs(601), run_id, inputs))
+            .await
+            .unwrap();
+        assert_eq!(outcome.cancellations, 1, "the job timeout must fire");
+
+        // Tick 2: the runner never renewed; the lease expires past 45 min.
+        let inputs = backend.reap_inputs().await.unwrap();
+        let outcome = backend
+            .reap_sweep(sweep_at(
+                started + std::time::Duration::from_secs(2701),
+                run_id,
+                inputs,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.expired.len(),
+            1,
+            "a timeout-triggered attempt must still settle on lease expiry"
+        );
+        assert_eq!(
+            outcome.expired[0].request_id, claimed.request.request_id,
+            "the expired attempt is the timed-out one"
+        );
+        let request = backend
+            .request(RequestKey::Id(claimed.request.request_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            request.result,
+            Some(ExecutionStatus::Failure),
+            "lease expiry must fail the attempt"
+        );
+    }
+
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -3226,6 +3316,12 @@ mod pg {
         let (_pg, backend) = backend().await;
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_then_lease_expiry_settles_attempt() {
+        let (_pg, backend) = backend().await;
+        suite::timeout_then_lease_expiry_settles_attempt(&backend).await;
     }
 
     #[tokio::test]
@@ -4092,6 +4188,11 @@ mod lite {
         let backend = LiteBackend::in_memory().unwrap();
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_then_lease_expiry_settles_attempt() {
+        suite::timeout_then_lease_expiry_settles_attempt(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
