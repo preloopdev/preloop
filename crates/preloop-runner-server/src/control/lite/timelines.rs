@@ -36,7 +36,9 @@ impl LiteBackend {
     /// 2. `INSERT INTO timelines .. ON CONFLICT DO UPDATE SET change_id =
     ///    change_id + 1 RETURNING change_id`;
     /// 3. upsert each stamped record into `timeline_records`;
-    /// 4. return the change id and every stored record ordered by record id.
+    /// 4. evict the lowest record ids past [`MAX_TIMELINE_RECORDS`],
+    ///    protecting the records this PATCH wrote;
+    /// 5. return the change id and every stored record ordered by record id.
     pub(crate) async fn patch_timeline(
         &self,
         timeline_key: &str,
@@ -78,6 +80,50 @@ impl LiteBackend {
                     upsert
                         .execute(params![timeline, record_id, change_id, body])
                         .map_err(db)?;
+                }
+            }
+            // Write-side bound: the read LIMIT alone let `timeline_records`
+            // grow without limit and could omit a record this PATCH wrote
+            // from the response. Evict the lowest record ids past the cap,
+            // never a record stamped with this PATCH's `change_id`; a PATCH
+            // larger than the cap falls through to evicting the lowest
+            // regardless so the bound always holds.
+            let cap = MAX_TIMELINE_RECORDS as i64;
+            let count: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM timeline_records WHERE timeline_id = ?1",
+                    [&timeline],
+                    |row| row.get(0),
+                )
+                .map_err(db)?;
+            if count > cap {
+                let excess = count - cap;
+                tx.prepare_cached(
+                    "DELETE FROM timeline_records WHERE timeline_id = ?1 AND change_id <> ?2 \
+                       AND record_id IN (SELECT record_id FROM timeline_records \
+                                         WHERE timeline_id = ?1 AND change_id <> ?2 \
+                                         ORDER BY record_id LIMIT ?3)",
+                )
+                .map_err(db)?
+                .execute(params![timeline, change_id, excess])
+                .map_err(db)?;
+                let count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM timeline_records WHERE timeline_id = ?1",
+                        [&timeline],
+                        |row| row.get(0),
+                    )
+                    .map_err(db)?;
+                if count > cap {
+                    tx.prepare_cached(
+                        "DELETE FROM timeline_records WHERE timeline_id = ?1 \
+                           AND record_id IN (SELECT record_id FROM timeline_records \
+                                             WHERE timeline_id = ?1 \
+                                             ORDER BY record_id LIMIT ?2)",
+                    )
+                    .map_err(db)?
+                    .execute(params![timeline, count - cap])
+                    .map_err(db)?;
                 }
             }
             let mut stmt = tx

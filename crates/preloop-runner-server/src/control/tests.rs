@@ -117,6 +117,19 @@ fn job_message(
     .unwrap()
 }
 
+/// A minimal Azure-protocol timeline record, addressed by `id` so ordering
+/// by record id is predictable.
+fn timeline_record(id: u128, name: &str) -> preloop_gha_protocol::azdo::TimelineRecord {
+    serde_json::from_value(serde_json::json!({
+        "id": uuid::Uuid::from_u128(id),
+        "name": name,
+        "type": "Task",
+        "state": "completed",
+        "result": "succeeded",
+    }))
+    .unwrap()
+}
+
 fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
     let nanos = crate::models::now_unix_nanos();
     QueuedJob {
@@ -1569,6 +1582,79 @@ pub(crate) mod suite {
         );
     }
 
+    /// A timeline PATCH bounds storage at `MAX_TIMELINE_RECORDS` rows per
+    /// timeline and always serves the records it just wrote: filling the
+    /// timeline to the cap then patching one record whose id sorts after
+    /// every stored one evicts the lowest stored record and returns the new
+    /// one.
+    pub(crate) async fn timeline_patch_is_bounded_and_keeps_the_patch(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a claim");
+        };
+        let key = format!(
+            "{}/{}",
+            claimed.request.plan_id, claimed.request.timeline_id
+        );
+
+        // Exactly the cap: nothing is evicted yet.
+        let fill: Vec<_> = (1..=MAX_TIMELINE_RECORDS as u128)
+            .map(|id| timeline_record(id, "fill"))
+            .collect();
+        let (_, stored) = backend.patch_timeline(&key, fill).await.unwrap();
+        assert_eq!(stored.len(), MAX_TIMELINE_RECORDS);
+
+        // One more record, sorting after every stored one. The write-side
+        // bound evicts the lowest stored record, never the fresh patch.
+        let late = u128::MAX;
+        let (_, stored) = backend
+            .patch_timeline(&key, vec![timeline_record(late, "late")])
+            .await
+            .unwrap();
+        let ids: Vec<String> = stored.iter().map(|record| record.id.to_string()).collect();
+        assert!(
+            stored
+                .iter()
+                .any(|record| record.name.as_deref() == Some("late")),
+            "the PATCH response must contain the record it just wrote, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&uuid::Uuid::from_u128(1).to_string()),
+            "the lowest stored record is evicted past the cap, got {ids:?}"
+        );
+        assert_eq!(
+            stored.len(),
+            MAX_TIMELINE_RECORDS,
+            "storage stays bounded at the cap"
+        );
+
+        let (_, fetched) = backend.get_timeline(&key, 0, usize::MAX).await.unwrap();
+        assert!(
+            fetched
+                .iter()
+                .any(|record| record.id == uuid::Uuid::from_u128(late)),
+            "a later GET returns the stored patch"
+        );
+    }
+
     pub(crate) async fn reconcile_recovers_orphaned_claim(backend: &dyn ControlBackend) {
         // Crash-recovery: a job claimed by a runner whose session then dies
         // (releasing the request's owner) is orphaned. reconcile_on_boot must
@@ -2928,6 +3014,12 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn timeline_patch_is_bounded_and_keeps_the_patch() {
+        let (_pg, backend) = backend().await;
+        suite::timeline_patch_is_bounded_and_keeps_the_patch(&backend).await;
+    }
+
+    #[tokio::test]
     async fn reconcile_recovers_orphaned_claim() {
         let (_pg, backend) = backend().await;
         suite::reconcile_recovers_orphaned_claim(&backend).await;
@@ -3516,6 +3608,12 @@ mod lite {
     #[tokio::test]
     async fn list_runs_filters_on_the_projected_status() {
         suite::list_runs_filters_on_the_projected_status(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn timeline_patch_is_bounded_and_keeps_the_patch() {
+        suite::timeline_patch_is_bounded_and_keeps_the_patch(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

@@ -70,16 +70,17 @@ fn decode_records(rows: &[tokio_postgres::Row]) -> Vec<TimelineRecord> {
 
 impl PgBackend {
     /// Apply one timeline PATCH: bump the change counter, stamp and upsert
-    /// the patched records, return the new change id and every stored
-    /// record ordered by record id (capped at [`MAX_TIMELINE_RECORDS`]).
+    /// the patched records, evict the lowest record ids past
+    /// [`MAX_TIMELINE_RECORDS`] (protecting the patched ones), and return
+    /// the new change id and every stored record ordered by record id.
     /// `NotFound` when no attempt owns the timeline.
     ///
     /// Statements (one transaction): `INSERT INTO timelines .. SELECT ..
     /// WHERE EXISTS (job_requests.timeline_id) ON CONFLICT DO UPDATE SET
     /// change_id = change_id + 1 RETURNING change_id` (the row lock
     /// serializes PATCHes of one timeline); `INSERT INTO timeline_records ..
-    /// SELECT FROM unnest(..) ON CONFLICT DO UPDATE`; `SELECT record FROM
-    /// timeline_records ORDER BY record_id LIMIT n`.
+    /// SELECT FROM unnest(..) ON CONFLICT DO UPDATE`; the cap `DELETE`;
+    /// `SELECT record FROM timeline_records ORDER BY record_id LIMIT n`.
     pub(super) async fn patch_timeline(
         &self,
         timeline_key: &str,
@@ -119,6 +120,54 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        }
+        // Write-side bound: the read LIMIT alone let `timeline_records`
+        // grow without limit and could omit a record this PATCH wrote from
+        // the response. Evict the lowest record ids past the cap, never a
+        // record stamped with this PATCH's `change_id`; a PATCH larger than
+        // the cap falls through to evicting the lowest regardless so the
+        // bound always holds.
+        let cap = MAX_TIMELINE_RECORDS as i64;
+        let count: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM timeline_records WHERE timeline_id = $1::text::uuid",
+                &[&timeline],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        if count > cap {
+            let excess = count - cap;
+            tx.execute(
+                "DELETE FROM timeline_records WHERE timeline_id = $1::text::uuid \
+                   AND change_id <> $2 AND record_id IN \
+                   (SELECT record_id FROM timeline_records \
+                    WHERE timeline_id = $1::text::uuid AND change_id <> $2 \
+                    ORDER BY record_id LIMIT $3)",
+                &[&timeline, &change_id, &excess],
+            )
+            .await
+            .map_err(db)?;
+            let count: i64 = tx
+                .query_one(
+                    "SELECT count(*) FROM timeline_records WHERE timeline_id = $1::text::uuid",
+                    &[&timeline],
+                )
+                .await
+                .map_err(db)?
+                .get(0);
+            if count > cap {
+                tx.execute(
+                    "DELETE FROM timeline_records WHERE timeline_id = $1::text::uuid \
+                       AND record_id IN \
+                       (SELECT record_id FROM timeline_records \
+                        WHERE timeline_id = $1::text::uuid \
+                        ORDER BY record_id LIMIT $2)",
+                    &[&timeline, &(count - cap)],
+                )
+                .await
+                .map_err(db)?;
+            }
         }
         let stored = tx
             .query(
