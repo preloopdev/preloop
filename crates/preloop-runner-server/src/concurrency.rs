@@ -1052,6 +1052,195 @@ mod properties {
             }
         }
     }
+
+    // ---- `evaluate_concurrency`: group and scope semantics ----
+
+    /// Evaluate a `concurrency:` block whose group comes from the documented
+    /// workflow `inputs` context.
+    fn evaluate_group(group: &str) -> Result<(String, bool, ConcurrencyQueue), String> {
+        let github = json!({});
+        let inputs = BTreeMap::from([("group".to_owned(), Value::String(group.to_owned()))]);
+        let vars = BTreeMap::new();
+        let ctx = ConcurrencyContext {
+            scope: ConcurrencyScope::Workflow,
+            github: &github,
+            inputs: &inputs,
+            vars: &vars,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let raw = Concurrency {
+            group: "${{ inputs.group }}".to_owned(),
+            cancel_in_progress: None,
+            queue: ConcurrencyQueue::Single,
+        };
+        evaluate_concurrency(&raw, &ctx)
+    }
+
+    /// GH-VALIDATE-02/03: the evaluated group limit counts UTF-16 code units
+    /// (C# `string.Length`), so 400 ASCII characters fit exactly and 401 are
+    /// rejected with the evaluated length in the message.
+    #[test]
+    fn evaluated_ascii_group_length_400_utf16_units_is_accepted() {
+        let group = "a".repeat(400);
+        let (evaluated, cancel, queue) =
+            evaluate_group(&group).expect("400 ASCII characters must be accepted");
+        assert_eq!(
+            (evaluated.as_str(), cancel, queue),
+            (group.as_str(), false, ConcurrencyQueue::Single)
+        );
+
+        let error =
+            evaluate_group(&"a".repeat(401)).expect_err("401 ASCII characters must be rejected");
+        assert_eq!(
+            error,
+            "concurrency group name is too long (401 UTF-16 code units, maximum 400)"
+        );
+    }
+
+    /// GH-VALIDATE-05/06: an astral character counts as two UTF-16 code
+    /// units, so 200 astral characters (400 units) fit and 201 (402 units)
+    /// are rejected using that evaluated length.
+    #[test]
+    fn evaluated_astral_group_length_boundary_is_400_utf16_units() {
+        assert!(
+            evaluate_group(&"😀".repeat(200)).is_ok(),
+            "200 astral characters (400 UTF-16 code units) must be accepted"
+        );
+        let error = evaluate_group(&"😀".repeat(201))
+            .expect_err("201 astral characters (402 UTF-16 code units) must be rejected");
+        assert_eq!(
+            error,
+            "concurrency group name is too long (402 UTF-16 code units, maximum 400)"
+        );
+    }
+
+    /// GH-VALIDATE-07: BMP characters occupy one UTF-16 code unit each even
+    /// when they occupy two or more bytes in UTF-8.
+    #[test]
+    fn evaluated_bmp_group_length_400_utf16_units_is_accepted() {
+        assert!(
+            evaluate_group(&"é".repeat(400)).is_ok(),
+            "400 BMP characters (400 UTF-16 code units) must be accepted"
+        );
+    }
+
+    /// GH-VALIDATE-01: `queue: max` with `cancel-in-progress: true` is
+    /// rejected before admission, never resolved as independent options.
+    #[test]
+    fn validate_max_plus_cancel_is_error() {
+        let github = json!({});
+        let inputs = BTreeMap::new();
+        let vars = BTreeMap::new();
+        let ctx = ConcurrencyContext {
+            scope: ConcurrencyScope::Workflow,
+            github: &github,
+            inputs: &inputs,
+            vars: &vars,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let incompatible = Concurrency {
+            group: "build".to_owned(),
+            cancel_in_progress: Some("true".to_owned()),
+            queue: ConcurrencyQueue::Max,
+        };
+        let result = evaluate_concurrency(&incompatible, &ctx);
+        assert!(
+            result.is_err(),
+            "GH-VALIDATE-01: queue: max + cancel-in-progress: true must be rejected, got {result:?}"
+        );
+
+        // Each option alone stays valid.
+        let without_cancel = Concurrency {
+            cancel_in_progress: None,
+            ..incompatible.clone()
+        };
+        assert!(evaluate_concurrency(&without_cancel, &ctx).is_ok());
+        let without_max = Concurrency {
+            queue: ConcurrencyQueue::Single,
+            ..incompatible
+        };
+        assert!(evaluate_concurrency(&without_max, &ctx).is_ok());
+    }
+
+    proptest! {
+        /// GH-CTX-WF-01: workflow-scope concurrency receives `github`,
+        /// `inputs` and `vars`, but never the job-only `matrix`, `strategy`
+        /// or `needs` contexts.
+        #[test]
+        fn gh_ctx_wf_01_enforces_workflow_context_allowlist(
+            github_value in "[a-z]{1,8}",
+            input_value in "[a-z]{1,8}",
+            var_value in "[a-z]{1,8}",
+            forbidden_index in 0..3usize,
+        ) {
+            const FORBIDDEN: [&str; 3] =
+                ["matrix.os", "strategy.job-index", "needs.setup.result"];
+
+            let github = json!({"ref_name": github_value});
+            let inputs = BTreeMap::from([(
+                "target".to_owned(),
+                Value::String(input_value.clone()),
+            )]);
+            let vars = BTreeMap::from([("suffix".to_owned(), var_value.clone())]);
+            let matrix = BTreeMap::from([("os".to_owned(), Value::String("linux".to_owned()))]);
+            let strategy = json!({"job-index": 0});
+            let needs = json!({"setup": {"result": "success"}});
+            let ctx = ConcurrencyContext {
+                scope: ConcurrencyScope::Workflow,
+                github: &github,
+                inputs: &inputs,
+                vars: &vars,
+                matrix: Some(&matrix),
+                strategy: Some(&strategy),
+                needs: Some(&needs),
+            };
+            let allowed = Concurrency {
+                group: "${{ github.ref_name }}-${{ inputs.target }}-${{ vars.suffix }}"
+                    .to_owned(),
+                cancel_in_progress: None,
+                queue: ConcurrencyQueue::Single,
+            };
+            let (group, cancel, queue) = evaluate_concurrency(&allowed, &ctx)
+                .expect("GH-CTX-WF-01: documented workflow contexts must evaluate");
+            prop_assert_eq!(group, format!("{github_value}-{input_value}-{var_value}"));
+            prop_assert!(!cancel);
+            prop_assert_eq!(queue, ConcurrencyQueue::Single);
+
+            // The same expression evaluated against different job-only
+            // contexts must produce the same result: matrix/strategy/needs
+            // are invisible at workflow scope.
+            let alternate_matrix =
+                BTreeMap::from([("os".to_owned(), Value::String("windows".to_owned()))]);
+            let alternate_strategy = json!({"job-index": 99});
+            let alternate_needs = json!({"setup": {"result": "failure"}});
+            let alternate = ConcurrencyContext {
+                scope: ConcurrencyScope::Workflow,
+                github: &github,
+                inputs: &inputs,
+                vars: &vars,
+                matrix: Some(&alternate_matrix),
+                strategy: Some(&alternate_strategy),
+                needs: Some(&alternate_needs),
+            };
+            let raw = Concurrency {
+                group: format!("${{{{ {} }}}}", FORBIDDEN[forbidden_index]),
+                cancel_in_progress: None,
+                queue: ConcurrencyQueue::Single,
+            };
+            let resolved = evaluate_concurrency(&raw, &ctx);
+            prop_assert!(
+                resolved.is_err(),
+                "GH-CTX-WF-01: workflow scope must not resolve {}: {:?}",
+                FORBIDDEN[forbidden_index],
+                resolved
+            );
+            prop_assert_eq!(resolved, evaluate_concurrency(&raw, &alternate));
+        }
+    }
 }
 
 #[cfg(test)]
