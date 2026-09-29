@@ -1266,9 +1266,13 @@ impl Backend {
             Self::Postgres(b) => b.test_working_set().await,
         }
     }
-    /// Open the backend selected by `store_url`: `postgres://…` → PostgreSQL,
-    /// anything else (`sqlite://<path>`, a bare path) → SQLite. The default
-    /// authoritative database is `<state_dir>/preloop.db`.
+    /// Open the backend selected by `store_url`, falling back to the
+    /// `PRELOOP_STORE_URL` environment variable and then to SQLite at
+    /// `<state_dir>/preloop.db`. The URL goes through
+    /// [`crate::store::parse_store_url`], the same parser that labels the
+    /// status snapshot, so the live backend and the reported one cannot drift:
+    /// `postgres://…` → PostgreSQL, `sqlite://<path>`/`sqlite:<path>`/a bare
+    /// path → SQLite; an unsupported scheme is rejected.
     pub(crate) async fn open(
         store_url: Option<&str>,
         state_dir: &std::path::Path,
@@ -1276,32 +1280,36 @@ impl Backend {
         require_job_assignments: bool,
         runner_liveness_timeout: std::time::Duration,
     ) -> Result<Self, ControlError> {
-        if let Some(url) =
-            store_url.filter(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
-        {
-            let backend = super::pg::PgBackend::connect(
-                url,
-                pool_assignments_enabled,
-                require_job_assignments,
-                runner_liveness_timeout,
-            )
-            .await?;
-            return Ok(Self::Postgres(backend));
-        }
-        let path = match store_url {
-            Some(url) if url.starts_with("sqlite://") => {
-                std::path::PathBuf::from(url.trim_start_matches("sqlite://"))
-            }
-            Some(url) if !url.is_empty() => std::path::PathBuf::from(url),
-            _ => state_dir.join("preloop.db"),
+        let raw = match store_url {
+            Some(value) if !value.trim().is_empty() => value.to_owned(),
+            _ => std::env::var(crate::store::STORE_URL_ENV).unwrap_or_default(),
         };
-        let backend = super::lite::LiteBackend::open(
-            &path,
-            pool_assignments_enabled,
-            require_job_assignments,
-            runner_liveness_timeout,
-        )?;
-        Ok(Self::Sqlite(backend))
+        match crate::store::parse_store_url(&raw).map_err(ControlError::backend)? {
+            crate::store::StoreUrl::Postgres(url) => {
+                let backend = super::pg::PgBackend::connect(
+                    &url,
+                    pool_assignments_enabled,
+                    require_job_assignments,
+                    runner_liveness_timeout,
+                )
+                .await?;
+                Ok(Self::Postgres(backend))
+            }
+            crate::store::StoreUrl::Sqlite(path) => {
+                let path = if path.as_os_str().is_empty() {
+                    state_dir.join("preloop.db")
+                } else {
+                    path
+                };
+                let backend = super::lite::LiteBackend::open(
+                    &path,
+                    pool_assignments_enabled,
+                    require_job_assignments,
+                    runner_liveness_timeout,
+                )?;
+                Ok(Self::Sqlite(backend))
+            }
+        }
     }
 
     /// Resolve a request's `(request_id, run_id)` from its `agent_job_id`.
