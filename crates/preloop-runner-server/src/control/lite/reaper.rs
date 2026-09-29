@@ -84,12 +84,7 @@ fn queue_job_cancellation(
 /// Fail one ready job for starvation: leave the ready queue, land the
 /// terminal row, recompute the run status (no dependent promotion, no
 /// concurrency release — the job never held a gate).
-fn starve_job(
-    tx: &Transaction<'_>,
-    backend: &LiteBackend,
-    run_id: RunId,
-    job_id: &JobId,
-) -> Result<(), ControlError> {
+fn starve_job(tx: &Transaction<'_>, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
     let run = codec::run_key(run_id);
     tx.prepare_cached(
         "UPDATE jobs SET status = 'failure', queue_state = 'none', \
@@ -107,10 +102,10 @@ fn starve_job(
         .map_err(db)?
         .execute(params![run, job_id.0])
         .map_err(db)?;
-    let summary = jobs::summarize_run_row(tx, run_id)?;
-    if summary.is_terminal() {
-        super::settle::release_concurrency_for_run(tx, backend, run_id)?;
-    }
+    // The run status is recomputed, but its workflow-level concurrency hold
+    // is NOT released: starvation is not a cancellation (the trait doc's
+    // `reap_sweep` step 1 performs no concurrency release).
+    jobs::summarize_run_row(tx, run_id)?;
     Ok(())
 }
 
@@ -274,7 +269,7 @@ impl LiteBackend {
                             "starving queued job failed after {}s without a matching runner",
                             grace.as_secs()
                         );
-                        starve_job(tx, self, job.run_id, &job.job_id)?;
+                        starve_job(tx, job.run_id, &job.job_id)?;
                         starved.push((job.run_id, job.job_id.clone(), reason));
                     }
                 }
