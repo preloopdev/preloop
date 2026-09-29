@@ -2901,16 +2901,28 @@ pub fn build_job_artifacts(
         // builder wrote it) so consumers that parse it are not surprised; the
         // token's real authority goes in its own variable, which the runner
         // prints inside the same `GITHUB_TOKEN Permissions` group.
-        let (token, authority) = match pat {
-            PatToken::Embed { token, scopes } => (token, pat_scopes_wire_value(&scopes)),
-            // H3: unverifiable authority means no PAT is embedded. The token
-            // is EMPTY, not the runtime token: the runtime JWT fails upstream
-            // as a dead credential ("Bad credentials"), while an empty
-            // GITHUB_TOKEN makes API clients anonymous — public reads work
-            // within unauthenticated rate limits. Anything that needs real
-            // authority still fails at the point of use, which is the point.
+        let (token, authority) = match &pat {
+            PatToken::Embed { token, scopes } => {
+                // The github context predates PAT selection, so
+                // `${{ github.token }}` inputs (checkout's token, persist-
+                // credentials) resolve empty unless the PAT is patched in —
+                // same hole apply_minted_token_to_message fills for App mints.
+                if let Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) =
+                    agent_msg.context_data.get_mut("github")
+                {
+                    github.insert(
+                        "token".to_owned(),
+                        preloop_gha_protocol::azdo::PipelineContextData::String(token.clone()),
+                    );
+                }
+                (token.clone(), pat_scopes_wire_value(scopes))
+            }
+            // H3: unverifiable authority means no PAT is embedded. The job
+            // keeps the runtime token, which authenticates only against this
+            // control plane, so a step that needs GitHub fails at the point of
+            // use rather than running with authority nobody could bound.
             PatToken::Withheld => (
-                String::new(),
+                runtime_token.clone(),
                 "withheld: PAT authority unverifiable; NOT the declared `permissions:` set"
                     .to_owned(),
             ),
@@ -2921,14 +2933,12 @@ pub fn build_job_artifacts(
         );
         token
     } else {
-        // No GitHub App and no PAT: there is no forge credential to hand the
-        // job. Shipping the runtime JWT as GITHUB_TOKEN sent a dead
-        // credential to api.github.com (`Bad credentials` from setup-*) and
-        // let actions/checkout write `AUTHORIZATION: basic x-access-token:<jwt>`
-        // — rejected outright rather than anonymous. Empty is the honest
-        // value: unauthenticated GitHub access is the correct mode here, and
-        // checkouts ride the forge relay.
-        String::new()
+        // No GitHub App and no PAT: `system.github.token` stays the
+        // job-scoped runtime JWT — engine endpoints (snapshots, forge relay,
+        // results) authenticate against it. It does NOT reach api.github.com:
+        // `${{ github.token }}` inputs resolve from the context (empty), and
+        // the runner no longer back-fills GITHUB_TOKEN from this variable.
+        runtime_token.clone()
     };
     agent_msg.variables.insert(
         "system.github.token".to_owned(),

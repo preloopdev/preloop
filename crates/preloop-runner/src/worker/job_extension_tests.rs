@@ -1416,11 +1416,14 @@ fn test_golden_acquirejob_payloads_parsing() {
             "mismatched GITHUB_REPOSITORY in {scenario}"
         );
 
-        // GITHUB_TOKEN must be set and not empty
+        // GITHUB_TOKEN mirrors `github.token` only — never the engine's
+        // runtime JWT. The golden captures carry no `github.token` context,
+        // so the env is empty here (anonymous mode): exporting the JWT sent a
+        // dead credential to api.github.com on engines without an App/PAT.
         let token = job.env.get("GITHUB_TOKEN").map(|s| s.as_str());
-        assert!(
-            token.is_some() && !token.unwrap().is_empty(),
-            "GITHUB_TOKEN must not be empty in {scenario}"
+        assert_eq!(
+            token, None,
+            "GITHUB_TOKEN must not export when github.token is empty ({scenario}) — the old fallback leaked the engine's runtime JWT to api.github.com"
         );
 
         // 3. Scenario-specific checks
