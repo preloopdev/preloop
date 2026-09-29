@@ -3161,12 +3161,9 @@ jobs:
             job_id: preloop_gha_protocol::JobId("gen".to_owned()),
             agent_job_id: None,
             status: ExecutionStatus::Success,
-            outputs: [(
-                "matrix".to_owned(),
-                serde_json::json!("{\"leg\":[1,2]}"),
-            )]
-            .into_iter()
-            .collect(),
+            outputs: [("matrix".to_owned(), serde_json::json!("{\"leg\":[1,2]}"))]
+                .into_iter()
+                .collect(),
             annotations: Vec::new(),
             step_results: Vec::new(),
         },
@@ -21382,21 +21379,24 @@ async fn verdict_poll_releases_inner_before_the_backend_read() {
 /// `inputs[name]` of a delivered step, handling the TemplateToken map wire
 /// form (`inputs.map[].Key/Value`) the job message uses.
 fn delivered_step_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
-    step["inputs"].get(name).and_then(Value::as_str).or_else(|| {
-        let found = step["inputs"]["map"].as_array()?.iter().find(|entry| {
-            entry
-                .get("Key")
-                .or_else(|| entry.get("key"))
-                .and_then(|key| key.get("lit"))
+    step["inputs"]
+        .get(name)
+        .and_then(Value::as_str)
+        .or_else(|| {
+            let found = step["inputs"]["map"].as_array()?.iter().find(|entry| {
+                entry
+                    .get("Key")
+                    .or_else(|| entry.get("key"))
+                    .and_then(|key| key.get("lit"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| key == name)
+            })?;
+            found
+                .get("Value")
+                .or_else(|| found.get("value"))
+                .and_then(|value| value.get("lit"))
                 .and_then(Value::as_str)
-                .is_some_and(|key| key == name)
-        })?;
-        found
-            .get("Value")
-            .or_else(|| found.get("value"))
-            .and_then(|value| value.get("lit"))
-            .and_then(Value::as_str)
-    })
+        })
 }
 
 /// The decoded body of a distributedtask (AzDO) delivery.

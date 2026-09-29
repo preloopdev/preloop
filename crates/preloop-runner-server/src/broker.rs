@@ -1156,8 +1156,8 @@ pub fn re_mint_snapshot_credentials(
         // submission: the snapshot endpoint authenticates the job-scoped
         // runtime token, which the GITHUB_TOKEN replacement cannot satisfy.
         use base64::Engine as _;
-        let credentials = base64::engine::general_purpose::STANDARD
-            .encode(format!("x-access-token:{fresh}"));
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{fresh}"));
         rewrite.auth_header = format!("AUTHORIZATION: basic {credentials}");
     }
     let mut re_minted = 0;

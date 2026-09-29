@@ -1289,9 +1289,7 @@ pub(crate) mod suite {
     /// re-adds value-derived hints only. A template stored with none delivers
     /// a job whose runner cannot redact credential shapes the workflow never
     /// declared.
-    pub(crate) async fn baseline_mask_hints_survive_template_storage(
-        backend: &dyn ControlBackend,
-    ) {
+    pub(crate) async fn baseline_mask_hints_survive_template_storage(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let plan: preloop_gha_protocol::JobPlan = serde_json::from_value(serde_json::json!({
             "id": "build",
@@ -1314,7 +1312,10 @@ pub(crate) mod suite {
         );
         let mut job = submit_job(run_id, "build", 1);
         job.queued.message = message;
-        backend.submit_run(submit_run(run_id, vec![job])).await.unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
 
         let ctx = backend.acquire_context(1).await.unwrap();
         assert_eq!(
