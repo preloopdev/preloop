@@ -311,13 +311,18 @@ pub fn log_key(plan_id: &str, log_id: &str) -> String {
 /// backend.
 ///
 /// A cache miss does one scoped read (`job_requests` to resolve the run,
-/// `runs` for its secrets — no queues, sessions, or concurrency families).
-/// The resolved masker is cached permanently. An *unresolved* plan (log chunk
+/// `runs` for its repository and, via the stored template, the job's
+/// `environment:` — no queues, sessions, or concurrency families). The
+/// resolved masker is cached permanently. An *unresolved* plan (log chunk
 /// arrived before the run row exists) masks against every run's secrets but
 /// is NOT cached — caching the fallback would permanently mask against a set
 /// that lacks this run's secrets and leak them into the log. Instead a short
 /// negative-cache TTL bounds how often the unresolved plan re-probes the
 /// backend.
+///
+/// A SecretProvider failure is propagated, never cached and never masked
+/// over: the caller drops the append instead of persisting (and streaming)
+/// an unmasked body, and the retry is free to resolve a real masker.
 pub(crate) async fn mask_log_bytes_cached(
     shared: &Arc<SharedState>,
     plan_id: &str,
@@ -357,15 +362,21 @@ pub(crate) async fn mask_log_bytes_cached(
     // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
     // only when the plan mapped to a concrete run row, so the fallback
     // union is never cached as if it were the run's real masker. Values come
-    // from the SecretProvider (run > repo > global); environment-tier values
-    // join the node cache when a job is acquired.
-    let resolved_run_id = shared
+    // from the SecretProvider (run > environment > repo > global). The
+    // environment tier is per job and only joins a node's cache when that
+    // node served the acquire, so the cold path reads it back from the
+    // stored template's secret spec — the same input the acquire fill uses.
+    // A resolution failure propagates: an empty masker would persist the raw
+    // body, and caching it would disable masking for the plan's whole life.
+    let callback = shared
         .state
         .backend
         .callback_job(plan_id, None, None)
         .await
         .ok()
-        .flatten()
+        .flatten();
+    let resolved_run_id = callback
+        .as_ref()
         .map(|callback| callback.run_id)
         .or_else(|| plan_id.parse::<RunId>().ok());
     let provider = shared.state.secret_provider.as_ref();
@@ -378,18 +389,28 @@ pub(crate) async fn mask_log_bytes_cached(
                 .await
                 .map(|record| record.submission.repository.clone())
                 .unwrap_or_default();
-            let mut values: Vec<String> = provider
+            let environment = match &callback {
+                Some(callback) => shared
+                    .state
+                    .backend
+                    .acquire_context(callback.request_id)
+                    .await
+                    .ok()
+                    .and_then(|context| context.message.preloop_secret_spec)
+                    .and_then(|spec| spec.environment),
+                None => None,
+            };
+            let resolved_secrets = provider
                 .resolve(crate::secret_provider::SecretScope {
                     repository: &repository,
-                    environment: None,
+                    environment: environment.as_deref(),
                     run_id: Some(run_id),
                 })
-                .map(|map| {
-                    preloop_gha_protocol::masking::expose_all(&map)
-                        .into_values()
-                        .collect()
-                })
-                .unwrap_or_default();
+                .map_err(crate::control::ControlError::backend)?;
+            let mut values: Vec<String> =
+                preloop_gha_protocol::masking::expose_all(&resolved_secrets)
+                    .into_values()
+                    .collect();
             values.sort();
             values.dedup();
             (values, true)
@@ -397,7 +418,9 @@ pub(crate) async fn mask_log_bytes_cached(
         None => {
             // Unresolvable plan: union of stored provider secrets plus every
             // provided value the node already cached at submit/acquire.
-            let mut values = provider.resolve_all().unwrap_or_default();
+            let mut values = provider
+                .resolve_all()
+                .map_err(crate::control::ControlError::backend)?;
             {
                 let inner = shared.state.inner.lock().await;
                 for cached in inner.plan_secret_masker.values() {

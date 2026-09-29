@@ -4263,6 +4263,249 @@ jobs:
     );
 }
 
+/// Environment-tier secret values must mask on a node whose masker cache is
+/// cold (a restart, or a node that did not serve the acquire). The append
+/// path has to resolve the job's `environment:` itself — from the stored
+/// template's secret spec — instead of relying on the acquire-time cache
+/// merge, which only exists on the node that claimed the job.
+#[tokio::test]
+async fn log_append_masks_environment_secrets_on_a_cold_masker_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let mut secrets = state.secrets.write();
+        secrets
+            .env
+            .entry("owner/repo".to_owned())
+            .or_default()
+            .entry("prod".to_owned())
+            .or_default()
+            .insert("ENV_TOKEN".to_owned(), "env-tier-secret".to_owned());
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - run: echo env
+"#,
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let (plan_id, stored_environment) = {
+        let inner = state.test_tx().await;
+        let request = inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("the submitted job must have a request");
+        let queued = inner.ready().next().expect("job should be queued");
+        (
+            request.plan_id.clone(),
+            queued
+                .message
+                .preloop_secret_spec
+                .as_ref()
+                .and_then(|spec| spec.environment.clone()),
+        )
+    };
+    assert_eq!(
+        stored_environment.as_deref(),
+        Some("prod"),
+        "the stored template must carry the job's environment tier"
+    );
+
+    // A cold node: nothing has resolved or acquired this plan yet.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.plan_secret_masker.clear();
+        inner.plan_secret_masker_pending.clear();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/_apis/v1/Logfiles/scope/actions/{plan_id}/log-1"))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::from("token=env-tier-secret"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner
+            .logs
+            .get(&format!("{plan_id}/log-1"))
+            .map(Vec::as_slice),
+        Some(&b"token=***"[..]),
+        "environment-tier secrets must be masked from a cold masker cache"
+    );
+}
+
+/// A `SecretProvider` wrapper whose failures can be switched on after the
+/// submission that seeds the state.
+struct SwitchableSecretProvider {
+    inner: std::sync::Arc<dyn crate::secret_provider::SecretProvider>,
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SwitchableSecretProvider {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("secret backend unavailable");
+        }
+        Ok(())
+    }
+}
+
+impl crate::secret_provider::SecretProvider for SwitchableSecretProvider {
+    fn resolve(
+        &self,
+        scope: crate::secret_provider::SecretScope<'_>,
+    ) -> anyhow::Result<BTreeMap<String, preloop_gha_protocol::SecretString>> {
+        self.check()?;
+        self.inner.resolve(scope)
+    }
+
+    fn resolve_all(&self) -> anyhow::Result<Vec<String>> {
+        self.check()?;
+        self.inner.resolve_all()
+    }
+
+    fn put_run(
+        &self,
+        run_id: RunId,
+        secrets: &BTreeMap<String, preloop_gha_protocol::SecretString>,
+    ) -> anyhow::Result<()> {
+        self.inner.put_run(run_id, secrets)
+    }
+
+    fn run_tier(
+        &self,
+        run_id: RunId,
+    ) -> anyhow::Result<BTreeMap<String, preloop_gha_protocol::SecretString>> {
+        self.inner.run_tier(run_id)
+    }
+
+    fn delete_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        self.inner.delete_run(run_id)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+}
+
+/// A SecretProvider failure must fail the append closed: the raw body is
+/// neither stored nor streamed, and the failure is never cached as an empty
+/// masker (which would disable masking for the plan for the process's life).
+#[tokio::test]
+async fn log_append_fails_closed_when_the_secret_provider_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.secret_provider = std::sync::Arc::new(SwitchableSecretProvider {
+        inner: state.secret_provider.clone(),
+        failing: failing.clone(),
+    });
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo masked\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"TOKEN": "super-secret"}
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let plan_id = {
+        let inner = state.test_tx().await;
+        inner
+            .job_requests
+            .values()
+            .find(|request| request.run_id == run_id)
+            .expect("the submitted job must have a request")
+            .plan_id
+            .clone()
+    };
+
+    let append = |body: &'static str| {
+        let app = app.clone();
+        let plan_id = plan_id.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/_apis/v1/Logfiles/scope/actions/{plan_id}/log-1"))
+                    .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A cold node: the submit-time seed is gone (restart, or a node that did
+    // not serve this run), so the append must resolve through the provider.
+    {
+        let mut inner = state.inner.lock().await;
+        inner.plan_secret_masker.clear();
+        inner.plan_secret_masker_pending.clear();
+    }
+    let response = append("token=super-secret").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a provider failure must drop the append, not store it unmasked"
+    );
+    {
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.logs.get(&format!("{plan_id}/log-1")).is_none(),
+            "the failed append must not be buffered"
+        );
+    }
+
+    // The failure is not cached: once the provider recovers, the same plan
+    // masks against its real secrets instead of a permanently empty masker.
+    failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    let response = append("token=super-secret").await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let inner = state.inner.lock().await;
+    assert_eq!(
+        inner
+            .logs
+            .get(&format!("{plan_id}/log-1"))
+            .map(Vec::as_slice),
+        Some(&b"token=***"[..]),
+        "the provider error must not have been cached as an empty masker"
+    );
+}
+
 #[tokio::test]
 async fn registration_persists_runner_public_key_material() {
     let temp = tempfile::tempdir().unwrap();
