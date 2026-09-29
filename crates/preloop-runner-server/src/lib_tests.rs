@@ -7354,7 +7354,10 @@ async fn update_agent_is_self_only_for_runner_tokens() {
     );
     let listing = state.backend.list_runners(None).await.unwrap();
     let row_a = listing.runners.iter().find(|r| r.id == runner_a).unwrap();
-    assert_eq!(row_a.labels, vec!["self-hosted".to_string(), "linux".to_string()]);
+    assert_eq!(
+        row_a.labels,
+        vec!["self-hosted".to_string(), "linux".to_string()]
+    );
 
     // The system token keeps unrestricted access (operator flows).
     assert_eq!(
@@ -26094,7 +26097,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             SHA,
             ".github/workflows/other.yml"
         )
-        .await,
+        .await
+        .unwrap(),
         None,
         "a workflow that was never submitted is new work and must still run"
     );
@@ -26105,7 +26109,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             "dddddddddddddddddddddddddddddddddddddddd",
             PUBLISHED_WORKFLOW
         )
-        .await,
+        .await
+        .unwrap(),
         None,
         "a different commit is different work"
     );
