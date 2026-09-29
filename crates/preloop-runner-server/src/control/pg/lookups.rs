@@ -1657,13 +1657,16 @@ async fn hydrate_steps(
         for row in tx
             .query(
                 &format!(
-                    "SELECT {STEP_COLUMNS}, position FROM (\
+                    // PostgreSQL names the cast expressions in the derived
+                    // table (`int8`, not `started_at`), so re-selecting
+                    // `{STEP_COLUMNS}` from it fails; project it wholesale.
+                    "SELECT s.* FROM (\
                        SELECT {STEP_COLUMNS}, position FROM job_steps \
                        WHERE agent_job_id = ANY($1::text[]::uuid[]) \
                        UNION ALL \
                        SELECT {STEP_COLUMNS}, position FROM step_history \
                        WHERE agent_job_id = ANY($1::text[]::uuid[])) s \
-                     ORDER BY agent_job_id, position"
+                     ORDER BY s.agent_job_id, s.position"
                 ),
                 &[&key_list],
             )

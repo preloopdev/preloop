@@ -990,6 +990,12 @@ impl LiteBackend {
     /// `list_runs`: id order by `(terminal, last-activity desc)`, filtered
     /// on workflow/status/event, then each id's `run_record` projection
     /// (history fallback covers archived runs).
+    ///
+    /// `status` filters on the projected API word like `run_record`, never
+    /// the raw `runs.status` storage word: a terminal run reads its
+    /// conclusion (`completed` matches any terminal run, the wire's
+    /// legacy alias) and a run waiting on its workflow-level gate reads
+    /// `pending`, not `queued`.
     pub(crate) async fn list_runs(
         &self,
         filter: crate::control::backend::RunListFilter,
@@ -998,19 +1004,24 @@ impl LiteBackend {
             let mut stmt = tx
                 .prepare_cached(
                     "SELECT run_id FROM ( \
-                         SELECT run_id, \
-                                CASE WHEN status = 'completed' THEN 1 ELSE 0 END AS terminal_rank, \
-                                COALESCE(completed_at, started_at, created_at) AS sort_at \
-                         FROM runs \
-                         WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
-                           AND (?2 IS NULL OR status = ?2) \
-                           AND (?3 IS NULL OR event = ?3) \
+                         SELECT r.run_id, \
+                                CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END AS terminal_rank, \
+                                COALESCE(r.completed_at, r.started_at, r.created_at) AS sort_at, \
+                                r.workflow_path, r.event, \
+                                CASE WHEN r.status = 'completed' THEN COALESCE(r.conclusion, 'success') \
+                                     WHEN EXISTS (SELECT 1 FROM concurrency_waits w \
+                                                  WHERE w.holder_run_id = r.run_id \
+                                                    AND w.holder_kind = 'run') THEN 'pending' \
+                                     ELSE r.status END AS status \
+                         FROM runs r \
                          UNION ALL \
-                         SELECT run_id, 1, COALESCE(completed_at, started_at, created_at) \
-                         FROM run_history \
-                         WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
-                           AND (?2 IS NULL OR 'completed' = ?2) \
-                           AND (?3 IS NULL OR event = ?3)) \
+                         SELECT h.run_id, 1, \
+                                COALESCE(h.completed_at, h.started_at, h.created_at), \
+                                h.workflow_path, h.event, COALESCE(h.conclusion, 'success') \
+                         FROM run_history h) \
+                     WHERE (?1 IS NULL OR instr(workflow_path, ?1) > 0) \
+                       AND (?2 IS NULL OR status = ?2 OR (?2 = 'completed' AND terminal_rank = 1)) \
+                       AND (?3 IS NULL OR event = ?3) \
                      ORDER BY terminal_rank, sort_at DESC, run_id LIMIT ?4",
                 )
                 .map_err(db)?;

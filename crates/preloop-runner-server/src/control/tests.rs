@@ -1497,6 +1497,78 @@ pub(crate) mod suite {
         assert!(b.held, "second run in the same group must be held");
     }
 
+    /// `list_runs` filters on the projected API status word, never the raw
+    /// storage word (`runs.status`): a terminated run matches its conclusion
+    /// and a workflow-gated run matches `pending`, never `queued`.
+    pub(crate) async fn list_runs_filters_on_the_projected_status(backend: &dyn ControlBackend) {
+        let cancelled = RunId::new();
+        backend
+            .submit_run(submit_run(cancelled, vec![submit_job(cancelled, "build", 1)]))
+            .await
+            .unwrap();
+        backend.cancel_run(cancelled, None).await.unwrap();
+        assert_eq!(
+            backend.run_record(cancelled).await.unwrap().status,
+            ExecutionStatus::Cancelled,
+            "a cancelled run's record projects `cancelled`"
+        );
+
+        let gate = RunId::new();
+        let mut gate_submit = submit_run(gate, vec![submit_job(gate, "deploy", 2)]);
+        gate_submit.workflow_concurrency = Some(workflow_concurrency("deploy", false));
+        assert!(
+            !backend.submit_run(gate_submit).await.unwrap().held,
+            "the first run of a group acquires it"
+        );
+
+        let held = RunId::new();
+        let mut submit = submit_run(held, vec![submit_job(held, "deploy", 3)]);
+        submit.workflow_concurrency = Some(workflow_concurrency("deploy", false));
+        let outcome = backend.submit_run(submit).await.unwrap();
+        assert!(outcome.held, "a second run in the group waits on the gate");
+
+        let by_status = |status: &str| {
+            let backend = backend;
+            let status = status.to_owned();
+            async move {
+                backend
+                    .list_runs(RunListFilter {
+                        status: Some(status),
+                        limit: 50,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let cancelled_list = by_status("cancelled").await;
+        assert!(
+            cancelled_list.iter().any(|run| run.run_id == cancelled),
+            "`?status=cancelled` must return the run whose record reads `cancelled`, got {:?}",
+            cancelled_list
+                .iter()
+                .map(|run| (run.run_id, run.status))
+                .collect::<Vec<_>>()
+        );
+
+        let pending_list = by_status("pending").await;
+        assert!(
+            pending_list.iter().any(|run| run.run_id == held),
+            "`?status=pending` must return the gate-held run"
+        );
+
+        let queued_list = by_status("queued").await;
+        assert!(
+            queued_list.iter().any(|run| run.run_id == gate),
+            "`?status=queued` must return the runnable run holding the gate"
+        );
+        assert!(
+            !queued_list.iter().any(|run| run.run_id == held),
+            "`?status=queued` must not return the gate-held run (its record reads `pending`)"
+        );
+    }
+
     pub(crate) async fn reconcile_recovers_orphaned_claim(backend: &dyn ControlBackend) {
         // Crash-recovery: a job claimed by a runner whose session then dies
         // (releasing the request's owner) is orphaned. reconcile_on_boot must
@@ -2850,6 +2922,12 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn list_runs_filters_on_the_projected_status() {
+        let (_pg, backend) = backend().await;
+        suite::list_runs_filters_on_the_projected_status(&backend).await;
+    }
+
+    #[tokio::test]
     async fn reconcile_recovers_orphaned_claim() {
         let (_pg, backend) = backend().await;
         suite::reconcile_recovers_orphaned_claim(&backend).await;
@@ -3433,6 +3511,11 @@ mod lite {
     #[tokio::test]
     async fn concurrency_gate_serializes_group() {
         suite::concurrency_gate_serializes_group(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn list_runs_filters_on_the_projected_status() {
+        suite::list_runs_filters_on_the_projected_status(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
