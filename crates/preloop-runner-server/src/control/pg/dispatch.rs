@@ -1387,6 +1387,34 @@ pub(super) async fn release_concurrency_for_run(
         )
         .await
         .map_err(db)?;
+    // Lock the runs this release will promote before taking any group-row
+    // lock: every command locks `runs` first and group rows second, so a
+    // promotion that wrote a foreign run's rows under a group lock would
+    // invert that order and deadlock against a command on that run.
+    let mut promoted_runs = std::collections::BTreeSet::new();
+    for row in &rows {
+        let namespace: String = row.get(0);
+        let key = (row.get::<_, String>(1), row.get::<_, String>(2));
+        let waiter = tx
+            .query_opt(
+                "SELECT holder_run_id::text FROM concurrency_waits \
+                 WHERE namespace_id=$1 AND repository=$2 AND group_name=$3 \
+                 ORDER BY wait_id LIMIT 1",
+                &[&namespace, &key.0, &key.1],
+            )
+            .await
+            .map_err(db)?;
+        if let Some(waiter) = waiter {
+            if let Ok(promoted) = waiter.get::<_, String>(0).parse::<RunId>() {
+                if promoted != run_id {
+                    promoted_runs.insert(promoted);
+                }
+            }
+        }
+    }
+    for promoted in promoted_runs {
+        PgBackend::lock_run(tx, promoted).await?;
+    }
     for row in rows {
         let namespace: String = row.get(0);
         let key = (row.get::<_, String>(1), row.get::<_, String>(2));
@@ -1432,6 +1460,24 @@ async fn promote_after_release_inner(
     namespace: &str,
     key: &(String, String),
 ) -> Result<(), ControlError> {
+    // Take the promoted run's row lock before touching any group row: every
+    // command locks `runs` first and group rows second, so promoting (and
+    // then writing) a foreign run while holding a group-row lock would
+    // invert that order and deadlock against a command on that run.
+    let next_run = tx
+        .query_opt(
+            "SELECT holder_run_id::text FROM concurrency_waits \
+             WHERE namespace_id=$1 AND repository=$2 AND group_name=$3 \
+             ORDER BY wait_id LIMIT 1",
+            &[&namespace, &key.0, &key.1],
+        )
+        .await
+        .map_err(db)?;
+    if let Some(row) = next_run {
+        if let Ok(run_id) = row.get::<_, String>(0).parse::<RunId>() {
+            PgBackend::lock_run(tx, run_id).await?;
+        }
+    }
     let next = tx
         .query_opt(
             "SELECT wait_id, holder_kind, holder_run_id::text, holder_job_id, \
