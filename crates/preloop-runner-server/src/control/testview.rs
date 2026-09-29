@@ -181,6 +181,12 @@ pub(crate) struct TestState {
     pub(crate) job_assignments: BTreeMap<(RunId, JobId), crate::models::AssignmentRecord>,
     pub(crate) pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
     pub(crate) cancellation_queue: VecDeque<QueuedCancellation>,
+    /// Durable outbox rows written in this working set: `(run, topic)`, in
+    /// `event_id` order. Test-only read for the transactional event contract.
+    pub(crate) outbox_topics: Vec<(Option<RunId>, String)>,
+    /// Every queued job cancellation with its recorded reason
+    /// (`job_cancellations.reason`), in cancellation order.
+    pub(crate) cancellation_reasons: Vec<(RunId, JobId, Option<String>)>,
 
     // ── Configuration seeded at load (not persisted) ──────────────────
     pub(crate) pool_assignments_enabled: bool,

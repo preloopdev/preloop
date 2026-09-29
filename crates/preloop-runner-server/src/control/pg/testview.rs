@@ -595,6 +595,37 @@ impl PgBackend {
                 agent_job_id: codec::uuid(row.get::<_, String>(2).as_str())?,
             });
         }
+        for row in client
+            .query(
+                "SELECT q.run_id::text, q.job_id, c.reason \
+                 FROM job_cancellations c \
+                 JOIN job_requests q ON q.request_id = c.request_id \
+                 ORDER BY c.cancellation_id",
+                &[],
+            )
+            .await
+            .map_err(db)?
+        {
+            t.cancellation_reasons.push((
+                codec::run_id(row.get::<_, String>(0).as_str())?,
+                codec::job_id(row.get(1)),
+                row.get::<_, Option<String>>(2),
+            ));
+        }
+        for row in client
+            .query(
+                "SELECT run_id::text, topic FROM outbox_events ORDER BY event_id",
+                &[],
+            )
+            .await
+            .map_err(db)?
+        {
+            let run: Option<String> = row.get(0);
+            t.outbox_topics.push((
+                run.map(|run| codec::run_id(&run)).transpose()?,
+                row.get(1),
+            ));
+        }
 
         // ── Counters ─────────────────────────────────────────────────
         let row = client

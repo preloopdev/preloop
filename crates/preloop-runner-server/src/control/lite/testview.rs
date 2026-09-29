@@ -720,6 +720,41 @@ impl LiteBackend {
                 agent_job_id: codec::uuid(&agent),
             });
         }
+        for row in tx
+            .prepare_cached(
+                "SELECT q.run_id, q.job_id, c.reason FROM job_cancellations c \
+                 JOIN job_requests q ON q.request_id = c.request_id \
+                 ORDER BY c.cancellation_id",
+            )
+            .map_err(db)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(db)?
+        {
+            let (run, job, reason) = row.map_err(db)?;
+            t.cancellation_reasons
+                .push((codec::run_id(&run), codec::job_id(job), reason));
+        }
+        for row in tx
+            .prepare_cached("SELECT run_id, topic FROM outbox_events ORDER BY event_id")
+            .map_err(db)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })
+            .map_err(db)?
+        {
+            let (run, topic) = row.map_err(db)?;
+            t.outbox_topics
+                .push((run.map(|run| codec::run_id(&run)), topic));
+        }
 
         // ── Counters ─────────────────────────────────────────────────
         t.next_request_id = tx

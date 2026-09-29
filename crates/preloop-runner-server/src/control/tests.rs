@@ -250,6 +250,45 @@ fn submit_job_full(run_id: RunId, job_id: &str, request_id: i64) -> SubmitJob {
     job
 }
 
+/// One materialized matrix leg for an `apply_expansion` call: a `BuiltJob`
+/// whose plan carries the leg's id/base and whose artifacts are the minimal
+/// message/request rows `register_built_jobs` persists. The request id is
+/// allocated by the backend, so the fixture's value is irrelevant.
+fn built_matrix_leg(
+    run_id: RunId,
+    job_id: &str,
+    base_id: &str,
+    index: usize,
+    total: usize,
+) -> crate::control::logic::BuiltJob {
+    let plan: preloop_gha_protocol::JobPlan = serde_json::from_value(serde_json::json!({
+        "id": job_id,
+        "base_id": base_id,
+        "name": job_id,
+        "runs_on": ["self-hosted"],
+        "matrix_index": index,
+        "matrix_total": total,
+        "fail_fast": true,
+        "continue_on_error": false,
+    }))
+    .expect("matrix leg plan decodes");
+    crate::control::logic::BuiltJob {
+        plan,
+        condition_context: preloop_gha_expressions::Context::default(),
+        artifacts: crate::runs::BuiltJobArtifacts {
+            agent_msg: job_message(job_id, index as i64),
+            job_request: request_record(run_id, job_id, index as i64),
+            id_token_granted: false,
+            oidc_ctx: crate::state::OidcJobContext {
+                environment: None,
+                job_workflow_ref: None,
+                job_workflow_sha: None,
+            },
+            github_token_request: None,
+        },
+    }
+}
+
 fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
     let mut record = run_record(run_id);
     record.run_number = NEXT_FIXTURE_RUN_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -776,6 +815,261 @@ pub(crate) mod suite {
             }
             other => panic!("expected cancel, got {other:?}"),
         }
+    }
+
+    /// A fail-fast matrix leg's failure cancels its pending siblings; the
+    /// dependent that declared `needs: <matrix base>` must then compute as
+    /// settled (skipped), not hang on a stale `remaining_needs` counter, and
+    /// the run must finalize.
+    pub(crate) async fn matrix_fail_fast_settles_dependent_and_run(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        // `fan` is a needs-driven matrix; `after` depends on the matrix base.
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut after = submit_job(run_id, "after", 3);
+        after.queued.needs = vec![JobId("fan".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), fan, after],
+            ))
+            .await
+            .unwrap();
+
+        // Completing `gen` queues the deferred node for expansion.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        built_matrix_leg(run_id, "fan-1", "fan", 1, 2),
+                        built_matrix_leg(run_id, "fan-2", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+
+        // One leg fails while its sibling is still pending: fail-fast cancels
+        // the sibling, and the base's dependent must settle.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("fan-1".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("fan-1".to_owned())),
+            Some(&ExecutionStatus::Failure)
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("fan-2".to_owned())),
+            Some(&ExecutionStatus::Cancelled),
+            "fail-fast must cancel the pending sibling"
+        );
+        assert_eq!(
+            record.jobs.get(&JobId("after".to_owned())),
+            Some(&ExecutionStatus::Skipped),
+            "the dependent of a fail-fast-cancelled matrix must settle"
+        );
+        assert!(
+            record.status.is_terminal(),
+            "the run must finalize once the dependent settles, got {:?}",
+            record.status
+        );
+    }
+
+    /// A cancellation that lands between `claim_expansion` and
+    /// `apply_expansion` invalidates the lease: the build's subtree must be
+    /// discarded and the run must stay cancelled.
+    pub(crate) async fn cancelled_run_discards_in_flight_expansion(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), fan],
+            ))
+            .await
+            .unwrap();
+
+        // Completing `gen` promotes the deferred node into the expansion queue.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+        assert_eq!(claim.generation, 1);
+
+        backend.cancel_run(run_id, None).await.unwrap();
+        assert_eq!(
+            backend.run_record(run_id).await.unwrap().status,
+            ExecutionStatus::Cancelled
+        );
+
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        built_matrix_leg(run_id, "fan-1", "fan", 1, 2),
+                        built_matrix_leg(run_id, "fan-2", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.conclusion.as_deref(),
+            Some("cancelled"),
+            "a build that returns after cancellation must not resurrect the run"
+        );
+        assert_eq!(record.status, ExecutionStatus::Cancelled);
+        assert!(
+            !record.jobs.contains_key(&JobId("fan-1".to_owned()))
+                && !record.jobs.contains_key(&JobId("fan-2".to_owned())),
+            "a stale build must not register legs into a cancelled run"
+        );
+    }
+
+    /// Cancelling a run that already completed is a no-op: the terminal
+    /// conclusion is preserved (pg guards the transition; lite must too).
+    pub(crate) async fn cancel_of_terminal_run_preserves_conclusion(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.run_record(run_id).await.unwrap().conclusion.as_deref(),
+            Some("success")
+        );
+
+        backend.cancel_run(run_id, None).await.unwrap();
+        let after = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            after.conclusion.as_deref(),
+            Some("success"),
+            "cancelling a completed run must not rewrite its conclusion"
+        );
+        assert_eq!(after.status, ExecutionStatus::Success);
+        // A repeat cancel is still a no-op.
+        backend.cancel_run(run_id, None).await.unwrap();
+        assert_eq!(
+            backend.run_record(run_id).await.unwrap().conclusion.as_deref(),
+            Some("success")
+        );
+    }
+
+    /// A starved run is finalized without releasing its workflow-level
+    /// concurrency hold (the trait doc: `reap_sweep` step 1 performs no
+    /// concurrency release). A run parked behind the group stays held.
+    pub(crate) async fn starved_run_keeps_workflow_hold(backend: &dyn ControlBackend) {
+        let run_a = RunId::new();
+        let mut submit_a = submit_run(run_a, vec![submit_job(run_a, "deploy", 1)]);
+        submit_a.workflow_concurrency = Some(workflow_concurrency("g", false));
+        backend.submit_run(submit_a).await.unwrap();
+
+        let run_b = RunId::new();
+        let mut submit_b = submit_run(run_b, vec![submit_job(run_b, "deploy", 2)]);
+        submit_b.workflow_concurrency = Some(workflow_concurrency("g", false));
+        let held = backend.submit_run(submit_b).await.unwrap();
+        assert!(held.held, "the second run in the group must be held");
+
+        // No runner matches `self-hosted`, so A's only ready job starves once
+        // the grace window passes.
+        let ready: Vec<ReadyRow> = backend
+            .reap_inputs()
+            .await
+            .unwrap()
+            .ready
+            .into_iter()
+            .filter(|row| row.run_id == run_a)
+            .collect();
+        assert_eq!(ready.len(), 1, "the holder's job must be ready");
+        backend
+            .reap_sweep(ReapSweep {
+                now: std::time::SystemTime::now() + std::time::Duration::from_secs(600),
+                runs: std::collections::BTreeSet::from([run_a]),
+                ready,
+                active: Vec::new(),
+                paused: BTreeMap::new(),
+                pool_preparing: false,
+                warm_window_open: false,
+                first_seen: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let a = backend.run_record(run_a).await.unwrap();
+        assert_eq!(
+            a.jobs.get(&JobId("deploy".to_owned())),
+            Some(&ExecutionStatus::Failure),
+            "the starved job must be failed"
+        );
+        assert!(a.status.is_terminal(), "starvation must finalize the run");
+
+        let b = backend.run_record(run_b).await.unwrap();
+        assert_eq!(
+            b.status,
+            ExecutionStatus::Pending,
+            "starvation must not release the run's workflow concurrency hold"
+        );
     }
 
     /// Secret values are never written to the control database: a record
@@ -2211,6 +2505,30 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn matrix_fail_fast_settles_dependent_and_run() {
+        let (_pg, backend) = backend().await;
+        suite::matrix_fail_fast_settles_dependent_and_run(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_discards_in_flight_expansion() {
+        let (_pg, backend) = backend().await;
+        suite::cancelled_run_discards_in_flight_expansion(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_of_terminal_run_preserves_conclusion() {
+        let (_pg, backend) = backend().await;
+        suite::cancel_of_terminal_run_preserves_conclusion(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn starved_run_keeps_workflow_hold() {
+        let (_pg, backend) = backend().await;
+        suite::starved_run_keeps_workflow_hold(&backend).await;
+    }
+
+    #[tokio::test]
     async fn artifact_scopes_map_plan_ids_to_latest_run() {
         let (_pg, backend) = backend().await;
         suite::artifact_scopes_map_plan_ids_to_latest_run(&backend).await;
@@ -2485,9 +2803,209 @@ mod pg {
 // `&dyn ControlBackend`.
 mod lite {
     use super::suite;
-    use crate::control::backend::ControlBackend;
+    use super::{built_matrix_leg, create_session, poll, register_runner, submit_job, submit_run};
+    use crate::control::backend::{ControlBackend, ExpansionApply, JobCompletionInput};
     use crate::control::lite::LiteBackend;
+    use crate::control::types::PollOutcome;
     use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// Two materialized legs of the `fan` matrix.
+    fn fan_legs(run_id: RunId) -> crate::control::logic::BuiltExpansion {
+        crate::control::logic::BuiltExpansion::Matrix {
+            jobs: vec![
+                built_matrix_leg(run_id, "fan-1", "fan", 1, 2),
+                built_matrix_leg(run_id, "fan-2", "fan", 2, 2),
+            ],
+        }
+    }
+
+    /// Queue and lease the deferred `fan` node of a fresh run (`gen` produces
+    /// the matrix), returning the lease.
+    async fn lease_fan(
+        backend: &LiteBackend,
+        run_id: RunId,
+    ) -> crate::control::types::ExpansionClaim {
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), fan],
+            ))
+            .await
+            .unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend.claim_expansion().await.unwrap().unwrap()
+    }
+
+    /// Cancelling an already-terminal run must not append a second
+    /// `run.completed.v1` (pg emits it once, guarded).
+    #[tokio::test]
+    async fn terminal_cancel_does_not_re_emit_run_completed() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        backend.cancel_run(run_id, None).await.unwrap();
+        backend.cancel_run(run_id, None).await.unwrap();
+        let state = backend.test_working_set().unwrap();
+        let completed = state
+            .outbox_topics
+            .iter()
+            .filter(|(run, topic)| *run == Some(run_id) && topic == "run.completed.v1")
+            .count();
+        assert_eq!(completed, 1, "a run must emit run.completed.v1 exactly once");
+        assert_eq!(state.runs[&run_id].conclusion.as_deref(), Some("success"));
+    }
+
+    /// A run whose jobs all conclude at submit still emits its terminal event.
+    #[tokio::test]
+    async fn submit_concluded_run_emits_completion() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        let mut job = submit_job(run_id, "skip", 1);
+        job.initially_skipped = true;
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
+        let state = backend.test_working_set().unwrap();
+        let topics: Vec<&str> = state
+            .outbox_topics
+            .iter()
+            .filter(|(run, _)| *run == Some(run_id))
+            .map(|(_, topic)| topic.as_str())
+            .collect();
+        assert!(topics.contains(&"run.created.v1"), "got {topics:?}");
+        assert!(
+            topics.contains(&"run.completed.v1"),
+            "a run concluded at submit must emit run.completed.v1, got {topics:?}"
+        );
+    }
+
+    /// A run cancelled on arrival emits both its creation and its completion.
+    #[tokio::test]
+    async fn arrival_cancelled_submit_emits_run_events() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let newer = RunId::new();
+        let mut newer_submit = submit_run(newer, vec![submit_job(newer, "deploy", 1)]);
+        newer_submit.workflow_concurrency = Some(super::workflow_concurrency("g", true));
+        Arc::make_mut(&mut newer_submit.record.submission).payload =
+            serde_json::json!({"repository": {"pushed_at": 2000}});
+        backend.submit_run(newer_submit).await.unwrap();
+
+        let older = RunId::new();
+        let mut older_submit = submit_run(older, vec![submit_job(older, "deploy", 2)]);
+        older_submit.workflow_concurrency = Some(super::workflow_concurrency("g", true));
+        Arc::make_mut(&mut older_submit.record.submission).payload =
+            serde_json::json!({"repository": {"pushed_at": 1000}});
+        let outcome = backend.submit_run(older_submit).await.unwrap();
+        assert_eq!(
+            outcome.rejected,
+            Some(ExecutionStatus::Cancelled),
+            "the older arrival must be superseded"
+        );
+        let state = backend.test_working_set().unwrap();
+        let topics: Vec<&str> = state
+            .outbox_topics
+            .iter()
+            .filter(|(run, _)| *run == Some(older))
+            .map(|(_, topic)| topic.as_str())
+            .collect();
+        assert!(topics.contains(&"run.created.v1"), "got {topics:?}");
+        assert!(
+            topics.contains(&"run.completed.v1"),
+            "an arrival-cancelled run must emit run.completed.v1, got {topics:?}"
+        );
+    }
+
+    /// Fail-fast cancellations record the `fail_fast` reason (pg parity).
+    #[tokio::test]
+    async fn fail_fast_cancellation_reason_is_fail_fast() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        let claim = lease_fan(&backend, run_id).await;
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(fan_legs(run_id)),
+            })
+            .await
+            .unwrap();
+
+        // Claim one leg so it is in progress when the sibling fails.
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let other = if claimed.queued.job_id == JobId("fan-1".to_owned()) {
+            JobId("fan-2".to_owned())
+        } else {
+            JobId("fan-1".to_owned())
+        };
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: other,
+                agent_job_id: None,
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let state = backend.test_working_set().unwrap();
+        assert_eq!(
+            state.cancellation_reasons.len(),
+            1,
+            "the in-progress sibling must be cancelled"
+        );
+        assert_eq!(
+            state.cancellation_reasons[0].2.as_deref(),
+            Some("fail_fast"),
+            "fail-fast cancellations must match pg's reason"
+        );
+    }
 
     #[tokio::test]
     async fn submit_poll_complete_lifecycle() {
@@ -2529,6 +3047,27 @@ mod lite {
     #[tokio::test]
     async fn cancel_run_queues_cancellation() {
         suite::cancel_run_queues_cancellation(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_fail_fast_settles_dependent_and_run() {
+        suite::matrix_fail_fast_settles_dependent_and_run(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_discards_in_flight_expansion() {
+        suite::cancelled_run_discards_in_flight_expansion(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_of_terminal_run_preserves_conclusion() {
+        suite::cancel_of_terminal_run_preserves_conclusion(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn starved_run_keeps_workflow_hold() {
+        suite::starved_run_keeps_workflow_hold(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
