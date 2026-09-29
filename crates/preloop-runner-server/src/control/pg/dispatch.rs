@@ -5257,6 +5257,8 @@ impl PgBackend {
             message,
             run_id,
             job_id,
+            queue_depth: self.queue_depth().await?,
+            next_runs_on: self.ready_front_labels().await?,
         })
     }
 }

@@ -8915,6 +8915,185 @@ async fn cancel_run_refreshes_runner_pool_queue_metadata() {
     );
 }
 
+/// R8-4. The disttask (AzDO) claim is exactly when the ready queue shrinks,
+/// so it must refresh the same supervisor gauges the broker claim and the
+/// completion path refresh — otherwise the on-demand pool keeps seeing
+/// phantom queued work and a stale next-job hint.
+#[tokio::test]
+async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    for (runs_on, marker) in [("ubuntu-22.04", "first"), ("ubuntu-24.04", "second")] {
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": format!(
+                    "on: push\njobs:\n  build:\n    runs-on: {runs_on}\n    steps:\n      - run: echo {marker}\n"
+                ),
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+    }
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
+    assert_eq!(
+        *state.next_job_runs_on.read().unwrap(),
+        vec!["ubuntu-22.04"]
+    );
+
+    let message = poll_message(&app, "preloop-system-token", "default").await;
+    assert_eq!(
+        message["messageType"],
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+    );
+
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "a disttask claim must refresh the pool queue-depth gauge"
+    );
+    assert_eq!(
+        *state.next_job_runs_on.read().unwrap(),
+        vec!["ubuntu-24.04"],
+        "a disttask claim must refresh the pool next-job labels"
+    );
+}
+
+/// R8-3. A control-DB failure on the runner's disttask poll must not be
+/// answered as "nothing to deliver": the runner would long-poll forever
+/// against an outage. The mapped error (5xx) is the honest answer.
+#[tokio::test]
+async fn disttask_poll_surfaces_control_db_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // The poll's first statement after materializing the implicit compat
+    // session reads `session_messages`; dropping it makes the backend fail.
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE session_messages", [])
+                .expect("drop session_messages");
+        })
+        .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a control-DB outage must not look like an empty poll"
+    );
+}
+
+/// R8-3. An empty timeline is a legitimate answer, so a failed timeline read
+/// must not be reported as one.
+#[tokio::test]
+async fn timeline_read_surfaces_control_db_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE timeline_records", [])
+                .expect("drop timeline_records");
+        })
+        .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(
+                    "/_apis/v1/plans/plan-x/timelines/00000000-0000-0000-0000-000000000001/records",
+                )
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed timeline read must not be answered as an empty timeline"
+    );
+}
+
+/// R8-3. A timeline PATCH that the control DB rejects must not answer 200
+/// with `count: 0`: the runner would believe its records were persisted.
+#[tokio::test]
+async fn timeline_patch_surfaces_control_db_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let run = submit_simple_run(&app).await;
+    let _ = run;
+    let timeline_id: String = state
+        .test_db_mutate(|tx| {
+            tx.0.query_row("SELECT timeline_id FROM job_requests LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("a submitted job owns a timeline")
+        })
+        .await;
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE timeline_records", [])
+                .expect("drop timeline_records");
+        })
+        .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!(
+                    "/_apis/v1/plans/plan-x/timelines/{timeline_id}/records"
+                ))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "count": 1,
+                        "value": [{
+                            "id": "00000000-0000-0000-0000-0000000000ff",
+                            "name": "build",
+                            "type": "Job",
+                            "state": "inProgress"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a rejected timeline write must not be reported as a successful empty batch"
+    );
+}
+
 #[tokio::test]
 async fn message_poll_waits_until_work_is_enqueued() {
     let temp = tempfile::tempdir().unwrap();

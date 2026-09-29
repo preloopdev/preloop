@@ -4,7 +4,7 @@ pub async fn next_message(
     State(shared): State<Arc<SharedState>>,
     identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
+) -> Result<(StatusCode, Json<Option<azdo::TaskAgentMessage>>), ApiError> {
     let session_id = params
         .get("sessionId")
         .cloned()
@@ -28,33 +28,51 @@ pub async fn next_message(
                 session_id: session_id.clone(),
                 verified_runner_id: verified,
             })
-            .await;
-        let outcome = match outcome {
-            Ok(o) => o,
-            Err(_) => return (StatusCode::ACCEPTED, Json(None)),
-        };
+            .await
+            // A control-DB failure must not look like "nothing to deliver":
+            // the runner would long-poll forever against an outage. Surface
+            // the mapped error (5xx) so it retries the way it does for any
+            // other server fault.
+            .map_err(|error| {
+                tracing::warn!(%error, %session_id, "disttask poll failed");
+                ApiError::from(error)
+            })?;
 
         match outcome {
             crate::control::types::AzdoPollOutcome::Forbidden => {
-                return (StatusCode::FORBIDDEN, Json(None));
+                return Ok((StatusCode::FORBIDDEN, Json(None)));
             }
             crate::control::types::AzdoPollOutcome::Redeliver(message) => {
-                return match render_session_message(&shared, &session_id, message).await {
-                    Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
-                    None => (StatusCode::ACCEPTED, Json(None)),
-                };
+                return Ok(
+                    match render_session_message(&shared, &session_id, message).await {
+                        Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
+                        None => (StatusCode::ACCEPTED, Json(None)),
+                    },
+                );
             }
             crate::control::types::AzdoPollOutcome::Cancel(message) => {
-                return match render_session_message(&shared, &session_id, message).await {
-                    Some(rendered) => (StatusCode::OK, Json(Some(rendered))),
-                    None => (StatusCode::ACCEPTED, Json(None)),
-                };
+                return Ok(
+                    match render_session_message(&shared, &session_id, message).await {
+                        Some(rendered) => (StatusCode::OK, Json(Some(rendered))),
+                        None => (StatusCode::ACCEPTED, Json(None)),
+                    },
+                );
             }
             crate::control::types::AzdoPollOutcome::Claimed {
                 message,
                 run_id,
                 job_id,
+                queue_depth,
+                next_runs_on,
             } => {
+                // Refresh the on-demand pool gauges from the committed
+                // claim, exactly like the broker claim path: the ready
+                // queue just shrank.
+                shared
+                    .state
+                    .queue_depth
+                    .store(queue_depth, std::sync::atomic::Ordering::Release);
+                *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 github::report_check_run_in_progress(&shared, run_id, &job_id).await;
                 shared
                     .state
@@ -65,20 +83,22 @@ pub async fn next_message(
                         reason: None,
                     })
                     .await;
-                return match render_session_message(&shared, &session_id, message).await {
-                    Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
-                    None => (StatusCode::ACCEPTED, Json(None)),
-                };
+                return Ok(
+                    match render_session_message(&shared, &session_id, message).await {
+                        Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
+                        None => (StatusCode::ACCEPTED, Json(None)),
+                    },
+                );
             }
             crate::control::types::AzdoPollOutcome::Wait => {
                 if wait_seconds == 0 {
-                    return (StatusCode::OK, Json(None));
+                    return Ok((StatusCode::OK, Json(None)));
                 }
                 if tokio::time::timeout_at(deadline, shared.state.message_notify.notified())
                     .await
                     .is_err()
                 {
-                    return (StatusCode::OK, Json(None));
+                    return Ok((StatusCode::OK, Json(None)));
                 }
                 continue;
             }

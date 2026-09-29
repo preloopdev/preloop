@@ -703,6 +703,8 @@ impl LiteBackend {
                 message,
                 run_id,
                 job_id,
+                queue_depth: jobs::ready_count(tx)?,
+                next_runs_on: jobs::next_ready_labels(tx)?,
             })
         })
     }

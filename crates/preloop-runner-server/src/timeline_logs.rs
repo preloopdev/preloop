@@ -30,7 +30,7 @@ pub async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let records = wrapper.value;
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
     // Resolve the callback (plan/timeline → attempt → run/job + current job
@@ -154,10 +154,12 @@ pub async fn patch_timeline_records(
         .patch_timeline(&timeline_key, records)
         .await
     {
-        Ok((_change_id, stored)) => Json(json!({ "count": stored.len(), "value": stored })),
+        Ok((_change_id, stored)) => Ok(Json(json!({ "count": stored.len(), "value": stored }))),
+        // A 200 with an empty body would tell the runner its records were
+        // persisted when the control DB rejected them; surface the fault.
         Err(error) => {
             warn!(?error, "failed to persist timeline records");
-            Json(json!({ "count": 0, "value": [] }))
+            Err(ApiError::from(error))
         }
     }
 }
@@ -568,7 +570,7 @@ pub async fn patch_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     patch_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
@@ -592,7 +594,7 @@ pub async fn get_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Query(query): Query<TimelineQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
     // When `top` is absent the official runner expects the full timeline
     // (it does not paginate); storage is capped at MAX_TIMELINE_RECORDS, so
@@ -606,17 +608,20 @@ pub async fn get_timeline_records(
         .backend
         .get_timeline(&timeline_key, skip, top)
         .await
-        .unwrap_or_else(|error| {
+        // An empty timeline is a legitimate answer, so a failed read must
+        // not be reported as one: the runner would conclude the timeline is
+        // empty instead of retrying.
+        .map_err(|error| {
             warn!(?error, "failed to read timeline records");
-            (0, Vec::new())
-        });
-    Json(json!({
+            ApiError::from(error)
+        })?;
+    Ok(Json(json!({
         "id": timeline_id,
         "changeId": change_id,
         "lastChangedBy": uuid::Uuid::nil(),
         "lastChangedOn": "0001-01-01T00:00:00",
         "records": records
-    }))
+    })))
 }
 
 /// GET `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
@@ -624,7 +629,7 @@ pub async fn get_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     Query(query): Query<TimelineQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     get_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
@@ -788,7 +793,7 @@ pub async fn patch_timeline_records_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
     authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
-    Ok(patch_timeline_records(State(shared), Path(path), Json(wrapper)).await)
+    patch_timeline_records(State(shared), Path(path), Json(wrapper)).await
 }
 
 pub async fn get_timeline_records_authenticated(
@@ -799,7 +804,7 @@ pub async fn get_timeline_records_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
     authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
-    Ok(get_timeline_records(State(shared), Path(path), Query(query)).await)
+    get_timeline_records(State(shared), Path(path), Query(query)).await
 }
 
 pub async fn create_log_authenticated(
@@ -865,10 +870,7 @@ pub async fn patch_timeline_records_plan_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
     authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
-    Ok(
-        patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper))
-            .await,
-    )
+    patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper)).await
 }
 
 pub async fn get_timeline_records_plan_authenticated(
@@ -879,7 +881,7 @@ pub async fn get_timeline_records_plan_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
     authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
-    Ok(get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await)
+    get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await
 }
 
 pub async fn create_log_plan_authenticated(

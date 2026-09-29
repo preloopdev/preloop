@@ -1083,7 +1083,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     ///    (`verified_runner_id`, else the session owner) and
     ///    `claimed_at`/`started_at`/`last_renewed_at = now`, and queue a
     ///    `PipelineAgentJobRequest` message carrying only that request id →
-    ///    `Claimed`.
+    ///    `Claimed`. The outcome also carries the post-claim ready-queue
+    ///    depth and the new queue front's `runs-on` labels, so the handler
+    ///    refreshes the supervisor gauges exactly like the broker claim.
     ///
     /// Message ids come from the shared session-message id sequence.
     async fn poll_azdo_session(&self, poll: AzdoPoll) -> Result<AzdoPollOutcome, ControlError>;

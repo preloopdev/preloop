@@ -965,7 +965,7 @@ pub async fn next_message_compat(
     Path(_pool_id): Path<i64>,
     identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
+) -> Result<(StatusCode, Json<Option<azdo::TaskAgentMessage>>), ApiError> {
     next_message(State(shared), identity, Query(params)).await
 }
 /// POST /api/v1/runners/purge — orchestrator-facing runner deregistration:

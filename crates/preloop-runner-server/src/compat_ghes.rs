@@ -190,12 +190,12 @@ pub async fn patch_timeline_records_org(
         None,
     )
     .await?;
-    Ok(patch_timeline_records(
+    patch_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
         Json(wrapper),
     )
-    .await)
+    .await
 }
 
 pub async fn get_timeline_records_org(
@@ -213,12 +213,12 @@ pub async fn get_timeline_records_org(
         None,
     )
     .await?;
-    Ok(get_timeline_records(
+    get_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
         Query(query),
     )
-    .await)
+    .await
 }
 
 pub async fn create_log_org(

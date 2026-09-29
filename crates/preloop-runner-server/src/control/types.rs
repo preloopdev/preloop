@@ -1034,11 +1034,18 @@ pub(crate) enum AzdoPollOutcome {
     /// a `JobCancellation` session message (HTTP 200).
     Cancel(SessionMessage),
     /// A job was claimed: the new `PipelineAgentJobRequest` session message
-    /// (HTTP 202) and the job it assigns.
+    /// (HTTP 202) and the job it assigns, plus the ready-queue snapshot the
+    /// committed claim produced so the handler can refresh the supervisor
+    /// gauges (`queue_depth`/`next_job_runs_on`) the same way the broker
+    /// claim does.
     Claimed {
         message: SessionMessage,
         run_id: RunId,
         job_id: JobId,
+        /// Queue depth after the claim (for the supervisor atomic).
+        queue_depth: usize,
+        /// `runs-on` of the new queue front, for `next_job_runs_on`.
+        next_runs_on: Vec<String>,
     },
     /// Nothing to deliver now; the handler may long-poll.
     Wait,
