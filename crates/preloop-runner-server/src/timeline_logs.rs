@@ -155,8 +155,13 @@ pub async fn patch_timeline_records(
         .await
     {
         Ok((_change_id, stored)) => Ok(Json(json!({ "count": stored.len(), "value": stored }))),
-        // A 200 with an empty body would tell the runner its records were
-        // persisted when the control DB rejected them; surface the fault.
+        // An unknown timeline (test hooks, standalone uploads) keeps the
+        // permissive empty answer the pre-backend model gave.
+        Err(crate::control::ControlError::NotFound(_)) => {
+            Ok(Json(json!({ "count": 0, "value": [] })))
+        }
+        // Anything else is a real persistence failure: answering 200 with an
+        // empty body would tell the runner its records were stored.
         Err(error) => {
             warn!(?error, "failed to persist timeline records");
             Err(ApiError::from(error))
