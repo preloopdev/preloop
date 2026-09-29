@@ -865,3 +865,38 @@ async fn pair_runner_rebinds_swept_binding() {
     );
 }
 
+/// `purge_runner` must re-mark a ready job it still owned as pool-pending
+/// (trait doc `purge_runner_guarded`): the FK's `ON DELETE SET NULL` only
+/// clears the binding, which leaves the job invisible to `pair_runner` and
+/// unpairable by provisioning.
+#[tokio::test]
+async fn purge_returns_ready_assignment_to_pool() {
+    let (_pg, node) = pool_backend().await;
+    let run_id = RunId::new();
+    let job = JobId("build".to_owned());
+    let first = node.register_runner(register_runner("r1")).await.unwrap();
+    node.submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+        .await
+        .unwrap();
+    node.pair_runner(first.runner.id).await.unwrap();
+    assert_eq!(
+        assigned_runner(&node, run_id, &job).await,
+        Some(first.runner.id)
+    );
+
+    node.purge_runner(first.runner.id).await.unwrap();
+    let working = node.test_working_set().await.unwrap();
+    assert!(
+        working.pool_pending.contains_key(&(run_id, job.clone())),
+        "the purged runner's ready job must return to the pool waitlist"
+    );
+
+    // A replacement runner pairs straight from the waitlist.
+    let second = node.register_runner(register_runner("r2")).await.unwrap();
+    node.pair_runner(second.runner.id).await.unwrap();
+    assert_eq!(
+        assigned_runner(&node, run_id, &job).await,
+        Some(second.runner.id)
+    );
+}
+

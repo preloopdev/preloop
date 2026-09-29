@@ -584,6 +584,20 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        // Ready-but-assigned jobs of the dead runner return to pool-pending
+        // so provisioning re-runs for them. Collected BEFORE the runner row
+        // goes away — `job_assignments.runner_id` is ON DELETE SET NULL, so
+        // the delete below would hide them.
+        let unclaimed = tx
+            .query(
+                "SELECT j.run_id::text, j.job_id FROM jobs j \
+                 WHERE j.queue_state='ready' AND EXISTS ( \
+                   SELECT 1 FROM job_assignments a WHERE a.run_id=j.run_id \
+                   AND a.job_id=j.job_id AND a.runner_id=$1)",
+                &[&runner_id],
+            )
+            .await
+            .map_err(db)?;
         tx.execute("DELETE FROM runners WHERE runner_id=$1", &[&runner_id])
             .await
             .map_err(db)?;
@@ -596,6 +610,31 @@ impl PgBackend {
             let run_id = codec::run_id(row.get(0))?;
             let job_id = JobId(row.get(1));
             super::dispatch::requeue_claimed_tx(tx, run_id, &job_id).await?;
+        }
+        let now = now_us();
+        for row in unclaimed {
+            let run_id = row.get::<_, String>(0);
+            let job_id = JobId(row.get::<_, String>(1));
+            tx.execute(
+                "DELETE FROM job_assignments WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run_id, &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+            tx.execute(
+                concat!(
+                    "INSERT INTO provision_requests (run_id, job_id, namespace_id, \
+                     pool_key, labels, requested_at) \
+                     SELECT j.run_id, j.job_id, j.namespace_id, j.pool_key, j.runs_on, ",
+                    ts!("$3"),
+                    " FROM jobs j WHERE j.run_id = $1::text::uuid AND j.job_id = $2 \
+                     ON CONFLICT (run_id, job_id) DO UPDATE SET \
+                     requested_at = EXCLUDED.requested_at"
+                ),
+                &[&run_id, &job_id.0, &now],
+            )
+            .await
+            .map_err(db)?;
         }
         Ok(())
     }
