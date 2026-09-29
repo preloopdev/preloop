@@ -1826,7 +1826,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             .state
             .backend
             .submit_run(crate::control::types::SubmitRun {
-                namespace: submission.repository.clone(),
+                // Must match the namespace `allocate_run_number` just used:
+                // local runs live in DEFAULT_NAMESPACE, so the run row, its
+                // jobs and its concurrency keys all land there rather than
+                // under the repository slug.
+                namespace: crate::control::types::DEFAULT_NAMESPACE.to_owned(),
                 record,
                 jobs: submit_jobs,
                 workflow_concurrency,
@@ -1886,6 +1890,13 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         // Skipped jobs land in `outcome.concluded` (emitted below) — the
         // backend concluded them inside `submit_run`.
         for (job_id, status, reason) in &outcome.concluded {
+            // The empty-workflow-concurrency-group rejection names no real job:
+            // the backend marks it with a synthetic `*` id and the run-level
+            // `RunStatus` event below carries the reason. Emitting a
+            // `JobStatus` for `*` would describe a job that is not in the run.
+            if job_id.0 == "*" {
+                continue;
+            }
             shared
                 .state
                 .emit(NdjsonEvent::JobStatus {
