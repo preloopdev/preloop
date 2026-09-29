@@ -1221,6 +1221,7 @@ impl PgBackend {
                  WHERE q.agent_job_id = $1::text::uuid OR q.timeline_id = $2::text::uuid \
                     OR q.agent_job_id = $3::text::uuid \
                  ORDER BY COALESCE(q.agent_job_id = $1::text::uuid, false) DESC, \
+                          COALESCE(q.timeline_id = $2::text::uuid, false) DESC, \
                           q.request_id DESC LIMIT 1",
                 &[&plan, &timeline, &agent],
             )

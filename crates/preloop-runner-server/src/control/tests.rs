@@ -2927,6 +2927,42 @@ pub(crate) mod suite {
         );
     }
 
+    /// `callback_job` resolves by plan id, then timeline id, then agent job
+    /// id (trait doc): a timeline-id match outranks a newer attempt that
+    /// only matches the agent job id.
+    pub(crate) async fn callback_prefers_timeline_match(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut older = submit_job(run_id, "build", 1);
+        let timeline = uuid::Uuid::new_v4();
+        older.request.as_mut().unwrap().timeline_id = timeline;
+        let newer = submit_job(run_id, "other", 2);
+        let agent = newer.request.as_ref().unwrap().agent_job_id;
+        backend
+            .submit_run(submit_run(run_id, vec![older, newer]))
+            .await
+            .unwrap();
+        let older_request = backend
+            .request(RequestKey::Job(run_id, JobId("build".to_owned())))
+            .await
+            .unwrap();
+        let newer_request = backend
+            .request(RequestKey::Job(run_id, JobId("other".to_owned())))
+            .await
+            .unwrap();
+        assert!(
+            older_request.request_id < newer_request.request_id,
+            "fixture: the agent-job-id match must be the newer attempt"
+        );
+        let found = backend
+            .callback_job("not-a-uuid", Some(timeline), Some(agent))
+            .await
+            .unwrap()
+            .expect("one attempt resolves");
+        assert_eq!(
+            found.request_id, older_request.request_id,
+            "the timeline-id match must outrank the newer agent-job-id match"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -3355,6 +3391,11 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn callback_prefers_timeline_match() {
+        let (_pg, backend) = backend().await;
+        suite::callback_prefers_timeline_match(&backend).await;
+    }
+
     #[tokio::test]
     async fn secret_values_never_persist() {
         let (_pg, backend) = backend().await;
@@ -4231,6 +4272,10 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn callback_prefers_timeline_match() {
+        suite::callback_prefers_timeline_match(&LiteBackend::in_memory().unwrap()).await;
+    }
+
     /// A file-backed LiteBackend proves durability: submit, drop, reopen,
     /// and the job is still claimable — the DB is the authority.
     #[tokio::test]
