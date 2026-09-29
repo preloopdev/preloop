@@ -2847,6 +2847,28 @@ pub fn build_job_artifacts(
         }
     }
 
+    // Checkouts the snapshot cannot serve (deep history, tags, cross-repo)
+    // fetch anonymously through the engine's forge relay when no GitHub
+    // credential exists — otherwise actions/checkout writes a bogus
+    // `x-access-token:` header and the fetch dies at github.com. With an App
+    // or an embeddable PAT the step keeps direct forge access.
+    let has_forge_credential = shared.state.github_app.is_some()
+        || matches!(github_token_override.as_ref(), Some(PatToken::Embed { .. }));
+    let rerouted = crate::snapshots::reroute_forge_checkouts(
+        &mut agent_msg,
+        base_url,
+        &runtime_token,
+        has_forge_credential,
+    );
+    if rerouted > 0 {
+        info!(
+            %run_id,
+            job = %job.id,
+            %rerouted,
+            "Rerouted non-snapshot checkouts through anonymous forge relay"
+        );
+    }
+
     // Fork-restricted jobs never receive an OIDC grant: no request URL is
     // emitted here (and the broker restates it only for granted jobs), and
     // the `oidctoken` endpoint refuses via `id_token_grants`.
@@ -2881,12 +2903,14 @@ pub fn build_job_artifacts(
         // prints inside the same `GITHUB_TOKEN Permissions` group.
         let (token, authority) = match pat {
             PatToken::Embed { token, scopes } => (token, pat_scopes_wire_value(&scopes)),
-            // H3: unverifiable authority means no PAT is embedded. The job
-            // keeps the runtime token, which authenticates only against this
-            // control plane, so a step that needs GitHub fails at the point of
-            // use rather than running with authority nobody could bound.
+            // H3: unverifiable authority means no PAT is embedded. The token
+            // is EMPTY, not the runtime token: the runtime JWT fails upstream
+            // as a dead credential ("Bad credentials"), while an empty
+            // GITHUB_TOKEN makes API clients anonymous — public reads work
+            // within unauthenticated rate limits. Anything that needs real
+            // authority still fails at the point of use, which is the point.
             PatToken::Withheld => (
-                runtime_token.clone(),
+                String::new(),
                 "withheld: PAT authority unverifiable; NOT the declared `permissions:` set"
                     .to_owned(),
             ),
@@ -2897,7 +2921,14 @@ pub fn build_job_artifacts(
         );
         token
     } else {
-        runtime_token.clone()
+        // No GitHub App and no PAT: there is no forge credential to hand the
+        // job. Shipping the runtime JWT as GITHUB_TOKEN sent a dead
+        // credential to api.github.com (`Bad credentials` from setup-*) and
+        // let actions/checkout write `AUTHORIZATION: basic x-access-token:<jwt>`
+        // — rejected outright rather than anonymous. Empty is the honest
+        // value: unauthenticated GitHub access is the correct mode here, and
+        // checkouts ride the forge relay.
+        String::new()
     };
     agent_msg.variables.insert(
         "system.github.token".to_owned(),
