@@ -316,19 +316,17 @@ jobs:
           # removing a property module cannot hide behind a broad match.
           server_list=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null)
           legacy=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency::properties(:|$)' || true)
-          pure=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_properties::pure(:|$)' || true)
-          scheduler=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_properties::state_machine(:|$)' || true)
           http=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_http_properties(:|$)' || true)
           runner=$(cargo test -p preloop-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
           parser=$(cargo test -p preloop-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
-          if [ "$legacy" -eq 0 ] || [ "$pure" -eq 0 ] || [ "$scheduler" -eq 0 ] || [ "$http" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
-            echo "ERROR: zero matching tests (legacy=$legacy pure=$pure scheduler=$scheduler http=$http runner=$runner parser=$parser)" >&2
+          if [ "$legacy" -eq 0 ] || [ "$http" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
+            echo "ERROR: zero matching tests (legacy=$legacy http=$http runner=$runner parser=$parser)" >&2
             exit 1
           fi
-          echo "server filters: legacy=$legacy pure=$pure scheduler=$scheduler http=$http; runner=$runner parser=$parser"
+          echo "server filters: legacy=$legacy http=$http; runner=$runner parser=$parser"
       - name: Check no sleep() in property test files
         run: |
-          files="crates/preloop-runner-server/src/concurrency_properties.rs crates/preloop-runner-server/src/concurrency_http_properties.rs"
+          files="crates/preloop-runner-server/src/concurrency.rs crates/preloop-runner-server/src/concurrency_http_properties.rs"
           bad=0
           for f in $files; do
             if [ -f "$f" ] && grep -q 'sleep(' "$f"; then
@@ -343,13 +341,6 @@ jobs:
         run: |
           PROPTEST_CASES=256 cargo test -p preloop-runner-server \
             'concurrency::properties' -- --test-threads=1
-          PROPTEST_CASES=256 cargo test -p preloop-runner-server \
-            concurrency_properties::pure -- --test-threads=1
-
-      - name: Scheduler model properties
-        run: |
-          PROPTEST_CASES=256 cargo test -p preloop-runner-server \
-            concurrency_properties::state_machine -- --test-threads=1
 
       - name: Expression and parser properties
         run: |
@@ -444,20 +435,19 @@ jobs:
         run: |
           server_list=$(PROPTEST_CASES=1 cargo test -p preloop-runner-server -- --list 2>/dev/null)
           legacy=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency::properties(:|$)' || true)
-          properties=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_properties(:|$)' || true)
           http=$(printf '%s\n' "$server_list" | grep -Ec '^concurrency_http_properties(:|$)' || true)
           runner=$(cargo test -p preloop-runner -- --list 2>/dev/null | grep -c 'timespan_tests' || true)
           parser=$(cargo test -p preloop-gha-parser -- --list 2>/dev/null | grep -c 'concurrency_' || true)
-          if [ "$legacy" -eq 0 ] || [ "$properties" -eq 0 ] || [ "$http" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
-            echo "ERROR: zero matching tests (legacy=$legacy properties=$properties http=$http runner=$runner parser=$parser)" >&2
+          if [ "$legacy" -eq 0 ] || [ "$http" -eq 0 ] || [ "$runner" -eq 0 ] || [ "$parser" -eq 0 ]; then
+            echo "ERROR: zero matching tests (legacy=$legacy http=$http runner=$runner parser=$parser)" >&2
             exit 1
           fi
-          echo "server filters: legacy=$legacy properties=$properties http=$http; runner=$runner parser=$parser"
+          echo "server filters: legacy=$legacy http=$http; runner=$runner parser=$parser"
       - name: Check no sleep() in property test files
         run: |
           bad=0
           for f in \
-            crates/preloop-runner-server/src/concurrency_properties.rs \
+            crates/preloop-runner-server/src/concurrency.rs \
             crates/preloop-runner-server/src/concurrency_http_properties.rs; do
             if [ -f "$f" ] && grep -q 'sleep(' "$f"; then
               echo "ERROR: sleep() found in $f" >&2
@@ -470,9 +460,6 @@ jobs:
         run: |
           PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
             cargo test -p preloop-runner-server 'concurrency::properties' \
-            --release -- --test-threads=1
-          PROPTEST_CASES=10000 PROPTEST_MAX_SHRINK_ITERS=100000 \
-            cargo test -p preloop-runner-server concurrency_properties \
             --release -- --test-threads=1
 
       - name: Intensive runner timing profile (release)
