@@ -610,14 +610,15 @@ terminal output and not the full environment:
   },
   "log_reference": "preloop://runs/21bb9d8e/jobs/test/steps/2/attempts/1",
   "message": "step failed on attempt 1",
-  "capabilities": ["step.retry", "job.retry_from", "job.abort"]
+  "capabilities": ["step.retry", "job.retry_from", "job.continue", "job.abort"]
 }
 ```
 
 Source revisions are recorded per attempt in the attempt journal as
 `source_revision` strings (`original`, `repair-1`, …), not on the event.
 
-**Implemented operations:** `step.retry`, `job.retry_from`, and `job.abort`.
+**Implemented operations:** `step.retry`, `job.retry_from`, `job.continue`, and
+`job.abort`.
 Every mutation carries a client-supplied request ID and expected session
 version; duplicate request IDs return the original result without executing
 again.
@@ -704,7 +705,8 @@ Launch requirements, with current status:
 
 1. Capability-scoped sessions; diagnose / source-edit / vm-exec / network /
    persistence / secret-access are separate grants. *(partial: lease
-   capabilities cover `step.retry`, `job.retry_from`, `job.abort`)*
+   capabilities cover `step.retry`, `job.retry_from`, `job.continue`,
+   `job.abort`)*
 2. Redacted structured context — never the full environment by default.
    *(log excerpts are taken from the masked log file, after `mask_secrets`)*
 3. Full audit trail of commands, edits, syncs, retries, approvals. *(done, per
