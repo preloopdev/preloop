@@ -2298,6 +2298,63 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn strict_assignments_refuse_an_unassigned_job() {
+        let (_pg, backend) = backend().await;
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::strict_assignments_refuse_an_unassigned_job(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_pool_pending_blocks_claim() {
+        let (_pg, backend) = backend().await;
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        suite::fresh_pool_pending_blocks_claim(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_assignment_is_exclusive_to_its_runner() {
+        let (_pg, backend) = backend().await;
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        suite::fresh_assignment_is_exclusive_to_its_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn claim_scan_finds_a_matching_job_past_the_window() {
+        let (_pg, backend) = backend().await;
+        suite::claim_scan_finds_a_matching_job_past_the_window(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn settle_drops_the_deferred_token_request() {
+        let (_pg, backend) = backend().await;
+        suite::settle_drops_the_deferred_token_request(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn settle_refuses_an_unowned_attempt() {
+        let (_pg, backend) = backend().await;
+        suite::settle_refuses_an_unowned_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn completion_applies_the_reported_step_number() {
+        let (_pg, backend) = backend().await;
+        suite::completion_applies_the_reported_step_number(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn settle_refreshes_the_attempt_lease() {
+        let (_pg, backend) = backend().await;
+        suite::settle_refreshes_the_attempt_lease(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_outputs_survive_a_reload() {
+        let (_pg, backend) = backend().await;
+        suite::reusable_caller_outputs_survive_a_reload(&backend).await;
+    }
+
+    #[tokio::test]
     async fn secret_values_never_persist() {
         let (_pg, backend) = backend().await;
         suite::secret_values_never_persist(&backend).await;
@@ -2560,6 +2617,59 @@ mod lite {
             &LiteBackend::in_memory().unwrap(),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn strict_assignments_refuse_an_unassigned_job() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::strict_assignments_refuse_an_unassigned_job(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_pool_pending_blocks_claim() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        suite::fresh_pool_pending_blocks_claim(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_assignment_is_exclusive_to_its_runner() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        suite::fresh_assignment_is_exclusive_to_its_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn claim_scan_finds_a_matching_job_past_the_window() {
+        suite::claim_scan_finds_a_matching_job_past_the_window(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn settle_drops_the_deferred_token_request() {
+        suite::settle_drops_the_deferred_token_request(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn settle_refuses_an_unowned_attempt() {
+        suite::settle_refuses_an_unowned_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn completion_applies_the_reported_step_number() {
+        suite::completion_applies_the_reported_step_number(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn settle_refreshes_the_attempt_lease() {
+        suite::settle_refreshes_the_attempt_lease(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reusable_caller_outputs_survive_a_reload() {
+        suite::reusable_caller_outputs_survive_a_reload(&LiteBackend::in_memory().unwrap()).await;
     }
 
     /// A file-backed LiteBackend proves durability: submit, drop, reopen,

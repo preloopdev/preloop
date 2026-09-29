@@ -482,6 +482,68 @@ async fn concurrent_polls_claim_once() {
     assert_eq!(claims, 1, "one job must be claimed exactly once");
 }
 
+/// The same webhook delivery processed by two nodes at once must still produce
+/// ONE run: the loser sees `SubmitOutcome::existing`, never a unique-violation
+/// 500 on `runs_delivery`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_delivery_redelivery_returns_one_run() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let first = RunId::new();
+    let mut submit_a = submit_run(first, vec![submit_job(first, "build", 1)]);
+    submit_a.record.webhook_delivery_id = Some("delivery-race".to_owned());
+    submit_a.record.run_number = 101;
+    let replay = RunId::new();
+    let mut submit_b = submit_run(replay, vec![submit_job(replay, "build", 2)]);
+    submit_b.record.webhook_delivery_id = Some("delivery-race".to_owned());
+    submit_b.record.run_number = 102;
+
+    let (a, b) = tokio::join!(node_a.submit_run(submit_a), node_b.submit_run(submit_b));
+    let a = a.expect("one node must not fail on the delivery race");
+    let b = b.expect("the other node must not fail on the delivery race");
+    assert_eq!(a.run_id, b.run_id, "one delivery produces one run");
+    assert_eq!(
+        a.queued_jobs + b.queued_jobs,
+        1,
+        "exactly one node created the run's jobs"
+    );
+    assert!(
+        a.existing.is_some() || b.existing.is_some(),
+        "the loser replays the committed run: {a:?} / {b:?}"
+    );
+}
+
+/// A transaction that makes work available wakes waiters on OTHER nodes: the
+/// commit publishes the `Wake` hint on the shared LISTEN channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commits_wake_waiters_on_another_node() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let mut wakes = node_b.subscribe_wakes();
+    // The LISTEN connection registers asynchronously with `connect`; retry a
+    // bounded number of commits so a lost race on that registration cannot
+    // make the assertion flaky.
+    let mut received = None;
+    for attempt in 0..20u64 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let run_id = RunId::new();
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", attempt as i64)]);
+        submit.record.run_number = 5_000 + attempt;
+        node_a.submit_run(submit).await.unwrap();
+        match tokio::time::timeout(std::time::Duration::from_millis(500), wakes.recv()).await {
+            Ok(Ok(wake)) => {
+                received = Some(wake);
+                break;
+            }
+            Ok(Err(error)) => panic!("wake channel closed: {error}"),
+            Err(_) => continue,
+        }
+    }
+    let wake = received.expect("a commit that makes a job ready must wake other nodes");
+    assert!(
+        wake.ready >= 1,
+        "the hint must ask for at least one waiter, got {wake:?}"
+    );
+}
+
 fn timeline_record(id: u128, name: &str) -> azdo::TimelineRecord {
     serde_json::from_value(serde_json::json!({
         "id": uuid::Uuid::from_u128(id),
