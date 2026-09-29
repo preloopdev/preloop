@@ -93,6 +93,13 @@ pub(crate) fn strip_template(msg: &mut AgentJobRequestMessage, secret_hints: usi
             }
         }
     }
+    // The origin-rewrite header is a Basic credential wrapping the same
+    // runtime token. Blank just the header (keeping the URLs the rewrite
+    // exists for): every delivery path re-mints it from a fresh token via
+    // `broker::re_mint_snapshot_credentials`.
+    if let Some(rewrite) = msg.preloop_snapshot_origin_rewrite.as_mut() {
+        rewrite.auth_header.clear();
+    }
 }
 
 /// Fill a stored template with the secret surface its spec describes.

@@ -21245,6 +21245,87 @@ jobs:
     );
 }
 
+/// The origin-rewrite `Authorization` header is a Basic credential wrapping
+/// the job's runtime token, so the stored template must not persist it — and
+/// every delivery path must rebuild it from a freshly minted token, or a job
+/// queued past the token lifetime fetches its snapshot with an expired
+/// credential.
+#[tokio::test]
+async fn snapshot_origin_rewrite_header_is_reminted_at_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+"#;
+    submit_yaml(&app, yaml, "owner/repo").await;
+
+    {
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("job should be queued");
+        let rewrite = queued
+            .message
+            .preloop_snapshot_origin_rewrite
+            .as_ref()
+            .expect("a workspace snapshot must pin the forge→snapshot rewrite");
+        assert!(
+            rewrite.auth_header.is_empty(),
+            "the stored template must not persist the runtime token: {}",
+            rewrite.auth_header
+        );
+        assert!(!rewrite.snapshot_url.is_empty() && !rewrite.forge_url.is_empty());
+    }
+
+    let assert_fresh_header = |message: &Value, delivered_by: &str| {
+        let header = message["preloopSnapshotOriginRewrite"]["authHeader"]
+            .as_str()
+            .expect("the delivered message must carry an origin-rewrite header");
+        let token = header
+            .strip_prefix("AUTHORIZATION: basic ")
+            .expect("the header shape the runner consumes");
+        let decoded = BASE64_STANDARD
+            .decode(token)
+            .expect("the header credential must be base64");
+        let decoded = String::from_utf8(decoded).unwrap();
+        let token = decoded
+            .strip_prefix("x-access-token:")
+            .expect("the snapshot credential shape");
+        let claims = state
+            .verify_local_jwt_claims(token)
+            .unwrap_or_else(|| panic!("the {delivered_by} header token must verify"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            claims["exp"].as_u64().unwrap() > now,
+            "the {delivered_by} header token must not be expired"
+        );
+    };
+
+    // Broker acquire.
+    let acquired = acquire_queued_job(&app, "origin-rewrite-broker").await;
+    assert_fresh_header(&acquired, "broker");
+
+    // AzDO/disttask delivery of the same stored template.
+    submit_yaml(&app, yaml, "owner/repo").await;
+    let (runner_id, runner_token) =
+        register_runner_with_token(&app, "origin-rewrite-azdo", &["self-hosted"], None).await;
+    let (status, session) = create_disttask_session(&app, &runner_token, runner_id).await;
+    assert!(status.is_success(), "azdo session: {session}");
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &runner_token, session_id).await;
+    assert_fresh_header(&azdo_delivered_body(&state, &delivered, session_id), "azdo");
+}
+
 /// A retry verdict must carry a freshly minted snapshot credential: the
 /// worker replays the failed step from the message it already holds, whose
 /// pinned token may be long expired.
