@@ -968,7 +968,8 @@ impl PgBackend {
         let client = self.reader().await?;
         let row = client
             .query_opt(
-                "SELECT q.runner_id, q.result, s.runner_id AS session_runner \
+                "SELECT q.runner_id, q.result, s.runner_id AS session_runner, \
+                 s.session_id IS NOT NULL AS has_session \
                  FROM job_requests q LEFT JOIN runner_sessions s \
                  ON s.session_id = q.session_id WHERE q.request_id=$1",
                 &[&request_id],
@@ -984,7 +985,7 @@ impl PgBackend {
         crate::control::types::ensure_request_owner(
             owner_runner_id,
             session_runner,
-            row.get::<_, Option<i64>>(0).is_some() || session_runner.is_some(),
+            row.get(3),
             runner_id,
         )?;
         if result.is_some() {
