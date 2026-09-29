@@ -200,14 +200,14 @@ pub struct AgentJobRequestMessage {
     )]
     pub preloop_snapshot_commit: Option<String>,
 
-    /// Preloop extension: ids of steps whose `token` input was pinned to a
-    /// snapshot checkout credential at submission.
+    /// Preloop extension: ids of steps whose `token` input carries a
+    /// submission-time job runtime credential — snapshot-served checkouts
+    /// and checkouts rerouted onto the engine's forge relay.
     ///
-    /// The pinned credential is a local HMAC JWT with a ~50-minute lifetime,
-    /// but a job can sit queued (or paused in a debug session) far longer.
-    /// The broker re-mints these inputs at claim, and the server mints a
-    /// fresh credential on retry verdicts; the worker applies it only to the
-    /// steps named here.
+    /// That credential is a local HMAC JWT with a ~50-minute lifetime, but a
+    /// job can sit queued (or paused in a debug session) far longer. The
+    /// broker re-mints these inputs at claim, so a queued or retried job
+    /// starts with a fresh credential.
     #[serde(
         rename = "preloopSnapshotTokenSteps",
         default,

@@ -3414,9 +3414,9 @@ pub fn redirect_primary_checkout(
             continue;
         }
         // `repository`: default when absent, the declared-default expression,
-        // or provably the run's own repository. A literal same-repo value is
-        // still the default target — cpython, git/git, and rust-analyzer all
-        // spell it out.
+        // or provably the run's own repository. A literal that normalizes to
+        // the run's repo selects the same target as omitting the input, so
+        // skipping it would strand the checkout on the forge for no reason.
         let repository = resolve_step_input(step, "repository", &context_data);
         let repository_default = match &repository.value {
             // Evaluation failure means the input still holds its template;
@@ -3521,7 +3521,7 @@ pub fn redirect_primary_checkout(
 
 /// Point every checkout the snapshot could not serve at the engine's
 /// anonymous forge relay (`forge_git_http`), with the job runtime token
-/// pinned as its credential.
+/// pinned as its credential and recorded for claim-time re-mint.
 ///
 /// Without a GitHub App or PAT, `github.token` is empty and `actions/checkout`
 /// still writes `AUTHORIZATION: basic x-access-token:` — every forge fetch
@@ -3534,6 +3534,11 @@ pub fn redirect_primary_checkout(
 /// proven to name the configured forge (GHES hosts cannot ride the path-only
 /// relay), or when the repository value is unprovable. SSH checkouts and
 /// already-redirected steps are untouched.
+///
+/// Rewritten ids are appended to `preloop_snapshot_token_steps` — the list
+/// the broker re-mints at claim — because the pinned credential is a
+/// ~50-minute JWT and a queued job outlives it; an expired token turns the
+/// relay into a 401 the step can never recover from.
 pub fn reroute_forge_checkouts(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     base_url: &str,
@@ -3548,11 +3553,11 @@ pub fn reroute_forge_checkouts(
         Some(origin) => origin,
         None => return 0,
     };
-    let snapshot_steps: std::collections::HashSet<String> = message
+    let mut pinned: Vec<String> = message
         .preloop_snapshot_token_steps
-        .as_ref()
-        .map(|pinned| pinned.iter().cloned().collect())
+        .clone()
         .unwrap_or_default();
+    let snapshot_steps: std::collections::HashSet<String> = pinned.iter().cloned().collect();
     let mut rerouted = 0;
     for step in &mut message.steps {
         let is_checkout = step
@@ -3628,7 +3633,11 @@ pub fn reroute_forge_checkouts(
         // checkout write a header git refuses anonymously at the relay.
         step.inputs
             .insert("token".to_owned(), runtime_token.to_owned());
+        pinned.push(step.id.to_string());
         rerouted += 1;
+    }
+    if !pinned.is_empty() {
+        message.preloop_snapshot_token_steps = Some(pinned);
     }
     rerouted
 }
@@ -4663,9 +4672,9 @@ mod deepen_and_redirect_tests {
     }
 
     /// A literal `repository:` that names the run's own repo is still the
-    /// default checkout — real workflows spell it out (git/git does), and
-    /// the redirect used to skip them onto github.com where the empty token
-    /// 401'd.
+    /// default checkout — checkout resolves it to the same target as an
+    /// omitted input, and the redirect used to skip it onto github.com where
+    /// the empty token 401'd.
     #[test]
     fn redirect_primary_checkout_accepts_same_repo_literal() {
         assert_eq!(
@@ -4754,6 +4763,11 @@ mod deepen_and_redirect_tests {
         assert_eq!(step.inputs["github-server-url"], "http://127.0.0.1:9090");
         assert_eq!(step.inputs["repository"], "owner/repo");
         assert_eq!(step.inputs["token"], "jwt");
+        assert_eq!(
+            message.preloop_snapshot_token_steps,
+            Some(vec!["00000000-0000-0000-0000-000000000010".to_owned()]),
+            "a rerouted step's token must be re-minted at claim like a snapshot step's"
+        );
 
         // Cross-repo literal slug reroutes too.
         let mut message = make(serde_json::json!({"repository": "microsoft/vcpkg"}));
@@ -4762,6 +4776,10 @@ mod deepen_and_redirect_tests {
             1
         );
         assert_eq!(message.steps[0].inputs["repository"], "microsoft/vcpkg");
+        assert_eq!(
+            message.preloop_snapshot_token_steps,
+            Some(vec!["00000000-0000-0000-0000-000000000010".to_owned()])
+        );
 
         // A forge credential keeps the direct path.
         let mut message = make(serde_json::json!({"fetch-depth": "0"}));
@@ -4770,6 +4788,10 @@ mod deepen_and_redirect_tests {
             0
         );
         assert!(!message.steps[0].inputs.contains_key("github-server-url"));
+        assert_eq!(
+            message.preloop_snapshot_token_steps, None,
+            "an untouched message must not gain pins"
+        );
 
         // Unprovable repository expressions stay untouched.
         let mut message = make(serde_json::json!({"repository": "${{ inputs.repo }}"}));
@@ -4989,6 +5011,11 @@ mod remote_checkout_cache_tests {
             .expect("run-scoped mode caches the commit");
         assert_eq!(snapshot.commit_sha, commit);
         assert_eq!(snapshot.source, SnapshotSource::RemoteRunScoped);
+        assert_eq!(
+            snapshot.repository,
+            format!("snapshots/{run_id}"),
+            "checkout-cache snapshots are served on the same authenticated /snapshots/<run> route as local ones"
+        );
         assert_eq!(snapshot.default_branch.as_deref(), Some("main"));
         let namespace = snapshot
             .cache_namespace

@@ -1193,8 +1193,8 @@ pub async fn broker_acquire_job(
     Ok(Json(payload))
 }
 
-/// Replace every snapshot checkout credential pinned at submission with a
-/// freshly minted runtime token.
+/// Replace every pinned checkout credential — snapshot-served or rerouted
+/// onto the forge relay — with a freshly minted runtime token.
 ///
 /// Returns the number of steps refreshed. The pinned ids travel on the
 /// message ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]),
