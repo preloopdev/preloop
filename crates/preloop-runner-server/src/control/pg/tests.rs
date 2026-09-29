@@ -202,7 +202,9 @@ async fn fresh_database_opt() -> Option<(DisposablePg, String)> {
 
 /// Printed by every Postgres test that cannot reach a server.
 fn skip_no_postgres() {
-    eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server, or install postgresql");
+    eprintln!(
+        "skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server, or install postgresql"
+    );
 }
 
 // ── submission builders (self-contained; suite helpers are private) ─────

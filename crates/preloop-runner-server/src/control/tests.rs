@@ -2043,10 +2043,7 @@ pub(crate) mod suite {
         let mut tail = submit_job(run_id, "tail", 3);
         tail.queued.runs_on = vec!["self-hosted".to_owned(), "never-provisioned".to_owned()];
         let mut submit = submit_run(run_id, vec![holder, failing, tail]);
-        submit
-            .record
-            .job_fail_fast
-            .insert("build".to_owned(), true);
+        submit.record.job_fail_fast.insert("build".to_owned(), true);
         backend.submit_run(submit).await.unwrap();
 
         // leg-failing fails: fail-fast cancels its sibling leg-holder, which
@@ -3501,7 +3498,9 @@ async fn fresh_database_opt() -> Option<(PgGuard, String)> {
 
 /// Printed by every Postgres test that cannot reach a server.
 fn skip_no_postgres() {
-    eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server, or install postgresql");
+    eprintln!(
+        "skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server, or install postgresql"
+    );
 }
 
 mod pg {
