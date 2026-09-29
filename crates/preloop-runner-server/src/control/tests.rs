@@ -18,6 +18,7 @@ use crate::config::EnvironmentRulesMap;
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -333,6 +334,21 @@ fn create_session(runner_id: i64) -> CreateSession {
     }
 }
 
+/// `register_runner` with explicit labels (label-matching scenarios).
+fn register_runner_with_labels(name: &str, labels: &[&str]) -> RegisterRunner {
+    RegisterRunner {
+        labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        ..register_runner(name)
+    }
+}
+
+/// A `submit_job` whose job carries explicit `runs-on` labels.
+fn submit_job_on(run_id: RunId, job_id: &str, request_id: i64, runs_on: &[&str]) -> SubmitJob {
+    let mut submit = submit_job(run_id, job_id, request_id);
+    submit.queued.runs_on = runs_on.iter().map(|label| (*label).to_owned()).collect();
+    submit
+}
+
 fn poll(session_id: &str, runner_id: i64) -> PollRequest {
     PollRequest {
         session_id: session_id.to_owned(),
@@ -341,6 +357,35 @@ fn poll(session_id: &str, runner_id: i64) -> PollRequest {
         busy: false,
         wait_ms: 0,
     }
+}
+
+/// A `poll` reporting explicit runner labels.
+fn poll_with_labels(session_id: &str, runner_id: i64, labels: &[&str]) -> PollRequest {
+    let mut poll = poll(session_id, runner_id);
+    poll.runner = RunnerCapabilities {
+        known: true,
+        labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        runner_group_id: None,
+        runner_group_name: None,
+    };
+    poll
+}
+
+/// `(runner, run, job)` keys of a pairing list (`RunnerAssignment` has no
+/// equality, and the age is timing-dependent).
+fn pairing_keys(
+    assignments: &[preloop_observability::status::RunnerAssignment],
+) -> Vec<(i64, String, String)> {
+    assignments
+        .iter()
+        .map(|assignment| {
+            (
+                assignment.runner_id,
+                assignment.run_id.clone(),
+                assignment.job_id.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Poll with no verified runner identity — produces a claim whose
@@ -366,6 +411,40 @@ fn workflow_concurrency(group: &str, cancel_in_progress: bool) -> WorkflowConcur
             cancel_in_progress: Some(cancel_in_progress.to_string()),
             queue: preloop_gha_parser::ConcurrencyQueue::Single,
         },
+    }
+}
+
+/// Claim and pairing must agree on the label shapes the refactor split:
+/// only the `ubuntu`/`macos`/`windows` hosted prefixes stand in for a
+/// runner's OS label, exactly as the pre-refactor `take_matching_job` rule.
+#[test]
+fn label_matcher_keeps_the_merge_base_semantics() {
+    fn labels(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+    let runner = |values: &[&str]| crate::control::logic::RunnerMatchRow {
+        labels: labels(values),
+        known: true,
+        group_id: None,
+        group_name: None,
+    };
+    for (job, runner_labels, expected) in [
+        (&["ubuntu"][..], &["linux"][..], true),
+        (&["linux-6.1"][..], &["linux"][..], false),
+        (&["osx-14"][..], &["macos"][..], false),
+        (&["macos-15"][..], &["macos"][..], true),
+        (&["ubuntu-24.04"][..], &["macos"][..], false),
+    ] {
+        assert_eq!(
+            crate::runtime_scheduling::job_matches_runner(&labels(job), &labels(runner_labels)),
+            expected,
+            "pairing: {job:?} on {runner_labels:?}"
+        );
+        assert_eq!(
+            crate::control::logic::runner_matches(&labels(job), None, &runner(runner_labels)),
+            expected,
+            "claim must agree with pairing: {job:?} on {runner_labels:?}"
+        );
     }
 }
 
@@ -2284,6 +2363,196 @@ pub(crate) mod suite {
             "the reusable caller's resolved outputs must persist"
         );
     }
+
+    /// A workflow-held run's row reads `queued` — its `holder_kind = 'run'`
+    /// wait row carries the logical `Pending` — so it counts with
+    /// in-progress, and its parked jobs are not job-level concurrency
+    /// blocks. The pre-refactor snapshot counts the same way.
+    pub(crate) async fn workflow_held_run_is_not_queued(backend: &dyn ControlBackend) {
+        let run_a = RunId::new();
+        let mut submit_a = submit_run(run_a, vec![submit_job(run_a, "deploy", 1)]);
+        submit_a.workflow_concurrency = Some(workflow_concurrency("held", false));
+        assert!(!backend.submit_run(submit_a).await.unwrap().held);
+
+        let run_b = RunId::new();
+        let mut submit_b = submit_run(run_b, vec![submit_job(run_b, "deploy", 2)]);
+        submit_b.workflow_concurrency = Some(workflow_concurrency("held", false));
+        assert!(backend.submit_run(submit_b).await.unwrap().held);
+
+        let inputs = backend
+            .status_inputs(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                inputs.runs_queued,
+                inputs.runs_in_progress,
+                inputs.runs_completed
+            ),
+            (1, 1, 0),
+            "a held run is Pending (in-progress), never queued"
+        );
+        assert_eq!(inputs.queue_len, 1, "only the unheld run's job is ready");
+        assert_eq!(
+            inputs.concurrency_blocked, 0,
+            "workflow-level holds are not job-level concurrency blocks"
+        );
+    }
+
+    /// `status_inputs().runner_assignments` is the live pairing set: an
+    /// in-flight attempt whose session is gone (left for the reaper) is not
+    /// a live runner → job pairing.
+    pub(crate) async fn status_assignments_require_a_live_session(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend.register_runner(register_runner("r1")).await.unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(_) => {}
+            other => panic!("expected a claim, got {other:?}"),
+        }
+        let live = pairing_keys(&backend.live_assignments().await.unwrap());
+        assert_eq!(live.len(), 1, "the claimed attempt is live");
+        let inputs = backend
+            .status_inputs(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(
+            pairing_keys(&inputs.runner_assignments),
+            live,
+            "status inputs report the same pairings as live_assignments"
+        );
+
+        backend.delete_session(&session.session_id).await.unwrap();
+        assert!(
+            backend.live_assignments().await.unwrap().is_empty(),
+            "a deleted session owns no live assignment"
+        );
+        let inputs = backend
+            .status_inputs(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert!(
+            inputs.runner_assignments.is_empty(),
+            "a session-less attempt is not a live pairing"
+        );
+    }
+
+    /// Claim and pairing share one label matcher with the pre-refactor
+    /// semantics: `runs-on: ubuntu` matches a `linux` runner, while `osx-14`
+    /// never matches a `macos` runner.
+    pub(crate) async fn claim_uses_the_pairing_label_matcher(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner_with_labels("linux-1", &["linux"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_on(run_id, "build", 1, &["ubuntu"])],
+            ))
+            .await
+            .unwrap();
+        match backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &["linux"],
+            ))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => {
+                assert_eq!(claimed.queued.job_id, JobId("build".to_owned()));
+            }
+            other => panic!("`ubuntu` must match a `linux` runner, got {other:?}"),
+        }
+
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner_with_labels("mac-1", &["macos"]))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job_on(run_id, "build", 2, &["osx-14"])],
+            ))
+            .await
+            .unwrap();
+        match backend
+            .poll_session(poll_with_labels(
+                &session.session_id,
+                runner.runner.id,
+                &["macos"],
+            ))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Empty => {}
+            other => panic!("`osx-14` must not match a `macos` runner, got {other:?}"),
+        }
+    }
+
+    /// Fixture identity for [`swept_binding_is_reported`]'s per-backend seed.
+    pub(crate) struct SweptBinding {
+        pub(crate) runner_id: i64,
+        pub(crate) run_id: RunId,
+        pub(crate) job_id: String,
+    }
+
+    /// A stale binding released by `sweep_stale_bindings` must be published
+    /// as `StatusInputs::released_bindings`, the counter the operational
+    /// snapshot reports. No command ages a binding, so the caller seeds the
+    /// stale row itself (`seed`).
+    pub(crate) async fn swept_binding_is_reported<F, Fut>(backend: &dyn ControlBackend, seed: F)
+    where
+        F: FnOnce(SweptBinding) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let run_id = RunId::new();
+        let runner = backend.register_runner(register_runner("r1")).await.unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        seed(SweptBinding {
+            runner_id: runner.runner.id,
+            run_id,
+            job_id: "build".to_owned(),
+        })
+        .await;
+
+        let swept = backend.sweep_stale_bindings().await.unwrap();
+        assert_eq!(swept, 1, "the aged binding must be swept");
+        let inputs = backend
+            .status_inputs(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(
+            inputs.released_bindings, swept as u64,
+            "a swept binding must be reported by the status inputs"
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -2806,6 +3075,42 @@ mod pg {
         }
         assert_eq!(claimed.len(), JOBS);
     }
+
+    #[tokio::test]
+    async fn workflow_held_run_is_not_queued() {
+        let (_pg, backend) = backend().await;
+        suite::workflow_held_run_is_not_queued(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn status_assignments_require_a_live_session() {
+        let (_pg, backend) = backend().await;
+        suite::status_assignments_require_a_live_session(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn claim_uses_the_pairing_label_matcher() {
+        let (_pg, backend) = backend().await;
+        suite::claim_uses_the_pairing_label_matcher(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn swept_binding_is_reported() {
+        let (_pg, backend) = backend().await;
+        let db = &backend;
+        suite::swept_binding_is_reported(&backend, move |binding: suite::SweptBinding| async move {
+            // ASSIGNMENT_TTL (600s) is one sweep window: age past it.
+            db.test_execute(&format!(
+                "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
+                 first_assigned_at) VALUES ('{}', '{}', {}, now() - interval '11 minutes', \
+                 now() - interval '11 minutes')",
+                binding.run_id, binding.job_id, binding.runner_id,
+            ))
+            .await
+            .unwrap();
+        })
+        .await;
+    }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
@@ -3210,6 +3515,97 @@ mod lite {
     #[tokio::test]
     async fn reusable_caller_outputs_survive_a_reload() {
         suite::reusable_caller_outputs_survive_a_reload(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn workflow_held_run_is_not_queued() {
+        suite::workflow_held_run_is_not_queued(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn status_assignments_require_a_live_session() {
+        suite::status_assignments_require_a_live_session(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn claim_uses_the_pairing_label_matcher() {
+        suite::claim_uses_the_pairing_label_matcher(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn swept_binding_is_reported() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::swept_binding_is_reported(&backend, move |binding: suite::SweptBinding| async move {
+            // ASSIGNMENT_TTL (600s) is one sweep window: age past it.
+            let stale = (std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64;
+            db.exec_for_test(&format!(
+                "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
+                 first_assigned_at) VALUES ('{}', '{}', {}, {stale}, {stale})",
+                binding.run_id, binding.job_id, binding.runner_id,
+            ));
+        })
+        .await;
+    }
+
+    /// A poll without a token-verified identity must not satisfy a fresh pool
+    /// assignment: the session's self-declared runner id is not proof
+    /// (`effective_claim_runner` / `claim_permitted`), so the caller gets
+    /// `Empty` and the bound job stays ready for its verified runner.
+    ///
+    /// Lite-only: pg's claim path ignores the assignment/verified ladder
+    /// (tracked separately), so it claims here either way.
+    #[tokio::test]
+    async fn unverified_poll_cannot_claim_a_bound_job() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, true, std::time::Duration::from_secs(300));
+        let run_id = RunId::new();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let runner = backend
+            .register_runner(super::RegisterRunner {
+                pool_proven: true,
+                ..super::register_runner("r1")
+            })
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let binding = backend
+            .test_working_set()
+            .unwrap()
+            .job_assignments
+            .get(&(run_id, JobId("build".to_owned())))
+            .cloned()
+            .expect("the pool-proven registration binds the pending job");
+        assert_eq!(binding.runner_id, Some(runner.runner.id));
+
+        let outcome = backend
+            .poll_session(super::poll_unverified(&session.session_id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, super::PollOutcome::Empty),
+            "an unverified caller cannot claim a job bound to a runner, got {outcome:?}"
+        );
+        assert_eq!(
+            backend
+                .job_queue_state(run_id, &JobId("build".to_owned()))
+                .await
+                .unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned())),
+            "the bound job stays ready for its verified runner"
+        );
     }
 
     /// A file-backed LiteBackend proves durability: submit, drop, reopen,
