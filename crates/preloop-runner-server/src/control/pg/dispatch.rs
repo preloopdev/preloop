@@ -3194,6 +3194,14 @@ pub(super) async fn requeue_claimed_tx(
         serde_json::json!({"job_id": job_id.0, "status": "queued"}),
     )
     .await?;
+    notify_wake(
+        tx,
+        crate::control::wake::Wake {
+            ready: 1,
+            broadcast: false,
+        },
+    )
+    .await?;
     Ok(true)
 }
 
@@ -4640,6 +4648,12 @@ impl<'a> Sweep<'a> {
             let value = serde_json::to_value(outputs).map_err(ControlError::backend)?;
             if let Some(node) = self.node_mut(run_id, job_id) {
                 node.outputs = Some(value);
+            }
+            // The record the caller fold resolves against must see them too:
+            // lite reloads its record from the written rows, so the in-memory
+            // record has to be kept in step here.
+            if let Some(graph) = self.graphs.get_mut(&run_id) {
+                graph.record.job_outputs.insert(job_id.clone(), outputs.clone());
             }
         }
         if !annotations.is_empty() {
