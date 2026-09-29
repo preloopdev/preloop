@@ -649,4 +649,14 @@ impl PgBackend {
         t.next_runner_id = row.get(0);
         Ok(t)
     }
+
+    /// Test-only write escape hatch (mirrors lite's `exec_for_test`): seeds
+    /// rows no `ControlBackend` command expresses. Assertions always read
+    /// back through `test_working_set` or a real API — there is no in-memory
+    /// mirror to drift.
+    pub(crate) async fn test_execute(&self, sql: &str) -> Result<(), ControlError> {
+        let client = self.writer().await?;
+        client.execute(sql, &[]).await.map_err(db)?;
+        Ok(())
+    }
 }

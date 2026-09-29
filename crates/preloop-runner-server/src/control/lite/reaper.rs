@@ -372,7 +372,7 @@ impl LiteBackend {
     /// provision queue.
     pub(crate) async fn sweep_stale_bindings(&self) -> Result<usize, ControlError> {
         let (pool_on, require_on, _liveness) = self.config();
-        self.write(move |tx| {
+        let swept = self.write(move |tx| {
             let now = now_us();
             let assignment_cutoff = now - crate::control::logic::ASSIGNMENT_TTL.as_micros() as i64;
             let binding_cutoff = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
@@ -437,7 +437,10 @@ impl LiteBackend {
                 }
             }
             Ok(swept)
-        })
+        })?;
+        // Node-local bookkeeping for `status_inputs`; post-commit, like pg.
+        self.count_released_bindings(swept);
+        Ok(swept)
     }
 
     /// `status_inputs`: the
@@ -819,7 +822,7 @@ impl LiteBackend {
                 inputs.concurrency_pending_holders = pending;
                 inputs.concurrency_deepest_group_pending = deepest.unwrap_or(0);
             }
-            inputs.released_bindings = 0;
+            inputs.released_bindings = self.released_bindings();
             Ok(inputs)
         })
     }
