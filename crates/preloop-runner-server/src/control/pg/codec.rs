@@ -51,8 +51,11 @@ pub(super) fn us_to_system(us: i64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_micros(us.max(0) as u64)
 }
 
-pub(super) fn us_to_chrono(us: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp_micros(us).unwrap_or_default()
+/// `int8` microseconds since the epoch → UTC instant; `None` when the value
+/// is outside chrono's range (the SQLite twin `us_to_utc` answers the same
+/// for one stored value — a corrupt row must read as absent, not 1970).
+pub(super) fn us_to_chrono(us: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_micros(us)
 }
 
 /// Parse a uuid read back as `col::text`. The column type guarantees the

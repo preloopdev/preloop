@@ -323,7 +323,7 @@ impl PgBackend {
                     workflow: row.get(1),
                     status: status_word.to_owned(),
                     event: row.get(3),
-                    started_at: row.get::<_, Option<i64>>(4).map(codec::us_to_chrono),
+                    started_at: row.get::<_, Option<i64>>(4).and_then(codec::us_to_chrono),
                     assigned_runners: row.get::<_, Vec<String>>(5),
                 });
         }

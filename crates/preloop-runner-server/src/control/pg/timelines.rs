@@ -56,8 +56,8 @@ pub(super) fn step_from_row(
             context_name: row.get(5),
             name: row.get(6),
             conclusion: row.get(7),
-            started_at: row.get::<_, Option<i64>>(8).map(codec::us_to_chrono),
-            finished_at: row.get::<_, Option<i64>>(9).map(codec::us_to_chrono),
+            started_at: row.get::<_, Option<i64>>(8).and_then(codec::us_to_chrono),
+            finished_at: row.get::<_, Option<i64>>(9).and_then(codec::us_to_chrono),
         },
     ))
 }

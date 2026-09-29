@@ -1069,3 +1069,45 @@ async fn job_point_reads_fall_back_to_archived_rows() {
     );
 }
 
+/// A corrupt out-of-range timestamptz reads as absent, matching the SQLite
+/// codec (`us_to_utc`), instead of silently claiming 1970.
+#[tokio::test]
+async fn out_of_range_step_timestamp_reads_as_absent() {
+    let (_pg, node, _other) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, _runner_id) = submit_and_claim(&node, run_id).await;
+    let agent = request.agent_job_id;
+    let now = chrono::Utc::now().timestamp_micros();
+    node.patch_steps(
+        agent,
+        vec![StepPatch {
+            id: "step-1".to_owned(),
+            name: "Build".to_owned(),
+            conclusion: "success".to_owned(),
+            started_at_us: Some(now),
+            finished_at_us: None,
+            observed_us: now,
+        }],
+    )
+    .await
+    .unwrap();
+    {
+        // ~year 280000: storable in `timestamptz`, outside chrono's range.
+        let client = node.writer().await.unwrap();
+        client
+            .execute(
+                "UPDATE job_steps SET started_at = to_timestamp(8800000000000) \
+                 WHERE agent_job_id = $1::text::uuid AND step_id = $2",
+                &[&agent.to_string(), &"step-1"],
+            )
+            .await
+            .unwrap();
+    }
+
+    let manifests = node.run_step_manifests(run_id).await.unwrap();
+    let steps = manifests.get(&agent).expect("manifest for the attempt");
+    assert!(
+        steps[0].started_at.is_none(),
+        "an out-of-range stored timestamp must read as absent, not 1970"
+    );
+}
