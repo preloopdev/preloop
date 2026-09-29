@@ -1,0 +1,6 @@
+[[failures]]
+endpoint = "scenario:227-composite-pre-post"
+expected_status = 0
+actual_status = 0
+diff = "See .runner-watch/conformance/v2.337.0/227-composite-pre-post.md — POST /broker/{n}/acquirejob response_schema (response body drops/changes reference fields)"
+
