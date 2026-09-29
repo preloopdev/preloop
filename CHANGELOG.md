@@ -8,6 +8,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- `PRELOOP_CREDENTIAL_STORE` selects where the engine's own credentials — the
+  system token and the GitHub App/PAT — are kept: `os` (the native
+  keychain/secret-service, default), `file` (`0600` files under
+  `$PRELOOP_HOME/credentials`, for headless hosts and containers where keychain
+  prompts are unacceptable), or `memory` (non-persistent; tests only).
+
+### Changed
+
+- Control-plane state is database-authoritative. Runs, jobs, runners, sessions,
+  webhook deliveries and logs are mutated through one `ControlBackend` trait,
+  one short transaction per command, instead of an in-memory working set that
+  was snapshotted to the database. SQLite remains the default (single writer,
+  WAL); Postgres implements the same contract so **several engine nodes can
+  share one database** — jobs are claimed with `FOR UPDATE SKIP LOCKED` and
+  nodes wake each other through `LISTEN`/`NOTIFY`. The old `Store` snapshot
+  layer is gone. Cache and artifact reservations remain node-local, so a
+  multi-node deployment must route a job's cache/artifact requests back to the
+  node that reserved them (or run one node per job).
+- The control schema is greenfield v1, created on first use and versioned in
+  `schema_meta`. There is no upgrade path from an older control database:
+  SQLite refuses a pre-`ControlBackend` `preloop.db` and offers only
+  "recreate the database", while Postgres creates a fresh `control` schema and
+  leaves an older `public` layout untouched and unread. Export anything you need
+  and start from a fresh database.
+- The debug controller API moved to a single `/api/v1/debug/sessions/…` surface
+  from the older controller-only namespace, and the standalone verdict POST
+  folded into the same lease-gated, idempotent `/operations` surface as retry
+  and abort. Agents and scripts written against the old namespace must be
+  repointed; the bundled CLI already is.
+- Secret values are never written to the control database: a stored job message
+  carries secret names, and the values are resolved when a runner acquires the
+  job. The builtin secret provider is node-local (its tiers come from this
+  node's config, its run tiers from `<state_dir>/run-secrets/`), so a multi-node
+  deployment needs a shared secret provider.
+- Job messages and AzDO responses now match `actions/runner` v2.337.0: remote
+  action references always emit `repositoryType`, `actionsEnvironment.url` is an
+  explicit `null` when the workflow defines no deployment URL, and `plan.env`
+  is emitted as `environmentVariables` template maps.
+
+### Fixed
+
+- Pre-baked golden downloads now check free space on the destination filesystem
+  before writing the multi-gigabyte payload. An undersized host gets an
+  actionable size error instead of downloading a partial image and falling
+  through to an even larger local bake.
+
 ## [0.33.7] - 2026-09-28
 
 ### Added
@@ -358,13 +406,6 @@ Releases before v0.27.0 predate the changelog.
   left `in_progress` with nothing executing it raises a
   `run_in_progress_without_execution` condition instead of vanishing from the
   operator's view.
-- SQLite control databases now enforce `NOT NULL` on text primary keys, matching
-  PostgreSQL instead of accepting identity rows with `NULL` keys. The v8
-  migration rebuilds affected tables atomically and preserves existing rows.
-- Pre-baked golden downloads now check free space on the destination filesystem
-  before writing the multi-gigabyte payload. An undersized host gets an
-  actionable size error instead of downloading a partial image and falling
-  through to an even larger local bake.
 - `preloop run` declared its change set as known even when path derivation had
   not run, so an empty list read as "nothing changed" and every `paths:` filter
   rejected the run with a 400. The flag now mirrors whether derivation actually
