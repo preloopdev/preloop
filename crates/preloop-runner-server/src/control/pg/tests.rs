@@ -8,7 +8,8 @@
 //!
 //! A `PRELOOP_TEST_POSTGRES_URL`-provided server is used when set; otherwise
 //! each test starts its own `initdb`'d cluster (Postgres.app / Homebrew /
-//! system bin, or `initdb` on `PATH`).
+//! system bin, or `initdb` on `PATH`). With neither available, tests print a
+//! skip notice and pass.
 
 use super::PgBackend;
 use crate::control::backend::{
@@ -32,6 +33,8 @@ use std::sync::Arc;
 struct DisposablePg {
     dir: PathBuf,
     port: u16,
+    /// Directory holding `initdb`/`pg_ctl` for this cluster.
+    bin: PathBuf,
     /// Retains a per-test database created on `PRELOOP_TEST_POSTGRES_URL`.
     /// Without this guard, the temporary database is dropped immediately
     /// after `fresh_database` returns and all backend connections fail.
@@ -39,8 +42,7 @@ struct DisposablePg {
 }
 
 impl DisposablePg {
-    fn start() -> Self {
-        let bin = pg_bin();
+    fn start(bin: PathBuf) -> Self {
         // Short path: the `-k` Unix socket lives inside `dir`, and
         // `std::env::temp_dir()` + a UUID exceeds the 104-byte `sun_path`
         // limit. `/tmp` keeps it well under.
@@ -76,6 +78,7 @@ impl DisposablePg {
         Self {
             dir,
             port,
+            bin,
             database: None,
         }
     }
@@ -90,8 +93,7 @@ impl Drop for DisposablePg {
         if self.database.is_some() {
             return;
         }
-        let bin = pg_bin();
-        let _ = Command::new(bin.join("pg_ctl"))
+        let _ = Command::new(self.bin.join("pg_ctl"))
             .args([
                 "-D".into(),
                 self.dir.join("data").to_string_lossy().into_owned(),
@@ -118,7 +120,9 @@ fn run(bin: PathBuf, args: &[String]) {
 }
 
 /// Locate a PostgreSQL bin dir: Postgres.app, Homebrew, system, or PATH.
-fn pg_bin() -> PathBuf {
+/// `None` when no local server binaries are installed — the tests then skip
+/// unless `PRELOOP_TEST_POSTGRES_URL` names a server.
+fn pg_bin_opt() -> Option<PathBuf> {
     let candidates = [
         "/Applications/Postgres.app/Contents/Versions/latest/bin",
         "/opt/homebrew/opt/postgresql@18/bin",
@@ -134,20 +138,17 @@ fn pg_bin() -> PathBuf {
     for dir in candidates {
         let bin = PathBuf::from(dir);
         if bin.join("initdb").exists() {
-            return bin;
+            return Some(bin);
         }
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             if dir.join("initdb").exists() {
-                return dir;
+                return Some(dir);
             }
         }
     }
-    panic!(
-        "no PostgreSQL binaries found: set PRELOOP_TEST_POSTGRES_URL to a \
-         disposable database, or install Postgres.app / postgresql"
-    );
+    None
 }
 
 fn free_port() -> u16 {
@@ -165,31 +166,43 @@ async fn connect(url: &str) -> PgBackend {
 }
 
 /// Two independent backends (separate writer pools) on ONE database: the
-/// shape of two engine nodes sharing a cell, for race tests.
-async fn backend_pair() -> (DisposablePg, PgBackend, PgBackend) {
-    let (guard, url) = fresh_database().await;
+/// shape of two engine nodes sharing a cell, for race tests. `None` when no
+/// Postgres is reachable: the caller prints the skip notice and returns.
+async fn backend_pair() -> Option<(DisposablePg, PgBackend, PgBackend)> {
+    let (guard, url) = fresh_database_opt().await?;
     let first = connect(&url).await;
     let second = connect(&url).await;
-    (guard, first, second)
+    Some((guard, first, second))
 }
 
-async fn fresh_database() -> (DisposablePg, String) {
+/// A database nobody else uses plus its cleanup guard, or `None` when no
+/// Postgres is reachable (`PRELOOP_TEST_POSTGRES_URL` unset and no local
+/// server binaries): tests skip instead of panicking, matching the repo's
+/// convention for optional Postgres coverage.
+async fn fresh_database_opt() -> Option<(DisposablePg, String)> {
     // A shared server (PRELOOP_TEST_POSTGRES_URL) is honored by the suite
     // harness; the pg unit tests always isolate via a disposable cluster so
     // they also run without configuration.
     if let Some((database, url)) = crate::test_pg::fresh_database().await {
-        return (
+        return Some((
             DisposablePg {
                 dir: PathBuf::new(),
                 port: 0,
+                bin: PathBuf::new(),
                 database: Some(database),
             },
             url,
-        );
+        ));
     }
-    let pg = DisposablePg::start();
+    let bin = pg_bin_opt()?;
+    let pg = DisposablePg::start(bin);
     let url = pg.url();
-    (pg, url)
+    Some((pg, url))
+}
+
+/// Printed by every Postgres test that cannot reach a server.
+fn skip_no_postgres() {
+    eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server, or install postgresql");
 }
 
 // ── submission builders (self-contained; suite helpers are private) ─────
@@ -398,7 +411,9 @@ async fn submit_many(node: &PgBackend, count: usize, base_run_number: u64) -> Ve
 /// repository starts at one without colliding.
 #[tokio::test]
 async fn run_numbers_are_atomic_and_scoped() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let key = ("default", "owner/repo", ".github/workflows/ci.yml");
     let (first, second) = tokio::join!(
         node_a.allocate_run_number(key.0, key.1, key.2),
@@ -427,7 +442,9 @@ async fn run_numbers_are_atomic_and_scoped() {
 /// mints must still be unique — it is the cross-node correlation key.
 #[tokio::test]
 async fn concurrent_submits_mint_distinct_request_ids() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     const PER_NODE: usize = 24;
     let (agents_a, agents_b) = tokio::join!(
         submit_many(&node_a, PER_NODE, 1_000),
@@ -454,7 +471,9 @@ async fn concurrent_submits_mint_distinct_request_ids() {
 /// `UPDATE` is the mutual exclusion, and it must hold across nodes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_polls_claim_once() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let runner = node_a.register_runner(register_runner("r1")).await.unwrap();
     // Two sessions on two nodes, all polling the same queue.
     let session_a = node_a
@@ -586,7 +605,9 @@ async fn submit_and_claim(
 /// taking every other command (and the webhook inbox) down with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_acquires_beyond_pool_size_complete() {
-    let (_pg, node, _other) = backend_pair().await;
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let (request, runner_id) = submit_and_claim(&node, RunId::new()).await;
     let acquires = (0..64).map(|_| node.acquire_for_runner(request.request_id, runner_id));
     let results = tokio::time::timeout(
@@ -606,7 +627,9 @@ async fn concurrent_acquires_beyond_pool_size_complete() {
 /// not exist).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timelines_are_shared_and_bounded_across_nodes() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
     let key = format!("{}/{}", request.plan_id, request.timeline_id);
@@ -664,7 +687,9 @@ async fn timelines_are_shared_and_bounded_across_nodes() {
 /// the cutoff; a live request's timeline survives.
 #[tokio::test]
 async fn prune_timelines_drops_settled_attempts() {
-    let (_pg, node_a, _node_b) = backend_pair().await;
+    let Some((_pg, node_a, _node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, runner_id) = submit_and_claim(&node_a, run_id).await;
     let key = format!("{}/{}", request.plan_id, request.timeline_id);
@@ -707,7 +732,9 @@ async fn prune_timelines_drops_settled_attempts() {
 /// timestamps forward. Unknown attempts write nothing.
 #[tokio::test]
 async fn patch_steps_upserts_synthetic_steps() {
-    let (_pg, node_a, _node_b) = backend_pair().await;
+    let Some((_pg, node_a, _node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
     let agent = request.agent_job_id;
@@ -771,7 +798,9 @@ async fn patch_steps_upserts_synthetic_steps() {
 /// nodes get distinct ids.
 #[tokio::test]
 async fn create_log_allocates_per_plan_across_nodes() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
     let plan = request.agent_job_id.to_string();

@@ -414,6 +414,15 @@ fn poll_unverified(session_id: &str) -> PollRequest {
     }
 }
 
+/// One job-level `concurrency:` gate: queue `single`, so exactly one holder.
+fn job_concurrency(group: &str, cancel_in_progress: bool) -> preloop_gha_parser::Concurrency {
+    preloop_gha_parser::Concurrency {
+        group: group.to_owned(),
+        cancel_in_progress: Some(cancel_in_progress.to_string()),
+        queue: preloop_gha_parser::ConcurrencyQueue::Single,
+    }
+}
+
 /// A job-level `concurrency:` declaration.
 fn job_concurrency(group: &str) -> preloop_gha_parser::Concurrency {
     preloop_gha_parser::Concurrency {
@@ -2011,6 +2020,88 @@ pub(crate) mod suite {
         );
     }
 
+    /// Fail-fast must release the concurrency slot of the sibling it
+    /// cancels. `apply_fail_fast` is the only path that cancels a sibling
+    /// without completing it, so a leaked hold (or a leaked wait row) parks
+    /// every later run in that group forever.
+    pub(crate) async fn fail_fast_releases_the_cancelled_sibling_concurrency_slot(
+        backend: &dyn ControlBackend,
+    ) {
+        // One fail-fast base ("build") with two gated legs on ONE group: the
+        // first admitted leg takes the group's hold, the second parks behind
+        // it, and failing the second cancels the holder. The ungated tail job
+        // is unmatched by the test runner and never claims, so the run stays
+        // non-terminal after fail-fast — a terminal run releases all of its
+        // holds anyway, which would mask a leak.
+        let run_id = RunId::new();
+        let mut holder = submit_job(run_id, "leg-holder", 1);
+        holder.queued.base_id = "build".to_owned();
+        holder.queued.concurrency = Some(job_concurrency("group-a", false));
+        let mut failing = submit_job(run_id, "leg-failing", 2);
+        failing.queued.base_id = "build".to_owned();
+        failing.queued.concurrency = Some(job_concurrency("group-a", false));
+        let mut tail = submit_job(run_id, "tail", 3);
+        tail.queued.runs_on = vec!["self-hosted".to_owned(), "never-provisioned".to_owned()];
+        let mut submit = submit_run(run_id, vec![holder, failing, tail]);
+        submit
+            .record
+            .job_fail_fast
+            .insert("build".to_owned(), true);
+        backend.submit_run(submit).await.unwrap();
+
+        // leg-failing fails: fail-fast cancels its sibling leg-holder, which
+        // owns the group slot.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("leg-failing".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Failure,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let record = backend.run_record(run_id).await.unwrap();
+        assert_eq!(
+            record.jobs.get(&JobId("leg-holder".to_owned())),
+            Some(&ExecutionStatus::Cancelled),
+            "fail-fast must cancel the sibling that holds the group"
+        );
+        assert!(
+            !record.status.is_terminal(),
+            "the tail job keeps the run alive so the run-level release cannot mask the leak"
+        );
+
+        // A later run in the same group must be able to claim its job; with
+        // the sibling's slot leaked, that job parks behind the dead holder.
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let next_run = RunId::new();
+        let mut job = submit_job(next_run, "deploy", 4);
+        job.queued.concurrency = Some(job_concurrency("group-a", false));
+        backend
+            .submit_run(submit_run(next_run, vec![job]))
+            .await
+            .unwrap();
+        match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claim) => {
+                assert_eq!(claim.queued.job_id, JobId("deploy".to_owned()));
+            }
+            other => panic!("the group slot must be free after fail-fast, got {other:?}"),
+        }
+    }
+
     pub(crate) async fn reconcile_recovers_orphaned_claim(backend: &dyn ControlBackend) {
         // Crash-recovery: a job claimed by a runner whose session then dies
         // (releasing the request's owner) is orphaned. reconcile_on_boot must
@@ -3267,11 +3358,12 @@ use std::process::Command;
 struct DisposablePg {
     dir: PathBuf,
     port: u16,
+    /// Directory holding `initdb`/`pg_ctl` for this cluster.
+    bin: PathBuf,
 }
 
 impl DisposablePg {
-    fn start() -> Self {
-        let bin = pg_bin();
+    fn start(bin: PathBuf) -> Self {
         // Short path: the `-k` Unix socket lives inside `dir`, and
         // `std::env::temp_dir()` (`/var/folders/…/T/`) + a UUID exceeds
         // the 104-byte `sun_path` limit. `/tmp` keeps it well under.
@@ -3308,7 +3400,7 @@ impl DisposablePg {
             ],
         );
 
-        Self { dir, port }
+        Self { dir, port, bin }
     }
 
     fn url(&self) -> String {
@@ -3318,8 +3410,7 @@ impl DisposablePg {
 
 impl Drop for DisposablePg {
     fn drop(&mut self) {
-        let bin = pg_bin();
-        let _ = Command::new(bin.join("pg_ctl"))
+        let _ = Command::new(self.bin.join("pg_ctl"))
             .args([
                 "-D".into(),
                 self.dir.join("data").to_string_lossy().into_owned(),
@@ -3346,7 +3437,9 @@ fn run(bin: PathBuf, args: &[String]) {
 }
 
 /// Locate a PostgreSQL bin dir: Postgres.app, Homebrew, system, or PATH.
-fn pg_bin() -> PathBuf {
+/// `None` when no local server binaries are installed — the Postgres tests
+/// then skip unless `PRELOOP_TEST_POSTGRES_URL` names a server.
+fn pg_bin_opt() -> Option<PathBuf> {
     let candidates = [
         "/Applications/Postgres.app/Contents/Versions/latest/bin",
         "/opt/homebrew/opt/postgresql@18/bin",
@@ -3362,21 +3455,18 @@ fn pg_bin() -> PathBuf {
     for dir in candidates {
         let bin = PathBuf::from(dir);
         if bin.join("initdb").exists() {
-            return bin;
+            return Some(bin);
         }
     }
     // Fall back to PATH.
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
             if dir.join("initdb").exists() {
-                return dir;
+                return Some(dir);
             }
         }
     }
-    panic!(
-        "no PostgreSQL binaries found: set PRELOOP_TEST_POSTGRES_URL to a \
-         disposable database, or install Postgres.app / postgresql"
-    );
+    None
 }
 
 fn free_port() -> u16 {
@@ -3395,21 +3485,28 @@ enum PgGuard {
     Cluster(#[allow(dead_code)] DisposablePg),
 }
 
-/// A URL to a database nobody else uses, plus its cleanup guard.
-async fn fresh_database() -> (PgGuard, String) {
-    match crate::test_pg::fresh_database().await {
-        Some((db, url)) => (PgGuard::Database(db), url),
-        None => {
-            let pg = DisposablePg::start();
-            let url = pg.url();
-            (PgGuard::Cluster(pg), url)
-        }
+/// A URL to a database nobody else uses, plus its cleanup guard. `None`
+/// when no Postgres is reachable: `PRELOOP_TEST_POSTGRES_URL` is unset and
+/// no local server binaries are installed, so tests skip instead of failing
+/// (the repo-wide convention for optional Postgres coverage).
+async fn fresh_database_opt() -> Option<(PgGuard, String)> {
+    if let Some((db, url)) = crate::test_pg::fresh_database().await {
+        return Some((PgGuard::Database(db), url));
     }
+    let bin = pg_bin_opt()?;
+    let pg = DisposablePg::start(bin);
+    let url = pg.url();
+    Some((PgGuard::Cluster(pg), url))
+}
+
+/// Printed by every Postgres test that cannot reach a server.
+fn skip_no_postgres() {
+    eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server, or install postgresql");
 }
 
 mod pg {
     use super::*;
-    use super::{PgGuard, fresh_database};
+    use super::{PgGuard, fresh_database_opt, skip_no_postgres};
     use crate::control::pg::PgBackend;
 
     async fn connect(url: &str) -> PgBackend {
@@ -3419,31 +3516,36 @@ mod pg {
     }
 
     /// A backend on its own fresh database. Keep the guard alive for the
-    /// test's duration.
-    async fn backend() -> (PgGuard, PgBackend) {
-        let (guard, url) = fresh_database().await;
+    /// test's duration. `None` when no Postgres is reachable: the caller
+    /// prints the skip notice and returns.
+    async fn backend() -> Option<(PgGuard, PgBackend)> {
+        let (guard, url) = fresh_database_opt().await?;
         let backend = connect(&url).await;
-        (guard, backend)
+        Some((guard, backend))
     }
 
     /// Two independent backends (separate pools) on ONE database: the
     /// shape of two engine nodes sharing a cell, for race tests.
-    async fn backend_pair() -> (PgGuard, PgBackend, PgBackend) {
-        let (guard, url) = fresh_database().await;
+    async fn backend_pair() -> Option<(PgGuard, PgBackend, PgBackend)> {
+        let (guard, url) = fresh_database_opt().await?;
         let first = connect(&url).await;
         let second = connect(&url).await;
-        (guard, first, second)
+        Some((guard, first, second))
     }
 
     #[tokio::test]
     async fn submit_poll_complete_lifecycle() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::submit_poll_complete_lifecycle(&backend).await;
     }
 
     #[tokio::test]
     async fn sessionless_runner_is_not_idle_capacity() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::sessionless_runner_is_not_idle_capacity(&backend).await;
     }
 
@@ -3455,31 +3557,41 @@ mod pg {
 
     #[tokio::test]
     async fn step_reports_merge_into_manifest() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::step_reports_merge_into_manifest(&backend).await;
     }
 
     #[tokio::test]
     async fn webhook_replay_is_idempotent() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::webhook_replay_is_idempotent(&backend).await;
     }
 
     #[tokio::test]
     async fn request_lookup_resolves_attempt_correlations() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::request_lookup_resolves_attempt_correlations(&backend).await;
     }
 
     #[tokio::test]
     async fn push_state_only_changes_its_run_column() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::push_state_only_changes_its_run_column(&backend).await;
     }
 
     #[tokio::test]
     async fn cancel_run_queues_cancellation() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::cancel_run_queues_cancellation(&backend).await;
     }
 
@@ -3515,13 +3627,17 @@ mod pg {
 
     #[tokio::test]
     async fn artifact_scopes_map_plan_ids_to_latest_run() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::artifact_scopes_map_plan_ids_to_latest_run(&backend).await;
     }
 
     #[tokio::test]
     async fn concurrency_gate_serializes_group() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::concurrency_gate_serializes_group(&backend).await;
     }
 
@@ -3544,8 +3660,18 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn fail_fast_releases_the_cancelled_sibling_concurrency_slot() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::fail_fast_releases_the_cancelled_sibling_concurrency_slot(&backend).await;
+    }
+
+    #[tokio::test]
     async fn run_record_round_trips_through_tables() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::run_record_round_trips_through_tables(&backend).await;
     }
 
@@ -3581,43 +3707,57 @@ mod pg {
 
     #[tokio::test]
     async fn reconcile_recovers_orphaned_claim() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::reconcile_recovers_orphaned_claim(&backend).await;
     }
 
     #[tokio::test]
     async fn purge_requeues_claimed_as_queued() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::purge_requeues_claimed_as_queued(&backend).await;
     }
 
     #[tokio::test]
     async fn purge_requeues_ownerless_claim() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::purge_requeues_ownerless_claim(&backend).await;
     }
 
     #[tokio::test]
     async fn check_run_mapping() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::check_run_mapping(&backend).await;
     }
 
     #[tokio::test]
     async fn submit_unhostable_job_persists_failure() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::submit_unhostable_job_persists_failure(&backend).await;
     }
 
     #[tokio::test]
     async fn submit_skipped_parent_settles_child() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::submit_skipped_parent_settles_child(&backend).await;
     }
 
     #[tokio::test]
     async fn cancel_in_progress_submit_reports_surviving_depth() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::cancel_in_progress_submit_reports_surviving_depth(&backend).await;
     }
 
@@ -3706,7 +3846,9 @@ mod pg {
 
     #[tokio::test]
     async fn secret_values_never_persist() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::secret_values_never_persist(&backend).await;
     }
 
@@ -3718,7 +3860,9 @@ mod pg {
 
     #[tokio::test]
     async fn webhook_inbox_claim_is_fenced_and_deduplicated() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::webhook_inbox_claim_is_fenced_and_deduplicated(&backend).await;
     }
 
@@ -3751,7 +3895,9 @@ mod pg {
     /// request id.
     #[tokio::test]
     async fn concurrent_submits_mint_distinct_request_ids() {
-        let (_pg, node_a, node_b) = backend_pair().await;
+        let Some((_pg, node_a, node_b)) = backend_pair().await else {
+            return skip_no_postgres();
+        };
         const PER_NODE: usize = 24;
         let (agents_a, agents_b) = tokio::join!(
             submit_many(&node_a, PER_NODE),
@@ -3780,7 +3926,9 @@ mod pg {
         use crate::control::types::PollOutcome;
         const JOBS: usize = 24;
         const RUNNERS: usize = 12;
-        let (_pg, node_a, node_b) = backend_pair().await;
+        let Some((_pg, node_a, node_b)) = backend_pair().await else {
+            return skip_no_postgres();
+        };
         let nodes = [std::sync::Arc::new(node_a), std::sync::Arc::new(node_b)];
         let mut sessions = Vec::new();
         for i in 0..RUNNERS {
@@ -4238,6 +4386,14 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn fail_fast_releases_the_cancelled_sibling_concurrency_slot() {
+        suite::fail_fast_releases_the_cancelled_sibling_concurrency_slot(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn reconcile_recovers_orphaned_claim() {
         suite::reconcile_recovers_orphaned_claim(&LiteBackend::in_memory().unwrap()).await;
     }
@@ -4688,4 +4844,45 @@ mod lite {
             crate::control::lite::SCHEMA_VERSION
         );
     }
+}
+
+// ── Schema copies and legacy identity ───────────────────────────────────
+
+/// `docs/control-schema.sql` is a hand copy of the backend's schema, and the
+/// control-plane job applies *it* to prove the target schema is valid; keep
+/// the two identical (comments and blank lines aside) so that check cannot
+/// validate a stale DDL while the backend accepts something else.
+#[test]
+fn docs_control_schema_matches_backend_schema() {
+    fn ddl(sql: &str) -> String {
+        sql.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    assert_eq!(
+        ddl(include_str!("../../../../docs/control-schema.sql")),
+        ddl(include_str!("pg/schema.sql")),
+        "docs/control-schema.sql drifted from control/pg/schema.sql"
+    );
+}
+
+/// Legacy session ids are stored under their RFC 4122 v5 (SHA-1) encoding, so
+/// the derivation must not change — a stored id's rows would become
+/// unreachable. Reference value from an independent implementation
+/// (Python `uuid.uuid5` with the same namespace).
+#[test]
+fn session_uuid_keeps_the_legacy_v5_encoding() {
+    use crate::control::logic::{session_uuid, SESSION_ID_NAMESPACE};
+
+    assert_eq!(
+        session_uuid("s1").to_string(),
+        "b02cbb01-07e8-577e-8b5f-d710c9c53520"
+    );
+    assert_eq!(
+        session_uuid(&SESSION_ID_NAMESPACE.to_string()).to_string(),
+        SESSION_ID_NAMESPACE.to_string(),
+        "a canonical UUID session id is already its own stored value"
+    );
 }
