@@ -1242,16 +1242,21 @@ impl PgBackend {
     /// The one in-flight request a session still claims, when exactly one
     /// exists.
     ///
-    /// Statement: `SELECT .. FROM job_requests WHERE result IS NULL AND
-    /// session_id IS NOT NULL LIMIT 2`.
+    /// The session binding counts only while its `runner_sessions` row
+    /// exists (`job_requests.session_id` has no foreign key).
+    ///
+    /// Statement: `SELECT .. FROM job_requests q JOIN runner_sessions s ON
+    /// s.session_id = q.session_id WHERE q.result IS NULL LIMIT 2`.
     pub(super) async fn sole_inflight_request(
         &self,
     ) -> Result<Option<(i64, RunId, JobId, uuid::Uuid)>, ControlError> {
         let client = self.reader().await?;
         let rows = client
             .query(
-                "SELECT request_id, run_id::text, job_id, agent_job_id::text FROM job_requests \
-                 WHERE result IS NULL AND session_id IS NOT NULL LIMIT 2",
+                "SELECT request_id, run_id::text, job_id, agent_job_id::text \
+                 FROM job_requests q JOIN runner_sessions s \
+                 ON s.session_id = q.session_id \
+                 WHERE q.result IS NULL LIMIT 2",
                 &[],
             )
             .await
@@ -1382,12 +1387,14 @@ impl PgBackend {
         Ok(stats)
     }
 
-    /// Live runner → job assignments: in-flight attempts a session still
-    /// claims, with their owner and age.
+    /// Owned, session-bound, in-flight attempts per runner (status page).
+    /// The session binding counts only while its `runner_sessions` row exists
+    /// (`job_requests.session_id` has no foreign key).
     ///
-    /// Statement: `SELECT runner_id, run_id, job_id, started_at FROM
-    /// job_requests WHERE result IS NULL AND session_id IS NOT NULL AND
-    /// runner_id IS NOT NULL ORDER BY runner_id`.
+    /// Statement: `SELECT q.runner_id, q.run_id, q.job_id, q.started_at FROM
+    /// job_requests q JOIN runner_sessions s ON s.session_id = q.session_id
+    /// WHERE q.result IS NULL AND q.runner_id IS NOT NULL ORDER BY
+    /// q.runner_id`.
     pub(super) async fn live_assignments(
         &self,
     ) -> Result<Vec<preloop_observability::status::RunnerAssignment>, ControlError> {
@@ -1396,10 +1403,12 @@ impl PgBackend {
         Ok(client
             .query(
                 concat!(
-                    "SELECT runner_id, run_id::text, job_id, ",
-                    us!("started_at"),
-                    " FROM job_requests WHERE result IS NULL AND session_id IS NOT NULL \
-                     AND runner_id IS NOT NULL ORDER BY runner_id, request_id"
+                    "SELECT q.runner_id, q.run_id::text, q.job_id, ",
+                    us!("q.started_at"),
+                    " FROM job_requests q JOIN runner_sessions s \
+                     ON s.session_id = q.session_id \
+                     WHERE q.result IS NULL AND q.runner_id IS NOT NULL \
+                     ORDER BY q.runner_id, q.request_id"
                 ),
                 &[],
             )
