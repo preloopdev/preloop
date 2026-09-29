@@ -792,7 +792,6 @@ pub async fn drain_expansions(shared: &Arc<SharedState>) -> SchedulingOutcome {
         {
             Ok(promoted) => outcome.merge(promoted),
             Err(error) => {
-                eprintln!("APPLY-ERR {error:?}");
                 tracing::warn!(?error, "drain_expansions: apply failed");
                 return outcome;
             }
