@@ -1549,6 +1549,17 @@ async fn advance_jobset(
     jobset_id: i64,
     acquired_key: Option<&(String, String)>,
 ) -> Result<JobsetAdvance, ControlError> {
+    // The jobset's gates live in the run's namespace, like every other
+    // concurrency key (lite reads it from the run's job row).
+    let namespace: String = tx
+        .query_opt(
+            "SELECT namespace_id FROM runs WHERE run_id=$1::text::uuid",
+            &[&run_id.0.to_string()],
+        )
+        .await
+        .map_err(db)?
+        .map(|row| row.get(0))
+        .unwrap_or_else(|| "default".to_owned());
     if let Some(key) = acquired_key {
         tx.execute(
             "UPDATE jobset_gates SET acquired=true WHERE jobset_id=$1 \
@@ -1595,7 +1606,7 @@ async fn advance_jobset(
             jobset_id: Some(jobset_id),
         };
         match acquire_gate(
-            backend, tx, "default", &key, &display, &holder, cancel, queue,
+            backend, tx, &namespace, &key, &display, &holder, cancel, queue,
         )
         .await?
         {
@@ -1626,15 +1637,18 @@ async fn release_jobset_gates(
 ) -> Result<(), ControlError> {
     let gates = tx
         .query(
-            "SELECT repository, group_name FROM jobset_gates \
-             WHERE jobset_id=$1 AND acquired",
+            "SELECT g.repository, g.group_name, r.namespace_id FROM jobset_gates g \
+             JOIN jobsets s ON s.jobset_id = g.jobset_id \
+             JOIN runs r ON r.run_id = s.run_id \
+             WHERE g.jobset_id=$1 AND g.acquired",
             &[&jobset_id],
         )
         .await
         .map_err(db)?;
     for gate in gates {
         let key = (gate.get::<_, String>(0), gate.get::<_, String>(1));
-        promote_after_release(backend, tx, "default", &key).await?;
+        let namespace: String = gate.get(2);
+        promote_after_release(backend, tx, &namespace, &key).await?;
     }
     Ok(())
 }
