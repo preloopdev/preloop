@@ -28,7 +28,13 @@ sha2 = "0.10"
 hex = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
-fs2 = "0.4"
+
+# Free space for the golden download. `nix` is the safe wrapper around
+# `statvfs`: the workspace forbids `unsafe`, which rules out raw `libc`
+# calls. Already in the tree via command-group. Unix-only — non-Unix builds
+# report the error and the caller continues without the space check.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true

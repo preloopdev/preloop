@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use preloop_gha_protocol::crypto::{sign_jwt_ps256, AgentRsaKeypair};
 use rand::Rng;
-use rand_distr::{Distribution, LogNormal};
 use serde_json::{json, Value};
 
 use crate::metrics::Metrics;
@@ -27,6 +26,16 @@ pub struct JobModel {
     pub renew_every: Duration,
     /// Probability a job reports failure.
     pub failure_rate: f64,
+}
+
+/// A log-normal draw with parameters `mu` (log-median) and `sigma`: a
+/// standard normal sample by Box-Muller, exponentiated. `rand_distr`'s
+/// `LogNormal` is not used because that crate is unvetted in this workspace.
+fn log_normal_seconds(rng: &mut impl Rng, mu: f64, sigma: f64) -> f64 {
+    let u1: f64 = rng.gen::<f64>().max(f64::MIN_POSITIVE);
+    let u2: f64 = rng.gen();
+    let normal = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+    (mu + sigma * normal).exp()
 }
 
 pub struct Runner {
@@ -255,8 +264,10 @@ impl Runner {
         let duration = {
             let mut rng = rand::thread_rng();
             let median = self.model.median.as_secs_f64();
-            let dist = LogNormal::new(median.ln(), self.model.sigma).unwrap();
-            Duration::from_secs_f64(dist.sample(&mut rng).clamp(0.05, median * 20.0))
+            Duration::from_secs_f64(
+                log_normal_seconds(&mut rng, median.ln(), self.model.sigma)
+                    .clamp(0.05, median * 20.0),
+            )
         };
         let updates = self.model.timeline_updates.max(1);
         let tick = duration / updates;

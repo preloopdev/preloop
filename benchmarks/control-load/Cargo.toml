@@ -26,4 +26,3 @@ tokio-postgres.workspace = true
 uuid.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_urlencoded = "0.7"
-rand_distr = "0.4"

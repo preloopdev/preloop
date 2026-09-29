@@ -22,10 +22,28 @@ pub(crate) use crate::runtime_scheduling::{
 pub(crate) const SESSION_ID_NAMESPACE: uuid::Uuid =
     uuid::uuid!("7d3c0a1c-6f4a-4d4c-a5d4-8d27b5a3c1f0");
 
-/// Convert a session id to its stored UUID, using UUID v5 for legacy ids.
+/// Convert a session id to its stored UUID, hashing legacy ids with
+/// RFC 4122 v5 (SHA-1) so the mapping of a stored id never changes.
+///
+/// Uses the workspace's `sha1` crate rather than `uuid`'s `v5` feature: the
+/// latter pulls the unvetted `sha1_smol` into the dependency graph.
 pub(crate) fn session_uuid(id: &str) -> uuid::Uuid {
     id.parse()
-        .unwrap_or_else(|_| uuid::Uuid::new_v5(&SESSION_ID_NAMESPACE, id.as_bytes()))
+        .unwrap_or_else(|_| uuid_v5(&SESSION_ID_NAMESPACE, id))
+}
+
+/// RFC 4122 UUID v5: SHA-1 of the namespace bytes then the name, first 16
+/// bytes, with the version and variant bits set.
+fn uuid_v5(namespace: &uuid::Uuid, name: &str) -> uuid::Uuid {
+    use sha1::{Digest, Sha1};
+
+    let mut hasher = Sha1::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_sha1_bytes(bytes).into_uuid()
 }
 
 /// How long an unmatched ready job may wait for a matching runner.

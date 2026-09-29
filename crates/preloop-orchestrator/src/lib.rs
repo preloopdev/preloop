@@ -771,8 +771,21 @@ fn report_golden_download_progress(source: &str, downloaded_bytes: u64, total_by
     }
 }
 
+/// Free space on the filesystem holding `path`, in bytes.
+#[cfg(unix)]
 fn filesystem_available_space(path: &Path) -> std::io::Result<u64> {
-    fs2::available_space(path)
+    let stat = nix::sys::statvfs::statvfs(path).map_err(std::io::Error::from)?;
+    Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
+}
+
+/// `statvfs` is Unix-only; the caller logs the error and continues without
+/// the space check.
+#[cfg(not(unix))]
+fn filesystem_available_space(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "free-space checks require a Unix host",
+    ))
 }
 
 fn golden_download_required_bytes(expected_bytes: Option<u64>) -> u64 {

@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use rand_distr::{Distribution, Exp};
 
 use metrics::Metrics;
 
@@ -138,6 +137,13 @@ fn multiplier(bursts: &[(u64, u64, f64)], t: u64) -> f64 {
         .fold(1.0, f64::max)
 }
 
+/// Exponential inter-arrival gap for a Poisson process at `rate` per second
+/// (inverse transform). `rand_distr`'s `Exp` is not used because that crate
+/// is unvetted in this workspace.
+fn exponential_gap(rng: &mut impl Rng, rate: f64) -> f64 {
+    -(1.0 - rng.gen::<f64>()).ln() / rate
+}
+
 async fn run(args: RunArgs) -> Result<()> {
     anyhow::ensure!(!args.servers.is_empty(), "--servers required");
     let bursts: Vec<(u64, u64, f64)> = args
@@ -200,7 +206,7 @@ async fn run(args: RunArgs) -> Result<()> {
     while Instant::now() < submit_end {
         let t = metrics.elapsed().as_secs();
         let rate = args.runs_per_sec * multiplier(&bursts, t);
-        let gap = Exp::new(rate).unwrap().sample(&mut rng);
+        let gap = exponential_gap(&mut rng, rate);
         next += Duration::from_secs_f64(gap);
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             tokio::time::sleep(wait).await;
