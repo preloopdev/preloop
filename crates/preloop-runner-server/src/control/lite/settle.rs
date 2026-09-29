@@ -506,6 +506,13 @@ fn fail_jobset(
         release_jobset(tx, backend, set_id)?;
     }
     for job_id in job_ids {
+        tx.prepare_cached(
+            "UPDATE jobs SET expand_generation = expand_generation + 1 \
+             WHERE run_id = ?1 AND job_id = ?2",
+        )
+        .map_err(db)?
+        .execute(params![codec::run_key(run_id), job_id.0])
+        .map_err(db)?;
         finish_job_row(tx, run_id, job_id, status)?;
         if is_expandable(tx, run_id, job_id)? {
             retire_node_requests(tx, run_id, job_id, status)?;
@@ -597,6 +604,7 @@ pub(super) fn cancel_run_inner(
     };
     tx.prepare_cached(
         "UPDATE jobs SET status = 'cancelled', queue_state = 'none', \
+             expand_generation = expand_generation + 1, \
              completed_at = ?2, started_at = COALESCE(started_at, ?2), \
              claimed_by_runner_id = NULL, claimed_at = NULL \
          WHERE run_id = ?1 AND status NOT IN ('success','failure','cancelled','skipped')",
@@ -662,6 +670,15 @@ pub(super) fn cancel_job_inner(
         queue_cancellation(tx, request_id)?;
         count = 1;
     }
+    // A cancelled node's in-flight expansion lease is stale: bumping the
+    // generation makes `apply_expansion` discard the build.
+    tx.prepare_cached(
+        "UPDATE jobs SET expand_generation = expand_generation + 1 \
+         WHERE run_id = ?1 AND job_id = ?2",
+    )
+    .map_err(db)?
+    .execute(params![codec::run_key(run_id), job_id.0])
+    .map_err(db)?;
     finish_job_row(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
     // Reusable callers own their callee subtree; a cancelled caller cancels
     // it (matrix legs included — they carry `parent_job_id` too).

@@ -1973,6 +1973,7 @@ async fn cancel_run_tx(
     tx.execute(
         concat!(
             "UPDATE jobs SET status='cancelled', queue_state='none', \
+             expand_generation=expand_generation+1, \
              completed_at=",
             ts!("$2"),
             ", started_at=COALESCE(started_at,",
@@ -2118,6 +2119,7 @@ async fn cancel_job_tx(
         tx.execute(
             concat!(
                 "UPDATE jobs SET status='cancelled', queue_state='none', \
+                 expand_generation=expand_generation+1, \
                  completed_at=",
                 ts!("$3"),
                 ", started_at=COALESCE(started_at,",
