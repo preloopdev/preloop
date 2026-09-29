@@ -2903,6 +2903,30 @@ pub(crate) mod suite {
         );
     }
 
+    /// `job_queue_state` returns the `QueueKind` vocabulary, not the storage
+    /// column: a dependency-blocked job reads `pending`.
+    pub(crate) async fn job_queue_state_speaks_queue_kind(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut child = submit_job(run_id, "child", 2);
+        child.queued.needs = vec![JobId("parent".to_owned())];
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "parent", 1), child],
+            ))
+            .await
+            .unwrap();
+        let (kind, _status) = backend
+            .job_queue_state(run_id, &JobId("child".to_owned()))
+            .await
+            .unwrap()
+            .expect("the blocked job has a live row");
+        assert_eq!(
+            kind, "pending",
+            "a needs-blocked job is `pending` in the QueueKind vocabulary"
+        );
+    }
+
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -3322,6 +3346,12 @@ mod pg {
     async fn timeout_then_lease_expiry_settles_attempt() {
         let (_pg, backend) = backend().await;
         suite::timeout_then_lease_expiry_settles_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn job_queue_state_speaks_queue_kind() {
+        let (_pg, backend) = backend().await;
+        suite::job_queue_state_speaks_queue_kind(&backend).await;
     }
 
     #[tokio::test]
@@ -4193,6 +4223,11 @@ mod lite {
     #[tokio::test]
     async fn timeout_then_lease_expiry_settles_attempt() {
         suite::timeout_then_lease_expiry_settles_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn job_queue_state_speaks_queue_kind() {
+        suite::job_queue_state_speaks_queue_kind(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

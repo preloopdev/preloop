@@ -77,6 +77,17 @@ pub(super) const PLAN_TYPE: &str = "actions";
 /// Terminal `jobs.status` values.
 const TERMINAL_STATUSES: &str = "('success','failure','cancelled','skipped','timed_out')";
 
+/// `jobs.queue_state` in the shared `QueueKind` vocabulary (the SQLite twin,
+/// `control::lite::queries::QUEUE_KIND`): `blocked` is dependencies/max
+/// parallel (`pending`), `held` is a concurrency gate (`blocked`), and both
+/// expansion states are `expand`.
+const QUEUE_KIND: &str = "CASE j.queue_state \
+     WHEN 'blocked' THEN 'pending' \
+     WHEN 'held' THEN 'blocked' \
+     WHEN 'pending_expansion' THEN 'expand' \
+     WHEN 'expanding' THEN 'expand' \
+     ELSE j.queue_state END";
+
 /// A plan id is the attempt's `agent_job_id`; anything else names no plan.
 fn plan_uuid(plan_id: &str) -> Option<String> {
     plan_id.parse::<uuid::Uuid>().ok().map(|id| id.to_string())
@@ -1273,11 +1284,10 @@ impl PgBackend {
             .collect())
     }
 
-    /// `(queue_state, status)` of one job in the shared `QueueKind`
-    /// vocabulary (`blocked` = parked on a hold; parity with lite's
-    /// `QUEUE_KIND` mapping in `lite/queries.rs`).
+    /// `(queue_kind, status)` of one job, in the `QueueKind` vocabulary.
     ///
-    /// Statement: `SELECT queue_state, status FROM jobs WHERE run_id, job_id`.
+    /// Statement: `SELECT <QUEUE_KIND>, status FROM jobs WHERE run_id,
+    /// job_id`.
     pub(super) async fn job_queue_state(
         &self,
         run_id: RunId,
@@ -1286,13 +1296,10 @@ impl PgBackend {
         let client = self.reader().await?;
         Ok(client
             .query_opt(
-                "SELECT CASE queue_state \
-                     WHEN 'blocked' THEN 'pending' \
-                     WHEN 'held' THEN 'blocked' \
-                     WHEN 'pending_expansion' THEN 'expand' \
-                     WHEN 'expanding' THEN 'expand' \
-                     ELSE queue_state END, \
-                 status FROM jobs WHERE run_id = $1::text::uuid AND job_id = $2",
+                &format!(
+                    "SELECT {QUEUE_KIND}, j.status FROM jobs j \
+                     WHERE j.run_id = $1::text::uuid AND j.job_id = $2"
+                ),
                 &[&run_text(run_id), &job_id.0],
             )
             .await
