@@ -562,6 +562,17 @@ impl PgBackend {
             ),
         };
 
+        // A node whose `parent_job_id` names another node marks the parent as
+        // expanded (matrix parents leave `record.jobs`, reusable callers stay).
+        // Resolved before the projection so `contributes()` sees the flag.
+        let parents: BTreeSet<String> = nodes
+            .values()
+            .filter_map(|node| node.parent_job_id.clone())
+            .collect();
+        for (job_id, node) in nodes.iter_mut() {
+            node.has_children = parents.contains(&job_id.0);
+        }
+
         // Project the RunRecord fields the schema carries.
         let mut jobs = BTreeMap::new();
         let mut job_outputs = BTreeMap::new();
@@ -700,14 +711,7 @@ impl PgBackend {
         };
 
         // A node whose `parent_job_id` names another node marks the parent as
-        // expanded (matrix parents leave `record.jobs`, reusable callers stay).
-        let parents: BTreeSet<String> = nodes
-            .values()
-            .filter_map(|node| node.parent_job_id.clone())
-            .collect();
-        for (job_id, node) in nodes.iter_mut() {
-            node.has_children = parents.contains(&job_id.0);
-        }
+        // expanded (resolved above, before `record.jobs` was projected).
 
         Ok(Some(RunGraph {
             record,

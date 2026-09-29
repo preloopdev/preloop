@@ -1064,12 +1064,15 @@ pub(crate) mod suite {
         );
         assert!(a.status.is_terminal(), "starvation must finalize the run");
 
-        let b = backend.run_record(run_b).await.unwrap();
+        // The held run's job must not enter the ready queue: releasing A's
+        // hold would promote B.
+        let stats = backend.queue_stats().await.unwrap();
         assert_eq!(
-            b.status,
-            ExecutionStatus::Pending,
+            stats.ready, 0,
             "starvation must not release the run's workflow concurrency hold"
         );
+        let b = backend.run_record(run_b).await.unwrap();
+        assert!(!b.status.is_terminal(), "the held run must stay live");
     }
 
     /// Secret values are never written to the control database: a record
