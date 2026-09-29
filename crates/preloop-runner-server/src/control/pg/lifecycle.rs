@@ -736,36 +736,55 @@ impl PgBackend {
             .collect())
     }
 
-    /// `lookup_agent`: runner by name plus its pool-proven marker state.
+    /// `lookup_agent`: the lowest-id runner named `name` plus its client id,
+    /// synthesizing and recording `{:08x}-0000-4000-8000-000000000000` when
+    /// the runner has none (so a later token request resolves), per the
+    /// trait doc.
     pub(super) async fn lookup_agent(
         &self,
         name: &str,
     ) -> Result<Option<(preloop_gha_protocol::RegisteredRunner, String)>, ControlError> {
-        let client = self.reader().await?;
-        let row = client
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let row = tx
             .query_opt(
                 "SELECT runner_id, name, labels::text, ephemeral, public_key, \
                  runner_group_id, runner_group_name, client_id \
-                 FROM runners WHERE name=$1 ORDER BY runner_id DESC LIMIT 1",
+                 FROM runners WHERE name=$1 ORDER BY runner_id LIMIT 1 \
+                 FOR UPDATE",
                 &[&name],
             )
             .await
             .map_err(db)?;
-        Ok(row.map(|row| {
-            (
-                preloop_gha_protocol::RegisteredRunner {
-                    id: row.get(0),
-                    name: row.get(1),
-                    labels: from_json::<Vec<String>>(row.get::<_, String>(2).as_str())
-                        .unwrap_or_default(),
-                    ephemeral: row.get(3),
-                    public_key: row.get(4),
-                    runner_group_id: row.get(5),
-                    runner_group_name: row.get(6),
-                },
-                row.get::<_, Option<String>>(7).unwrap_or_default(),
-            )
-        }))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let runner_id: i64 = row.get(0);
+        let client_id = match row.get::<_, Option<String>>(7) {
+            Some(client_id) => client_id,
+            None => {
+                let synthesized =
+                    format!("{:08x}-0000-4000-8000-000000000000", runner_id as u32);
+                tx.execute(
+                    "UPDATE runners SET client_id=$2 WHERE runner_id=$1",
+                    &[&runner_id, &synthesized],
+                )
+                .await
+                .map_err(db)?;
+                synthesized
+            }
+        };
+        let runner = preloop_gha_protocol::RegisteredRunner {
+            id: runner_id,
+            name: row.get(1),
+            labels: from_json::<Vec<String>>(row.get::<_, String>(2).as_str()).unwrap_or_default(),
+            ephemeral: row.get(3),
+            public_key: row.get(4),
+            runner_group_id: row.get(5),
+            runner_group_name: row.get(6),
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(Some((runner, client_id)))
     }
 
     /// `bind_runner_client`: attach a stable client identity; optionally
