@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::Regex;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2461,8 +2462,8 @@ async fn replay_flows_to_preloop_inner(
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 captured["status"] = json!(status);
                 captured["response_headers"] = json!(headers);
+                let mut runtime_token = None;
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
-                    let mut runtime_token = None;
                     if (path.ends_with("/sessions") || path.ends_with("/runner/session"))
                         && let (Some(official_id), Some(local_id)) = (
                             flow.pointer("/response_body_json/sessionId")
@@ -2529,7 +2530,8 @@ async fn replay_flows_to_preloop_inner(
                     // comparison tool sees null instead of substituting {}.
                     captured["response_body_json"] = Value::Null;
                 } else {
-                    captured["response_body"] = json!(redact_replay_text(&text, None));
+                    captured["response_body"] =
+                        json!(redact_replay_text(&text, runtime_token.as_deref()));
                 }
             }
             Err(error) => {
@@ -2796,10 +2798,20 @@ fn looks_like_jwt(value: &str) -> bool {
 }
 
 fn redact_replay_text(value: &str, exact_token: Option<&str>) -> String {
-    exact_token.map_or_else(
-        || value.to_owned(),
-        |token| value.replace(token, "***REDACTED***"),
-    )
+    // The official capture pipeline scrubs raw bytes with these credential
+    // shapes (`experiments/mitm/addons/redact.py`). The replay side has to
+    // apply the same rules to non-JSON bodies, otherwise a token-shaped string
+    // stays verbatim on one side of the comparison and reads as a value
+    // divergence.
+    let github_token_re = Regex::new(r"gh[sopur]_[A-Za-z0-9_.-]{8,}|github_pat_[A-Za-z0-9_]{15,}")
+        .expect("static regex");
+    let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,})+").expect("static regex");
+    let value = github_token_re.replace_all(value, "***REDACTED***");
+    let value = jwt_re.replace_all(&value, "***REDACTED***");
+    match exact_token {
+        Some(token) => value.replace(token, "***REDACTED***"),
+        None => value.into_owned(),
+    }
 }
 
 fn extract_replay_job_key(body: &Value) -> Option<(String, String)> {
@@ -4564,6 +4576,23 @@ mod tests {
         assert_eq!(
             rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents", 7),
             "/_apis/distributedtask/pools/1/agents"
+        );
+    }
+
+    #[test]
+    fn non_json_replay_bodies_are_redacted_like_the_capture_pipeline() {
+        // Credential shapes the official capture pipeline scrubs from raw bytes.
+        assert_eq!(
+            redact_replay_text(
+                "denied token ghs_15368_eyJhbGciOiJFUzI1NiJ9.eyJhaWQiOjE1MzY4fQ.Duv_FPs3lVT",
+                None
+            ),
+            "denied token ***REDACTED***"
+        );
+        // The acquired runtime token is redacted even when it has no JWT shape.
+        assert_eq!(
+            redact_replay_text("runtime-token here", Some("runtime-token")),
+            "***REDACTED*** here"
         );
     }
 
