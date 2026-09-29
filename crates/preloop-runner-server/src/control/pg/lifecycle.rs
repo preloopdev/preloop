@@ -766,8 +766,7 @@ impl PgBackend {
         let client_id = match row.get::<_, Option<String>>(7) {
             Some(client_id) => client_id,
             None => {
-                let synthesized =
-                    format!("{:08x}-0000-4000-8000-000000000000", runner_id as u32);
+                let synthesized = format!("{:08x}-0000-4000-8000-000000000000", runner_id as u32);
                 tx.execute(
                     "UPDATE runners SET client_id=$2 WHERE runner_id=$1",
                     &[&runner_id, &synthesized],
