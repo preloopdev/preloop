@@ -20879,7 +20879,7 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
 
-    let refreshed = crate::broker::re_mint_snapshot_tokens(&mut message, &state);
+    let refreshed = crate::broker::re_mint_snapshot_credentials(&mut message, &state);
     assert_eq!(refreshed, 1);
 
     let token = message.steps[0].inputs.get("token").unwrap();
@@ -20909,7 +20909,7 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     // Without the pinned-step marker nothing is refreshed.
     message.preloop_snapshot_token_steps = None;
     assert_eq!(
-        crate::broker::re_mint_snapshot_tokens(&mut message, &state),
+        crate::broker::re_mint_snapshot_credentials(&mut message, &state),
         0
     );
 }
@@ -21133,6 +21133,115 @@ async fn verdict_poll_releases_inner_before_the_backend_read() {
     assert!(
         state.inner.try_lock().is_ok(),
         "the node-local lock must be released before the backend read is awaited"
+    );
+}
+
+/// `inputs[name]` of a delivered step, handling the TemplateToken map wire
+/// form (`inputs.map[].Key/Value`) the job message uses.
+fn delivered_step_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
+    step["inputs"].get(name).and_then(Value::as_str).or_else(|| {
+        let found = step["inputs"]["map"].as_array()?.iter().find(|entry| {
+            entry
+                .get("Key")
+                .or_else(|| entry.get("key"))
+                .and_then(|key| key.get("lit"))
+                .and_then(Value::as_str)
+                .is_some_and(|key| key == name)
+        })?;
+        found
+            .get("Value")
+            .or_else(|| found.get("value"))
+            .and_then(|value| value.get("lit"))
+            .and_then(Value::as_str)
+    })
+}
+
+/// The decoded body of a distributedtask (AzDO) delivery.
+///
+/// A runner-backed session keys its messages with the AES key derived from
+/// the session id (the create-session response publishes the same key), so
+/// the base64 body only becomes JSON after decryption.
+fn azdo_delivered_body(state: &AppState, message: &Value, session_id: &str) -> Value {
+    let body = BASE64_STANDARD
+        .decode(
+            message["body"]
+                .as_str()
+                .expect("an AzDO delivery must carry a base64 body"),
+        )
+        .expect("the AzDO body must be base64");
+    let iv = BASE64_STANDARD
+        .decode(
+            message["iv"]
+                .as_str()
+                .expect("an AzDO delivery must carry an IV"),
+        )
+        .expect("the AzDO IV must be base64");
+    let plaintext = state
+        .session_encryption(session_id)
+        .decrypt(&body, &iv)
+        .expect("the AzDO body must decrypt with the session key");
+    serde_json::from_slice(&plaintext).unwrap()
+}
+
+/// The AzDO/disttask delivery path renders the stored template directly
+/// (`render_session_message`), where `strip_template` blanked the pinned
+/// checkout `token` input. It must re-mint that credential exactly like the
+/// broker claim path: otherwise `actions/checkout` replays the blank slot,
+/// falls back to `${{ github.token }}`, and the snapshot endpoint refuses a
+/// credential it cannot verify.
+#[tokio::test]
+async fn azdo_session_delivery_remints_the_pinned_snapshot_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+
+    let (runner_id, runner_token) =
+        register_runner_with_token(&app, "azdo-snapshot-remint", &["self-hosted"], None).await;
+    let (status, session) = create_disttask_session(&app, &runner_token, runner_id).await;
+    assert!(status.is_success(), "azdo session: {session}");
+    let session_id = session["sessionId"].as_str().unwrap();
+
+    let delivered = poll_message(&app, &runner_token, session_id).await;
+    let message = azdo_delivered_body(&state, &delivered, session_id);
+    let checkout = message["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the delivered job should contain the checkout step");
+    let token = delivered_step_input(checkout, "token")
+        .expect("an AzDO-delivered job must carry a freshly minted checkout token");
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .expect("the AzDO-delivered token must verify as a local JWT");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        claims["exp"].as_u64().unwrap() > now,
+        "the AzDO-delivered token must not be expired"
+    );
+    assert_eq!(
+        claims["sub"],
+        format!("preloop-job-{}", message["jobId"].as_str().unwrap()),
+        "the re-minted token must be scoped to this job"
     );
 }
 

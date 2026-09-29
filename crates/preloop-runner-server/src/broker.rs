@@ -1041,7 +1041,7 @@ pub async fn broker_acquire_job(
     // never recover from — it replays whatever the message carries. Re-mint
     // the pinned inputs at claim so the token is fresh exactly when the job
     // first runs.
-    let re_minted = re_mint_snapshot_tokens(&mut message, &shared.state);
+    let re_minted = re_mint_snapshot_credentials(&mut message, &shared.state);
     if re_minted > 0 {
         tracing::info!(
             request_id,
@@ -1121,27 +1121,45 @@ pub async fn broker_acquire_job(
     Ok(Json(payload))
 }
 
-/// Replace every pinned checkout credential — snapshot-served or rerouted
-/// onto the forge relay — with a freshly minted runtime token.
+/// Re-mint every snapshot credential the message carries from one freshly
+/// minted runtime token: the pinned checkout steps' `token` inputs —
+/// snapshot-served or rerouted onto the forge relay — and the
+/// forge→snapshot origin-rewrite `Authorization` header (whose stored form
+/// [`crate::message_template::strip_template`] blanks).
 ///
-/// Returns the number of steps refreshed. The pinned ids travel on the
+/// Returns the number of pinned steps refreshed. The pinned ids travel on the
 /// message ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]),
 /// so this deliberately matches by step id rather than by token shape.
-pub fn re_mint_snapshot_tokens(
+///
+/// Every delivery path must call this when it renders the stored template: a
+/// job can sit queued (or paused in a debug session) well past the runtime
+/// token's ~50-minute lifetime, and a checkout or redirected git fetch
+/// replaying the stored credential would be answered with a 401 it can never
+/// recover from.
+pub fn re_mint_snapshot_credentials(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     state: &AppState,
 ) -> usize {
-    let Some(pinned) = message.preloop_snapshot_token_steps.as_ref() else {
-        return 0;
-    };
-    let pinned: std::collections::HashSet<uuid::Uuid> = pinned
+    let pinned: std::collections::HashSet<uuid::Uuid> = message
+        .preloop_snapshot_token_steps
+        .as_deref()
+        .unwrap_or_default()
         .iter()
         .filter_map(|id| uuid::Uuid::parse_str(id).ok())
         .collect();
-    if pinned.is_empty() {
+    if pinned.is_empty() && message.preloop_snapshot_origin_rewrite.is_none() {
         return 0;
     }
     let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    if let Some(rewrite) = message.preloop_snapshot_origin_rewrite.as_mut() {
+        // Same credential shape `runs::build_job_artifacts` pinned at
+        // submission: the snapshot endpoint authenticates the job-scoped
+        // runtime token, which the GITHUB_TOKEN replacement cannot satisfy.
+        use base64::Engine as _;
+        let credentials = base64::engine::general_purpose::STANDARD
+            .encode(format!("x-access-token:{fresh}"));
+        rewrite.auth_header = format!("AUTHORIZATION: basic {credentials}");
+    }
     let mut re_minted = 0;
     for step in &mut message.steps {
         if pinned.contains(&step.id) {
