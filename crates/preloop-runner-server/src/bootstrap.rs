@@ -610,26 +610,7 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                loop {
-                    match shared.state.backend.archive_finished_runs(32).await {
-                        Ok(archived) => {
-                            // Submission-supplied secrets live exactly as long
-                            // as the run's live rows.
-                            for run_id in &archived {
-                                if let Err(error) = shared.state.secret_provider.delete_run(*run_id) {
-                                    tracing::warn!(%run_id, %error, "failed to drop archived run's secrets");
-                                }
-                            }
-                            if archived.len() < 32 {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(?error, "run history archive failed; will retry");
-                            break;
-                        }
-                    }
-                }
+                archive_finished_runs_once(&shared).await;
                 // Timelines replay a running job to its runner; one idle for a
                 // week belongs to a job long finished.
                 let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).timestamp_micros();
@@ -640,6 +621,34 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
             _ = shared.shutdown.cancelled() => break,
         }
     }
+}
+
+/// Drain one archive pass: move settled runs to history in batches until a
+/// short batch or an error, and return how many runs moved. Split out so a
+/// test can drive a pass deterministically instead of racing the interval.
+pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
+    let mut archived_total = 0;
+    loop {
+        match shared.state.backend.archive_finished_runs(32).await {
+            Ok(archived) => {
+                archived_total += archived.len();
+                // Run-tier secrets are NOT dropped here. Archiving only moves
+                // settled rows into history, and a run in history can still be
+                // re-run — `rerun` reads the original run tier. There is no
+                // run-history retention/pruning yet, so the run tier lives as
+                // long as the run's history; when retention lands, drop the
+                // tier where the history row is removed.
+                if archived.len() < 32 {
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, "run history archive failed; will retry");
+                break;
+            }
+        }
+    }
+    archived_total
 }
 
 /// Everything the operational snapshot reads from durable control state

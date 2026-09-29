@@ -3444,11 +3444,27 @@ pub async fn rerun_run_inner(
         .map_err(ApiError::from)?;
     // A re-run sees the values the original submission supplied; they live
     // in the provider's run tier while the run's history survives.
-    submission.secrets = shared
+    let run_tier = shared
         .state
         .secret_provider
         .run_tier(run_id)
         .map_err(|error| secret_provider_error(shared, error))?;
+    // The submission recorded the names it supplied. If any can no longer be
+    // resolved, fail loudly: submitting with them silently dropped would run
+    // the workflow without secrets.
+    let missing: Vec<&str> = submission
+        .run_secret_names
+        .iter()
+        .filter(|name| !run_tier.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "cannot rerun run {run_id}: its submission secrets ({}) can no longer be resolved",
+            missing.join(", ")
+        )));
+    }
+    submission.secrets = run_tier;
     let accepted = submit_run_inner(shared, submission).await?;
 
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {

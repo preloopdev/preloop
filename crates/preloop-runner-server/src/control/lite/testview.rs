@@ -840,6 +840,22 @@ impl TestDb<'_> {
         Ok(())
     }
 
+    /// `runs.completed_at` backdating (microseconds). Lets a test put a
+    /// settled run past the archive grace window without sleeping.
+    pub(crate) fn set_run_completed_at_us(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        self.0
+            .execute(
+                "UPDATE runs SET completed_at = ?2 WHERE run_id = ?1",
+                rusqlite::params![codec::run_key(run_id), completed_at_us],
+            )
+            .map_err(Self::db_err)?;
+        Ok(())
+    }
+
     /// `job_check_run_ids[job] = id`.
     pub(crate) fn set_job_check_run(
         &self,

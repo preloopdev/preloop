@@ -15942,6 +15942,67 @@ async fn stored_secrets_are_injected_into_native_submissions() {
     assert_eq!(var["isSecret"].as_bool(), Some(true));
 }
 
+/// A submission's run-tier secrets must outlive the run finishing and being
+/// archived: a re-run of an archived run re-resolves them. Dropping the tier
+/// at archive silently ran the re-run without secrets.
+#[tokio::test]
+async fn archived_run_keeps_run_tier_secrets_for_rerun() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shutdown = CancellationToken::new();
+    let app = app(state.clone(), shutdown.clone());
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown,
+    });
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "secrets": {"MY_TOKEN": "s3cr3t-value"}
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    complete_via_api(&app, accepted["run_id"].as_str().unwrap(), "build").await;
+
+    // Push the settled run past the archive grace window, then archive it.
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(run_id, old).unwrap();
+        })
+        .await;
+    let archived = crate::bootstrap::archive_finished_runs_once(&shared).await;
+    assert!(archived >= 1, "the settled run must archive");
+    assert_eq!(
+        state.secret_provider.run_tier(run_id).unwrap().len(),
+        1,
+        "archiving a run must not drop its run tier"
+    );
+
+    // Re-run the archived run: the new run's jobs resolve the same value.
+    request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/rerun"),
+        Value::Null,
+    )
+    .await;
+    let acquired = acquire_queued_job(&app, "rerun-secret-runner").await;
+    let var = acquired["variables"]
+        .as_object()
+        .and_then(|map| map.get("MY_TOKEN"))
+        .expect("re-run acquires the submission secret");
+    assert_eq!(var["value"].as_str(), Some("s3cr3t-value"));
+    assert_eq!(var["isSecret"].as_bool(), Some(true));
+}
+
 /// Extract the queued job message for a run, wherever it currently sits.
 fn queued_message_for(
     tx: &crate::control::testview::TestState,

@@ -366,7 +366,8 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Move a bounded batch of settled runs from active scheduling tables to
     /// immutable job/attempt history in one transaction per batch. Returns
-    /// the archived run ids (their run-tier secrets can be dropped).
+    /// the archived run ids. Their run-tier secrets outlive the move: an
+    /// archived run can still be re-run.
     async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError>;
 
     /// Retention selection: ids of terminal runs whose completion (falling
