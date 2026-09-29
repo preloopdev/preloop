@@ -55,7 +55,11 @@ pub(crate) fn secret_spec_for(
 ) -> MessageSecretSpec {
     let callee = job.workflow_file.is_some();
     MessageSecretSpec {
-        names: if callee { BTreeSet::new() } else { names.clone() },
+        names: if callee {
+            BTreeSet::new()
+        } else {
+            names.clone()
+        },
         environment: job.oidc_environment.clone(),
         inherit: callee && job.secrets_inherit,
         map: if callee && !job.secrets_inherit {
@@ -316,7 +320,9 @@ mod tests {
 
     fn provider(dir: &std::path::Path) -> BuiltinSecretProvider {
         BuiltinSecretProvider::new(
-            std::sync::Arc::new(parking_lot::RwLock::new(crate::state::SecretStore::default())),
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::state::SecretStore::default(),
+            )),
             dir.join("run-secrets"),
             crate::store::Envelope::new(b"test-cluster-key"),
         )
@@ -368,6 +374,9 @@ mod tests {
         // The node that owns the tier fills the real value.
         let mut owner = template(&["TOKEN"]);
         let filled = fill_template(&mut owner, &provider(dir_a.path()), "o/r", run_id).unwrap();
-        assert_eq!(filled.values.get("TOKEN").map(String::as_str), Some("s3cr3t"));
+        assert_eq!(
+            filled.values.get("TOKEN").map(String::as_str),
+            Some("s3cr3t")
+        );
     }
 }
