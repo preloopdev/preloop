@@ -1205,11 +1205,10 @@ pub(crate) mod suite {
         // The protocol body: `{"jobId": .., "timeout": ..}`. Compare parsed
         // JSON — PostgreSQL stores the body as `jsonb` and normalizes its
         // text on the way out.
-        let expected: serde_json::Value =
-            serde_json::from_str(&crate::concurrency::job_cancel_body(
-                claimed.request.agent_job_id,
-            ))
-            .unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            &crate::concurrency::job_cancel_body(claimed.request.agent_job_id),
+        )
+        .unwrap();
         let body_of = |message: &preloop_gha_protocol::azdo::TaskAgentMessage| {
             serde_json::from_str::<serde_json::Value>(&message.body)
                 .unwrap_or_else(|error| panic!("body is not the protocol JSON: {error}"))
@@ -1585,7 +1584,10 @@ pub(crate) mod suite {
     pub(crate) async fn list_runs_filters_on_the_projected_status(backend: &dyn ControlBackend) {
         let cancelled = RunId::new();
         backend
-            .submit_run(submit_run(cancelled, vec![submit_job(cancelled, "build", 1)]))
+            .submit_run(submit_run(
+                cancelled,
+                vec![submit_job(cancelled, "build", 1)],
+            ))
             .await
             .unwrap();
         backend.cancel_run(cancelled, None).await.unwrap();

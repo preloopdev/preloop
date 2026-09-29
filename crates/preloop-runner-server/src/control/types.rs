@@ -1031,9 +1031,7 @@ impl SessionMessage {
     /// `queue_job_message` and `queue_cancellation_message` store.
     pub(crate) fn runner_body(&self) -> String {
         if self.message_type == azdo::message_type::PIPELINE_AGENT_JOB_REQUEST {
-            self.request_id
-                .map(|id| id.to_string())
-                .unwrap_or_default()
+            self.request_id.map(|id| id.to_string()).unwrap_or_default()
         } else {
             self.body.clone().unwrap_or_default()
         }
