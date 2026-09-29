@@ -4653,7 +4653,10 @@ impl<'a> Sweep<'a> {
             // lite reloads its record from the written rows, so the in-memory
             // record has to be kept in step here.
             if let Some(graph) = self.graphs.get_mut(&run_id) {
-                graph.record.job_outputs.insert(job_id.clone(), outputs.clone());
+                graph
+                    .record
+                    .job_outputs
+                    .insert(job_id.clone(), outputs.clone());
             }
         }
         if !annotations.is_empty() {

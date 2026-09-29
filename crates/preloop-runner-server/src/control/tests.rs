@@ -1465,9 +1465,7 @@ pub(crate) mod suite {
     /// never happened, so no runner may take the job (the `claim_permitted`
     /// ladder both backends must share). Requires `set_config(false, true, _)`
     /// from the wrapper.
-    pub(crate) async fn strict_assignments_refuse_an_unassigned_job(
-        backend: &dyn ControlBackend,
-    ) {
+    pub(crate) async fn strict_assignments_refuse_an_unassigned_job(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         // Submitted with no idle session: nothing pairs the job.
         backend
@@ -1525,9 +1523,7 @@ pub(crate) mod suite {
 
     /// A fresh assignment is exclusive to its paired runner: an equally
     /// labelled runner may not steal it. Requires `set_config(true, false, _)`.
-    pub(crate) async fn fresh_assignment_is_exclusive_to_its_runner(
-        backend: &dyn ControlBackend,
-    ) {
+    pub(crate) async fn fresh_assignment_is_exclusive_to_its_runner(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         // A pool-proven idle runner is paired at enqueue.
         let mut registration = register_runner("a");
@@ -1543,10 +1539,7 @@ pub(crate) mod suite {
             .unwrap();
 
         // A second, equally labelled runner must not take the fresh pairing.
-        let runner_b = backend
-            .register_runner(register_runner("b"))
-            .await
-            .unwrap();
+        let runner_b = backend.register_runner(register_runner("b")).await.unwrap();
         let session_b = backend
             .create_session(create_session(runner_b.runner.id))
             .await
@@ -1776,9 +1769,7 @@ pub(crate) mod suite {
 
     /// `settle_job` applies the reported step's runner number to the attempt's
     /// manifest (`conclusion` + `runner number` per the trait doc).
-    pub(crate) async fn completion_applies_the_reported_step_number(
-        backend: &dyn ControlBackend,
-    ) {
+    pub(crate) async fn completion_applies_the_reported_step_number(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
             .register_runner(register_runner("r1"))

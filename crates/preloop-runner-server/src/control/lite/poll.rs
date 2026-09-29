@@ -255,60 +255,60 @@ fn claim_one(
         for (position, (run, job, runs_on, runner_group, enqueued_at, assignment, provision_at)) in
             rows.into_iter().enumerate()
         {
-        let provision_fresh = provision_at.map(|at| at > fresh_after);
-        let (assigned_runner_id, assignment_fresh, first_assigned_fresh, runner_registered) =
-            assignment.unwrap_or((None, false, false, false));
-        // `claim_permitted` verbatim: assignment rows bind verified sessions
-        // while fresh, stale/orphaned bindings open to any verified caller,
-        // a fresh pool-pending row blocks everyone, and unassigned jobs are
-        // only claimable when strict assignments are off.
-        let enqueue_ceiling_expired = enqueued_at > 0
-            && now.saturating_sub(enqueued_at)
-                >= crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
-        // The old model swept stale bindings before checking in permissive
-        // mode — a stale assignment/pool_pending row counts as absent there.
-        let assignment = if !require_assignments && !assignment_fresh {
-            None
-        } else {
-            assignment
-        };
-        let provision_fresh = if !require_assignments && provision_fresh == Some(false) {
-            None
-        } else {
-            provision_fresh
-        };
-        let claimable = if assignment.is_some() {
-            if !first_assigned_fresh || enqueue_ceiling_expired {
-                verified
+            let provision_fresh = provision_at.map(|at| at > fresh_after);
+            let (assigned_runner_id, assignment_fresh, first_assigned_fresh, runner_registered) =
+                assignment.unwrap_or((None, false, false, false));
+            // `claim_permitted` verbatim: assignment rows bind verified sessions
+            // while fresh, stale/orphaned bindings open to any verified caller,
+            // a fresh pool-pending row blocks everyone, and unassigned jobs are
+            // only claimable when strict assignments are off.
+            let enqueue_ceiling_expired = enqueued_at > 0
+                && now.saturating_sub(enqueued_at)
+                    >= crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
+            // The old model swept stale bindings before checking in permissive
+            // mode — a stale assignment/pool_pending row counts as absent there.
+            let assignment = if !require_assignments && !assignment_fresh {
+                None
             } else {
-                match assigned_runner_id {
-                    None => verified,
-                    Some(id) => {
-                        if !runner_registered || !assignment_fresh {
-                            verified
-                        } else {
-                            Some(id) == verified_runner_id
+                assignment
+            };
+            let provision_fresh = if !require_assignments && provision_fresh == Some(false) {
+                None
+            } else {
+                provision_fresh
+            };
+            let claimable = if assignment.is_some() {
+                if !first_assigned_fresh || enqueue_ceiling_expired {
+                    verified
+                } else {
+                    match assigned_runner_id {
+                        None => verified,
+                        Some(id) => {
+                            if !runner_registered || !assignment_fresh {
+                                verified
+                            } else {
+                                Some(id) == verified_runner_id
+                            }
                         }
                     }
                 }
-            }
-        } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
-            false
-        } else if provision_fresh.is_some() {
-            verified
-        } else {
-            !require_assignments
-        };
-        candidates.push(logic::ClaimCandidate {
-            run_id: codec::run_id(&run),
-            job_id: JobId(job),
-            runs_on,
-            runner_group,
-            assigned_runner_id,
-            assignment_fresh,
-            queue_position: position as u64,
-            claimable,
-        });
+            } else if provision_fresh == Some(true) && !enqueue_ceiling_expired {
+                false
+            } else if provision_fresh.is_some() {
+                verified
+            } else {
+                !require_assignments
+            };
+            candidates.push(logic::ClaimCandidate {
+                run_id: codec::run_id(&run),
+                job_id: JobId(job),
+                runs_on,
+                runner_group,
+                assigned_runner_id,
+                assignment_fresh,
+                queue_position: position as u64,
+                claimable,
+            });
         }
         // `assigned_to_this_runner` keys off the proven runner id: an
         // unverified session cannot satisfy an assignment binding even by
