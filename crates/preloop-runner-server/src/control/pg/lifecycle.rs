@@ -137,7 +137,8 @@ impl PgBackend {
 
     /// `open_runner_session`: insert a caller-minted session. Verified
     /// sessions are exclusive per runner (Conflict on a second live one);
-    /// `runner_id: None` writes nothing (compat).
+    /// `runner_id: None` writes nothing (compat); `require_live_runner`
+    /// rejects an unregistered runner in the insert's transaction.
     pub(super) async fn open_runner_session(
         &self,
         open: OpenRunnerSession,
@@ -155,15 +156,17 @@ impl PgBackend {
         // The liveness check and the insert share this transaction: the
         // liveness sweep may have purged the runner after token validation
         // but before the insert (the broker route maps `Forbidden` to 401).
-        let alive = tx
-            .query_opt("SELECT 1 FROM runners WHERE runner_id=$1", &[&runner_id])
-            .await
-            .map_err(db)?
-            .is_some();
-        if !alive {
-            return Err(ControlError::Forbidden(
-                "runner registration no longer exists".to_owned(),
-            ));
+        if open.require_live_runner {
+            let alive = tx
+                .query_opt("SELECT 1 FROM runners WHERE runner_id=$1", &[&runner_id])
+                .await
+                .map_err(db)?
+                .is_some();
+            if !alive {
+                return Err(ControlError::Forbidden(
+                    "runner registration no longer exists".to_owned(),
+                ));
+            }
         }
         if open.verified {
             let conflict = tx
@@ -913,6 +916,7 @@ impl PgBackend {
             runner_id: Some(runner_id),
             protocol: SessionProtocol::Broker,
             verified: false,
+            require_live_runner: true,
         })
         .await
     }

@@ -772,6 +772,12 @@ pub(crate) struct OpenRunnerSession {
     /// The session was created under a listen token naming `runner_id`.
     /// Verified sessions are exclusive per runner (409 on a second one).
     pub(crate) verified: bool,
+    /// Refuse (403) when `runner_id` names no registered runner, checked
+    /// inside the insert's transaction. The broker session root requires it
+    /// (a purge must not race token validation into a live session); the
+    /// legacy AzDO create paths, which may name an agent id whose
+    /// registration arrives later, do not.
+    pub(crate) require_live_runner: bool,
 }
 
 /// Who is asking to purge a runner identity, which decides the guard

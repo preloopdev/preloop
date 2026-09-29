@@ -450,7 +450,9 @@ impl LiteBackend {
 
     /// `open_runner_session` (pg lifecycle.rs): insert a caller-minted
     /// session. Verified sessions are exclusive per runner (Conflict on a
-    /// second live one); `runner_id: None` writes nothing (compat).
+    /// second live one); `runner_id: None` writes nothing (compat);
+    /// `require_live_runner` rejects an unregistered runner in the insert's
+    /// transaction.
     pub(crate) async fn open_runner_session(
         &self,
         open: OpenRunnerSession,
@@ -468,17 +470,19 @@ impl LiteBackend {
             // liveness sweep may have purged the runner after token
             // validation but before the insert (the handler maps `Forbidden`
             // to 401).
-            let alive = tx
-                .prepare_cached("SELECT 1 FROM runners WHERE runner_id = ?1")
-                .map_err(db)?
-                .query_row([runner_id], |row| row.get::<_, i64>(0))
-                .optional()
-                .map_err(db)?
-                .is_some();
-            if !alive {
-                return Err(ControlError::Forbidden(
-                    "runner registration no longer exists".to_owned(),
-                ));
+            if open.require_live_runner {
+                let alive = tx
+                    .prepare_cached("SELECT 1 FROM runners WHERE runner_id = ?1")
+                    .map_err(db)?
+                    .query_row([runner_id], |row| row.get::<_, i64>(0))
+                    .optional()
+                    .map_err(db)?
+                    .is_some();
+                if !alive {
+                    return Err(ControlError::Forbidden(
+                        "runner registration no longer exists".to_owned(),
+                    ));
+                }
             }
             if open.verified {
                 let conflict = tx
@@ -1022,6 +1026,7 @@ impl LiteBackend {
             runner_id: Some(runner_id),
             protocol: SessionProtocol::Broker,
             verified: false,
+            require_live_runner: true,
         })
         .await
     }

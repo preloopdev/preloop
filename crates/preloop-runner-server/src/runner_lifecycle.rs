@@ -211,6 +211,9 @@ pub async fn create_session(
             runner_id: Some(request.runner_id),
             protocol: crate::control::SessionProtocol::Broker,
             verified: false,
+            // The legacy AzDO/AgentSession create may name an agent id whose
+            // registration arrives later.
+            require_live_runner: false,
         })
         .await
         .map_err(ApiError::from)?;
@@ -306,6 +309,9 @@ pub async fn create_session_disttask(
                 crate::control::SessionProtocol::Broker
             },
             verified: runner_id.is_some() && verified == runner_id,
+            // The distributedtask session create serves legacy clients that
+            // may name an agent id before its registration lands.
+            require_live_runner: false,
         })
         .await
         .map_err(ApiError::from)?;
