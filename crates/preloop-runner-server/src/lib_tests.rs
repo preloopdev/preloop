@@ -14242,6 +14242,33 @@ async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() 
     );
 }
 
+/// R9a-4. A failed dedup read must not fall through to submitting: that
+/// re-runs the workflow push-back already tested and published, which is
+/// exactly the duplicate this gate exists to prevent.
+#[tokio::test]
+async fn push_webhook_refuses_to_submit_when_the_dedup_read_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = WebhookDedupFixture::new(&temp).await;
+    assert_eq!(
+        fixture.post("delivery-dedup-fail", Some("push")).await,
+        StatusCode::ACCEPTED
+    );
+    fixture
+        .state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE run_push_states", [])
+                .expect("drop run_push_states");
+        })
+        .await;
+
+    fixture.drain().await;
+    let inner = fixture.state.test_tx().await;
+    assert!(
+        inner.runs.is_empty(),
+        "a failed dedup read must not submit a possibly-duplicate run"
+    );
+}
+
 #[tokio::test]
 async fn github_webhook_missing_event_does_not_poison_delivery_id() {
     let temp = tempfile::tempdir().unwrap();
@@ -26054,7 +26081,9 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         shutdown: CancellationToken::new(),
     });
     assert_eq!(
-        crate::github_push::already_published(&shared, "owner/repo", SHA, PUBLISHED_WORKFLOW).await,
+        crate::github_push::already_published(&shared, "owner/repo", SHA, PUBLISHED_WORKFLOW)
+            .await
+            .unwrap(),
         Some(published_id),
         "the echo of our own push must be recognised"
     );
@@ -26134,15 +26163,48 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             MATERIALIZED_SHA,
             PUBLISHED_WORKFLOW
         )
-        .await,
+        .await
+        .unwrap(),
         Some(dirty_id),
         "the webhook echo of a materialized dirty-tree commit must be recognised"
     );
     assert_eq!(
         crate::github_push::already_published(&shared, "owner/repo", BASE_SHA, PUBLISHED_WORKFLOW)
-            .await,
+            .await
+            .unwrap(),
         Some(dirty_id),
         "the recorded submission sha (the base commit) still matches, as for any push-back run"
+    );
+}
+
+/// R9a-4. The dedup gate decides whether a push webhook may submit at all,
+/// so a backend failure must surface as an error: `None` means "not
+/// published — submit", which re-runs the workflow push-back already tested.
+#[tokio::test]
+async fn already_published_fails_closed_when_the_backend_read_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE run_push_states", [])
+                .expect("drop run_push_states");
+        })
+        .await;
+
+    let result = crate::github_push::already_published(
+        &shared,
+        "owner/repo",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ".github/workflows/ci.yml",
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a failed dedup read must not be reported as 'not published': {result:?}"
     );
 }
 
@@ -26291,6 +26353,122 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
             "the published commit is recorded for webhook dedup"
         );
     }
+
+    std::env::remove_var("PRELOOP_GITHUB_TOKEN");
+    std::env::remove_var("PRELOOP_GITHUB_API_URL");
+}
+
+/// R9a-4. The terminal `Synced` write records `effective_sha`, which is what
+/// makes the push webhook's echo match `already_published`. Losing it
+/// silently re-runs CI, so a failed write must fail the sync.
+#[tokio::test]
+async fn dirty_push_sync_surfaces_a_failed_terminal_state_write() {
+    const BASE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MATERIALIZED: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    let mock_app = Router::new()
+        .route(
+            "/repos/owner/repo",
+            get(|| async { Json(json!({"default_branch": "main"})) }),
+        )
+        .route(
+            "/repos/owner/repo/commits/*ref",
+            get(|Path(r#ref): Path<String>| async move {
+                assert_eq!(r#ref, "feat/x", "dirty sync must verify the branch head");
+                Json(json!({
+                    "sha": MATERIALIZED,
+                    "commit": {"tree": {"sha": TREE}},
+                }))
+            }),
+        )
+        .route(
+            "/repos/owner/repo/pulls",
+            get(|| async { Json(json!([])) }).post(
+                |_body: axum::extract::Json<Value>| async move { Json(json!({"number": 42})) },
+            ),
+        )
+        .route(
+            "/repos/owner/repo/check-runs",
+            post(|_body: axum::extract::Json<Value>| async move { Json(json!({"id": 7})) }),
+        )
+        .route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch(|| async { Json(json!({"id": 7})) }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token");
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "git_ref": "refs/heads/feat/x",
+            "sha": BASE_SHA,
+            "push_tree": TREE,
+            "push": {"create_pr": true, "draft_pr": true, "dirty": true},
+        }),
+    )
+    .await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    state
+        .test_db_mutate(|tx| {
+            let rid: RunId = run_id.parse().unwrap();
+            tx.set_run_status(rid, "completed", Some("success"))
+                .unwrap();
+            tx.execute(
+                "UPDATE jobs SET status = 'success', queue_state = 'none' \
+                 WHERE run_id = ?1 AND job_id = 'build'",
+                [rid.to_string()],
+            )
+            .unwrap();
+            // Fail the terminal write only: the push-state row is dropped and
+            // every write back into the table aborts. The sync's own reads
+            // (the run snapshot) are unaffected.
+            tx.execute("DELETE FROM run_push_states", []).unwrap();
+            tx.execute(
+                "CREATE TRIGGER fail_push_state_insert BEFORE INSERT ON run_push_states \
+                 BEGIN SELECT RAISE(ABORT, 'forced write failure'); END",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "CREATE TRIGGER fail_push_state_update BEFORE UPDATE ON run_push_states \
+                 BEGIN SELECT RAISE(ABORT, 'forced write failure'); END",
+                [],
+            )
+            .unwrap();
+        })
+        .await;
+
+    let (status, body) = request_json_status(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/push"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a lost terminal push-state write must fail the sync instead of re-running CI later: {body}"
+    );
 
     std::env::remove_var("PRELOOP_GITHUB_TOKEN");
     std::env::remove_var("PRELOOP_GITHUB_API_URL");

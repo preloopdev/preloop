@@ -2858,7 +2858,11 @@ async fn process_delivery_payload_with_lease(
                 push_tree: None,
             };
 
-            if let Some(tested_by) = crate::github_push::already_published(
+            // The dedup gate decides whether a run may be submitted at all.
+            // A failed read must abort the delivery (GitHub redelivers), not
+            // fall through to submitting: `None` would re-run CI on the exact
+            // commit push-back already tested and published.
+            let tested_by = match crate::github_push::already_published(
                 shared,
                 &repo_full_name,
                 &submission.sha,
@@ -2866,6 +2870,19 @@ async fn process_delivery_payload_with_lease(
             )
             .await
             {
+                Ok(tested_by) => tested_by,
+                Err(error) => {
+                    error!(
+                        ?error,
+                        sha = %submission.sha,
+                        "failed to read push-back publication state; refusing to submit a possible duplicate"
+                    );
+                    return WebhookOutcome::TransientError(format!(
+                        "failed to read push-back publication state: {error:?}"
+                    ));
+                }
+            };
+            if let Some(tested_by) = tested_by {
                 info!(
                     workflow = %filename,
                     sha = %submission.sha,

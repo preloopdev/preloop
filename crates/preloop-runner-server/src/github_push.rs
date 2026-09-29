@@ -89,18 +89,22 @@ pub struct PushOverride {
 /// A dirty-tree run's submission sha is the *base* commit, not the commit
 /// the push webhook carries; once the sync ran, the published (materialized)
 /// commit is recorded in `push_state.effective_sha` and matched here too.
+///
+/// A backend failure is an error, never `None`: `None` means "submit the
+/// workflow", so reading a failed query as `None` would re-run the exact
+/// workflow push-back already tested and published.
 pub async fn already_published(
     shared: &Arc<SharedState>,
     repository: &str,
     sha: &str,
     workflow_path: &str,
-) -> Option<RunId> {
+) -> Result<Option<RunId>, ApiError> {
     shared
         .state
         .backend
         .published_run(repository, sha, workflow_path)
         .await
-        .unwrap_or(None)
+        .map_err(ApiError::from)
 }
 
 pub async fn push_run_to_github(
@@ -190,7 +194,10 @@ pub async fn push_run_to_github(
     };
 
     async fn mark_blocked(shared: &Arc<SharedState>, run_id: RunId, error: String) {
-        let _ = shared
+        // The caller is already returning the real failure; a lost blocked
+        // marker would let a retry look like a fresh attempt, so at least
+        // never drop it silently.
+        if let Err(write_error) = shared
             .state
             .backend
             .set_push_state(
@@ -202,7 +209,14 @@ pub async fn push_run_to_github(
                     effective_sha: None,
                 },
             )
-            .await;
+            .await
+        {
+            tracing::warn!(
+                %run_id,
+                ?write_error,
+                "failed to record the blocked push-back state"
+            );
+        }
     }
 
     let (owner, _) = repository
@@ -396,13 +410,21 @@ pub async fn push_run_to_github(
     //    loop may have been skipped or failed). Jobs with an existing check
     //    run were already updated through the normal lifecycle.
     for job_id in jobs.keys() {
-        let has_check_run = shared
-            .state
-            .backend
-            .job_check_run_id(run_id, job_id)
-            .await
-            .unwrap_or(None)
-            .is_some();
+        // A failed read must not be read as "no check run yet": that would
+        // POST a second queued check run over the one the lifecycle already
+        // reported. Abort the sync instead — it is retryable.
+        let has_check_run = match shared.state.backend.job_check_run_id(run_id, job_id).await {
+            Ok(id) => id.is_some(),
+            Err(error) => {
+                tracing::warn!(
+                    %run_id,
+                    %job_id,
+                    ?error,
+                    "failed to read the job's check-run state; aborting push-back sync"
+                );
+                return Err(ApiError::from(error));
+            }
+        };
         if !has_check_run {
             if let Err(error) = crate::github::report_check_run_queued(
                 shared,
@@ -422,7 +444,7 @@ pub async fn push_run_to_github(
         }
     }
 
-    let _ = shared
+    shared
         .state
         .backend
         .set_push_state(
@@ -437,7 +459,13 @@ pub async fn push_run_to_github(
                 effective_sha: Some(effective_sha),
             },
         )
-        .await;
+        .await
+        // Losing this write loses `effective_sha`, so the webhook echo no
+        // longer matches `already_published` and CI re-runs: surface it.
+        .map_err(|error| {
+            tracing::warn!(%run_id, ?error, "failed to record the push-back sync state");
+            ApiError::from(error)
+        })?;
 
     Ok(SyncResponse {
         status: "pushed",
