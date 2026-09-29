@@ -449,24 +449,31 @@ impl LiteBackend {
     ) -> Result<StatusInputs, ControlError> {
         self.read(move |tx| {
             let mut inputs = StatusInputs::default();
-            // Coarse run counts.
+            // Coarse run counts, mirroring pg's reader: a workflow-held run's
+            // row still reads `queued` (the `holder_kind = 'run'` wait row
+            // carries the logical `Pending`; see `submit`), so held runs
+            // count as in-progress.
             {
-                let mut stmt = tx
-                    .prepare_cached("SELECT status, COUNT(*) FROM runs GROUP BY status")
+                let (queued, in_progress, completed): (i64, i64, i64) = tx
+                    .prepare_cached(
+                        "SELECT \
+                         COALESCE(SUM(CASE WHEN r.status = 'queued' AND NOT EXISTS (\
+                            SELECT 1 FROM concurrency_waits w \
+                            WHERE w.holder_run_id = r.run_id AND w.holder_kind = 'run')\
+                            THEN 1 ELSE 0 END), 0), \
+                         COALESCE(SUM(CASE WHEN r.status = 'in_progress' OR EXISTS (\
+                            SELECT 1 FROM concurrency_waits w \
+                            WHERE w.holder_run_id = r.run_id AND w.holder_kind = 'run')\
+                            THEN 1 ELSE 0 END), 0), \
+                         COALESCE(SUM(CASE WHEN r.status = 'completed' THEN 1 ELSE 0 END), 0) \
+                         FROM runs r",
+                    )
+                    .map_err(db)?
+                    .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(db)?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
-                    })
-                    .map_err(db)?;
-                for row in rows {
-                    let (status, count) = row.map_err(db)?;
-                    match status.as_str() {
-                        "queued" => inputs.runs_queued += count,
-                        "completed" => inputs.runs_completed += count,
-                        _ => inputs.runs_in_progress += count,
-                    }
-                }
+                inputs.runs_queued = queued.max(0) as u32;
+                inputs.runs_in_progress = in_progress.max(0) as u32;
+                inputs.runs_completed = completed.max(0) as u32;
             }
             inputs.queue_len = jobs::ready_count(tx)?;
             inputs.pending_jobs_len = tx
@@ -484,8 +491,15 @@ impl LiteBackend {
                 .map_err(db)?
                 .query_row([], |row| row.get::<_, u32>(0))
                 .map_err(db)? as usize;
+            // Job-level holds only: a job parked behind its run's workflow
+            // gate (`holder_kind = 'run'`) is not a job-level concurrency
+            // block, matching pg's reader and the field's contract.
             inputs.concurrency_blocked = tx
-                .prepare_cached("SELECT COUNT(*) FROM jobs WHERE queue_state = 'held'")
+                .prepare_cached(
+                    "SELECT COUNT(*) FROM jobs j WHERE j.queue_state = 'held' AND NOT EXISTS (\
+                     SELECT 1 FROM concurrency_waits w \
+                     WHERE w.holder_run_id = j.run_id AND w.holder_kind = 'run')",
+                )
                 .map_err(db)?
                 .query_row([], |row| row.get::<_, u32>(0))
                 .map_err(db)?;
