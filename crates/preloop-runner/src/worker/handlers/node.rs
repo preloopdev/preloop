@@ -297,6 +297,100 @@ pub async fn run_node_action(
         action_dir.to_string_lossy().to_string(),
     );
 
+    // A job container runs every step inside it — the official runner execs
+    // node actions through `docker exec` too, using the externals mounted at
+    // `/__e`. Running the host binary against container paths fails two ways:
+    // the action cannot see its inputs at their advertised locations, and the
+    // host-side externals probe reports `bundled nodeXX is missing` whenever
+    // the resolved runner root differs from the mount source.
+    let job_container_id = ctx
+        .job
+        .container_state
+        .as_ref()
+        .and_then(|state| state.job_container_id.clone());
+    if let Some(container_id) = job_container_id {
+        let host_work = Path::new(workspace)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // `/__e` is the read-only externals mount, sourced from
+        // `{runner_work}/../externals` (steps_runner.rs). Probe that exact
+        // host dir — not the walked runner root — so the check answers
+        // "what will the container see". That is the check that failed as
+        // `bundled node24 is missing` when the mount source was absent.
+        let mounted_node = Path::new(workspace)
+            .parent()
+            .map(|runner_work| {
+                runner_work
+                    .join("..")
+                    .join("externals")
+                    .join(node_version)
+                    .join("bin")
+                    .join("node")
+            })
+            .unwrap_or_else(|| bundled_node.clone());
+        if !mounted_node.is_file() {
+            anyhow::bail!(
+                "bundled {node_version} is missing at {}; job containers have no \
+                 system Node fallback — fix the runner bundle",
+                mounted_node.display()
+            );
+        }
+        let container_node = format!("/__e/{node_version}/bin/node");
+        for key in [
+            "GITHUB_WORKSPACE",
+            "GITHUB_ENV",
+            "GITHUB_PATH",
+            "GITHUB_OUTPUT",
+            "GITHUB_STATE",
+            "GITHUB_STEP_SUMMARY",
+            "GITHUB_ARTIFACTS",
+            "GITHUB_ARTIFACTS_LIST",
+            "GITHUB_ACTION_PATH",
+            "RUNNER_TEMP",
+            "RUNNER_TOOL_CACHE",
+        ] {
+            if let Some(val) = env.get(key).cloned() {
+                env.insert(
+                    key.to_string(),
+                    crate::worker::container_ops::translate_to_container_path(&val, &host_work),
+                );
+            }
+        }
+        env.insert("HOME".to_string(), "/github/home".to_string());
+        let container_workdir =
+            crate::worker::container_ops::translate_to_container_path(workspace, &host_work);
+        let container_entry = crate::worker::container_ops::translate_to_container_path(
+            &entry_point.to_string_lossy(),
+            &host_work,
+        );
+        info!(
+            "Running node action in container {container_id}: {container_node} {container_entry}"
+        );
+        ctx.debug(&format!(
+            "Command line: docker exec -i {container_id} {container_node} [{container_entry}]"
+        ));
+        let ctx_ref = &mut *ctx;
+        let on_chunk = Box::new(move |chunk: &[u8]| {
+            ctx_ref.write_chunk(chunk);
+        });
+        let result = crate::worker::container_ops::docker_exec(
+            &container_id,
+            &container_node,
+            &[container_entry.as_str()],
+            &container_workdir,
+            &env,
+            Some(cancel_rx),
+            Some(on_chunk),
+        )
+        .await?;
+        if result.exit_code != 0 {
+            anyhow::bail!("node action exited with code {}", result.exit_code);
+        }
+        return Ok(());
+    }
+
     info!("Running node action: {node_path} {}", entry_point.display());
     let ctx_ref = &mut *ctx;
     let on_chunk = Box::new(move |chunk: &[u8]| {
