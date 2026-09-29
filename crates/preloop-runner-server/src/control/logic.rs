@@ -107,46 +107,6 @@ pub(crate) struct RunnerMatchRow {
     pub(crate) group_name: Option<String>,
 }
 
-/// Return whether every job label is compatible with a runner's labels.
-///
-/// Empty job labels and unknown runner labels match everything. Exact labels
-/// match case-insensitively. Hosted OS labels (`ubuntu-*`, `macos-*`,
-/// `windows-*`) match a runner's corresponding `linux`, `macos`, or `windows`
-/// OS label; a known runner with no OS label only matches such a label when it
-/// is `self-hosted`.
-pub(crate) fn runner_labels_match(job_labels: &[String], runner_labels: &[String]) -> bool {
-    if job_labels.is_empty() || runner_labels.is_empty() {
-        return true;
-    }
-    let set: HashSet<String> = runner_labels
-        .iter()
-        .map(|v| v.to_ascii_lowercase())
-        .collect();
-    let os = ["linux", "macos", "windows"]
-        .into_iter()
-        .find(|value| set.contains(*value));
-    job_labels.iter().all(|required| {
-        let required = required.to_ascii_lowercase();
-        if set.contains(&required) {
-            return true;
-        }
-        let required_os = if required.starts_with("ubuntu-") || required.starts_with("linux-") {
-            Some("linux")
-        } else if required.starts_with("macos-") || required.starts_with("osx-") {
-            Some("macos")
-        } else if required.starts_with("windows-") {
-            Some("windows")
-        } else {
-            None
-        };
-        match (required_os, os) {
-            (Some(required), Some(actual)) => required == actual,
-            (Some(_), None) => set.contains("self-hosted"),
-            (None, _) => false,
-        }
-    })
-}
-
 /// Match a required runner group. Numeric requirements match group ids;
 /// omitted group metadata means the default group id/name (`1`/`Default`).
 pub(crate) fn runner_group_matches(required: Option<&str>, runner: &RunnerMatchRow) -> bool {
@@ -174,7 +134,11 @@ pub(crate) fn runner_matches(
     required_group: Option<&str>,
     runner: &RunnerMatchRow,
 ) -> bool {
-    runner_labels_match(job_labels, &runner.labels) && runner_group_matches(required_group, runner)
+    // One label matcher for claim and pairing: the pre-refactor
+    // `take_matching_job` rule the pairing, reaper, and starvation paths
+    // already call.
+    crate::runtime_scheduling::job_matches_runner(job_labels, &runner.labels)
+        && runner_group_matches(required_group, runner)
 }
 
 /// Candidate row used by claim preference ordering.
@@ -1403,65 +1367,6 @@ pub(crate) fn unhostable_platform(
         .find(|os| *os == "macos" || *os == "windows")?;
     let hosted_by_someone = runners.into_iter().any(|os| os == needed);
     (!hosted_by_someone).then_some(needed)
-}
-
-pub(crate) fn job_matches_runner(job_labels: &[String], runner_labels: &[String]) -> bool {
-    if job_labels.is_empty() {
-        return true;
-    }
-    if runner_labels.is_empty() {
-        return true;
-    }
-    let runner_set: std::collections::HashSet<String> =
-        runner_labels.iter().map(|l| l.to_lowercase()).collect();
-    let runner_os = ["linux", "macos", "windows"]
-        .into_iter()
-        .find(|os| runner_set.contains(*os));
-    job_labels.iter().all(|required| {
-        let req = required.to_lowercase();
-        if runner_set.contains(&req) {
-            return true;
-        }
-        let Some(required_os) = hosted_label_os(&req) else {
-            return false;
-        };
-        match runner_os {
-            Some(os) => os == required_os,
-            None => runner_set.contains("self-hosted"),
-        }
-    })
-}
-
-pub(crate) fn job_matches_runner_group(
-    required_group: Option<&str>,
-    runner: &crate::models::RunnerCapabilities,
-) -> bool {
-    let Some(required) = required_group.map(str::trim).filter(|v| !v.is_empty()) else {
-        return true;
-    };
-    if !runner.known {
-        return false;
-    }
-    if let Ok(required_id) = required.parse::<i64>() {
-        return match runner.runner_group_id {
-            Some(actual_id) => actual_id == required_id,
-            None => runner.runner_group_name.is_none() && required_id == 1,
-        };
-    }
-    match (&runner.runner_group_id, &runner.runner_group_name) {
-        (Some(id), Some(name)) if *id != 1 => name.eq_ignore_ascii_case(required),
-        (_, Some(name)) => name.eq_ignore_ascii_case(required),
-        (None, None) | (Some(1), None) => "Default".eq_ignore_ascii_case(required),
-        (Some(_), None) => false,
-    }
-}
-
-pub(crate) fn job_matches_runner_capabilities(
-    job: &QueuedJob,
-    runner: &crate::models::RunnerCapabilities,
-) -> bool {
-    job_matches_runner(&job.runs_on, &runner.labels)
-        && job_matches_runner_group(job.runner_group.as_deref(), runner)
 }
 
 pub(crate) fn capabilities_of(
