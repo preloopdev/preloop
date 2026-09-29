@@ -3734,6 +3734,95 @@ mod lite {
         .await;
     }
 
+    /// Archiving a run drops its attempt timelines with it — pg asserts the
+    /// same with `timelines.timeline_id REFERENCES job_requests(timeline_id)
+    /// ON DELETE CASCADE`. Without it the rows leak forever: the archive
+    /// deletes the `job_requests` rows `prune_timelines` matches on.
+    #[tokio::test]
+    async fn archive_drops_the_runs_timelines() {
+        use crate::control::types::PollOutcome;
+
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(super::register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(super::poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let key = format!(
+            "{}/{}",
+            claimed.request.plan_id, claimed.request.timeline_id
+        );
+        backend
+            .patch_timeline(&key, vec![super::timeline_record(1, "one")])
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_timeline(&key, 0, usize::MAX)
+                .await
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: std::collections::BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+
+        // Backdate the completion past the archive grace so the tick claims
+        // the run.
+        let completed = crate::models::now_unix_nanos() / 1000 - 120 * 1_000_000;
+        backend
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE runs SET completed_at = ?1 WHERE run_id = ?2",
+                    (completed, run_id.0.to_string()),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            backend
+                .archive_finished_runs(32)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "the settled run archives"
+        );
+
+        let (change_id, records) = backend.get_timeline(&key, 0, usize::MAX).await.unwrap();
+        assert_eq!(change_id, 0, "the archived run's timeline is gone");
+        assert!(records.is_empty(), "its records went with it");
+    }
+
     /// A timed-out session-bound attempt is cancelled through the marker
     /// only: the runner's next poll delivers one `JobCancellation` carrying
     /// the official body — never an eagerly parked message whose body the
