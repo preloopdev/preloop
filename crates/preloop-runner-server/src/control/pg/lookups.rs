@@ -420,9 +420,11 @@ impl PgBackend {
             .get(0))
     }
 
-    /// A job's evaluated display name.
+    /// A job's evaluated display name — live `job_specs`, else the archived
+    /// `job_history`.
     ///
-    /// Statement: `SELECT display_name FROM job_specs WHERE run_id, job_id`.
+    /// Statement: `SELECT display_name FROM job_specs WHERE run_id, job_id
+    /// UNION ALL SELECT .. FROM job_history .. LIMIT 1`.
     pub(super) async fn job_display_name(
         &self,
         run_id: RunId,
@@ -431,7 +433,12 @@ impl PgBackend {
         let client = self.reader().await?;
         Ok(client
             .query_opt(
-                "SELECT display_name FROM job_specs WHERE run_id = $1::text::uuid AND job_id = $2",
+                "SELECT display_name FROM job_specs \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 UNION ALL \
+                 SELECT display_name FROM job_history \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 LIMIT 1",
                 &[&run_text(run_id), &job_id.0],
             )
             .await

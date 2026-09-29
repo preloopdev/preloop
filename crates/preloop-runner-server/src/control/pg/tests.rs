@@ -1013,3 +1013,59 @@ async fn run_step_manifests_survive_archival() {
     assert_eq!(steps[0].name, "Build");
 }
 
+/// Archiving must not lose a job's check-run id or display name: a
+/// push-back retry on an archived run re-creates the check run and
+/// mis-names it when the point reads only consult the live tables.
+#[tokio::test]
+async fn job_point_reads_fall_back_to_archived_rows() {
+    let (_pg, node, _other) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, runner_id) = submit_and_claim(&node, run_id).await;
+    let job = JobId("build".to_owned());
+    node.set_job_check_run(run_id, &job, 4242).await.unwrap();
+    node.complete_job(JobCompletionInput {
+        run_id,
+        job_id: job.clone(),
+        agent_job_id: Some(request.agent_job_id),
+        status: ExecutionStatus::Success,
+        outputs: BTreeMap::new(),
+        runner_id: Some(runner_id),
+    })
+    .await
+    .unwrap();
+    {
+        let client = node.writer().await.unwrap();
+        client
+            .execute(
+                "UPDATE job_specs SET display_name = 'Build (display)' \
+                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                &[&run_id.0.to_string(), &job.0],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "UPDATE runs SET completed_at = now() - interval '10 minutes' \
+                 WHERE run_id = $1::text::uuid",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        node.archive_finished_runs(64).await.unwrap().contains(&run_id),
+        "the completed run must archive"
+    );
+
+    assert_eq!(
+        node.job_check_run_id(run_id, &job).await.unwrap(),
+        Some(4242),
+        "the archived check-run mapping must survive"
+    );
+    assert_eq!(
+        node.job_display_name(run_id, &job).await.unwrap(),
+        Some("Build (display)".to_owned()),
+        "the archived display name must survive"
+    );
+}
+
