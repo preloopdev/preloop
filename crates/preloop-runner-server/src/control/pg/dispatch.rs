@@ -2696,7 +2696,7 @@ impl<'a> Sweep<'a> {
         }
         set_status_in(self.graphs.get_mut(&run_id), job_id, status);
         self.mark(run_id, job_id);
-        let _ = release_concurrency_for_job(self.backend, self.tx, run_id, job_id).await;
+        release_concurrency_for_job(self.backend, self.tx, run_id, job_id).await?;
         let expandable = self
             .graphs
             .get(&run_id)
