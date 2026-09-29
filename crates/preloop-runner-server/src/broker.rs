@@ -440,9 +440,9 @@ pub async fn next_message_disttask(
         Some(crate::control::types::SessionProtocol::Azdo)
     );
     if is_azdo {
-        let (status, body) =
-            next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await;
-        Ok((status, body).into_response())
+        let response =
+            next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await?;
+        Ok(response.into_response())
     } else {
         next_message_broker_ref(State(shared), Path(pool_id), identity, Query(params)).await
     }

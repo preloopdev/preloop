@@ -8951,7 +8951,24 @@ async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
         vec!["ubuntu-22.04"]
     );
 
-    let message = poll_message(&app, "preloop-system-token", "default").await;
+    // The compat `Message` poll is the path a pool runner uses for the
+    // implicit session; the disttask prefix routes through `touch_session`
+    // first and only reaches the AzDO poll for an existing session.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_apis/v1/Message/1?sessionId=default&waitSeconds=0")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let message: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     assert_eq!(
         message["messageType"],
         azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
@@ -8991,7 +9008,7 @@ async fn disttask_poll_surfaces_control_db_failures() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/runner/server/_apis/distributedtask/pools/1/messages?sessionId=default&waitSeconds=0")
+                .uri("/_apis/v1/Message/1?sessionId=default&waitSeconds=0")
                 .header(header::AUTHORIZATION, "Bearer preloop-system-token")
                 .body(Body::empty())
                 .unwrap(),

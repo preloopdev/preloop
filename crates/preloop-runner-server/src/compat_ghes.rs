@@ -125,7 +125,7 @@ pub async fn next_message_compat_org(
     Path((_org, pool_id)): Path<(String, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
+) -> Result<(StatusCode, Json<Option<azdo::TaskAgentMessage>>), ApiError> {
     next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await
 }
 
