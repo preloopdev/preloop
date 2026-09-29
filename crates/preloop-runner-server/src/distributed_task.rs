@@ -357,21 +357,27 @@ pub async fn complete_job_compat_authenticated(
 }
 
 /// `Some(owned)` when the request exists — `owned` = the runner owns it via
-/// the recorded owner or the owner session's runner. `Err(Forbidden)` when
-/// an owner exists and differs; unowned requests report owned.
+/// the recorded owner or the owner session's runner, or the request is
+/// session-bound but unowned (replay-compat). `Err(Forbidden)` when an owner
+/// exists and differs, and `Ok(Some(false))` for a request that was never
+/// assigned: a released attempt (ready again, no owner and no session) must
+/// not be readable or settleable by any registered runner.
 async fn agent_request_owned_by(
     backend: &crate::control::backend::Backend,
     request_id: i64,
     runner_id: i64,
 ) -> Result<Option<bool>, crate::control::ControlError> {
-    let Some((owner, session_runner, _)) = backend.request_owner(request_id).await? else {
+    let Some((owner, session_runner, session_bound)) = backend.request_owner(request_id).await?
+    else {
         return Ok(None);
     };
     match owner.or(session_runner) {
         Some(owner) if owner != runner_id => Err(crate::control::ControlError::Forbidden(
             "agent request belongs to another runner".to_owned(),
         )),
-        _ => Ok(Some(true)),
+        Some(_) => Ok(Some(true)),
+        None if session_bound => Ok(Some(true)),
+        None => Ok(Some(false)),
     }
 }
 
@@ -395,9 +401,14 @@ pub async fn agent_request_get(
         .await
         .map_err(ApiError::from)?;
     if let Some(runner_id) = runner_id {
-        agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+        if let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+        {
+            return Err(ApiError::from(crate::control::ControlError::Forbidden(
+                "agent request belongs to another runner".to_owned(),
+            )));
+        }
     }
     Ok(Json(agent_request_json(pool_id, &request)))
 }
@@ -409,9 +420,14 @@ pub async fn agent_request_ack(
     identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+        if let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+        {
+            return Err(ApiError::from(crate::control::ControlError::Forbidden(
+                "agent request belongs to another runner".to_owned(),
+            )));
+        }
     }
     Ok(StatusCode::OK)
 }
