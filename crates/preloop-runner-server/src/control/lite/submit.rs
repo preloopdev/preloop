@@ -310,6 +310,22 @@ fn submit_run_tx(
                         )
                     })
                     .collect();
+                // A cancelled arrival is still a created (and immediately
+                // completed) run: emit both durable events, matching pg.
+                jobs::emit_outbox(
+                    tx,
+                    &namespace,
+                    Some(run_id),
+                    "run.created.v1",
+                    serde_json::json!({"status": "cancelled", "jobs": submit_jobs.len()}),
+                )?;
+                jobs::emit_outbox(
+                    tx,
+                    &namespace,
+                    Some(run_id),
+                    "run.completed.v1",
+                    serde_json::json!({"status": "cancelled"}),
+                )?;
                 return Ok(SubmitOutcome {
                     run_id,
                     run_number: record.run_number,
@@ -569,6 +585,7 @@ fn submit_run_tx(
     }
 
     // ── Promotion sweep for needs-gated jobs ────────────────────────────
+    let submit_concluded = concluded.len();
     let mut outcome = crate::runtime_scheduling::SchedulingOutcome::default();
     promote::promote_run(tx, backend, run_id, &mut outcome)?;
     for (rid, jid) in outcome.skipped.iter().chain(outcome.failed.iter()) {
@@ -578,6 +595,9 @@ fn submit_run_tx(
             concluded.push((jid.clone(), status, None));
         }
     }
+    // A job settled by the sweep emitted `run.completed.v1` through
+    // `settle_node`; only a run the submit itself concluded needs one here.
+    let sweep_settled = concluded.len() > submit_concluded;
 
     // ── Run status ──────────────────────────────────────────────────────
     let summary = jobs::summarize_run_row(tx, run_id)?;
@@ -607,13 +627,20 @@ fn submit_run_tx(
     .map_err(db)?
     .execute([codec::run_key(run_id)])
     .map_err(db)?;
-    if !held {
+    jobs::emit_outbox(
+        tx,
+        &namespace,
+        Some(run_id),
+        "run.created.v1",
+        serde_json::json!({"status": status_str(status), "jobs": inserted}),
+    )?;
+    if status.is_terminal() && !sweep_settled {
         jobs::emit_outbox(
             tx,
             &namespace,
             Some(run_id),
-            "run.created.v1",
-            serde_json::json!({"status": status_str(status), "jobs": inserted}),
+            "run.completed.v1",
+            serde_json::json!({"status": status_str(status)}),
         )?;
     }
 
