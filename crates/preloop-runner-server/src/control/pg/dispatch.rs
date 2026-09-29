@@ -5265,6 +5265,8 @@ impl PgBackend {
 impl PgBackend {
     /// `poll_azdo_session`: the distributedtask poll shape — redeliver, cancel,
     /// then claim — returning the session message row the handler renders.
+    /// An unknown non-UUID session id is the implicit compat session and is
+    /// materialized runner-less, like the SQLite backend's.
     ///
     /// Statements: session read + touch; `session_messages` oldest; active
     /// request read; cancellation read/insert; the claim batch and its
@@ -5276,10 +5278,41 @@ impl PgBackend {
     ) -> Result<AzdoPollOutcome, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
-        let Some(session) = self.session_ref(&tx, &poll.session_id).await? else {
-            // An unknown session is answered like a foreign one: the runner
-            // must re-register rather than receive work it cannot decode.
-            return Ok(AzdoPollOutcome::Forbidden);
+        let session = match self.session_ref(&tx, &poll.session_id).await? {
+            Some(session) => session,
+            None if poll.session_id.parse::<uuid::Uuid>().is_err() => {
+                // The implicit compat session (legacy `sessionId=default`,
+                // any non-UUID id) owns no runner: its row is materialized
+                // lazily so `session_messages`/`job_requests` keys resolve,
+                // and `plaintext` rendering keeps messages decodable without
+                // a key exchange.
+                let uuid = logic::session_uuid(&poll.session_id).to_string();
+                let now = now_us();
+                tx.execute(
+                    concat!(
+                        "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
+                         verified, created_at, last_seen_at) \
+                         VALUES ($1::text::uuid, NULL, 'azdo', false, ",
+                        ts!("$2"),
+                        ", ",
+                        ts!("$2"),
+                        ") ON CONFLICT DO NOTHING"
+                    ),
+                    &[&uuid, &now],
+                )
+                .await
+                .map_err(db)?;
+                SessionRef {
+                    session_uuid: uuid,
+                    runner_id: None,
+                    protocol: "azdo",
+                    live: true,
+                }
+            }
+            // An unknown keyed session is answered like a foreign one: the
+            // runner must re-register rather than receive work it cannot
+            // decode.
+            None => return Ok(AzdoPollOutcome::Forbidden),
         };
         if let Some(verified) = poll.verified_runner_id
             && session.runner_id != Some(verified)
