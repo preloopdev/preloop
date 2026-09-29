@@ -3555,10 +3555,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .unwrap_or("unknown")
             )));
         }
-        // `base_install_script` already prepared the default account, and that
-        // fragment is fingerprinted. Re-run it here only for a configured
-        // non-default user, whose identity the fingerprint cannot know: the
-        // script is idempotent, so the default case is a cheap no-op skip.
+        // `base_install_script` already prepared the default account for
+        // curated bases, and provisioning reconciles it again before configure
+        // (custom bases get the fix there for the first time). Re-run it here
+        // only for a configured non-default user, whose identity the
+        // fingerprint cannot know: the script is idempotent either way.
         let runner_user = self
             .config
             .runner_user
@@ -5642,6 +5643,34 @@ async fn provision_runner<P: VmProvider + 'static>(
                 }
                 verify_toolchain_installed(provider.as_ref(), name, layer).await?;
             }
+        }
+    }
+
+    // Reconcile the unprivileged runner account on every machine, whatever its
+    // provenance: curated stock bases, custom/official images, and forked
+    // goldens alike. `base_install_script` runs this only inside the curated
+    // bake, so custom bases reached jobs with root-owned `/usr/local/rustup`,
+    // `/usr/local/cargo`, and `/opt/hostedtoolcache` — and any step that
+    // writes them (`rustup component add`, `cargo fmt`, toolcache drops) died
+    // with EACCES. The script is idempotent, so re-running it on an
+    // already-prepared image costs one exec round trip.
+    {
+        let runner_user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
+        let runner_uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
+        let account_script = runner_account_script(runner_user, runner_uid);
+        let output = provider
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), account_script])
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OrchestratorError::Config(format!(
+                "runner-account reconciliation failed on {} (exit {}): {}",
+                name.as_str(),
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown")
+            )));
         }
     }
 
