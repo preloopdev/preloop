@@ -10448,6 +10448,115 @@ async fn fork_pr_runs_get_read_only_cache_access() {
     );
 }
 
+/// R2b-5. The cache v2 namespace (repository) must come from the caller's
+/// job token, exactly like the artifact path, and never from the request
+/// body: otherwise any job can read another repository's cache or plant
+/// entries in it.
+#[tokio::test]
+async fn cache_v2_namespace_follows_the_job_token_not_the_request_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let submit = |repository: &'static str| {
+        let state = state.clone();
+        async move {
+            crate::submit_run_inner(
+                &state.shared(),
+                preloop_gha_protocol::WorkflowSubmission {
+                    workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n".to_owned(),
+                    event: "push".to_owned(),
+                    payload: json!({"ref": "refs/heads/main", "commits": []}),
+                    repository: repository.to_owned(),
+                    git_ref: "refs/heads/main".to_owned(),
+                    trust_tier: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("trusted submission accepted")
+        }
+    };
+    let run_a = submit("owner/a").await;
+    let run_b = submit("owner/b").await;
+    let token_for = |run_id: &preloop_gha_protocol::RunId| {
+        let state = state.clone();
+        let run_id = run_id.to_string();
+        async move {
+            let inner = state.test_tx().await;
+            let message = queued_message_for(&inner, &run_id);
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
+        }
+    };
+    let token_a = token_for(&run_a.run_id).await;
+    let token_b = token_for(&run_b.run_id).await;
+
+    // Repository B's own upload lands in B's namespace.
+    let b_key = crate::results_twirp::scoped_cache_key("shared-key", None, Some("owner/b"));
+    state
+        .cache
+        .put(&b_key, "v1", b"bytes-from-b")
+        .await
+        .expect("seed repository B cache");
+
+    let restore_uri = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL";
+    let restore_body = json!({"key": "shared-key", "version": "v1", "repository": "owner/b"});
+
+    // A's job token naming B in the body still reads A's namespace: a miss.
+    let as_a = request_json_with_bearer(
+        &app,
+        Method::POST,
+        restore_uri,
+        restore_body.clone(),
+        &token_a,
+    )
+    .await;
+    assert_eq!(
+        as_a["ok"], false,
+        "a job token must not read another repository's cache by naming it in the body"
+    );
+
+    // B's token resolves the same body to B's own namespace: a hit.
+    let as_b =
+        request_json_with_bearer(&app, Method::POST, restore_uri, restore_body, &token_b).await;
+    assert_eq!(
+        as_b["ok"], true,
+        "the owning repository's job still reads its own cache"
+    );
+
+    // A reservation is namespaced by the caller too, so A cannot plant an
+    // entry in B's namespace for B to restore later.
+    let create_uri = "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry";
+    let created = request_json_with_bearer(
+        &app,
+        Method::POST,
+        create_uri,
+        json!({"key": "poison-key", "version": "v1", "repository": "owner/b"}),
+        &token_a,
+    )
+    .await;
+    assert_eq!(
+        created["ok"], true,
+        "a trusted job may reserve a cache entry"
+    );
+    let inner = state.inner.lock().await;
+    let keys = inner
+        .cache_v2_pending
+        .values()
+        .map(|pending| pending.key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        keys.contains(
+            &crate::results_twirp::scoped_cache_key("poison-key", None, Some("owner/a")).as_str()
+        ),
+        "A's reservation must be namespaced under A's repository, got {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|key| key.starts_with("owner/b:")),
+        "a body repository must not move a reservation into B's namespace, got {keys:?}"
+    );
+}
+
 /// A fork job's runtime JWT must not smuggle a cache write in after the
 /// job's request was retired. Retirement (`RequestRetirement::Purge` in
 /// `retire_node_requests`) removes the correlation records

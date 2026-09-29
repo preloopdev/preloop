@@ -736,7 +736,6 @@ pub async fn twirp_cache_v2_create(
     // and poison the default branch's cache namespace.
     let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
     let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), Some(repository.as_str()));
-
     if shared
         .state
         .cache
@@ -1029,7 +1028,6 @@ pub async fn twirp_cache_v2_get_dl_url(
     // the client-supplied scopes; with none supplied, the unscoped default
     // is tried once.
     let primary_scopes = resolve_cache_read_scopes(&shared.state, &headers, &scopes).await?;
-
     let mut hit: Option<(preloop_cache::CacheEntry, Vec<u8>)> = None;
     let mut lookup_ms: u128 = 0;
     for primary in &primary_scopes {
