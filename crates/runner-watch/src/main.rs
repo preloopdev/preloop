@@ -2312,6 +2312,9 @@ async fn replay_flows_to_preloop_inner(
         {
             path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
         }
+        // Rewrite the disttask agent id to the registered replay runner as well:
+        // the golden PUTs/DELETEs target the official pool's agent id.
+        path = rewrite_replay_agent_id(&path, replay_runner_id);
         // Rewrite OIDC plan/job IDs to match local replay state
         if path.contains("/oidctoken")
             && let Some(rest) =
@@ -3311,6 +3314,30 @@ fn rewrite_replay_plan_ids(path: &str, plan_ids: &HashMap<String, String>) -> St
         .fold(path.to_owned(), |rewritten, (official, local)| {
             rewritten.replace(official, local)
         })
+}
+
+/// Rewrite the pool agent id in a disttask `/agents/{n}` path to the runner the
+/// replay registered. The golden flow PUTs against the official pool's agent id
+/// (e.g. `agents/51`), which does not exist in the replay's state, so the id has
+/// to follow the same numeric mapping as the broker path.
+fn rewrite_replay_agent_id(path: &str, replay_runner_id: i64) -> String {
+    let Some(position) = path.find("/agents/") else {
+        return path.to_owned();
+    };
+    let tail = &path[position + "/agents/".len()..];
+    let (id, suffix) = match tail.find(['?', '#']) {
+        Some(index) => (&tail[..index], &tail[index..]),
+        None => (tail, ""),
+    };
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return path.to_owned();
+    }
+    format!(
+        "{}/agents/{}{}",
+        &path[..position],
+        replay_runner_id,
+        suffix
+    )
 }
 
 fn replay_auth_token<'a>(
@@ -4520,6 +4547,23 @@ mod tests {
                 &session_ids,
             ),
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=local-session&status=Online"
+        );
+    }
+
+    #[test]
+    fn replay_rewrites_disttask_agent_ids_to_the_registered_runner() {
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents/51", 7),
+            "/_apis/distributedtask/pools/1/agents/7"
+        );
+        // A query string keeps its position; a non-numeric tail is left alone.
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/0/agents?agentName=x", 7),
+            "/_apis/distributedtask/pools/0/agents?agentName=x"
+        );
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents", 7),
+            "/_apis/distributedtask/pools/1/agents"
         );
     }
 
