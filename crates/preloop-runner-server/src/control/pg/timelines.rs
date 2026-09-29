@@ -409,20 +409,35 @@ impl PgBackend {
     }
 
     /// A run's stored step manifests keyed by attempt, each in position
-    /// order.
+    /// order: live attempts from `job_steps`, archived ones from
+    /// `step_history` (the live rows go with the run).
     ///
-    /// Statement: `SELECT <step columns> FROM job_steps s JOIN job_requests
-    /// q USING (agent_job_id) WHERE q.run_id = $1 ORDER BY agent_job_id,
-    /// position`.
+    /// Statement: `SELECT <step columns>, position FROM (job_steps ⋈
+    /// job_requests of the run UNION ALL step_history of the run) ORDER BY
+    /// agent_job_id, position`.
     pub(super) async fn run_step_manifests(
         &self,
         run_id: RunId,
     ) -> Result<BTreeMap<uuid::Uuid, Vec<StepRecord>>, ControlError> {
         let client = self.reader().await?;
         let sql = format!(
-            "SELECT {STEP_COLUMNS} FROM job_steps WHERE agent_job_id IN \
-             (SELECT agent_job_id FROM job_requests WHERE run_id = $1::text::uuid) \
-             ORDER BY agent_job_id, position"
+            "SELECT agent_job_id, step_id, kind, workflow_index, runner_number, context_name, \
+             name, conclusion, started_at, finished_at FROM ( \
+               SELECT agent_job_id::text AS agent_job_id, step_id, kind, workflow_index, \
+                      runner_number, context_name, name, conclusion, {live_start} AS started_at, \
+                      {live_finish} AS finished_at, position \
+               FROM job_steps WHERE agent_job_id IN \
+                 (SELECT agent_job_id FROM job_requests WHERE run_id = $1::text::uuid) \
+               UNION ALL \
+               SELECT h.agent_job_id::text, h.step_id, h.kind, h.workflow_index, \
+                      h.runner_number, h.context_name, h.name, h.conclusion, \
+                      {arch_start} AS started_at, {arch_finish} AS finished_at, h.position \
+               FROM step_history h WHERE h.run_id = $1::text::uuid \
+             ) s ORDER BY agent_job_id, position",
+            live_start = us!("started_at"),
+            live_finish = us!("finished_at"),
+            arch_start = us!("h.started_at"),
+            arch_finish = us!("h.finished_at"),
         );
         let rows = client
             .query(&sql, &[&run_id.0.to_string()])

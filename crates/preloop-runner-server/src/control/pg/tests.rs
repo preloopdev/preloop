@@ -900,3 +900,61 @@ async fn purge_returns_ready_assignment_to_pool() {
     );
 }
 
+/// Archiving moves steps to `step_history`; the step manifest of the
+/// archived run must still list them (the live `job_steps` rows are gone
+/// with the run).
+#[tokio::test]
+async fn run_step_manifests_survive_archival() {
+    let (_pg, node, _other) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, runner_id) = submit_and_claim(&node, run_id).await;
+    let agent = request.agent_job_id;
+    let now = chrono::Utc::now().timestamp_micros();
+    node.patch_steps(
+        agent,
+        vec![StepPatch {
+            id: "step-1".to_owned(),
+            name: "Build".to_owned(),
+            conclusion: "success".to_owned(),
+            started_at_us: Some(now),
+            finished_at_us: Some(now + 5),
+            observed_us: now,
+        }],
+    )
+    .await
+    .unwrap();
+    node.complete_job(JobCompletionInput {
+        run_id,
+        job_id: JobId("build".to_owned()),
+        agent_job_id: Some(agent),
+        status: ExecutionStatus::Success,
+        outputs: BTreeMap::new(),
+        runner_id: Some(runner_id),
+    })
+    .await
+    .unwrap();
+    {
+        let client = node.writer().await.unwrap();
+        client
+            .execute(
+                "UPDATE runs SET completed_at = now() - interval '10 minutes' \
+                 WHERE run_id = $1::text::uuid",
+                &[&run_id.0.to_string()],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        node.archive_finished_runs(64).await.unwrap().contains(&run_id),
+        "the completed run must archive"
+    );
+
+    let manifests = node.run_step_manifests(run_id).await.unwrap();
+    let steps = manifests
+        .get(&agent)
+        .expect("the archived attempt keeps its manifest");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].id, "step-1");
+    assert_eq!(steps[0].name, "Build");
+}
+
