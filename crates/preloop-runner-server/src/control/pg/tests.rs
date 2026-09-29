@@ -1120,3 +1120,160 @@ async fn out_of_range_step_timestamp_reads_as_absent() {
         "an out-of-range stored timestamp must read as absent, not 1970"
     );
 }
+
+fn gate(group: &str) -> preloop_gha_parser::Concurrency {
+    preloop_gha_parser::Concurrency {
+        group: group.to_owned(),
+        cancel_in_progress: Some("false".to_owned()),
+        queue: preloop_gha_parser::ConcurrencyQueue::Single,
+    }
+}
+
+/// A max-parallel re-park must keep the waiter's FIFO slot and drop the
+/// finished holder's row: `park_waiter` re-inserted at the tail and left the
+/// group naming a terminal job, so the group was wedged behind a ghost holder.
+#[tokio::test]
+async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
+    let (_pg, node, _other) = backend_pair().await;
+    let run = RunId::new();
+    // Cohort `m` (max-parallel 2): `a` holds gate `g1`, `aw` waits behind it,
+    // `bb` takes the free `g2`; `t1`/`t2` only drive promotion sweeps.
+    let mut submit = submit_run(
+        run,
+        vec![
+            submit_job(run, "a", 1),
+            submit_job(run, "aw", 2),
+            submit_job(run, "bb", 3),
+            submit_job(run, "t1", 4),
+            submit_job(run, "t2", 5),
+        ],
+    );
+    for job in &mut submit.jobs {
+        match job.queued.job_id.0.as_str() {
+            "a" | "aw" | "bb" => {
+                job.queued.base_id = "m".to_owned();
+                job.queued.max_parallel = Some(2);
+            }
+            _ => {}
+        }
+    }
+    submit.jobs[0].queued.concurrency = Some(gate("g1"));
+    submit.jobs[1].queued.concurrency = Some(gate("g1"));
+    submit.jobs[2].queued.concurrency = Some(gate("g2"));
+    node.submit_run(submit).await.unwrap();
+
+    let complete = |job: &'static str| {
+        let node = &node;
+        async move {
+            node.complete_job(JobCompletionInput {
+                run_id: run,
+                job_id: JobId(job.to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        }
+    };
+    // Park `aw` behind `a`.
+    complete("t1").await;
+    let wait_id: i64 = node
+        .writer()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT wait_id FROM concurrency_waits WHERE holder_job_id='aw'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // Fill the cohort cap with `bb` so `aw`'s promotion finds it saturated.
+    complete("t2").await;
+    // Completing `a` releases `g1` and re-parks `aw`.
+    complete("a").await;
+
+    let hold: Option<i64> = node
+        .writer()
+        .await
+        .unwrap()
+        .query_opt(
+            "SELECT 1 FROM concurrency_holds \
+             WHERE repository='owner/repo' AND group_name='g1'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .map(|row| row.get(0));
+    assert!(
+        hold.is_none(),
+        "a re-parked waiter must not leave the finished holder's row behind"
+    );
+    let reparked: Option<i64> = node
+        .writer()
+        .await
+        .unwrap()
+        .query_opt(
+            "SELECT wait_id FROM concurrency_waits WHERE holder_job_id='aw'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .map(|row| row.get(0));
+    assert_eq!(
+        reparked,
+        Some(wait_id),
+        "the re-parked waiter must keep its FIFO position"
+    );
+}
+
+/// A promotion that writes the promoted run's rows must take that run's row
+/// lock before any group-row lock: the reverse order deadlocked (40P01)
+/// against a command on the promoted run and clobbered its rows with a stale
+/// snapshot.
+#[tokio::test]
+async fn promotion_takes_the_promoted_runs_row_lock_first() {
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let wf = |group: &str| crate::control::types::WorkflowConcurrency {
+        group: group.to_owned(),
+        cancel_in_progress: false,
+        queue: preloop_gha_parser::ConcurrencyQueue::Single,
+        raw: gate(group),
+    };
+    // R1 holds group `g`; R2 waits behind it.
+    let run_1 = RunId::new();
+    let mut submit_1 = submit_run(run_1, vec![submit_job(run_1, "build", 1)]);
+    submit_1.workflow_concurrency = Some(wf("g"));
+    node_a.submit_run(submit_1).await.unwrap();
+    let run_2 = RunId::new();
+    let mut submit_2 = submit_run(run_2, vec![submit_job(run_2, "build", 2)]);
+    submit_2.record.run_number = 2;
+    submit_2.workflow_concurrency = Some(wf("g"));
+    assert!(node_a.submit_run(submit_2).await.unwrap().held);
+
+    // A command on R2 (its run row locked) runs while R1's cancellation
+    // releases `g` and promotes R2.
+    let conn = node_b.writer().await.unwrap();
+    conn.batch_execute("BEGIN").await.unwrap();
+    conn.query_one(
+        "SELECT 1 FROM runs WHERE run_id=$1::text::uuid FOR NO KEY UPDATE",
+        &[&run_2.0.to_string()],
+    )
+    .await
+    .unwrap();
+    let cancel = node_a.cancel_run(run_1, None);
+    let delete = async {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        conn.execute(
+            "DELETE FROM concurrency_waits WHERE holder_run_id=$1::text::uuid",
+            &[&run_2.0.to_string()],
+        )
+        .await
+        .expect("the releasing transaction must not hold R2's wait row while it waits for R2's run row");
+        conn.batch_execute("COMMIT").await.unwrap();
+    };
+    let (cancel, ()) = tokio::join!(cancel, delete);
+    cancel.expect("the promotion must complete once R2's row lock is released");
+}
