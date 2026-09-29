@@ -272,6 +272,10 @@ pub(super) fn apply_fail_fast(
         let job_id = JobId(job_id);
         finish_job_row(tx, run_id, &job_id, ExecutionStatus::Cancelled)?;
         release_concurrency_for_job(tx, backend, run_id, &job_id)?;
+        // `finish_job_row` bypasses `settle_node`, so a cancelled sibling
+        // would otherwise leave the base's dependents on a stale
+        // `remaining_needs` and the run hanging.
+        jobs::refresh_remaining_needs(tx, run_id, &job_id, &failed.base_id)?;
         cancelled.push(job_id);
     }
     if !cancelled.is_empty() {
@@ -733,6 +737,13 @@ pub(super) fn settle_node(
         apply_fail_fast(tx, backend, run_id, job_id)?
     } else {
         Vec::new()
+    };
+    // Fail-fast can cancel the last non-terminal siblings and finalize the
+    // run; recompute so its completion event and gate release are not lost.
+    let summary = if cancelled_siblings.is_empty() {
+        summary
+    } else {
+        jobs::summarize_run_row(tx, run_id)?
     };
     settle_requests_for_job(tx, run_id, job_id, effective)?;
     release_concurrency_for_job(tx, backend, run_id, job_id)?;

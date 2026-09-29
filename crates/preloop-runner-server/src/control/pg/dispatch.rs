@@ -2704,28 +2704,64 @@ impl<'a> Sweep<'a> {
             retire_node_requests(self.tx, run_id, job_id, Retirement::Settle(status)).await?;
         }
         clear_assignment(self.tx, run_id, job_id).await?;
-        // Dependents' remaining_needs decrement.
-        let dependents: Vec<String> = self
-            .tx
-            .query(
-                "SELECT job_id FROM job_needs WHERE run_id=$1::text::uuid \
-                 AND needs_job_id=$2",
-                &[&run_id.0.to_string(), &job_id.0],
-            )
-            .await
-            .map_err(db)?
-            .iter()
-            .map(|row| row.get(0))
-            .collect();
+        // Dependents' `remaining_needs` recompute. A declared need matches a
+        // job id or its matrix base, and an expanded matrix parent is replaced
+        // by its legs — so the fast-path counter cannot be decremented per
+        // settled job: a base need must wait for *every* leg, and a leg's id
+        // never appears in the dependent's `job_needs` row.
+        let base_id = self
+            .graphs
+            .get(&run_id)
+            .and_then(|graph| graph.nodes.get(job_id))
+            .map(|node| node.base_id.clone());
+        let dependents: Vec<JobId> = self
+            .graphs
+            .get(&run_id)
+            .map(|graph| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| {
+                        !node.status.is_terminal()
+                            && node.queue_state != logic::QueueState::None
+                            && node.needs.iter().any(|need| {
+                                need.0 == job_id.0
+                                    || base_id.as_deref() == Some(need.0.as_str())
+                            })
+                    })
+                    .map(|(dependent, _)| dependent.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         for dependent in dependents {
-            let dependent = JobId(dependent);
-            let Some(node) = self.node_mut(run_id, &dependent) else {
-                continue;
+            let remaining: i32 = {
+                let Some(graph) = self.graphs.get(&run_id) else {
+                    break;
+                };
+                let Some(node) = graph.nodes.get(&dependent) else {
+                    continue;
+                };
+                node.needs
+                    .iter()
+                    .map(|need| {
+                        graph
+                            .nodes
+                            .iter()
+                            .filter(|(id, dependency)| {
+                                (id == &need || dependency.base_id == need.0)
+                                    && !(dependency.kind == NodeKind::MatrixParent
+                                        && dependency.has_children)
+                                    && !dependency.status.is_terminal()
+                            })
+                            .count() as i32
+                    })
+                    .sum()
             };
-            let (next, promotable) = logic::decrement_remaining_needs(node.remaining_needs, true);
-            node.remaining_needs = next;
-            if promotable {
-                node.deps_ready_at_us = Some(now);
+            if let Some(node) = self.node_mut(run_id, &dependent) {
+                node.remaining_needs = remaining;
+                if remaining <= 0 {
+                    node.deps_ready_at_us = Some(now);
+                }
             }
             self.mark(run_id, &dependent);
         }
