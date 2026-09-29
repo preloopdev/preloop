@@ -859,7 +859,10 @@ async fn pair_runner_rebinds_swept_binding() {
         Some(second.runner.id)
     );
     assert_eq!(
-        node.test_working_set().await.unwrap().released_bindings_count,
+        node.test_working_set()
+            .await
+            .unwrap()
+            .released_bindings_count,
         1,
         "only the sweep released a binding"
     );
@@ -1000,7 +1003,10 @@ async fn run_step_manifests_survive_archival() {
             .unwrap();
     }
     assert!(
-        node.archive_finished_runs(64).await.unwrap().contains(&run_id),
+        node.archive_finished_runs(64)
+            .await
+            .unwrap()
+            .contains(&run_id),
         "the completed run must archive"
     );
 
@@ -1053,7 +1059,10 @@ async fn job_point_reads_fall_back_to_archived_rows() {
             .unwrap();
     }
     assert!(
-        node.archive_finished_runs(64).await.unwrap().contains(&run_id),
+        node.archive_finished_runs(64)
+            .await
+            .unwrap()
+            .contains(&run_id),
         "the completed run must archive"
     );
 

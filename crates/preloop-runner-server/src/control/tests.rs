@@ -2868,7 +2868,11 @@ pub(crate) mod suite {
         // Tick 1: the job timeout fires; the lease is still live.
         let inputs = backend.reap_inputs().await.unwrap();
         let outcome = backend
-            .reap_sweep(sweep_at(started + std::time::Duration::from_secs(601), run_id, inputs))
+            .reap_sweep(sweep_at(
+                started + std::time::Duration::from_secs(601),
+                run_id,
+                inputs,
+            ))
             .await
             .unwrap();
         assert_eq!(outcome.cancellations, 1, "the job timeout must fire");

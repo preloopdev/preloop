@@ -177,7 +177,8 @@ impl PgBackend {
                             .await
                             .map_err(db)?;
                         if flagged > 0
-                            && enqueue_cancellation_job(&tx, request.run_id, &request.job_id).await?
+                            && enqueue_cancellation_job(&tx, request.run_id, &request.job_id)
+                                .await?
                         {
                             outcome.cancellations += 1;
                         }
