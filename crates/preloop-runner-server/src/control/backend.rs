@@ -947,7 +947,10 @@ pub(crate) trait ControlBackend: Send + Sync {
     ) -> Result<Option<preloop_gha_protocol::crypto::AgentRsaPublicKey>, ControlError>;
 
     /// Insert a session row for `open.runner_id` (`last_seen_at = now`).
-    /// `runner_id = None` writes nothing and succeeds. When `open.verified`,
+    /// `runner_id = None` writes nothing and succeeds. `Forbidden` when
+    /// `runner_id` names no registered runner: the liveness check and the
+    /// insert run in one transaction, so a purge racing token validation
+    /// cannot leave a session behind. When `open.verified`,
     /// fails with `Conflict` (nothing written) if the runner already owns a
     /// verified session; otherwise the new session is recorded as verified.
     /// No session key is stored: keys are derived from the cluster key and

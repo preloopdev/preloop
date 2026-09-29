@@ -152,6 +152,19 @@ impl PgBackend {
         };
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
+        // The liveness check and the insert share this transaction: the
+        // liveness sweep may have purged the runner after token validation
+        // but before the insert (the broker route maps `Forbidden` to 401).
+        let alive = tx
+            .query_opt("SELECT 1 FROM runners WHERE runner_id=$1", &[&runner_id])
+            .await
+            .map_err(db)?
+            .is_some();
+        if !alive {
+            return Err(ControlError::Forbidden(
+                "runner registration no longer exists".to_owned(),
+            ));
+        }
         if open.verified {
             let conflict = tx
                 .query_opt(

@@ -464,6 +464,22 @@ impl LiteBackend {
             _ => "azdo",
         };
         self.write(|tx| {
+            // The liveness check and the insert share this transaction: the
+            // liveness sweep may have purged the runner after token
+            // validation but before the insert (the handler maps `Forbidden`
+            // to 401).
+            let alive = tx
+                .prepare_cached("SELECT 1 FROM runners WHERE runner_id = ?1")
+                .map_err(db)?
+                .query_row([runner_id], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(db)?
+                .is_some();
+            if !alive {
+                return Err(ControlError::Forbidden(
+                    "runner registration no longer exists".to_owned(),
+                ));
+            }
             if open.verified {
                 let conflict = tx
                     .prepare_cached(
@@ -481,8 +497,8 @@ impl LiteBackend {
                     )));
                 }
             }
-            // runner_id has no FK (see schema.sql): an unverified create may
-            // declare an agent id whose registration arrives later.
+            // `runner_id` has no FK (see schema.sql), so liveness is checked
+            // above: a session never outlives its runner registration.
             tx.prepare_cached(
                 "INSERT INTO runner_sessions (session_id, runner_id, protocol, \
                  verified) VALUES (?1, ?2, ?3, ?4) \
