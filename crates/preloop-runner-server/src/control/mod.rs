@@ -7,13 +7,16 @@
 //! Postgres implements the same contract for shared-node deployments.
 //!
 //! Layout:
+//! - [`backend`]: the `ControlBackend` trait itself — one documented contract
+//!   per command.
 //! - [`types`]: backend-neutral domain types, command inputs/outputs, errors.
 //! - [`lite`] / [`pg`]: the two `ControlBackend` implementations (SQLite is
 //!   the default; Postgres serves shared-node deployments).
-//! - [`sched`] / [`commands`]: shared, backend-neutral helpers the backends
-//!   and callers reuse (label matching, file commands, TTL constants).
-//! - [`rows`]: backend-neutral row codecs for decomposed families (steps).
 //! - [`logic`]: pure decision functions both backends share.
+//! - [`wake`]: how a committed enqueue reaches waiting long-polls.
+//! - [`txn_stats`]: per-phase control-transaction timings for operators.
+//! - `tests` / `testview`: the shared behavioral suite and its test-only
+//!   read view of the control database.
 
 // The submodules use `use super::*` to reach the crate prelude, matching how
 // `runtime_scheduling.rs` (the module this replaces) sees the whole crate
