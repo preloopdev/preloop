@@ -912,6 +912,37 @@ async fn park_waiter(
         .get(0))
 }
 
+/// Re-park a waiter at its original FIFO position (same `wait_id`): a
+/// promotion attempt that found max-parallel saturated must not let a
+/// younger waiter jump the queue.
+async fn requeue_waiter(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    key: &(String, String),
+    wait_id: i64,
+    holder: &GateHolder,
+) -> Result<(), ControlError> {
+    let (kind, run_id, job_id, jobset_id) = gate_row(holder);
+    tx.execute(
+        "INSERT INTO concurrency_waits (wait_id, namespace_id, repository, \
+         group_name, holder_kind, holder_run_id, holder_job_id, holder_jobset_id) \
+         OVERRIDING SYSTEM VALUE VALUES ($1,$2,$3,$4,$5,$6::text::uuid,$7,$8)",
+        &[
+            &wait_id,
+            &namespace,
+            &key.0,
+            &key.1,
+            &kind,
+            &run_id,
+            &job_id,
+            &jobset_id,
+        ],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 /// Remove a holder's wait row(s).
 async fn remove_waiter(
     tx: &Transaction<'_>,
@@ -1440,7 +1471,7 @@ async fn promote_waiter(
     tx: &Transaction<'_>,
     namespace: &str,
     key: &(String, String),
-    _wait_id: i64,
+    wait_id: i64,
     holder: &concurrency::Holder,
     jobset_id: Option<i64>,
 ) -> Result<(), ControlError> {
@@ -1464,16 +1495,22 @@ async fn promote_waiter(
             // Max-parallel back-pressure: a leg under the cap re-waits.
             let under = job_under_max_parallel(tx, *run_id, job_id).await?;
             if !under {
-                park_waiter(
+                // Re-park at the original FIFO position and release the
+                // group: no holder owns it (lite's `requeue_wait` after
+                // `release_hold`), so the finished holder's row cannot wedge
+                // every later arrival.
+                requeue_waiter(
                     tx,
                     namespace,
                     key,
+                    wait_id,
                     &GateHolder {
                         holder: holder.clone(),
                         jobset_id: None,
                     },
                 )
                 .await?;
+                clear_group(tx, namespace, key).await?;
                 return Ok(());
             }
             set_holder(
