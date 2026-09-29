@@ -149,6 +149,21 @@ def map_entries(token: Any) -> list[tuple[str, Any, int | None, int | None]]:
     ]
 
 
+def environment_entries(token: Any) -> list[tuple[str, Any, int | None, int | None]]:
+    """Expand the acquirejob ``environmentVariables`` list of per-scope maps.
+
+    The capture carries one token map per source scope (top-level, job, step),
+    so the entries have to be flattened before the caller can route them to the
+    level their source column names.
+    """
+    if isinstance(token, list):
+        entries: list[tuple[str, Any, int | None, int | None]] = []
+        for item in token:
+            entries.extend(map_entries(item))
+        return entries
+    return map_entries(token)
+
+
 def input_entries(step: dict[str, Any]) -> list[tuple[str, Any, int | None, int | None]]:
     return map_entries(step.get("inputs"))
 
@@ -258,7 +273,7 @@ def render_workflow(name: str, payload: dict[str, Any], replay_job_count: int = 
     # Top-level defaults and env are the entries whose source indentation is 2.
     top_env: list[tuple[str, Any, int | None, int | None]] = []
     job_env: list[tuple[str, Any, int | None, int | None]] = []
-    for entry in map_entries(payload.get("environmentVariables")):
+    for entry in environment_entries(payload.get("environmentVariables")):
         if entry[3] == 3:
             top_env.append(entry)
         else:
@@ -304,10 +319,17 @@ def render_workflow(name: str, payload: dict[str, Any], replay_job_count: int = 
             for key, raw, _, _ in map_entries(value):
                 lines.append(f"        {key}: {yaml_scalar(token_value(raw))}")
     if payload.get("jobContainer"):
-        notes.append("job container map recovered; source formatting is not recoverable")
         lines.append("    container:")
-        for key, raw, _, _ in map_entries(payload["jobContainer"]):
-            lines.append(f"      {key}: {yaml_scalar(token_value(raw))}")
+        container_entries = map_entries(payload["jobContainer"])
+        if container_entries:
+            notes.append("job container map recovered; source formatting is not recoverable")
+            for key, raw, _, _ in container_entries:
+                lines.append(f"      {key}: {yaml_scalar(token_value(raw))}")
+        else:
+            # A scalar container (`container: node:22-alpine`) arrives as a
+            # plain literal token, not a token map.
+            notes.append("job container scalar recovered")
+            lines[-1] = "    container: " + yaml_scalar(token_value(payload["jobContainer"]))
     lines.append("    steps:")
     for step in payload.get("steps", []):
         render_step(step_records(step), lines, notes)

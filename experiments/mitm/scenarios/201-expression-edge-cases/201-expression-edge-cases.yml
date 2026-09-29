@@ -1,18 +1,19 @@
 name: 201-expression-edge-cases
 on: workflow_dispatch
+
+env:
+  GLOBAL_MULTI: "${{ 'a' }}/${{ 'b' }}"
+
 jobs:
   expr:
     runs-on: self-hosted
+    env:
+      JOB_ENV: "${{ github.workflow }}-${{ github.run_attempt }}"
     outputs:
       joined: "${{ steps.build.outputs.joined }}"
       json_out: "${{ steps.build.outputs.json_out }}"
     steps:
-
-
-
-
       - name: "functions"
-
         env:
           HAS: "${{ contains(fromJSON('[\"alpha\",\"beta\"]'), 'beta') }}"
           ESCAPED: "{${{ 'brace' }}}"
