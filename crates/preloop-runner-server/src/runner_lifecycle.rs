@@ -833,12 +833,30 @@ pub async fn replace_runner_compat(
 /// re-registers under a fresh id for the `/_apis/v1/Agent` flow.
 pub(crate) async fn update_agent(
     State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
     Path((_pool_id, agent_id)): Path<(i64, String)>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let runner_id = agent_id
         .parse::<i64>()
         .map_err(|_| ApiError::bad_request("agent id must be numeric"))?;
+    // A runner may refresh its own name/labels and nothing else; labels are
+    // the dispatch predicate, so rewriting a peer's row starves it or makes
+    // it claim jobs it was never provisioned for. The system token (and the
+    // registration credential behind the management flows) stays unrestricted.
+    let caller = crate::auth::admin_caller(
+        &shared.state,
+        &headers,
+        identity.as_ref().map(|axum::Extension(id)| id),
+    )?;
+    if let crate::auth::AdminCaller::Runner(caller_runner_id) = caller {
+        if caller_runner_id != runner_id {
+            return Err(ApiError::forbidden(
+                "a runner may only update its own agent",
+            ));
+        }
+    }
     let name = request
         .get("name")
         .and_then(|v| v.as_str())

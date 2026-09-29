@@ -7298,6 +7298,79 @@ async fn admin_deletes_reject_job_tokens_and_confine_runners_to_themselves() {
     );
 }
 
+/// R2b-1. `PUT …/agents/{id}` is the official runner's in-place name/label
+/// refresh, and it shares its route with the self-only DELETE above. A
+/// runner listen token must therefore only rewrite its own row: labels are
+/// the dispatch predicate, so a peer could otherwise strip a runner's labels
+/// to starve it or add a privileged label to make it claim jobs it was never
+/// provisioned for.
+#[tokio::test]
+async fn update_agent_is_self_only_for_runner_tokens() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "agent-update-a", &["self-hosted"], None).await;
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "agent-update-b", &["self-hosted"], None).await;
+
+    for uri in [
+        format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}"),
+        format!("/_apis/distributedtask/pools/1/agents/{runner_a}"),
+    ] {
+        assert_eq!(
+            status_with_bearer(
+                &app,
+                &token_b,
+                Method::PUT,
+                &uri,
+                json!({"name": "hijacked", "labels": [{"name": "privileged"}]}),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not rewrite runner A through {uri}"
+        );
+    }
+
+    // Runner A's row is untouched by the rejected attempts.
+    let listing = state.backend.list_runners(None).await.unwrap();
+    let row_a = listing.runners.iter().find(|r| r.id == runner_a).unwrap();
+    assert_eq!(row_a.name, "agent-update-a");
+    assert_eq!(row_a.labels, vec!["self-hosted".to_string()]);
+
+    // Its owner may update itself: that is the runner's normal refresh.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token_a,
+            Method::PUT,
+            &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}"),
+            json!({"name": "agent-update-a", "labels": [{"name": "self-hosted"}, {"name": "linux"}]}),
+        )
+        .await,
+        StatusCode::OK,
+        "a runner must be able to update itself"
+    );
+    let listing = state.backend.list_runners(None).await.unwrap();
+    let row_a = listing.runners.iter().find(|r| r.id == runner_a).unwrap();
+    assert_eq!(row_a.labels, vec!["self-hosted".to_string(), "linux".to_string()]);
+
+    // The system token keeps unrestricted access (operator flows).
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            "preloop-system-token",
+            Method::PUT,
+            &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_b}"),
+            json!({"name": "agent-update-b", "labels": [{"name": "self-hosted"}]}),
+        )
+        .await,
+        StatusCode::OK,
+        "the system token may update any runner"
+    );
+}
+
 #[tokio::test]
 async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
     let temp = tempfile::tempdir().unwrap();
