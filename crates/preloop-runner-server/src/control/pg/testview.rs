@@ -621,10 +621,8 @@ impl PgBackend {
             .map_err(db)?
         {
             let run: Option<String> = row.get(0);
-            t.outbox_topics.push((
-                run.map(|run| codec::run_id(&run)).transpose()?,
-                row.get(1),
-            ));
+            t.outbox_topics
+                .push((run.map(|run| codec::run_id(&run)).transpose()?, row.get(1)));
         }
 
         // ── Counters ─────────────────────────────────────────────────

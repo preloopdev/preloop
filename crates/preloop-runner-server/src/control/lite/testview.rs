@@ -744,10 +744,7 @@ impl LiteBackend {
             .prepare_cached("SELECT run_id, topic FROM outbox_events ORDER BY event_id")
             .map_err(db)?
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(db)?
         {

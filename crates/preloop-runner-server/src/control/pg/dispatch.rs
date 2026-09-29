@@ -2727,8 +2727,7 @@ impl<'a> Sweep<'a> {
                         !node.status.is_terminal()
                             && node.queue_state != logic::QueueState::None
                             && node.needs.iter().any(|need| {
-                                need.0 == job_id.0
-                                    || base_id.as_deref() == Some(need.0.as_str())
+                                need.0 == job_id.0 || base_id.as_deref() == Some(need.0.as_str())
                             })
                     })
                     .map(|(dependent, _)| dependent.clone())

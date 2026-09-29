@@ -914,10 +914,7 @@ pub(crate) mod suite {
         fan.queued.needs = vec![JobId("gen".to_owned())];
         fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
         backend
-            .submit_run(submit_run(
-                run_id,
-                vec![submit_job(run_id, "gen", 1), fan],
-            ))
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]))
             .await
             .unwrap();
 
@@ -996,7 +993,12 @@ pub(crate) mod suite {
             .await
             .unwrap();
         assert_eq!(
-            backend.run_record(run_id).await.unwrap().conclusion.as_deref(),
+            backend
+                .run_record(run_id)
+                .await
+                .unwrap()
+                .conclusion
+                .as_deref(),
             Some("success")
         );
 
@@ -1011,7 +1013,12 @@ pub(crate) mod suite {
         // A repeat cancel is still a no-op.
         backend.cancel_run(run_id, None).await.unwrap();
         assert_eq!(
-            backend.run_record(run_id).await.unwrap().conclusion.as_deref(),
+            backend
+                .run_record(run_id)
+                .await
+                .unwrap()
+                .conclusion
+                .as_deref(),
             Some("success")
         );
     }
@@ -2834,10 +2841,7 @@ mod lite {
         fan.queued.needs = vec![JobId("gen".to_owned())];
         fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
         backend
-            .submit_run(submit_run(
-                run_id,
-                vec![submit_job(run_id, "gen", 1), fan],
-            ))
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]))
             .await
             .unwrap();
         backend
@@ -2883,7 +2887,10 @@ mod lite {
             .iter()
             .filter(|(run, topic)| *run == Some(run_id) && topic == "run.completed.v1")
             .count();
-        assert_eq!(completed, 1, "a run must emit run.completed.v1 exactly once");
+        assert_eq!(
+            completed, 1,
+            "a run must emit run.completed.v1 exactly once"
+        );
         assert_eq!(state.runs[&run_id].conclusion.as_deref(), Some("success"));
     }
 
