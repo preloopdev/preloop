@@ -617,28 +617,33 @@ pub(super) fn cancel_run_inner(
             retire_node_requests(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
         }
     }
-    tx.prepare_cached(
-        "UPDATE runs SET status = 'completed', conclusion = 'cancelled', \
-             completed_at = COALESCE(completed_at, ?2), \
-             started_at = COALESCE(started_at, ?2) \
-         WHERE run_id = ?1",
-    )
-    .map_err(db)?
-    .execute(params![run, now_us()])
-    .map_err(db)?;
+    let finalized = tx
+        .prepare_cached(
+            "UPDATE runs SET status = 'completed', conclusion = 'cancelled', \
+                 completed_at = COALESCE(completed_at, ?2), \
+                 started_at = COALESCE(started_at, ?2) \
+             WHERE run_id = ?1 AND status <> 'completed'",
+        )
+        .map_err(db)?
+        .execute(params![run, now_us()])
+        .map_err(db)?;
     release_concurrency_for_run(tx, backend, run_id)?;
     tx.prepare_cached("DELETE FROM jobsets WHERE run_id = ?1")
         .map_err(db)?
         .execute([&run])
         .map_err(db)?;
     jobs::clear_run_dispatch_intent(tx, run_id)?;
-    jobs::emit_outbox(
-        tx,
-        jobs::namespace_of(tx, run_id)?.as_str(),
-        Some(run_id),
-        "run.completed.v1",
-        serde_json::json!({"status": "cancelled"}),
-    )?;
+    // Only a run that just became terminal emits its completion: a repeat
+    // cancel must not append a second `run.completed.v1`.
+    if finalized > 0 {
+        jobs::emit_outbox(
+            tx,
+            jobs::namespace_of(tx, run_id)?.as_str(),
+            Some(run_id),
+            "run.completed.v1",
+            serde_json::json!({"status": "cancelled"}),
+        )?;
+    }
     Ok(cancellations)
 }
 
