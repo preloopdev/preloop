@@ -546,8 +546,11 @@ impl LiteBackend {
         })
     }
 
-    /// Renew an in-flight AgentRequest's lease; `false` when settled or
-    /// unknown (the PATCH contract renews nothing silently).
+    /// Renew an in-flight AgentRequest's lease; `false` when settled,
+    /// unknown, or holder-less (the PATCH contract renews nothing silently).
+    /// The holder ladder is the recorded owner, else the claiming session's
+    /// runner: an attempt with neither has no lease to extend (pg's
+    /// `LEASE_UPSERT`).
     pub(crate) async fn renew_agent_request(
         &self,
         request_id: i64,
@@ -558,8 +561,11 @@ impl LiteBackend {
             let renewed = tx
                 .prepare_cached(
                     "INSERT INTO job_leases (request_id, runner_id, expires_at, renewed_at) \
-                     SELECT request_id, runner_id, ?2, ?3 FROM job_requests \
-                     WHERE request_id = ?1 AND result IS NULL AND runner_id IS NOT NULL \
+                     SELECT q.request_id, COALESCE(q.runner_id, s.runner_id), ?2, ?3 \
+                     FROM job_requests q \
+                     LEFT JOIN runner_sessions s ON s.session_id = q.session_id \
+                     WHERE q.request_id = ?1 AND q.result IS NULL \
+                       AND COALESCE(q.runner_id, s.runner_id) IS NOT NULL \
                      ON CONFLICT (request_id) DO UPDATE SET \
                          expires_at = excluded.expires_at, renewed_at = excluded.renewed_at",
                 )

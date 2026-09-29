@@ -367,8 +367,10 @@ impl PgBackend {
         tx.commit().await.map_err(db)
     }
 
-    /// Renew an in-flight AgentRequest's lease; `false` for a completed or
-    /// unknown request (the PATCH contract renews nothing silently).
+    /// Renew an in-flight AgentRequest's lease; `false` for a completed,
+    /// unknown or holder-less request (the PATCH contract renews nothing
+    /// silently, and an attempt with neither a recorded owner nor a claiming
+    /// session's runner has no lease to extend).
     ///
     /// Statements (one transaction): `SELECT 1 FROM job_requests WHERE
     /// request_id AND result IS NULL FOR NO KEY UPDATE`; lease upsert.
@@ -390,13 +392,15 @@ impl PgBackend {
             .await
             .map_err(db)?
             .is_some();
-        if in_flight {
+        let renewed = if in_flight {
             tx.execute(LEASE_UPSERT, &[&request_id, &expires, &now_us()])
                 .await
-                .map_err(db)?;
-        }
+                .map_err(db)?
+        } else {
+            0
+        };
         tx.commit().await.map_err(db)?;
-        Ok(in_flight)
+        Ok(renewed > 0)
     }
 
     /// Settle a claimed request once (first result wins) with the full
