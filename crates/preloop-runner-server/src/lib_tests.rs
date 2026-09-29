@@ -16936,9 +16936,8 @@ async fn submitted_run_shares_the_namespace_of_its_run_number_counter() {
 
     state
         .test_db_mutate(move |tx| {
-            let run_namespace: String = tx
-                .0
-                .query_row(
+            let run_namespace: String =
+                tx.0.query_row(
                     "SELECT namespace_id FROM runs WHERE run_id = ?1",
                     [run_id.as_str()],
                     |row| row.get(0),
@@ -16949,9 +16948,8 @@ async fn submitted_run_shares_the_namespace_of_its_run_number_counter() {
                 crate::control::types::DEFAULT_NAMESPACE,
                 "the run must live in the local tenant"
             );
-            let counter_namespace: String = tx
-                .0
-                .query_row(
+            let counter_namespace: String =
+                tx.0.query_row(
                     "SELECT namespace_id FROM workflow_run_numbers WHERE repository = ?1",
                     ["owner/repo"],
                     |row| row.get(0),
