@@ -2404,7 +2404,10 @@ pub(crate) mod suite {
     /// a live runner → job pairing.
     pub(crate) async fn status_assignments_require_a_live_session(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
-        let runner = backend.register_runner(register_runner("r1")).await.unwrap();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
         let session = backend
             .create_session(create_session(runner.runner.id))
             .await
@@ -2530,7 +2533,10 @@ pub(crate) mod suite {
         Fut: Future<Output = ()>,
     {
         let run_id = RunId::new();
-        let runner = backend.register_runner(register_runner("r1")).await.unwrap();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
         backend
             .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
             .await
@@ -3098,17 +3104,20 @@ mod pg {
     async fn swept_binding_is_reported() {
         let (_pg, backend) = backend().await;
         let db = &backend;
-        suite::swept_binding_is_reported(&backend, move |binding: suite::SweptBinding| async move {
-            // ASSIGNMENT_TTL (600s) is one sweep window: age past it.
-            db.test_execute(&format!(
-                "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
+        suite::swept_binding_is_reported(
+            &backend,
+            move |binding: suite::SweptBinding| async move {
+                // ASSIGNMENT_TTL (600s) is one sweep window: age past it.
+                db.test_execute(&format!(
+                    "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
                  first_assigned_at) VALUES ('{}', '{}', {}, now() - interval '11 minutes', \
                  now() - interval '11 minutes')",
-                binding.run_id, binding.job_id, binding.runner_id,
-            ))
-            .await
-            .unwrap();
-        })
+                    binding.run_id, binding.job_id, binding.runner_id,
+                ))
+                .await
+                .unwrap();
+            },
+        )
         .await;
     }
 }
@@ -3536,18 +3545,21 @@ mod lite {
     async fn swept_binding_is_reported() {
         let backend = LiteBackend::in_memory().unwrap();
         let db = &backend;
-        suite::swept_binding_is_reported(&backend, move |binding: suite::SweptBinding| async move {
-            // ASSIGNMENT_TTL (600s) is one sweep window: age past it.
-            let stale = (std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60))
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as i64;
-            db.exec_for_test(&format!(
-                "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
+        suite::swept_binding_is_reported(
+            &backend,
+            move |binding: suite::SweptBinding| async move {
+                // ASSIGNMENT_TTL (600s) is one sweep window: age past it.
+                let stale = (std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60))
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64;
+                db.exec_for_test(&format!(
+                    "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
                  first_assigned_at) VALUES ('{}', '{}', {}, {stale}, {stale})",
-                binding.run_id, binding.job_id, binding.runner_id,
-            ));
-        })
+                    binding.run_id, binding.job_id, binding.runner_id,
+                ));
+            },
+        )
         .await;
     }
 
