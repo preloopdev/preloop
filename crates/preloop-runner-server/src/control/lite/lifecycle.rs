@@ -523,10 +523,14 @@ impl LiteBackend {
                 ));
             }
             // Release the session's live requests so the jobs can be retried.
-            // runner_id stays: the attempt's owner survives session teardown
-            // so only that runner may still complete/renew it (legacy
-            // AgentRequest semantics — verified by
-            // legacy_agent_requests_are_bound_to_runner_identity).
+            // Only the session binding goes: runner_id stays, so the
+            // attempt's owner survives session teardown and only that runner
+            // may still complete/renew it (legacy AgentRequest semantics —
+            // verified by
+            // legacy_agent_requests_are_bound_to_runner_identity). The start
+            // stamp and the lease stay too: the trait doc leaves the active
+            // request and its claimed job to the lease reaper, which reads
+            // both of them.
             let requests: Vec<i64> = {
                 let mut stmt = tx
                     .prepare_cached(
@@ -545,17 +549,12 @@ impl LiteBackend {
                 .map_err(db)?;
             for request_id in requests {
                 tx.prepare_cached(
-                    "UPDATE job_requests SET session_id = NULL, \
-                     started_at = NULL, timeout_triggered = 0 \
+                    "UPDATE job_requests SET session_id = NULL \
                      WHERE request_id = ?1 AND result IS NULL",
                 )
                 .map_err(db)?
                 .execute([request_id])
                 .map_err(db)?;
-                tx.prepare_cached("DELETE FROM job_leases WHERE request_id = ?1")
-                    .map_err(db)?
-                    .execute([request_id])
-                    .map_err(db)?;
             }
             Ok(true)
         })

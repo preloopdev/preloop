@@ -230,20 +230,16 @@ impl PgBackend {
         .map_err(db)?;
         for row in requests {
             let request_id: i64 = row.get(0);
-            // runner_id stays: the attempt's owner survives session teardown
-            // so only that runner may still complete/renew it (legacy
-            // AgentRequest semantics — verified by
-            // legacy_agent_requests_are_bound_to_runner_identity).
+            // Only the session binding goes: runner_id stays, so the
+            // attempt's owner survives session teardown and only that runner
+            // may still complete/renew it (legacy AgentRequest semantics —
+            // verified by legacy_agent_requests_are_bound_to_runner_identity).
+            // Its start stamp and lease stay too: the trait doc leaves the
+            // request and its claimed job to the lease reaper, which reads
+            // both of them.
             tx.execute(
-                "UPDATE job_requests SET session_id = NULL, \
-                 started_at = NULL, timeout_triggered = false \
+                "UPDATE job_requests SET session_id = NULL \
                  WHERE request_id = $1 AND result IS NULL",
-                &[&request_id],
-            )
-            .await
-            .map_err(db)?;
-            tx.execute(
-                "DELETE FROM job_leases WHERE request_id = $1",
                 &[&request_id],
             )
             .await
