@@ -900,6 +900,61 @@ async fn purge_returns_ready_assignment_to_pool() {
     );
 }
 
+/// `get_timeline` answers `(change_id, records)` as one snapshot: a record
+/// can never carry a change id greater than the counter returned beside it,
+/// because a PATCH bumps the counter in the same commit that stamps its
+/// records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeline_reply_is_coherent_under_concurrent_patches() {
+    const PATCHES: usize = 120;
+    const GETS: usize = 200;
+    let (_pg, node_a, node_b) = backend_pair().await;
+    let run_id = RunId::new();
+    let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
+    let key = format!("{}/{}", request.plan_id, request.timeline_id);
+    node_a
+        .patch_timeline(&key, vec![timeline_record(1, "seed")])
+        .await
+        .unwrap();
+
+    let node_a = Arc::new(node_a);
+    let node_b = Arc::new(node_b);
+    let patcher = {
+        let node = node_a.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            for i in 0..PATCHES {
+                node.patch_timeline(&key, vec![timeline_record(100 + i as u128, "x")])
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+    let reader = {
+        let node = node_b.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            let mut incoherent = Vec::new();
+            for _ in 0..GETS {
+                let (change_id, records) = node.get_timeline(&key, 0, usize::MAX).await.unwrap();
+                if records
+                    .iter()
+                    .any(|record| record.change_id.unwrap_or(0) > change_id)
+                {
+                    incoherent.push((change_id, records.len()));
+                }
+            }
+            incoherent
+        })
+    };
+    patcher.await.unwrap();
+    let incoherent = reader.await.unwrap();
+    assert!(
+        incoherent.is_empty(),
+        "a reply reported a change id older than its own records: {incoherent:?}"
+    );
+}
+
 /// Archiving moves steps to `step_history`; the step manifest of the
 /// archived run must still list them (the live `job_steps` rows are gone
 /// with the run).

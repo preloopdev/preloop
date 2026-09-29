@@ -184,6 +184,11 @@ impl PgBackend {
     /// A timeline's change id and a `skip`/`top` page of its records
     /// ordered by record id. An unknown timeline reads as change 0, empty.
     ///
+    /// One repeatable-read, read-only transaction on one reader: the counter
+    /// and the records it describes must come from one snapshot (READ
+    /// COMMITTED would let a concurrent PATCH commit between them and stamp
+    /// records with the next change id).
+    ///
     /// Statements: `SELECT change_id FROM timelines WHERE timeline_id`;
     /// `SELECT record FROM timeline_records .. ORDER BY record_id OFFSET
     /// LIMIT`.
@@ -196,8 +201,15 @@ impl PgBackend {
         let Some(timeline) = timeline_uuid(timeline_key) else {
             return Ok((0, Vec::new()));
         };
-        let client = self.reader().await?;
-        let change_id: i32 = client
+        let mut client = self.reader().await?;
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(db)?;
+        let change_id: i32 = tx
             .query_opt(
                 "SELECT change_id FROM timelines WHERE timeline_id = $1::text::uuid",
                 &[&timeline],
@@ -206,7 +218,7 @@ impl PgBackend {
             .map_err(db)?
             .map(|row| row.get(0))
             .unwrap_or(0);
-        let rows = client
+        let rows = tx
             .query(
                 "SELECT record::text FROM timeline_records WHERE timeline_id = $1::text::uuid \
                  ORDER BY record_id OFFSET $2 LIMIT $3",
@@ -218,6 +230,7 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        tx.commit().await.map_err(db)?;
         Ok((change_id, decode_records(&rows)))
     }
 
