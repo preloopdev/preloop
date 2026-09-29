@@ -12,9 +12,7 @@ on:
     branches: [main]
   pull_request:
     paths:
-      - "crates/preloop-runner-server/src/control/**"
-      - "crates/preloop-runner-server/src/concurrency.rs"
-      - "crates/preloop-runner-server/src/secret_provider.rs"
+      - "crates/preloop-runner-server/**"
       - "docs/control-schema.sql"
       - ".github/workflows/control-plane.yml"
   workflow_dispatch:
@@ -72,6 +70,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-nextest
         run: cargo install cargo-nextest --locked --version 0.9.144
+      - name: Verify control filter matches at least one test
+        run: |
+          count=$(cargo nextest list -p preloop-runner-server -E 'test(/^control::/)' | grep -c '^preloop-runner-server control::' || true)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: nextest filter 'test(/^control::/)' matched zero tests in preloop-runner-server" >&2
+            exit 1
+          fi
+          echo "control: $count test(s) found"
       - name: Control tests (SQLite + PostgreSQL)
         run: cargo nextest run --locked -p preloop-runner-server -E 'test(/^control::/)'
       - name: Target schema applies cleanly
