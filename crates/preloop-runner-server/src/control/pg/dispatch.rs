@@ -928,14 +928,7 @@ async fn requeue_waiter(
          group_name, holder_kind, holder_run_id, holder_job_id, holder_jobset_id) \
          OVERRIDING SYSTEM VALUE VALUES ($1,$2,$3,$4,$5,$6::text::uuid,$7,$8)",
         &[
-            &wait_id,
-            &namespace,
-            &key.0,
-            &key.1,
-            &kind,
-            &run_id,
-            &job_id,
-            &jobset_id,
+            &wait_id, &namespace, &key.0, &key.1, &kind, &run_id, &job_id, &jobset_id,
         ],
     )
     .await
@@ -1796,9 +1789,7 @@ async fn resume_held_run(
         .jobs
         .clone();
     {
-        let Sweep {
-            graphs, dirty, ..
-        } = &mut sweep;
+        let Sweep { graphs, dirty, .. } = &mut sweep;
         let graph = graphs.get_mut(&run_id).expect("inserted");
         for job_id in &parked {
             let Some(node) = graph.nodes.get_mut(job_id) else {
@@ -1810,7 +1801,11 @@ async fn resume_held_run(
             let unsettled = node
                 .needs
                 .iter()
-                .filter(|need| jobs_status.get(*need).is_none_or(|status| !status.is_terminal()))
+                .filter(|need| {
+                    jobs_status
+                        .get(*need)
+                        .is_none_or(|status| !status.is_terminal())
+                })
                 .count() as i32;
             node.remaining_needs = unsettled;
             if unsettled == 0 {
@@ -1828,10 +1823,7 @@ async fn resume_held_run(
 
 /// The jobs a run parked behind its own workflow gate (no per-job wait row
 /// of their own), in `job_order`.
-async fn held_jobs_of_run(
-    tx: &Transaction<'_>,
-    run_id: RunId,
-) -> Result<Vec<JobId>, ControlError> {
+async fn held_jobs_of_run(tx: &Transaction<'_>, run_id: RunId) -> Result<Vec<JobId>, ControlError> {
     Ok(tx
         .query(
             "SELECT j.job_id FROM jobs j WHERE j.run_id=$1::text::uuid \

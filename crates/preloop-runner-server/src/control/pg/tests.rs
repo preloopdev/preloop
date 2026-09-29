@@ -1271,7 +1271,9 @@ async fn promotion_takes_the_promoted_runs_row_lock_first() {
             &[&run_2.0.to_string()],
         )
         .await
-        .expect("the releasing transaction must not hold R2's wait row while it waits for R2's run row");
+        .expect(
+            "the releasing transaction must not hold R2's wait row while it waits for R2's run row",
+        );
         conn.batch_execute("COMMIT").await.unwrap();
     };
     let (cancel, ()) = tokio::join!(cancel, delete);

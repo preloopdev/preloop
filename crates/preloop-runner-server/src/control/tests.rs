@@ -1832,7 +1832,9 @@ pub(crate) mod suite {
             .await
             .unwrap();
         assert_eq!(
-            state_c.as_ref().map(|(queue_state, _)| queue_state.as_str()),
+            state_c
+                .as_ref()
+                .map(|(queue_state, _)| queue_state.as_str()),
             Some("ready"),
             "the parked waiter must be promoted, got {state_c:?}"
         );
@@ -1957,7 +1959,9 @@ pub(crate) mod suite {
             .await
             .unwrap();
         assert_ne!(
-            state_b.as_ref().map(|(queue_state, _)| queue_state.as_str()),
+            state_b
+                .as_ref()
+                .map(|(queue_state, _)| queue_state.as_str()),
             Some("held"),
             "a jobset gate in another namespace must not hold this run back, got {state_b:?}"
         );
@@ -4161,8 +4165,10 @@ mod lite {
 
     #[tokio::test]
     async fn workflow_concurrency_releases_when_the_run_finishes() {
-        suite::workflow_concurrency_releases_when_the_run_finishes(&LiteBackend::in_memory().unwrap())
-            .await;
+        suite::workflow_concurrency_releases_when_the_run_finishes(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]
