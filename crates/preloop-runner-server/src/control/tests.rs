@@ -1612,7 +1612,6 @@ pub(crate) mod suite {
         assert!(outcome.held, "a second run in the group waits on the gate");
 
         let by_status = |status: &str| {
-            let backend = backend;
             let status = status.to_owned();
             async move {
                 backend
