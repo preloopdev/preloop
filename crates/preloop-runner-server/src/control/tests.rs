@@ -2787,6 +2787,32 @@ pub(crate) mod suite {
             "a swept binding must be reported by the status inputs"
         );
     }
+
+    /// `pair_runner` marks the runner pool-proven (trait doc step 1) even
+    /// when no pending job matches: `pool_proven` is exactly the gate
+    /// enqueue-time binding applies while pool assignments are on, and the
+    /// only other stamp site is registration, which always passes
+    /// `pool_proven: false`.
+    pub(crate) async fn pairing_marks_runner_pool_proven(backend: &dyn ControlBackend) {
+        let runner = backend
+            .register_runner(register_runner("pool-proven"))
+            .await
+            .unwrap();
+        assert!(
+            !runner.pool_proven,
+            "registration alone must not prove a runner"
+        );
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let after = backend
+            .update_runner(runner.runner.id, None, None)
+            .await
+            .unwrap();
+        assert!(
+            after.pool_proven,
+            "pair_runner must mark the runner pool-proven"
+        );
+    }
+
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -3194,6 +3220,15 @@ mod pg {
         suite::reusable_caller_outputs_survive_a_reload(&backend).await;
     }
 
+    /// Pool assignments on: the pairing path only runs in that mode.
+    #[tokio::test]
+    async fn pairing_marks_runner_pool_proven() {
+        let (_pg, backend) = backend().await;
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
     #[tokio::test]
     async fn secret_values_never_persist() {
         let (_pg, backend) = backend().await;
@@ -4051,6 +4086,15 @@ mod lite {
         );
     }
 
+    /// Pool assignments on: the pairing path only runs in that mode.
+    #[tokio::test]
+    async fn pairing_marks_runner_pool_proven() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        suite::pairing_marks_runner_pool_proven(&backend).await;
+    }
+
+    #[tokio::test]
     /// A file-backed LiteBackend proves durability: submit, drop, reopen,
     /// and the job is still claimable — the DB is the authority.
     #[tokio::test]

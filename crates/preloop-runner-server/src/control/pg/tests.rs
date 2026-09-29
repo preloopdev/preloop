@@ -786,3 +786,82 @@ async fn create_log_allocates_per_plan_across_nodes() {
     assert_eq!(ids, [1, 2], "one log id per allocation, loser retries");
     assert_eq!(node_a.create_log(&plan).await.unwrap(), 3);
 }
+
+// ── pool pairing / purge / archival (pg-only: needs pools on, an aged
+// binding, or a raw timestamp write) ─────────────────────────────────────
+
+/// Pool assignments on. `pair_runner` runs only in that mode.
+async fn pool_backend() -> (DisposablePg, PgBackend) {
+    let (guard, url) = fresh_database().await;
+    let backend = PgBackend::connect(&url, true, false, std::time::Duration::from_secs(300))
+        .await
+        .expect("test database connection failed");
+    (guard, backend)
+}
+
+/// The runner id the working set shows bound to `(run, job)`.
+async fn assigned_runner(node: &PgBackend, run_id: RunId, job_id: &JobId) -> Option<i64> {
+    node.test_working_set()
+        .await
+        .unwrap()
+        .job_assignments
+        .get(&(run_id, job_id.clone()))
+        .and_then(|assignment| assignment.runner_id)
+}
+
+/// `sweep_stale_bindings` releases a stale binding by clearing `runner_id`
+/// but KEEPS the `job_assignments` row and re-creates the pending mark, so
+/// the next `pair_runner` must rebind with an upsert and leave the released
+/// job in the pool waitlist. A plain INSERT dies on the
+/// `job_assignments_pkey` unique constraint and a bare `runner_id = NULL`
+/// strands the job outside provisioning.
+#[tokio::test]
+async fn pair_runner_rebinds_swept_binding() {
+    let (_pg, node) = pool_backend().await;
+    let run_id = RunId::new();
+    let job = JobId("build".to_owned());
+    let first = node.register_runner(register_runner("r1")).await.unwrap();
+    node.submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+        .await
+        .unwrap();
+    node.pair_runner(first.runner.id).await.unwrap();
+    assert_eq!(
+        assigned_runner(&node, run_id, &job).await,
+        Some(first.runner.id)
+    );
+
+    // Age the binding past the claim-binding TTL, then sweep it: the row
+    // survives with a NULL runner and the job re-enters provision_requests.
+    {
+        let client = node.writer().await.unwrap();
+        client
+            .execute(
+                "UPDATE job_assignments SET assigned_at = now() - interval '10 minutes' \
+                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                &[&run_id.0.to_string(), &job.0],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        node.sweep_stale_bindings().await.unwrap() > 0,
+        "the aged binding must be swept"
+    );
+    assert_eq!(assigned_runner(&node, run_id, &job).await, None);
+
+    // A second runner registers and pairs: the surviving row is upserted.
+    let second = node.register_runner(register_runner("r2")).await.unwrap();
+    node.pair_runner(second.runner.id)
+        .await
+        .expect("pair_runner must rebind the released job");
+    assert_eq!(
+        assigned_runner(&node, run_id, &job).await,
+        Some(second.runner.id)
+    );
+    assert_eq!(
+        node.test_working_set().await.unwrap().released_bindings_count,
+        1,
+        "only the sweep released a binding"
+    );
+}
+

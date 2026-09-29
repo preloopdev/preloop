@@ -384,8 +384,9 @@ impl PgBackend {
         }))
     }
 
-    /// `pair_registered_runner` parity: clean stale bindings, then pair this
-    /// runner with the oldest pool-pending job it can serve.
+    /// `pair_runner` per the trait doc: mark the runner pool-proven, release
+    /// stale/dead bindings back to the pool waitlist, then bind the oldest
+    /// pool-pending ready job this runner can serve.
     async fn pair_runner_tx(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
@@ -395,6 +396,15 @@ impl PgBackend {
         if !pool_assignments && !require_assignments {
             return Ok(());
         }
+        // "mark the runner pool-proven" comes first: enqueue-time binding
+        // gates on this flag (pg/dispatch.rs `on_job_enqueued`), and
+        // registration always writes `pool_proven = false`.
+        tx.execute(
+            "UPDATE runners SET pool_proven = true WHERE runner_id = $1",
+            &[&runner_id],
+        )
+        .await
+        .map_err(db)?;
         let row = tx
             .query_opt(
                 "SELECT labels::text, runner_group_id, runner_group_name \
@@ -410,28 +420,65 @@ impl PgBackend {
             runner_group_id: row.get(1),
             runner_group_name: row.get(2),
         };
-        // Stale bindings on dead runners release back to the pending set.
-        let stale_ttl = crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
-        let cutoff = now_us() - stale_ttl;
-        tx.execute(
-            concat!(
-                "UPDATE job_assignments SET runner_id=NULL WHERE runner_id=$1 \
-                 OR runner_id IS NOT NULL AND ",
-                us!("assigned_at"),
-                " < $2 \
-                 OR NOT EXISTS (SELECT 1 FROM runners r WHERE r.runner_id=job_assignments.runner_id)"
-            ),
-            &[&runner_id, &cutoff],
-        )
-        .await
-        .map_err(db)?;
-        // Oldest pool-pending job this runner can serve (queue order).
+        // Bindings on this runner, stale bindings, and bindings whose runner
+        // is gone lose their runner; each released job rejoins the pool
+        // waitlist at now (trait doc: "re-marked pool-pending at `now`").
+        let now = now_us();
+        let stale_cutoff = now - crate::control::logic::CLAIM_BINDING_TTL.as_micros() as i64;
+        let released = tx
+            .query(
+                concat!(
+                    "SELECT a.run_id::text, a.job_id FROM job_assignments a \
+                     WHERE a.runner_id IS NOT NULL AND (a.runner_id = $1 \
+                       OR ",
+                    us!("a.assigned_at"),
+                    " < $2 \
+                       OR NOT EXISTS (SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id))"
+                ),
+                &[&runner_id, &stale_cutoff],
+            )
+            .await
+            .map_err(db)?;
+        let mut released_count = 0usize;
+        for row in &released {
+            let run_id = row.get::<_, String>(0);
+            let job_id = JobId(row.get::<_, String>(1));
+            tx.execute(
+                "UPDATE job_assignments SET runner_id = NULL \
+                 WHERE run_id = $1::text::uuid AND job_id = $2",
+                &[&run_id, &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+            if pool_assignments {
+                tx.execute(
+                    concat!(
+                        "INSERT INTO provision_requests (run_id, job_id, namespace_id, \
+                         pool_key, labels, requested_at) \
+                         SELECT j.run_id, j.job_id, j.namespace_id, j.pool_key, j.runs_on, ",
+                        ts!("$3"),
+                        " FROM jobs j WHERE j.run_id = $1::text::uuid AND j.job_id = $2 \
+                         ON CONFLICT (run_id, job_id) DO UPDATE SET \
+                         requested_at = EXCLUDED.requested_at"
+                    ),
+                    &[&run_id, &job_id.0, &now],
+                )
+                .await
+                .map_err(db)?;
+                released_count += 1;
+            }
+        }
+        self.released_bindings
+            .fetch_add(released_count as u64, std::sync::atomic::Ordering::Relaxed);
+        // Oldest pool-pending job this runner can serve (pending-mark order,
+        // ties by queue position).
         let pending = tx
             .query(
                 "SELECT p.run_id::text, p.job_id, j.runs_on::text, j.runner_group \
                  FROM provision_requests p JOIN jobs j \
                  ON j.run_id=p.run_id AND j.job_id=p.job_id \
-                 WHERE j.queue_state='ready' ORDER BY p.requested_at LIMIT 64",
+                 WHERE j.queue_state='ready' \
+                 ORDER BY p.requested_at, j.priority DESC, j.run_order, j.job_order LIMIT 64",
                 &[],
             )
             .await
@@ -450,10 +497,22 @@ impl PgBackend {
                 )
                 .await
                 .map_err(db)?;
+                // Upsert: `sweep_stale_bindings` releases a binding by
+                // clearing `runner_id` and keeps the row, and the trait doc
+                // rebinds any existing assignment (`first_at` kept).
                 tx.execute(
-                    "INSERT INTO job_assignments (run_id, job_id, runner_id) \
-                     VALUES ($1::text::uuid,$2,$3)",
-                    &[&run_id.0.to_string(), &job_id.0, &runner_id],
+                    concat!(
+                        "INSERT INTO job_assignments (run_id, job_id, runner_id, \
+                         assigned_at, first_assigned_at) \
+                         VALUES ($1::text::uuid, $2, $3, ",
+                        ts!("$4"),
+                        ", ",
+                        ts!("$4"),
+                        ") \
+                         ON CONFLICT (run_id, job_id) DO UPDATE SET \
+                         runner_id = EXCLUDED.runner_id, assigned_at = EXCLUDED.assigned_at"
+                    ),
+                    &[&run_id.0.to_string(), &job_id.0, &runner_id, &now],
                 )
                 .await
                 .map_err(db)?;
