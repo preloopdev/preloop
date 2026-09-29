@@ -43,6 +43,11 @@ pub(crate) struct FillOutcome {
 ///
 /// `names` is the caller-scope name set; `run_names` is the submission's
 /// run-tier name set (non-secret, recorded for every job of the run).
+///
+/// A reusable callee never carries the caller's name set: it receives only
+/// the secrets its call mapped (`secrets: {...}`) or, with `secrets: inherit`,
+/// every caller secret — the same rule
+/// `preloop_gha_parser::job_builder` applies when it builds the message.
 pub(crate) fn secret_spec_for(
     job: &JobPlan,
     names: &BTreeSet<String>,
@@ -50,7 +55,7 @@ pub(crate) fn secret_spec_for(
 ) -> MessageSecretSpec {
     let callee = job.workflow_file.is_some();
     MessageSecretSpec {
-        names: names.clone(),
+        names: if callee { BTreeSet::new() } else { names.clone() },
         environment: job.oidc_environment.clone(),
         inherit: callee && job.secrets_inherit,
         map: if callee && !job.secrets_inherit {
@@ -169,10 +174,11 @@ pub(crate) fn fill_template(
     }
     if !spec.map.is_empty() {
         // Caller-side `secrets:` mapping: expressions resolve against the
-        // caller's context — secrets (real values — this is the sanctioned
-        // resolution point, `build_context` masks everywhere else), plus
-        // github/inputs/vars/matrix/strategy pulled back out of the stored
-        // `context_data` so `${{ vars.X }}`-style maps keep working.
+        // caller's context — the full caller scope (not `resolved`, which is
+        // empty for a callee), plus github/inputs/vars/matrix/strategy pulled
+        // back out of the stored `context_data` so `${{ vars.X }}`-style maps
+        // keep working. This is the sanctioned resolution point;
+        // `build_context` masks everywhere else.
         let mut ctx = preloop_gha_expressions::Context::new();
         for (key, value) in &msg.context_data {
             ctx.insert(key.clone(), value.to_json());
@@ -180,7 +186,7 @@ pub(crate) fn fill_template(
         ctx.insert(
             "secrets",
             serde_json::Value::Object(
-                resolved
+                scoped
                     .iter()
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect(),

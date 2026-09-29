@@ -16003,6 +16003,79 @@ async fn archived_run_keeps_run_tier_secrets_for_rerun() {
     assert_eq!(var["isSecret"].as_bool(), Some(true));
 }
 
+/// A reusable-workflow callee that declares no `secrets:` receives none of
+/// the caller's secrets — only `secrets: inherit` or an explicit map does.
+#[tokio::test]
+async fn reusable_callee_without_secrets_receives_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.secrets.write().repo.insert(
+        "owner/repo".to_owned(),
+        std::collections::BTreeMap::from([("OTHER".to_owned(), "leak".to_owned())]),
+    );
+    let app = app(state.clone(), CancellationToken::new());
+
+    let callee_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo inner\n";
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+
+    let acquired = acquire_queued_job(&app, "callee-no-secrets").await;
+    let variables = acquired["variables"].as_object().unwrap();
+    assert!(
+        !variables.contains_key("OTHER"),
+        "a callee without `secrets:` must not receive caller secrets: {variables:?}"
+    );
+}
+
+/// A reusable-call `secrets: {T: ${{ secrets.X }}}` mapping resolves against
+/// the caller scope and delivers only the mapped name.
+#[tokio::test]
+async fn reusable_callee_secrets_map_resolves_against_caller_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state.secrets.write().repo.insert(
+        "owner/repo".to_owned(),
+        std::collections::BTreeMap::from([("OTHER".to_owned(), "leak".to_owned())]),
+    );
+    let app = app(state.clone(), CancellationToken::new());
+
+    let callee_yaml = "on: workflow_call\njobs:\n  inner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo inner\n";
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n    secrets:\n      T: ${{ secrets.OTHER }}\n",
+            "event": "push",
+            "repository": "owner/repo",
+            "reusable_workflows": {".github/workflows/callee.yml": callee_yaml},
+        }),
+    )
+    .await;
+
+    let acquired = acquire_queued_job(&app, "callee-mapped").await;
+    let variables = acquired["variables"].as_object().unwrap();
+    assert_eq!(
+        variables.get("T").and_then(|var| var["value"].as_str()),
+        Some("leak"),
+        "the mapped name resolves against the caller scope: {variables:?}"
+    );
+    assert!(
+        !variables.contains_key("OTHER"),
+        "only the mapped name may reach the callee: {variables:?}"
+    );
+}
+
 /// Extract the queued job message for a run, wherever it currently sits.
 fn queued_message_for(
     tx: &crate::control::testview::TestState,
