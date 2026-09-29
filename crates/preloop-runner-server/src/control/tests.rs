@@ -414,6 +414,15 @@ fn poll_unverified(session_id: &str) -> PollRequest {
     }
 }
 
+/// A job-level `concurrency:` declaration.
+fn job_concurrency(group: &str) -> preloop_gha_parser::Concurrency {
+    preloop_gha_parser::Concurrency {
+        group: group.to_owned(),
+        cancel_in_progress: Some("false".to_owned()),
+        queue: preloop_gha_parser::ConcurrencyQueue::Single,
+    }
+}
+
 fn workflow_concurrency(group: &str, cancel_in_progress: bool) -> WorkflowConcurrency {
     WorkflowConcurrency {
         group: group.to_owned(),
@@ -1722,6 +1731,235 @@ pub(crate) mod suite {
                 .iter()
                 .any(|record| record.id == uuid::Uuid::from_u128(late)),
             "a later GET returns the stored patch"
+        );
+    }
+
+    /// A run's workflow-level concurrency hold is released by the completion
+    /// that makes the run terminal (not only by a cancellation): the group
+    /// stops naming the finished run, a later arrival acquires it, and the
+    /// waiter parked behind the finished run is promoted.
+    pub(crate) async fn workflow_concurrency_releases_when_the_run_finishes(
+        backend: &dyn ControlBackend,
+    ) {
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let session_id = session.session_id.clone();
+        let runner_id = runner.runner.id;
+
+        // A run finishing with no waiter must free its group outright.
+        let run_a = RunId::new();
+        let mut submit_a = submit_run(run_a, vec![submit_job(run_a, "deploy", 1)]);
+        submit_a.workflow_concurrency = Some(workflow_concurrency("release", false));
+        assert!(!backend.submit_run(submit_a).await.unwrap().held);
+        let claimed = match backend
+            .poll_session(poll(&session_id, runner_id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim for run A, got {other:?}"),
+        };
+        assert_eq!(claimed.queued.run_id, run_a);
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: run_a,
+                job_id: JobId("deploy".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_id),
+            })
+            .await
+            .unwrap();
+        let record_a = backend.run_record(run_a).await.unwrap();
+        assert!(
+            record_a.status.is_terminal(),
+            "run A must be terminal, got {:?}",
+            record_a.status
+        );
+        let inputs = backend
+            .status_inputs(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(
+            inputs.concurrency_groups_active, 0,
+            "a finished run must not keep its workflow hold"
+        );
+
+        // The group is usable again: a fresh arrival takes it.
+        let run_b = RunId::new();
+        let mut submit_b = submit_run(run_b, vec![submit_job(run_b, "deploy", 2)]);
+        submit_b.workflow_concurrency = Some(workflow_concurrency("release", false));
+        assert!(
+            !backend.submit_run(submit_b).await.unwrap().held,
+            "a later run must acquire the released group"
+        );
+
+        // A waiter parked behind the finished run is promoted in the same
+        // command that releases the hold.
+        let run_c = RunId::new();
+        let mut submit_c = submit_run(run_c, vec![submit_job(run_c, "deploy", 3)]);
+        submit_c.workflow_concurrency = Some(workflow_concurrency("release", false));
+        assert!(backend.submit_run(submit_c).await.unwrap().held);
+        let claimed = match backend
+            .poll_session(poll(&session_id, runner_id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim for run B, got {other:?}"),
+        };
+        assert_eq!(claimed.queued.run_id, run_b);
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: run_b,
+                job_id: JobId("deploy".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_id),
+            })
+            .await
+            .unwrap();
+        let state_c = backend
+            .job_queue_state(run_c, &JobId("deploy".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(
+            state_c.as_ref().map(|(queue_state, _)| queue_state.as_str()),
+            Some("ready"),
+            "the parked waiter must be promoted, got {state_c:?}"
+        );
+    }
+
+    /// A workflow-gate release must re-evaluate each held job through the
+    /// normal promotion path (needs, job-level gates, max-parallel) instead of
+    /// enqueueing every parked job: a `deploy` job whose `needs: [build]` is
+    /// still pending must stay blocked until `build` settles.
+    pub(crate) async fn workflow_gate_release_respects_needs(backend: &dyn ControlBackend) {
+        let run_a = RunId::new();
+        let mut submit_a = submit_run(run_a, vec![submit_job(run_a, "hold", 1)]);
+        submit_a.workflow_concurrency = Some(workflow_concurrency("g", false));
+        assert!(!backend.submit_run(submit_a).await.unwrap().held);
+
+        let run_b = RunId::new();
+        let build = submit_job(run_b, "build", 2);
+        // Admission order is job-id sorted, so `deploy` is evaluated after
+        // `build` in the release sweep.
+        let mut deploy = submit_job(run_b, "deploy", 3);
+        deploy.queued.needs = vec![JobId("build".to_owned())];
+        let mut submit_b = submit_run(run_b, vec![build, deploy]);
+        submit_b.workflow_concurrency = Some(workflow_concurrency("g", false));
+        assert!(backend.submit_run(submit_b).await.unwrap().held);
+
+        // Freeing the gate (cancelling the holder) promotes run B.
+        backend.cancel_run(run_a, None).await.unwrap();
+
+        let build_state = backend
+            .job_queue_state(run_b, &JobId("build".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(
+            build_state
+                .as_ref()
+                .map(|(queue_state, _)| queue_state.as_str()),
+            Some("ready"),
+            "the gate-free job must be promoted, got {build_state:?}"
+        );
+        let deploy_state = backend
+            .job_queue_state(run_b, &JobId("deploy".to_owned()))
+            .await
+            .unwrap();
+        assert_ne!(
+            deploy_state
+                .as_ref()
+                .map(|(queue_state, _)| queue_state.as_str()),
+            Some("ready"),
+            "a needs-blocked job must not be enqueued by the gate release, got {deploy_state:?}"
+        );
+    }
+
+    /// A reusable-caller JobSet gate is keyed by the run's namespace, like
+    /// every other concurrency key: two tenants that happen to share a group
+    /// name must not serialize against each other.
+    pub(crate) async fn jobset_gate_is_scoped_to_run_namespace(backend: &dyn ControlBackend) {
+        let caller = |run_id: RunId, request_id: i64| {
+            let call = preloop_gha_protocol::ReusableCallPlan {
+                uses: "owner/repo/.github/workflows/inner.yml@refs/heads/main".to_owned(),
+                workflow_file: "inner.yml".to_owned(),
+                workflow_sha: None,
+                workflow_repository: None,
+                depth: 1,
+            };
+            // The caller placeholder node: `record.caller_plans` supplies its
+            // deferred plan and `record.reusable_calls` its gate metadata.
+            let plan: preloop_gha_protocol::JobPlan = serde_json::from_value(serde_json::json!({
+                "id": "caller",
+                "base_id": "caller",
+                "name": "caller",
+                "runs_on": ["self-hosted"],
+                "reusable_call": call,
+            }))
+            .unwrap();
+            let meta = preloop_gha_parser::ReusableCallMetadata {
+                caller_job_id: "caller".to_owned(),
+                output_definitions: BTreeMap::new(),
+                inner_job_ids: Vec::new(),
+                inputs: BTreeMap::new(),
+                caller_concurrency: Some(job_concurrency("tenant-gate")),
+                embedded_concurrency: None,
+                matrix: BTreeMap::new(),
+                if_condition: None,
+                workflow_sha: None,
+                workflow_repository: None,
+            };
+            let mut job = submit_job(run_id, "caller", request_id);
+            job.queued.reusable_call = Some(call);
+            (job, plan, meta)
+        };
+
+        let run_a = RunId::new();
+        let (job_a, plan_a, meta_a) = caller(run_a, 1);
+        let mut submit_a = submit_run(run_a, vec![job_a]);
+        submit_a.namespace = "tenant-a".to_owned();
+        submit_a
+            .record
+            .caller_plans
+            .insert(JobId("caller".to_owned()), plan_a);
+        submit_a
+            .record
+            .reusable_calls
+            .insert("caller".to_owned(), meta_a);
+        backend.submit_run(submit_a).await.unwrap();
+
+        let run_b = RunId::new();
+        let (job_b, plan_b, meta_b) = caller(run_b, 2);
+        let mut submit_b = submit_run(run_b, vec![job_b]);
+        submit_b.namespace = "tenant-b".to_owned();
+        submit_b
+            .record
+            .caller_plans
+            .insert(JobId("caller".to_owned()), plan_b);
+        submit_b
+            .record
+            .reusable_calls
+            .insert("caller".to_owned(), meta_b);
+        backend.submit_run(submit_b).await.unwrap();
+
+        let state_b = backend
+            .job_queue_state(run_b, &JobId("caller".to_owned()))
+            .await
+            .unwrap();
+        assert_ne!(
+            state_b.as_ref().map(|(queue_state, _)| queue_state.as_str()),
+            Some("held"),
+            "a jobset gate in another namespace must not hold this run back, got {state_b:?}"
         );
     }
 
@@ -3240,6 +3478,24 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn workflow_concurrency_releases_when_the_run_finishes() {
+        let (_pg, backend) = backend().await;
+        suite::workflow_concurrency_releases_when_the_run_finishes(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn workflow_gate_release_respects_needs() {
+        let (_pg, backend) = backend().await;
+        suite::workflow_gate_release_respects_needs(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn jobset_gate_is_scoped_to_run_namespace() {
+        let (_pg, backend) = backend().await;
+        suite::jobset_gate_is_scoped_to_run_namespace(&backend).await;
+    }
+
+    #[tokio::test]
     async fn run_record_round_trips_through_tables() {
         let (_pg, backend) = backend().await;
         suite::run_record_round_trips_through_tables(&backend).await;
@@ -3901,6 +4157,22 @@ mod lite {
     async fn timeline_patch_is_bounded_and_keeps_the_patch() {
         suite::timeline_patch_is_bounded_and_keeps_the_patch(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn workflow_concurrency_releases_when_the_run_finishes() {
+        suite::workflow_concurrency_releases_when_the_run_finishes(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn workflow_gate_release_respects_needs() {
+        suite::workflow_gate_release_respects_needs(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn jobset_gate_is_scoped_to_run_namespace() {
+        suite::jobset_gate_is_scoped_to_run_namespace(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

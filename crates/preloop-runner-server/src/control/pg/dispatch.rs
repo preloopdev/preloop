@@ -2790,6 +2790,10 @@ impl<'a> Sweep<'a> {
             .get(&run_id)
             .is_some_and(|graph| graph.record.status.is_terminal());
         if now_completed && !was_completed {
+            // A terminal run must not hold a workflow-level slot: release the
+            // group and promote its next waiter (lite's `settle_node` does the
+            // same after `release_concurrency_for_job`).
+            release_concurrency_for_run(self.backend, self.tx, run_id).await?;
             let conclusion = self
                 .graphs
                 .get(&run_id)
