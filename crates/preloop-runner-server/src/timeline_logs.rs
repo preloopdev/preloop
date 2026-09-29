@@ -1161,8 +1161,8 @@ mod tests {
             }),
         )
         .await;
+        let response = response.expect("timeline read");
         let records = response
-            .expect("timeline read")
             .0
             .get("records")
             .and_then(|v| v.as_array())
