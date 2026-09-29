@@ -423,15 +423,6 @@ fn job_concurrency(group: &str, cancel_in_progress: bool) -> preloop_gha_parser:
     }
 }
 
-/// A job-level `concurrency:` declaration.
-fn job_concurrency(group: &str) -> preloop_gha_parser::Concurrency {
-    preloop_gha_parser::Concurrency {
-        group: group.to_owned(),
-        cancel_in_progress: Some("false".to_owned()),
-        queue: preloop_gha_parser::ConcurrencyQueue::Single,
-    }
-}
-
 fn workflow_concurrency(group: &str, cancel_in_progress: bool) -> WorkflowConcurrency {
     WorkflowConcurrency {
         group: group.to_owned(),
@@ -1967,7 +1958,7 @@ pub(crate) mod suite {
                 output_definitions: BTreeMap::new(),
                 inner_job_ids: Vec::new(),
                 inputs: BTreeMap::new(),
-                caller_concurrency: Some(job_concurrency("tenant-gate")),
+                caller_concurrency: Some(job_concurrency("tenant-gate", false)),
                 embedded_concurrency: None,
                 matrix: BTreeMap::new(),
                 if_condition: None,
@@ -3596,31 +3587,41 @@ mod pg {
 
     #[tokio::test]
     async fn matrix_fail_fast_settles_dependent_and_run() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::matrix_fail_fast_settles_dependent_and_run(&backend).await;
     }
 
     #[tokio::test]
     async fn cancelled_run_discards_in_flight_expansion() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::cancelled_run_discards_in_flight_expansion(&backend).await;
     }
 
     #[tokio::test]
     async fn cancel_of_terminal_run_preserves_conclusion() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::cancel_of_terminal_run_preserves_conclusion(&backend).await;
     }
 
     #[tokio::test]
     async fn starved_run_keeps_workflow_hold() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::starved_run_keeps_workflow_hold(&backend).await;
     }
 
     #[tokio::test]
     async fn redelivered_cancellation_keeps_its_body() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::redelivered_cancellation_keeps_its_body(&backend).await;
     }
 
@@ -3642,19 +3643,25 @@ mod pg {
 
     #[tokio::test]
     async fn workflow_concurrency_releases_when_the_run_finishes() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::workflow_concurrency_releases_when_the_run_finishes(&backend).await;
     }
 
     #[tokio::test]
     async fn workflow_gate_release_respects_needs() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::workflow_gate_release_respects_needs(&backend).await;
     }
 
     #[tokio::test]
     async fn jobset_gate_is_scoped_to_run_namespace() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::jobset_gate_is_scoped_to_run_namespace(&backend).await;
     }
 
@@ -3694,13 +3701,17 @@ mod pg {
 
     #[tokio::test]
     async fn list_runs_filters_on_the_projected_status() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::list_runs_filters_on_the_projected_status(&backend).await;
     }
 
     #[tokio::test]
     async fn timeline_patch_is_bounded_and_keeps_the_patch() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::timeline_patch_is_bounded_and_keeps_the_patch(&backend).await;
     }
 
@@ -3762,84 +3773,110 @@ mod pg {
 
     #[tokio::test]
     async fn strict_assignments_refuse_an_unassigned_job() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         backend.set_config(false, true, std::time::Duration::from_secs(300));
         suite::strict_assignments_refuse_an_unassigned_job(&backend).await;
     }
 
     #[tokio::test]
     async fn fresh_pool_pending_blocks_claim() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::fresh_pool_pending_blocks_claim(&backend).await;
     }
 
     #[tokio::test]
     async fn fresh_assignment_is_exclusive_to_its_runner() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::fresh_assignment_is_exclusive_to_its_runner(&backend).await;
     }
 
     #[tokio::test]
     async fn claim_scan_finds_a_matching_job_past_the_window() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::claim_scan_finds_a_matching_job_past_the_window(&backend).await;
     }
 
     #[tokio::test]
     async fn settle_drops_the_deferred_token_request() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::settle_drops_the_deferred_token_request(&backend).await;
     }
 
     #[tokio::test]
     async fn settle_refuses_an_unowned_attempt() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::settle_refuses_an_unowned_attempt(&backend).await;
     }
 
     #[tokio::test]
     async fn completion_applies_the_reported_step_number() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::completion_applies_the_reported_step_number(&backend).await;
     }
 
     #[tokio::test]
     async fn settle_refreshes_the_attempt_lease() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::settle_refreshes_the_attempt_lease(&backend).await;
     }
 
     #[tokio::test]
     async fn reusable_caller_outputs_survive_a_reload() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::reusable_caller_outputs_survive_a_reload(&backend).await;
     }
 
     /// Pool assignments on: the pairing path only runs in that mode.
     #[tokio::test]
     async fn pairing_marks_runner_pool_proven() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         backend.set_config(true, false, std::time::Duration::from_secs(300));
         suite::pairing_marks_runner_pool_proven(&backend).await;
     }
 
     #[tokio::test]
     async fn timeout_then_lease_expiry_settles_attempt() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::timeout_then_lease_expiry_settles_attempt(&backend).await;
     }
 
     #[tokio::test]
     async fn job_queue_state_speaks_queue_kind() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::job_queue_state_speaks_queue_kind(&backend).await;
     }
 
     #[tokio::test]
     async fn callback_prefers_timeline_match() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::callback_prefers_timeline_match(&backend).await;
     }
 
@@ -3853,7 +3890,9 @@ mod pg {
 
     #[tokio::test]
     async fn baseline_mask_hints_survive_template_storage() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::baseline_mask_hints_survive_template_storage(&backend).await;
     }
 
@@ -3993,25 +4032,33 @@ mod pg {
 
     #[tokio::test]
     async fn workflow_held_run_is_not_queued() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::workflow_held_run_is_not_queued(&backend).await;
     }
 
     #[tokio::test]
     async fn status_assignments_require_a_live_session() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::status_assignments_require_a_live_session(&backend).await;
     }
 
     #[tokio::test]
     async fn claim_uses_the_pairing_label_matcher() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::claim_uses_the_pairing_label_matcher(&backend).await;
     }
 
     #[tokio::test]
     async fn swept_binding_is_reported() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         let db = &backend;
         suite::swept_binding_is_reported(
             &backend,

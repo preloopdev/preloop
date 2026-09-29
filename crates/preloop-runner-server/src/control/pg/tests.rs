@@ -508,7 +508,9 @@ async fn concurrent_polls_claim_once() {
 /// 500 on `runs_delivery`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_delivery_redelivery_returns_one_run() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let first = RunId::new();
     let mut submit_a = submit_run(first, vec![submit_job(first, "build", 1)]);
     submit_a.record.webhook_delivery_id = Some("delivery-race".to_owned());
@@ -537,7 +539,9 @@ async fn concurrent_delivery_redelivery_returns_one_run() {
 /// commit publishes the `Wake` hint on the shared LISTEN channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commits_wake_waiters_on_another_node() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let mut wakes = node_b.subscribe_wakes();
     // The LISTEN connection registers asynchronously with `connect`; retry a
     // bounded number of commits so a lost race on that registration cannot
@@ -822,12 +826,12 @@ async fn create_log_allocates_per_plan_across_nodes() {
 // binding, or a raw timestamp write) ─────────────────────────────────────
 
 /// Pool assignments on. `pair_runner` runs only in that mode.
-async fn pool_backend() -> (DisposablePg, PgBackend) {
-    let (guard, url) = fresh_database().await;
+async fn pool_backend() -> Option<(DisposablePg, PgBackend)> {
+    let (guard, url) = fresh_database_opt().await?;
     let backend = PgBackend::connect(&url, true, false, std::time::Duration::from_secs(300))
         .await
         .expect("test database connection failed");
-    (guard, backend)
+    Some((guard, backend))
 }
 
 /// The runner id the working set shows bound to `(run, job)`.
@@ -848,7 +852,9 @@ async fn assigned_runner(node: &PgBackend, run_id: RunId, job_id: &JobId) -> Opt
 /// strands the job outside provisioning.
 #[tokio::test]
 async fn pair_runner_rebinds_swept_binding() {
-    let (_pg, node) = pool_backend().await;
+    let Some((_pg, node)) = pool_backend().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let job = JobId("build".to_owned());
     let first = node.register_runner(register_runner("r1")).await.unwrap();
@@ -905,7 +911,9 @@ async fn pair_runner_rebinds_swept_binding() {
 /// unpairable by provisioning.
 #[tokio::test]
 async fn purge_returns_ready_assignment_to_pool() {
-    let (_pg, node) = pool_backend().await;
+    let Some((_pg, node)) = pool_backend().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let job = JobId("build".to_owned());
     let first = node.register_runner(register_runner("r1")).await.unwrap();
@@ -942,7 +950,9 @@ async fn purge_returns_ready_assignment_to_pool() {
 async fn timeline_reply_is_coherent_under_concurrent_patches() {
     const PATCHES: usize = 120;
     const GETS: usize = 200;
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
     let key = format!("{}/{}", request.plan_id, request.timeline_id);
@@ -994,7 +1004,9 @@ async fn timeline_reply_is_coherent_under_concurrent_patches() {
 /// with the run).
 #[tokio::test]
 async fn run_step_manifests_survive_archival() {
-    let (_pg, node, _other) = backend_pair().await;
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, runner_id) = submit_and_claim(&node, run_id).await;
     let agent = request.agent_job_id;
@@ -1055,7 +1067,9 @@ async fn run_step_manifests_survive_archival() {
 /// mis-names it when the point reads only consult the live tables.
 #[tokio::test]
 async fn job_point_reads_fall_back_to_archived_rows() {
-    let (_pg, node, _other) = backend_pair().await;
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, runner_id) = submit_and_claim(&node, run_id).await;
     let job = JobId("build".to_owned());
@@ -1113,7 +1127,9 @@ async fn job_point_reads_fall_back_to_archived_rows() {
 /// codec (`us_to_utc`), instead of silently claiming 1970.
 #[tokio::test]
 async fn out_of_range_step_timestamp_reads_as_absent() {
-    let (_pg, node, _other) = backend_pair().await;
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run_id = RunId::new();
     let (request, _runner_id) = submit_and_claim(&node, run_id).await;
     let agent = request.agent_job_id;
@@ -1165,7 +1181,9 @@ fn gate(group: &str) -> preloop_gha_parser::Concurrency {
 /// group naming a terminal job, so the group was wedged behind a ghost holder.
 #[tokio::test]
 async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
-    let (_pg, node, _other) = backend_pair().await;
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let run = RunId::new();
     // Cohort `m` (max-parallel 2): `a` holds gate `g1`, `aw` waits behind it,
     // `bb` takes the free `g2`; `t1`/`t2` only drive promotion sweeps.
@@ -1266,7 +1284,9 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
 /// snapshot.
 #[tokio::test]
 async fn promotion_takes_the_promoted_runs_row_lock_first() {
-    let (_pg, node_a, node_b) = backend_pair().await;
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
     let wf = |group: &str| crate::control::types::WorkflowConcurrency {
         group: group.to_owned(),
         cancel_in_progress: false,

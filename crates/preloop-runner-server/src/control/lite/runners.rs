@@ -33,7 +33,7 @@ impl LiteBackend {
 
     /// Owned, session-bound, in-flight attempts per runner (status page).
     pub(crate) async fn live_assignments(&self) -> Result<Vec<RunnerAssignment>, ControlError> {
-        self.read(|tx| live_assignments_tx(tx))
+        self.read(live_assignments_tx)
     }
 }
 
