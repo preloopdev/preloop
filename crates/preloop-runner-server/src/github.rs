@@ -249,6 +249,11 @@ pub fn run_details_url(run_id: RunId) -> Option<String> {
 }
 
 /// Report a queued check run to GitHub or simulate it locally.
+///
+/// Also stamps `reports_check_runs` on the run: every intake path that
+/// reports checks (webhook, dispatch, push, rerun) funnels through here, so
+/// the flag is the persistent answer to "should jobs materialized later get
+/// check runs too".
 pub async fn report_check_run_queued(
     shared: &Arc<SharedState>,
     repo: &str,
@@ -256,12 +261,22 @@ pub async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) -> anyhow::Result<Option<u64>> {
-    let existing_check_run_id = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
+    let (existing_check_run_id, mint_lock) = {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.reports_check_runs = true;
+        }
+        (
+            inner
+                .runs
+                .get(&run_id)
+                .and_then(|run| run.job_check_run_ids.get(job_id).copied()),
+            inner
+                .check_run_mint_locks
+                .entry(run_id)
+                .or_default()
+                .clone(),
+        )
     };
     let token = resolve_check_run_token(shared, repo).await;
 
@@ -287,7 +302,98 @@ pub async fn report_check_run_queued(
         }
     }
 
-    let check_run_id = if let Some(token) = &token {
+    // Mint under the per-run lock and re-check the mapping inside it: two
+    // reporters (e.g. an expansion mint and a claim-time in-progress report)
+    // can both see "no mapping" and POST, and GitHub accepts duplicate check
+    // runs for the same name+SHA — the loser would strand a `queued` check.
+    let _guard = mint_lock.lock().await;
+    let existing = {
+        let inner = shared.state.inner.lock().await;
+        inner
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
+    };
+    if let Some(check_run_id) = existing {
+        return Ok(Some(check_run_id));
+    }
+    mint_check_run(shared, repo, sha, job_id, run_id, token.as_deref()).await
+}
+
+/// The repository + SHA check runs for this run attach to, when the run
+/// reports checks at all. `status_check_sha` wins so late-minted checks land
+/// on the same commit as intake-time checks (PR head vs. base/merge); a
+/// synced push run overrides with the published commit.
+fn check_run_report_coords(run: &crate::models::RunRecord) -> Option<(String, String)> {
+    if !run.reports_check_runs {
+        return None;
+    }
+    let sha = run
+        .push_state
+        .as_ref()
+        .and_then(|state| state.effective_sha.clone())
+        .or_else(|| run.submission.status_check_sha.clone())
+        .unwrap_or_else(|| run.submission.sha.clone());
+    Some((run.submission.repository.clone(), sha))
+}
+
+/// Return the job's check run id, minting a `queued` check when the job was
+/// materialized after intake reported (runtime-expanded matrix legs,
+/// reusable callee jobs). `None` when the run does not report checks or the
+/// mint fails — callers then behave as before this fix: skip the report.
+pub async fn ensure_check_run_mapped(
+    shared: &Arc<SharedState>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Option<u64> {
+    let (coords, mint_lock) = {
+        let mut inner = shared.state.inner.lock().await;
+        let run = inner.runs.get(&run_id)?;
+        if let Some(id) = run.job_check_run_ids.get(job_id).copied() {
+            return Some(id);
+        }
+        (
+            check_run_report_coords(run)?,
+            inner
+                .check_run_mint_locks
+                .entry(run_id)
+                .or_default()
+                .clone(),
+        )
+    };
+    let _guard = mint_lock.lock().await;
+    {
+        let inner = shared.state.inner.lock().await;
+        if let Some(id) = inner
+            .runs
+            .get(&run_id)
+            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
+        {
+            return Some(id);
+        }
+    }
+    let (repo, sha) = coords;
+    let token = resolve_check_run_token(shared, &repo).await;
+    match mint_check_run(shared, &repo, &sha, job_id, run_id, token.as_deref()).await {
+        Ok(id) => id,
+        Err(error) => {
+            warn!(%run_id, %job_id, ?error, "failed to mint check run for materialized job");
+            None
+        }
+    }
+}
+
+/// POST a `queued` check run (or mint a mock id when no token resolves) and
+/// record the job→check-run mapping. Caller holds the per-run mint lock.
+async fn mint_check_run(
+    shared: &Arc<SharedState>,
+    repo: &str,
+    sha: &str,
+    job_id: &JobId,
+    run_id: RunId,
+    token: Option<&str>,
+) -> anyhow::Result<Option<u64>> {
+    let check_run_id = if let Some(token) = token {
         let details_url = run_details_url(run_id);
 
         let job_name = {
@@ -514,14 +620,28 @@ pub async fn report_check_runs_for_run(
     reused_check_run: Option<(JobId, u64)>,
 ) {
     let (repository, sha, jobs) = {
-        let inner = shared.state.inner.lock().await;
-        let Some(run) = inner.runs.get(&run_id) else {
+        let mut inner = shared.state.inner.lock().await;
+        // The rerun reports checks even when every job is an expandable
+        // placeholder — those mint nothing here, but their materialized legs
+        // report later and need the flag.
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.reports_check_runs = true;
+        } else {
             return;
-        };
+        }
+        let run = inner.runs.get(&run_id).unwrap();
         (
             run.submission.repository.clone(),
             run.submission.sha.clone(),
-            run.jobs.keys().cloned().collect::<Vec<_>>(),
+            // Expandable nodes are placeholders: no check run. Materialized
+            // legs mint their own when the rerun re-expands them.
+            run.jobs
+                .keys()
+                .filter(|job_id| {
+                    !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
         )
     };
 
@@ -569,23 +689,25 @@ pub async fn report_check_run_in_progress(
     run_id: RunId,
     job_id: &JobId,
 ) {
-    let (repo, check_run_id, job_name) = {
+    let (repo, job_name) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
             Some(r) => r,
             None => return,
         };
         let repo = run.submission.repository.clone();
-        let check_run_id = match run.job_check_run_ids.get(job_id).copied() {
-            Some(id) => id,
-            None => return,
-        };
         let job_name = run
             .job_names
             .get(job_id)
             .cloned()
             .unwrap_or_else(|| job_id.0.clone());
-        (repo, check_run_id, job_name)
+        (repo, job_name)
+    };
+
+    // Jobs materialized after intake (runtime matrix fan-out, reusable callee
+    // jobs) have no check run yet; mint one instead of dropping the report.
+    let Some(check_run_id) = ensure_check_run_mapped(shared, run_id, job_id).await else {
+        return;
     };
 
     let token = resolve_check_run_token(shared, &repo).await;
@@ -686,7 +808,6 @@ fn check_summary(
     summary.push_str(&format!("\n\njob_id: `{}`", job_id.0));
     summary
 }
-
 /// Report check run status to completed on GitHub or simulate it locally.
 pub async fn report_check_run_completed(
     shared: &Arc<SharedState>,
@@ -694,17 +815,13 @@ pub async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    let (repo, check_run_id, job_name, steps, started_at, completed_at, annotations, global_issues) = {
+    let (repo, job_name, steps, started_at, completed_at, annotations, global_issues) = {
         let inner = shared.state.inner.lock().await;
         let run = match inner.runs.get(&run_id) {
             Some(run) => run,
             None => return,
         };
         let repo = run.submission.repository.clone();
-        let check_run_id = match run.job_check_run_ids.get(job_id).copied() {
-            Some(id) => id,
-            None => return,
-        };
         let projected = crate::runs::project_run(&inner, run.clone());
         let detail = projected
             .jobs_list
@@ -779,7 +896,6 @@ pub async fn report_check_run_completed(
         }
         (
             repo,
-            check_run_id,
             job_name,
             steps,
             started_at,
@@ -787,6 +903,14 @@ pub async fn report_check_run_completed(
             annotations,
             global_issues,
         )
+    };
+
+    // Jobs materialized after intake (runtime matrix fan-out, reusable callee
+    // jobs) have no check run yet; mint one instead of dropping the report.
+    // A cancelled expandable placeholder mints a `cancelled` check — GitHub
+    // has no delete API, so concluding it is better than leaving it queued.
+    let Some(check_run_id) = ensure_check_run_mapped(shared, run_id, job_id).await else {
+        return;
     };
 
     let conclusion = match status {
@@ -2680,6 +2804,10 @@ async fn process_delivery_payload_with_lease(
                 changed_paths: changed_paths.clone(),
                 changed_paths_known,
                 resolved_sha: Some(resolved_sha.clone()),
+                status_check_sha: effective
+                    .status_check_sha
+                    .clone()
+                    .or_else(|| Some(resolved_sha.clone())),
                 filter_branch,
                 dispatch_inputs,
                 dispatch_inputs_stringified,
@@ -2726,12 +2854,31 @@ async fn process_delivery_payload_with_lease(
                         .status_check_sha
                         .clone()
                         .unwrap_or_else(|| resolved_sha.clone());
+                    // Expandable nodes (deferred matrices, reusable callers)
+                    // are placeholders: GitHub never shows a check for them,
+                    // and materialized jobs mint their own when they enter
+                    // the run. Skipping them here also keeps a dissolved
+                    // placeholder from stranding a `queued` check.
                     let jobs = {
-                        let inner = shared.state.inner.lock().await;
-                        inner
-                            .runs
-                            .get(&run_id)
-                            .map(|r| r.jobs.keys().cloned().collect::<Vec<_>>())
+                        let mut inner = shared.state.inner.lock().await;
+                        // Stamped even when every job is expandable — the
+                        // filtered list may be empty, so nothing downstream
+                        // ever calls report_check_run_queued, but legs still
+                        // materialize later and must report.
+                        if let Some(run) = inner.runs.get_mut(&run_id) {
+                            run.reports_check_runs = true;
+                        }
+                        inner.runs.get(&run_id).map(|r| {
+                            r.jobs
+                                .keys()
+                                .filter(|job_id| {
+                                    !crate::runtime_scheduling::is_expandable_node(
+                                        &inner, run_id, job_id,
+                                    )
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
                     };
                     if let Some(jobs) = jobs {
                         for job_id in jobs {
@@ -4336,5 +4483,176 @@ mod tests {
             2,
             "clean sender's rerequest must create a run"
         );
+    }
+
+    /// Seed one plain run, reported or not. `submit_run_inner` never mints
+    /// check-run ids itself — intake loops do — so this yields a run with an
+    /// empty `job_check_run_ids`, the shape a not-yet-materialized job has.
+    async fn mint_fixture(
+        reports_check_runs: bool,
+        status_check_sha: Option<&str>,
+    ) -> (tempfile::TempDir, std::sync::Arc<crate::SharedState>, RunId) {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+        let submission = WorkflowSubmission {
+            workflow_yaml:
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                    .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            status_check_sha: status_check_sha.map(str::to_owned),
+            resolved_sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
+            ..Default::default()
+        };
+        let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
+        {
+            let mut inner = shared.state.inner.lock().await;
+            inner
+                .runs
+                .get_mut(&accepted.run_id)
+                .unwrap()
+                .reports_check_runs = reports_check_runs;
+        }
+        (temp, shared, accepted.run_id)
+    }
+
+    #[tokio::test]
+    async fn materialized_job_mints_check_run_when_intake_reported() {
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+
+        // A leg materialized by a deferred matrix has a check run minted
+        // on demand — no GitHub token resolves in tests, so the mock id is
+        // fine; the assertion is that the mapping exists at all.
+        let leg = JobId("build (linux)".to_owned());
+        let id = ensure_check_run_mapped(&shared, run_id, &leg).await;
+        assert!(id.is_some(), "reported runs mint checks for late jobs");
+        let inner = shared.state.inner.lock().await;
+        assert!(
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .job_check_run_ids
+                .contains_key(&leg),
+            "the minted id must be recorded for lifecycle PATCHes"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialized_job_gets_no_check_run_when_intake_never_reported() {
+        let (_temp, shared, run_id) = mint_fixture(false, None).await;
+
+        let leg = JobId("build (linux)".to_owned());
+        assert_eq!(
+            ensure_check_run_mapped(&shared, run_id, &leg).await,
+            None,
+            "plain local runs mint no check runs, matching intake"
+        );
+        let inner = shared.state.inner.lock().await;
+        assert!(
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .job_check_run_ids
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_report_mints_missing_check_run_for_late_job() {
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let leg = JobId("build (linux)".to_owned());
+
+        // A matrix leg that skips at promotion never dispatches, so the only
+        // report it ever gets is the completion one — which must mint the
+        // check rather than drop the report.
+        report_check_run_completed(&shared, run_id, &leg, ExecutionStatus::Skipped).await;
+
+        let inner = shared.state.inner.lock().await;
+        assert!(
+            inner
+                .runs
+                .get(&run_id)
+                .unwrap()
+                .job_check_run_ids
+                .contains_key(&leg),
+            "a terminal report must mint the check it reports to"
+        );
+    }
+
+    #[test]
+    fn report_coords_prefer_status_check_sha() {
+        // Late mints must land on the same commit as intake checks: for PR
+        // runs the check sha is the head sha, not `submission.sha` (base).
+        let mut submission = WorkflowSubmission {
+            repository: "owner/repo".to_owned(),
+            sha: "base".to_owned(),
+            status_check_sha: Some("head".to_owned()),
+            ..Default::default()
+        };
+        let run = crate::models::RunRecord {
+            run_id: RunId::new(),
+            webhook_delivery_id: None,
+            run_name: None,
+            submission: std::sync::Arc::new(submission.clone()),
+            jobs: BTreeMap::new(),
+            status: ExecutionStatus::InProgress,
+            job_outputs: BTreeMap::new(),
+            job_base_ids: BTreeMap::new(),
+            job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
+            job_check_run_ids: BTreeMap::new(),
+            reports_check_runs: true,
+            reusable_calls: BTreeMap::new(),
+            jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            run_number: 1,
+            run_attempt: 1,
+            workflow_path_str: String::new(),
+            event: "pull_request".to_owned(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing: None,
+            fork_approval_pending: false,
+            fork_approval_requested_at_unix_nanos: None,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
+        };
+        assert_eq!(
+            check_run_report_coords(&run),
+            Some(("owner/repo".to_owned(), "head".to_owned()))
+        );
+        // A synced push overrides: checks must attach to the published
+        // commit, not the submission's local base sha.
+        let mut pushed = run.clone();
+        pushed.push_state = Some(crate::models::PushState {
+            status: crate::models::PushStatus::Synced,
+            error: None,
+            pr_number: None,
+            effective_sha: Some("published".to_owned()),
+        });
+        assert_eq!(
+            check_run_report_coords(&pushed),
+            Some(("owner/repo".to_owned(), "published".to_owned()))
+        );
+        // Unreported runs yield no coordinates.
+        submission.status_check_sha = None;
+        let mut quiet = run.clone();
+        quiet.submission = std::sync::Arc::new(submission);
+        quiet.reports_check_runs = false;
+        assert_eq!(check_run_report_coords(&quiet), None);
     }
 }

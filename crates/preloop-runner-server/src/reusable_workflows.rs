@@ -180,6 +180,7 @@ mod tests {
             job_fail_fast: BTreeMap::new(),
             job_continue_on_error: BTreeMap::new(),
             job_check_run_ids: BTreeMap::new(),
+            reports_check_runs: false,
             reusable_calls: BTreeMap::from([
                 (
                     "outer/call".to_owned(),
