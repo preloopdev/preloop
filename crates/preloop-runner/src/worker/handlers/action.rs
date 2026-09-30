@@ -94,16 +94,25 @@ pub(crate) async fn run_action_from_dir(
 ///
 /// The reference names the root of the repository the workflow runs from —
 /// the same tree the job checked out — so the action is already on disk when
-/// that checkout is this workspace. `None` when the reference has no subpath
-/// or the directory does not exist (the caller falls back to the staged
-/// remote copy, which is what the official runner uses).
+/// that checkout is this workspace. `None` when the reference has no subpath,
+/// escapes the workspace (`$/../..`, or a symlink resolving outside), or the
+/// directory does not exist; the caller then falls back to the staged remote
+/// copy, which is what the official runner uses.
 pub(crate) fn self_repository_local_dir(uses: &str, workspace: &str) -> Option<std::path::PathBuf> {
-    let subpath = uses.strip_prefix("$/")?.trim_start_matches('/');
-    if subpath.is_empty() {
+    let subpath = uses.strip_prefix("$/")?.trim_matches('/');
+    if subpath.is_empty()
+        || subpath
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return None;
     }
-    let dir = std::path::Path::new(workspace).join(subpath);
-    dir.is_dir().then_some(dir)
+    // Canonical containment: `..` segments are already rejected, but a
+    // symlink inside the workspace can still point outside it, and the
+    // manifest loader would happily read that action.yml.
+    let root = std::fs::canonicalize(workspace).ok()?;
+    let dir = std::fs::canonicalize(std::path::Path::new(workspace).join(subpath)).ok()?;
+    (dir.starts_with(&root) && dir.is_dir()).then_some(dir)
 }
 
 /// Resolve a remote action reference to a local directory.
@@ -717,7 +726,11 @@ mod tests {
 
         assert_eq!(
             self_repository_local_dir("$/.github/actions/setup-tox", &workspace).as_deref(),
-            Some(action.as_path()),
+            Some(
+                std::fs::canonicalize(&action)
+                    .expect("action dir canonicalizes")
+                    .as_path()
+            ),
             "a $/ reference resolves to the workspace-relative directory"
         );
         assert_eq!(
@@ -730,6 +743,38 @@ mod tests {
             None,
             "a missing directory falls back to remote resolution"
         );
+        assert_eq!(
+            self_repository_local_dir("$/../../etc", &workspace),
+            None,
+            "a $/ reference must not escape the workspace"
+        );
+        assert_eq!(
+            self_repository_local_dir("$/./.github/actions/setup-tox", &workspace),
+            None,
+            "dot segments are refused rather than normalized"
+        );
+        // A symlink inside the workspace that resolves outside it must not
+        // let the manifest loader read a foreign action.yml.
+        let outside = std::env::temp_dir().join(format!(
+            "preloop-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(outside.join("evil")).unwrap();
+        let link = root.join(".github/actions/escaped");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("evil"), &link).unwrap();
+            assert_eq!(
+                self_repository_local_dir("$/.github/actions/escaped", &workspace),
+                None,
+                "a symlink escaping the workspace is refused"
+            );
+        }
+        std::fs::remove_dir_all(&outside).ok();
         assert_eq!(
             self_repository_local_dir("./.github/actions/setup-tox", &workspace),
             None,
