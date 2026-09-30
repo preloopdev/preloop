@@ -182,6 +182,13 @@ fn create_reporting_context(
 }
 
 /// Execute a job from the deserialized message.
+///
+/// Sets up the workspace, prepares actions, runs steps, and reports completion
+/// using `via`. Container and service expression tokens are evaluated against
+/// the job context before workspace setup; evaluation errors propagate.
+/// Workspace setup, reporting-client creation, and completion-reporting errors
+/// also propagate. Action-preparation and step-execution failures are reported
+/// as job results, so `Ok(())` does not imply a successful job conclusion.
 pub async fn run_job(
     job_message: serde_json::Value,
     via: ProtocolPath,

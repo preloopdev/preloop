@@ -1577,6 +1577,9 @@ fn interactive_continue_conclusion(masking_failed: bool) -> &'static str {
 /// Execute a single step, threading cancel_rx to the process invoker.
 ///
 /// When a job container is active, script steps are routed through `docker exec`.
+/// Script expressions include the step's environment; a template error falls
+/// back to the original script. Relative working directories are resolved
+/// against `workspace`. Script and action handler errors propagate.
 async fn execute_step(
     step_type: &StepType,
     ctx: &mut StepContext<'_>,

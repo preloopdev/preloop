@@ -186,6 +186,16 @@ fn action_entry(
 }
 
 /// Run a Node.js action.
+///
+/// Uses a string `with.__preloop_entry`, otherwise selects the manifest's
+/// pre, post, or main entry from the step ID. A missing pre/post entry returns
+/// success without launching a process. Inputs and defaults use the calling
+/// step's environment; template errors fall back to the original input text.
+/// Runs inside the job container when present, otherwise on the host.
+///
+/// Returns errors for missing main entries or entry-point files, paths found
+/// outside the containment root, unsupported or unavailable runtimes, process
+/// invocation failures, and nonzero exit codes.
 pub async fn run_node_action(
     manifest: &ActionManifest,
     action_dir: &Path,

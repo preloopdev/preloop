@@ -58,6 +58,8 @@ fn actions_tarball_root_str(s: &str, separator: char) -> Option<String> {
 /// `if:`, `run:`, and nested-action `with:` values — against this context;
 /// without the nested results, an inner cache step keyed on
 /// `${{ steps.<id>.outputs.dir }}` resolves to an empty string.
+/// The calling step's environment overrides the job environment; `inputs`
+/// and `steps` replace the corresponding roots with composite-local values.
 fn composite_inner_context(
     ctx: &StepContext<'_>,
     input_env: &std::collections::HashMap<String, String>,
@@ -134,6 +136,18 @@ pub async fn run_composite_action(
     run_composite_action_inner(manifest, action_dir, with, workspace, ctx, 0, cancel_rx).await
 }
 
+/// Run nested steps and publish composite outputs, restoring the calling
+/// step's environment and GitHub action path/status before returning.
+///
+/// `depth` starts at zero; values of 10 or more are rejected. Inputs and
+/// defaults use the calling step's environment, retaining their original
+/// text when template evaluation returns an error. Job environment and PATH
+/// changes from file commands persist after the composite returns.
+///
+/// Returns errors for missing `runs.steps`, condition evaluation, file-command
+/// creation, and output-file writes. Inner-step errors propagate after eligible
+/// cleanup steps run unless `continue-on-error` is set. Failed output
+/// expressions are skipped.
 fn run_composite_action_inner<'a>(
     manifest: &'a ActionManifest,
     action_dir: &'a Path,

@@ -854,6 +854,12 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 ///
 /// Remote actions must be downloaded before this runs; `action_paths` maps the
 /// original `uses:` ref to the resolved manifest directory.
+/// Local actions skip pre steps. When `self_repository_enabled` is true,
+/// valid `$/` paths are also treated as local, with staged paths preferred
+/// over workspace paths. If their manifest cannot be loaded, a post step
+/// with condition `always()` is registered without an injected entry point
+/// for resolution at execution time. Other manifest-loading errors skip
+/// lifecycle registration for that action.
 pub fn build_step_list_with_lifecycle(
     main_steps: Vec<Step>,
     workspace: &str,

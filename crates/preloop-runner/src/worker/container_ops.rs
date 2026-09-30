@@ -137,6 +137,11 @@ fn decode_template_token(value: &serde_json::Value) -> serde_json::Value {
 /// `None`, and the job silently runs on the VM instead of the container —
 /// which is how `apk add` ended up executing on an Ubuntu host for curl's
 /// Alpine matrix legs.
+///
+/// Returns a copy with expression tokens replaced by their evaluated values;
+/// other objects and arrays are traversed, and scalar values are preserved.
+/// Returns an error containing the expression and its evaluation error if any
+/// token fails to evaluate.
 pub(crate) fn evaluate_expression_tokens(
     value: &serde_json::Value,
     ctx: &preloop_gha_expressions::Context,

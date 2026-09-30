@@ -28,6 +28,13 @@ pub async fn run_docker_action(
 }
 
 /// Run a docker action from a manifest (Dockerfile or image).
+///
+/// A `__post_` step without a string `with.__preloop_entry` returns success
+/// without running the container, after image preparation and environment
+/// evaluation. Those operations can still build an image or fail.
+/// Returns errors for a missing image, failed expressions in supplied inputs
+/// or `runs` fields, process invocation failures, or nonzero Docker build/run
+/// exit codes. Input-default template errors fall back to the default text.
 pub async fn run_docker_action_from_manifest(
     manifest: &ActionManifest,
     action_dir: &Path,

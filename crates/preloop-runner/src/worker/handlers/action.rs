@@ -11,6 +11,12 @@ use crate::worker::execution_context::StepContext;
 ///
 /// This function is recursive (composite actions can reference other actions),
 /// so it returns a boxed future to avoid infinite-size futures.
+///
+/// `$/` references require the `actions_self_repository` feature and prefer
+/// a staged action, then an existing directory contained in `workspace`, then
+/// remote-reference resolution. Updates the job's GitHub action context and
+/// leaves it set after execution. Feature-gate, resolution, manifest-loading,
+/// and action-handler errors propagate to the caller.
 pub fn run_action<'a>(
     uses: &'a str,
     with: &'a serde_json::Value,
@@ -131,6 +137,10 @@ pub(crate) fn feature_enabled(raw: Option<&str>) -> bool {
 /// The primary checkout populates the workspace *after* the step list is
 /// built, so lifecycle registration needs the path before the action exists;
 /// [`self_repository_local_dir`] additionally proves existence and containment.
+///
+/// Returns `None` unless `uses` starts with `$/` and has a nonempty subpath
+/// after trimming surrounding slashes. Empty interior segments and `.` or
+/// `..` segments are rejected. The returned path is not canonicalized.
 pub(crate) fn self_repository_local_path(
     uses: &str,
     workspace: &str,
@@ -152,8 +162,9 @@ pub(crate) fn self_repository_local_path(
 /// the same tree the job checked out — so the action is already on disk when
 /// that checkout is this workspace. `None` when the reference has no subpath,
 /// escapes the workspace (`$/../..`, or a symlink resolving outside), or the
-/// directory does not exist; the caller then falls back to the staged remote
-/// copy, which is what the official runner uses.
+/// directory does not exist. Also returns `None` for an invalid reference or
+/// if either path cannot be canonicalized. Returns the canonical directory
+/// on success; callers decide how to handle a failed lookup.
 pub(crate) fn self_repository_local_dir(uses: &str, workspace: &str) -> Option<std::path::PathBuf> {
     let dir = self_repository_local_path(uses, workspace)?;
     if !dir.is_dir() {
