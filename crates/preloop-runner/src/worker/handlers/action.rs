@@ -401,6 +401,42 @@ mod tests {
         assert_eq!(resolved, staged);
     }
 
+    /// A `$/` reference whose action is checked out in the workspace runs from
+    /// there — the path pytest's `uses: $/.github/actions/setup-tox` takes
+    /// (the official rewrite would download `<self repo>@<sha>`, which a
+    /// snapshot commit cannot serve).
+    #[tokio::test]
+    async fn self_repository_action_reference_runs_from_the_workspace() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let action_dir = workspace.path().join(".github/actions/setup-tox");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: setup-tox\nruns:\n  using: composite\n  steps:\n    - run: echo ran-from-workspace\n      shell: bash\n",
+        )
+        .unwrap();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j2".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let result = run_action(
+            "$/.github/actions/setup-tox",
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+        )
+        .await;
+        drop(cancel_tx);
+        result.expect("$/ self-repository reference must run from the workspace");
+    }
+
     #[test]
     fn validate_remote_action_reference_rejects_traversal() {
         assert!(validate_remote_action_reference("actions", "checkout", "v4", "").is_ok());
