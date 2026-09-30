@@ -31,6 +31,22 @@ pub fn run_action<'a>(
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
+        } else if uses.starts_with("$/") {
+            // `$/path` names the root of the repository the workflow runs
+            // from. The official runner rewrites it to `<self repo>@<sha>`
+            // and downloads it, which only works when that sha is fetchable;
+            // for a run whose checkout *is* this workspace (local snapshots,
+            // or any ref the forge cannot serve) the action is already on
+            // disk. Prefer the staged copy when preparation produced one, and
+            // fall back to the workspace path — the same tree, no download.
+            let action_dir = match ctx.job.action_paths.get(uses) {
+                Some(path) => std::path::PathBuf::from(path),
+                None => match self_repository_local_dir(uses, workspace) {
+                    Some(path) => path,
+                    None => resolve_remote_action(uses, workspace, ctx)?,
+                },
+            };
+            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
@@ -72,6 +88,22 @@ pub(crate) async fn run_action_from_dir(
             anyhow::bail!("Unsupported action type: {other}")
         }
     }
+}
+
+/// Resolve a `$/path` self-repository reference against the workspace.
+///
+/// The reference names the root of the repository the workflow runs from —
+/// the same tree the job checked out — so the action is already on disk when
+/// that checkout is this workspace. `None` when the reference has no subpath
+/// or the directory does not exist (the caller falls back to the staged
+/// remote copy, which is what the official runner uses).
+pub(crate) fn self_repository_local_dir(uses: &str, workspace: &str) -> Option<std::path::PathBuf> {
+    let subpath = uses.strip_prefix("$/")?.trim_start_matches('/');
+    if subpath.is_empty() {
+        return None;
+    }
+    let dir = std::path::Path::new(workspace).join(subpath);
+    dir.is_dir().then_some(dir)
 }
 
 /// Resolve a remote action reference to a local directory.
@@ -629,5 +661,45 @@ mod tests {
             Some("My Display Name".to_string()),
             "github.action must not be the display name"
         );
+    }
+
+    /// `$/path` names the repository root the workflow runs from; when the
+    /// run's checkout is the workspace, the action is already on disk.
+    #[test]
+    fn self_repository_references_resolve_inside_the_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "preloop-self-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let action = root.join(".github/actions/setup-tox");
+        std::fs::create_dir_all(&action).unwrap();
+        let workspace = root.to_string_lossy().to_string();
+
+        assert_eq!(
+            self_repository_local_dir("$/.github/actions/setup-tox", &workspace).as_deref(),
+            Some(action.as_path()),
+            "a $/ reference resolves to the workspace-relative directory"
+        );
+        assert_eq!(
+            self_repository_local_dir("$/", &workspace),
+            None,
+            "a bare $/ has no action path (the caller must resolve remotely)"
+        );
+        assert_eq!(
+            self_repository_local_dir("$/missing/action", &workspace),
+            None,
+            "a missing directory falls back to remote resolution"
+        );
+        assert_eq!(
+            self_repository_local_dir("./.github/actions/setup-tox", &workspace),
+            None,
+            "only $/ references are handled here; ./ and ../ stay caller-relative"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
