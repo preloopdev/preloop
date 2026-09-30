@@ -118,7 +118,7 @@ pub async fn live_logs_sse(
     live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
-/// M5: the protocol live-log read route must not let one job's runtime
+/// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. The caller's credential must identify
 /// the exact job being read; the system credential bypasses (first-party
 /// CLI/UI read through the separate native route).
@@ -344,7 +344,7 @@ pub async fn ws_live_logs(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, ApiError> {
-    // R1-8: bind the ingest target to the caller's identity. The generic
+    // Bind the ingest target to the caller's identity. The generic
     // protocol bearer admits any job's runtime credential, which would let one
     // job stream into another job's buffer — forging its live log, or wiping
     // its retained tail (reopening a feed clears the closed mark and history).

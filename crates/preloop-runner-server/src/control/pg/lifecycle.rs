@@ -14,7 +14,7 @@ use crate::control::types::{
 use crate::models::{RunRecord, RunnerCapabilities};
 use crate::runtime_scheduling;
 use preloop_gha_protocol::azdo;
-use preloop_gha_protocol::{JobId, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::collections::BTreeSet;
 
 /// `(repository, permissions, declared, untrusted)` of a stored token
@@ -580,12 +580,12 @@ impl PgBackend {
 
     /// `purge_runner` internals shared by the guards: capture owned claimed
     /// jobs, delete the runner (sessions cascade; requests' sessions clear),
-    /// then requeue each job.
+    /// then requeue each job. Returns the retired attempts' identities.
     async fn purge_runner_tx(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
         runner_id: i64,
-    ) -> Result<(), ControlError> {
+    ) -> Result<Vec<uuid::Uuid>, ControlError> {
         // Claimed jobs this runner owns: request owner, session owner, or
         // assignment binding.
         let requeue = tx
@@ -624,10 +624,11 @@ impl PgBackend {
         tx.execute("DELETE FROM job_leases WHERE runner_id=$1", &[&runner_id])
             .await
             .map_err(db)?;
+        let mut retired = Vec::new();
         for row in requeue {
             let run_id = codec::run_id(row.get(0))?;
             let job_id = JobId(row.get(1));
-            super::dispatch::requeue_claimed_tx(tx, run_id, &job_id).await?;
+            super::dispatch::requeue_claimed_tx(tx, run_id, &job_id, &mut retired).await?;
         }
         let now = now_us();
         for row in unclaimed {
@@ -654,23 +655,28 @@ impl PgBackend {
             .await
             .map_err(db)?;
         }
-        Ok(())
+        Ok(retired)
     }
 
-    /// `purge_runner` (engine credential): unconditional.
-    pub(super) async fn purge_runner(&self, runner_id: i64) -> Result<(), ControlError> {
+    /// `purge_runner` (engine credential): unconditional; returns the
+    /// retired attempts' identities.
+    pub(super) async fn purge_runner(
+        &self,
+        runner_id: i64,
+    ) -> Result<Vec<uuid::Uuid>, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
-        self.purge_runner_tx(&tx, runner_id).await?;
-        tx.commit().await.map_err(db)
+        let retired = self.purge_runner_tx(&tx, runner_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(retired)
     }
 
-    /// `purge_runner_guarded`.
+    /// `purge_runner_guarded`: `None` when the guard refused.
     pub(super) async fn purge_runner_guarded(
         &self,
         runner_id: i64,
         guard: PurgeGuard,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<Vec<uuid::Uuid>>, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         let exists = tx
@@ -704,11 +710,11 @@ impl PgBackend {
         };
         if !allowed {
             tx.commit().await.map_err(db)?;
-            return Ok(false);
+            return Ok(None);
         }
-        self.purge_runner_tx(&tx, runner_id).await?;
+        let retired = self.purge_runner_tx(&tx, runner_id).await?;
         tx.commit().await.map_err(db)?;
-        Ok(true)
+        Ok(Some(retired))
     }
 
     pub(super) async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError> {
@@ -1494,10 +1500,13 @@ impl PgBackend {
             .map_err(db)?;
         let mut recovered = 0usize;
         let mut failed = 0usize;
+        // A booting node has no live-log followers to close, so the retired
+        // identities are not reported.
+        let mut retired = Vec::new();
         for row in &orphaned {
             let run_id = codec::run_id(row.get::<_, String>(0).as_str())?;
             let job_id = JobId(row.get(1));
-            if super::dispatch::requeue_claimed_tx(&tx, run_id, &job_id).await? {
+            if super::dispatch::requeue_claimed_tx(&tx, run_id, &job_id, &mut retired).await? {
                 recovered += 1;
             } else {
                 failed += 1;
@@ -1570,7 +1579,7 @@ impl PgBackend {
         tx.commit().await.map_err(db)
     }
     /// `run_record`: the run's record — live rows when the run still exists,
-    /// the history tables when it was archived (decisions-4 Q10(a)).
+    /// the history tables when it was archived.
     ///
     /// Statements: the graph load; `SELECT job_id, status FROM jobs UNION ALL
     /// job_history`; on the archived path one `run_history` + one
@@ -1600,6 +1609,24 @@ impl PgBackend {
                         .or_insert_with(|| {
                             crate::control::types::status_parse(row.get::<_, String>(1).as_str())
                         });
+                }
+                // A run parked behind its workflow-level concurrency gate is
+                // stored `queued`; its `holder_kind = 'run'` wait row is what
+                // makes it Pending (lite's `run_record` and `list_runs`
+                // project it the same way).
+                if record.status == ExecutionStatus::Queued {
+                    let held: bool = tx
+                        .query_one(
+                            "SELECT EXISTS (SELECT 1 FROM concurrency_waits \
+                             WHERE holder_run_id = $1::text::uuid AND holder_kind = 'run')",
+                            &[&run],
+                        )
+                        .await
+                        .map_err(db)?
+                        .get(0);
+                    if held {
+                        record.status = ExecutionStatus::Pending;
+                    }
                 }
                 record
             }

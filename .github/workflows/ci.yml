@@ -246,7 +246,7 @@ jobs:
         run: |
           set -euo pipefail
           shard=${{ matrix.shard }}
-          crates="recovery runs_api logs registration broker security webhooks concurrency"
+          crates="recovery runs_api logs registration broker security webhooks concurrency execution_protection_api runner_deprecations"
           selected=""
           for c in $crates; do
             h=$(printf '%s' "$c" | md5sum | cut -c1-8)

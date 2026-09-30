@@ -1,4 +1,4 @@
-//!  reproductions for dynamic-matrix fidelity bugs.
+//! Reproductions for dynamic-matrix fidelity bugs.
 //!
 //! Each test encodes the behavior GitHub produces. A failure here is the bug.
 

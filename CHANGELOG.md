@@ -293,7 +293,7 @@ Releases before v0.27.0 predate the changelog.
 - #299 — Align string comparison and case-insensitivity with the official runner
 - #298 — Close remaining masking races
 - #297 — Sign blob tokens as JWTs, enforce owner liveness on bearer writes
-- #296 — r1_12 rematerialization test matches record/head split
+- #296 — rematerialization test matches record/head split
 - #283 — Remove aarch64 golden bake jobs
 - #282 — Bump guest disk template to 200G for golden pack
 - #280 — Bump guest storage to 200G for golden pack

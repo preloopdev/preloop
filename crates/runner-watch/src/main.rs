@@ -2210,7 +2210,7 @@ async fn replay_flows_to_preloop_inner(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // The server requires exp/iat/aud on client assertions (R1-9): exp
+        // The server requires exp/iat/aud on client assertions: exp
         // bounds the replay window, aud must name the token endpoint or the
         // server base URL.
         let token_endpoint = format!(

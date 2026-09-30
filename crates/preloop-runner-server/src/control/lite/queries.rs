@@ -1,6 +1,6 @@
 //! Read paths over runs and jobs, the check-run mapping, push state, and
 //! archival. Reads that served archived runs fall back to the `*_history`
-//! tables (decision round 4, Q10): an archived run has no `runs` row.
+//! tables: an archived run has no `runs` row.
 
 use super::codec::{self, now_us};
 use super::{LiteBackend, db};
@@ -9,10 +9,17 @@ use crate::models::{JobDetail, PushState, PushStatus};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use rusqlite::{OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
-type JobQueryRow = (String, String, Option<String>, Option<i64>, Option<String>);
+type JobQueryRow = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    bool,
+);
 
 /// Keep a run live while its push state may still dedup an echo webhook:
-/// GitHub keeps deliveries redeliverable for three days (round 4, Q10).
+/// GitHub keeps deliveries redeliverable for three days.
 const PUSH_ECHO_WINDOW_US: i64 = 3 * 24 * 60 * 60 * 1_000_000;
 
 /// Let late runner callbacks settle before a terminal run is archived.
@@ -249,8 +256,9 @@ impl LiteBackend {
 
     /// Check-run reporting inputs: repository + sha from the submission,
     /// run clocks, and per job (by job id) status, display name, check-run
-    /// id, annotations and the latest attempt's steps. Archived runs read
-    /// `run_history`/`job_history` (steps from `step_history`).
+    /// id, `placeholder`, annotations and the latest attempt's steps.
+    /// Archived runs read `run_history`/`job_history` (steps from
+    /// `step_history`).
     pub(crate) async fn run_dispatch_info(
         &self,
         run_id: RunId,
@@ -299,11 +307,16 @@ impl LiteBackend {
                 .and_then(|map| serde_json::from_value(map).ok())
                 .unwrap_or_default();
             let job_rows: Vec<JobQueryRow> = {
+                // `placeholder` marks the expandable nodes (`kind`) that never
+                // dispatch: intake loops skip them so no `queued` check run is
+                // minted for a node expansion replaces.
                 let sql = if archived {
-                    "SELECT job_id, status, display_name, check_run_id, annotations \
+                    "SELECT job_id, status, display_name, check_run_id, annotations, \
+                         (kind IN ('matrix_parent','reusable_caller')) \
                      FROM job_history WHERE run_id = ?1 ORDER BY job_id"
                 } else {
-                    "SELECT j.job_id, j.status, s.display_name, j.check_run_id, j.annotations \
+                    "SELECT j.job_id, j.status, s.display_name, j.check_run_id, j.annotations, \
+                         (j.kind IN ('matrix_parent','reusable_caller')) \
                      FROM jobs j LEFT JOIN job_specs s \
                        ON s.run_id = j.run_id AND s.job_id = j.job_id \
                      WHERE j.run_id = ?1 ORDER BY j.job_id"
@@ -317,6 +330,7 @@ impl LiteBackend {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     })
                     .map_err(db)?;
@@ -325,13 +339,20 @@ impl LiteBackend {
                 // them from `record_details` so reports can mint for them.
                 for (job_id, id) in &stored_ids {
                     if !rows.iter().any(|row| row.0 == *job_id) {
-                        rows.push((job_id.clone(), "pending".to_owned(), None, Some(*id), None));
+                        rows.push((
+                            job_id.clone(),
+                            "pending".to_owned(),
+                            None,
+                            Some(*id),
+                            None,
+                            false,
+                        ));
                     }
                 }
                 rows
             };
             let mut jobs = Vec::with_capacity(job_rows.len());
-            for (job, status, display_name, check_run_id, annotations) in job_rows {
+            for (job, status, display_name, check_run_id, annotations, placeholder) in job_rows {
                 let steps = if archived {
                     super::steps::archived_attempt_steps(tx, &run, &job)?
                 } else {
@@ -353,6 +374,7 @@ impl LiteBackend {
                     status,
                     display_name,
                     check_run_id: check_run_id.map(|id| id as u64),
+                    placeholder,
                     detail,
                     steps,
                 });
@@ -591,8 +613,8 @@ impl LiteBackend {
         })
     }
 
-    /// Queue pressure. Buckets from the queue-state combinations (round 4,
-    /// Q13): `pending` = blocked without a concurrency wait (needs or
+    /// Queue pressure. Buckets from the queue-state combinations:
+    /// `pending` = blocked without a concurrency wait (needs or
     /// max-parallel), `blocked` = blocked with a concurrency wait,
     /// `expanding` = expansion nodes not yet claimed.
     pub(crate) async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
@@ -637,8 +659,8 @@ impl LiteBackend {
         })
     }
 
-    /// The job's `(queue kind, status)` in the `QueueKind` vocabulary
-    /// (round 4, Q13 mapping); `None` when the job has no live row.
+    /// The job's `(queue kind, status)` in the `QueueKind` vocabulary;
+    /// `None` when the job has no live row.
     pub(crate) async fn job_queue_state(
         &self,
         run_id: RunId,
@@ -897,7 +919,7 @@ impl LiteBackend {
 
 /// `blocked` is dependencies/max-parallel (`pending` in the old vocabulary);
 /// `held` is any concurrency gate, with `concurrency_waits.holder_kind`
-/// distinguishing workflow (`run`) from job/jobset (round 5, B1).
+/// distinguishing workflow (`run`) from job/jobset.
 const QUEUE_KIND: &str = "CASE j.queue_state \
      WHEN 'blocked' THEN 'pending' \
      WHEN 'held' THEN 'blocked' \
@@ -946,8 +968,7 @@ const ATTEMPT_HISTORY_FROM: &str = "attempt_history q";
 
 impl LiteBackend {
     /// `run_record`: the projected run record, live rows first and
-    /// `run_history`/`job_history`/`attempt_history` when archived
-    /// (decision Q10).
+    /// `run_history`/`job_history`/`attempt_history` when archived.
     pub(crate) async fn run_record(
         &self,
         run_id: RunId,

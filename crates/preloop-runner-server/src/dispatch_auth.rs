@@ -62,7 +62,7 @@ pub struct DispatchIdentity {
     /// Trust tier stamped on dispatched runs. Installation-token dispatches
     /// get [`TrustTier::AppDispatch`]; everything else [`TrustTier::AdminManual`].
     pub tier: TrustTier,
-    /// Which channel of the D2 chain authenticated the request.
+    /// Which channel of the token-validation chain authenticated the request.
     pub kind: DispatchAuthKind,
 }
 

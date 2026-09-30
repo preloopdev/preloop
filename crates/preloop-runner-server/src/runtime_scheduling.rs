@@ -590,28 +590,37 @@ pub fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
 /// failing the job: an unevaluated label matches nothing, which is the same
 /// outcome the build-time fallback has always had.
 pub fn resolve_deferred_runs_on(job: &mut QueuedJob, context: &preloop_gha_expressions::Context) {
-    if !job.runs_on.iter().any(|label| label.contains("${{")) {
+    resolve_deferred_runs_on_labels(&mut job.runs_on, context, &job.run_id.0, &job.job_id.0);
+}
+
+/// [`resolve_deferred_runs_on`] over a stored label list (backend `jobs.runs_on`).
+pub fn resolve_deferred_runs_on_labels(
+    runs_on: &mut Vec<String>,
+    context: &preloop_gha_expressions::Context,
+    run_id: &impl std::fmt::Display,
+    job_id: &str,
+) {
+    if !runs_on.iter().any(|label| label.contains("${{")) {
         return;
     }
-    let resolved: Vec<String> = job
-        .runs_on
+    let resolved: Vec<String> = runs_on
         .iter()
         .flat_map(|label| preloop_gha_parser::eval::resolve_runs_on_label(label, context))
         .collect();
     if resolved.iter().any(|label| label.contains("${{")) {
         tracing::warn!(
-            run_id = %job.run_id.0,
-            job = %job.job_id.0,
+            %run_id,
+            job = %job_id,
             labels = ?resolved,
             "runs-on expression could not be resolved after needs completed; the job may never match a runner"
         );
     }
-    job.runs_on = if resolved.is_empty() {
+    *runs_on = if resolved.is_empty() {
         // Degenerate: every template contributed zero labels (an expression
         // evaluating to an empty array). Keep the raw templates so the job
         // stays unschedulable — an empty label list would match every runner.
         // The warning above fires for these, since they still contain `${{`.
-        job.runs_on.clone()
+        runs_on.clone()
     } else {
         resolved
     };
@@ -640,82 +649,6 @@ pub fn needs_json_context(run: &RunRecord, needs: &[JobId]) -> serde_json::Value
         })
         .collect::<serde_json::Map<_, _>>();
     serde_json::Value::Object(values)
-}
-
-/// Everything a deferred node needs in order to build its subtree, cloned out
-/// of the run record while the lock is held.
-///
-/// Snapshotting up front is what lets the expensive part — parsing workflow
-/// YAML, building one runner message per tx job, minting a runtime token
-/// per job — run with the global mutex released.
-struct ExpansionContext {
-    run_id: RunId,
-    submission: Arc<WorkflowSubmission>,
-    snapshot: Option<crate::snapshots::WorkspaceSnapshot>,
-    github_json: serde_json::Value,
-    workflow_path: String,
-    workflow_ref: String,
-    head_sha: String,
-}
-
-struct ReusableExpansionInputs {
-    ctx: ExpansionContext,
-    caller_id: JobId,
-    caller_plan: preloop_gha_protocol::JobPlan,
-    call: preloop_gha_protocol::ReusableCallPlan,
-    needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
-}
-
-struct MatrixExpansionInputs {
-    ctx: ExpansionContext,
-    node_id: JobId,
-    base_id: String,
-    expression: String,
-    needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
-    /// Home workflow of the deferred node: set when the node lives inside a
-    /// reusable callee, so the build phase parses the callee YAML rather than
-    /// the root workflow.
-    workflow_file: Option<String>,
-    /// Callee identity of the deferred node (`workflow_ref`, `workflow_sha`,
-    /// `workflow_repository` of the workflow defining it): set together with
-    /// `workflow_file` when the node lives inside a reusable callee, so the
-    /// fan-out cells report the callee in their `job.workflow_*` context
-    /// values rather than the root workflow.
-    workflow_ref: Option<String>,
-    workflow_sha: Option<String>,
-    workflow_repository: Option<String>,
-    /// The deferred node's own `inputs` context. For a top-level node this is
-    /// the run's dispatch inputs (stamped on the plan at submit time); for a
-    /// node inside a reusable workflow it is the caller's `with` values that
-    /// the callee subtree was expanded with. The fan-out cells must see these
-    /// scoped inputs, not the root dispatch inputs: GitHub scopes `inputs` to
-    /// the workflow that declares the job, so a callee cell reading
-    /// `inputs.dry_run` gets the caller's `with` value even on a
-    /// push-triggered run whose dispatch map is empty.
-    scoped_inputs: BTreeMap<String, serde_json::Value>,
-}
-
-enum ExpansionPlan {
-    Reusable(Box<ReusableExpansionInputs>),
-    Matrix(Box<MatrixExpansionInputs>),
-}
-
-/// One fully built tx job, still detached from the run.
-struct BuiltJob {
-    plan: preloop_gha_protocol::JobPlan,
-    condition_context: preloop_gha_expressions::Context,
-    artifacts: crate::runs::BuiltJobArtifacts,
-}
-
-enum BuiltExpansion {
-    Reusable {
-        caller_id: JobId,
-        jobs: Vec<BuiltJob>,
-        reusable_calls: BTreeMap<String, preloop_gha_parser::ReusableCallMetadata>,
-    },
-    Matrix {
-        jobs: Vec<BuiltJob>,
-    },
 }
 
 /// How to retire the request correlation an expandable node minted at submit.

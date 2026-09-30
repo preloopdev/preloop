@@ -555,14 +555,33 @@ async fn submit_and_report(
 ) -> Result<RunAccepted, ApiError> {
     let accepted = crate::submit_run_inner(shared, submission).await?;
     let run_id = accepted.run_id;
-    let jobs = shared
+    // Stamped before filtering: an all-expandable run mints nothing at intake
+    // yet still needs the flag for the legs it materializes later.
+    if let Err(error) = shared
         .state
         .backend
-        .run_job_statuses(run_id)
+        .set_reports_check_runs(run_id, true)
+        .await
+    {
+        warn!(%run_id, ?error, "failed to stamp reports_check_runs for dispatch run");
+    }
+    let info = shared
+        .state
+        .backend
+        .run_dispatch_info(run_id)
         .await
         .map_err(ApiError::from)?;
-    if let Some(jobs) = jobs {
-        for (job_id, _) in jobs {
+    if let Some(info) = info {
+        // Expandable nodes (deferred matrices, reusable callers) are
+        // placeholders: they never dispatch, expansion replaces them, and
+        // their materialized legs mint their own checks — a `queued` check
+        // minted here would strand on GitHub (there is no delete API).
+        let jobs = info
+            .jobs
+            .into_iter()
+            .filter(|job| !job.placeholder)
+            .map(|job| job.job_id);
+        for job_id in jobs {
             if let Err(error) =
                 crate::github::report_check_run_queued(shared, repository, sha, &job_id, run_id)
                     .await

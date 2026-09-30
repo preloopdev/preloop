@@ -716,7 +716,7 @@ pub struct PendingCache {
     #[serde(default)]
     pub job_backend_id: String,
     pub bytes: Vec<u8>,
-    /// R1-6 — unix seconds the reservation was made. The TTL sweeper frees
+    /// Unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.
     #[serde(default)]

@@ -5,9 +5,9 @@
 //! Every command is one transaction: lock the touched `runs` rows (ascending
 //! `run_id` — the schema's per-run mutex), load each run's graph, decide with
 //! `control/logic.rs` + `runtime_scheduling.rs`, write the deltas back.
-//! Gate acquisition takes the `concurrency_holds` row first, then locks the
-//! foreign run it cancels/promotes — group-before-run order, always, so two
-//! cross-run commands cannot deadlock.
+//! Gate acquisition pre-locks every foreign holder/waiter run in ascending
+//! order, then locks the group row. This keeps cross-run cancellation and
+//! promotion in the same run-before-group order as ordinary commands.
 
 use super::codec::{self, from_json, json, now_us, ts};
 use super::graph::{self, Node, NodeKind, ReusableNodeSpec, RunGraph, queue_state_str};
@@ -77,7 +77,8 @@ async fn flush_node(
             ts!("$13"),
             ", outputs=$14::text::jsonb, annotations=$15::text::jsonb, \
              check_run_id=$16, expand_generation=$17, \
-             environment_gate=$18::text::jsonb \
+             environment_gate=$18::text::jsonb, \
+             pool_key=$19, runs_on=$20::text::jsonb \
              WHERE run_id=$1::text::uuid AND job_id=$2"
         ),
         &[
@@ -99,11 +100,50 @@ async fn flush_node(
             &node.check_run_id,
             &node.expand_generation,
             &environment_gate_json,
+            &node.pool_key,
+            &serde_json::to_string(&node.runs_on).unwrap_or_else(|_| "[]".into()),
         ],
     )
     .await
     .map_err(db)?;
     Ok(())
+}
+
+fn apply_resolved_runs_on(node: &mut Node, runs_on: Vec<String>) {
+    if node.runs_on == runs_on {
+        return;
+    }
+    node.runs_on = runs_on;
+    node.pool_key =
+        crate::control::types::compute_pool_key(&node.runs_on, node.runner_group.as_deref());
+}
+
+async fn promotion_label_reason(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    runs_on: &[String],
+) -> Result<Option<String>, ControlError> {
+    let platforms = PgBackend::registered_platforms_on(tx).await?;
+    let pool_labels = backend.pool_labels();
+    let any_runner_matches = if pool_labels.is_empty() {
+        false
+    } else {
+        tx.query("SELECT labels::text FROM runners", &[])
+            .await
+            .map_err(db)?
+            .iter()
+            .any(|row| {
+                let text: String = row.get(0);
+                let labels = codec::from_json::<Vec<String>>(&text).unwrap_or_default();
+                sched_helpers::job_matches_runner(runs_on, &labels)
+            })
+    };
+    Ok(logic::promotion_unsatisfiable_reason(
+        runs_on,
+        platforms,
+        &pool_labels,
+        any_runner_matches,
+    ))
 }
 
 /// Persist `runs.status`/`conclusion`/timestamps from the graph's record.
@@ -411,6 +451,17 @@ async fn insert_request_row(
         .await
         .map_err(db)?;
     }
+    insert_step_manifest(tx, request.agent_job_id, manifest).await?;
+    Ok(request_id)
+}
+
+/// Insert an attempt's step manifest, keyed by its runtime identity.
+async fn insert_step_manifest(
+    tx: &Transaction<'_>,
+    agent_job_id: uuid::Uuid,
+    manifest: &[crate::models::StepRecord],
+) -> Result<(), ControlError> {
+    let agent_job_id = agent_job_id.to_string();
     for (position, step) in manifest.iter().enumerate() {
         let kind = match step.kind {
             crate::models::StepKind::Workflow => "workflow",
@@ -428,7 +479,7 @@ async fn insert_request_row(
                 ") ON CONFLICT (agent_job_id, step_id) DO NOTHING"
             ),
             &[
-                &request.agent_job_id.to_string(),
+                &agent_job_id,
                 &step.id,
                 &(position as i32),
                 &kind,
@@ -444,7 +495,7 @@ async fn insert_request_row(
         .await
         .map_err(db)?;
     }
-    Ok(request_id)
+    Ok(())
 }
 
 /// Settle one request whose job is terminal: stamp the verdict, move the
@@ -1117,6 +1168,40 @@ pub(super) enum GateOutcome {
 /// `logic::try_acquire_concurrency` including the stale-arrival check and
 /// queue-mode displacement. Cancelling a foreign holder/parked waiters is
 /// the caller-visible side effect.
+/// Lock every existing foreign run named by a group before taking the group
+/// row. Cancellation and promotion then cannot invert the command-wide
+/// run-before-group lock order.
+async fn lock_gate_runs(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    key: &(String, String),
+    arriving_run: RunId,
+) -> Result<(), ControlError> {
+    let rows = tx
+        .query(
+            "SELECT holder_run_id::text FROM concurrency_holds \
+             WHERE namespace_id=$1 AND repository=$2 AND group_name=$3 \
+             UNION \
+             SELECT holder_run_id::text FROM concurrency_waits \
+             WHERE namespace_id=$1 AND repository=$2 AND group_name=$3",
+            &[&namespace, &key.0, &key.1],
+        )
+        .await
+        .map_err(db)?;
+    let mut runs = std::collections::BTreeSet::new();
+    for row in rows {
+        if let Ok(run) = row.get::<_, String>(0).parse::<RunId>() {
+            if run != arriving_run {
+                runs.insert(run);
+            }
+        }
+    }
+    for run in runs {
+        PgBackend::lock_run(tx, run).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn acquire_gate(
     backend: &PgBackend,
     tx: &Transaction<'_>,
@@ -1127,6 +1212,7 @@ pub(super) async fn acquire_gate(
     cancel_in_progress: bool,
     queue: ConcurrencyQueue,
 ) -> Result<GateOutcome, ControlError> {
+    lock_gate_runs(tx, namespace, key, holder.holder.run_id()).await?;
     let probe_run = holder.holder.run_id().0.to_string();
     let Some(group) = lock_group(tx, namespace, key, &probe_run).await? else {
         // Unreachable in one transaction (the probe self-lands and `FOR
@@ -1882,6 +1968,7 @@ async fn resume_held_node(
     if let Some(mut message) = PgBackend::node_message(tx, graph.record.run_id, job_id).await? {
         let mut queued = graph::queued_of(job_id, graph.record.run_id, node, message);
         sched_helpers::hydrate_needs_context(&mut queued, &graph.record);
+        apply_resolved_runs_on(node, queued.runs_on);
         message = queued.message;
         PgBackend::write_node_message(tx, graph.record.run_id, job_id, &message).await?;
     }
@@ -2588,7 +2675,6 @@ impl<'a> Sweep<'a> {
     pub(super) async fn sweep(&mut self) -> Result<(), ControlError> {
         loop {
             let mut settled = false;
-            let mut promoted_by_base: BTreeMap<(RunId, String), u64> = BTreeMap::new();
             let candidates: Vec<(RunId, JobId)> = self
                 .graphs
                 .iter()
@@ -2608,7 +2694,7 @@ impl<'a> Sweep<'a> {
                 let decision = self.decide(run_id, &job_id).await?;
                 match decision {
                     DependencyDecision::Run => {
-                        self.promote(run_id, &job_id, &mut promoted_by_base).await?;
+                        self.promote(run_id, &job_id).await?;
                     }
                     DependencyDecision::Skip | DependencyDecision::Error => {
                         let status = if decision == DependencyDecision::Skip {
@@ -2622,12 +2708,6 @@ impl<'a> Sweep<'a> {
                     DependencyDecision::Wait => {}
                 }
             }
-            // Max-parallel admissions: legs admitted this pass count toward
-            // the cap.
-            let _ = promoted_by_base;
-            if !settled && promoted_by_base.is_empty() {
-                return Ok(());
-            }
             if !settled {
                 return Ok(());
             }
@@ -2637,12 +2717,7 @@ impl<'a> Sweep<'a> {
     /// A blocked node whose needs settled promotes: jobset gates for a
     /// reusable caller, expansion for a deferred node, gate + ready for a
     /// dispatchable job.
-    async fn promote(
-        &mut self,
-        run_id: RunId,
-        job_id: &JobId,
-        promoted_by_base: &mut BTreeMap<(RunId, String), u64>,
-    ) -> Result<(), ControlError> {
+    async fn promote(&mut self, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
         let (is_caller, is_matrix, max_parallel, base_id, has_gates) = {
             let Some(node) = self.graphs.get(&run_id).and_then(|g| g.nodes.get(job_id)) else {
                 return Ok(());
@@ -2697,19 +2772,20 @@ impl<'a> Sweep<'a> {
             self.defer_expansion(run_id, job_id).await?;
             return Ok(());
         }
-        // Max-parallel: matrix legs queue behind the cohort cap.
-        if let Some(limit) = max_parallel {
-            let admitted_so_far = promoted_by_base
-                .get(&(run_id, base_id.clone()))
-                .copied()
-                .unwrap_or(0);
-            if !self.under_max_parallel(run_id, job_id, &base_id, limit, admitted_so_far) {
-                // Stays `blocked` — a later leg completion re-admits it.
-                return Ok(());
-            }
-            *promoted_by_base
-                .entry((run_id, base_id.clone()))
-                .or_insert(0) += 1;
+        // Max-parallel: matrix legs queue behind the cohort cap. A leg
+        // admitted earlier in this pass is already `ready` in the graph, so
+        // the scan counts it exactly once.
+        if let Some(limit) = max_parallel
+            && !self.under_max_parallel(run_id, &base_id, limit)
+        {
+            // Stays `blocked` — a later leg completion re-admits it.
+            return Ok(());
+        }
+        // Deferred `runs-on` resolves here, once needs outputs exist. Fail
+        // before occupying a concurrency slot if the concrete labels can
+        // never be served.
+        if self.hydrate_and_reject_labels(run_id, job_id).await? {
+            return Ok(());
         }
         // Job-level gate.
         if has_gates {
@@ -2738,6 +2814,61 @@ impl<'a> Sweep<'a> {
         self.enqueue(run_id, job_id).await
     }
 
+    /// Hydrate needs/`runs-on` and fail the job when the resolved labels are
+    /// unhostable or unsatisfiable. `true` means the node was settled.
+    async fn hydrate_and_reject_labels(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        let mut resolved = None;
+        if let Some(message) = self.message(run_id, job_id).await? {
+            let (mut queued, record) = {
+                let graph = self.graphs.get(&run_id).expect("loaded");
+                let node = graph.nodes.get(job_id).expect("loaded");
+                (
+                    graph::queued_of(job_id, run_id, node, message),
+                    graph.record.clone(),
+                )
+            };
+            sched_helpers::hydrate_needs_context(&mut queued, &record);
+            PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
+            resolved = Some(queued.runs_on.clone());
+            self.messages
+                .insert((run_id, job_id.clone()), Some(queued.message));
+            self.hydrated.insert((run_id, job_id.clone()));
+        }
+        if let Some(runs_on) = resolved.clone()
+            && let Some(node) = self.node_mut(run_id, job_id)
+        {
+            apply_resolved_runs_on(node, runs_on);
+            self.mark(run_id, job_id);
+        }
+        let runs_on = resolved.unwrap_or_else(|| {
+            self.graphs
+                .get(&run_id)
+                .and_then(|graph| graph.nodes.get(job_id))
+                .map(|node| node.runs_on.clone())
+                .unwrap_or_default()
+        });
+        if let Some(reason) = promotion_label_reason(self.backend, self.tx, &runs_on).await? {
+            tracing::warn!(
+                %run_id,
+                job = %job_id.0,
+                labels = ?runs_on,
+                pool_labels = ?self.backend.pool_labels(),
+                %reason,
+                "runs-on unsatisfiable by runner pool; failing the job"
+            );
+            self.settle_node(run_id, job_id, ExecutionStatus::Failure)
+                .await?;
+            self.outcome
+                .push(ExecutionStatus::Failure, run_id, job_id.clone());
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Hydrate + enqueue one promotable job.
     async fn enqueue(&mut self, run_id: RunId, job_id: &JobId) -> Result<(), ControlError> {
         // Hydrate needs context into the stored message template.
@@ -2752,9 +2883,13 @@ impl<'a> Sweep<'a> {
             };
             sched_helpers::hydrate_needs_context(&mut queued, &record);
             PgBackend::write_node_message(self.tx, run_id, job_id, &queued.message).await?;
+            let runs_on = queued.runs_on.clone();
             self.messages
                 .insert((run_id, job_id.clone()), Some(queued.message));
             self.hydrated.insert((run_id, job_id.clone()));
+            if let Some(node) = self.node_mut(run_id, job_id) {
+                apply_resolved_runs_on(node, runs_on);
+            }
         }
         let now = self.now;
         let graph = self.graph(run_id).await?;
@@ -3089,20 +3224,13 @@ impl<'a> Sweep<'a> {
         Ok(())
     }
 
-    /// Whether the cohort of `base_id` legs is under `limit` (queue + running
-    /// + admitted this pass).
-    fn under_max_parallel(
-        &self,
-        run_id: RunId,
-        _job_id: &JobId,
-        base_id: &str,
-        limit: u64,
-        admitted_this_pass: u64,
-    ) -> bool {
+    /// Whether the cohort of `base_id` legs is under `limit`: legs that are
+    /// ready, claimed or running (lite's `under_max_parallel` rule).
+    fn under_max_parallel(&self, run_id: RunId, base_id: &str, limit: u64) -> bool {
         let Some(graph) = self.graphs.get(&run_id) else {
             return true;
         };
-        let mut active = admitted_this_pass;
+        let mut active = 0;
         for node in graph.nodes.values() {
             if node.base_id == base_id
                 && (node.status == ExecutionStatus::InProgress
@@ -3303,13 +3431,15 @@ pub(super) async fn append_event_tx(
     emit_outbox(tx, run_id, &topic, payload).await
 }
 
-/// Requeue a claimed job whose runner is gone: drop the claim (owner,
-/// session, start stamp, lease) and put the node back at the head of the
-/// ready queue (its `jobs` row goes back to `queued`/`ready`).
+/// Requeue a claimed job whose runner is gone: drop the claim — its attempt
+/// is replaced via [`retry_attempt_tx`], whose abandoned runtime identity
+/// lands in `retired` — and put the node back at the head of the ready
+/// queue (its `jobs` row goes back to `queued`/`ready`).
 pub(super) async fn requeue_claimed_tx(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
+    retired: &mut Vec<uuid::Uuid>,
 ) -> Result<bool, ControlError> {
     let run = run_id.0.to_string();
     let Some(row) = tx
@@ -3327,32 +3457,7 @@ pub(super) async fn requeue_claimed_tx(
     if state != "claimed" {
         return Ok(false);
     }
-    let request = tx
-        .query_opt(
-            "SELECT request_id FROM job_requests WHERE run_id = $1::text::uuid \
-             AND job_id = $2 AND result IS NULL ORDER BY request_id DESC LIMIT 1 \
-             FOR NO KEY UPDATE",
-            &[&run, &job_id.0],
-        )
-        .await
-        .map_err(db)?;
-    if let Some(row) = request {
-        let request_id: i64 = row.get(0);
-        tx.execute(
-            "UPDATE job_requests SET runner_id = NULL, session_id = NULL, \
-             started_at = NULL, timeout_triggered = false \
-             WHERE request_id = $1 AND result IS NULL",
-            &[&request_id],
-        )
-        .await
-        .map_err(db)?;
-        tx.execute(
-            "DELETE FROM job_leases WHERE request_id = $1",
-            &[&request_id],
-        )
-        .await
-        .map_err(db)?;
-    }
+    retired.extend(retry_attempt_tx(tx, run_id, job_id).await?);
     tx.execute(
         "UPDATE jobs SET status = 'queued', queue_state = 'ready', \
          claimed_by_runner_id = NULL, claimed_at = NULL, \
@@ -3386,6 +3491,92 @@ pub(super) async fn requeue_claimed_tx(
     )
     .await?;
     Ok(true)
+}
+
+/// Replace the job's in-flight attempt so no credential of the abandoned
+/// one survives the retry — the SQLite backend's `retry_attempt` contract.
+/// The old row settles `cancelled` — its runtime token, debug token and
+/// renewals stop validating — while its step manifest, logs and timeline
+/// stay addressable. The replacement gets a fresh runtime identity (`jobId`
+/// and the derived plan id), its own timeline, a pending step manifest and
+/// an unissued debug token; the stored message and the deferred token-mint
+/// recipe move to it. Returns the abandoned runtime identity, `None` when
+/// nothing was in flight.
+async fn retry_attempt_tx(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<Option<uuid::Uuid>, ControlError> {
+    let run = run_id.0.to_string();
+    let Some(row) = tx
+        .query_opt(
+            "SELECT request_id, agent_job_id::text, namespace_id FROM job_requests \
+             WHERE run_id = $1::text::uuid AND job_id = $2 AND result IS NULL \
+             ORDER BY request_id DESC LIMIT 1 FOR NO KEY UPDATE",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?
+    else {
+        return Ok(None);
+    };
+    let request_id: i64 = row.get(0);
+    let abandoned = codec::uuid(row.get(1))?;
+    let namespace: String = row.get(2);
+    let Some(mut message) = PgBackend::node_message(tx, run_id, job_id).await? else {
+        return Err(ControlError::backend(anyhow::anyhow!(
+            "request {request_id} has no message template"
+        )));
+    };
+    tx.execute(
+        "UPDATE job_requests SET result = 'cancelled', finished_at = now(), \
+         runner_id = NULL, session_id = NULL WHERE request_id = $1",
+        &[&request_id],
+    )
+    .await
+    .map_err(db)?;
+    tx.execute(
+        "DELETE FROM job_leases WHERE request_id = $1",
+        &[&request_id],
+    )
+    .await
+    .map_err(db)?;
+    let agent_job_id = uuid::Uuid::new_v4();
+    let timeline_id = uuid::Uuid::new_v4();
+    let retry: i64 = tx
+        .query_one(
+            "INSERT INTO job_requests (run_id, job_id, namespace_id, agent_job_id, \
+             timeline_id) VALUES ($1::text::uuid,$2,$3,$4::text::uuid,$5::text::uuid) \
+             RETURNING request_id",
+            &[
+                &run,
+                &job_id.0,
+                &namespace,
+                &agent_job_id.to_string(),
+                &timeline_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(db)?
+        .get(0);
+    insert_step_manifest(
+        tx,
+        agent_job_id,
+        &crate::models::StepRecord::manifest(&message.steps),
+    )
+    .await?;
+    message.job_id = agent_job_id;
+    message.request_id = retry;
+    message.plan.plan_id = agent_job_id.to_string();
+    message.timeline.id = timeline_id;
+    PgBackend::write_node_message(tx, run_id, job_id, &message).await?;
+    tx.execute(
+        "UPDATE github_token_requests SET request_id = $2 WHERE request_id = $1",
+        &[&request_id, &retry],
+    )
+    .await
+    .map_err(db)?;
+    Ok(Some(abandoned))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3584,7 +3775,7 @@ impl PgBackend {
     ) -> Result<SubmitOutcome, ControlError> {
         let SubmitRun {
             namespace,
-            record,
+            mut record,
             jobs,
             workflow_concurrency,
             empty_concurrency_group,
@@ -3634,6 +3825,50 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
+        // A caller may replay a run number (tests and push-back retries do);
+        // GitHub allocates the next number rather than surfacing a unique-key
+        // failure. Keep the counter ahead of both its row and existing runs.
+        let collision: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM runs WHERE namespace_id=$1 \
+                 AND repository=$2 AND workflow_path=$3 AND run_number=$4 \
+                 AND run_attempt=$5)",
+                &[
+                    &namespace,
+                    &record.submission.repository,
+                    &record.workflow_path_str,
+                    &(record.run_number as i64),
+                    &(record.run_attempt as i32),
+                ],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        if collision {
+            record.run_number = tx
+                .query_one(
+                    "INSERT INTO workflow_run_numbers \
+                     (namespace_id, repository, workflow_path, last_run_number) \
+                     VALUES ($1,$2,$3, GREATEST(1, COALESCE( \
+                         (SELECT MAX(run_number) + 1 FROM runs \
+                          WHERE namespace_id=$1 AND repository=$2 AND workflow_path=$3), 1))) \
+                     ON CONFLICT (namespace_id, repository, workflow_path) DO UPDATE SET \
+                       last_run_number = GREATEST(\
+                         workflow_run_numbers.last_run_number + 1,\
+                         COALESCE((SELECT MAX(run_number) + 1 FROM runs \
+                                   WHERE namespace_id=$1 AND repository=$2 AND workflow_path=$3), 1)) \
+                     RETURNING last_run_number",
+                    &[
+                        &namespace,
+                        &record.submission.repository,
+                        &record.workflow_path_str,
+                    ],
+                )
+                .await
+                .map_err(db)?
+                .get::<_, i64>(0)
+                .max(0) as u64;
+        }
         // With a delivery id the insert tolerates the winner of a concurrent
         // redelivery (it waits for that transaction, then does nothing); the
         // `runs_delivery` index is the arbiter. Without one, the plain insert
@@ -3772,10 +4007,42 @@ impl PgBackend {
         )
         .await?;
 
-        // Workflow-level concurrency gate: the run either occupies the slot,
-        // parks behind it, or dies on arrival.
+        // Workless submissions take no workflow admission: a Holder::Run
+        // taken here is never released through the completion path.
+        let platforms = Self::registered_platforms_on(&tx).await?;
+        let pool_labels = if check_hostable {
+            self.pool_labels()
+        } else {
+            Vec::new()
+        };
+        let runner_labels: Vec<Vec<String>> = if pool_labels.is_empty() {
+            Vec::new()
+        } else {
+            tx.query("SELECT labels::text FROM runners", &[])
+                .await
+                .map_err(db)?
+                .iter()
+                .map(|row| {
+                    let text: String = row.get(0);
+                    codec::from_json::<Vec<String>>(&text).unwrap_or_default()
+                })
+                .collect()
+        };
+        let has_runnable = jobs.iter().any(|job| {
+            !logic::concludes_at_submit(
+                job.initially_skipped,
+                job.queued.reusable_call.is_some() || job.queued.deferred_matrix.is_some(),
+                &job.queued.runs_on,
+                check_hostable,
+                platforms.iter().copied(),
+                &pool_labels,
+                runner_labels
+                    .iter()
+                    .any(|labels| sched_helpers::job_matches_runner(&job.queued.runs_on, labels)),
+            )
+        });
         let mut held = false;
-        if let Some(wf) = &workflow_concurrency {
+        if has_runnable && let Some(wf) = &workflow_concurrency {
             let key = concurrency::concurrency_key(&record.submission.repository, &wf.group);
             match acquire_gate(
                 self,
@@ -3805,17 +4072,6 @@ impl PgBackend {
                     emit_outbox(
                         &tx,
                         Some(record.run_id),
-                        "run.created.v1",
-                        serde_json::json!({
-                            "run_number": record.run_number,
-                            "repository": record.submission.repository,
-                            "workflow_path": record.workflow_path_str,
-                        }),
-                    )
-                    .await?;
-                    emit_outbox(
-                        &tx,
-                        Some(record.run_id),
                         "run.completed.v1",
                         serde_json::json!({"conclusion": "cancelled"}),
                     )
@@ -3838,8 +4094,8 @@ impl PgBackend {
             }
         }
 
-        let platforms = Self::registered_platforms_on(&tx).await?;
-        let accepted = jobs.iter().filter(|job| !job.initially_skipped).count();
+        // Jobs admitted (not concluded at submit) — `RunAccepted.queued_jobs`.
+        let mut accepted = 0usize;
         let final_status;
         let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
         let mut graph = RunGraph {
@@ -3878,7 +4134,7 @@ impl PgBackend {
                 concluded.push((
                     job_id.clone(),
                     ExecutionStatus::Failure,
-                    Some(format!("no {platform} runner registered")),
+                    Some(logic::unhostable_reason(platform, &node.runs_on)),
                 ));
             }
             if initially_skipped && node.status != ExecutionStatus::Failure {
@@ -3886,6 +4142,40 @@ impl PgBackend {
                 node.queue_state = logic::QueueState::None;
                 node.completed_at_us = Some(now);
                 concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
+            }
+            // Labels the co-hosted pool can never satisfy and no registered
+            // runner serves: conclude now instead of starving in the queue.
+            // Placeholders are skipped — expansion materializes their jobs.
+            if !matches!(
+                node.status,
+                ExecutionStatus::Failure | ExecutionStatus::Skipped
+            ) && queued.reusable_call.is_none()
+                && queued.deferred_matrix.is_none()
+                && let Some(reason) = logic::unschedulable_reason(
+                    &node.runs_on,
+                    &pool_labels,
+                    runner_labels.iter().any(|labels| {
+                        crate::runtime_scheduling::job_matches_runner(&node.runs_on, labels)
+                    }),
+                )
+            {
+                tracing::warn!(
+                    run_id = %record.run_id,
+                    job = %job_id.0,
+                    labels = ?node.runs_on,
+                    pool_labels = ?pool_labels,
+                    "runs-on unsatisfiable by runner pool; failing the job at enqueue"
+                );
+                node.status = ExecutionStatus::Failure;
+                node.queue_state = logic::QueueState::None;
+                node.completed_at_us = Some(now);
+                concluded.push((job_id.clone(), ExecutionStatus::Failure, Some(reason)));
+            }
+            if !matches!(
+                node.status,
+                ExecutionStatus::Failure | ExecutionStatus::Skipped
+            ) {
+                accepted += 1;
             }
             // A node that reaches admission behind a hold parks: the workflow
             // gate is not this run's turn yet (`held`), the run is held by the
@@ -5494,10 +5784,18 @@ fn expansion_plan(graph: &RunGraph, job: &QueuedJob) -> Option<ExpansionPlan> {
         })));
     }
     let expression = job.deferred_matrix.clone()?;
-    let workflow_file = record
-        .caller_plans
-        .get(&job.job_id)
-        .and_then(|plan| plan.workflow_file.clone());
+    // A node materialized inside a reusable callee carries its own plan (the
+    // expansion pass stores it alongside the node), whose `inputs` are the
+    // caller's `with` values the callee subtree was expanded with. A node
+    // that was never stored (a top-level node from the initial submit, which
+    // only stores reusable callers) falls back to the dispatch inputs the
+    // submit path stamped on every plan: the fan-out cells inherit the
+    // node's own `inputs` context, not the root dispatch map.
+    let stored_plan = record.caller_plans.get(&job.job_id);
+    let workflow_file = stored_plan.and_then(|plan| plan.workflow_file.clone());
+    let scoped_inputs = stored_plan
+        .map(|plan| plan.inputs.clone())
+        .unwrap_or_else(|| ctx.submission.dispatch_inputs.clone());
     Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
         ctx,
         node_id: job.job_id.clone(),
@@ -5505,6 +5803,7 @@ fn expansion_plan(graph: &RunGraph, job: &QueuedJob) -> Option<ExpansionPlan> {
         expression,
         needs_outputs,
         workflow_file,
+        scoped_inputs,
     })))
 }
 

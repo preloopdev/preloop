@@ -120,6 +120,15 @@ CREATE TABLE runs (
     concurrency_group       text,
     concurrency_cancel_in_progress boolean NOT NULL DEFAULT false,
     event_seq               bigint NOT NULL DEFAULT 0,   -- bumped per outbox event (run_seq)
+    -- Fork-PR policy: the run is held at scheduler admission until the
+    -- operator approves it; a hold past the window fails closed (reaper).
+    -- Real columns so the expiry sweep filters in SQL.
+    fork_approval_pending   boolean NOT NULL DEFAULT false,
+    fork_approval_requested_at bigint,
+    fork_approval_approved_at  bigint,
+    fork_approval_note      text,
+    -- Intake reported GitHub check runs for this run (late check-run mint).
+    reports_check_runs      boolean NOT NULL DEFAULT false,
     created_at              timestamptz NOT NULL DEFAULT now(),
     started_at              timestamptz,
     completed_at            timestamptz
@@ -150,7 +159,11 @@ CREATE TABLE run_submissions (
     github_context          jsonb NOT NULL,
     workspace_snapshot      jsonb,
     snapshot_timing         jsonb,              -- duration_ms, object_count, pack_bytes
-    secret_refs             jsonb NOT NULL DEFAULT '{}' -- name -> {scope, version}
+    secret_refs             jsonb NOT NULL DEFAULT '{}', -- name -> {scope, version}
+    -- Record-level per-job maps the table layout has no column for (jobs
+    -- with no `jobs` row yet — a check run minted before its matrix leg
+    -- materializes). Mirrors lite's `run_submissions.record_details`.
+    record_details          jsonb NOT NULL DEFAULT '{}'
 );
 
 -- Push-back for local submissions (`preloop push`): acted on after the run
@@ -202,6 +215,10 @@ CREATE TABLE jobs (
     outputs                 jsonb,
     annotations             jsonb,
     check_run_id            bigint,
+    -- Environment protection gate state (`EnvironmentGateState` JSON): armed
+    -- at scheduler admission, updated on approval, cleared when satisfied.
+    -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
+    environment_gate        jsonb,
     -- latency clocks
     created_at              timestamptz NOT NULL DEFAULT now(),
     deps_ready_at           timestamptz,
@@ -634,6 +651,12 @@ CREATE TABLE run_history (
     head_sha                text NOT NULL,
     conclusion              text,
     submission              jsonb NOT NULL,     -- secrets never archived
+    record_details          jsonb NOT NULL DEFAULT '{}',
+    fork_approval_pending   boolean NOT NULL DEFAULT false,
+    fork_approval_requested_at bigint,
+    fork_approval_approved_at  bigint,
+    fork_approval_note      text,
+    reports_check_runs      boolean NOT NULL DEFAULT false,
     created_at              timestamptz NOT NULL,
     started_at              timestamptz,
     completed_at            timestamptz,

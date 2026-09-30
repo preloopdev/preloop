@@ -730,11 +730,11 @@ mod properties {
     // ---- property tests ----
 
     proptest! {
-        /// GH-GROUP-01: Case variants produce equal keys.
+        /// Case variants produce equal keys.
         /// concurrency_key lowercases both repo and group, so any casing of the
         /// same ASCII string must map to the same key.
         #[test]
-        fn gh_group_01_case_insensitive(
+        fn group_key_case_insensitive(
             repo in arb_name(),
             group in arb_name(),
         ) {
@@ -748,28 +748,28 @@ mod properties {
                 &group,
             );
             prop_assert_eq!(&key_lower, &key_upper,
-                "GH-GROUP-01: upper/lower must produce equal keys");
+                "upper/lower must produce equal keys");
             prop_assert_eq!(&key_lower, &key_mixed,
-                "GH-GROUP-01: mixed case must produce equal key");
+                "mixed case must produce equal key");
         }
 
-        /// GH-GROUP-01: Normalization is idempotent — applying concurrency_key
+        /// Normalization is idempotent — applying concurrency_key
         /// to already-lowered output returns the same pair.
         #[test]
-        fn gh_group_01_idempotent(
+        fn group_key_normalization_is_idempotent(
             repo in arb_name(),
             group in arb_name(),
         ) {
             let (r1, g1) = concurrency_key(&repo, &group);
             let (r2, g2) = concurrency_key(&r1, &g1);
             prop_assert_eq!((&r1, &g1), (&r2, &g2),
-                "GH-GROUP-01: normalization must be idempotent");
+                "normalization must be idempotent");
         }
 
-        /// GH-GROUP-01: Different repositories keep keys distinct even when
+        /// Different repositories keep keys distinct even when
         /// group names match (case-insensitively).
         #[test]
-        fn gh_group_01_repo_isolation(
+        fn group_key_repo_isolation(
             repo_a in arb_name(),
             repo_b in arb_name(),
             group in arb_name(),
@@ -779,38 +779,38 @@ mod properties {
             // Keys equal iff repos are equal after lowering.
             let repos_equal = repo_a.eq_ignore_ascii_case(&repo_b);
             prop_assert_eq!(key_a == key_b, repos_equal,
-                "GH-GROUP-01: keys must differ iff repos differ (case-insensitive)");
+                "keys must differ iff repos differ (case-insensitive)");
         }
 
-        /// GH-SINGLE-01: Single mode cancels every existing pending holder,
+        /// Single mode cancels every existing pending holder,
         /// never cancels the arrival, and parks the arrival.
         #[test]
-        fn gh_single_01_cancel_all_pending_park_arrival(
+        fn single_mode_cancel_all_pending_park_arrival(
             pending in arb_pending(10),
         ) {
             let result = apply_queue_mode(ConcurrencyQueue::Single, &pending);
 
             // Never cancels arrival
             prop_assert!(!result.cancel_arrival,
-                "GH-SINGLE-01: arrival must never be cancelled in single mode");
+                "arrival must never be cancelled in single mode");
 
             // Always parks arrival
             prop_assert!(result.park_arrival,
-                "GH-SINGLE-01: arrival must always be parked in single mode");
+                "arrival must always be parked in single mode");
 
             // Cancels exactly all existing pending holders
             prop_assert_eq!(result.cancel_pending.len(), pending.len(),
-                "GH-SINGLE-01: must cancel all {} existing pending holders", pending.len());
+                "must cancel all {} existing pending holders", pending.len());
 
             // Cancel set matches pending contents and order
             let expected: Vec<Holder> = pending.iter().cloned().collect();
             prop_assert_eq!(&result.cancel_pending, &expected,
-                "GH-SINGLE-01: cancelled holders must match existing pending in order");
+                "cancelled holders must match existing pending in order");
         }
 
-        /// GH-MAX-01: Lengths 0..99 park the arrival without cancellation.
+        /// Lengths 0..99 park the arrival without cancellation.
         #[test]
-        fn gh_max_01_under_limit_parks(
+        fn max_concurrency_under_limit_parks(
             len in 0..100usize,
         ) {
             let pending: VecDeque<Holder> = (0..len as u32)
@@ -819,16 +819,16 @@ mod properties {
             let result = apply_queue_mode(ConcurrencyQueue::Max, &pending);
 
             prop_assert!(!result.cancel_arrival,
-                "GH-MAX-01: arrival must not be cancelled at len={len}");
+                "arrival must not be cancelled at len={len}");
             prop_assert!(result.park_arrival,
-                "GH-MAX-01: arrival must be parked at len={len}");
+                "arrival must be parked at len={len}");
             prop_assert!(result.cancel_pending.is_empty(),
-                "GH-MAX-01: no existing pending should be cancelled at len={len}");
+                "no existing pending should be cancelled at len={len}");
         }
 
-        /// GH-MAX-01: At exactly 100 pending, arrival is cancelled (overflow).
+        /// At exactly 100 pending, arrival is cancelled (overflow).
         #[test]
-        fn gh_max_01_at_limit_cancels_arrival(
+        fn max_concurrency_at_limit_cancels_arrival(
             extra in 0..6usize,
         ) {
             let len = QUEUE_MAX_PENDING + extra; // 100, 101, 102, 103, 104, 105
@@ -838,17 +838,17 @@ mod properties {
             let result = apply_queue_mode(ConcurrencyQueue::Max, &pending);
 
             prop_assert!(result.cancel_arrival,
-                "GH-MAX-01: arrival must be cancelled at len={len}");
+                "arrival must be cancelled at len={len}");
             prop_assert!(!result.park_arrival,
-                "GH-MAX-01: arrival must not be parked at len={len}");
+                "arrival must not be parked at len={len}");
             prop_assert!(result.cancel_pending.is_empty(),
-                "GH-MAX-01: existing queue must not be mutated at len={len}");
+                "existing queue must not be mutated at len={len}");
         }
 
-        /// GH-MAX-01: Boundary test at exactly 99/100/101 — the three critical
+        /// Boundary test at exactly 99/100/101 — the three critical
         /// values around QUEUE_MAX_PENDING.
         #[test]
-        fn gh_max_01_boundary_99_100_101(
+        fn max_concurrency_boundary_99_100_101(
             boundary in prop_oneof![Just(99usize), Just(100usize), Just(101usize)],
         ) {
             let pending: VecDeque<Holder> = (0..boundary as u32)
@@ -859,12 +859,12 @@ mod properties {
             match boundary {
                 99 => {
                     prop_assert!(!result.cancel_arrival,
-                        "GH-MAX-01: 99 pending must park arrival");
+                        "99 pending must park arrival");
                     prop_assert!(result.park_arrival);
                 }
                 100 | 101 => {
                     prop_assert!(result.cancel_arrival,
-                        "GH-MAX-01: {boundary} pending must cancel arrival");
+                        "{boundary} pending must cancel arrival");
                     prop_assert!(!result.park_arrival);
                 }
                 _ => unreachable!(),
@@ -1078,7 +1078,7 @@ mod properties {
         evaluate_concurrency(&raw, &ctx)
     }
 
-    /// GH-VALIDATE-02/03: the evaluated group limit counts UTF-16 code units
+    /// The evaluated group limit counts UTF-16 code units
     /// (C# `string.Length`), so 400 ASCII characters fit exactly and 401 are
     /// rejected with the evaluated length in the message.
     #[test]
@@ -1099,7 +1099,7 @@ mod properties {
         );
     }
 
-    /// GH-VALIDATE-05/06: an astral character counts as two UTF-16 code
+    /// An astral character counts as two UTF-16 code
     /// units, so 200 astral characters (400 units) fit and 201 (402 units)
     /// are rejected using that evaluated length.
     #[test]
@@ -1116,7 +1116,7 @@ mod properties {
         );
     }
 
-    /// GH-VALIDATE-07: BMP characters occupy one UTF-16 code unit each even
+    /// BMP characters occupy one UTF-16 code unit each even
     /// when they occupy two or more bytes in UTF-8.
     #[test]
     fn evaluated_bmp_group_length_400_utf16_units_is_accepted() {
@@ -1126,7 +1126,7 @@ mod properties {
         );
     }
 
-    /// GH-VALIDATE-01: `queue: max` with `cancel-in-progress: true` is
+    /// `queue: max` with `cancel-in-progress: true` is
     /// rejected before admission, never resolved as independent options.
     #[test]
     fn validate_max_plus_cancel_is_error() {
@@ -1150,7 +1150,7 @@ mod properties {
         let result = evaluate_concurrency(&incompatible, &ctx);
         assert!(
             result.is_err(),
-            "GH-VALIDATE-01: queue: max + cancel-in-progress: true must be rejected, got {result:?}"
+            "queue: max + cancel-in-progress: true must be rejected, got {result:?}"
         );
 
         // Each option alone stays valid.
@@ -1167,11 +1167,11 @@ mod properties {
     }
 
     proptest! {
-        /// GH-CTX-WF-01: workflow-scope concurrency receives `github`,
+        /// Workflow-scope concurrency receives `github`,
         /// `inputs` and `vars`, but never the job-only `matrix`, `strategy`
         /// or `needs` contexts.
         #[test]
-        fn gh_ctx_wf_01_enforces_workflow_context_allowlist(
+        fn workflow_context_enforces_allowlist(
             github_value in "[a-z]{1,8}",
             input_value in "[a-z]{1,8}",
             var_value in "[a-z]{1,8}",
@@ -1205,7 +1205,7 @@ mod properties {
                 queue: ConcurrencyQueue::Single,
             };
             let (group, cancel, queue) = evaluate_concurrency(&allowed, &ctx)
-                .expect("GH-CTX-WF-01: documented workflow contexts must evaluate");
+                .expect("documented workflow contexts must evaluate");
             prop_assert_eq!(group, format!("{github_value}-{input_value}-{var_value}"));
             prop_assert!(!cancel);
             prop_assert_eq!(queue, ConcurrencyQueue::Single);
@@ -1234,7 +1234,7 @@ mod properties {
             let resolved = evaluate_concurrency(&raw, &ctx);
             prop_assert!(
                 resolved.is_err(),
-                "GH-CTX-WF-01: workflow scope must not resolve {}: {:?}",
+                "workflow scope must not resolve {}: {:?}",
                 FORBIDDEN[forbidden_index],
                 resolved
             );

@@ -729,8 +729,8 @@ impl LiteBackend {
         })
     }
 
-    /// Allocate a plan-local log id and create its `log_files` row
-    /// (decision round 1, Q3): `INSERT .. SELECT COALESCE(MAX(log_id), 0) +
+    /// Allocate a plan-local log id and create its `log_files` row:
+    /// `INSERT .. SELECT COALESCE(MAX(log_id), 0) +
     /// 1 .. ON CONFLICT DO NOTHING RETURNING log_id`, arbitrated by
     /// `UNIQUE (plan_id, log_id)`. The plan's run comes from the attempt
     /// (`agent_job_id = plan_id`); an unknown plan is `NotFound`.

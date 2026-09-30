@@ -27,12 +27,16 @@ pub(crate) use crate::*;
 
 pub mod backend;
 pub(crate) mod lite;
+#[cfg(not(feature = "test-support"))]
 pub(crate) mod logic;
+// Integration test crates address `control::logic::session_uuid` directly.
+#[cfg(feature = "test-support")]
+pub mod logic;
 pub(crate) mod pg;
 #[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod testview;
+pub mod testview;
 pub(crate) mod txn_stats;
 pub mod types;
 pub(crate) mod wake;

@@ -1330,3 +1330,57 @@ async fn promotion_takes_the_promoted_runs_row_lock_first() {
     let (cancel, ()) = tokio::join!(cancel, delete);
     cancel.expect("the promotion must complete once R2's row lock is released");
 }
+
+/// Cancel-in-progress displacement locks the run it will cancel before the
+/// group's hold row. Otherwise it deadlocks against a command that already
+/// holds that run row and next needs the group.
+#[tokio::test]
+async fn gate_displacement_locks_the_cancelled_run_before_the_group() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let wf = || crate::control::types::WorkflowConcurrency {
+        group: "g".to_owned(),
+        cancel_in_progress: true,
+        queue: preloop_gha_parser::ConcurrencyQueue::Single,
+        raw: gate("g"),
+    };
+    let holder = RunId::new();
+    let mut first = submit_run(holder, vec![submit_job(holder, "build", 1)]);
+    first.workflow_concurrency = Some(wf());
+    node_a.submit_run(first).await.unwrap();
+
+    let conn = node_b.writer().await.unwrap();
+    conn.batch_execute("BEGIN").await.unwrap();
+    conn.query_one(
+        "SELECT 1 FROM runs WHERE run_id=$1::text::uuid FOR NO KEY UPDATE",
+        &[&holder.0.to_string()],
+    )
+    .await
+    .unwrap();
+
+    let arrival = RunId::new();
+    let mut second = submit_run(arrival, vec![submit_job(arrival, "build", 2)]);
+    second.record.run_number = 2;
+    second.workflow_concurrency = Some(wf());
+    let submit = node_a.submit_run(second);
+    let group_lock = async {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        conn.query_one(
+            "SELECT 1 FROM concurrency_holds \
+             WHERE namespace_id='default' AND repository='owner/repo' \
+               AND group_name='g' FOR UPDATE",
+            &[],
+        )
+        .await
+        .expect("the arrival must not hold the group row while waiting for the prior run row");
+        conn.batch_execute("COMMIT").await.unwrap();
+    };
+    let (submitted, ()) = tokio::join!(submit, group_lock);
+    let submitted = submitted.expect("displacement completes after the run-row lock is released");
+    assert_eq!(submitted.run_id, arrival);
+    assert_eq!(
+        node_a.run_record(holder).await.unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+}

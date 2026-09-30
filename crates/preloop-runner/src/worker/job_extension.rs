@@ -306,7 +306,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         // The tool-cache library falls back to the agent directory when
         // RUNNER_TOOL_CACHE is absent; export both like the official runner.
         ("AGENT_TOOLSDIRECTORY", tool_cache_dir(workspace)),
-        // P1.9: Missing GITHUB_*/RUNNER_* env vars (F034)
+        // Additional GITHUB_*/RUNNER_* env vars the official runner exports.
         (
             "GITHUB_REF_PROTECTED",
             str_from_json_or(&github, "ref_protected", "false"),

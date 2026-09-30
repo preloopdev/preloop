@@ -1011,20 +1011,29 @@ pub async fn broker_acquire_job(
             // A static PAT is embedded only when its OAuth scopes were
             // verified at submit (scope cache warm); unverifiable authority
             // stays withheld and the job keeps the runtime token.
-            shared
-                .state
-                .static_github_pat()
-                .and_then(|pat| crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes)))
-                .map(|(pat, scopes)| {
-                    message.variables.insert(
-                        "system.github.token.pat_scopes".to_owned(),
-                        preloop_gha_protocol::azdo::VariableValue::new(
-                            crate::runs::pat_scopes_wire_value(&scopes),
-                        ),
-                    );
-                    pat
-                })
-                .unwrap_or(runtime)
+            match shared.state.static_github_pat() {
+                Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
+                    Some(scopes) => {
+                        message.variables.insert(
+                            "system.github.token.pat_scopes".to_owned(),
+                            preloop_gha_protocol::azdo::VariableValue::new(
+                                crate::runs::pat_scopes_wire_value(&scopes),
+                            ),
+                        );
+                        pat
+                    }
+                    None => {
+                        message.variables.insert(
+                            "system.github.token.pat_scopes".to_owned(),
+                            preloop_gha_protocol::azdo::VariableValue::new(
+                                crate::runs::PAT_WITHHELD_WIRE_VALUE,
+                            ),
+                        );
+                        runtime
+                    }
+                },
+                None => runtime,
+            }
         };
         apply_minted_token_to_message(
             &mut message,

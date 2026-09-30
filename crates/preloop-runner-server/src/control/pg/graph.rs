@@ -14,7 +14,7 @@
 //!   deleted — it settles terminal (`queue_state = 'none'`) and keeps its
 //!   materialized legs beneath it.
 //! - `concurrency_waits.holder_kind = 'run'` marks a workflow-held run;
-//!   `jobs.queue_state = 'held'` covers both kinds of gate (decisions-5 B1).
+//!   `jobs.queue_state = 'held'` covers both kinds of gate.
 
 use super::codec::{self, us, us_to_system};
 use super::{PgBackend, db};

@@ -19,76 +19,58 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 /// Field names deliberately match the old `InnerState` scheduling subset —
 /// the ported logic reads identically, and every field here is either
-/// loaded from / written back to the database inside the command's
-/// transaction, or seeded from configuration at load time.
+/// loaded from the database or seeded from configuration at load time.
 #[derive(Clone)]
-pub(crate) struct JobRowState {
-    pub(crate) status: ExecutionStatus,
-    pub(crate) queue_position: Option<i64>,
-    pub(crate) seq: i64,
-    pub(crate) priority: i16,
-    pub(crate) run_order: i64,
-    pub(crate) job_order: i64,
-    pub(crate) not_before_us: Option<i64>,
-    pub(crate) namespace_id: String,
-    pub(crate) pool_key: String,
-    pub(crate) row_sig: Option<u64>,
-}
-
-/// Rows loaded into a [`TestState`] (legacy write-back bookkeeping; unused
-/// in the read view but kept so the struct compiles for tests).
-#[derive(Default, Clone)]
-pub(crate) struct LoadedRows {
-    pub(crate) runs: BTreeSet<RunId>,
-    pub(crate) jobs: BTreeMap<(RunId, JobId), QueueKind>,
-}
-
-/// Node-local side effects recorded by a command (legacy write-back
-/// bookkeeping; empty in the read view).
-#[derive(Default, Clone)]
-pub(crate) struct TxSideEffects {
-    pub(crate) live_log_removals: Vec<String>,
-    pub(crate) live_log_closes: Vec<String>,
-    pub(crate) dap_removals: Vec<RunId>,
+pub struct JobRowState {
+    pub status: ExecutionStatus,
+    pub queue_position: Option<i64>,
+    pub seq: i64,
+    pub priority: i16,
+    pub run_order: i64,
+    pub job_order: i64,
+    pub not_before_us: Option<i64>,
+    pub namespace_id: String,
+    pub pool_key: String,
+    pub row_sig: Option<u64>,
 }
 
 #[derive(Default, Clone)]
-pub(crate) struct TestState {
+pub struct TestState {
     // ── Runs and queue collections ────────────────────────────────────
-    pub(crate) runs: BTreeMap<RunId, RunRecord>,
+    pub runs: BTreeMap<RunId, RunRecord>,
     /// Tenant identity persisted alongside each run, including scoped
     /// foreign runs selected through the ready queue.
-    pub(crate) run_namespaces: BTreeMap<RunId, String>,
-    pub(crate) workflow_run_counters: BTreeMap<String, u64>,
+    pub run_namespaces: BTreeMap<RunId, String>,
+    pub workflow_run_counters: BTreeMap<String, u64>,
     /// Ready-queue jobs *in this working set*. The global queue is the
     /// `jobs` table (`queue_kind='ready'` ordered by `queue_position`); this
     /// deque holds the candidates a poll inspected plus jobs this command
     /// newly enqueued, in order.
-    pub(crate) queue: VecDeque<QueuedJob>,
+    pub queue: VecDeque<QueuedJob>,
     /// The global ready queue: every `jobs` row with `queue_kind='ready'`,
     /// in `queue_position` order. Commands that scan the queue (claim
     /// selection, capability matching, stuck-on-external-hosts) read this;
     /// `queue` holds only jobs this transaction newly enqueued.
-    pub(crate) ready_index: VecDeque<QueuedJob>,
+    pub ready_index: VecDeque<QueuedJob>,
     /// Global ready-queue size at load time, adjusted as this transaction
     /// pushes/pops — reported back for the supervisor atomic.
-    pub(crate) ready_count: i64,
+    pub ready_count: i64,
     /// Set by a Postgres poll: the ready jobs this transaction locked. Other
     /// loaded ready jobs (siblings in a candidate run) may be claimed by a
     /// concurrent poll and must not be chosen here. `None`: every loaded
     /// ready job is claimable (single-writer and global transactions).
-    pub(crate) poll_claimable: Option<BTreeSet<(RunId, JobId)>>,
+    pub poll_claimable: Option<BTreeSet<(RunId, JobId)>>,
     /// `runs-on` labels of the global ready-queue front, captured unscoped.
     /// Pool scaling reads this; a scoped `ready_index` head can name the
     /// wrong platform.
-    pub(crate) next_queue_labels: Vec<String>,
+    pub next_queue_labels: Vec<String>,
     /// Whether the global ready queue was loaded into `ready_index` this
     /// transaction (`scope.ready_queue`). When true, `next_job_labels` reads
     /// the live front (post-claim); when false, it falls back to the
     /// load-time `next_queue_labels` snapshot.
-    pub(crate) ready_queue_loaded: bool,
+    pub ready_queue_loaded: bool,
     /// Reaper bookkeeping: when each ready job was first observed queued.
-    pub(crate) queued_at: BTreeMap<(RunId, JobId), std::time::SystemTime>,
+    pub queued_at: BTreeMap<(RunId, JobId), std::time::SystemTime>,
     /// Persisted `(status, queue_position, seq)` for every `jobs` row this
     /// transaction loaded. A job whose run is NOT in `tx.runs` was widened in
     /// by a global queue-kind clause — its run record, queue position and
@@ -96,113 +78,106 @@ pub(crate) struct TestState {
     /// for a row staying in the SAME slot; a transition or requeue allocates
     /// fresh. Status is preserved verbatim for same-slot widened rows and
     /// otherwise comes from `job_status` (explicit override) or `run.jobs`.
-    pub(crate) job_row_state: BTreeMap<(RunId, JobId), JobRowState>,
+    pub job_row_state: BTreeMap<(RunId, JobId), JobRowState>,
     /// Explicit per-job status overrides set by commands via
     /// [`TestState::set_job_status`]. Checked first at write-back so a command
     /// can mark a job `queued`/`in_progress` even when its run record isn't
     /// loaded (a widened foreign job being promoted or requeued).
-    pub(crate) job_status: BTreeMap<(RunId, JobId), ExecutionStatus>,
-    pub(crate) pending_jobs: VecDeque<QueuedJob>,
-    pub(crate) pending_expansions: VecDeque<QueuedJob>,
+    pub job_status: BTreeMap<(RunId, JobId), ExecutionStatus>,
+    pub pending_jobs: VecDeque<QueuedJob>,
+    pub pending_expansions: VecDeque<QueuedJob>,
     /// Expansion reservations held by this working set.
-    pub(crate) expanding: BTreeSet<(RunId, JobId)>,
+    pub expanding: BTreeSet<(RunId, JobId)>,
     /// Payloads of claimed-but-unapplied expansion nodes, kept at load so a
     /// crash recovery can push them back onto `pending_expansions` instead
     /// of losing the node (the row's payload columns and sealed message survive write-back).
-    pub(crate) expanding_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
+    pub expanding_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
     /// Generation this transaction claimed each expanding node under.
-    pub(crate) expand_generations: BTreeMap<(RunId, JobId), i64>,
-    pub(crate) concurrency_blocked: VecDeque<QueuedJob>,
-    pub(crate) held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
-    pub(crate) claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
+    pub expand_generations: BTreeMap<(RunId, JobId), i64>,
+    pub concurrency_blocked: VecDeque<QueuedJob>,
+    pub held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
+    pub claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
 
     // ── Runners and sessions ──────────────────────────────────────────
-    pub(crate) runners: BTreeMap<i64, RegisteredRunner>,
-    pub(crate) runner_registered_at: BTreeMap<i64, std::time::SystemTime>,
-    pub(crate) runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
-    pub(crate) runner_client_ids: BTreeMap<String, i64>,
-    pub(crate) pool_proven_runners: BTreeSet<i64>,
+    pub runners: BTreeMap<i64, RegisteredRunner>,
+    pub runner_registered_at: BTreeMap<i64, std::time::SystemTime>,
+    pub runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
+    pub runner_client_ids: BTreeMap<String, i64>,
+    pub pool_proven_runners: BTreeSet<i64>,
     /// AzDO-protocol sessions (`sessions` rows).
-    pub(crate) sessions: BTreeMap<String, RunnerSession>,
+    pub sessions: BTreeMap<String, RunnerSession>,
     /// Broker-protocol session → runner.
-    pub(crate) broker_session_runners: BTreeMap<String, i64>,
-    pub(crate) session_last_seen: BTreeMap<String, std::time::SystemTime>,
-    pub(crate) session_active_requests: BTreeMap<String, i64>,
-    pub(crate) azdo_sessions: HashSet<String>,
+    pub broker_session_runners: BTreeMap<String, i64>,
+    pub session_last_seen: BTreeMap<String, std::time::SystemTime>,
+    pub session_active_requests: BTreeMap<String, i64>,
+    pub azdo_sessions: HashSet<String>,
     /// Sessions created under a verified listen token (the token named the
     /// runner). Only these count toward the duplicate-live-session conflict:
     /// an unverified compat session must never squat a runner id and block
     /// the legitimate runner's own session.
-    pub(crate) verified_sessions: HashSet<String>,
+    pub verified_sessions: HashSet<String>,
     /// Undelivered session messages (broker_messages table).
-    pub(crate) inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
+    pub inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
 
     // ── Requests, messages, grants ────────────────────────────────────
-    pub(crate) job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
+    pub job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
     /// request_id → undelivered job message (job_request_messages table).
-    pub(crate) broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
-    pub(crate) github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
-    pub(crate) id_token_grants: BTreeMap<(RunId, JobId), bool>,
-    pub(crate) oidc_job_contexts: BTreeMap<(RunId, JobId), OidcJobContext>,
+    pub broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
+    pub github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
+    pub id_token_grants: BTreeMap<(RunId, JobId), bool>,
+    pub oidc_job_contexts: BTreeMap<(RunId, JobId), OidcJobContext>,
     /// Derived lookup maps — rebuilt on load, never persisted directly.
-    pub(crate) inflight_requests: BTreeMap<i64, (RunId, JobId)>,
-    pub(crate) plan_requests: BTreeMap<String, i64>,
-    pub(crate) agent_job_requests: BTreeMap<uuid::Uuid, i64>,
-    pub(crate) timeline_requests: BTreeMap<uuid::Uuid, i64>,
-    pub(crate) next_message_id: i64,
-    pub(crate) next_runner_id: i64,
+    pub inflight_requests: BTreeMap<i64, (RunId, JobId)>,
+    pub plan_requests: BTreeMap<String, i64>,
+    pub agent_job_requests: BTreeMap<uuid::Uuid, i64>,
+    pub timeline_requests: BTreeMap<uuid::Uuid, i64>,
+    pub next_message_id: i64,
+    pub next_runner_id: i64,
     /// Next job-request correlation id on SQLite, where the single writer
     /// serializes every allocation.
-    pub(crate) next_request_id: i64,
+    pub next_request_id: i64,
     /// Request ids reserved from Postgres `request_id_seq` before this
     /// transaction loaded. `Some` means allocation must come from the pool:
     /// run-scoped writers on different runs run concurrently, so an
     /// in-memory `max + 1` would hand two of them the same primary key.
-    pub(crate) reserved_request_ids: Option<VecDeque<i64>>,
+    pub reserved_request_ids: Option<VecDeque<i64>>,
     /// Set when a command allocated more request ids than were reserved.
     /// Write-back refuses to commit such a transaction.
-    pub(crate) request_id_shortfall: bool,
+    pub request_id_shortfall: bool,
 
     // ── Steps ─────────────────────────────────────────────────────────
     /// Step manifest per execution attempt (`agent_job_id`), in manifest
     /// order. Persisted one row per step in `job_steps`.
-    pub(crate) job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
+    pub job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
 
     // ── Concurrency and jobsets ───────────────────────────────────────
-    pub(crate) concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
-    pub(crate) holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
-    pub(crate) jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
-    pub(crate) jobset_ready: BTreeSet<JobSetId>,
-    pub(crate) run_concurrency: BTreeMap<RunId, preloop_gha_parser::Concurrency>,
+    pub concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
+    pub holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
+    pub jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
+    pub jobset_ready: BTreeSet<JobSetId>,
+    pub run_concurrency: BTreeMap<RunId, preloop_gha_parser::Concurrency>,
 
     // ── Assignments and cancellations ─────────────────────────────────
-    pub(crate) job_assignments: BTreeMap<(RunId, JobId), crate::models::AssignmentRecord>,
-    pub(crate) pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
-    pub(crate) cancellation_queue: VecDeque<QueuedCancellation>,
+    pub job_assignments: BTreeMap<(RunId, JobId), crate::models::AssignmentRecord>,
+    pub pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
+    pub cancellation_queue: VecDeque<QueuedCancellation>,
     /// Durable outbox rows written in this working set: `(run, topic)`, in
     /// `event_id` order. Test-only read for the transactional event contract.
-    pub(crate) outbox_topics: Vec<(Option<RunId>, String)>,
+    pub outbox_topics: Vec<(Option<RunId>, String)>,
     /// Every queued job cancellation with its recorded reason
     /// (`job_cancellations.reason`), in cancellation order.
-    pub(crate) cancellation_reasons: Vec<(RunId, JobId, Option<String>)>,
+    pub cancellation_reasons: Vec<(RunId, JobId, Option<String>)>,
 
     // ── Configuration seeded at load (not persisted) ──────────────────
-    pub(crate) pool_assignments_enabled: bool,
-    pub(crate) require_job_assignments: bool,
-    pub(crate) runner_liveness_timeout: std::time::Duration,
+    pub pool_assignments_enabled: bool,
+    pub require_job_assignments: bool,
+    pub runner_liveness_timeout: std::time::Duration,
     /// Observable count of stale bindings released this transaction.
-    pub(crate) released_bindings_count: u64,
-
-    // ── Write-back bookkeeping ────────────────────────────────────────
-    /// Identity of every row loaded into this working set, per family.
-    /// Write-back upserts present rows and deletes loaded-but-removed rows.
-    pub(crate) loaded: LoadedRows,
-    /// Node-local side effects to apply after commit.
-    pub(crate) side: TxSideEffects,
+    pub released_bindings_count: u64,
 }
 
 /// Every session id with a `runner_sessions` row in the working set.
-pub(crate) fn session_ids(tx: &TestState) -> BTreeSet<String> {
+pub fn session_ids(tx: &TestState) -> BTreeSet<String> {
     tx.broker_session_runners
         .keys()
         .chain(tx.sessions.keys())
@@ -216,7 +191,7 @@ pub(crate) fn session_ids(tx: &TestState) -> BTreeSet<String> {
 /// Everything the `runner_sessions` row of `session_id` is written from.
 impl TestState {
     /// Seed configuration that used to live on `InnerState`.
-    pub(crate) fn with_config(mut self, config: (bool, bool, std::time::Duration)) -> Self {
+    pub fn with_config(mut self, config: (bool, bool, std::time::Duration)) -> Self {
         self.pool_assignments_enabled = config.0;
         self.require_job_assignments = config.1;
         self.runner_liveness_timeout = config.2;
@@ -227,7 +202,7 @@ impl TestState {
     /// (`ready_index`) followed by jobs this transaction newly enqueued
     /// (`queue`). The method
     /// form auto-borrows, so it works on owned and `&mut` receivers alike.
-    pub(crate) fn ready(&self) -> impl Iterator<Item = &QueuedJob> {
+    pub fn ready(&self) -> impl Iterator<Item = &QueuedJob> {
         self.ready_index.iter().chain(self.queue.iter())
     }
 
@@ -240,7 +215,7 @@ impl TestState {
     /// Rebuild the derived request lookup maps after `job_requests` changed.
     /// Called by the backend after loading and by ported code that inserts
     /// or removes request records.
-    pub(crate) fn reindex_requests(&mut self) {
+    pub fn reindex_requests(&mut self) {
         self.inflight_requests = self
             .job_requests
             .iter()
@@ -265,7 +240,7 @@ impl TestState {
     }
 
     /// Register a request record and its derived index entries.
-    pub(crate) fn insert_request(&mut self, record: TaskAgentJobRequestRecord) {
+    pub fn insert_request(&mut self, record: TaskAgentJobRequestRecord) {
         let request_id = record.request_id;
         if record.result.is_none() {
             self.inflight_requests
@@ -281,7 +256,7 @@ impl TestState {
     }
 
     /// Remove a request record and its derived index entries.
-    pub(crate) fn remove_request(&mut self, request_id: i64) -> Option<TaskAgentJobRequestRecord> {
+    pub fn remove_request(&mut self, request_id: i64) -> Option<TaskAgentJobRequestRecord> {
         let record = self.job_requests.remove(&request_id)?;
         self.inflight_requests.remove(&request_id);
         if self.plan_requests.get(&record.plan_id) == Some(&request_id) {
@@ -297,7 +272,7 @@ impl TestState {
     }
 
     /// Push a job onto the ready queue (working-set copy) and count it.
-    pub(crate) fn push_ready(&mut self, job: QueuedJob) {
+    pub fn push_ready(&mut self, job: QueuedJob) {
         self.queue.push_back(job);
         self.ready_count += 1;
     }
@@ -307,7 +282,7 @@ impl TestState {
     /// loaded, mirrors it into `run.jobs` so `summarize_run` and `run_record`
     /// see the same value. Use this instead of `run.jobs.insert` for any
     /// transition that may touch a widened job whose run isn't loaded.
-    pub(crate) fn set_job_status(&mut self, run_id: RunId, job_id: JobId, status: ExecutionStatus) {
+    pub fn set_job_status(&mut self, run_id: RunId, job_id: JobId, status: ExecutionStatus) {
         self.job_status.insert((run_id, job_id.clone()), status);
         if let Some(run) = self.runs.get_mut(&run_id) {
             run.jobs.insert(job_id, status);
@@ -315,7 +290,7 @@ impl TestState {
     }
 
     /// Remove the job at `pos` from the ready queue (working-set copy).
-    pub(crate) fn remove_ready(&mut self, pos: usize) -> Option<QueuedJob> {
+    pub fn remove_ready(&mut self, pos: usize) -> Option<QueuedJob> {
         let job = self.queue.remove(pos)?;
         self.ready_count -= 1;
         Some(job)
@@ -325,7 +300,7 @@ impl TestState {
     /// queue (`ready_index` + this-transaction `queue`), decrementing
     /// `ready_count` for each removal. Raw `retain` on either deque leaves
     /// the scalar stale-high, so every removal path must go through here.
-    pub(crate) fn retain_ready(&mut self, mut pred: impl FnMut(&QueuedJob) -> bool) {
+    pub fn retain_ready(&mut self, mut pred: impl FnMut(&QueuedJob) -> bool) {
         let before = self.queue.len() + self.ready_index.len();
         self.queue.retain(|job| pred(job));
         self.ready_index.retain(|job| pred(job));
@@ -335,13 +310,13 @@ impl TestState {
 
     /// Whether the global ready queue is non-empty after this transaction's
     /// changes (used for the notify decision).
-    pub(crate) fn queue_nonempty(&self) -> bool {
+    pub fn queue_nonempty(&self) -> bool {
         self.ready_count > 0 || !self.cancellation_queue.is_empty()
     }
 
     /// Runner that owns a session, checking broker then AzDO maps — the
     /// same precedence the old `InnerState::runner_id_for_session` used.
-    pub(crate) fn runner_id_for_session(&self, session_id: &str) -> Option<i64> {
+    pub fn runner_id_for_session(&self, session_id: &str) -> Option<i64> {
         self.broker_session_runners
             .get(session_id)
             .copied()
@@ -353,7 +328,7 @@ impl TestState {
     }
 
     /// Dispatch metadata for the runner owning `session_id`.
-    pub(crate) fn runner_capabilities_for_session(
+    pub fn runner_capabilities_for_session(
         &self,
         session_id: &str,
     ) -> crate::models::RunnerCapabilities {
@@ -369,13 +344,13 @@ impl TestState {
     }
 
     /// Record a session poll (durable `last_seen_at_us` on write-back).
-    pub(crate) fn mark_session_seen(&mut self, session_id: &str) {
+    pub fn mark_session_seen(&mut self, session_id: &str) {
         self.session_last_seen
             .insert(session_id.to_owned(), std::time::SystemTime::now());
     }
 
     /// Allocate the next broker message id (counters table on write-back).
-    pub(crate) fn next_broker_message_id(&mut self) -> i64 {
+    pub fn next_broker_message_id(&mut self) -> i64 {
         self.next_message_id += 1;
         self.next_message_id
     }
@@ -385,7 +360,7 @@ impl TestState {
     /// marks the transaction so write-back refuses it (and returns a
     /// placeholder that is never persisted). SQLite's single writer
     /// serializes allocation, so it advances the loaded counter.
-    pub(crate) fn alloc_request_id(&mut self) -> i64 {
+    pub fn alloc_request_id(&mut self) -> i64 {
         if let Some(pool) = &mut self.reserved_request_ids {
             if let Some(id) = pool.pop_front() {
                 return id;

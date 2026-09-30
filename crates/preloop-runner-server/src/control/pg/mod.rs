@@ -168,6 +168,10 @@ pub(crate) struct PgBackend {
     /// after open from the real server config. Empty until then — no rules
     /// means every environment gate proceeds, the pre-rules behavior.
     environment_rules: parking_lot::RwLock<std::sync::Arc<crate::config::EnvironmentRulesMap>>,
+    /// The co-hosted runner pool's shared status handle; its advertised
+    /// labels decide whether a `runs-on` is satisfiable at submit and
+    /// promotion. Detached (no labels) until bootstrap hands it over.
+    pool_status: parking_lot::RwLock<preloop_observability::status::PoolStatus>,
     /// Stale claim bindings released since boot (`tx.released_bindings_count`
     /// parity — process-local, reset on restart).
     released_bindings: std::sync::atomic::AtomicU64,
@@ -200,6 +204,7 @@ impl PgBackend {
             environment_rules: parking_lot::RwLock::new(std::sync::Arc::new(
                 crate::config::EnvironmentRulesMap::new(),
             )),
+            pool_status: parking_lot::RwLock::new(Default::default()),
             released_bindings: std::sync::atomic::AtomicU64::new(0),
             wakes: super::wake::spawn_listener(url.to_owned()),
         })
@@ -249,6 +254,16 @@ impl PgBackend {
     /// The live environment protection rules (an `Arc` clone, cheap).
     pub(super) fn environment_rules(&self) -> std::sync::Arc<crate::config::EnvironmentRulesMap> {
         self.environment_rules.read().clone()
+    }
+
+    /// Share the runner pool's status handle (bootstrap / `AppState`).
+    pub(crate) fn set_pool_status(&self, status: preloop_observability::status::PoolStatus) {
+        *self.pool_status.write() = status;
+    }
+
+    /// The labels the co-hosted pool advertises; empty when none published.
+    pub(super) fn pool_labels(&self) -> Vec<String> {
+        self.pool_status.read().labels()
     }
 
     /// A connection for a command transaction.

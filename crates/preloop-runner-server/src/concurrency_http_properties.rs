@@ -291,7 +291,7 @@ pub mod http_sequences {
 
     /// Property: pending runs (held in held_runs) expose no dispatchable broker job.
     ///
-    /// Contract: GH-SLOT-01 — a pending holder must not leak jobs into the
+    /// Contract: a pending holder must not leak jobs into the
     /// dispatch queue, otherwise a runner could pick up a job before the
     /// concurrency gate opens.
     #[tokio::test]
@@ -313,7 +313,7 @@ pub mod http_sequences {
         for held_id in &held_run_ids {
             assert!(
                 !queue_run_ids.contains(held_id),
-                "GH-SLOT-01: held run {held_id} must not have jobs in the dispatch queue"
+                "held run {held_id} must not have jobs in the dispatch queue"
             );
         }
         // The running holder's run should have queued jobs.
@@ -374,7 +374,7 @@ pub mod http_sequences {
         let total_cancels = cancel_count + msg_cancel_count;
         assert_eq!(
             total_cancels, 1,
-            "GH-CANCEL-01: expected exactly 1 cancellation message for A, got {total_cancels} \
+            "expected exactly 1 cancellation message for A, got {total_cancels} \
              (queue={cancel_count}, inflight={msg_cancel_count})"
         );
         drop(tx);
@@ -388,7 +388,7 @@ pub mod http_sequences {
     /// cancellation message, because the replaced pending run was never
     /// dispatched to a runner.
     ///
-    /// Contract: GH-SINGLE-01 — replacing a pending holder sends no
+    /// Contract: replacing a pending holder sends no
     /// JobCancellation because the runner never received a job.
     #[tokio::test]
     async fn pending_only_replacement_no_runner_cancellation() {
@@ -432,7 +432,7 @@ pub mod http_sequences {
         // specifically for B's run_id.)
         assert_eq!(
             b_cancels, 0,
-            "GH-SINGLE-01: pending-only cancelled run must emit no runner cancellation"
+            "pending-only cancelled run must emit no runner cancellation"
         );
     }
 
@@ -478,7 +478,7 @@ pub mod http_sequences {
     /// Property: different repositories NEVER interfere; case variants in
     /// one repository DO interfere.
     ///
-    /// Contract: GH-GROUP-01 — group identity is (repository, case-insensitive
+    /// Contract: group identity is (repository, case-insensitive
     /// group name). Different repos are independent.
     #[tokio::test]
     async fn repo_isolation_and_case_folding() {
@@ -509,14 +509,14 @@ pub mod http_sequences {
         let c_run = get_run(&app, c_id).await;
         assert_eq!(
             c_run["status"], "pending",
-            "GH-GROUP-01: case-folded group in same repo must contend"
+            "case-folded group in same repo must contend"
         );
 
         // b should still be queued (different repo).
         let b_run = get_run(&app, b_id).await;
         assert_eq!(
             b_run["status"], "queued",
-            "GH-GROUP-01: different repo must not interfere"
+            "different repo must not interfere"
         );
     }
 
@@ -648,7 +648,7 @@ pub mod http_sequences {
 
     /// Property: max queue mode preserves all pending holders (up to 100).
     ///
-    /// Contract: GH-MAX-01 — queue:max parks arrivals as pending without
+    /// Contract: queue:max parks arrivals as pending without
     /// cancelling existing pending holders.
     #[tokio::test]
     async fn max_queue_preserves_pending_holders() {
@@ -673,7 +673,7 @@ pub mod http_sequences {
             let run = get_run(&app, id).await;
             assert_eq!(
                 run["status"], "pending",
-                "GH-MAX-01: run {id} should be pending under queue:max, got {}",
+                "run {id} should be pending under queue:max, got {}",
                 run["status"]
             );
         }
@@ -681,7 +681,7 @@ pub mod http_sequences {
 
     /// Property: FIFO promotion under queue:max.
     ///
-    /// Contract: GH-FIFO-01 — pending holders are promoted in admission order.
+    /// Contract: pending holders are promoted in admission order.
     #[tokio::test]
     async fn max_queue_fifo_promotion() {
         let temp = tempfile::tempdir().unwrap();
@@ -704,12 +704,12 @@ pub mod http_sequences {
         let c_run = get_run(&app, &c_id).await;
         assert!(
             b_run["status"] == "queued" || b_run["status"] == "in_progress",
-            "GH-FIFO-01: B must be promoted before C, got B={}",
+            "B must be promoted before C, got B={}",
             b_run["status"]
         );
         assert_eq!(
             c_run["status"], "pending",
-            "GH-FIFO-01: C must remain pending when B is promoted"
+            "C must remain pending when B is promoted"
         );
     }
 
@@ -717,7 +717,7 @@ pub mod http_sequences {
     ///
     /// This exercises bounded generated operation sequences against the real
     /// Axum router, checking after every operation:
-    /// 1. At most one running holder per group (GH-SLOT-01)
+    /// 1. At most one running holder per group
     /// 2. Pending runs have no dispatchable jobs
     /// 3. Terminal holders are absent from dispatch/concurrency queues
     /// 4. No cross-run state leakage
@@ -794,7 +794,7 @@ pub mod http_sequences {
                 // ── After-operation invariant checks ────────────────────
                 let tx = state.test_tx().await;
 
-                // INV-1: GH-SLOT-01 — at most one running holder per group.
+                // At most one running holder per group.
                 for (key, group) in &tx.concurrency_groups {
                     assert!(
                         group.running.as_ref().is_none_or(|_| true),
@@ -803,7 +803,7 @@ pub mod http_sequences {
                     // The running field is Option<Holder>, so it's at most one.
                 }
 
-                // INV-2: Pending runs (held_runs) must not have jobs in queue.
+                // Pending runs (held_runs) must not have jobs in queue.
                 for held_run_id in tx.held_runs.keys() {
                     let in_queue = tx.ready().any(|j| j.run_id == *held_run_id);
                     assert!(
@@ -812,7 +812,7 @@ pub mod http_sequences {
                     );
                 }
 
-                // INV-3: Terminal runs have no entries in dispatch/concurrency queues.
+                // Terminal runs have no entries in dispatch/concurrency queues.
                 for (run_id, run) in &tx.runs {
                     if run.status.is_terminal() {
                         let in_queue = tx.ready().any(|j| &j.run_id == run_id);
@@ -827,7 +827,7 @@ pub mod http_sequences {
                     }
                 }
 
-                // INV-4: No duplicate (run_id, job_id) in queue.
+                // No duplicate (run_id, job_id) in queue.
                 {
                     let mut seen = std::collections::HashSet::new();
                     for j in tx.ready() {
@@ -840,7 +840,7 @@ pub mod http_sequences {
                     }
                 }
 
-                // INV-5: No duplicate (run_id, job_id) in pending_jobs.
+                // No duplicate (run_id, job_id) in pending_jobs.
                 {
                     let mut seen = std::collections::HashSet::new();
                     for j in &tx.pending_jobs {
@@ -853,7 +853,7 @@ pub mod http_sequences {
                     }
                 }
 
-                // INV-6: No duplicate (run_id, job_id) in concurrency_blocked.
+                // No duplicate (run_id, job_id) in concurrency_blocked.
                 {
                     let mut seen = std::collections::HashSet::new();
                     for j in &tx.concurrency_blocked {

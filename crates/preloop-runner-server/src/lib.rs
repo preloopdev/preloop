@@ -40,8 +40,8 @@ pub mod remote_workflows;
 pub mod reusable_workflows;
 pub mod runs;
 pub mod secret_provider;
-#[cfg(test)]
-mod test_pg;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_pg;
 use runs::*;
 pub mod runtime_scheduling;
 use runtime_scheduling::*;

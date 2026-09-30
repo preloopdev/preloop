@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(evaluate_template(literal, &ctx).unwrap(), literal);
     }
 
-    // --- P1 expressions/templates gap coverage ---
+    // --- expressions/templates gap coverage ---
 
     #[test]
     fn template_with_matrix_context() {

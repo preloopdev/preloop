@@ -849,6 +849,26 @@ pub(crate) mod suite {
         assert_eq!(push.pr_number, Some(42));
         assert_eq!(push.effective_sha.as_deref(), Some("tested-sha"));
         assert_eq!(run.jobs[&JobId("build".into())], ExecutionStatus::Queued);
+
+        // An unknown run is a no-op, not an error, on every backend: callers
+        // treat any `Err` as a failed write of a run they do hold.
+        let unknown = RunId::new();
+        backend
+            .set_push_state(
+                unknown,
+                crate::models::PushState {
+                    status: crate::models::PushStatus::Blocked,
+                    error: None,
+                    pr_number: None,
+                    effective_sha: None,
+                },
+            )
+            .await
+            .expect("an unknown run is a no-op");
+        assert!(
+            backend.run_record(unknown).await.is_err(),
+            "nothing was created"
+        );
     }
 
     /// Artifact scope resolution: a plan id (the request's `agent_job_id`
@@ -1074,6 +1094,115 @@ pub(crate) mod suite {
         );
     }
 
+    /// A deferred matrix node fans out with its own scoped `inputs`: the
+    /// caller's `with:` values when the node was materialized inside a
+    /// reusable callee (its stored plan carries them), else the run's dispatch
+    /// inputs. Fanning out with anything else hands the cells an `inputs`
+    /// context no other job in the run sees (#285).
+    pub(crate) async fn deferred_matrix_expansion_scopes_its_inputs(backend: &dyn ControlBackend) {
+        // A top-level node has no stored plan; the fan-out falls back to the
+        // dispatch inputs the submit path stamped on every plan.
+        let run_id = RunId::new();
+        let dispatch_inputs = BTreeMap::from([("dry_run".to_owned(), serde_json::json!(true))]);
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]);
+        submit.record.submission = Arc::new(preloop_gha_protocol::WorkflowSubmission {
+            dispatch_inputs: dispatch_inputs.clone(),
+            ..submission()
+        });
+        backend.submit_run(submit).await.unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+        match claim
+            .plan
+            .expect("a deferred matrix node must plan an expansion")
+        {
+            crate::control::logic::ExpansionPlan::Matrix(inputs) => assert_eq!(
+                inputs.scoped_inputs, dispatch_inputs,
+                "a top-level deferred node must fan out with the dispatch inputs"
+            ),
+            crate::control::logic::ExpansionPlan::Reusable(_) => {
+                panic!("expected a matrix expansion plan")
+            }
+        }
+
+        // A node inside a reusable callee carries the caller's `with:` values
+        // on its stored plan; the empty dispatch map of a push-triggered run
+        // must not erase them.
+        let run_id = RunId::new();
+        let with_values = BTreeMap::from([("mode".to_owned(), serde_json::json!("plan"))]);
+        let stored_plan: preloop_gha_protocol::JobPlan =
+            serde_json::from_value(serde_json::json!({
+                "id": "call/fan",
+                "base_id": "call/fan",
+                "name": "call / fan",
+                "runs_on": ["self-hosted"],
+                "inputs": {"mode": "plan"},
+            }))
+            .expect("the stored callee plan decodes");
+        let mut callee_fan = submit_job(run_id, "call/fan", 2);
+        callee_fan.queued.needs = vec![JobId("call/gen".to_owned())];
+        callee_fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "call/gen", 1), callee_fan]);
+        assert!(
+            submit.record.submission.dispatch_inputs.is_empty(),
+            "the callee case must not be rescued by a root dispatch map"
+        );
+        submit
+            .record
+            .caller_plans
+            .insert(JobId("call/fan".to_owned()), stored_plan);
+        backend.submit_run(submit).await.unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("call/gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred callee node must be leased");
+        assert_eq!(claim.job.job_id, JobId("call/fan".to_owned()));
+        match claim
+            .plan
+            .expect("a deferred matrix node must plan an expansion")
+        {
+            crate::control::logic::ExpansionPlan::Matrix(inputs) => assert_eq!(
+                inputs.scoped_inputs, with_values,
+                "a callee node must fan out with the caller's with values"
+            ),
+            crate::control::logic::ExpansionPlan::Reusable(_) => {
+                panic!("expected a matrix expansion plan")
+            }
+        }
+    }
+
     /// Cancelling a run that already completed is a no-op: the terminal
     /// conclusion is preserved (pg guards the transition; lite must too).
     pub(crate) async fn cancel_of_terminal_run_preserves_conclusion(backend: &dyn ControlBackend) {
@@ -1159,6 +1288,7 @@ pub(crate) mod suite {
                 paused: BTreeMap::new(),
                 pool_preparing: false,
                 warm_window_open: false,
+                pool_labels: Vec::new(),
                 first_seen: BTreeMap::new(),
             })
             .await
@@ -1180,7 +1310,11 @@ pub(crate) mod suite {
             "starvation must not release the run's workflow concurrency hold"
         );
         let b = backend.run_record(run_b).await.unwrap();
-        assert!(!b.status.is_terminal(), "the held run must stay live");
+        assert_eq!(
+            b.status,
+            ExecutionStatus::Pending,
+            "the held run stays parked behind the group on every backend"
+        );
     }
 
     /// A parked cancellation is redelivered with its stored protocol body
@@ -1778,6 +1912,59 @@ pub(crate) mod suite {
         );
     }
 
+    /// A single timeline is bounded by both record count and aggregate
+    /// record size. The newest PATCH is retained even when it is the only
+    /// record large enough to exceed the byte budget.
+    pub(crate) async fn timeline_patch_enforces_byte_budget(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("timeline-bytes"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a claim");
+        };
+        let key = format!(
+            "{}/{}",
+            claimed.request.plan_id, claimed.request.timeline_id
+        );
+        let fill: Vec<_> = (1..=MAX_TIMELINE_RECORDS as u128)
+            .map(|id| timeline_record(id, "small"))
+            .collect();
+        backend.patch_timeline(&key, fill).await.unwrap();
+
+        let mut huge = timeline_record(u128::MAX, "huge");
+        huge.current_operation =
+            Some("x".repeat(crate::memory_caps::MAX_TIMELINE_BYTES_PER_TIMELINE + 1024));
+        let (_, patched) = backend.patch_timeline(&key, vec![huge]).await.unwrap();
+        assert!(
+            patched
+                .iter()
+                .any(|record| record.name.as_deref() == Some("huge")),
+            "the fresh record must remain in the PATCH response"
+        );
+        assert_eq!(
+            patched.len(),
+            1,
+            "oversized input is reduced to the protected fresh record"
+        );
+        let (_, fetched) = backend.get_timeline(&key, 0, usize::MAX).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].name.as_deref(), Some("huge"));
+    }
+
     /// A run's workflow-level concurrency hold is released by the completion
     /// that makes the run terminal (not only by a cancellation): the group
     /// stops naming the finished run, a later arrival acquires it, and the
@@ -2249,11 +2436,87 @@ pub(crate) mod suite {
             None
         );
 
-        let ghost = JobId("ghost".to_owned());
-        assert!(!backend.set_job_check_run(run_id, &ghost, 13).await.unwrap());
+        // A job with no `jobs` row yet — a matrix leg minted before its
+        // expansion materializes — keeps its mapping in the run record, and
+        // clearing it follows the same compare-and-clear rule.
+        let leg = JobId("build (linux)".to_owned());
+        assert!(backend.set_job_check_run(run_id, &leg, 13).await.unwrap());
         assert_eq!(
-            backend.job_check_run_id(run_id, &ghost).await.unwrap(),
-            None
+            backend.job_check_run_id(run_id, &leg).await.unwrap(),
+            Some(13)
+        );
+        backend.clear_job_check_run(run_id, &leg, 13).await.unwrap();
+        assert_eq!(backend.job_check_run_id(run_id, &leg).await.unwrap(), None);
+
+        // An unknown run records nothing.
+        assert!(
+            !backend
+                .set_job_check_run(RunId::new(), &leg, 14)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// `run_dispatch_info` flags the expandable placeholder nodes — a
+    /// deferred-matrix parent and a reusable caller. They never dispatch:
+    /// expansion replaces them with the legs that mint their own checks, so
+    /// the intake loops skip a flagged row and no `queued` check run is
+    /// minted for a node whose row is purged (GitHub has no delete API). A
+    /// plain job and a materialized matrix leg stay unflagged.
+    pub(crate) async fn dispatch_info_flags_expandable_placeholders(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        // Both placeholders wait on `gen`: the submit-time promotion sweep
+        // must not expand them, so they stay placeholders as intake sees them.
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        let mut call = submit_job(run_id, "call", 3);
+        call.queued.needs = vec![JobId("gen".to_owned())];
+        call.queued.reusable_call = Some(preloop_gha_protocol::ReusableCallPlan {
+            uses: "octo-org/octo-repo/.github/workflows/callee.yml@main".to_owned(),
+            workflow_file: "octo-org/octo-repo/.github/workflows/callee.yml".to_owned(),
+            workflow_sha: Some("abc123".to_owned()),
+            workflow_repository: Some("octo-org/octo-repo".to_owned()),
+            depth: 1,
+        });
+        // A static matrix leg is a real dispatchable job (`kind` `matrix_leg`).
+        let mut leg = submit_job(run_id, "build (linux)", 4);
+        leg.queued.base_id = "build".to_owned();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "gen", 1), fan, call, leg],
+            ))
+            .await
+            .unwrap();
+
+        let info = backend
+            .run_dispatch_info(run_id)
+            .await
+            .unwrap()
+            .expect("the submitted run exists");
+        let placeholder = |job_id: &str| {
+            info.jobs
+                .iter()
+                .find(|job| job.job_id.0 == job_id)
+                .unwrap_or_else(|| panic!("job {job_id} missing from the run"))
+                .placeholder
+        };
+        assert!(
+            !placeholder("gen"),
+            "a plain dispatchable job must not be flagged"
+        );
+        assert!(
+            !placeholder("build (linux)"),
+            "a materialized matrix leg is a real job, not a placeholder"
+        );
+        assert!(
+            placeholder("fan"),
+            "a deferred-matrix parent never dispatches: intake must skip its check"
+        );
+        assert!(
+            placeholder("call"),
+            "a reusable caller never dispatches: intake must skip its check"
         );
     }
 
@@ -3189,6 +3452,7 @@ pub(crate) mod suite {
             paused: BTreeMap::new(),
             pool_preparing: false,
             warm_window_open: false,
+            pool_labels: Vec::new(),
             first_seen: BTreeMap::new(),
         }
     }
@@ -3196,7 +3460,9 @@ pub(crate) mod suite {
     /// The timeout arm and the lease arm of `reap_sweep` are independent
     /// (trait doc steps 2 and 3): an attempt that already hit its
     /// `timeout-minutes` and whose runner then went silent must still have
-    /// its lease expired and settle as a failure on the next tick.
+    /// its lease expired and settle as a failure on the next tick. The
+    /// session is dead throughout: a live session with a stale lease is the
+    /// hung-worker case, reaped on the worker's own cadence instead.
     pub(crate) async fn timeout_then_lease_expiry_settles_attempt(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -3231,7 +3497,8 @@ pub(crate) mod suite {
             .expect("the claim stamps started_at");
 
         // Tick 1: the job timeout fires; the lease is still live.
-        let inputs = backend.reap_inputs().await.unwrap();
+        let mut inputs = backend.reap_inputs().await.unwrap();
+        silence_sessions(&mut inputs);
         let outcome = backend
             .reap_sweep(sweep_at(
                 started + std::time::Duration::from_secs(601),
@@ -3243,7 +3510,8 @@ pub(crate) mod suite {
         assert_eq!(outcome.cancellations, 1, "the job timeout must fire");
 
         // Tick 2: the runner never renewed; the lease expires past 45 min.
-        let inputs = backend.reap_inputs().await.unwrap();
+        let mut inputs = backend.reap_inputs().await.unwrap();
+        silence_sessions(&mut inputs);
         let outcome = backend
             .reap_sweep(sweep_at(
                 started + std::time::Duration::from_secs(2701),
@@ -3269,6 +3537,82 @@ pub(crate) mod suite {
             request.result,
             Some(ExecutionStatus::Failure),
             "lease expiry must fail the attempt"
+        );
+    }
+
+    /// Model runners whose sessions stopped polling.
+    fn silence_sessions(inputs: &mut ReapInputs) {
+        for active in &mut inputs.active {
+            active.session_live = false;
+        }
+    }
+
+    /// A worker that stops renewing while its session keeps polling is hung,
+    /// not disconnected: its attempt is reaped at the worker's own cadence
+    /// (`HUNG_WORKER_LEASE_SECONDS`) instead of holding the slot for the full
+    /// lease. A silent session keeps the full lease.
+    pub(crate) async fn live_session_with_stale_lease_is_reaped_as_hung(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let inputs = backend.reap_inputs().await.unwrap();
+        let active = inputs
+            .active
+            .iter()
+            .find(|active| active.request_id == claimed.request.request_id)
+            .expect("the claim is an active attempt");
+        assert!(active.session_live, "a polling session is live");
+        let renewed = active.last_renewed_at.expect("the claim stamps the lease");
+        let stale = renewed
+            + std::time::Duration::from_secs(crate::distributed_task::HUNG_WORKER_LEASE_SECONDS);
+
+        let mut silent = backend.reap_inputs().await.unwrap();
+        silence_sessions(&mut silent);
+        let outcome = backend
+            .reap_sweep(sweep_at(stale, run_id, silent))
+            .await
+            .unwrap();
+        assert!(
+            outcome.expired.is_empty(),
+            "a disconnected runner keeps the full lease"
+        );
+
+        let outcome = backend
+            .reap_sweep(sweep_at(
+                stale,
+                run_id,
+                backend.reap_inputs().await.unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome
+                .expired
+                .iter()
+                .map(|lease| lease.request_id)
+                .collect::<Vec<_>>(),
+            vec![claimed.request.request_id],
+            "a live session with a stale lease is a hung worker"
         );
     }
 
@@ -3451,6 +3795,7 @@ pub(crate) mod suite {
                 paused: Default::default(),
                 pool_preparing: false,
                 warm_window_open: false,
+                pool_labels: Vec::new(),
                 first_seen: Default::default(),
             })
             .await
@@ -3678,6 +4023,123 @@ pub(crate) mod suite {
                 .renew_agent_request(request_id, &locked_until)
                 .await
                 .unwrap()
+        );
+    }
+
+    /// A `max-parallel: 3` cohort whose three legs become runnable in the
+    /// same promotion pass admits all three at once: each admitted leg
+    /// counts toward the cap exactly once.
+    pub(crate) async fn max_parallel_admits_the_full_cap_in_one_pass(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let mut jobs = vec![submit_job(run_id, "setup", 1)];
+        for (index, leg) in ["build (1)", "build (2)", "build (3)"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut job = submit_job(run_id, leg, 2 + index as i64);
+            job.queued.base_id = "build".to_owned();
+            job.queued.max_parallel = Some(3);
+            job.queued.needs = vec![JobId("setup".to_owned())];
+            job.queued.dependencies_ready_at_unix_nanos = None;
+            jobs.push(job);
+        }
+        backend.submit_run(submit_run(run_id, jobs)).await.unwrap();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("setup must be claimable, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.job_id, JobId("setup".to_owned()));
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("setup".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.queue_stats().await.unwrap().ready,
+            3,
+            "all three legs fit under max-parallel 3 and are admitted in one pass"
+        );
+    }
+
+    /// Submit two runs into one cancel-in-progress group where the second
+    /// arrival carries the older event, so it is cancelled on arrival.
+    /// Returns the cancelled run's id.
+    pub(crate) async fn submit_arrival_cancelled_run(backend: &dyn ControlBackend) -> RunId {
+        let newer = RunId::new();
+        let mut newer_submit = submit_run(newer, vec![submit_job(newer, "deploy", 1)]);
+        newer_submit.workflow_concurrency = Some(workflow_concurrency("g", true));
+        Arc::make_mut(&mut newer_submit.record.submission).payload =
+            serde_json::json!({"repository": {"pushed_at": 2000}});
+        backend.submit_run(newer_submit).await.unwrap();
+
+        let older = RunId::new();
+        let mut older_submit = submit_run(older, vec![submit_job(older, "deploy", 2)]);
+        older_submit.workflow_concurrency = Some(workflow_concurrency("g", true));
+        Arc::make_mut(&mut older_submit.record.submission).payload =
+            serde_json::json!({"repository": {"pushed_at": 1000}});
+        let outcome = backend.submit_run(older_submit).await.unwrap();
+        assert_eq!(
+            outcome.rejected,
+            Some(ExecutionStatus::Cancelled),
+            "the older arrival must be superseded"
+        );
+        older
+    }
+
+    /// The run's durable events hold exactly one `run.created.v1` and one
+    /// `run.completed.v1`.
+    pub(crate) fn assert_created_and_completed_once(
+        topics: &[(Option<RunId>, String)],
+        run: RunId,
+    ) {
+        let count = |topic: &str| {
+            topics
+                .iter()
+                .filter(|(owner, t)| *owner == Some(run) && t == topic)
+                .count()
+        };
+        assert_eq!(count("run.created.v1"), 1, "topics: {topics:?}");
+        assert_eq!(count("run.completed.v1"), 1, "topics: {topics:?}");
+    }
+
+    /// Submitting the same natural run number twice reallocates the second
+    /// run above both the collision and the counter; both backends expose
+    /// the same number contract.
+    pub(crate) async fn duplicate_run_number_is_reallocated(backend: &dyn ControlBackend) {
+        let first = RunId::new();
+        let mut a = submit_run(first, vec![submit_job(first, "build", 1)]);
+        a.record.run_number = 900_000;
+        let outcome_a = backend.submit_run(a).await.unwrap();
+        assert_eq!(outcome_a.run_number, 900_000);
+
+        let second = RunId::new();
+        let mut b = submit_run(second, vec![submit_job(second, "build", 2)]);
+        b.record.run_number = 900_000;
+        let outcome_b = backend.submit_run(b).await.unwrap();
+        assert!(
+            outcome_b.run_number > outcome_a.run_number,
+            "the duplicate number is reallocated: {outcome_b:?}"
+        );
+        assert_eq!(
+            backend.run_record(second).await.unwrap().run_number,
+            outcome_b.run_number
         );
     }
 }
@@ -3952,6 +4414,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn deferred_matrix_expansion_scopes_its_inputs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::deferred_matrix_expansion_scopes_its_inputs(&backend).await;
+    }
+
+    #[tokio::test]
     async fn cancel_of_terminal_run_preserves_conclusion() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -4072,6 +4542,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn timeline_patch_enforces_byte_budget() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::timeline_patch_enforces_byte_budget(&backend).await;
+    }
+
+    #[tokio::test]
     async fn reconcile_recovers_orphaned_claim() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -4101,6 +4579,14 @@ mod pg {
             return skip_no_postgres();
         };
         suite::check_run_mapping(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_info_flags_expandable_placeholders() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::dispatch_info_flags_expandable_placeholders(&backend).await;
     }
 
     #[tokio::test]
@@ -4218,6 +4704,14 @@ mod pg {
             return skip_no_postgres();
         };
         suite::timeout_then_lease_expiry_settles_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn live_session_with_stale_lease_is_reaped_as_hung() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::live_session_with_stale_lease_is_reaped_as_hung(&backend).await;
     }
 
     #[tokio::test]
@@ -4541,6 +5035,34 @@ mod pg {
         assert!(backend.sole_inflight_request().await.unwrap().is_none());
         assert!(backend.live_assignments().await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn max_parallel_admits_the_full_cap_in_one_pass() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::max_parallel_admits_the_full_cap_in_one_pass(&backend).await;
+    }
+
+    /// A run cancelled on arrival emits its creation and its completion,
+    /// each exactly once.
+    #[tokio::test]
+    async fn arrival_cancelled_submit_emits_run_events() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let older = suite::submit_arrival_cancelled_run(&backend).await;
+        let topics = backend.test_working_set().await.unwrap().outbox_topics;
+        suite::assert_created_and_completed_once(&topics, older);
+    }
+
+    #[tokio::test]
+    async fn duplicate_run_number_is_reallocated() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::duplicate_run_number_is_reallocated(&backend).await;
+    }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
@@ -4554,7 +5076,6 @@ mod lite {
     use crate::control::types::PollOutcome;
     use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     /// Two materialized legs of the `fan` matrix.
     fn fan_legs(run_id: RunId) -> crate::control::logic::BuiltExpansion {
@@ -4654,40 +5175,14 @@ mod lite {
         );
     }
 
-    /// A run cancelled on arrival emits both its creation and its completion.
+    /// A run cancelled on arrival emits its creation and its completion,
+    /// each exactly once.
     #[tokio::test]
     async fn arrival_cancelled_submit_emits_run_events() {
         let backend = LiteBackend::in_memory().unwrap();
-        let newer = RunId::new();
-        let mut newer_submit = submit_run(newer, vec![submit_job(newer, "deploy", 1)]);
-        newer_submit.workflow_concurrency = Some(super::workflow_concurrency("g", true));
-        Arc::make_mut(&mut newer_submit.record.submission).payload =
-            serde_json::json!({"repository": {"pushed_at": 2000}});
-        backend.submit_run(newer_submit).await.unwrap();
-
-        let older = RunId::new();
-        let mut older_submit = submit_run(older, vec![submit_job(older, "deploy", 2)]);
-        older_submit.workflow_concurrency = Some(super::workflow_concurrency("g", true));
-        Arc::make_mut(&mut older_submit.record.submission).payload =
-            serde_json::json!({"repository": {"pushed_at": 1000}});
-        let outcome = backend.submit_run(older_submit).await.unwrap();
-        assert_eq!(
-            outcome.rejected,
-            Some(ExecutionStatus::Cancelled),
-            "the older arrival must be superseded"
-        );
-        let state = backend.test_working_set().unwrap();
-        let topics: Vec<&str> = state
-            .outbox_topics
-            .iter()
-            .filter(|(run, _)| *run == Some(older))
-            .map(|(_, topic)| topic.as_str())
-            .collect();
-        assert!(topics.contains(&"run.created.v1"), "got {topics:?}");
-        assert!(
-            topics.contains(&"run.completed.v1"),
-            "an arrival-cancelled run must emit run.completed.v1, got {topics:?}"
-        );
+        let older = suite::submit_arrival_cancelled_run(&backend).await;
+        let topics = backend.test_working_set().unwrap().outbox_topics;
+        suite::assert_created_and_completed_once(&topics, older);
     }
 
     /// Fail-fast cancellations record the `fail_fast` reason (pg parity).
@@ -4805,6 +5300,12 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn deferred_matrix_expansion_scopes_its_inputs() {
+        suite::deferred_matrix_expansion_scopes_its_inputs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
     async fn cancel_of_terminal_run_preserves_conclusion() {
         suite::cancel_of_terminal_run_preserves_conclusion(&LiteBackend::in_memory().unwrap())
             .await;
@@ -4879,6 +5380,11 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn timeline_patch_enforces_byte_budget() {
+        suite::timeline_patch_enforces_byte_budget(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
     async fn workflow_concurrency_releases_when_the_run_finishes() {
         suite::workflow_concurrency_releases_when_the_run_finishes(
             &LiteBackend::in_memory().unwrap(),
@@ -4922,6 +5428,12 @@ mod lite {
     #[tokio::test]
     async fn check_run_mapping() {
         suite::check_run_mapping(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_info_flags_expandable_placeholders() {
+        suite::dispatch_info_flags_expandable_placeholders(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]
@@ -5087,6 +5599,7 @@ mod lite {
                 paused: Default::default(),
                 pool_preparing: false,
                 warm_window_open: false,
+                pool_labels: Vec::new(),
                 first_seen: Default::default(),
             })
             .await
@@ -5272,6 +5785,12 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn live_session_with_stale_lease_is_reaped_as_hung() {
+        suite::live_session_with_stale_lease_is_reaped_as_hung(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
     async fn job_queue_state_speaks_queue_kind() {
         suite::job_queue_state_speaks_queue_kind(&LiteBackend::in_memory().unwrap()).await;
     }
@@ -5443,6 +5962,17 @@ mod lite {
 
         assert!(backend.sole_inflight_request().await.unwrap().is_none());
         assert!(backend.live_assignments().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_parallel_admits_the_full_cap_in_one_pass() {
+        suite::max_parallel_admits_the_full_cap_in_one_pass(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_run_number_is_reallocated() {
+        suite::duplicate_run_number_is_reallocated(&LiteBackend::in_memory().unwrap()).await;
     }
 }
 

@@ -473,6 +473,26 @@ pub(super) fn insert_job_message(
     Ok(())
 }
 
+/// The job's stored runner message, or `None` when the job has no row or
+/// its row is a caller placeholder (`{}`, not a runnable message).
+pub(super) fn stored_job_message(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<Option<preloop_gha_protocol::azdo::AgentJobRequestMessage>, ControlError> {
+    Ok(tx
+        .prepare_cached(
+            "SELECT message_template FROM job_messages WHERE run_id = ?1 AND job_id = ?2",
+        )
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id), job_id.0], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(db)?
+        .and_then(|json| serde_json::from_str(&json).ok()))
+}
+
 /// Rewrite only the message template (promotion hydration); leaves the
 /// `if:` context untouched.
 pub(super) fn update_job_message(
@@ -871,7 +891,7 @@ pub(super) fn run_record(
         .query_row([&run], |row| row.get::<_, bool>(0))
         .map_err(db)?;
     // An archived run's live row is gone: the head read falls back to
-    // `run_history` (decision Q10), the job projection to `job_history`.
+    // `run_history`, the job projection to `job_history`.
     let head = if archived {
         tx.prepare_cached(
             "SELECT 'completed', r.conclusion, r.run_number, r.run_attempt, \

@@ -96,7 +96,7 @@ pub async fn require_results_bearer(
         return Ok(next.run(request).await);
     }
     if path.starts_with("/twirp-blob/") {
-        // R1-2: this route used to fall through the `!/twirp/` check below
+        // This route used to fall through the `!/twirp/` check below
         // with zero authentication, and blob_put/blob_get joined the raw
         // segments into the filesystem. The gate now owns both problems.
         let path = path.to_owned();
@@ -117,7 +117,7 @@ pub async fn require_results_bearer(
     Ok(next.run(request).await)
 }
 
-/// Authorize `/twirp-blob/{kind}/{token}` requests (R1-2).
+/// Authorize `/twirp-blob/{kind}/{token}` requests.
 ///
 /// The blob endpoints are bearerless by protocol design — the Azure SDK in
 /// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
@@ -189,7 +189,7 @@ async fn authorize_blob_request(
     }
 }
 
-/// R1-10: require the calling job to be live before a Results write.
+/// Require the calling job to be live before a Results write.
 ///
 /// Resolves the job's request record and rejects when the job is unknown
 /// (purged) or has settled/projected to a terminal status — the stale
@@ -228,7 +228,7 @@ pub async fn job_is_live(state: &AppState, job_uuid: uuid::Uuid) -> Result<bool,
     }
 }
 
-/// R1-10: require a job UUID to be live before a write, for handlers that
+/// Require a job UUID to be live before a write, for handlers that
 /// authenticate from headers rather than a typed [`ResultsIdentity`]
 /// (the legacy `/_apis/artifactcache` cache write path). Same rule as
 /// [`require_live_results_job`]: the system identity bypasses, so callers
@@ -986,7 +986,7 @@ pub async fn job_repository_from_headers(
     Ok(Some(repository))
 }
 
-/// R1-5: resolve the git ref of the job behind a job runtime bearer, from
+/// Resolve the git ref of the job behind a job runtime bearer, from
 /// the job → run → submission chain. Mirrors `job_repository_from_headers`.
 /// Returns `None` for the system token (the engine itself has no job).
 pub async fn job_git_ref_from_headers(

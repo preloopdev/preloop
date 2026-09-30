@@ -4,7 +4,7 @@
 //! `status_inputs` (operational status reads).
 //!
 //! Reaper sweeps and status reads over the agreed tables. Starvation
-//! first-seen marks are node-local (decisions-5 B2): the caller passes them
+//! first-seen marks are node-local: the caller passes them
 //! in `ReapSweep::first_seen`; nothing about them is persisted.
 
 use super::codec::{self, now_us};
@@ -109,7 +109,9 @@ impl LiteBackend {
                     .prepare_cached(
                         "SELECT q.request_id, q.run_id, q.job_id, q.started_at, \
                                 l.renewed_at, q.timeout_triggered, \
-                                CAST(json_extract(m.message_template, '$.jobTimeout') AS INTEGER) \
+                                CAST(json_extract(m.message_template, '$.jobTimeout') AS INTEGER), \
+                                EXISTS (SELECT 1 FROM runner_sessions s \
+                                        WHERE s.session_id = q.session_id AND s.last_seen_at >= ?1) \
                          FROM job_requests q \
                          LEFT JOIN job_leases l ON l.request_id = q.request_id \
                          LEFT JOIN job_messages m ON m.run_id = q.run_id AND m.job_id = q.job_id \
@@ -117,7 +119,7 @@ impl LiteBackend {
                     )
                     .map_err(db)?;
                 let rows = stmt
-                    .query_map([], |row| {
+                    .query_map([cutoff], |row| {
                         Ok(ActiveRequest {
                             request_id: row.get(0)?,
                             run_id: codec::run_id(&row.get::<_, String>(1)?),
@@ -125,6 +127,7 @@ impl LiteBackend {
                             started_at: row.get::<_, Option<i64>>(3)?.map(codec::us_to_system),
                             last_renewed_at: row.get::<_, Option<i64>>(4)?.map(codec::us_to_system),
                             timeout_triggered: row.get::<_, i64>(5)? != 0,
+                            session_live: row.get::<_, i64>(7)? != 0,
                             job_timeout_s: row.get(6)?,
                         })
                     })
@@ -219,6 +222,7 @@ impl LiteBackend {
                 paused,
                 pool_preparing,
                 warm_window_open,
+                pool_labels,
                 first_seen,
             } = sweep;
             let runner_labels = runner_label_sets(tx)?;
@@ -241,10 +245,17 @@ impl LiteBackend {
                         crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                     }),
                 };
-                match logic::starvation_verdict(&candidate, now, pool_preparing, warm_window_open) {
-                    // Marks are node-local (decisions-5 B2): the caller
+                let verdict = logic::starvation_verdict(
+                    &candidate,
+                    now,
+                    pool_preparing,
+                    warm_window_open,
+                    &pool_labels,
+                );
+                let (reason, unschedulable) = match verdict {
+                    // Marks are node-local: the caller
                     // owns stamping/clearing; nothing persists here.
-                    StarvationVerdict::ClearMark | StarvationVerdict::Mark { .. } => {}
+                    StarvationVerdict::ClearMark | StarvationVerdict::Mark { .. } => continue,
                     StarvationVerdict::Starve { reason, grace } => {
                         tracing::warn!(
                             run_id = %job.run_id,
@@ -253,10 +264,26 @@ impl LiteBackend {
                             "starving queued job failed after {}s without a matching runner",
                             grace.as_secs()
                         );
-                        starve_job(tx, job.run_id, &job.job_id)?;
-                        starved.push((job.run_id, job.job_id.clone(), reason));
+                        (reason, false)
                     }
-                }
+                    StarvationVerdict::Unschedulable { reason } => {
+                        tracing::warn!(
+                            run_id = %job.run_id,
+                            job_id = %job.job_id.0,
+                            labels = ?job.runs_on,
+                            pool_labels = ?pool_labels,
+                            "queued job failed fast: runs-on unsatisfiable by runner pool"
+                        );
+                        (reason, true)
+                    }
+                };
+                starve_job(tx, job.run_id, &job.job_id)?;
+                starved.push(StarvedJob {
+                    run_id: job.run_id,
+                    job_id: job.job_id.clone(),
+                    reason,
+                    unschedulable,
+                });
             }
             // ── Timeouts + lease expiry ────────────────────────────────
             let mut cancellations = 0usize;
@@ -298,11 +325,12 @@ impl LiteBackend {
                 }
                 if let Some(last_renewed_at) = request.last_renewed_at {
                     let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
-                    if elapsed
-                        >= std::time::Duration::from_secs(
-                            crate::distributed_task::JOB_LEASE_SECONDS,
-                        )
-                    {
+                    let lease_seconds = if request.session_live {
+                        crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
+                    } else {
+                        crate::distributed_task::JOB_LEASE_SECONDS
+                    };
+                    if elapsed >= std::time::Duration::from_secs(lease_seconds) {
                         tracing::info!(
                             %run_id,
                             %job_id,

@@ -366,7 +366,7 @@ with real SANY + TLC runs (`experiments/specula-20260804/`). Project moves fast 
 
 MC-R1 and MC-R2 were each confirmed by reverting the fix and watching the  
 regression test fail on the predicted symptom, then pass again with the fix  
-restored. CR-1 (broker messageId collision) was dropped during confirmation  already fixed by review commit `193986ce`.
+restored. The broker `messageId` collision case was dropped — already fixed by commit `193986ce`.
 
 Artifacts: `spec/base.tla` (single SANY-valid module), TLC configs per
 scenario, four counterexample traces, `spec/bug-report.md` (per-bug Rust

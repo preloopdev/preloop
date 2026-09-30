@@ -3,12 +3,15 @@
 
 use super::codec::now_us;
 use super::{LiteBackend, db};
-use crate::control::types::{ControlError, MAX_TIMELINE_RECORDS, stamp_timeline_records};
+use crate::control::types::{
+    ControlError, MAX_TIMELINE_RECORDS, stamp_timeline_records, timeline_record_bytes,
+};
+use crate::memory_caps::MAX_TIMELINE_BYTES_PER_TIMELINE;
 use preloop_gha_protocol::azdo::TimelineRecord;
 use rusqlite::{OptionalExtension, params};
 
 /// The timeline id addressed by a `'{plan_id}/{timeline_id}'` key: the uuid
-/// after the last `/` (decision round 1, Q1). `None` when it is not a uuid.
+/// after the last `/`. `None` when it is not a uuid.
 fn timeline_id(timeline_key: &str) -> Option<String> {
     let tail = timeline_key.rsplit('/').next().unwrap_or(timeline_key);
     tail.parse::<uuid::Uuid>().ok().map(|id| id.to_string())
@@ -125,6 +128,49 @@ impl LiteBackend {
                     .execute(params![timeline, count - cap])
                     .map_err(db)?;
                 }
+            }
+            // Bound aggregate record size as well as record count. Protect
+            // this PATCH's records until no older record remains, matching
+            // the old in-memory eviction rule.
+            let mut size_stmt = tx
+                .prepare_cached(
+                    "SELECT record_id, change_id, record FROM timeline_records \
+                     WHERE timeline_id = ?1 ORDER BY record_id",
+                )
+                .map_err(db)?;
+            let rows = size_stmt
+                .query_map([&timeline], |row| {
+                    let record: TimelineRecord = serde_json::from_str(&row.get::<_, String>(2)?)
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        timeline_record_bytes(&record),
+                    ))
+                })
+                .map_err(db)?;
+            let mut sized: Vec<(String, i64, usize)> =
+                rows.collect::<Result<_, _>>().map_err(db)?;
+            let mut total_bytes: usize = sized.iter().map(|(_, _, size)| *size).sum();
+            while total_bytes > MAX_TIMELINE_BYTES_PER_TIMELINE && sized.len() > 1 {
+                let index = sized
+                    .iter()
+                    .position(|(_, row_change, _)| *row_change != change_id)
+                    .unwrap_or(0);
+                let (record_id, _, size) = sized.remove(index);
+                tx.prepare_cached(
+                    "DELETE FROM timeline_records WHERE timeline_id = ?1 AND record_id = ?2",
+                )
+                .map_err(db)?
+                .execute(params![timeline, record_id])
+                .map_err(db)?;
+                total_bytes = total_bytes.saturating_sub(size);
             }
             let mut stmt = tx
                 .prepare_cached(

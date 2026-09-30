@@ -18,13 +18,13 @@ use super::dispatch::{
 use super::{PgBackend, db};
 use crate::control::logic::{StarvationCandidate, StarvationVerdict, starvation_verdict};
 use crate::control::types::{
-    ControlError, ExpiredLease, ReapSweep, ReapSweepOutcome, StatusInputs,
+    ControlError, ExpiredLease, ReapSweep, ReapSweepOutcome, StarvedJob, StatusInputs,
 };
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 
 impl PgBackend {
     /// `reap_sweep`: starvation verdicts for unmatched ready jobs
-    /// (decisions-5 B2 — marks are node-local, passed in as
+    /// (marks are node-local, passed in as
     /// `ReapSweep::first_seen`; unmarked rows fall back to `enqueued_at`), timeout
     /// `job_cancellations` markers, and expired-lease settlements, all
     /// conditional on the row still being unsettled/ready. Only writes to
@@ -51,6 +51,7 @@ impl PgBackend {
             paused,
             pool_preparing,
             warm_window_open,
+            pool_labels,
             first_seen,
         } = sweep;
         let now_us = now
@@ -79,7 +80,7 @@ impl PgBackend {
                 runs_on: &job.runs_on,
                 enqueued_at: SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
-                // No durable first-seen column (decisions-5 B2): the mark
+                // No durable first-seen column: the mark
                 // lives in the caller's memory (`ReapSweep::first_seen`);
                 // unmarked rows fall back to the enqueue instant.
                 first_seen: first_seen.get(&(job.run_id, job.job_id.clone())).copied(),
@@ -87,8 +88,36 @@ impl PgBackend {
                     crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
                 }),
             };
-            if let StarvationVerdict::Starve { reason, .. } =
-                starvation_verdict(&candidate, now, pool_preparing, warm_window_open)
+            let verdict = starvation_verdict(
+                &candidate,
+                now,
+                pool_preparing,
+                warm_window_open,
+                &pool_labels,
+            );
+            let (reason, unschedulable) = match verdict {
+                StarvationVerdict::ClearMark | StarvationVerdict::Mark { .. } => continue,
+                StarvationVerdict::Starve { reason, grace } => {
+                    tracing::warn!(
+                        run_id = %job.run_id,
+                        job_id = %job.job_id.0,
+                        labels = ?job.runs_on,
+                        "starving queued job failed after {}s without a matching runner",
+                        grace.as_secs()
+                    );
+                    (reason, false)
+                }
+                StarvationVerdict::Unschedulable { reason } => {
+                    tracing::warn!(
+                        run_id = %job.run_id,
+                        job_id = %job.job_id.0,
+                        labels = ?job.runs_on,
+                        pool_labels = ?pool_labels,
+                        "queued job failed fast: runs-on unsatisfiable by runner pool"
+                    );
+                    (reason, true)
+                }
+            };
             {
                 // The conditional UPDATE is the multi-node guard: whoever
                 // turns the row terminal first owns the failure.
@@ -143,9 +172,12 @@ impl PgBackend {
                     )
                     .await?;
                 }
-                outcome
-                    .starved
-                    .push((job.run_id, job.job_id.clone(), reason));
+                outcome.starved.push(StarvedJob {
+                    run_id: job.run_id,
+                    job_id: job.job_id.clone(),
+                    reason,
+                    unschedulable,
+                });
             }
         }
 
@@ -187,9 +219,12 @@ impl PgBackend {
             }
             if let Some(renewed) = request.last_renewed_at {
                 let elapsed = now.duration_since(renewed).unwrap_or_default();
-                if elapsed
-                    >= std::time::Duration::from_secs(crate::distributed_task::JOB_LEASE_SECONDS)
-                {
+                let lease_seconds = if request.session_live {
+                    crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
+                } else {
+                    crate::distributed_task::JOB_LEASE_SECONDS
+                };
+                if elapsed >= std::time::Duration::from_secs(lease_seconds) {
                     // Conditional settle: whoever stamps the result reports
                     // the expiry (one node fails it through `settle_job`).
                     let row = tx
@@ -243,7 +278,7 @@ impl PgBackend {
         let runner_assignments = self.live_assignments().await?;
         let client = self.reader().await?;
         let mut out = StatusInputs::default();
-        // Queue buckets by the mapping the shared suite adopted (round 5).
+        // Queue buckets by the mapping the shared suite adopted.
         for row in client
             .query(
                 "SELECT CASE WHEN queue_state = 'held' AND EXISTS (\

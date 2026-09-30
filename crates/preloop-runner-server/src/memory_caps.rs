@@ -42,7 +42,7 @@ pub const MAX_LOGS_PER_PLAN: usize = 512;
 /// from fabricating unlimited `plan_id` values to bypass the per-plan cap.
 pub const MAX_LOG_BYTES_GLOBAL: usize = 256 * 1024 * 1024;
 
-/// F1 — global retained log entry cap.
+/// Global retained log entry cap.
 pub const MAX_LOGS_GLOBAL: usize = 4096;
 
 /// per-timeline record cap. PATCH upserts beyond this evict the oldest
@@ -68,7 +68,7 @@ pub const MAX_TIMELINE_KEYS: usize = 4096;
 /// per-run event buckets (each itself capped by [`MAX_TIMELINE_EVENTS`]).
 pub const MAX_TIMELINE_EVENT_KEYS: usize = 4096;
 
-/// F5 — per-block cap for staged blob blocks. actions/upload-artifact v4
+/// Per-block cap for staged blob blocks. actions/upload-artifact v4
 /// stages 8 MiB blocks, but @actions/cache v6 stages 64 MiB blocks
 /// (`uploadChunkSize`; user-overridable up to 128 MiB via
 /// `CACHE_UPLOAD_CHUNK_SIZE`) for archives over its 128 MiB single-shot
@@ -77,7 +77,7 @@ pub const MAX_TIMELINE_EVENT_KEYS: usize = 4096;
 /// cap cannot exhaust server RAM; larger blocks are rejected with 413.
 pub const MAX_BLOCK_BYTES: usize = 128 * 1024 * 1024;
 
-/// F5 — cap on the number of block IDs in a blocklist commit request.
+/// Cap on the number of block IDs in a blocklist commit request.
 pub const MAX_BLOCKLIST_BLOCKS: usize = 10_000;
 
 /// cap on the assembled blob size. Assembly streams block files into the
@@ -94,14 +94,14 @@ pub const MAX_TOP_RECORDS: usize = 500;
 /// evade the cap by inventing other job ids in request bodies.
 pub const MAX_PENDING_PER_JOB: usize = 32;
 
-/// R1-6 — cap on a single in-flight legacy cache upload
+/// Cap on a single in-flight legacy cache upload
 /// (`PendingCache::bytes`). `cache_upload` appends every PATCH body with no
 /// running total; without this cap a job could grow server RAM without bound
 /// by PATCHing chunks forever (~500 requests/GiB at the 2 MiB default body
 /// limit). Matches the 512 MiB body limit on the Twirp blob upload route.
 pub const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// R1-6 — per-job aggregate cap on in-flight legacy cache upload bytes.
+/// Per-job aggregate cap on in-flight legacy cache upload bytes.
 /// `MAX_CACHE_UPLOAD_BYTES` bounds one reservation; without an aggregate
 /// budget a job could still hold `MAX_PENDING_PER_JOB` × 512 MiB (~16 GiB)
 /// in `pending_caches`. 1 GiB leaves headroom for two full-size uploads
@@ -110,7 +110,7 @@ pub const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 /// it; bytes are released when the reservation commits or is swept.
 pub const MAX_PENDING_CACHE_BYTES_PER_JOB: u64 = 1024 * 1024 * 1024;
 
-/// F7 — global cap on minted cache download tokens; the oldest are evicted.
+/// Global cap on minted cache download tokens; the oldest are evicted.
 pub const MAX_CACHE_DL_TOKENS: usize = 1024;
 
 /// per-run cap on finalized artifact v2 registry entries, mirroring
@@ -121,7 +121,7 @@ pub const MAX_ARTIFACTS_PER_RUN: usize = 500;
 /// are evicted past this so a flood of fabricated run ids stays bounded.
 pub const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 
-/// F8 — terminal runs whose heavy node-local runtime state (live-log buffers,
+/// Terminal runs whose heavy node-local runtime state (live-log buffers,
 /// timeline projections) stays in memory. A finished run's live-log buffer is
 /// capped at 64 MiB *per job* and its timeline projections are only dropped on
 /// request purge — neither is needed once the run is old enough that nothing
@@ -129,7 +129,7 @@ pub const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 /// ~4 GiB/hour of retained buffers on cpane and the kernel OOM killer kept
 /// restarting the engine mid-run (starving every queued job).
 ///
-/// Post-cutover there is no in-memory run-record cap to pair this with:
+/// There is no in-memory run-record cap to pair this with:
 /// `RunRecord`s are database rows, and the durable bound on how long a settled
 /// run stays in the hot scheduling tables is
 /// [`ControlBackend::archive_finished_runs`](crate::control::ControlBackend::archive_finished_runs).
@@ -173,7 +173,7 @@ pub fn job_backend_id_from_bearer(state: &AppState, headers: &HeaderMap) -> Opti
 /// every append (and log creation). Returns the log keys evicted from memory
 /// so the caller can delete them from the durable store too — otherwise the
 /// on-disk `log_files`/`log_chunks` grow without bound even though memory is
-/// capped (D2).
+/// capped.
 pub fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<String> {
     let mut evicted = Vec::new();
     // Fast path: when the whole retained set is under the per-plan budget, no
@@ -421,7 +421,7 @@ pub fn trim_cache_dl_tokens(inner: &mut InnerState) {
 
 // ─── Node-local run keys, resolved from the control backend ─────────────────
 //
-// Post-cutover the run records, dispatch queue and request rows live in the
+// The run records, dispatch queue and request rows live in the
 // control database; `InnerState` holds only node-local metadata. That metadata
 // is still keyed by the ids those rows carry — logical job ids and agent job
 // ids (live-log buffers), plan ids (retained console keys `{plan_id}/{log_id}`,
@@ -510,7 +510,7 @@ impl ResidentRunTraces {
     }
 }
 
-/// F8 — the runs that must give up their node-local runtime state, with their
+/// The runs that must give up their node-local runtime state, with their
 /// keys already resolved from the backend. Produced by
 /// [`plan_completed_run_trim`], applied by [`trim_completed_runs`].
 pub(crate) struct CompletedRunTrim {
@@ -518,7 +518,7 @@ pub(crate) struct CompletedRunTrim {
     pub drops: Vec<(RunId, RunNodeKeys)>,
 }
 
-/// F8 — plan which runs must give up their node-local runtime state: every
+/// Plan which runs must give up their node-local runtime state: every
 /// resident run that is not among the newest
 /// [`MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`] terminal runs.
 ///
@@ -528,7 +528,7 @@ pub(crate) struct CompletedRunTrim {
 /// theirs and everything older loses it. Runs still in flight are never
 /// trimmed.
 ///
-/// Post-cutover the run records themselves are database rows, so there is no
+/// The run records themselves are database rows, so there is no
 /// in-memory record cap to enforce alongside this: the durable bound on how
 /// long a settled run stays in the hot scheduling tables is
 /// [`ControlBackend::archive_finished_runs`](crate::control::ControlBackend::archive_finished_runs).
@@ -578,7 +578,7 @@ pub(crate) async fn plan_completed_run_trim(
     Ok(CompletedRunTrim { drops })
 }
 
-/// F8 — apply a planned trim under the state lock. Returns how many runs gave
+/// Apply a planned trim under the state lock. Returns how many runs gave
 /// up their node-local runtime state.
 pub(crate) fn trim_completed_runs(inner: &mut InnerState, trim: &CompletedRunTrim) -> usize {
     for (run_id, keys) in &trim.drops {
@@ -740,7 +740,7 @@ pub(crate) fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId, keys
     }
 }
 
-/// F7 — bound the finalized artifact v2 registry: `MAX_ARTIFACTS_PER_RUN` per
+/// Bound the finalized artifact v2 registry: `MAX_ARTIFACTS_PER_RUN` per
 /// run and `MAX_ARTIFACT_REGISTRY_ENTRIES` globally, evicting oldest entries
 /// by finalization order (not lexicographic key order).
 pub fn trim_artifact_registry(inner: &mut InnerState) {
@@ -805,7 +805,7 @@ pub fn trim_artifact_registry(inner: &mut InnerState) {
 /// TTL sweep for pending uploads and download tokens. Entries with
 /// `created_unix == 0` (restored from a persisted meta, or engine-token
 /// reservations made before timestamps existed) are left alone, matching the
-/// session-liveness sweep's treatment of restored state. R1-6: the legacy
+/// session-liveness sweep's treatment of restored state. The legacy
 /// artifactcache reservations (`pending_caches`) are in-memory only and were
 /// never swept — an abandoned reservation held its bytes forever — so they
 /// are covered by the same TTL.
@@ -829,7 +829,7 @@ pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
     for token in stale_artifact {
         inner.artifact_v2_pending.remove(&token);
     }
-    // R1-6: legacy reservations are freed too; only `cache_commit` removed
+    // Legacy reservations are freed too; only `cache_commit` removed
     // them before, so abandoned uploads accumulated RAM without bound.
     let stale_legacy: Vec<i64> = inner
         .pending_caches
@@ -1255,7 +1255,7 @@ mod tests {
             .await;
     }
 
-    /// F8 — only the runs outside the newest `MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`
+    /// Only the runs outside the newest `MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`
     /// terminal runs give up their node-local runtime state, an in-flight run is
     /// never trimmed however old it is, and applying the plan under the lock
     /// frees exactly the planned runs' state.
@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(inner.timeline_events_order.len(), newest + 1);
     }
 
-    /// The F8 trim frees the live-log buffer of every logical job and attempt of
+    /// The trim frees the live-log buffer of every logical job and attempt of
     /// the trimmed run, not only its timeline ring, and leaves other runs' buffers
     /// alone.
     #[test]
@@ -1454,7 +1454,7 @@ mod tests {
         );
 
         // The resident-trace snapshot sees the run through its run-keyed
-        // structures, so the F8 planner would consider it.
+        // structures, so the planner would consider it.
         let traces = ResidentRunTraces::of(&inner);
         assert!(traces.run_ids.contains(&run_id));
 

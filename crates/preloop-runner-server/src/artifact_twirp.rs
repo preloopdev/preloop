@@ -76,7 +76,7 @@ pub fn canonical_artifact_scope(
 /// registry off them. The results-service bearer guard parses the bearer into
 /// a typed plan/job identity, so trusting those body fields would let a
 /// workflow step list, re-point, sign a URL for, or delete another run's
-/// artifacts just by sending different ids (SEC-02). The owning run is
+/// artifacts just by sending different ids. The owning run is
 /// therefore taken from the caller's signed runtime token and the body ids
 /// only survive if they canonicalize to it.
 ///
@@ -158,7 +158,7 @@ pub async fn twirp_artifact_v2_create(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate the JWT signature and claims before taking the global state lock.
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     let identity = match job {
         None => crate::auth::ResultsIdentity::System,
         Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
@@ -175,7 +175,7 @@ pub async fn twirp_artifact_v2_create(
     // directory and the pending-reservation map key.
     let jti = uuid::Uuid::new_v4().to_string();
     let registry_key = artifact_v2_registry_key(&canonical_run, &request.name);
-    // F7: the job is taken from the signed runtime token scope, not the
+    // The job is taken from the signed runtime token scope, not the
     // request body, so a runner cannot evade its per-job pending cap by
     // inventing other job ids. Control-plane callers (no job token) reserve
     // without a per-job budget; the TTL sweep still bounds them by age.
@@ -269,7 +269,7 @@ pub async fn twirp_artifact_v2_finalize(
     Json(request): Json<ArtifactV2FinalizeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     let identity = match job {
         None => crate::auth::ResultsIdentity::System,
         Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
@@ -345,7 +345,7 @@ pub async fn twirp_artifact_v2_finalize(
         );
         // Track finalization order for FIFO eviction.
         inner.artifact_registry_order.push_back(registry_key);
-        // F7: keep the registry bounded per run (500) and globally (10k);
+        // Keep the registry bounded per run (500) and globally (10k);
         // oldest entries are evicted first.
         trim_artifact_registry(&mut inner);
     }
@@ -482,7 +482,7 @@ pub async fn twirp_artifact_v2_delete(
     Json(request): Json<ArtifactV2DeleteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = artifact_v2_job_from_headers(&shared.state, &headers)?;
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     let identity = match job {
         None => crate::auth::ResultsIdentity::System,
         Some(job_id) => crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {

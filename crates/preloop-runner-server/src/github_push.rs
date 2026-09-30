@@ -123,7 +123,7 @@ pub async fn push_run_to_github(
             crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
             other => ApiError::from(other),
         })?;
-    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs, dirty) = {
+    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, dirty) = {
         let run = &run;
         if let Some(state) = &run.push_state
             && state.status == PushStatus::Synced
@@ -188,7 +188,6 @@ pub async fn push_run_to_github(
             draft_pr,
             run.submission.actor.clone(),
             conclusion.clone(),
-            run.jobs.clone(),
             push.dirty,
         )
     };
@@ -408,8 +407,20 @@ pub async fn push_run_to_github(
 
     // 4. Report check runs for jobs that never got one (the submit-time
     //    loop may have been skipped or failed). Jobs with an existing check
-    //    run were already updated through the normal lifecycle.
-    for job_id in jobs.keys() {
+    //    run were already updated through the normal lifecycle. Expandable
+    //    placeholders (deferred-matrix parents, reusable callers) mint no
+    //    check: they never dispatch, expansion replaced them, and their
+    //    materialized legs report their own.
+    let dispatch_info = shared
+        .state
+        .backend
+        .run_dispatch_info(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let job_rows = dispatch_info.map(|info| info.jobs).unwrap_or_default();
+    for job in job_rows.iter().filter(|job| !job.placeholder) {
+        let job_id = &job.job_id;
+        let status = job.status;
         // A failed read must not be read as "no check run yet": that would
         // POST a second queued check run over the one the lifecycle already
         // reported. Abort the sync instead — it is retryable.
@@ -437,9 +448,8 @@ pub async fn push_run_to_github(
             {
                 tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-            if jobs.get(job_id).is_some_and(|status| status.is_terminal()) {
-                crate::github::report_check_run_completed(shared, run_id, job_id, jobs[job_id])
-                    .await;
+            if status.is_terminal() {
+                crate::github::report_check_run_completed(shared, run_id, job_id, status).await;
             }
         }
     }

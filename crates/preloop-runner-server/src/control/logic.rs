@@ -6,7 +6,6 @@
 
 use crate::models::{QueuedJob, RunRecord};
 use crate::state::JobSetGate;
-use preloop_gha_protocol::azdo;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, WorkflowSubmission};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use std::time::{Duration, SystemTime};
 // Pure helpers shared with the runtime scheduler.
 pub(crate) use crate::runtime_scheduling::{
     DependencyDecision, SchedulingOutcome, aggregate_need_status, matching_need_ids,
-    matching_need_statuses, need_context, needs_json_context,
+    matching_need_statuses, needs_json_context,
 };
 
 /// Namespace used to deterministically encode legacy non-UUID session ids.
@@ -27,7 +26,7 @@ pub(crate) const SESSION_ID_NAMESPACE: uuid::Uuid =
 ///
 /// Uses the workspace's `sha1` crate rather than `uuid`'s `v5` feature: the
 /// latter pulls the unvetted `sha1_smol` into the dependency graph.
-pub(crate) fn session_uuid(id: &str) -> uuid::Uuid {
+pub fn session_uuid(id: &str) -> uuid::Uuid {
     id.parse()
         .unwrap_or_else(|_| uuid_v5(&SESSION_ID_NAMESPACE, id))
 }
@@ -48,8 +47,11 @@ fn uuid_v5(namespace: &uuid::Uuid, name: &str) -> uuid::Uuid {
 
 /// How long an unmatched ready job may wait for a matching runner.
 pub(crate) const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
-/// Absolute queue-age ceiling while a pool is preparing.
-pub(crate) const MAX_QUEUED_GRACE: Duration = Duration::from_secs(600);
+/// Absolute backstop, measured from ready-enqueue, on how long a job whose
+/// labels the pool can satisfy — or whose runner a preparing pool may still
+/// provide — waits for a matching runner. One hour covers a full golden
+/// rebuild plus several failed provision rounds.
+pub(crate) const MAX_QUEUED_GRACE: Duration = Duration::from_secs(3600);
 
 /// Ready-job inputs for starvation evaluation.
 #[derive(Debug, Clone)]
@@ -64,41 +66,151 @@ pub(crate) struct StarvationCandidate<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StarvationVerdict {
     ClearMark,
-    Mark { first_seen: SystemTime },
-    Starve { reason: String, grace: Duration },
+    Mark {
+        first_seen: SystemTime,
+    },
+    /// No matching runner appeared within `grace`.
+    Starve {
+        reason: String,
+        grace: Duration,
+    },
+    /// The co-hosted pool's advertised labels can never satisfy the job.
+    Unschedulable {
+        reason: String,
+    },
 }
 
-/// Decide starvation using the production 120/600 second grace rules.
+/// Labels only an external (macOS/Windows) host can serve: such a job waits
+/// for that host to register rather than failing on the Linux pool's terms.
+pub(crate) fn needs_external_host(runs_on: &[String]) -> bool {
+    runs_on.iter().any(|label| {
+        let label = label.to_ascii_lowercase();
+        label.starts_with("macos") || label.starts_with("windows")
+    })
+}
+
+/// Why a job fails fast against the co-hosted pool: the pool published its
+/// advertised labels and they can never satisfy `runs_on`. `None` when the
+/// pool published none (external-only deployments) or the labels match.
+pub(crate) fn pool_unsatisfiable_reason(
+    runs_on: &[String],
+    pool_labels: &[String],
+) -> Option<String> {
+    (!pool_labels.is_empty()
+        && !crate::runtime_scheduling::job_matches_runner(runs_on, pool_labels))
+    .then(|| {
+        format!(
+            "no runner is registered for `runs-on: {}` and the runner pool's advertised \
+             labels ({}) can never satisfy it, so the job cannot be scheduled",
+            runs_on.join(", "),
+            pool_labels.join(", ")
+        )
+    })
+}
+
+/// A `runs-on` still carrying an unevaluated `${{ }}` template: its labels
+/// read `needs.*` and only become concrete at promotion.
+pub(crate) fn runs_on_deferred(runs_on: &[String]) -> bool {
+    runs_on.iter().any(|label| label.contains("${{"))
+}
+
+/// Why a concrete `runs-on` fails at submit or promotion instead of queueing:
+/// the pool's advertised labels can never satisfy it and nothing else can
+/// serve it — no registered runner matches and it does not wait for an
+/// external host (the starvation sweep's rule). `None` otherwise, including
+/// while the labels are still templates or the pool published none.
+pub(crate) fn unschedulable_reason(
+    runs_on: &[String],
+    pool_labels: &[String],
+    any_runner_matches: bool,
+) -> Option<String> {
+    if any_runner_matches || needs_external_host(runs_on) || runs_on_deferred(runs_on) {
+        return None;
+    }
+    pool_unsatisfiable_reason(runs_on, pool_labels)
+}
+
+/// After deferred `runs-on` becomes concrete at promotion: fail if the
+/// platform is unhostable or the co-hosted pool can never serve it and no
+/// registered runner / external host will. `None` queues the job.
+pub(crate) fn promotion_unsatisfiable_reason(
+    runs_on: &[String],
+    platforms: impl IntoIterator<Item = &'static str>,
+    pool_labels: &[String],
+    any_runner_matches: bool,
+) -> Option<String> {
+    if let Some(platform) = unhostable_platform(runs_on, platforms) {
+        return Some(unhostable_reason(platform, runs_on));
+    }
+    unschedulable_reason(runs_on, pool_labels, any_runner_matches)
+}
+
+/// Whether a job is already terminal at submit (gated `if:`, unhostable, or
+/// pool-unsatisfiable). Placeholders expand later and never conclude here.
+pub(crate) fn concludes_at_submit(
+    initially_skipped: bool,
+    placeholder: bool,
+    runs_on: &[String],
+    check_hostable: bool,
+    platforms: impl IntoIterator<Item = &'static str>,
+    pool_labels: &[String],
+    any_runner_matches: bool,
+) -> bool {
+    if initially_skipped {
+        return true;
+    }
+    if placeholder {
+        return false;
+    }
+    if check_hostable && unhostable_platform(runs_on, platforms).is_some() {
+        return true;
+    }
+    unschedulable_reason(runs_on, pool_labels, any_runner_matches).is_some()
+}
+
+/// Decide starvation using the production 120/3600 second grace rules.
+///
+/// Ages are measured on this node's clock; an enqueue instant another node
+/// stamped slightly in the future counts as age zero rather than as expired.
+/// `enqueued_at == UNIX_EPOCH` means the enqueue instant is unknown.
 pub(crate) fn starvation_verdict(
     job: &StarvationCandidate<'_>,
     now: SystemTime,
     pool_preparing: bool,
     warm_window_open: bool,
+    pool_labels: &[String],
 ) -> StarvationVerdict {
-    if job.any_runner_matches
-        || job.runs_on.iter().any(|label| {
-            let label = label.to_ascii_lowercase();
-            label.starts_with("macos") || label.starts_with("windows")
-        })
-    {
+    // Non-Linux jobs can only run on a registered host; keep them queued
+    // until it appears rather than failing a temporarily empty host pool.
+    if job.any_runner_matches || needs_external_host(job.runs_on) {
         return StarvationVerdict::ClearMark;
     }
-    let grace = if pool_preparing {
-        let expired = now
-            .duration_since(job.enqueued_at)
-            .map(|age| age >= MAX_QUEUED_GRACE)
-            .unwrap_or(true);
-        if warm_window_open || !expired {
+    let enqueue_age = (job.enqueued_at != SystemTime::UNIX_EPOCH)
+        .then(|| now.duration_since(job.enqueued_at).unwrap_or_default());
+    let within_ceiling = enqueue_age.is_some_and(|age| age < MAX_QUEUED_GRACE);
+    // A job the pool's advertised labels can satisfy is exempt from the short
+    // grace — its runner appears once the pool warms — so only the backstop
+    // applies; one they can never satisfy fails fast instead of starving.
+    if !pool_labels.is_empty() {
+        if let Some(reason) = pool_unsatisfiable_reason(job.runs_on, pool_labels) {
+            return StarvationVerdict::Unschedulable { reason };
+        }
+        if within_ceiling {
             return StarvationVerdict::ClearMark;
+        }
+    }
+    let grace = if pool_preparing {
+        // A known enqueue instant is protected until the ceiling; a restored
+        // job whose instant was lost gets this process's warm window only.
+        if within_ceiling || (enqueue_age.is_none() && warm_window_open) {
+            // Provisioning time does not consume the short grace. Re-stamp
+            // at every protected tick so a retry gap starts a fresh window.
+            return StarvationVerdict::Mark { first_seen: now };
         }
         MAX_QUEUED_GRACE
     } else {
         let first_seen = job.first_seen.unwrap_or(job.enqueued_at);
-        if now
-            .duration_since(first_seen)
-            .map(|age| age < QUEUED_JOB_GRACE)
-            .unwrap_or(false)
-        {
+        if now.duration_since(first_seen).unwrap_or_default() < QUEUED_JOB_GRACE {
             return StarvationVerdict::Mark { first_seen };
         }
         QUEUED_JOB_GRACE
@@ -702,7 +814,7 @@ pub(crate) struct QueueStateInput {
     pub(crate) expanding: bool,
 }
 
-/// Apply decisions-5 queue mapping exactly:
+/// Apply the queue mapping exactly:
 /// needs/max-parallel become `blocked`; any concurrency wait becomes `held`.
 /// The holder kind distinguishes workflow-level from job/jobset-level waits
 /// in queue statistics. Expansion states are fenced before ordinary queues.
@@ -900,13 +1012,13 @@ mod decision_tests {
         let mut job = starvation_candidate(&linux, Duration::from_secs(10_000), None, now);
         job.any_runner_matches = true;
         assert_eq!(
-            starvation_verdict(&job, now, false, false),
+            starvation_verdict(&job, now, false, false, &[]),
             StarvationVerdict::ClearMark
         );
         let mac = labels(&["macOS-14"]);
         let job = starvation_candidate(&mac, Duration::from_secs(10_000), None, now);
         assert_eq!(
-            starvation_verdict(&job, now, false, false),
+            starvation_verdict(&job, now, false, false, &[]),
             StarvationVerdict::ClearMark
         );
     }
@@ -922,14 +1034,14 @@ mod decision_tests {
             now,
         );
         assert_eq!(
-            starvation_verdict(&job, now, false, false),
+            starvation_verdict(&job, now, false, false, &[]),
             StarvationVerdict::Mark {
                 first_seen: now - Duration::from_secs(30)
             }
         );
         let job = starvation_candidate(&linux, Duration::from_secs(121), None, now);
         let StarvationVerdict::Starve { reason, grace } =
-            starvation_verdict(&job, now, false, false)
+            starvation_verdict(&job, now, false, false, &[])
         else {
             panic!("an unmatched job past the grace window must starve");
         };
@@ -941,19 +1053,164 @@ mod decision_tests {
     fn preparing_pool_protects_until_enqueue_ceiling() {
         let now = SystemTime::now();
         let linux = labels(&["self-hosted", "linux"]);
-        let young = starvation_candidate(&linux, Duration::from_secs(599), None, now);
+        // Protected ticks re-stamp the observation clock.
+        let young = starvation_candidate(&linux, Duration::from_secs(3599), None, now);
         assert_eq!(
-            starvation_verdict(&young, now, true, false),
+            starvation_verdict(&young, now, true, false, &[]),
+            StarvationVerdict::Mark { first_seen: now }
+        );
+        // The ceiling holds even inside this process's warm window: a known
+        // enqueue instant past it starves.
+        let old = starvation_candidate(&linux, MAX_QUEUED_GRACE, None, now);
+        for warm_window_open in [false, true] {
+            assert!(matches!(
+                starvation_verdict(&old, now, true, warm_window_open, &[]),
+                StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
+            ));
+        }
+        // A restored job whose enqueue instant was lost gets the warm window
+        // only.
+        let unknown = StarvationCandidate {
+            enqueued_at: SystemTime::UNIX_EPOCH,
+            ..starvation_candidate(&linux, Duration::ZERO, None, now)
+        };
+        assert_eq!(
+            starvation_verdict(&unknown, now, true, true, &[]),
+            StarvationVerdict::Mark { first_seen: now }
+        );
+        assert!(matches!(
+            starvation_verdict(&unknown, now, true, false, &[]),
+            StarvationVerdict::Starve { .. }
+        ));
+    }
+
+    #[test]
+    fn pool_labels_fail_fast_or_exempt_until_the_ceiling() {
+        let now = SystemTime::now();
+        let pool = labels(&["self-hosted", "linux", "x64"]);
+        let gpu = labels(&["self-hosted", "gpu"]);
+        let fresh_gpu = starvation_candidate(&gpu, Duration::from_secs(1), None, now);
+        let StarvationVerdict::Unschedulable { reason } =
+            starvation_verdict(&fresh_gpu, now, true, true, &pool)
+        else {
+            panic!("labels the pool can never satisfy must fail fast");
+        };
+        assert!(reason.contains("can never satisfy"), "{reason}");
+        // An external-host job waits for its host regardless of pool labels.
+        let mac = labels(&["macos-14"]);
+        let mac_job = starvation_candidate(&mac, Duration::from_secs(1), None, now);
+        assert_eq!(
+            starvation_verdict(&mac_job, now, false, false, &pool),
             StarvationVerdict::ClearMark
         );
-        let old = starvation_candidate(&linux, Duration::from_secs(600), None, now);
+        // A job the pool can satisfy skips the short grace until the ceiling.
+        let linux = labels(&["self-hosted", "linux"]);
+        let waiting = starvation_candidate(&linux, Duration::from_secs(600), None, now);
+        assert_eq!(
+            starvation_verdict(&waiting, now, false, false, &pool),
+            StarvationVerdict::ClearMark
+        );
+        let stuck = starvation_candidate(&linux, MAX_QUEUED_GRACE, None, now);
         assert!(matches!(
-            starvation_verdict(&old, now, true, false),
-            StarvationVerdict::Starve { grace, .. } if grace == MAX_QUEUED_GRACE
+            starvation_verdict(&stuck, now, false, false, &pool),
+            StarvationVerdict::Starve { .. }
+        ));
+    }
+
+    #[test]
+    fn unschedulable_reason_exempts_external_hosts_and_templates() {
+        let pool = labels(&["self-hosted", "linux", "x64"]);
+        assert!(unschedulable_reason(&labels(&["macos-14"]), &pool, false).is_none());
+        assert!(
+            unschedulable_reason(&["${{ needs.plan.outputs.runner }}".into()], &pool, false)
+                .is_none()
+        );
+        assert!(unschedulable_reason(&labels(&["gpu-large"]), &pool, true).is_none());
+        let reason = unschedulable_reason(&labels(&["gpu-large"]), &pool, false)
+            .expect("unmatched pool-incompatible labels fail");
+        assert!(reason.contains("can never satisfy"), "{reason}");
+        assert!(unschedulable_reason(&labels(&["gpu-large"]), &[], false).is_none());
+    }
+
+    #[test]
+    fn promotion_rejects_unhostable_and_unsatisfiable_resolved_labels() {
+        let pool = labels(&["ubuntu-latest"]);
+        let reason = promotion_unsatisfiable_reason(
+            &labels(&["windows-latest"]),
+            std::iter::empty(),
+            &pool,
+            false,
+        )
+        .expect("windows with no windows runner is unhostable");
+        assert!(reason.contains("windows"), "{reason}");
+        assert!(reason.contains("registered with this server"), "{reason}");
+        let reason =
+            promotion_unsatisfiable_reason(&labels(&["gpu-large"]), ["linux"], &pool, false)
+                .expect("resolved label the pool cannot serve fails");
+        assert!(reason.contains("can never satisfy"), "{reason}");
+        assert!(
+            promotion_unsatisfiable_reason(&labels(&["ubuntu-latest"]), ["linux"], &pool, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workless_jobs_conclude_at_submit_placeholders_do_not() {
+        let pool = labels(&["ubuntu-latest"]);
+        let linux = ["linux"];
+        assert!(concludes_at_submit(
+            true,
+            false,
+            &labels(&["ubuntu-latest"]),
+            true,
+            linux,
+            &pool,
+            false
+        ));
+        assert!(!concludes_at_submit(
+            false,
+            true,
+            &labels(&["gpu-large"]),
+            true,
+            linux,
+            &pool,
+            false
+        ));
+        assert!(concludes_at_submit(
+            false,
+            false,
+            &labels(&["gpu-large"]),
+            true,
+            linux,
+            &pool,
+            false
+        ));
+        assert!(!concludes_at_submit(
+            false,
+            false,
+            &labels(&["ubuntu-latest"]),
+            true,
+            linux,
+            &pool,
+            false
+        ));
+    }
+
+    #[test]
+    fn an_enqueue_stamped_ahead_of_this_clock_is_fresh() {
+        let now = SystemTime::now();
+        let linux = labels(&["self-hosted", "linux"]);
+        let ahead = StarvationCandidate {
+            enqueued_at: now + Duration::from_secs(2),
+            ..starvation_candidate(&linux, Duration::ZERO, None, now)
+        };
+        assert!(matches!(
+            starvation_verdict(&ahead, now, false, false, &[]),
+            StarvationVerdict::Mark { .. }
         ));
         assert_eq!(
-            starvation_verdict(&old, now, true, true),
-            StarvationVerdict::ClearMark
+            starvation_verdict(&ahead, now, true, false, &[]),
+            StarvationVerdict::Mark { first_seen: now }
         );
     }
 
@@ -1006,6 +1263,58 @@ mod decision_tests {
         assert_eq!(
             claim_preference(&rows, Some(7), &["linux".into()], None, &runner),
             Some(1)
+        );
+    }
+
+    /// A 24.04 machine may stand in for an `ubuntu-22.04` job, but it must not
+    /// take one while a job it exactly matches is claimable: the pool is
+    /// usually already building the 22.04 machine that job asked for, and the
+    /// stand-in would hand it a different base image for no reason.
+    #[test]
+    fn exact_labels_beat_an_earlier_stand_in_candidate() {
+        let runner = RunnerMatchRow {
+            labels: labels(&[
+                "self-hosted",
+                "Linux",
+                "X64",
+                "ubuntu-24.04",
+                "ubuntu-latest",
+            ]),
+            known: true,
+            ..Default::default()
+        };
+        // `pinned` is first in the queue, so only the preference can reorder
+        // it: it is a stand-in candidate, never an exact match.
+        let pinned = ClaimCandidate {
+            run_id: rid(1),
+            job_id: jid("pinned"),
+            runs_on: labels(&["ubuntu-22.04"]),
+            runner_group: None,
+            assigned_runner_id: None,
+            assignment_fresh: false,
+            queue_position: 0,
+            claimable: true,
+        };
+        let wide = ClaimCandidate {
+            run_id: rid(1),
+            job_id: jid("wide"),
+            runs_on: labels(&["self-hosted"]),
+            runner_group: None,
+            assigned_runner_id: None,
+            assignment_fresh: false,
+            queue_position: 1,
+            claimable: true,
+        };
+        assert_eq!(
+            claim_preference(&[pinned.clone(), wide], None, &runner.labels, None, &runner),
+            Some(1),
+            "the exact `self-hosted` match must win over the 22.04 stand-in"
+        );
+        // And the stand-in still happens rather than starving the pinned job.
+        assert_eq!(
+            claim_preference(&[pinned], None, &runner.labels, None, &runner),
+            Some(0),
+            "the pinned job stays claimable once the exact match is gone"
         );
     }
 
@@ -1387,6 +1696,17 @@ pub(crate) fn unhostable_platform(
     (!hosted_by_someone).then_some(needed)
 }
 
+/// Why a job whose platform no registered runner hosts is concluded
+/// (`bounded_termination_reason` classifies this prose as
+/// `no_platform_runner`).
+pub(crate) fn unhostable_reason(platform: &str, runs_on: &[String]) -> String {
+    format!(
+        "no {platform} runner is registered with this server, so `runs-on: {}` \
+         cannot be scheduled",
+        runs_on.join(", ")
+    )
+}
+
 pub(crate) fn capabilities_of(
     runner: &preloop_gha_protocol::RegisteredRunner,
 ) -> crate::models::RunnerCapabilities {
@@ -1479,50 +1799,6 @@ pub(crate) fn ancestor_statuses(run: &RunRecord, job: &QueuedJob) -> Vec<Executi
     statuses
 }
 
-pub(crate) fn hydrate_needs_context(job: &mut QueuedJob, run: &RunRecord) {
-    let needs = job
-        .needs
-        .iter()
-        .filter_map(|need| need_context(run, need).map(|context| (need.0.clone(), context)))
-        .collect();
-    job.message
-        .context_data
-        .insert("needs".to_owned(), azdo::PipelineContextData::Dict(needs));
-
-    let Some(environment) = job.environment.as_ref() else {
-        return;
-    };
-    let Some(name) = (match environment {
-        serde_json::Value::String(name) => Some(name.as_str()),
-        serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
-        _ => None,
-    }) else {
-        return;
-    };
-    if !preloop_gha_parser::eval::resolves_after_job_build(name) {
-        return;
-    }
-    let Some(actions_environment) = job.message.actions_environment.as_mut() else {
-        return;
-    };
-    let mut context = preloop_gha_expressions::Context::new();
-    for (key, value) in &job.message.context_data {
-        context.insert(key, value.to_json());
-    }
-    match preloop_gha_parser::eval::resolve_string(name, &context) {
-        Ok(resolved) => actions_environment.name = resolved,
-        Err(error) => {
-            tracing::error!(
-                run_id = %job.run_id.0,
-                job = %job.job_id.0,
-                environment = %name,
-                %error,
-                "deployment environment expression failed to evaluate after needs completed"
-            );
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // Request lifecycle
 // ─────────────────────────────────────────────────────────────────────────
@@ -1560,6 +1836,15 @@ pub(crate) struct MatrixExpansionInputs {
     pub(crate) expression: String,
     pub(crate) needs_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     pub(crate) workflow_file: Option<String>,
+    /// The deferred node's own `inputs` context. For a top-level node this is
+    /// the run's dispatch inputs (stamped on the plan at submit time); for a
+    /// node inside a reusable workflow it is the caller's `with` values that
+    /// the callee subtree was expanded with. The fan-out cells must see these
+    /// scoped inputs, not the root dispatch inputs: GitHub scopes `inputs` to
+    /// the workflow that declares the job, so a callee cell reading
+    /// `inputs.dry_run` gets the caller's `with` value even on a
+    /// push-triggered run whose dispatch map is empty.
+    pub(crate) scoped_inputs: BTreeMap<String, serde_json::Value>,
 }
 
 pub(crate) enum ExpansionPlan {
@@ -1794,6 +2079,7 @@ fn build_matrix_expansion(
         expression,
         needs_outputs,
         workflow_file,
+        scoped_inputs,
     } = inputs;
     let run_id = ctx.run_id;
     let workflow_yaml = workflow_file
@@ -1810,7 +2096,13 @@ fn build_matrix_expansion(
         &base_id,
         &expression,
         &needs_outputs,
-        Some(&ctx.submission.inputs),
+        // Fan out with the deferred node's own scoped inputs: the root run's
+        // dispatch inputs for a top-level node, or the caller's `with` values
+        // for a node inside a reusable workflow. The legacy
+        // `submission.inputs` field is empty for workflow_dispatch runs, so
+        // using it here would fan out cells with an empty `inputs` context
+        // while plain jobs see the values.
+        Some(&scoped_inputs),
     )
     .map_err(|error| {
         tracing::warn!(%run_id, job = %node_id, %error, "dynamic matrix expansion failed");
@@ -1819,7 +2111,6 @@ fn build_matrix_expansion(
 
     let github_json = ctx.github_json.clone();
     let vars = ctx.submission.vars.clone();
-    let submission_inputs = ctx.submission.inputs.clone();
     let jobs = build_jobs(shared, &ctx, &plans, |plan| {
         preloop_gha_parser::eval::build_context(
             &github_json,
@@ -1832,8 +2123,121 @@ fn build_matrix_expansion(
                 .collect(),
             &serde_json::json!({}),
             &BTreeMap::new(),
-            &submission_inputs,
+            // The fan-out plans carry the node's scoped inputs on the plan
+            // itself, so the cell `if:` sees the same `inputs` the steps will.
+            &plan.inputs,
         )
     })?;
     Ok(BuiltExpansion::Matrix { jobs })
+}
+
+#[cfg(test)]
+mod matrix_expansion_tests {
+    use super::*;
+
+    /// The workflow the fan-out tests expand: a needs-deferred matrix whose
+    /// cell gates on `inputs.dry_run`.
+    const DEFERRED_MATRIX_WORKFLOW: &str = r#"
+on: push
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo gen
+  downstream:
+    needs: [gen]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run }}
+    strategy:
+      matrix: ${{ fromJSON(needs.gen.outputs.matrix) }}
+    steps:
+      - run: echo dynamic
+"#;
+
+    /// A deferred matrix node fans out with its own scoped `inputs`: the
+    /// root run's dispatch inputs for a top-level node (stamped on the plan at
+    /// submit time), or the caller's `with` values for a node inside a
+    /// reusable workflow. The legacy `submission.inputs` field is empty for
+    /// workflow_dispatch runs, so fanning out with it handed the cells an
+    /// empty `inputs` context while plain jobs saw the values, and both the
+    /// step expressions and the job-level `if:` resolved against nothing
+    /// (#285).
+    #[tokio::test]
+    async fn matrix_expansion_uses_deferred_node_scoped_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = crate::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let shared = state.shared();
+
+        let scoped_inputs = BTreeMap::from([("dry_run".to_owned(), serde_json::json!(true))]);
+        let submission = Arc::new(WorkflowSubmission {
+            workflow_yaml: DEFERRED_MATRIX_WORKFLOW.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        });
+        // The legacy field is empty — as it is on every workflow_dispatch
+        // run — so only `scoped_inputs` can carry the fan-out's values.
+        assert!(submission.inputs.is_empty());
+
+        let built = build_expansion(
+            &shared,
+            ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
+                ctx: ExpansionContext {
+                    run_id: RunId::new(),
+                    submission,
+                    snapshot: None,
+                    github_json: serde_json::json!({}),
+                    workflow_path: ".github/workflows/ci.yml".to_owned(),
+                    workflow_ref: "owner/repo/.github/workflows/ci.yml@refs/heads/main".to_owned(),
+                    head_sha: "0".repeat(40),
+                },
+                node_id: JobId("downstream".to_owned()),
+                base_id: "downstream".to_owned(),
+                expression: "${{ fromJSON(needs.gen.outputs.matrix) }}".to_owned(),
+                needs_outputs: BTreeMap::from([(
+                    "gen".to_owned(),
+                    BTreeMap::from([(
+                        "matrix".to_owned(),
+                        serde_json::json!({
+                            "include": [
+                                {"os": "ubuntu-latest"},
+                                {"os": "ubuntu-22.04"},
+                            ],
+                        }),
+                    )]),
+                )]),
+                workflow_file: None,
+                scoped_inputs: scoped_inputs.clone(),
+            })),
+        )
+        .expect("the deferred matrix must expand");
+
+        let BuiltExpansion::Matrix { jobs } = built else {
+            panic!("a matrix node must fan out");
+        };
+        assert_eq!(jobs.len(), 2, "both matrix combinations must fan out");
+        for job in &jobs {
+            assert_eq!(
+                job.plan.inputs, scoped_inputs,
+                "cell `{}` must carry the node's scoped inputs",
+                job.plan.id.0
+            );
+            // Evaluate exactly as the promotion path does: the cell `if:`
+            // gates on `inputs.dry_run`, which is true only when the
+            // condition context was built from the plan's own inputs.
+            let condition =
+                preloop_gha_expressions::effective_condition(job.plan.if_condition.as_deref());
+            let context = job
+                .condition_context
+                .clone()
+                .with_status(true, false, false);
+            assert!(
+                preloop_gha_expressions::eval_bool(&condition, &context).unwrap(),
+                "cell `{}` must see `inputs.dry_run` in its `if:` context",
+                job.plan.id.0
+            );
+        }
+    }
 }

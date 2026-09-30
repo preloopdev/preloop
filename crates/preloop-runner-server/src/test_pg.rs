@@ -6,10 +6,10 @@
 //! without seeing each other's rows.
 
 /// Environment variable naming the shared test server's admin URL.
-pub(crate) const TEST_POSTGRES_URL_ENV: &str = "PRELOOP_TEST_POSTGRES_URL";
+pub const TEST_POSTGRES_URL_ENV: &str = "PRELOOP_TEST_POSTGRES_URL";
 
 /// Drops its database on drop.
-pub(crate) struct TestDatabase {
+pub struct TestDatabase {
     admin_url: String,
     name: String,
 }
@@ -41,7 +41,7 @@ impl Drop for TestDatabase {
 
 /// A fresh database on the shared server and its URL, or `None` when
 /// `PRELOOP_TEST_POSTGRES_URL` is unset.
-pub(crate) async fn fresh_database() -> Option<(TestDatabase, String)> {
+pub async fn fresh_database() -> Option<(TestDatabase, String)> {
     let admin_url = std::env::var(TEST_POSTGRES_URL_ENV)
         .ok()
         .filter(|url| !url.trim().is_empty())?;

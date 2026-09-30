@@ -600,13 +600,17 @@ impl PgBackend {
                     us!("q.started_at"),
                     ", ",
                     us!("l.renewed_at"),
-                    ", q.timeout_triggered, (m.message_template->>'jobTimeout')::int8 \
+                    ", q.timeout_triggered, (m.message_template->>'jobTimeout')::int8, \
+                     EXISTS (SELECT 1 FROM runner_sessions s \
+                             WHERE s.session_id = q.session_id AND ",
+                    us!("s.last_seen_at"),
+                    " >= $1) \
                      FROM job_requests q \
                      LEFT JOIN job_leases l ON l.request_id = q.request_id \
                      LEFT JOIN job_messages m ON m.run_id = q.run_id AND m.job_id = q.job_id \
                      WHERE q.result IS NULL ORDER BY q.request_id"
                 ),
-                &[],
+                &[&cutoff],
             )
             .await
             .map_err(db)?
@@ -618,6 +622,7 @@ impl PgBackend {
                 started_at: row.get::<_, Option<i64>>(3).map(codec::us_to_system),
                 last_renewed_at: row.get::<_, Option<i64>>(4).map(codec::us_to_system),
                 timeout_triggered: row.get(5),
+                session_live: row.get(7),
                 job_timeout_s: row.get(6),
             });
         }

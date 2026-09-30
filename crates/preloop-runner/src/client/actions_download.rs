@@ -11,7 +11,7 @@
 //!
 //! Then flow 20: GET codeload.github.com/{owner}/{repo}/tar.gz/{resolved_sha}
 //!
-//! M2: no api.github.com fallback — if the launch endpoint does not resolve
+//! No api.github.com fallback — if the launch endpoint does not resolve
 //! the ref to a SHA-pinned URL, the runner refuses the download.
 
 use anyhow::{Context, Result};
@@ -152,7 +152,7 @@ impl ActionsResolveClient {
             Err(e) => {
                 tracing::warn!(
                     "runnerresolve batch failed; action downloads will fail closed \
-                     (M2: there is no api.github.com fallback): {e:#}"
+                     (there is no api.github.com fallback): {e:#}"
                 );
                 return Ok(HashMap::new());
             }

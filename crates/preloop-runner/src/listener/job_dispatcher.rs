@@ -444,8 +444,8 @@ impl RunningJob {
 
     /// Hard-kill the worker and its whole process tree (after cancel timeout
     /// expires). Steps run in their own process groups (`process.rs`
-    /// `group_spawn`), so killing only the worker PID would orphan them
-    /// (CR-2 F-2); the official runner's JobDispatcher kills the worker with
+    /// `group_spawn`), so killing only the worker PID would orphan them;
+    /// the official runner's JobDispatcher kills the worker with
     /// `Process.Kill(entireProcessTree: true)`, and this mirrors that.
     pub async fn kill(&mut self) {
         // Drop stdin first to unblock the worker's reader
@@ -762,7 +762,7 @@ mod timespan_tests {
 
     proptest! {
         #[test]
-        fn run_time_01_parses_valid_timespans(
+        fn parses_valid_timespans(
             days in 0_u64..=10_000,
             hours in 0_u64..24,
             minutes in 0_u64..60,
@@ -779,12 +779,12 @@ mod timespan_tests {
             prop_assert_eq!(
                 parse_timespan_secs(&input),
                 Some(expected),
-                "RUN-TIME-01: valid TimeSpan must preserve its duration without an early fractional truncation",
+                "valid TimeSpan must preserve its duration without an early fractional truncation",
             );
         }
 
         #[test]
-        fn run_time_01_rejects_out_of_range_clock_fields(
+        fn rejects_out_of_range_clock_fields(
             hours in 24_u64..=99,
             minutes in 60_u64..=99,
             seconds in 60_u64..=99,
@@ -795,7 +795,7 @@ mod timespan_tests {
         }
 
         #[test]
-        fn run_time_01_never_schedules_forced_kill_before_45_seconds(
+        fn never_schedules_forced_kill_before_45_seconds(
             timeout_secs in any::<u64>(),
         ) {
             let timing = cancellation_timing(timeout_secs);
@@ -805,7 +805,7 @@ mod timespan_tests {
         }
 
         #[test]
-        fn run_scope_01_cancel_ipc_excludes_server_concurrency_metadata(
+        fn cancel_ipc_excludes_server_concurrency_metadata(
             timeout_secs in any::<u64>(),
         ) {
             let encoded = serde_json::to_value(WorkerMessage::Cancel { timeout_secs }).unwrap();
@@ -819,7 +819,7 @@ mod timespan_tests {
             for server_only in ["concurrency", "group", "queue", "matrix", "reusable"] {
                 prop_assert!(
                     !object.contains_key(server_only),
-                    "RUN-SCOPE-01: runner IPC exposed server-only field {server_only}",
+                    "runner IPC exposed server-only field {server_only}",
                 );
             }
         }
@@ -959,7 +959,7 @@ mod tests {
         );
     }
 
-    // --- P1 job dispatcher gap coverage ---
+    // --- job dispatcher gap coverage ---
 
     #[test]
     fn worker_message_job_serialization() {

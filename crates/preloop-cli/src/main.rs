@@ -1372,7 +1372,7 @@ fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Anonymous liveness probe for the local engine (H4).
+/// Anonymous liveness probe for the local engine.
 ///
 /// `/healthz` is a public, unauthenticated endpoint — the handler never reads
 /// credentials — so the probe must not attach the API bearer token. Sending
@@ -1397,7 +1397,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
 
-    // H4: the liveness probe is anonymous — see `probe_engine_health`.
+    // The liveness probe is anonymous — see `probe_engine_health`.
     if probe_engine_health(&client, &url).await {
         return Ok(());
     }
@@ -6061,7 +6061,7 @@ mod tests {
         assert_eq!(mounted_control_origin("https://preloop.preloop.dev"), None);
     }
 
-    /// H4: the engine liveness probe must never carry the API bearer token.
+    /// The engine liveness probe must never carry the API bearer token.
     /// `/healthz` is public and unauthenticated, so an `Authorization`
     /// header on the probe only leaks the credential. Failing first: with
     /// `PRELOOP_TOKEN` set (so `api_token()` resolves to a real secret),
@@ -6102,7 +6102,7 @@ mod tests {
         assert!(healthy, "stub /healthz should answer the probe");
         assert!(
             !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
-            "H4: the /healthz probe must not send an Authorization header"
+            "the /healthz probe must not send an Authorization header"
         );
     }
 }

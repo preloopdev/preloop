@@ -249,7 +249,7 @@ pub fn run_record_value(run: &RunRecord) -> anyhow::Result<serde_json::Value> {
     Ok(value)
 }
 
-pub(crate) fn now_us() -> i64 {
+pub fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

@@ -96,8 +96,8 @@ async fn register_runner_inner(
 /// Retired: the control backend commits every mutation durably inside its own
 /// transaction, so the legacy `StoreSnapshot`/`store_inner` dual-write is no
 /// longer needed to survive a restart. Kept as a no-op so the registration /
-/// session call sites read unchanged; the whole helper is deleted in the
-/// cutover cleanup once the snapshot store is removed.
+/// session call sites read unchanged; the whole helper is deleted once the
+/// snapshot store is removed.
 async fn persist_full_state(_shared: &Arc<SharedState>) -> Result<(), ApiError> {
     Ok(())
 }
@@ -416,16 +416,22 @@ pub async fn purge_runner_identity_guarded(
         }
         crate::auth::AdminCaller::RunnerManager => crate::control::PurgeGuard::RegistrationToken,
     };
-    shared
+    let retired = shared
         .state
         .backend
         .purge_runner_guarded(agent_id, guard)
         .await
-        .map_err(ApiError::from)?;
-    // `runner_public_keys` is node-local — outside the scheduling tx.
+        .map_err(ApiError::from)?
+        .unwrap_or_default();
+    // `runner_public_keys` and the live-log feeds are node-local — outside
+    // the scheduling tx. An abandoned attempt's feed closes so its
+    // `logs -f` followers exit; the retry streams under its own identity.
     {
         let mut inner = shared.state.inner.lock().await;
         inner.runner_public_keys.remove(&agent_id);
+        for agent_job_id in &retired {
+            crate::live_logs::close_live_log(&mut inner, &agent_job_id.to_string());
+        }
     }
     shared.state.message_notify.notify_waiters();
     Ok(())
@@ -458,13 +464,14 @@ async fn purge_runner_identity_with_phantom_check(
     } else {
         crate::control::PurgeGuard::System
     };
-    let purged = shared
+    let Some(retired) = shared
         .state
         .backend
         .purge_runner_guarded(runner_id, guard)
         .await
-        .unwrap_or(false);
-    if !purged {
+        .ok()
+        .flatten()
+    else {
         if only_if_phantom {
             tracing::info!(
                 runner_id,
@@ -472,10 +479,13 @@ async fn purge_runner_identity_with_phantom_check(
             );
         }
         return false;
-    }
+    };
     {
         let mut inner = shared.state.inner.lock().await;
         inner.runner_public_keys.remove(&runner_id);
+        for agent_job_id in &retired {
+            crate::live_logs::close_live_log(&mut inner, &agent_job_id.to_string());
+        }
     }
     shared.state.message_notify.notify_waiters();
     true

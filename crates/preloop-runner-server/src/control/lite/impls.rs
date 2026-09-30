@@ -124,7 +124,7 @@ impl ControlBackend for LiteBackend {
     async fn delete_session(&self, session_id: &str) -> Result<(), ControlError> {
         self.delete_session(session_id).await
     }
-    async fn purge_runner(&self, runner_id: i64) -> Result<(), ControlError> {
+    async fn purge_runner(&self, runner_id: i64) -> Result<Vec<uuid::Uuid>, ControlError> {
         self.purge_runner(runner_id).await
     }
     async fn claim_expansion(&self) -> Result<Option<ExpansionClaim>, ControlError> {
@@ -654,7 +654,7 @@ impl ControlBackend for LiteBackend {
         &self,
         runner_id: i64,
         guard: PurgeGuard,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<Vec<uuid::Uuid>>, ControlError> {
         self.purge_runner_guarded(runner_id, guard).await
     }
     async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError> {

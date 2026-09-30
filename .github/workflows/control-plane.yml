@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["16", "17"]
+        postgres: ["16", "17", "18"]
     env:
       CARGO_BUILD_JOBS: "6"
       RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"

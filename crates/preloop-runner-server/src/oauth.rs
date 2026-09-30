@@ -102,7 +102,7 @@ pub fn decode_jwt_segment(segment: &str) -> Option<serde_json::Value> {
 }
 
 /// Token TTL in seconds. Override with PRELOOP_TOKEN_TTL_SECS for testing
-/// short-lived tokens (e.g. =1 triggers RLIS-02 proactive refresh immediately).
+/// short-lived tokens (e.g. =1 triggers the proactive refresh immediately).
 pub fn token_ttl_secs() -> u64 {
     std::env::var("PRELOOP_TOKEN_TTL_SECS")
         .ok()
@@ -116,7 +116,7 @@ const MAX_ASSERTION_LIFETIME_SECS: i64 = 600;
 /// Clock-skew allowance for iat/nbf future-dating.
 const ASSERTION_CLOCK_SKEW_SECS: i64 = 60;
 
-/// Validate the RFC 7523 §3 claims of a client_assertion JWT (R1-9).
+/// Validate the RFC 7523 §3 claims of a client_assertion JWT.
 ///
 /// Requires `exp` and rejects expired assertions; requires the assertion to
 /// be addressed to this server (`aud` matches the called token endpoint or
@@ -305,7 +305,7 @@ pub async fn oauth2_token(
         }
     }
 
-    // R1-9: validate the assertion claims (RFC 7523 §3). The signature alone
+    // Validate the assertion claims (RFC 7523 §3). The signature alone
     // does not bind the assertion to this server or to a time window: without
     // exp/aud checks a captured assertion replays indefinitely against any
     // preloop server holding the runner's public key.

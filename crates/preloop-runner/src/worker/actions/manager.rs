@@ -1,12 +1,12 @@
 //! Action download and extraction manager.
 //!
-//! F022: Uses `ActionsResolveClient` to batch-resolve `uses:` refs to SHA-pinned
+//! Uses `ActionsResolveClient` to batch-resolve `uses:` refs to SHA-pinned
 //! codeload.github.com URLs before downloading.
 //!
 //! Golden 10 flow 19-20: batch POST to runnerresolve → GET codeload tarball →
 //! extract to `_work/_actions/{owner}/{repo}/{sha}/`.
 //!
-//! M2: there is no api.github.com fallback. If the server did not resolve
+//! There is no api.github.com fallback. If the server did not resolve
 //! the ref to a commit SHA with a SHA-pinned download URL, the download is
 //! refused before any network access — fetching the mutable ref would
 //! reintroduce the TOCTOU that SHA pinning removes.
@@ -92,7 +92,7 @@ fn evict_action_cache(dest: &Path, sidecar: &Path) -> Result<()> {
 /// mutable branch/tag: callers pass `resolved_sha` from the runnerresolve
 /// response, falling back to the raw `uses:` ref only when resolution
 /// failed. `download_url` must be the server-supplied SHA-pinned tarball
-/// URL. Both are required (M2): if the server could not pin the ref to a
+/// URL. Both are required: if the server could not pin the ref to a
 /// commit, the runner refuses to fetch the mutable ref from
 /// api.github.com — downloading `tarball/{branch|tag}` reintroduces the
 /// TOCTOU that SHA pinning exists to remove (the ref can move between
@@ -129,18 +129,18 @@ pub async fn download_action(
     auth_token: Option<&str>,
     digest_pin: ArchiveDigestPin,
 ) -> Result<(PathBuf, Option<String>)> {
-    // M2: only pinned commit SHAs may be downloaded; anything else means
+    // Only pinned commit SHAs may be downloaded; anything else means
     // server-side resolution failed. The all-zero sentinel is a valid SHA
     // shape but names no commit, so it is rejected like any unpinned ref.
     if !preloop_gha_protocol::git_ref::is_commit_sha_not_zero(git_ref) {
         anyhow::bail!(
-            "M2: refusing to download action {owner}/{repo}@{git_ref}: \
+            "refusing to download action {owner}/{repo}@{git_ref}: \
              ref was not resolved to a commit SHA"
         );
     }
     let url = download_url.filter(|url| !url.is_empty()).ok_or_else(|| {
         anyhow::anyhow!(
-            "M2: refusing to download action {owner}/{repo}@{git_ref}: \
+            "refusing to download action {owner}/{repo}@{git_ref}: \
              server supplied no SHA-pinned download URL"
         )
     })?;
@@ -183,7 +183,7 @@ pub async fn download_action(
                 // (`{runner_actions}:/__w/_actions`), so a previous job's
                 // workflow could have modified the extracted tree. Evict it
                 // and re-download; the fresh bytes are verified against the
-                // engine-attested digest header before extraction (P2).
+                // engine-attested digest header before extraction.
                 // The runner verifies *against* pins and attestations, it
                 // never mints them.
                 tracing::warn!(
@@ -202,7 +202,7 @@ pub async fn download_action(
         }
     }
 
-    // M2: no api.github.com fallback. `url` is the server-supplied
+    // No api.github.com fallback. `url` is the server-supplied
     // SHA-pinned tarball URL, validated above; a missing URL fails closed.
     let url = url.to_string();
 
@@ -243,7 +243,7 @@ pub async fn download_action(
     // and no executable destination is left behind.
     //
     // The expected digest is the resolve-time pin when Pinned; otherwise
-    // the engine-attested digest from the download response header (P2):
+    // the engine-attested digest from the download response header:
     // the engine computed it over the exact bytes it serves, so even an
     // Unpinned download is verified. When neither exists (older engine),
     // the download proceeds unverified with a warning — legacy behavior.
@@ -1000,7 +1000,7 @@ mod tests {
         assert_eq!(cached_res, res);
     }
 
-    /// M2: an unresolved action (no SHA-pinned download URL from the
+    /// An unresolved action (no SHA-pinned download URL from the
     /// server) must be rejected before any network access — the runner
     /// must not fall back to `api.github.com/repos/{o}/{r}/tarball/{ref}`.
     #[tokio::test]
@@ -1030,10 +1030,10 @@ mod tests {
         );
     }
 
-    /// M2: a mutable ref (branch/tag/short SHA) that the server failed to
+    /// A mutable ref (branch/tag/short SHA) that the server failed to
     /// resolve must be rejected before any network access, even when a URL
     /// is supplied. The unreachable URL proves no network attempt happens:
-    /// a fetch would fail with a connection error, not the M2 error.
+    /// a fetch would fail with a connection error, not the refusal.
     #[tokio::test]
     async fn download_action_rejects_mutable_ref() {
         let temp = TempDir::new().unwrap();
@@ -1058,9 +1058,8 @@ mod tests {
         }
     }
 
-    /// M2: the SHA/URL checks run before the cache lookup — a stale
-    /// mutable-ref cache entry (left by a pre-fix run) must not bypass
-    /// fail-closed.
+    /// The SHA/URL checks run before the cache lookup — a stale
+    /// mutable-ref cache entry must not bypass fail-closed.
     #[tokio::test]
     async fn download_action_rejects_mutable_ref_despite_cache() {
         let temp = TempDir::new().unwrap();
@@ -1081,7 +1080,7 @@ mod tests {
         .await;
         assert!(
             result.is_err(),
-            "stale mutable-ref cache entry must not bypass M2"
+            "stale mutable-ref cache entry must not bypass fail-closed"
         );
     }
 
@@ -1476,7 +1475,7 @@ mod tests {
         assert_eq!(observed.as_deref(), Some(pin.as_str()));
     }
 
-    /// P2: an Unpinned cache hit is NOT trusted as-is. The cache entry is
+    /// An Unpinned cache hit is NOT trusted as-is. The cache entry is
     /// of unknown provenance (job containers mount this directory
     /// read-write), so it is evicted and replaced by a fresh download
     /// verified against the engine-attested digest header — never executed
@@ -1521,7 +1520,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sidecar).unwrap().trim(), digest);
     }
 
-    /// P2: when the Unpinned re-download fails, the stale cache is still
+    /// When the Unpinned re-download fails, the stale cache is still
     /// evicted — the failure surfaces as an error rather than silently
     /// executing the unknown-provenance tree.
     #[tokio::test]
@@ -1551,7 +1550,7 @@ mod tests {
         );
     }
 
-    /// P2: a download whose bytes do not match the engine-attested digest
+    /// A download whose bytes do not match the engine-attested digest
     /// fails closed before extraction, even when Unpinned — no tree left.
     #[tokio::test]
     async fn download_action_fails_closed_on_attestation_mismatch() {

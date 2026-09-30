@@ -58,7 +58,7 @@ pub struct GitHubConfig {
     /// policy. Also the credential for the `--via pat` setup path.
     /// Stored inline (legacy); see [`Self::legacy_app_pem`].
     ///
-    /// H3: a static PAT cannot be narrowed per job. When no GitHub App is
+    /// A static PAT cannot be narrowed per job. When no GitHub App is
     /// configured, submission introspects the PAT's classic OAuth scopes and
     /// refuses runs whose declared `permissions:` are narrower than the PAT.
     /// Prefer a GitHub App so installation tokens are minted least-privilege.
@@ -2074,7 +2074,7 @@ REPO_OVERLAY = "repo-from-credential"
         assert!(load_credential_from(&bad).is_err());
     }
 
-    // --- H2: config-file secret sealing ---
+    // --- config-file secret sealing ---
 
     /// The file on disk must hold ciphertext, never plaintext secret values.
     #[test]
@@ -2114,12 +2114,12 @@ REPO_OVERLAY = "repo-from-credential"
         );
     }
 
-    /// Pre-fix configs held plaintext. They must keep loading, and the next
+    /// Legacy configs held plaintext. They must keep loading, and the next
     /// write must re-seal them — no silent loss, no plaintext left behind.
     #[test]
     fn legacy_plaintext_secrets_are_read_and_resealed() {
         let dir = tempfile::tempdir().unwrap();
-        // Simulate a pre-fix file: plaintext values, no key ever generated.
+        // Simulate a legacy file: plaintext values, no key ever generated.
         let plain_text = toml::to_string_pretty(&populated_config()).unwrap();
         assert!(!plain_text.contains(SEALED_SECRET_PREFIX));
         // Loading legacy plaintext never touches the key backend.

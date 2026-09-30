@@ -1047,7 +1047,7 @@ fn extract_iss(headers: &axum::http::HeaderMap) -> String {
         .unwrap_or_default()
 }
 
-/// M3: each registered secret is accepted only for repositories covered by
+/// Each registered secret is accepted only for repositories covered by
 /// the App that owns it. A payload signed by App 525's secret claiming
 /// org-a/repo (App 424's installation) is a cross-App forgery and must be
 /// rejected, even though the signature itself is valid. Coverage is exact:
@@ -1113,13 +1113,13 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     assert_eq!(
         deliver_webhook(&app, "ping", &ping("org-b/other-repo"), "second-secret").await,
         StatusCode::FORBIDDEN,
-        "M3: same-owner sibling repo outside the installation must be rejected"
+        "same-owner sibling repo outside the installation must be rejected"
     );
     // App 525's secret for org-a/repo (App 424's installation) → 403.
     assert_eq!(
         deliver_webhook(&app, "ping", &ping("org-a/repo"), "second-secret").await,
         StatusCode::FORBIDDEN,
-        "M3: cross-App forgery must be rejected"
+        "cross-App forgery must be rejected"
     );
     // Legacy secret: no App identity, no binding — accepted as before.
     assert_eq!(

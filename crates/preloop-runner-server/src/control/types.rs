@@ -390,6 +390,13 @@ pub(crate) struct RunDispatchJob {
     /// `run_jobs.display_name` — the evaluated GitHub name, when stored.
     pub(crate) display_name: Option<String>,
     pub(crate) check_run_id: Option<u64>,
+    /// An expandable placeholder (`jobs.kind` `matrix_parent` / `reusable_caller`):
+    /// the node never dispatches, expansion replaces it with the legs that
+    /// report their own checks, and a `queued` check minted for it would
+    /// strand on GitHub (there is no delete API). Intake loops skip these
+    /// rows; a placeholder concluded by cancellation still reports through
+    /// `report_check_run_completed`, which mints on demand.
+    pub(crate) placeholder: bool,
     /// Stored `jobs_list` entry (annotations, step projection) if present.
     pub(crate) detail: Option<crate::models::JobDetail>,
     /// Latest attempt's step manifest (`job_steps`), empty pre-dispatch.
@@ -440,8 +447,13 @@ impl RunConcurrency {
 }
 
 /// Errors every backend maps onto the same domain vocabulary. Handlers
+///
+/// Public (rather than crate-private) only so the `test-support` integration
+/// crates can name it: `control::testview`'s seed helpers return it from
+/// public methods, and a private error type there is unusable outside the
+/// crate.
 #[derive(Debug)]
-pub(crate) enum ControlError {
+pub enum ControlError {
     NotFound(String),
     Conflict(String),
     Forbidden(String),
@@ -505,7 +517,6 @@ impl From<ControlError> for ApiError {
                 // caller that can reach a control-backed handler — including
                 // untrusted workflow code holding a runtime token. Log it
                 // server-side; return a fixed message to the client.
-                eprintln!("control backend error: {error:?}");
                 tracing::error!(?error, "control backend error");
                 ApiError::internal("control backend error")
             }
@@ -530,6 +541,14 @@ pub(crate) fn check_key_fingerprint(stored: &[u8], fingerprint: &str) -> Result<
 /// Records kept per timeline (a runner timeline has tens of records; this
 /// bounds a misbehaving client).
 pub(crate) const MAX_TIMELINE_RECORDS: usize = 1024;
+/// Approximate the in-memory footprint used by the timeline byte budget.
+/// Keep this intentionally stable across SQLite and Postgres.
+pub(crate) fn timeline_record_bytes(record: &azdo::TimelineRecord) -> usize {
+    record.name.as_ref().map_or(0, String::len)
+        + record.display_name.as_ref().map_or(0, String::len)
+        + record.current_operation.as_ref().map_or(0, String::len)
+        + 256
+}
 
 /// Stamp patched timeline records with the new change id and modification
 /// time, returning `(record_id, json)` pairs ready to upsert.
@@ -641,6 +660,10 @@ pub(crate) struct ActiveRequest {
     pub(crate) started_at: Option<std::time::SystemTime>,
     pub(crate) last_renewed_at: Option<std::time::SystemTime>,
     pub(crate) timeout_triggered: bool,
+    /// The request's owning session is still inside the liveness window.
+    /// A stale lease under a live session means the worker died (short
+    /// cadence); without a live session it is a disconnect (full lease).
+    pub(crate) session_live: bool,
     /// The job's `timeout-minutes` in seconds, when its message set one.
     pub(crate) job_timeout_s: Option<i64>,
 }
@@ -818,7 +841,9 @@ pub(crate) struct ReapSweep {
     pub(crate) pool_preparing: bool,
     /// This process started less than `MAX_QUEUED_GRACE` ago.
     pub(crate) warm_window_open: bool,
-    /// Node-local starvation marks (decisions-5 B2): the instant this node's
+    /// Labels the co-hosted pool advertises; empty when it published none.
+    pub(crate) pool_labels: Vec<String>,
+    /// Node-local starvation marks: the instant this node's
     /// reaper first saw each unmatched ready job. Backends feed
     /// `first_seen.get(&(run, job))` to `logic::starvation_verdict`; they
     /// never persist marks. A missing entry falls back to `enqueued_at`.
@@ -835,6 +860,17 @@ pub(crate) struct ExpiredLease {
     pub(crate) agent_job_id: Option<uuid::Uuid>,
 }
 
+/// A ready job the starvation sweep failed.
+#[derive(Debug, Clone)]
+pub(crate) struct StarvedJob {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    pub(crate) reason: String,
+    /// The pool's advertised labels can never satisfy the job's `runs-on`;
+    /// otherwise no matching runner appeared within the grace window.
+    pub(crate) unschedulable: bool,
+}
+
 /// What `reap_sweep` changed.
 #[derive(Debug, Default)]
 pub(crate) struct ReapSweepOutcome {
@@ -842,8 +878,8 @@ pub(crate) struct ReapSweepOutcome {
     pub(crate) cancellations: usize,
     /// Attempts failed for an expired lease, in `ReapSweep::active` order.
     pub(crate) expired: Vec<ExpiredLease>,
-    /// Ready jobs failed for starvation: `(run, job, reason)`.
-    pub(crate) starved: Vec<(RunId, JobId, String)>,
+    /// Ready jobs failed for starvation.
+    pub(crate) starved: Vec<StarvedJob>,
 }
 
 /// `record_environment_approval` input: one operator approval for a job

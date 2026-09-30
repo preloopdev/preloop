@@ -32,7 +32,7 @@ impl AppState {
         claims.insert("iat".to_owned(), json!(now));
         claims.insert("nbf".to_owned(), json!(now));
         claims.insert("exp".to_owned(), json!(expires_at));
-        // R1-10: every minted token gets a unique id so identical claims
+        // Every minted token gets a unique id so identical claims
         // minted in the same second do not produce byte-identical tokens.
         // Callers that already set `jti` (e.g. the OAuth flow) keep theirs.
         if !claims.contains_key("jti") {
@@ -285,16 +285,16 @@ impl AppState {
     /// Read a consistent snapshot of the authoritative scheduling state for
     /// assertions, as a [`TestState`] populated by
     /// `Backend::test_working_set`.
-    pub(crate) async fn test_tx(&self) -> crate::control::testview::TestState {
+    pub async fn test_tx(&self) -> crate::control::testview::TestState {
         self.backend
             .test_working_set()
             .await
             .expect("test_working_set failed")
     }
 
-    /// `#[cfg(test)]`: adjust runner liveness timing without a restart
-    /// (SQLite backend only).
-    pub(crate) fn test_set_runner_liveness(&self, d: std::time::Duration) {
+    /// Test hook: adjust runner liveness timing without a restart (SQLite
+    /// backend only).
+    pub fn test_set_runner_liveness(&self, d: std::time::Duration) {
         match &*self.backend {
             crate::control::Backend::Sqlite(b) => {
                 let (pool, require, _) = b.config();
@@ -313,7 +313,7 @@ impl AppState {
     ///
     /// The closure receives the backend's writer connection inside a `BEGIN
     /// IMMEDIATE` transaction so seeds interleave correctly with commands.
-    pub(crate) async fn test_db_mutate<R>(
+    pub async fn test_db_mutate<R>(
         &self,
         f: impl FnOnce(&crate::control::lite::TestDb<'_>) -> R + Send,
     ) -> R {
@@ -327,6 +327,215 @@ impl AppState {
                 )
             }
         }
+    }
+
+    /// Test hook: switch pool assignments on or off, keeping the other
+    /// backend settings.
+    pub fn test_set_pool_assignments(&self, enabled: bool) {
+        let (_, require, timeout) = self.backend.config();
+        self.backend.set_config(enabled, require, timeout);
+    }
+
+    /// Test hook: resolve the secret scope a job of `run_id` in `repository`
+    /// sees (run > repository > global tiers), exactly as acquire does.
+    pub fn test_resolve_run_secrets(
+        &self,
+        repository: &str,
+        run_id: RunId,
+    ) -> std::collections::BTreeMap<String, preloop_gha_protocol::SecretString> {
+        self.secret_provider
+            .resolve(crate::secret_provider::SecretScope {
+                repository,
+                environment: None,
+                run_id: Some(run_id),
+            })
+            .expect("secret provider resolves")
+    }
+
+    /// Test hook: switch the pool-assignment and require-assignment knobs
+    /// together, keeping the configured lease timeout.
+    pub fn test_set_backend_config(&self, pool_assignments: bool, require_assignments: bool) {
+        let (_, _, timeout) = self.backend.config();
+        self.backend
+            .set_config(pool_assignments, require_assignments, timeout);
+    }
+
+    /// Test hook: claim up to `limit` webhook deliveries under a
+    /// `lease_secs` lease, returning how many the backend handed out.
+    pub async fn test_claim_webhook_deliveries(&self, limit: usize, lease_secs: u64) -> usize {
+        self.backend
+            .claim_webhook_deliveries(limit, lease_secs)
+            .await
+            .expect("claim_webhook_deliveries failed")
+            .len()
+    }
+
+    /// Test hook: release delivery leases left behind by a crashed node,
+    /// returning how many deliveries the backend recovered.
+    pub async fn test_recover_webhook_deliveries(&self) -> u64 {
+        self.backend
+            .recover_webhook_deliveries()
+            .await
+            .expect("recover_webhook_deliveries failed")
+    }
+
+    /// Test hook: broker-path renew of `agent_job_id` by `runner_id`;
+    /// `false` when the backend refuses (unknown, foreign or settled).
+    pub async fn test_renew_broker_request(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> bool {
+        self.backend
+            .renew_broker_request(agent_job_id, runner_id, locked_until)
+            .await
+            .is_ok()
+    }
+
+    /// Test hook: cancel one job through the control backend.
+    pub async fn test_cancel_job(&self, run_id: RunId, job_id: &JobId) {
+        self.backend
+            .cancel_job(run_id, job_id)
+            .await
+            .expect("cancel_job failed");
+    }
+
+    /// Test hook: the live-log key a logical job key resolves to (the latest
+    /// attempt), and whether the run or that job is terminal.
+    pub async fn test_live_log_key(&self, run_id: RunId, job_id: &str) -> Option<(String, bool)> {
+        self.backend
+            .live_log_key(run_id, job_id)
+            .await
+            .expect("live_log_key failed")
+    }
+
+    /// Test hook: append raw bytes to a live-log segment.
+    pub async fn test_log_append(&self, plan: &str, log: &str, bytes: &[u8]) {
+        self.log_segments
+            .append(plan, log, bytes)
+            .await
+            .expect("live-log append failed");
+    }
+
+    /// Test hook: flush every buffered live-log segment to disk.
+    pub async fn test_log_flush(&self) {
+        self.log_segments
+            .flush_all()
+            .await
+            .expect("live-log flush failed");
+    }
+
+    /// Test hook: read a live-log segment back from its node-local file.
+    pub async fn test_log_read_all(&self, plan: &str, log: &str) -> Vec<u8> {
+        self.log_segments
+            .read_all(plan, log)
+            .await
+            .expect("live-log read failed")
+    }
+
+    /// Test hook: interpose a secret provider that forwards normally and
+    /// fails every call while the returned flag is set. Lets a test arm a
+    /// provider outage after the submission that seeded the state.
+    pub fn test_install_toggled_secret_provider(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.secret_provider = std::sync::Arc::new(ToggledSecretProvider {
+            inner: self.secret_provider.clone(),
+            failing: failing.clone(),
+        });
+        failing
+    }
+
+    /// Test hook: drive exactly one run-history archive pass instead of
+    /// racing the interval, returning how many settled runs moved.
+    pub async fn test_archive_finished_runs_once(&self) -> usize {
+        crate::bootstrap::archive_finished_runs_once(&self.shared()).await
+    }
+}
+
+/// Test hook: open a control backend exactly as boot does (`store_url`
+/// explicit, else `PRELOOP_STORE_URL`, else `<state_dir>/preloop.db`) and
+/// report which variant it selected (`"sqlite"` or `"postgres"`). `Err`
+/// carries the open error's message. The backend is dropped on return: the
+/// callers assert URL grammar, env precedence and migration race safety, not
+/// a live connection. The knob defaults are the boot defaults.
+///
+/// A free function rather than a hook method: it needs no [`AppState`], and
+/// its whole point is the selection [`AppState::new`] would have done.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn test_open_backend(
+    store_url: Option<&str>,
+    state_dir: &std::path::Path,
+) -> Result<&'static str, String> {
+    let backend =
+        crate::control::Backend::open(store_url, state_dir, false, false, Duration::from_secs(300))
+            .await
+            .map_err(|error| error.to_string())?;
+    Ok(match backend {
+        crate::control::Backend::Sqlite(_) => "sqlite",
+        crate::control::Backend::Postgres(_) => "postgres",
+    })
+}
+
+/// Test-only secret provider wrapper: forwards every call to the real
+/// provider until the shared flag is set, then fails them all. Lets a test
+/// arm a provider outage *after* the submission that seeded the state.
+#[cfg(any(test, feature = "test-support"))]
+struct ToggledSecretProvider {
+    inner: std::sync::Arc<dyn crate::secret_provider::SecretProvider>,
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ToggledSecretProvider {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("secret backend unavailable");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::secret_provider::SecretProvider for ToggledSecretProvider {
+    fn resolve(
+        &self,
+        scope: crate::secret_provider::SecretScope<'_>,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, preloop_gha_protocol::SecretString>>
+    {
+        self.check()?;
+        self.inner.resolve(scope)
+    }
+
+    fn resolve_all(&self) -> anyhow::Result<Vec<String>> {
+        self.check()?;
+        self.inner.resolve_all()
+    }
+
+    fn put_run(
+        &self,
+        run_id: RunId,
+        secrets: &std::collections::BTreeMap<String, preloop_gha_protocol::SecretString>,
+    ) -> anyhow::Result<()> {
+        self.inner.put_run(run_id, secrets)
+    }
+
+    fn run_tier(
+        &self,
+        run_id: RunId,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, preloop_gha_protocol::SecretString>>
+    {
+        self.inner.run_tier(run_id)
+    }
+
+    fn delete_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        self.inner.delete_run(run_id)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
     }
 }
 
@@ -587,11 +796,11 @@ pub struct AppState {
     /// `None` when no App is configured, in which case job tokens fall back to
     /// `PRELOOP_GITHUB_TOKEN` and then to the local HMAC JWT.
     pub github_app: Option<crate::github_app::GitHubAppCredentials>,
-    /// The full registered GitHub App registry (D6). The legacy env-var App
+    /// The full registered GitHub App registry. The legacy env-var App
     /// is always the first entry and mirrors `github_app`.
     pub github_apps: Option<crate::github_app::GitHubApps>,
     /// Short-TTL cache of installation tokens validated against github.com
-    /// for the GitHub-compatible dispatch API (D2.4).
+    /// for the GitHub-compatible dispatch API.
     pub dispatch_token_cache: Arc<crate::dispatch_auth::InstallationTokenCache>,
     /// Short-TTL cache of actor logins resolved for dispatch authentication
     /// (PAT `GET /user`, App `GET /app`).
@@ -711,13 +920,13 @@ pub struct SecretStore {
     /// Registered environments, keyed by `owner/repo` then environment name.
     /// A job's `environment:` must be registered for its repository; a job
     /// claiming any other name fails closed before secrets are injected or
-    /// an OIDC environment subject is minted (M4).
+    /// an OIDC environment subject is minted.
     pub environments: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl SecretStore {
     /// Whether `environment:` `env` names a registered environment of
-    /// `repo` (M4). Jobs claiming an unregistered environment fail closed.
+    /// `repo`. Jobs claiming an unregistered environment fail closed.
     pub fn is_environment_registered(&self, repo: &str, env: &str) -> bool {
         self.environments
             .get(repo)
@@ -1185,6 +1394,10 @@ impl AppState {
             );
         }
         let message_notify = Arc::new(Notify::new());
+        // One pool status handle, shared with the backend: the pool's
+        // advertised labels gate `runs-on` inside submit/promotion.
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::default());
+        backend.set_pool_status((*pool_status).clone());
         // Cross-node wake-ups (Postgres LISTEN): a job committed through any
         // node wakes runners long-polling this one.
         if let Some(mut wakes) = backend.subscribe_wakes() {
@@ -1225,7 +1438,7 @@ impl AppState {
                 preloop_observability::status::OperationalSnapshot::default(),
             )),
             terminal_jobs_recorded,
-            pool_status: Arc::new(preloop_observability::status::PoolStatus::default()),
+            pool_status,
             started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
             // pool spawns against the right workload after restart.
@@ -1371,10 +1584,39 @@ impl AppState {
         if let Err(error) = self.backend.append_event(&event).await {
             error!(?error, "failed to persist control-plane event");
         }
+        // A run just completed: bound the node-local runtime state retained
+        // for completed runs, so the heap cannot grow one run's live-log
+        // buffers and projections per completed run forever.
+        if event.terminal_run_status().is_some() {
+            self.trim_completed_run_state().await;
+        }
         // Always broadcast so SSE/UI subscribers see live events. The
         // broadcast is advisory, not authoritative — a store hiccup must
         // never freeze the stream for a healthy run.
         let _ = self.events.send(event);
+    }
+
+    /// Drop the node-local runtime state (live-log buffers, timeline
+    /// projections, artifact registries) of every terminal run outside the
+    /// newest [`crate::memory_caps::MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`].
+    /// The resident set is read under the lock, resolved against the backend
+    /// without it, and applied under it again.
+    async fn trim_completed_run_state(&self) {
+        let traces = {
+            let inner = self.inner.lock().await;
+            crate::memory_caps::ResidentRunTraces::of(&inner)
+        };
+        match crate::memory_caps::plan_completed_run_trim(&self.backend, &traces).await {
+            Ok(trim) => {
+                if !trim.drops.is_empty() {
+                    let mut inner = self.inner.lock().await;
+                    crate::memory_caps::trim_completed_runs(&mut inner, &trim);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, "completed-run runtime-state trim failed");
+            }
+        }
     }
 
     /// Plaintext static PAT for job tokens, when one is configured.
@@ -1644,7 +1886,7 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
-    /// Reaper starvation marks (decisions-5 B2, node-local): when this node
+    /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job
     /// leaves the ready queue; a restart resets them, which only delays a

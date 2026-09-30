@@ -233,7 +233,7 @@ pub async fn run_steps(
                     setup_lines.push(format!("{ts} {perm}: {level_str}"));
                 }
             }
-            // H3: a static-PAT-backed GITHUB_TOKEN does not honor the
+            // A static-PAT-backed GITHUB_TOKEN does not honor the
             // workflow's `permissions:` block, so the declared set above is
             // not what the token carries. State the token's real authority
             // in the same group rather than leaving it to be inferred.
@@ -808,7 +808,7 @@ pub async fn run_steps(
                 }
             };
             let durable_log_error = step_ctx.durable_log_error.clone();
-            // F029: If the display name still contains unresolved expressions
+            // If the display name still contains unresolved expressions
             // after the pre-execution evaluation (e.g. `${{ needs.*.result }}`
             // or `${{ format(...) }}`), try to fix it now that the step has
             // executed and contexts may have been populated.
@@ -1027,7 +1027,7 @@ pub async fn run_steps(
                     _ => Vec::new(),
                 };
 
-                // P1-3: Race the blocking pause against cancellation so a
+                // Race the blocking pause against cancellation so a
                 // cancel arriving while the worker waits for a verdict
                 // does not hang the job/VM indefinitely.
                 let decision = {

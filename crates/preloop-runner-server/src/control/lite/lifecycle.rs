@@ -58,12 +58,14 @@ fn runner_caps(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunnerCapabilities> 
 }
 
 /// `requeue_claimed_tx` (pg dispatch.rs): a claimed job whose runner is
-/// gone drops the claim — owner/session/start stamps and the lease — and
-/// returns to the head of the ready queue.
+/// gone drops the claim — its attempt is replaced via [`retry_attempt`],
+/// whose abandoned runtime identity lands in `retired` — and returns to the
+/// head of the ready queue.
 pub(super) fn requeue_claimed(
     tx: &Transaction<'_>,
     run_id: RunId,
     job_id: &JobId,
+    retired: &mut Vec<uuid::Uuid>,
 ) -> Result<bool, ControlError> {
     let run = codec::run_key(run_id);
     let state: Option<String> = tx
@@ -75,29 +77,7 @@ pub(super) fn requeue_claimed(
     if state.as_deref() != Some("claimed") {
         return Ok(false);
     }
-    let request_id: Option<i64> = tx
-        .prepare_cached(
-            "SELECT request_id FROM job_requests WHERE run_id = ?1 AND job_id = ?2 \
-             AND result IS NULL ORDER BY request_id DESC LIMIT 1",
-        )
-        .map_err(db)?
-        .query_row(params![run, job_id.0], |row| row.get(0))
-        .optional()
-        .map_err(db)?;
-    if let Some(request_id) = request_id {
-        tx.prepare_cached(
-            "UPDATE job_requests SET runner_id = NULL, session_id = NULL, \
-             started_at = NULL, timeout_triggered = 0 \
-             WHERE request_id = ?1 AND result IS NULL",
-        )
-        .map_err(db)?
-        .execute([request_id])
-        .map_err(db)?;
-        tx.prepare_cached("DELETE FROM job_leases WHERE request_id = ?1")
-            .map_err(db)?
-            .execute([request_id])
-            .map_err(db)?;
-    }
+    retired.extend(retry_attempt(tx, run_id, job_id)?);
     tx.prepare_cached(
         "UPDATE jobs SET status = 'queued', queue_state = 'ready', \
          claimed_by_runner_id = NULL, claimed_at = NULL, \
@@ -112,6 +92,77 @@ pub(super) fn requeue_claimed(
         .execute(params![run, job_id.0])
         .map_err(db)?;
     Ok(true)
+}
+
+/// Replace the job's in-flight attempt so no credential of the abandoned
+/// one survives the retry. The old row settles `cancelled` — its runtime
+/// token, debug token and renewals stop validating — while its step
+/// manifest, logs and timeline stay addressable. The replacement gets a
+/// fresh runtime identity (`jobId` and the derived plan id), its own
+/// timeline, a pending step manifest and an unissued debug token; the stored
+/// message and the deferred token-mint recipe move to it. Returns the
+/// abandoned runtime identity, `None` when nothing was in flight.
+pub(super) fn retry_attempt(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+) -> Result<Option<uuid::Uuid>, ControlError> {
+    let Some((request_id, abandoned, namespace)) = tx
+        .prepare_cached(
+            "SELECT request_id, agent_job_id, namespace_id FROM job_requests \
+             WHERE run_id = ?1 AND job_id = ?2 AND result IS NULL \
+             ORDER BY request_id DESC LIMIT 1",
+        )
+        .map_err(db)?
+        .query_row(params![codec::run_key(run_id), job_id.0], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()
+        .map_err(db)?
+    else {
+        return Ok(None);
+    };
+    let Some(mut message) = jobs::stored_job_message(tx, run_id, job_id)? else {
+        return Err(ControlError::backend(anyhow::anyhow!(
+            "request {request_id} has no message template"
+        )));
+    };
+    tx.prepare_cached(
+        "UPDATE job_requests SET result = 'cancelled', finished_at = ?2, \
+         runner_id = NULL, session_id = NULL WHERE request_id = ?1",
+    )
+    .map_err(db)?
+    .execute(params![request_id, now_us()])
+    .map_err(db)?;
+    tx.prepare_cached("DELETE FROM job_leases WHERE request_id = ?1")
+        .map_err(db)?
+        .execute([request_id])
+        .map_err(db)?;
+    let agent_job_id = uuid::Uuid::new_v4();
+    let timeline_id = uuid::Uuid::new_v4();
+    let retry = super::submit::insert_attempt(
+        tx,
+        &namespace,
+        run_id,
+        job_id,
+        agent_job_id,
+        timeline_id,
+        crate::models::StepRecord::manifest(&message.steps),
+    )?;
+    message.job_id = agent_job_id;
+    message.request_id = retry;
+    message.plan.plan_id = codec::plan_id(&agent_job_id);
+    message.timeline.id = timeline_id;
+    jobs::update_job_message(tx, run_id, job_id, &message)?;
+    tx.prepare_cached("UPDATE github_token_requests SET request_id = ?2 WHERE request_id = ?1")
+        .map_err(db)?
+        .execute(params![request_id, retry])
+        .map_err(db)?;
+    Ok(Some(codec::uuid(&abandoned)))
 }
 
 /// `append_event_tx` (pg dispatch.rs): append one durable event to the
@@ -298,7 +349,7 @@ fn pair_runner_tx(
 /// `runner_sessions.runner_id` carries no FK (a declared id may precede
 /// registration), so the sessions are deleted explicitly — a revoked
 /// long-poll must find no session and get `Forbidden`.
-fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlError> {
+fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<Vec<uuid::Uuid>, ControlError> {
     let requeue: Vec<(String, String)> = {
         let mut stmt = tx
             .prepare_cached(
@@ -365,8 +416,9 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlEr
         .map_err(db)?
         .execute([runner_id])
         .map_err(db)?;
+    let mut retired = Vec::new();
     for (run, job) in requeue {
-        requeue_claimed(tx, codec::run_id(&run), &JobId(job))?;
+        requeue_claimed(tx, codec::run_id(&run), &JobId(job), &mut retired)?;
     }
     let now = now_us();
     for (run, job) in unclaimed {
@@ -385,7 +437,7 @@ fn purge_runner_tx(tx: &Transaction<'_>, runner_id: i64) -> Result<(), ControlEr
         .execute(params![run, job, now])
         .map_err(db)?;
     }
-    Ok(())
+    Ok(retired)
 }
 
 impl LiteBackend {
@@ -748,19 +800,24 @@ impl LiteBackend {
         })
     }
 
-    /// `purge_runner` (pg lifecycle.rs): unconditional purge.
-    pub(crate) async fn purge_runner(&self, runner_id: i64) -> Result<(), ControlError> {
+    /// `purge_runner` (pg lifecycle.rs): unconditional purge; returns the
+    /// runtime identities of the attempts it retired.
+    pub(crate) async fn purge_runner(
+        &self,
+        runner_id: i64,
+    ) -> Result<Vec<uuid::Uuid>, ControlError> {
         self.write(|tx| purge_runner_tx(tx, runner_id))
     }
 
     /// `purge_runner_guarded` (pg lifecycle.rs): apply `guard`, then purge.
     /// `IfPhantom`/`RegistrationToken` refuse while the runner owns a
-    /// session; `Runner(caller)` refuses another runner's identity.
+    /// session; `Runner(caller)` refuses another runner's identity. `None`
+    /// when the guard refused; otherwise the retired attempts' identities.
     pub(crate) async fn purge_runner_guarded(
         &self,
         runner_id: i64,
         guard: PurgeGuard,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<Vec<uuid::Uuid>>, ControlError> {
         self.write(|tx| {
             let exists = tx
                 .prepare_cached("SELECT 1 FROM runners WHERE runner_id = ?1")
@@ -792,10 +849,9 @@ impl LiteBackend {
                 PurgeGuard::IfPhantom => exists && !owns_session()?,
             };
             if !allowed {
-                return Ok(false);
+                return Ok(None);
             }
-            purge_runner_tx(tx, runner_id)?;
-            Ok(true)
+            purge_runner_tx(tx, runner_id).map(Some)
         })
     }
 
@@ -1129,8 +1185,11 @@ impl LiteBackend {
             };
             let mut recovered = 0usize;
             let mut failed = 0usize;
+            // A booting node has no live-log followers to close, so the
+            // retired identities are not reported.
+            let mut retired = Vec::new();
             for (run, job) in &orphaned {
-                if requeue_claimed(tx, codec::run_id(run), &JobId(job.clone()))? {
+                if requeue_claimed(tx, codec::run_id(run), &JobId(job.clone()), &mut retired)? {
                     recovered += 1;
                 } else {
                     failed += 1;

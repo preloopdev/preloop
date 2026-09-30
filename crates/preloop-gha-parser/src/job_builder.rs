@@ -907,7 +907,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context, file_id: u32) -> T
     // The runner evaluates these at step execution time via evaluate_template()
     // with the full job context (including workspace for hashFiles, github.action,
     // steps.*.outputs, etc.). Pre-resolving at job-build time runs without a
-    // workspace and silently zeros out hashFiles() results (PEXP-01 root cause).
+    // workspace and silently zeros out hashFiles() results.
     //
     // `with` inputs are still resolved because action handlers need resolved values
     // to locate and configure the action before step execution.

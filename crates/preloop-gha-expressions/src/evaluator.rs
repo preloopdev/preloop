@@ -1142,13 +1142,13 @@ pub(crate) fn handle_under_root(file: &std::fs::File, workspace_root: &std::path
         .unwrap_or(false)
 }
 
-/// Implementation of `hashFiles(pattern, ...)` (F027).
+/// Implementation of `hashFiles(pattern, ...)`.
 ///
 /// Globs each argument pattern relative to `context.workspace_dir`, collects
 /// all matching file paths (sorted), SHA-256 hashes each file, then
 /// SHA-256 hashes the concatenated hex digests. Returns `""` on no match.
 ///
-/// R1-7: every match is confined to the workspace. Absolute patterns and
+/// Every match is confined to the workspace. Absolute patterns and
 /// parent traversal are rejected outright via platform-native components
 /// (so Unix `/`/`..` and Windows `..\`, `C:\`, `\` all fail loudly rather
 /// than becoming a file-content oracle like `hashFiles('/etc/passwd')`),
@@ -1159,7 +1159,7 @@ pub(crate) fn handle_under_root(file: &std::fs::File, workspace_root: &std::path
 /// are streamed through the hasher instead of being `fs::read` into memory
 /// whole.
 ///
-/// F055: Supports `--follow-symbolic-links` as an optional first argument.
+/// Supports `--follow-symbolic-links` as an optional first argument.
 /// When set, symbolic links are followed during file enumeration.
 /// Matches official `HashFilesFunction.cs:44-51`.
 fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionError> {
@@ -1205,7 +1205,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         patterns.push(s);
     }
 
-    // R1-7: dedup by matched path (overlapping patterns must not trip the
+    // Dedup by matched path (overlapping patterns must not trip the
     // file cap with duplicates) and bound the retained set so adversarial
     // globs like `**/*` cannot grow it without limit. Canonicalization is
     // only the confinement check — hashing/sorting keep the matched path so
@@ -1213,7 +1213,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
     let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
 
-    // R1-7: canonical workspace root for the confinement check below. If the
+    // Canonical workspace root for the confinement check below. If the
     // workspace itself cannot be canonicalized there is nothing safe to
     // match, so return "" like the no-workspace case.
     let workspace_root = match std::fs::canonicalize(workspace) {
@@ -1226,7 +1226,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
     let mut visited = 0usize;
 
     for pattern in &patterns {
-        // R1-7: reject absolute patterns and `..` traversal outright.
+        // Reject absolute patterns and `..` traversal outright.
         // Silently remapping `/etc/passwd` to a workspace-relative path, or
         // skipping escaping `../` matches, would hide attacker intent and
         // turn hashFiles() into a quiet file-content oracle. Fail loudly.
@@ -1258,7 +1258,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
                         Err(_) => continue,
                     };
                     if metadata.file_type().is_symlink() {
-                        // F055: without --follow-symbolic-links, symlinks are
+                        // Without --follow-symbolic-links, symlinks are
                         // never followed.
                         if !follow_symlinks {
                             continue;
@@ -1306,7 +1306,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
     // Official hashFiles.ts:29-35 feeds binary digest bytes directly into the outer SHA-256.
     // Concatenating hex-string representations produces a completely different key.
     //
-    // R1-7: stream each file through the hasher instead of fs::read()-ing it
+    // Stream each file through the hasher instead of fs::read()-ing it
     // whole, enforcing the total byte budget so one huge match cannot OOM
     // the evaluator.
     let mut combined: Vec<u8> = Vec::new();

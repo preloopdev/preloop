@@ -75,8 +75,12 @@ pub(crate) struct LiteBackend {
     /// after open from the real server config. Empty until then — no rules
     /// means every environment gate proceeds, the pre-rules behavior.
     environment_rules: parking_lot::RwLock<std::sync::Arc<crate::config::EnvironmentRulesMap>>,
-    /// Stale bindings released since this node started (replaces
-    /// `TxState::released_bindings_count`; node-local, not persisted).
+    /// The co-hosted runner pool's shared status handle; its advertised
+    /// labels decide whether a `runs-on` is satisfiable at submit and
+    /// promotion. Detached (no labels) until bootstrap hands it over.
+    pool_status: parking_lot::RwLock<preloop_observability::status::PoolStatus>,
+    /// Stale bindings released since this node started (node-local, not
+    /// persisted).
     released_bindings: AtomicU64,
 }
 
@@ -262,6 +266,7 @@ impl LiteBackend {
             environment_rules: parking_lot::RwLock::new(std::sync::Arc::new(
                 crate::config::EnvironmentRulesMap::new(),
             )),
+            pool_status: parking_lot::RwLock::new(Default::default()),
             released_bindings: AtomicU64::new(0),
         }
     }
@@ -314,6 +319,16 @@ impl LiteBackend {
     /// The live environment protection rules (an `Arc` clone, cheap).
     pub(super) fn environment_rules(&self) -> std::sync::Arc<crate::config::EnvironmentRulesMap> {
         self.environment_rules.read().clone()
+    }
+
+    /// Share the runner pool's status handle (bootstrap / `AppState`).
+    pub(crate) fn set_pool_status(&self, status: preloop_observability::status::PoolStatus) {
+        *self.pool_status.write() = status;
+    }
+
+    /// The labels the co-hosted pool advertises; empty when none published.
+    pub(super) fn pool_labels(&self) -> Vec<String> {
+        self.pool_status.read().labels()
     }
 
     /// Run one command as a write transaction: `BEGIN IMMEDIATE`, `f`,
@@ -395,7 +410,7 @@ impl LiteBackend {
     /// Allocate the next run number for a workflow:
     /// `INSERT .. ON CONFLICT DO UPDATE SET last_run_number = last_run_number
     /// + 1 RETURNING last_run_number`. Namespace `'default'` and repository
-    /// `''` until the trait passes both (decision round 1, Q4).
+    /// `''` until the trait passes both.
     /// Allocate the next run number for a workflow:
     /// `INSERT .. ON CONFLICT DO UPDATE SET last_run_number = last_run_number
     /// + 1 RETURNING last_run_number`, scoped by the

@@ -195,7 +195,7 @@ fn under_max_parallel(
 fn hydrate_message(
     tx: &Transaction<'_>,
     graph: &RunGraph,
-    job: &JobRow,
+    job: &mut JobRow,
 ) -> Result<(), ControlError> {
     let run = codec::run_key(job.run_id);
     let row: Option<(String, String)> = tx
@@ -247,22 +247,48 @@ fn hydrate_message(
         );
     }
     let spec = jobs::load_spec(tx, job.run_id, &job.job_id)?;
-    if let Some(spec) = spec
-        && let Some(environment) = spec.environment.as_ref()
-    {
-        let name = match environment {
-            serde_json::Value::String(name) => Some(name.as_str()),
-            serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
-            _ => None,
-        };
-        if let Some(name) = name
-            && preloop_gha_parser::eval::resolves_after_job_build(name)
+    let deferred_environment = spec.as_ref().and_then(|spec| {
+        spec.environment.as_ref().and_then(|environment| {
+            let name = match environment {
+                serde_json::Value::String(name) => Some(name.as_str()),
+                serde_json::Value::Object(map) => {
+                    map.get("name").and_then(serde_json::Value::as_str)
+                }
+                _ => None,
+            }?;
+            preloop_gha_parser::eval::resolves_after_job_build(name).then(|| name.to_owned())
+        })
+    });
+    let runs_on_deferred = logic::runs_on_deferred(&job.runs_on);
+    if runs_on_deferred || deferred_environment.is_some() {
+        let mut context = preloop_gha_expressions::Context::new();
+        for (key, value) in &message.context_data {
+            context.insert(key, value.to_json());
+        }
+        if runs_on_deferred {
+            crate::runtime_scheduling::resolve_deferred_runs_on_labels(
+                &mut job.runs_on,
+                &context,
+                &job.run_id,
+                &job.job_id.0,
+            );
+            job.pool_key = compute_pool_key(&job.runs_on, job.runner_group.as_deref());
+            tx.prepare_cached(
+                "UPDATE jobs SET runs_on = ?3, pool_key = ?4 \
+                 WHERE run_id = ?1 AND job_id = ?2",
+            )
+            .map_err(db)?
+            .execute(params![
+                run,
+                job.job_id.0,
+                serde_json::to_string(&job.runs_on).unwrap_or_else(|_| "[]".into()),
+                job.pool_key,
+            ])
+            .map_err(db)?;
+        }
+        if let Some(name) = deferred_environment.as_deref()
             && let Some(actions_environment) = message.actions_environment.as_mut()
         {
-            let mut context = preloop_gha_expressions::Context::new();
-            for (key, value) in &message.context_data {
-                context.insert(key, value.to_json());
-            }
             match preloop_gha_parser::eval::resolve_string(name, &context) {
                 Ok(resolved) => actions_environment.name = resolved,
                 Err(error) => {
@@ -760,8 +786,15 @@ pub(super) fn promote_run(
         if candidates.is_empty() {
             return Ok(());
         }
+        let platforms = jobs::registered_platforms(tx)?;
+        let pool_labels = backend.pool_labels();
+        let runner_labels = if pool_labels.is_empty() {
+            Vec::new()
+        } else {
+            jobs::runner_label_sets(tx)?
+        };
         let graph = jobs::run_graph(tx, run_id)?;
-        for job in candidates {
+        for mut job in candidates {
             let needs = jobs::job_needs(tx, run_id, &job.job_id)?;
             let (if_condition, ctx_json) = {
                 let spec = jobs::load_spec(tx, run_id, &job.job_id)?;
@@ -873,33 +906,54 @@ pub(super) fn promote_run(
                         spec.as_ref().and_then(|s| s.max_parallel),
                     )? =>
                 {
-                    hydrate_message(tx, &graph, &job)?;
-                    match acquire_job_gate(tx, backend, run_id, &job.job_id)? {
-                        GateOutcome::Proceed => {
-                            enqueue_ready(
-                                tx,
-                                backend,
-                                &job,
-                                spec.as_ref()
-                                    .map(|s| s.concurrency.is_some())
-                                    .unwrap_or(false),
-                            )?;
-                            outcome.promoted += 1;
-                        }
-                        GateOutcome::Parked => {
-                            tx.prepare_cached(
-                                "UPDATE jobs SET queue_state = 'held', status = 'pending', \
-                                     concurrency_wait_at = COALESCE(concurrency_wait_at, ?3) \
-                                 WHERE run_id = ?1 AND job_id = ?2",
-                            )
-                            .map_err(db)?
-                            .execute(params![codec::run_key(run_id), job.job_id.0, now_us()])
-                            .map_err(db)?;
-                        }
-                        GateOutcome::Failed(status) => {
-                            settle_job_row(tx, backend, &job, status)?;
-                            outcome.failed.push((run_id, job.job_id.clone()));
-                            settled = true;
+                    hydrate_message(tx, &graph, &mut job)?;
+                    if let Some(reason) = logic::promotion_unsatisfiable_reason(
+                        &job.runs_on,
+                        platforms.iter().copied(),
+                        &pool_labels,
+                        runner_labels.iter().any(|labels| {
+                            crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
+                        }),
+                    ) {
+                        tracing::warn!(
+                            %run_id,
+                            job = %job.job_id.0,
+                            labels = ?job.runs_on,
+                            pool_labels = ?pool_labels,
+                            %reason,
+                            "runs-on unsatisfiable by runner pool; failing the job"
+                        );
+                        settle_job_row(tx, backend, &job, ExecutionStatus::Failure)?;
+                        outcome.failed.push((run_id, job.job_id.clone()));
+                        settled = true;
+                    } else {
+                        match acquire_job_gate(tx, backend, run_id, &job.job_id)? {
+                            GateOutcome::Proceed => {
+                                enqueue_ready(
+                                    tx,
+                                    backend,
+                                    &job,
+                                    spec.as_ref()
+                                        .map(|s| s.concurrency.is_some())
+                                        .unwrap_or(false),
+                                )?;
+                                outcome.promoted += 1;
+                            }
+                            GateOutcome::Parked => {
+                                tx.prepare_cached(
+                                    "UPDATE jobs SET queue_state = 'held', status = 'pending', \
+                                         concurrency_wait_at = COALESCE(concurrency_wait_at, ?3) \
+                                     WHERE run_id = ?1 AND job_id = ?2",
+                                )
+                                .map_err(db)?
+                                .execute(params![codec::run_key(run_id), job.job_id.0, now_us()])
+                                .map_err(db)?;
+                            }
+                            GateOutcome::Failed(status) => {
+                                settle_job_row(tx, backend, &job, status)?;
+                                outcome.failed.push((run_id, job.job_id.clone()));
+                                settled = true;
+                            }
                         }
                     }
                 }

@@ -125,7 +125,7 @@ impl JobContext {
                     && !val.is_empty()
                 {
                     masks.insert(val.to_string());
-                    // Also mask trimmed variant and base64-encoded form (F028)
+                    // Also mask trimmed variant and base64-encoded form.
                     let trimmed = val.trim();
                     if trimmed != val {
                         masks.insert(trimmed.to_string());
@@ -135,7 +135,7 @@ impl JobContext {
                     masks.insert(base64::engine::general_purpose::STANDARD_NO_PAD.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val));
-                    // H1: register each non-empty trimmed CR/LF-delimited
+                    // Register each non-empty trimmed CR/LF-delimited
                     // line too. Log masking runs per assembled line, so
                     // a multiline initial secret (PEM key, JSON blob)
                     // would otherwise never match the whole value and

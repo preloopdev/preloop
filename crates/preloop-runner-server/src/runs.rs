@@ -265,7 +265,7 @@ fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
         .unwrap_or(true)
 }
 
-/// Static-PAT permission enforcement (H3).
+/// Static-PAT permission enforcement.
 ///
 /// When no GitHub App is configured, the operator's static PAT
 /// (`PRELOOP_GITHUB_TOKEN` / `github.pat`) is embedded verbatim as every
@@ -278,7 +278,7 @@ fn submission_allows_secrets(submission: &WorkflowSubmission) -> bool {
 /// publishes the token's real authority in `system.github.token.pat_scopes`,
 /// which the runner prints alongside the declared permission set.
 ///
-/// What a job's `GITHUB_TOKEN` becomes in PAT mode (H3).
+/// What a job's `GITHUB_TOKEN` becomes in PAT mode.
 ///
 /// A static PAT cannot be narrowed per job, so it is embedded only when its
 /// classic OAuth scopes were introspected and do not exceed the job's declared
@@ -332,7 +332,7 @@ pub fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
         .map(|(_, scopes)| scopes)
 }
 
-/// Warm the process-wide PAT scope cache once at startup (H3).
+/// Warm the process-wide PAT scope cache once at startup.
 ///
 /// The job expansion pipeline is synchronous and reads [`cached_pat_scopes`],
 /// so without a warm entry the first expansions after a restart would find a
@@ -596,6 +596,11 @@ pub(crate) fn pat_scopes_wire_value(scopes: &[String]) -> String {
         format!("static PAT OAuth scopes: {}", scopes.join(", "))
     }
 }
+
+/// Runner-visible explanation when a configured PAT is withheld because its
+/// authority could not be verified.
+pub(crate) const PAT_WITHHELD_WIRE_VALUE: &str =
+    "withheld: PAT authority unverifiable; NOT the declared `permissions:` set";
 
 pub async fn submit_run_inner(
     shared: &Arc<SharedState>,
@@ -1422,7 +1427,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     if shared.state.github_app.is_none()
         && let Some(pat) = shared.state.static_github_pat()
     {
-        // H3: a static PAT cannot be narrowed per job, so a PAT broader
+        // A static PAT cannot be narrowed per job, so a PAT broader
         // than a job's declared `permissions:` would silently hand every
         // non-fork job authority the workflow never claimed. Introspect
         // the PAT's classic OAuth scopes and refuse the run on mismatch;
@@ -1785,6 +1790,19 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 // scheduler admission.
                 environment_gate: None,
             };
+            // A needs-less job never passes through promotion, so `runs-on`
+            // labels left raw at build time (they read `needs.*`, empty for a
+            // needs-less job) are finished here against the complete context,
+            // before the backend validates the true labels.
+            if queued_job.needs.is_empty()
+                && crate::control::logic::runs_on_deferred(&queued_job.runs_on)
+            {
+                let mut context = preloop_gha_expressions::Context::new();
+                for (key, value) in &queued_job.message.context_data {
+                    context.insert(key, value.to_json());
+                }
+                crate::runtime_scheduling::resolve_deferred_runs_on(&mut queued_job, &context);
+            }
             // Skipped jobs are terminal at submit: no gate evaluation (a
             // `Wait` verdict would park a node that never admits), no plan-id
             // in the masker cache.
@@ -2024,43 +2042,9 @@ pub async fn submit_run(
     let accepted = submit_run_inner(&shared, submission).await?;
     if push_requested {
         let run_id = accepted.run_id;
-        if clean_push_checks {
-            // Report queued check runs for every job, exactly like the
-            // webhook adapter does for delivered events, so GitHub shows the
-            // run from the moment it is accepted. Jobs resolved terminal at
-            // submission (skipped, unsatisfiable needs) get their completion
-            let snap = shared
-                .state
-                .backend
-                .run_dispatch_info(run_id)
-                .await
-                .map_err(ApiError::from)?;
-            let Some(info) = snap else {
-                return Ok(Json(accepted));
-            };
-            for job in &info.jobs {
-                if let Err(error) = crate::github::report_check_run_queued(
-                    &shared,
-                    &info.repository,
-                    &info.sha,
-                    &job.job_id,
-                    run_id,
-                )
-                .await
-                {
-                    tracing::warn!(%run_id, job_id = %job.job_id.0, ?error, "failed to report queued GitHub check run");
-                }
-                if job.status.is_terminal() {
-                    crate::github::report_check_run_completed(
-                        &shared,
-                        run_id,
-                        &job.job_id,
-                        job.status,
-                    )
-                    .await;
-                }
-            }
-        }
+        // The push state commits before any GitHub reporting is detached, so
+        // a client reading the run right after `preloop run --push` always
+        // sees `pending` rather than no push state at all.
         shared
             .state
             .backend
@@ -2075,6 +2059,67 @@ pub async fn submit_run(
             )
             .await
             .map_err(ApiError::from)?;
+        if clean_push_checks {
+            // Report queued check runs for every dispatchable job in a
+            // detached task, so submitting a run with `--push` does not stall
+            // the CLI client on sequential GitHub Check API calls. Jobs
+            // resolved terminal at submission get their completion reported
+            // right after their queued check.
+            //
+            // Stamped before filtering: an all-expandable submission reports
+            // nothing at intake yet still needs the flag for the legs
+            // materialized later, which mint their own checks.
+            if let Err(error) = shared
+                .state
+                .backend
+                .set_reports_check_runs(run_id, true)
+                .await
+            {
+                tracing::warn!(%run_id, ?error, "failed to stamp reports_check_runs for push run");
+            }
+            let info = shared
+                .state
+                .backend
+                .run_dispatch_info(run_id)
+                .await
+                .map_err(ApiError::from)?;
+            if let Some(info) = info {
+                let repository = info.repository;
+                let sha = info.sha;
+                // Expandable nodes (deferred matrices, reusable callers) are
+                // placeholders: expansion replaces them with the legs that
+                // mint their own checks, and a `queued` check for the
+                // placeholder would strand on GitHub (no delete API).
+                let jobs: Vec<(JobId, ExecutionStatus)> = info
+                    .jobs
+                    .into_iter()
+                    .filter(|job| !job.placeholder)
+                    .map(|job| (job.job_id, job.status))
+                    .collect();
+                let reporter = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    for (job_id, status) in jobs {
+                        if let Err(error) = crate::github::report_check_run_queued(
+                            &reporter,
+                            &repository,
+                            &sha,
+                            &job_id,
+                            run_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
+                        }
+                        if status.is_terminal() {
+                            crate::github::report_check_run_completed(
+                                &reporter, run_id, &job_id, status,
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
+        }
     }
     Ok(Json(accepted))
 }
@@ -2271,7 +2316,7 @@ pub(crate) fn build_job_artifacts(
         job.oidc_id_token_granted,
     );
 
-    // M4: the environment registry. `environment:` names an
+    // The environment registry. `environment:` names an
     // operator-registered deployment tier; a workflow claiming an
     // unregistered name gets nothing — no environment secrets, no
     // environment OIDC subject — and the job fails closed rather than
@@ -3189,7 +3234,7 @@ pub async fn get_run_logs(
         .collect();
 
     // Read published segments plus the unflushed tail. The node-local preview
-    // remains a fallback for logs created before the segment writer cutover.
+    // remains a fallback for logs created before the segment writer existed.
     let mut sources = Vec::new();
     for (request, manifest) in requests.iter().zip(manifests.iter()) {
         let mut blocks = shared
@@ -4333,7 +4378,7 @@ mod tests {
 
     const ENV_WORKFLOW: &str = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo hi\n";
 
-    /// M4: `environment:` is an unvalidated string. A workflow claiming an
+    /// `environment:` is an unvalidated string. A workflow claiming an
     /// environment the operator never registered must fail closed — even
     /// when that environment has secrets configured (the pentest shape: env
     /// secret injected + OIDC `sub` asserting the unregistered environment).
@@ -4356,7 +4401,7 @@ mod tests {
         );
     }
 
-    /// M4: an environment the operator registered in `[environments]` keeps
+    /// An environment the operator registered in `[environments]` keeps
     /// working — the registry gates existence, not legitimate use.
     #[tokio::test]
     async fn registered_environment_accepts_run_submission() {

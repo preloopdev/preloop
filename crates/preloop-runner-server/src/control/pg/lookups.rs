@@ -1,7 +1,7 @@
 //! Request, callback, check-run and run lookups; push state; run numbers;
 //! key fingerprint; queue statistics.
 //!
-//! Archived runs (decision round 3/4): archive moves a run into the
+//! Archived runs: archive moves a run into the
 //! `*_history` tables and deletes its `runs` row, so the reads that served
 //! archived runs before fall back to history (`UNION ALL` of the live and
 //! the history query; a run lives in exactly one of them).
@@ -193,8 +193,8 @@ impl PgBackend {
             .collect())
     }
 
-    /// Record a run's push-sync state. `NotFound` for an unknown (or
-    /// archived) run.
+    /// Record a run's push-sync state. An unknown (or archived) run writes
+    /// nothing and is not an error — the same contract as the SQLite backend.
     ///
     /// Statement: `INSERT INTO run_push_states .. SELECT .. WHERE EXISTS
     /// (runs) ON CONFLICT (run_id) DO UPDATE`.
@@ -210,7 +210,7 @@ impl PgBackend {
             .to_owned();
         let pr_number = state.pr_number.map(|n| n.min(i64::MAX as u64) as i64);
         let client = self.writer().await?;
-        let written = client
+        client
             .execute(
                 "INSERT INTO run_push_states (run_id, status, error, pr_number, effective_sha, \
                  updated_at) SELECT run_id, $2, $3, $4, $5, now() FROM runs \
@@ -228,18 +228,14 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-        if written == 0 {
-            return Err(ControlError::NotFound(format!("run {run_id}")));
-        }
         Ok(())
     }
 
     /// Next run number of a workflow (per namespace + repository +
     /// workflow path; gaps allowed).
     ///
-    /// Statement: `INSERT INTO workflow_run_numbers .. VALUES (.., 1) ON
-    /// CONFLICT DO UPDATE SET last_run_number = last_run_number + 1
-    /// RETURNING last_run_number`.
+    /// Statement: `INSERT INTO workflow_run_numbers` seeds from the maximum
+    /// existing run number and increments atomically on conflict.
     pub(super) async fn allocate_run_number(
         &self,
         namespace_id: &str,
@@ -259,10 +255,16 @@ impl PgBackend {
         .map_err(db)?;
         let number: i64 = tx
             .query_one(
-                "INSERT INTO workflow_run_numbers AS w (namespace_id, repository, workflow_path, \
-                 last_run_number) VALUES ($1, $2, $3, 1) \
+                "INSERT INTO workflow_run_numbers AS w \
+                 (namespace_id, repository, workflow_path, last_run_number) \
+                 VALUES ($1, $2, $3, GREATEST(1, COALESCE( \
+                     (SELECT MAX(run_number) + 1 FROM runs \
+                      WHERE namespace_id=$1 AND repository=$2 AND workflow_path=$3), 1))) \
                  ON CONFLICT (namespace_id, repository, workflow_path) \
-                 DO UPDATE SET last_run_number = w.last_run_number + 1 \
+                 DO UPDATE SET last_run_number = GREATEST(\
+                     w.last_run_number + 1,\
+                     COALESCE((SELECT MAX(run_number) + 1 FROM runs \
+                               WHERE namespace_id=$1 AND repository=$2 AND workflow_path=$3), 1)) \
                  RETURNING last_run_number",
                 &[&namespace_id, &repository, &workflow_path],
             )
@@ -504,9 +506,10 @@ impl PgBackend {
 
     /// Check-run reporting inputs for one run: repository and sha from the
     /// stored submission, run clocks, and per job (in job id order) its
-    /// status, display name, check-run id, derived detail and latest
-    /// attempt's steps. Archived runs read history (no steps). `None` for an
-    /// unknown run.
+    /// status, display name, check-run id, `placeholder` flag (an expandable
+    /// node that never dispatches), derived detail and latest attempt's
+    /// steps. Archived runs read history (no steps). `None` for an unknown
+    /// run.
     ///
     /// Statements: `SELECT .. FROM runs JOIN run_submissions`; `SELECT ..
     /// FROM jobs LEFT JOIN job_specs .. latest attempt`; `SELECT <step
@@ -541,7 +544,8 @@ impl PgBackend {
                      j.annotations::text, \
                      (SELECT q.agent_job_id::text FROM job_requests q \
                       WHERE q.run_id = j.run_id AND q.job_id = j.job_id \
-                      ORDER BY q.request_id DESC LIMIT 1) \
+                      ORDER BY q.request_id DESC LIMIT 1), \
+                     (j.kind IN ('matrix_parent','reusable_caller')) \
                      FROM jobs j LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
                      WHERE j.run_id = $1::text::uuid ORDER BY j.job_id",
                     &[&run],
@@ -575,6 +579,7 @@ impl PgBackend {
                 let job_id: String = row.get(0);
                 let status = codec::status(row.get(1));
                 let display_name: Option<String> = row.get(2);
+                let placeholder: bool = row.get(6);
                 let job_steps = match row.get::<_, Option<&str>>(5) {
                     Some(agent) => steps.remove(&codec::uuid(agent)?).unwrap_or_default(),
                     None => Vec::new(),
@@ -596,6 +601,7 @@ impl PgBackend {
                     status,
                     display_name,
                     check_run_id: row.get::<_, Option<i64>>(3).map(|id| id as u64),
+                    placeholder,
                     steps: job_steps,
                 });
             }
@@ -619,6 +625,7 @@ impl PgBackend {
                             status: ExecutionStatus::Pending,
                             display_name: Some(job_id),
                             check_run_id: Some(id as u64),
+                            placeholder: false,
                             steps: Vec::new(),
                         });
                     }
@@ -654,7 +661,8 @@ impl PgBackend {
         let submission: serde_json::Value = codec::from_json(head.get(0))?;
         let job_rows = client
             .query(
-                "SELECT j.job_id, j.status, j.display_name, j.check_run_id, j.annotations::text \
+                "SELECT j.job_id, j.status, j.display_name, j.check_run_id, j.annotations::text, \
+                 (j.kind IN ('matrix_parent','reusable_caller')) \
                  FROM job_history j JOIN run_history r \
                    ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
                  WHERE j.run_id = $1::text::uuid ORDER BY j.job_id",
@@ -685,6 +693,7 @@ impl PgBackend {
                     status,
                     display_name: Some(display_name),
                     check_run_id: row.get::<_, Option<i64>>(3).map(|id| id as u64),
+                    placeholder: row.get(5),
                     steps: Vec::new(),
                 })
             })
@@ -707,6 +716,7 @@ impl PgBackend {
                         status: ExecutionStatus::Pending,
                         display_name: Some(job_id),
                         check_run_id: Some(id as u64),
+                        placeholder: false,
                         steps: Vec::new(),
                     });
                 }
@@ -1336,7 +1346,7 @@ impl PgBackend {
             .collect()
     }
 
-    /// Queue pressure snapshot. Buckets (decision round 5): `ready`,
+    /// Queue pressure snapshot. Buckets: `ready`,
     /// `claimed`; `pending` = `blocked` (needs / max-parallel); `blocked` =
     /// `held` jobs waiting on a job/jobset gate; `held` = `held` jobs of runs
     /// waiting on a workflow-level gate; `expanding` = `pending_expansion`
@@ -1433,7 +1443,7 @@ impl PgBackend {
     /// carry (status, queue kind, latest attempt) so `project_run_rows`
     /// rebuilds the same `jobs`/`jobs_list` shape the single-run read
     /// serves; archived jobs project `none` queue kind and lose caller
-    /// metadata (decisions-4 accepts the projection narrowing).
+    /// metadata; the archived projection simply carries less of it.
     ///
     /// Statements: one `UNION ALL` selection over `runs`/`run_history`;
     /// per run the `load_graph` or the archived `run_history` +

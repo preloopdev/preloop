@@ -43,20 +43,12 @@ pub async fn next_message(
                 return Ok((StatusCode::FORBIDDEN, Json(None)));
             }
             crate::control::types::AzdoPollOutcome::Redeliver(message) => {
-                return Ok(
-                    match render_session_message(&shared, &session_id, message).await {
-                        Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
-                        None => (StatusCode::ACCEPTED, Json(None)),
-                    },
-                );
+                let rendered = render_session_message(&shared, &session_id, message).await?;
+                return Ok((StatusCode::ACCEPTED, Json(Some(rendered))));
             }
             crate::control::types::AzdoPollOutcome::Cancel(message) => {
-                return Ok(
-                    match render_session_message(&shared, &session_id, message).await {
-                        Some(rendered) => (StatusCode::OK, Json(Some(rendered))),
-                        None => (StatusCode::ACCEPTED, Json(None)),
-                    },
-                );
+                let rendered = render_session_message(&shared, &session_id, message).await?;
+                return Ok((StatusCode::OK, Json(Some(rendered))));
             }
             crate::control::types::AzdoPollOutcome::Claimed {
                 message,
@@ -83,12 +75,8 @@ pub async fn next_message(
                         reason: None,
                     })
                     .await;
-                return Ok(
-                    match render_session_message(&shared, &session_id, message).await {
-                        Some(rendered) => (StatusCode::ACCEPTED, Json(Some(rendered))),
-                        None => (StatusCode::ACCEPTED, Json(None)),
-                    },
-                );
+                let rendered = render_session_message(&shared, &session_id, message).await?;
+                return Ok((StatusCode::ACCEPTED, Json(Some(rendered))));
             }
             crate::control::types::AzdoPollOutcome::Wait => {
                 if wait_seconds == 0 {
@@ -125,7 +113,7 @@ async fn render_session_message(
     shared: &Arc<SharedState>,
     session_id: &str,
     message: crate::control::types::SessionMessage,
-) -> Option<azdo::TaskAgentMessage> {
+) -> Result<azdo::TaskAgentMessage, ApiError> {
     // Control messages (JobCancellation and friends) carry their own
     // `body`; a request_id on them is correlation, not a job payload. Only
     // the assignment itself is rendered from the stored template.
@@ -138,7 +126,7 @@ async fn render_session_message(
             .backend
             .acquire_context(request_id)
             .await
-            .ok()?;
+            .map_err(ApiError::from)?;
         let mut msg = ctx.message;
         // The stored message is a secret-free template: resolve secrets back
         // in from the SecretProvider, then fill the token slots — the AzDO
@@ -150,7 +138,7 @@ async fn render_session_message(
             &ctx.repository,
             ctx.request.run_id,
         )
-        .ok()?;
+        .map_err(|error| ApiError::internal(format!("failed to fill job message: {error}")))?;
         // Merge the freshly resolved values (env-tier secrets included) into
         // the node masker entry seeded at submit.
         if !filled.values.is_empty() {
@@ -184,20 +172,29 @@ async fn render_session_message(
             // The PAT is embedded only when its OAuth scopes were verified
             // (cached by the submit-time introspection); unverifiable
             // authority stays withheld and the job keeps the runtime token.
-            shared
-                .state
-                .static_github_pat()
-                .and_then(|pat| crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes)))
-                .map(|(pat, scopes)| {
-                    msg.variables.insert(
-                        "system.github.token.pat_scopes".to_owned(),
-                        preloop_gha_protocol::azdo::VariableValue::new(
-                            crate::runs::pat_scopes_wire_value(&scopes),
-                        ),
-                    );
-                    pat
-                })
-                .unwrap_or(runtime)
+            match shared.state.static_github_pat() {
+                Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
+                    Some(scopes) => {
+                        msg.variables.insert(
+                            "system.github.token.pat_scopes".to_owned(),
+                            preloop_gha_protocol::azdo::VariableValue::new(
+                                crate::runs::pat_scopes_wire_value(&scopes),
+                            ),
+                        );
+                        pat
+                    }
+                    None => {
+                        msg.variables.insert(
+                            "system.github.token.pat_scopes".to_owned(),
+                            preloop_gha_protocol::azdo::VariableValue::new(
+                                crate::runs::PAT_WITHHELD_WIRE_VALUE,
+                            ),
+                        );
+                        runtime
+                    }
+                },
+                None => runtime,
+            }
         };
         crate::broker::apply_minted_token_to_message(
             &mut msg,
@@ -237,7 +234,8 @@ async fn render_session_message(
                 );
             }
         }
-        serde_json::to_string(&msg).ok()?
+        serde_json::to_string(&msg)
+            .map_err(|error| ApiError::internal(format!("failed to encode job message: {error}")))?
     } else {
         message.body.clone().unwrap_or_default()
     };
@@ -251,10 +249,12 @@ async fn render_session_message(
         if session_enc.key.is_empty() {
             (body_json.into_bytes(), vec![0u8; 16])
         } else {
-            session_enc.encrypt(body_json.as_bytes()).ok()?
+            session_enc.encrypt(body_json.as_bytes()).map_err(|error| {
+                ApiError::internal(format!("failed to encrypt job message: {error}"))
+            })?
         }
     };
-    Some(azdo::TaskAgentMessage {
+    Ok(azdo::TaskAgentMessage {
         message_id: message.message_id,
         message_type: message.message_type,
         body: BASE64_STANDARD.encode(&encrypted_body),

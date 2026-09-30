@@ -21,7 +21,7 @@ use steps::{STEP_COLUMNS, step_row};
 impl LiteBackend {
     /// Snapshot every scheduling table into a [`TestState`]. Single read
     /// transaction: the view is commit-consistent even while commands run.
-    pub(crate) fn test_working_set(&self) -> Result<TestState, ControlError> {
+    pub fn test_working_set(&self) -> Result<TestState, ControlError> {
         let mut conn = self.writer.lock();
         let tx = conn.transaction().map_err(db)?;
         let mut t = TestState {
@@ -781,10 +781,7 @@ impl LiteBackend {
     /// Seeds that no `ControlBackend` command expresses go through this; the
     /// assertions afterwards always read back through `test_working_set` or
     /// a real API — there is no in-memory mirror to drift.
-    pub(crate) fn test_db_mutate<R>(
-        &self,
-        f: impl FnOnce(&TestDb<'_>) -> R,
-    ) -> Result<R, ControlError> {
+    pub fn test_db_mutate<R>(&self, f: impl FnOnce(&TestDb<'_>) -> R) -> Result<R, ControlError> {
         let mut conn = self.writer.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -810,7 +807,7 @@ fn status_of(s: &str) -> ExecutionStatus {
 /// Typed seed/mutation helpers for tests, over a writer transaction. Every
 /// helper maps one `TestState` field write to its relational row(s), so
 /// tests keep short bodies instead of raw SQL.
-pub(crate) struct TestDb<'a>(pub &'a Transaction<'a>);
+pub struct TestDb<'a>(pub &'a Transaction<'a>);
 
 impl TestDb<'_> {
     fn db_err(e: rusqlite::Error) -> ControlError {
@@ -819,7 +816,7 @@ impl TestDb<'_> {
 
     /// `runs.status`/`conclusion`/`completed_at` for a forced-terminal or
     /// status override (what old tests did through `tx.runs[..]`).
-    pub(crate) fn set_run_status(
+    pub fn set_run_status(
         &self,
         run_id: RunId,
         status: &str,
@@ -842,7 +839,7 @@ impl TestDb<'_> {
 
     /// `runs.completed_at` backdating (microseconds). Lets a test put a
     /// settled run past the archive grace window without sleeping.
-    pub(crate) fn set_run_completed_at_us(
+    pub fn set_run_completed_at_us(
         &self,
         run_id: RunId,
         completed_at_us: i64,
@@ -857,7 +854,7 @@ impl TestDb<'_> {
     }
 
     /// `job_check_run_ids[job] = id`.
-    pub(crate) fn set_job_check_run(
+    pub fn set_job_check_run(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -874,7 +871,7 @@ impl TestDb<'_> {
 
     /// Rewrite one key inside `run_submissions.submission` (e.g.
     /// `trust_tier`, `workflow_path`).
-    pub(crate) fn set_submission_json(
+    pub fn set_submission_json(
         &self,
         run_id: RunId,
         json_path: &str,
@@ -896,7 +893,7 @@ impl TestDb<'_> {
     }
 
     /// `queued_at`/`enqueued_at` backdating. `us` is microseconds.
-    pub(crate) fn set_job_enqueued_us(
+    pub fn set_job_enqueued_us(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -912,7 +909,7 @@ impl TestDb<'_> {
     }
 
     /// `runner_sessions.last_seen_at` backdating.
-    pub(crate) fn set_session_seen(
+    pub fn set_session_seen(
         &self,
         session_id: &str,
         last_seen_us: i64,
@@ -930,7 +927,7 @@ impl TestDb<'_> {
     }
 
     /// `runners.registered_at` backdating.
-    pub(crate) fn set_runner_registered_at(
+    pub fn set_runner_registered_at(
         &self,
         runner_id: i64,
         registered_at_us: i64,
@@ -946,7 +943,7 @@ impl TestDb<'_> {
 
     /// Request-row fields: `started_at`, `owner_runner_id`, `result`,
     /// `claimed_at`, `session_id`, `runner_id`.
-    pub(crate) fn update_request(
+    pub fn update_request(
         &self,
         request_id: i64,
         started_at_us: Option<i64>,
@@ -976,7 +973,7 @@ impl TestDb<'_> {
 
     /// `job_leases.renewed_at` backdating (creates the lease row if absent —
     /// only claimed requests have one).
-    pub(crate) fn set_lease_renewed(
+    pub fn set_lease_renewed(
         &self,
         request_id: i64,
         runner_id: i64,
@@ -996,16 +993,12 @@ impl TestDb<'_> {
 
     /// Escape hatch for one-off seed statements the typed helpers do not
     /// cover.
-    pub(crate) fn execute(
-        &self,
-        sql: &str,
-        params: impl rusqlite::Params,
-    ) -> rusqlite::Result<usize> {
+    pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize> {
         self.0.execute(sql, params)
     }
 
     /// `job_assignments` staleness: `assigned_at`/`first_assigned_at`.
-    pub(crate) fn set_assignment_times(
+    pub fn set_assignment_times(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -1040,7 +1033,7 @@ impl TestDb<'_> {
     /// pending-pairing row when absent, else just updates `requested_at`.
     /// `labels` feed the provision lookup; tests usually want the job's own
     /// labels, e.g. `["ubuntu-latest"]`.
-    pub(crate) fn set_provision_requested_us(
+    pub fn set_provision_requested_us(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -1066,7 +1059,7 @@ impl TestDb<'_> {
 
     /// A verified broker session row (`broker_session_runners.insert`).
     /// Inserts the runner too when absent (FK).
-    pub(crate) fn insert_session(
+    pub fn insert_session(
         &self,
         session_id: &str,
         runner_id: i64,
@@ -1096,7 +1089,7 @@ impl TestDb<'_> {
     }
 
     /// A parked session message (`inflight_messages` insert).
-    pub(crate) fn insert_session_message(
+    pub fn insert_session_message(
         &self,
         session_id: &str,
         message_id: i64,
@@ -1125,7 +1118,7 @@ impl TestDb<'_> {
 
     /// A runner row (`tx.runners.insert` + derived `runner_client_ids` /
     /// `pool_proven_runners`).
-    pub(crate) fn insert_runner(
+    pub fn insert_runner(
         &self,
         runner_id: i64,
         name: &str,
@@ -1159,7 +1152,7 @@ impl TestDb<'_> {
     /// Claimed-but-undelivered state for restart-persistence tests:
     /// dequeue the job (`claimed`), bind the request to the session, park the
     /// message. `runner_id`/`session_id` must already exist (`insert_session`).
-    pub(crate) fn mark_claimed_for_session(
+    pub fn mark_claimed_for_session(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -1203,7 +1196,7 @@ impl TestDb<'_> {
     /// New attempt for a `(run, job)`: fresh `request_id` + `agent_job_id`,
     /// same timeline. The derived `agent_job_requests`/`timeline_requests`
     /// maps follow automatically at the next `test_working_set`.
-    pub(crate) fn insert_retry_request(
+    pub fn insert_retry_request(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -1248,7 +1241,7 @@ impl TestDb<'_> {
     }
 
     /// One workflow step row (`job_steps` insert for an attempt).
-    pub(crate) fn insert_step(
+    pub fn insert_step(
         &self,
         agent_job_id: uuid::Uuid,
         step_id: &str,
@@ -1280,7 +1273,7 @@ impl TestDb<'_> {
 
     /// `inflight`/`plan`/`agent` request lookups, then `DELETE` the request
     /// row (cascades leases/token requests/messages).
-    pub(crate) fn remove_request(&self, request_id: i64) -> Result<(), ControlError> {
+    pub fn remove_request(&self, request_id: i64) -> Result<(), ControlError> {
         self.0
             .execute(
                 "DELETE FROM job_requests WHERE request_id = ?1",
@@ -1292,7 +1285,7 @@ impl TestDb<'_> {
 
     /// Look up a request id by `(run, job)` — replaces iterating
     /// `inner.job_requests`.
-    pub(crate) fn request_id_for(
+    pub fn request_id_for(
         &self,
         run_id: RunId,
         job_id: &JobId,
@@ -1312,7 +1305,7 @@ impl TestDb<'_> {
 
     /// Look up `(request_id, agent_job_id, timeline_id)` of the newest
     /// request of a `(run, job)`.
-    pub(crate) fn request_key_for(
+    pub fn request_key_for(
         &self,
         run_id: RunId,
         job_id: &JobId,

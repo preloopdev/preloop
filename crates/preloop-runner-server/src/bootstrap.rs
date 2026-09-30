@@ -254,12 +254,17 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             && elapsed(request.started_at)
                 >= Duration::from_secs(request.job_timeout_s.unwrap_or(21600).max(0) as u64);
         let lease_expired = request.last_renewed_at.is_some()
-            && elapsed(request.last_renewed_at) >= Duration::from_secs(JOB_LEASE_SECONDS);
+            && elapsed(request.last_renewed_at)
+                >= Duration::from_secs(if request.session_live {
+                    crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
+                } else {
+                    JOB_LEASE_SECONDS
+                });
         if timed_out || lease_expired {
             due_runs.insert(request.run_id);
         }
     }
-    // Node-local starvation marks (decisions-5 B2). The verdict here decides
+    // Node-local starvation marks. The verdict here decides
     // only the mark; the backend re-evaluates the same verdict inside its
     // transaction, where the conditional ready→failure UPDATE is the
     // one-writer-wins guard across nodes.
@@ -293,18 +298,25 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 now,
                 pool_preparing,
                 started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+                &pool_status.labels,
             ) {
                 crate::control::logic::StarvationVerdict::ClearMark => {
                     marks.remove(&key);
                 }
-                // Nothing persists for a mark: no backend work is due.
+                // Provisioning protection re-stamps the observation clock;
+                // ordinary unmatched jobs keep the first observation.
                 crate::control::logic::StarvationVerdict::Mark { first_seen } => {
-                    marks.entry(key).or_insert(first_seen);
+                    if pool_preparing {
+                        marks.insert(key, first_seen);
+                    } else {
+                        marks.entry(key).or_insert(first_seen);
+                    }
                 }
                 // The mark stays until the job leaves the ready queue
                 // (`retain` above): the backend re-evaluates this verdict
                 // with the same mark, and a lost race re-decides identically.
-                crate::control::logic::StarvationVerdict::Starve { .. } => {
+                crate::control::logic::StarvationVerdict::Starve { .. }
+                | crate::control::logic::StarvationVerdict::Unschedulable { .. } => {
                     due_runs.insert(job.run_id);
                 }
             }
@@ -356,6 +368,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             paused: paused_credits,
             pool_preparing,
             warm_window_open: started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            pool_labels: pool_status.labels.clone(),
             first_seen,
         };
         match shared.state.backend.reap_sweep(sweep).await {
@@ -382,6 +395,36 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
     };
 
+    // Queue-wait for every starved job, so the histogram covers every
+    // terminal queue outcome, not just `claimed`: `unschedulable` = the
+    // pool's advertised labels can never match; `starved` = a matching
+    // runner never appeared inside the grace window.
+    for job in &starved {
+        if let Some(ready) = inputs
+            .ready
+            .iter()
+            .find(|ready| ready.run_id == job.run_id && ready.job_id == job.job_id)
+        {
+            let enqueued_at =
+                std::time::UNIX_EPOCH + Duration::from_nanos(ready.enqueued_at_unix_nanos as u64);
+            if let Ok(wait) = now.duration_since(enqueued_at) {
+                shared
+                    .state
+                    .observability
+                    .metrics()
+                    .lifecycle
+                    .record_queue_wait(
+                        if job.unschedulable {
+                            "unschedulable"
+                        } else {
+                            "starved"
+                        },
+                        wait,
+                    );
+            }
+        }
+    }
+
     // Run statuses for the jobs the sweep just failed, read back from the
     // authoritative rows: `reap_sweep` applied the starvation failures and
     // recomputed each affected run inside its transaction, so the post-sweep
@@ -389,9 +432,9 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // and the status after the first failure is not that conclusion — the
     // reads happen after every failure was applied, not per job.
     let mut starved_run_ids: Vec<RunId> = Vec::new();
-    for (run_id, _, _) in &starved {
-        if !starved_run_ids.contains(run_id) {
-            starved_run_ids.push(*run_id);
+    for job in &starved {
+        if !starved_run_ids.contains(&job.run_id) {
+            starved_run_ids.push(job.run_id);
         }
     }
     let mut starved_runs: Vec<(RunId, ExecutionStatus)> = Vec::new();
@@ -486,20 +529,20 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
 
     // Surface why a queued job was failed. Without this the only record is a
     // server-side log line the workflow author never sees.
-    for (run_id, job_id, reason) in &starved {
+    for job in &starved {
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
-                run_id: *run_id,
-                job_id: job_id.clone(),
+                run_id: job.run_id,
+                job_id: job.job_id.clone(),
                 status: ExecutionStatus::Failure,
-                reason: Some(reason.clone()),
+                reason: Some(job.reason.clone()),
             })
             .await;
         crate::github::report_check_run_completed(
             shared,
-            *run_id,
-            job_id,
+            job.run_id,
+            &job.job_id,
             ExecutionStatus::Failure,
         )
         .await;
@@ -1246,7 +1289,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
     }
-    // H3: warm the static-PAT OAuth scope cache once at startup. Job expansion
+    // Warm the static-PAT OAuth scope cache once at startup. Job expansion
     // is synchronous and cannot introspect the PAT itself, so without this the
     // first expansions after a restart would find a cold cache and withhold the
     // credential. The PAT is read from config/env during state construction and
@@ -1280,6 +1323,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     };
     if let Some(ps) = config.pool_status.clone() {
         state.pool_status = ps;
+        state.backend.set_pool_status((*state.pool_status).clone());
     }
     // Ensure uptime base is now (AppState::new set it, but re-arm after store load).
     state.started_at = std::time::Instant::now();

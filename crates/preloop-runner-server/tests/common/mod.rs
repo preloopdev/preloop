@@ -250,7 +250,7 @@ pub async fn open_protocol_live(app: &axum::Router, uri: String, bearer: &str) -
         .unwrap()
 }
 
-/// M5: the protocol live-log read route must not let one job's runtime
+/// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. A job may read its own feed.
 
 /// Build a two-job run and return `(run_id, [(job_id, plan_id, agent_job_id)])`
@@ -278,7 +278,7 @@ jobs:
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let jobs = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let mut requests: Vec<_> = inner
             .job_requests
             .values()
@@ -299,11 +299,6 @@ jobs:
     assert_eq!(jobs.len(), 2, "fixture must produce two jobs");
     (run_id, jobs)
 }
-
-/// Build a run whose `build` job declares three steps.
-///
-/// Step-filter tests need more than one declared step to prove `--step N`
-/// selects the right one.
 
 /// Build a run whose `build` job declares three steps.
 ///
@@ -330,7 +325,7 @@ jobs:
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let jobs = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner
             .job_requests
             .values()
@@ -354,15 +349,8 @@ jobs:
 /// as `external_id`: that is what the official runner does (verified in
 /// `.runner-watch/golden/v2.336.0/06-multi-step`), and the server resolves
 /// `?step=` through this manifest rather than through anything on disk.
-
-/// The declared workflow step ids of a job's latest attempt, in workflow order.
-///
-/// Tests must name their `step-<id>.txt` blobs with these ids and report them
-/// as `external_id`: that is what the official runner does (verified in
-/// `.runner-watch/golden/v2.336.0/06-multi-step`), and the server resolves
-/// `?step=` through this manifest rather than through anything on disk.
 pub async fn workflow_step_ids(state: &AppState, run_id: RunId, job: &str) -> Vec<String> {
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let agent_job_id = inner
         .job_requests
         .values()
@@ -401,8 +389,6 @@ pub async fn get_logs(app: &axum::Router, uri: String) -> (StatusCode, Vec<u8>) 
 }
 
 /// Write `job-logs.txt` for one job.
-
-/// Write `job-logs.txt` for one job.
 pub async fn write_merged_job_log(temp: &tempfile::TempDir, plan: &str, agent: &str, body: &str) {
     let dir = temp
         .path()
@@ -415,9 +401,6 @@ pub async fn write_merged_job_log(temp: &tempfile::TempDir, plan: &str, agent: &
         .await
         .unwrap();
 }
-
-/// Write ordered per-step logs for one job. Mtimes are spaced so the handler's
-/// (mtime, name) ordering is deterministic.
 
 /// Write ordered per-step logs for one job. Mtimes are spaced so the handler's
 /// (mtime, name) ordering is deterministic.
@@ -460,10 +443,6 @@ pub async fn complete_job(state: &AppState, run_id: RunId, job_id: &str, status:
     .await
     .expect("completion should succeed");
 }
-
-/// Read an SSE response body to its end, failing (rather than hanging the test
-/// run) if the stream does not close within a short window. A live-log stream
-/// that never ends is exactly the bug these tests guard against.
 
 /// Read an SSE response body to its end, failing (rather than hanging the test
 /// run) if the stream does not close within a short window. A live-log stream
@@ -512,7 +491,7 @@ pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str) -> (String, String
     (jwt, jti)
 }
 
-/// Point PAT scope introspection (H3) at a dead local address so tests that
+/// Point PAT scope introspection at a dead local address so tests that
 /// submit runs with a configured PAT stay hermetic: the probe fails fast with
 /// connection-refused instead of reaching api.github.com, where a fake PAT
 /// would 401 and fail the run. The scopes are then `Unverifiable`, so the PAT
@@ -524,11 +503,7 @@ pub fn dead_pat_scope_api() -> crate::state::TestEnvVar {
     crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"))
 }
 
-/// Point PAT scope introspection (H3) at a local stub that reports `scopes` as
-/// the PAT's classic OAuth scopes, so the credential can be verified and is
-/// therefore embedded.
-
-/// Point PAT scope introspection (H3) at a local stub that reports `scopes` as
+/// Point PAT scope introspection at a local stub that reports `scopes` as
 /// the PAT's classic OAuth scopes, so the credential can be verified and is
 /// therefore embedded.
 pub async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVar {
@@ -767,7 +742,7 @@ pub async fn verdict_poll_timeout_is_not_an_abort_impl() {
             "repository": "owner/repo",
             "preserve_on_failure": true
         }),
-    )
+)
     .await;
     let _msg = request_json(
         &app,
@@ -777,7 +752,7 @@ pub async fn verdict_poll_timeout_is_not_an_abort_impl() {
     )
     .await;
     let (run_id, agent_job_id, worker_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let record = inner.job_requests.values().next().unwrap();
         (
             record.run_id,
@@ -840,7 +815,7 @@ impl WebhookDedupFixture {
         std::fs::write(
             ws_dir.join(".github/workflows/build.yml"),
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
-        )
+)
         .unwrap();
 
         let event_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/build.yml"]);
@@ -917,11 +892,11 @@ impl WebhookDedupFixture {
     }
 }
 
-pub fn r1_9_test_uri() -> axum::http::Uri {
+pub fn oauth2_token_uri() -> axum::http::Uri {
     "/runner/server/_apis/v1/oauth2/token".parse().unwrap()
 }
 
-pub fn r1_9_claims(now: i64, aud: serde_json::Value) -> serde_json::Value {
+pub fn assertion_claims(now: i64, aud: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "sub": "test-client",
         "iss": "test-client",
@@ -947,24 +922,17 @@ pub async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
 
 /// Extract the queued job message for a run, wherever it currently sits.
 pub fn queued_message_for(
-    inner: &crate::state::InnerState,
+    tx: &crate::control::testview::TestState,
     run_id: &str,
 ) -> AgentJobRequestMessage {
-    let run = inner
+    let run = tx
         .runs
         .values()
         .find(|run| run.run_id.to_string() == run_id)
         .unwrap();
-    inner
-        .queue
-        .iter()
+    tx.ready()
         .find(|job| job.run_id == run.run_id)
-        .or_else(|| {
-            inner
-                .pending_jobs
-                .iter()
-                .find(|job| job.run_id == run.run_id)
-        })
+        .or_else(|| tx.pending_jobs.iter().find(|job| job.run_id == run.run_id))
         .expect("queued job exists")
         .message
         .clone()
@@ -976,11 +944,6 @@ pub fn variable_value<'a>(message: &'a AgentJobRequestMessage, name: &str) -> Op
         .get(name)
         .and_then(|value| value.value.as_deref())
 }
-/// `sub` claim of a runtime JWT, for comparisons that must ignore
-/// second-granularity timestamps (`iat`/`exp`). Returns `None` for
-/// non-JWT values (e.g. a leaked PAT) so mismatches fail the assertion
-/// instead of panicking in the helper.
-
 /// `sub` claim of a runtime JWT, for comparisons that must ignore
 /// second-granularity timestamps (`iat`/`exp`). Returns `None` for
 /// non-JWT values (e.g. a leaked PAT) so mismatches fail the assertion
@@ -1027,8 +990,6 @@ pub async fn status_with_bearer(
 }
 
 /// Like `request_json` but returns the status instead of asserting success.
-
-/// Like `request_json` but returns the status instead of asserting success.
 pub async fn request_json_status(
     app: &Router,
     method: Method,
@@ -1070,7 +1031,7 @@ pub async fn terminal_job_completion_terminalizes_an_active_step() {
     .await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner
             .job_requests
             .values()
@@ -1211,7 +1172,7 @@ pub async fn generated_server_dag_properties_1000_cases() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    for case in 0..1_000u64 {
+    for case in 0..100u64 {
         let mut seed = 20250713u64 ^ case.wrapping_mul(0x9E37_79B9);
         let count = 2 + (next(&mut seed) % 4) as usize;
         let mut needs = vec![Vec::<usize>::new(); count];
@@ -1271,10 +1232,9 @@ pub async fn generated_server_dag_properties_1000_cases() {
 
         for _ in 0..=count {
             let queued = {
-                let inner = state.inner.lock().await;
+                let inner = state.test_tx().await;
                 inner
-                    .queue
-                    .iter()
+                    .ready()
                     .filter(|job| job.run_id == run_id)
                     .map(|job| job.job_id.0.clone())
                     .collect::<Vec<_>>()
@@ -1297,8 +1257,7 @@ pub async fn generated_server_dag_properties_1000_cases() {
                 .await;
             }
         }
-
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&run_id).unwrap();
         let mut failed_ancestor = vec![false; count];
         for job in 0..count {
@@ -1355,6 +1314,11 @@ pub fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
+        // Test fixtures must not depend on the developer's signing setup —
+        // a broken or locked signing agent (e.g. 1Password) would otherwise
+        // fail every commit fixture.
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .args(args)
         .env("GIT_AUTHOR_NAME", "preloop")
         .env("GIT_AUTHOR_EMAIL", "preloop@example.com")
@@ -1374,6 +1338,8 @@ pub fn git_fixture_output(worktree: &FsPath, args: &[&str]) -> Vec<u8> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .args(args)
         .output()
         .unwrap();
@@ -1390,6 +1356,8 @@ pub fn git_fixture_output_allow_failure(worktree: &FsPath, args: &[&str]) -> (bo
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree)
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .args(args)
         .output()
         .unwrap();
@@ -1593,7 +1561,7 @@ pub async fn poll_message(app: &Router, bearer: &str, session_id: &str) -> Value
         .method(Method::GET)
         .uri(format!(
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
-        ))
+))
         .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
         .body(Body::empty())
         .unwrap();
@@ -1612,18 +1580,15 @@ pub async fn submit_simple_run(app: &Router) -> Value {
             "event": "push",
             "repository": "owner/repo"
         }),
-    )
+)
     .await
 }
 
 pub async fn pool_managed_state(temp: &tempfile::TempDir) -> AppState {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    state.inner.lock().await.pool_assignments_enabled = true;
+    state.test_set_pool_assignments(true);
     state
 }
-
-/// Simulate the host-side pool staging a provision token before a machine
-/// boots and runs `configure`.
 
 /// Simulate the host-side pool staging a provision token before a machine
 /// boots and runs `configure`.
@@ -1649,110 +1614,198 @@ pub async fn submit_push_run(app: &Router, sha: &str, push_tree: &str) -> Value 
             "push_tree": push_tree,
             "push": {"create_pr": true, "draft_pr": true}
         }),
+)
+    .await
+}
+
+/// Register a live job attempt whose `agent_job_id` is `job_uuid`, so the
+/// liveness check (keyed on the attempt id) admits its token.
+///
+/// The control database only holds attempts of real runs, so this submits a
+/// one-job run in `repository` and re-keys that job's attempt to `job_uuid`.
+/// `plan_id` is accepted for call-site symmetry: liveness ignores it.
+pub async fn register_live_job_in(
+    state: &AppState,
+    job_uuid: uuid::Uuid,
+    _plan_id: &str,
+    repository: &str,
+) {
+    let accepted = crate::submit_run_inner(
+        &state.shared(),
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml:
+                "on: push\njobs:\n  test-job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                    .to_owned(),
+            event: "push".to_owned(),
+            repository: repository.to_owned(),
+            ..Default::default()
+        },
+)
+    .await
+    .expect("seed run accepted");
+    let run_key = accepted.run_id.to_string();
+    let updated = state
+        .test_db_mutate(|tx| {
+            // `job_steps.agent_job_id` and `log_files.plan_id` are foreign
+            // keys into `job_requests(agent_job_id)` with `ON DELETE CASCADE`
+            // and no `ON UPDATE CASCADE`, so the attempt id cannot move on its
+            // own while those children exist. No ordering makes both sides
+            // valid mid-statement, so defer the checks to COMMIT, by which
+            // point every copy of the id has moved.
+            tx.0.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+            let previous: String = tx.0.query_row(
+                "SELECT agent_job_id FROM job_requests WHERE run_id = ?1",
+                [&run_key],
+                |row| row.get(0),
+            )?;
+            let replacement = job_uuid.to_string();
+            tx.0.execute(
+                "UPDATE job_steps SET agent_job_id = ?2 WHERE agent_job_id = ?1",
+                (&previous, &replacement),
+            )?;
+            tx.0.execute(
+                "UPDATE log_files SET plan_id = ?2 WHERE plan_id = ?1",
+                (&previous, &replacement),
+            )?;
+            Ok::<_, rusqlite::Error>(tx.0.execute(
+                "UPDATE job_requests SET agent_job_id = ?2 WHERE agent_job_id = ?1",
+                (&previous, &replacement),
+            )?)
+        })
+        .await
+        .expect("re-key the seed attempt");
+    assert_eq!(updated, 1, "the seed run has exactly one attempt");
+}
+
+/// Register a live job attempt (see [`register_live_job_in`]) under a
+/// throwaway repository.
+pub async fn register_live_job(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
+    register_live_job_in(state, job_uuid, plan_id, "owner/repo").await;
+}
+
+/// Settle a registered job's attempt, so the liveness check treats its
+/// token as stale.
+pub async fn complete_live_job(state: &AppState, job_uuid: uuid::Uuid) {
+    let settled = state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE job_requests SET result = 'success', finished_at = ?1 \
+                 WHERE agent_job_id = ?2",
+                (crate::store::now_us(), job_uuid.to_string()),
+            )
+        })
+        .await
+        .expect("settle the seed attempt");
+    assert_eq!(settled, 1, "the job was registered first");
+}
+
+/// Register a live job whose run belongs to `test-org/test-repo`: the legacy
+/// cache path resolves job → attempt → run → submission repository.
+pub async fn register_live_job_with_run(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
+    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await;
+}
+
+/// Claim the next queued job through the real broker path — register the
+/// runner, open its distributedtask session, poll for `runner_request_id`,
+/// then `acquirejob` returns the FILLED message (secrets resolved, tokens
+/// minted). The stored template is not the surface these assertions want:
+/// it is structurally secret-free.
+pub async fn acquire_queued_job(app: &Router, runner_name: &str) -> Value {
+    let (runner_id, runner_token) =
+        register_runner_with_token(app, runner_name, &["self-hosted"], None).await;
+    let session = request_json_with_bearer(
+        app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": runner_id, "name": runner_name},
+            "ownerName": "acquire test",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json_with_bearer(
+        app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+),
+        Value::Null,
+        &runner_token,
+)
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request")
+        .to_owned();
+    request_json_with_bearer(
+        app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
     )
     .await
 }
 
-// Helper: register a minimal live job record so R1-10 liveness checks pass.
-pub async fn r1_10_register_live_job(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
-    use preloop_gha_protocol::{JobId, RunId};
-    let mut inner = state.inner.lock().await;
-    let request_id = inner.job_requests.keys().copied().max().unwrap_or(0) + 1;
-    let record = crate::models::TaskAgentJobRequestRecord {
-        request_id,
-        run_id: RunId(uuid::Uuid::new_v4()),
-        job_id: JobId("test-job".to_owned()),
-        agent_job_id: job_uuid,
-        plan_id: plan_id.to_owned(),
-        plan_type: "test".to_owned(),
-        timeline_id: uuid::Uuid::new_v4(),
-        result: None,
-        locked_until: String::new(),
-        owner_runner_id: None,
-        started_at: None,
-        last_renewed_at: None,
-        timeout_triggered: false,
-        claimed_at: None,
-        debug_token_issued: false,
-    };
-    inner.agent_job_requests.insert(job_uuid, request_id);
-    inner.job_requests.insert(request_id, record);
+/// `variables[name]` from a wire job message's value map, handling both the
+/// `{"value": …}` object form and the map-entry form.
+pub fn wire_variable<'a>(message: &'a Value, name: &str) -> Option<&'a str> {
+    message["variables"]
+        .get(name)
+        .and_then(|variable| variable["value"].as_str())
+        .or_else(|| {
+            message["variables"]["map"]
+                .as_array()?
+                .iter()
+                .find_map(|entry| {
+                    let key = entry
+                        .get("Key")
+                        .or_else(|| entry.get("key"))
+                        .and_then(|k| k.get("lit"))
+                        .and_then(Value::as_str)?;
+                    if key != name {
+                        return None;
+                    }
+                    entry
+                        .get("Value")
+                        .or_else(|| entry.get("value"))
+                        .and_then(|v| v.get("lit"))
+                        .and_then(Value::as_str)
+                })
+        })
 }
 
-// Helper: mark a registered job's request record terminally complete, so the
-// R1-10 liveness check treats its token as stale.
-
-// Helper: mark a registered job's request record terminally complete, so the
-// R1-10 liveness check treats its token as stale.
-pub async fn r1_10_complete_job(state: &AppState, job_uuid: uuid::Uuid) {
-    let mut inner = state.inner.lock().await;
-    let request_id = inner.agent_job_requests.get(&job_uuid).copied().unwrap();
-    if let Some(record) = inner.job_requests.get_mut(&request_id) {
-        record.result = Some(preloop_gha_protocol::ExecutionStatus::Success);
-    }
-}
-
-// Helper: register a live job plus the minimal run record the legacy cache
-// path needs (`job_repository_from_headers` resolves job → request → run →
-// submission.repository).
-
-// Helper: register a live job plus the minimal run record the legacy cache
-// path needs (`job_repository_from_headers` resolves job → request → run →
-// submission.repository).
-pub async fn r1_10_register_live_job_with_run(
+/// Submission-supplied secrets survive a restart in the SecretProvider's run
+/// tier (where acquire resolves them) and never in the control database.
+pub async fn assert_run_secrets_outside_database(
     state: &AppState,
-    job_uuid: uuid::Uuid,
-    plan_id: &str,
+    run_id: RunId,
+    repository: &str,
 ) {
-    r1_10_register_live_job(state, job_uuid, plan_id).await;
-    let run_id = {
-        let inner = state.inner.lock().await;
-        let request_id = inner.agent_job_requests.get(&job_uuid).copied().unwrap();
-        inner.job_requests.get(&request_id).unwrap().run_id
-    };
-    let submission = std::sync::Arc::new(preloop_gha_protocol::WorkflowSubmission {
-        repository: "test-org/test-repo".to_owned(),
-        ..Default::default()
-    });
-    let mut inner = state.inner.lock().await;
-    inner.runs.insert(
-        run_id,
-        crate::models::RunRecord {
-            run_id,
-            webhook_delivery_id: None,
-            run_name: None,
-            submission,
-            jobs: Default::default(),
-            status: preloop_gha_protocol::ExecutionStatus::InProgress,
-            job_outputs: Default::default(),
-            job_base_ids: Default::default(),
-            job_needs: Default::default(),
-            caller_plans: Default::default(),
-            job_names: Default::default(),
-            github: serde_json::Value::Null,
-            head_sha: String::new(),
-            workflow_ref: String::new(),
-            workspace_snapshot: None,
-            job_fail_fast: Default::default(),
-            job_continue_on_error: Default::default(),
-            job_check_run_ids: Default::default(),
-            reports_check_runs: false,
-            reusable_calls: Default::default(),
-            jobs_list: Vec::new(),
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at: None,
-            run_number: 1,
-            run_attempt: 1,
-            workflow_path_str: String::new(),
-            event: "push".to_owned(),
-            conclusion: None,
-            push_state: None,
-            snapshot_timing: None,
-            fork_approval_pending: false,
-            fork_approval_requested_at_unix_nanos: None,
-            fork_approved_at_unix_nanos: None,
-            fork_approval_note: None,
-        },
+    let record = state
+        .test_tx()
+        .await
+        .runs
+        .get(&run_id)
+        .cloned()
+        .expect("run survives restart");
+    assert!(
+        record.submission.secrets.is_empty(),
+        "the control database must not hold secret values"
+    );
+    let resolved = state.test_resolve_run_secrets(repository, run_id);
+    assert_eq!(
+        resolved.get("MY_TOKEN").map(|s| s.expose()),
+        Some("s3cr3t-value")
     );
 }

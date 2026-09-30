@@ -27,7 +27,7 @@ pub async fn twirp_workflow_steps_update(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
@@ -61,7 +61,7 @@ pub async fn twirp_get_job_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     // The signed URL is the upload credential for `/replay/results/*` — a
     // bearerless route reachable from inside every runner VM. Only mint for
@@ -92,7 +92,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::auth::require_results_job(
         &identity,
@@ -105,7 +105,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     };
     // The bearerless upload token is a server-signed blob JWT: `job` binds it
     // to the owning job so the blob gate can reject writes from any other job
-    // (R1-2) and from this job once it settles (R1-10). `jti` names the
+    // and from this job once it settles. `jti` names the
     // on-disk staging directory. The runner PUTs to this URL without a
     // bearer (Azure SDK compat), so the signature — not a bearer — is the
     // credential here.
@@ -166,7 +166,7 @@ pub async fn twirp_get_step_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
@@ -201,7 +201,7 @@ pub async fn twirp_get_step_summary_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
@@ -264,7 +264,7 @@ pub async fn twirp_create_step_summary_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
@@ -309,7 +309,7 @@ pub async fn twirp_create_step_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let (Some(plan_id), Some(raw_job_id)) = (
         request.workflow_run_backend_id.as_deref(),
@@ -356,7 +356,7 @@ pub async fn twirp_create_job_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let Some(raw_job_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
@@ -396,7 +396,7 @@ pub fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Option<&str>
     )
 }
 
-/// R1-3: bind the cache namespace to the token's job. The repository is
+/// Bind the cache namespace to the token's job. The repository is
 /// resolved server-side from the job → run → submission chain, never from
 /// the request body — a job can only read/write its own repository's cache
 /// namespace, so a compromised job cannot poison another repository's
@@ -415,7 +415,7 @@ async fn resolve_cache_repository(
     }
 }
 
-/// R1-5: bind the cache *write* scope to the token's job. The scope is the
+/// Bind the cache *write* scope to the token's job. The scope is the
 /// job's own git ref from the run submission — never the client-supplied
 /// scope — so a branch run cannot claim `refs/heads/main` and poison the
 /// default branch's cache namespace (first write wins). The system token
@@ -433,7 +433,7 @@ async fn resolve_cache_write_scope(
     }
 }
 
-/// R1-5: scopes a job token may *read*, GitHub-style: its own ref, the PR
+/// Scopes a job token may *read*, GitHub-style: its own ref, the PR
 /// base branch when the run is a pull request, and the repository's real
 /// default branch as fallback (resolved from the event payload, not
 /// assumed to be `main`). Caches written on unrelated branches stay
@@ -723,15 +723,15 @@ pub async fn twirp_cache_v2_create(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let (key, version, _restore, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
-    // R1-3: the repository comes from the token's job, never the request body.
+    // The repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
     let client_scope = scopes.first().map(String::as_str);
-    // R1-5: the write scope is the token's job's git ref, never the
+    // The write scope is the token's job's git ref, never the
     // client-supplied scope — a branch run cannot claim `refs/heads/main`
     // and poison the default branch's cache namespace.
     let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
@@ -789,7 +789,7 @@ pub async fn twirp_cache_v2_create(
         {
             true
         } else {
-            // F7: a runner is capped at MAX_PENDING_PER_JOB in-flight cache
+            // A runner is capped at MAX_PENDING_PER_JOB in-flight cache
             // uploads. The job comes from the signed token scope, not the
             // request body. A refusal is a plain `ok: false`, the same
             // non-fatal shape actions/cache already handles for a miss.
@@ -884,16 +884,16 @@ pub async fn twirp_cache_v2_finalize(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let (key, version, _restore, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;
-    // R1-3: the repository comes from the token's job, never the request body.
+    // The repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
     let client_scope = scopes.first().map(String::as_str);
-    // R1-5: the write scope is the token's job's git ref, never the
+    // The write scope is the token's job's git ref, never the
     // client-supplied scope — a branch run cannot claim `refs/heads/main`
     // and poison the default branch's cache namespace.
     let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
@@ -1020,9 +1020,9 @@ pub async fn twirp_cache_v2_get_dl_url(
     let t0 = std::time::Instant::now();
     let (key, version, restore_keys, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::GetDownloadUrl)?;
-    // R1-3: the repository comes from the token's job, never the request body.
+    // The repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
-    // R1-5: a job token may only read its own ref's scope, plus the default
+    // A job token may only read its own ref's scope, plus the default
     // branch as fallback (GitHub semantics). Unrelated branches' caches stay
     // invisible even if the client lists them first. The system token keeps
     // the client-supplied scopes; with none supplied, the unscoped default
@@ -1088,7 +1088,7 @@ pub async fn twirp_cache_v2_get_dl_url(
         inner
             .cache_v2_dl_tokens
             .insert(dl_jti.clone(), (entry.key.clone(), entry.version.clone()));
-        // F7: bound the minted-token map; the oldest tokens are evicted
+        // Bound the minted-token map; the oldest tokens are evicted
         // first. A token that a runner has not yet fetched still works, so a
         // real workflow's few concurrent downloads are never affected.
         inner.cache_v2_dl_tokens_order.push_back(dl_jti.clone());
@@ -1164,8 +1164,8 @@ mod cache_pb_tests {
     #[test]
     fn pb_golden_sccache_create_fixture_decodes() {
         // Correct fixture: bytes generated with prost using official field
-        // numbers (metadata=1, key=2, version=3). This is the failing pre-fix
-        // exchange: hand-rolled flat key=1 decoder cannot parse it, prost does.
+        // numbers (metadata=1, key=2, version=3). A hand-rolled flat key=1
+        // decoder cannot parse it; prost does.
         let (key, version, restore, scopes, repository) =
             pb_cache_request(SCCACHE_CREATE_FIXTURE, CacheRequestKind::Create).unwrap();
         assert_eq!(key, ".sccache_check");
@@ -1277,7 +1277,7 @@ mod cache_pb_tests {
         );
     }
 
-    // ── R1-5 regression tests: cache namespace is bound to the job's git
+    // ── regression tests: cache namespace is bound to the job's git
     // ref, so one branch cannot poison another branch's cache entries. ──
 
     fn bearer_headers(token: &str) -> axum::http::HeaderMap {
@@ -1303,8 +1303,8 @@ mod cache_pb_tests {
         std::sync::atomic::AtomicU64::new(1);
 
     /// Seed a live run carrying one job attempt bound to `job_id`, through
-    /// the control backend — the authoritative writer, since the cutover left
-    /// no in-memory mirror to insert into. The request's `agent_job_id` is
+    /// the control backend — the authoritative writer, with no in-memory
+    /// mirror to insert into. The request's `agent_job_id` is
     /// what the job → run → submission lookups key on, and the submitted run
     /// record supplies the submission the cache scoping reads back.
     async fn seed_job_attempt(
@@ -1490,7 +1490,7 @@ mod cache_pb_tests {
 
     #[tokio::test]
     async fn cache_write_scope_binds_to_job_ref_not_client_scope() {
-        // R1-5: the write scope comes from the token's job's git ref. A
+        // The write scope comes from the token's job's git ref. A
         // feature-branch job claiming `refs/heads/main` must still land in
         // its own ref's namespace — otherwise it could poison the default
         // branch's cache (first write wins).
@@ -1533,7 +1533,7 @@ mod cache_pb_tests {
 
     #[tokio::test]
     async fn cache_read_scopes_allow_own_ref_and_default_branch_only() {
-        // R1-5: a job may read its own ref's scope plus the default branch
+        // A job may read its own ref's scope plus the default branch
         // fallback (GitHub semantics). Unrelated branches stay invisible even
         // when the client lists them first.
         let temp = tempfile::tempdir().unwrap();
@@ -1651,7 +1651,7 @@ mod cache_pb_tests {
 
     #[test]
     fn legacy_cache_namespace_includes_git_ref() {
-        // R1-5: the legacy artifactcache namespace binds repository + ref.
+        // The legacy artifactcache namespace binds repository + ref.
         assert_eq!(
             crate::cache_artifacts::ref_scoped_namespace(
                 Some("owner/repo".to_owned()),
@@ -1672,7 +1672,7 @@ mod cache_pb_tests {
     }
     #[tokio::test]
     async fn cache_repository_binds_to_job_not_request_body() {
-        // R1-3: the cache namespace binds to the token's job. A spoofed
+        // The cache namespace binds to the token's job. A spoofed
         // `repository` in the request body must not move the caller into
         // another repository's namespace.
         let temp = tempfile::tempdir().unwrap();

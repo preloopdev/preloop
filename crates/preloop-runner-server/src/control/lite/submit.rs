@@ -9,6 +9,7 @@ use super::codec::{self, now_us};
 use super::concurrency as cg;
 use super::{LiteBackend, db, jobs, promote, settle};
 use crate::concurrency::{self, Holder};
+use crate::control::logic;
 use crate::control::types::*;
 use crate::models::{QueuedJob, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
@@ -212,10 +213,36 @@ fn submit_run_tx(
         .enumerate()
         .map(|(index, detail)| (detail.job_id.clone(), index as i64))
         .collect();
-
     // ── Workflow-level gate ─────────────────────────────────────────────
+    // Workless submissions (every job gated off / unhostable / unsatisfiable)
+    // take no admission: a Holder::Run taken here is never released through
+    // the completion path and would park every later submission in the group.
+    let platforms = jobs::registered_platforms(tx)?;
+    let pool_labels = if check_hostable {
+        backend.pool_labels()
+    } else {
+        Vec::new()
+    };
+    let runner_labels = if pool_labels.is_empty() {
+        Vec::new()
+    } else {
+        jobs::runner_label_sets(tx)?
+    };
+    let has_runnable = submit_jobs.iter().any(|job| {
+        !logic::concludes_at_submit(
+            job.initially_skipped,
+            job.queued.reusable_call.is_some() || job.queued.deferred_matrix.is_some(),
+            &job.queued.runs_on,
+            check_hostable,
+            platforms.iter().copied(),
+            &pool_labels,
+            runner_labels.iter().any(|labels| {
+                crate::runtime_scheduling::job_matches_runner(&job.queued.runs_on, labels)
+            }),
+        )
+    });
     let mut held = false;
-    if let Some(wf) = &workflow_concurrency {
+    if has_runnable && let Some(wf) = &workflow_concurrency {
         let key = concurrency::concurrency_key(&record.submission.repository, &wf.group);
         let holder = Holder::Run(run_id);
         let mut cancel = settle::canceler(backend);
@@ -348,7 +375,6 @@ fn submit_run_tx(
     }
 
     // ── Per-job classification ──────────────────────────────────────────
-    let platforms = jobs::registered_platforms(tx)?;
     let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
     // `inserted` counts `jobs` rows (outbox detail); `queued` counts
     // dispatchable jobs — `RunAccepted.queued_jobs` and the waiter wake.
@@ -394,7 +420,10 @@ fn submit_run_tx(
             concluded.push((
                 job_id,
                 ExecutionStatus::Failure,
-                Some(format!("no {platform} runner registered")),
+                Some(crate::control::logic::unhostable_reason(
+                    platform,
+                    &job.runs_on,
+                )),
             ));
             inserted += 1;
             continue;
@@ -416,6 +445,44 @@ fn submit_run_tx(
                 &spec,
             )?;
             concluded.push((job_id.clone(), ExecutionStatus::Skipped, None));
+            inserted += 1;
+            continue;
+        }
+
+        // Labels the co-hosted pool can never satisfy and no registered
+        // runner serves: conclude now instead of starving in the queue.
+        // Placeholders are skipped — expansion materializes their real jobs.
+        if job.reusable_call.is_none()
+            && job.deferred_matrix.is_none()
+            && let Some(reason) = crate::control::logic::unschedulable_reason(
+                &job.runs_on,
+                &pool_labels,
+                runner_labels.iter().any(|labels| {
+                    crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels)
+                }),
+            )
+        {
+            tracing::warn!(
+                %run_id,
+                job = %job_id.0,
+                labels = ?job.runs_on,
+                pool_labels = ?pool_labels,
+                "runs-on unsatisfiable by runner pool; failing the job at enqueue"
+            );
+            insert_classified_job(
+                tx,
+                &namespace,
+                run_id,
+                &job,
+                &job_id,
+                order,
+                run_order,
+                job_order as i64,
+                ExecutionStatus::Failure,
+                "none",
+                &spec,
+            )?;
+            concluded.push((job_id, ExecutionStatus::Failure, Some(reason)));
             inserted += 1;
             continue;
         }
@@ -829,38 +896,17 @@ pub(super) fn mint_request(
         // attempt; its request correlation is minted at expansion.
         return Ok(());
     };
-    let agent_job_id = request.agent_job_id.to_string();
-    let timeline_id = request.timeline_id.to_string();
-    tx.prepare_cached(
-        "INSERT INTO job_requests (run_id, job_id, namespace_id, agent_job_id, \
-             timeline_id, runner_id, claimed_at) \
-         VALUES (?1,?2,?3,?4,?5,NULL,0)",
-    )
-    .map_err(db)?
-    .execute(params![
-        codec::run_key(run_id),
-        job_id.0,
+    let request_id = insert_attempt(
+        tx,
         namespace,
-        agent_job_id,
-        timeline_id
-    ])
-    .map_err(db)?;
-    let request_id = tx.last_insert_rowid();
+        run_id,
+        job_id,
+        request.agent_job_id,
+        request.timeline_id,
+        step_manifest,
+    )?;
     // The runner-facing message carries the allocated request id.
-    let patched = tx
-        .prepare_cached(
-            "SELECT message_template FROM job_messages WHERE run_id = ?1 AND job_id = ?2",
-        )
-        .map_err(db)?
-        .query_row(params![codec::run_key(run_id), job_id.0], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()
-        .map_err(db)?
-        .and_then(|json| {
-            serde_json::from_str::<preloop_gha_protocol::azdo::AgentJobRequestMessage>(&json).ok()
-        });
-    if let Some(mut message) = patched {
+    if let Some(mut message) = jobs::stored_job_message(tx, run_id, job_id)? {
         message.request_id = request_id;
         jobs::update_job_message(tx, run_id, job_id, &message)?;
     }
@@ -880,7 +926,38 @@ pub(super) fn mint_request(
         ])
         .map_err(db)?;
     }
-    for (position, step) in step_manifest.iter().enumerate() {
+    Ok(())
+}
+
+/// Insert one unclaimed attempt — its `job_requests` row and step manifest —
+/// and return the allocated `request_id`. The caller owns the message
+/// template and the token-mint recipe.
+pub(super) fn insert_attempt(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    run_id: RunId,
+    job_id: &JobId,
+    agent_job_id: uuid::Uuid,
+    timeline_id: uuid::Uuid,
+    step_manifest: Vec<StepRecord>,
+) -> Result<i64, ControlError> {
+    let agent_job_id = agent_job_id.to_string();
+    tx.prepare_cached(
+        "INSERT INTO job_requests (run_id, job_id, namespace_id, agent_job_id, \
+             timeline_id, runner_id, claimed_at) \
+         VALUES (?1,?2,?3,?4,?5,NULL,0)",
+    )
+    .map_err(db)?
+    .execute(params![
+        codec::run_key(run_id),
+        job_id.0,
+        namespace,
+        agent_job_id,
+        timeline_id.to_string()
+    ])
+    .map_err(db)?;
+    let request_id = tx.last_insert_rowid();
+    for (position, step) in step_manifest.into_iter().enumerate() {
         tx.prepare_cached(
             "INSERT INTO job_steps (agent_job_id, step_id, position, kind, \
                  workflow_index, runner_number, context_name, name, conclusion, \
@@ -907,7 +984,7 @@ pub(super) fn mint_request(
         ])
         .map_err(db)?;
     }
-    Ok(())
+    Ok(request_id)
 }
 
 /// `allocate_run_number` inside an open transaction: upsert the

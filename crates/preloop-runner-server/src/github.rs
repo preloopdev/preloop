@@ -646,9 +646,14 @@ pub async fn report_check_runs_for_run(
             Some(info) => (
                 info.repository,
                 info.sha,
+                // Expandable nodes (deferred matrices, reusable callers) are
+                // placeholders: expansion replaces them, and their
+                // materialized legs mint their own checks. A `queued` check
+                // minted here would strand on GitHub (no delete API).
                 info.jobs
-                    .iter()
-                    .map(|job| (job.job_id.clone(), job.status))
+                    .into_iter()
+                    .filter(|job| !job.placeholder)
+                    .map(|job| (job.job_id, job.status))
                     .collect::<Vec<_>>(),
             ),
             None => return,
@@ -1509,7 +1514,7 @@ async fn enqueue_webhook_delivery_with_budget(
 /// Verifies the signature, atomically enqueues the delivery to the durable
 /// store, and acknowledges with HTTP 202 Accepted. Background workers drain
 /// the queue asynchronously.
-/// The `repository.full_name` a webhook payload claims, if any (M3).
+/// The `repository.full_name` a webhook payload claims, if any.
 ///
 /// Read before any event processing so the signer's installation coverage
 /// can be bound to the claimed repository. A payload without a repository
@@ -1535,7 +1540,7 @@ pub async fn handle_github_webhook(
         .ok_or(StatusCode::UNAUTHORIZED)?;
     // Every registered App's secret is a candidate : a payload signed by
     // any App preloop fronts is accepted, one signed by none is rejected.
-    // M3: identify WHICH credential verified the payload — the signer
+    // Identify WHICH credential verified the payload — the signer
     // binds the claimed repository below.
     let signers: Vec<(String, crate::github_app::WebhookSigner)> = match &shared.state.github_apps {
         Some(apps) => apps.webhook_signers(shared.state.webhook_secret.as_deref()),
@@ -1560,7 +1565,7 @@ pub async fn handle_github_webhook(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    // M3: bind the claimed repository to the signer's installation
+    // Bind the claimed repository to the signer's installation
     // coverage BEFORE any event processing (adapters and check_run
     // rerequests alike). The signature only proves *some* registered
     // credential sent the payload — without binding, a payload signed by
@@ -2010,7 +2015,7 @@ fn webhook_workers() -> usize {
 
 /// Drain pending webhook deliveries (oldest received first) with
 /// [`webhook_workers`] concurrent claim loops.
-pub(crate) async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
+pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
     let loops = (0..webhook_workers()).map(|_| drain_webhook_queue_loop(shared));
     let mut total = 0;
     for result in futures::future::join_all(loops).await {
@@ -2931,7 +2936,13 @@ async fn process_delivery_payload_with_lease(
                         .ok()
                         .flatten();
                     if let Some(info) = info {
-                        for job in &info.jobs {
+                        // Expandable nodes (deferred matrices, reusable
+                        // callers) are placeholders: expansion replaces them
+                        // and their materialized legs mint their own checks.
+                        // Minting a `queued` check here would strand it on
+                        // GitHub (there is no delete API) for a dissolved
+                        // placeholder that never dispatches.
+                        for job in info.jobs.iter().filter(|job| !job.placeholder) {
                             let job_id = job.job_id.clone();
                             tokio::select! {
                                 _ = lease_lost.cancelled() => return WebhookOutcome::Success,

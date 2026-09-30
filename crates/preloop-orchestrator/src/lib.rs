@@ -7101,7 +7101,7 @@ chmod +x "$dest/bin/node"
     }
 
     /// The always-run ownership reconciliation must not install privilege
-    /// policy — the security review's P1: custom/official images that never
+    /// policy: custom/official images that never
     /// had blanket sudo must not gain it just because a job runs there — and
     /// it must not mask failures the way the account script's `|| true` tail
     /// does.

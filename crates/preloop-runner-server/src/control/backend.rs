@@ -324,8 +324,9 @@ pub(crate) trait ControlBackend: Send + Sync {
     async fn delete_session(&self, session_id: &str) -> Result<(), ControlError>;
 
     /// Remove a runner identity and every session/binding it owned;
-    /// requeue its claimed jobs so a replacement can pick them up.
-    async fn purge_runner(&self, runner_id: i64) -> Result<(), ControlError>;
+    /// requeue its claimed jobs so a replacement can pick them up. Returns
+    /// the runtime identities of the attempts retired for those retries.
+    async fn purge_runner(&self, runner_id: i64) -> Result<Vec<uuid::Uuid>, ControlError>;
 
     // ── Expansion ─────────────────────────────────────────────────────
 
@@ -421,6 +422,7 @@ pub(crate) trait ControlBackend: Send + Sync {
     async fn request(&self, key: RequestKey) -> Result<TaskAgentJobRequestRecord, ControlError>;
     /// Change only a run's push-sync state. The run advisory lock serializes
     /// this with scheduling transactions that may also rewrite run scalars.
+    /// An unknown or archived run writes nothing and returns `Ok(())`.
     async fn set_push_state(&self, run_id: RunId, state: PushState) -> Result<(), ControlError>;
     /// Latest live attempt's run for each plan id. Unknown plan ids are
     /// omitted; callers preserve their existing fallback semantics.
@@ -559,7 +561,9 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Check-run reporting inputs for one run: repository + head sha (from
     /// `run_submissions.submission_json`), and every job's id, display name,
-    /// status and check-run id. One indexed read — the per-job dispatch fan
+    /// status, check-run id and `placeholder` flag (an expandable node —
+    /// deferred-matrix parent / reusable caller — that never dispatches, so
+    /// intake loops skip it). One indexed read — the per-job dispatch fan
     /// -out and completion reporter must not load the run's working set.
     async fn run_dispatch_info(
         &self,
@@ -978,15 +982,16 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// for retry, queued messages dropped), requeues every claimed job it
     /// owned (by an unfinished attempt's recorded owner, by a doomed
     /// session's active request, or by an assignment naming it) back to the
-    /// ready queue as `queued`, and releases every assignment still naming it
-    /// (pool assignments on + job still ready → pool-pending at `now`).
-    /// Returns `true` when a purge ran; `IfPhantom` returns `false` without
-    /// writing when the runner is missing or owns a session.
+    /// ready queue as `queued` behind a fresh attempt, and releases every
+    /// assignment still naming it (pool assignments on + job still ready →
+    /// pool-pending at `now`). Returns the runtime identities of the retired
+    /// attempts when a purge ran; `None` without writing when the guard
+    /// refuses (`IfPhantom`: the runner is missing or owns a session).
     async fn purge_runner_guarded(
         &self,
         runner_id: i64,
         guard: PurgeGuard,
-    ) -> Result<bool, ControlError>;
+    ) -> Result<Option<Vec<uuid::Uuid>>, ControlError>;
 
     /// Ids of every registered ephemeral runner, ascending.
     async fn ephemeral_runner_ids(&self) -> Result<Vec<i64>, ControlError>;
@@ -1262,7 +1267,7 @@ impl Backend {
         }
     }
 
-    /// `#[cfg(test)]` working-set snapshot for pre-cutover assertions. Each
+    /// `#[cfg(test)]` working-set snapshot for test assertions. Each
     /// backend rebuilds the old field names from its own tables.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn test_working_set(
@@ -1369,9 +1374,19 @@ impl Backend {
         }
     }
 
+    /// Share the co-hosted runner pool's status handle. The backend reads
+    /// its advertised labels inside submit and promotion transactions to
+    /// fail a `runs-on` the pool can never satisfy.
+    pub(crate) fn set_pool_status(&self, status: preloop_observability::status::PoolStatus) {
+        match self {
+            Self::Sqlite(backend) => backend.set_pool_status(status),
+            Self::Postgres(backend) => backend.set_pool_status(status),
+        }
+    }
+
     /// Current scheduling config — the counterpart to [`Backend::set_config`]
     /// for callers that need to flip one flag without knowing the rest.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn config(&self) -> (bool, bool, std::time::Duration) {
         match self {
             Self::Sqlite(backend) => backend.config(),
@@ -1584,7 +1599,7 @@ impl ControlBackend for Backend {
             Self::Postgres(b) => b.delete_session(session_id).await,
         }
     }
-    async fn purge_runner(&self, runner_id: i64) -> Result<(), ControlError> {
+    async fn purge_runner(&self, runner_id: i64) -> Result<Vec<uuid::Uuid>, ControlError> {
         match self {
             Self::Sqlite(b) => b.purge_runner(runner_id).await,
             Self::Postgres(b) => b.purge_runner(runner_id).await,
@@ -2414,7 +2429,7 @@ impl ControlBackend for Backend {
         &self,
         runner_id: i64,
         guard: PurgeGuard,
-    ) -> Result<bool, ControlError> {
+    ) -> Result<Option<Vec<uuid::Uuid>>, ControlError> {
         match self {
             Self::Sqlite(b) => b.purge_runner_guarded(runner_id, guard).await,
             Self::Postgres(b) => b.purge_runner_guarded(runner_id, guard).await,

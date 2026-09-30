@@ -8,7 +8,10 @@
 
 use super::codec::{self, ts, us};
 use super::{PgBackend, db};
-use crate::control::types::{ControlError, MAX_TIMELINE_RECORDS, StepPatch, step_report};
+use crate::control::types::{
+    ControlError, MAX_TIMELINE_RECORDS, StepPatch, step_report, timeline_record_bytes,
+};
+use crate::memory_caps::MAX_TIMELINE_BYTES_PER_TIMELINE;
 use crate::models::{StepKind, StepRecord};
 use preloop_gha_protocol::RunId;
 use preloop_gha_protocol::azdo::TimelineRecord;
@@ -168,6 +171,41 @@ impl PgBackend {
                 .await
                 .map_err(db)?;
             }
+        }
+        let rows = tx
+            .query(
+                "SELECT record_id::text, change_id, record::text \
+                 FROM timeline_records WHERE timeline_id = $1::text::uuid \
+                 ORDER BY record_id",
+                &[&timeline],
+            )
+            .await
+            .map_err(db)?;
+        let mut sized = Vec::with_capacity(rows.len());
+        for row in rows {
+            let record: TimelineRecord =
+                serde_json::from_str(row.get(2)).map_err(ControlError::backend)?;
+            sized.push((
+                row.get::<_, String>(0),
+                row.get::<_, i32>(1),
+                timeline_record_bytes(&record),
+            ));
+        }
+        let mut total_bytes: usize = sized.iter().map(|(_, _, size)| *size).sum();
+        while total_bytes > MAX_TIMELINE_BYTES_PER_TIMELINE && sized.len() > 1 {
+            let index = sized
+                .iter()
+                .position(|(_, row_change, _)| *row_change != change_id)
+                .unwrap_or(0);
+            let (record_id, _, size) = sized.remove(index);
+            tx.execute(
+                "DELETE FROM timeline_records WHERE timeline_id = $1::text::uuid \
+                 AND record_id = $2::text::uuid",
+                &[&timeline, &record_id],
+            )
+            .await
+            .map_err(db)?;
+            total_bytes = total_bytes.saturating_sub(size);
         }
         let stored = tx
             .query(

@@ -37,7 +37,7 @@ fn release_blob_lock(kind: &str, token: &str, arc: Arc<Mutex<()>>) {
 //
 
 /// Blob kinds the `/twirp-blob/:kind/:token` route serves. Anything else is
-/// rejected before touching the filesystem (R1-2).
+/// rejected before touching the filesystem.
 pub const BLOB_KINDS: &[&str] = &["cache", "artifact", "diag"];
 
 /// Validate an already-decoded blob token: non-empty, restricted charset, no
@@ -198,7 +198,7 @@ pub async fn blob_put(
         warn!(kind, "rejected blob PUT with malformed jti");
         return StatusCode::BAD_REQUEST;
     };
-    // R1-10: if a bearer is present and verifies as a job identity, require
+    // If a bearer is present and verifies as a job identity, require
     // the job to be live. Bearerless PUTs (Azure SDK compat) cannot be
     // attributed; their liveness is enforced at URL-mint time.
     if let Some(bearer) = crate::auth::bearer_from_headers(&headers)
@@ -248,7 +248,7 @@ pub async fn blob_put(
                 warn!(kind, "failed to create blocks dir: {e}");
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
-            // F5: stream the block straight to a temp file, enforcing the
+            // Stream the block straight to a temp file, enforcing the
             // per-block cap mid-stream — a staged block is never buffered
             // whole in memory, so the cap (raised for the cache SDK's
             // 64 MiB blocks, issue #292) cannot exhaust server RAM. Commit
@@ -302,7 +302,7 @@ pub async fn blob_put(
             let blocks_dir = blob_root.join("blocks");
             let data_path = blob_root.join("data");
 
-            // F5: fail fast on the total assembly budget before reading any
+            // Fail fast on the total assembly budget before reading any
             // block, so a blocklist referencing > 512 MiB never starts
             // assembling (or materializes the destination).
             let mut total: u64 = 0;
@@ -371,7 +371,7 @@ pub async fn blob_put(
             status
         }
         _ => {
-            // F5: stream the single-shot body straight to a temp file, never
+            // Stream the single-shot body straight to a temp file, never
             // buffering the whole (up to 512 MiB) blob in memory, then
             // atomically rename it into place. A body past the assembly budget
             // is rejected mid-stream before it can fill the disk either.

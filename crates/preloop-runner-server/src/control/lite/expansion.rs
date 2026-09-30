@@ -67,10 +67,18 @@ fn expansion_plan(record: &crate::models::RunRecord, job: &QueuedJob) -> Option<
         })));
     }
     let expression = job.deferred_matrix.clone()?;
-    let workflow_file = record
-        .caller_plans
-        .get(&job.job_id)
-        .and_then(|plan| plan.workflow_file.clone());
+    // A node materialized inside a reusable callee carries its own plan (the
+    // expansion pass stores it alongside the node), whose `inputs` are the
+    // caller's `with` values the callee subtree was expanded with. A node
+    // that was never stored (a top-level node from the initial submit, which
+    // only stores reusable callers) falls back to the dispatch inputs the
+    // submit path stamped on every plan: the fan-out cells inherit the
+    // node's own `inputs` context, not the root dispatch map.
+    let stored_plan = record.caller_plans.get(&job.job_id);
+    let workflow_file = stored_plan.and_then(|plan| plan.workflow_file.clone());
+    let scoped_inputs = stored_plan
+        .map(|plan| plan.inputs.clone())
+        .unwrap_or_else(|| ctx.submission.dispatch_inputs.clone());
     Some(ExpansionPlan::Matrix(Box::new(MatrixExpansionInputs {
         ctx,
         node_id: job.job_id.clone(),
@@ -78,6 +86,7 @@ fn expansion_plan(record: &crate::models::RunRecord, job: &QueuedJob) -> Option<
         expression,
         needs_outputs,
         workflow_file,
+        scoped_inputs,
     })))
 }
 

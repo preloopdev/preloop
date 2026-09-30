@@ -243,7 +243,7 @@ pub struct GitHubAppCredentials {
     /// Every installation token this App has minted, keyed by token hash.
     /// The GitHub-compatible dispatch API consults it to validate a token
     /// offline — without a github.com round-trip — when github.com is
-    /// unreachable (D2.4).
+    /// unreachable.
     pub mint_ledger: Arc<MintLedger>,
     /// Webhook secret for `X-Hub-Signature-256` verification, when this App
     /// has its own (the legacy single-App secret lives in
@@ -296,7 +296,7 @@ impl GitHubApps {
     }
 
     /// Every registered webhook secret paired with the signer it belongs
-    /// to (M3). Each App's secret maps to that App; the legacy
+    /// to. Each App's secret maps to that App; the legacy
     /// `AppState::webhook_secret` (if set) maps to [`WebhookSigner::Legacy`].
     /// Deduplicated: a secret equal to the legacy secret is attributed to
     /// the legacy signer, since it is not uniquely the App's.
@@ -320,8 +320,8 @@ impl GitHubApps {
     }
 }
 
-/// Identity of the credential that verified a webhook payload's signature
-/// (M3). The signature alone only proves *some* registered credential sent
+/// Identity of the credential that verified a webhook payload's signature.
+/// The signature alone only proves *some* registered credential sent
 /// the payload; the signer binds the claimed repository to the sender's
 /// installation coverage before any event is processed.
 ///
@@ -647,7 +647,7 @@ pub async fn candidate_apps_for_repo(
     candidates
 }
 
-/// Whether `app`'s installation covers the exact `repository` (M3).
+/// Whether `app`'s installation covers the exact `repository`.
 ///
 /// `GET /repos/{owner}/{repo}/installation` authenticated with the App's JWT
 /// returns the installation of *that App* on *that repository*, or 404 when
@@ -683,7 +683,7 @@ pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str)
     {
         Ok(response) => response,
         Err(error) => {
-            warn!(app_id = %app.app_id, repository = %repository, ?error, "M3: repository installation lookup failed");
+            warn!(app_id = %app.app_id, repository = %repository, ?error, "repository installation lookup failed");
             return false;
         }
     };
@@ -691,13 +691,13 @@ pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str)
         return false;
     }
     if !response.status().is_success() {
-        warn!(app_id = %app.app_id, repository = %repository, status = %response.status(), "M3: repository installation lookup returned unexpected status");
+        warn!(app_id = %app.app_id, repository = %repository, status = %response.status(), "repository installation lookup returned unexpected status");
         return false;
     }
     let body: serde_json::Value = match response.json().await {
         Ok(body) => body,
         Err(error) => {
-            warn!(app_id = %app.app_id, repository = %repository, ?error, "M3: cannot parse repository installation response");
+            warn!(app_id = %app.app_id, repository = %repository, ?error, "cannot parse repository installation response");
             return false;
         }
     };
@@ -709,12 +709,12 @@ pub async fn app_covers_repository(app: &GitHubAppCredentials, repository: &str)
         .map(|id| id.to_string() == app.app_id)
         .unwrap_or(false);
     if !covers {
-        warn!(app_id = %app.app_id, repository = %repository, "M3: repository installation belongs to a different App");
+        warn!(app_id = %app.app_id, repository = %repository, "repository installation belongs to a different App");
     }
     covers
 }
 
-/// Select the App whose installation covers `repository`'s owner (D6).
+/// Select the App whose installation covers `repository`'s owner.
 ///
 /// Installation discovery is cached per App, so steady state is one cached
 /// lookup per App. For single-App setups, the single configured App is

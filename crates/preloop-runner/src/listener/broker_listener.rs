@@ -123,8 +123,8 @@ async fn force_fail_job(http: &HttpClient, job: &RunningJob, conclusion: &str) {
 /// Ask the worker to cancel the running job and wrap up, waiting up to the
 /// official 60s grace; if the worker fails or ignores the message, force-fail
 /// the job request so the run concludes instead of dangling until the lease
-/// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths
-/// (CR-2 F-1); mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
+/// reaper. Shared by the OS-signal and RunnerShutdown-broker-message paths.
+/// Mirrors the official `RunnerShutdown`/`OperatingSystemShutdown`
 /// handling in `JobDispatcher`.
 async fn shutdown_job_gracefully(http: &HttpClient, job: &mut RunningJob) {
     match job
@@ -240,7 +240,7 @@ pub async fn run_broker_loop(
     let result = async {
     loop {
         // Proactive OAuth token refresh — renew 5 minutes before expiry so the
-        // next poll cycle always uses a live token (RLIS-02).
+        // next poll cycle always uses a live token.
         if let Some(exp) = token_expires_at
             && std::time::Instant::now() >= exp {
                 info!("OAuth token expiring soon, proactively refreshing...");
@@ -651,7 +651,7 @@ pub async fn run_broker_loop(
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("unspecified");
                                 info!(%reason, "Service requested runner shutdown");
-                                // CR-2 F-1: this is the broker equivalent of
+                                // This is the broker equivalent of
                                 // the OS shutdown path — ask the worker to
                                 // cancel the running job and wrap up so the
                                 // run concludes instead of dangling until the
