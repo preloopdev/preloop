@@ -1257,7 +1257,7 @@ impl Backend {
 
     /// `#[cfg(test)]` working-set snapshot for pre-cutover assertions. Each
     /// backend rebuilds the old field names from its own tables.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn test_working_set(
         &self,
     ) -> Result<super::testview::TestState, ControlError> {

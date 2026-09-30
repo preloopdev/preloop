@@ -2247,6 +2247,80 @@ async fn stored_secrets_are_injected_into_native_submissions() {
     assert_eq!(secret_var.is_secret, Some(true));
 }
 
+/// Job-level `env: ${{ secrets.NAME }}` ships as an expression token in the
+/// stored template (values are absent by design). fill_template must resolve
+/// it into a literal on `environmentVariables` — the surface the runner
+/// materializes into the step environment — since the runner has no secrets
+/// context to evaluate the token itself.
+#[tokio::test]
+async fn job_level_env_secret_is_filled_into_environment_variables() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    state
+        .secrets
+        .write()
+        .global
+        .insert("E2E_ENV_SECRET".to_owned(), "env-stored-value".to_owned());
+    let app = app(state.clone(), CancellationToken::new());
+    let (runner_id, runner_token) =
+        register_runner_with_token(&app, "env-secret-runner", &["self-hosted"], None).await;
+
+    request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    env:\n      X: ${{ secrets.E2E_ENV_SECRET }}\n    steps:\n      - run: echo $X\n",
+            "event": "push",
+            "repository": "owner/repo",
+        }),
+    )
+    .await;
+
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let job_ref = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = body["runner_request_id"].as_str().unwrap();
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/broker/{runner_id}/acquirejob"),
+        json!({"jobMessageId": runner_request_id, "billingOwnerId": "local", "runnerOS": "Linux"}),
+        &runner_token,
+    )
+    .await;
+
+    let value = acquired["environmentVariables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["map"].as_array()?.first())
+        .find(|pair| pair["Key"]["lit"].as_str() == Some("X"))
+        .map(|pair| pair["Value"].clone())
+        .expect("X must reach the filled environmentVariables");
+    assert_eq!(
+        value["lit"].as_str(),
+        Some("env-stored-value"),
+        "the fill resolves secrets.* env tokens to literals: {value}"
+    );
+}
+
 /// Extract the queued job message for a run, wherever it currently sits.
 
 /// `preloop setup github --via pat` stores the credential as `github.pat` and

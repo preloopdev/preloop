@@ -1673,10 +1673,10 @@ jobs:
     }
 
     #[test]
-    fn job_env_secret_expression_carries_real_value() {
-        // Regression test for the issue where `${{ secrets.NAME }}` in
-        // job-level `env:` resolved to the log placeholder `***` instead of
-        // the secret value, so the step environment literally held `***`.
+    fn job_env_secret_expression_survives_as_token() {
+        // `${{ secrets.NAME }}` in job-level `env:` must neither resolve to
+        // the log placeholder `***` nor to a stored literal: the wire keeps
+        // the expression token and fill_template resolves it at acquire.
         let yaml = r#"
 on: workflow_dispatch
 jobs:
@@ -1698,32 +1698,28 @@ jobs:
         let github = serde_json::json!({"event_name": "workflow_dispatch"});
         let msg = build_agent_job_message(&plans[0], &github, &secrets, &BTreeMap::new()).unwrap();
 
-        let x = msg.variables.get("X").expect("job env variable X");
-        assert_eq!(x.value.as_deref(), Some("dummy-value-of-twenty-six"));
-
-        // The wire field the runner materializes into the step environment
-        // must carry the real value too, not the placeholder.
-        let wire_values: Vec<String> = msg
+        // The stored message is a secret-free template: `env:` values
+        // referencing `secrets.*` must reach the wire as *expression* tokens
+        // (the runner never sees a literal or `***`); fill_template resolves
+        // them at acquire against the SecretProvider.
+        let x = msg
             .environment_variables
             .iter()
-            .filter_map(|token| {
-                token
-                    .get("map")?
-                    .as_array()?
-                    .first()?
-                    .get("Value")?
-                    .get("lit")?
-                    .as_str()
-                    .map(str::to_owned)
+            .find_map(|entry| {
+                let pair = entry.get("map")?.as_array()?.first()?;
+                (pair.get("Key")?.get("lit")?.as_str()? == "X").then(|| pair["Value"].clone())
             })
-            .collect();
-        assert!(
-            wire_values.contains(&"dummy-value-of-twenty-six".to_owned()),
-            "environment_variables wire values: {wire_values:?}"
+            .expect("job env variable X on the wire");
+        assert_eq!(
+            x["type"],
+            serde_json::json!(3),
+            "expected an expression token: {x}"
         );
+        assert_eq!(x["expr"], "secrets.PROBE_SECRET");
+        let wire_text = serde_json::to_string(&msg.environment_variables).unwrap();
         assert!(
-            !wire_values.iter().any(|v| v == "***"),
-            "placeholder leaked into environment_variables: {wire_values:?}"
+            !wire_text.contains("***"),
+            "placeholder leaked into environment_variables: {wire_text}"
         );
     }
 

@@ -27,7 +27,7 @@ mod reaper;
 mod runners;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod testview;
 mod timelines;
 mod trait_impl;

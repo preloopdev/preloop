@@ -30,9 +30,9 @@ mod runners;
 mod settle;
 mod steps;
 mod submit;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod testview;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use testview::TestDb;
 #[cfg(test)]
 mod tests;

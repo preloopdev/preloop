@@ -158,6 +158,59 @@ pub(crate) fn fill_template(
         }
     }
 
+    // `env:` values referencing `secrets.*` ship as expression tokens: the
+    // builder cannot resolve them (values are absent by design) and the
+    // runner has no secrets context at run time, so the fill evaluates them
+    // here and stamps the literal — the same resolution point as `spec.map`.
+    if !resolved.is_empty() {
+        let ctx = env_expr_ctx(msg, &resolved);
+        for entry in &mut msg.environment_variables {
+            let Some(pair) = entry
+                .get_mut("map")
+                .and_then(|map| map.as_array_mut())
+                .and_then(|map| map.first_mut())
+            else {
+                continue;
+            };
+            let Some(value_token) = pair.get_mut("Value") else {
+                continue;
+            };
+            let rewritten: Option<String> = match value_token.get("type").and_then(|t| t.as_u64()) {
+                Some(3) => value_token
+                    .get("expr")
+                    .and_then(|expr| expr.as_str())
+                    .filter(|expr| expr.contains("secrets."))
+                    .map(|expr| resolve_token_expr(expr, &ctx)),
+                Some(1) => value_token
+                    .get("exprs")
+                    .and_then(|exprs| exprs.as_array())
+                    .filter(|exprs| {
+                        exprs
+                            .iter()
+                            .filter_map(|e| e.as_str())
+                            .any(|e| e.contains("secrets."))
+                    })
+                    .map(|exprs| {
+                        let template = value_token
+                            .get("fmt")
+                            .and_then(|fmt| fmt.as_str())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let mut out = template;
+                        for (index, expr) in exprs.iter().enumerate() {
+                            let value = resolve_token_expr(expr.as_str().unwrap_or_default(), &ctx);
+                            out = out.replace(&format!("{{{index}}}"), &value);
+                        }
+                        out
+                    }),
+                _ => None,
+            };
+            if let Some(literal) = rewritten {
+                *value_token = serde_json::json!({"type": 0, "lit": literal});
+            }
+        }
+    }
+
     // Stamp variables + rebuild the value-derived mask hints in the exact
     // slot the strip removed them from (end of the hint list, matching the
     // builder's append order).
@@ -181,4 +234,34 @@ pub(crate) fn fill_template(
         names: resolved.keys().cloned().collect(),
         values: resolved,
     })
+}
+
+/// Expression context for resolving `secrets.*` (and `github.*`/`vars.*`
+/// helpers) inside `environment_variables` tokens at fill time: stored
+/// `context_data` plus the freshly resolved real secret values.
+fn env_expr_ctx(
+    msg: &AgentJobRequestMessage,
+    resolved: &BTreeMap<String, String>,
+) -> preloop_gha_expressions::Context {
+    let mut ctx = preloop_gha_expressions::Context::new();
+    for (key, value) in &msg.context_data {
+        ctx.insert(key.clone(), value.to_json());
+    }
+    ctx.insert(
+        "secrets",
+        serde_json::Value::Object(
+            resolved
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        ),
+    );
+    ctx
+}
+
+/// Evaluate one bare expression body (`secrets.X`, `format(...)`, …) as a
+/// `${{ }}` source; an evaluation failure coalesces to "" rather than
+/// shipping the template raw.
+fn resolve_token_expr(expr: &str, ctx: &preloop_gha_expressions::Context) -> String {
+    preloop_gha_parser::eval::resolve_string(&format!("${{{{ {expr} }}}}"), ctx).unwrap_or_default()
 }
