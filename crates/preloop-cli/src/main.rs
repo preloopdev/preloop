@@ -141,7 +141,9 @@ run_ci_or_resume() {
   else
     log_range="${remote_sha}..$local_sha"
   fi
-  if git log --format=%B "$log_range" 2>/dev/null | grep -qi '\[skip *ci\]'; then
+  # No pipe to grep -q here: under pipefail, grep's early exit SIGPIPEs
+  # git log, the pipeline reports 141, and the bypass never fires.
+  if grep -qi '\[skip *ci\]' <<< "$(git log --format=%B "$log_range" 2>/dev/null)"; then
     echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
     return 0
   fi
