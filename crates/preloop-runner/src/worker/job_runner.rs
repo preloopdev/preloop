@@ -1225,6 +1225,13 @@ async fn build_debug_pause_client(
             .get("preloopSnapshotCommit")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
+    )
+    .with_snapshot_url(
+        job_message
+            .get("preloopSnapshotOriginRewrite")
+            .and_then(|rewrite| rewrite.get("snapshotUrl"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
     ))
 }
 

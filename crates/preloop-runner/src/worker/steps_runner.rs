@@ -1112,6 +1112,7 @@ pub async fn run_steps(
                                     }
                                 }
                             }
+
                         }
                         step_ctx.log(&format!(
                             "##[group]Retry attempt {} — {}",
@@ -1132,6 +1133,17 @@ pub async fn run_steps(
                         {
                             client.refresh_snapshot_tokens(std::slice::from_mut(step), token);
                             pending_snapshot_token = Some(token.to_owned());
+                        }
+                        // The origin-rewrite `http.<snapshot>.extraheader`
+                        // baked into job.env at start expires on the same
+                        // clock; swap in the verdict's fresh header so a
+                        // replayed `git fetch` (this step or a jumped
+                        // range) authenticates.
+                        if let Some(header) = decision
+                            .as_ref()
+                            .and_then(|d| d.snapshot_auth_header.as_deref())
+                        {
+                            client.refresh_snapshot_auth_header(&mut step_ctx.job.env, header);
                         }
 
                         match target {

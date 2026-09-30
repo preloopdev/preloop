@@ -353,6 +353,15 @@ pub struct VerdictResponse {
     /// only to steps the message marks as pinned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_token: Option<String>,
+    /// Fresh snapshot origin-rewrite auth header for retry verdicts.
+    ///
+    /// The `preloopSnapshotOriginRewrite` `authHeader` pinned at submission
+    /// expires on the same clock as the checkout token above; the runner
+    /// baked it into `GIT_CONFIG_*` env at job start, so a replayed `git
+    /// fetch` would hit the snapshot with a dead credential. Minted together
+    /// with `snapshot_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_auth_header: Option<String>,
     /// Session version at the time of the response.
     pub version: u64,
     /// Revert policy the controller chose.
