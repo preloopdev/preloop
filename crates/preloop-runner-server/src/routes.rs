@@ -828,6 +828,26 @@ pub fn build_app(
             "/snapshots/:run_id/*path",
             get(snapshot_git_http).post(snapshot_git_http),
         )
+        // Anonymous forge relay for checkouts the snapshot cannot serve
+        // (deep history, cross-repo): git smart-HTTP + the single
+        // `/api/v3/repos/{o}/{r}` lookup checkout issues for the default
+        // branch. Handlers authenticate the pinned job runtime token.
+        .route(
+            "/:org/:repo/info/refs",
+            get(crate::snapshots::forge_git_http),
+        )
+        .route(
+            "/:org/:repo/git-upload-pack",
+            post(crate::snapshots::forge_git_http),
+        )
+        .route(
+            "/:org/:repo/info/lfs/objects/batch",
+            post(crate::snapshots::forge_git_http),
+        )
+        .route(
+            "/api/v3/repos/:owner/:repo",
+            get(crate::snapshots::forge_api_repo),
+        )
         .route(
             "/api/v1/runners",
             post(register_runner_native)

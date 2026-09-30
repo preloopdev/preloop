@@ -1686,6 +1686,87 @@ pub fn runner_account_script(user: &str, uid: u32) -> String {
     )
 }
 
+/// Guest script that hands the runner account ownership of every path a job
+/// writes, without touching the image's privilege policy.
+///
+/// Ownership only, deliberately: account creation, the `/etc/sudoers.d` rule,
+/// and docker-group membership stay in [`runner_account_script`], which the
+/// curated bake runs as part of building an image. Installing that policy on
+/// an image which never had it would hand blanket root — and the container
+/// daemon — to whatever a fork executes.
+///
+/// The script first decides whether anything is actually wrong (`needs`), so
+/// an already-correct machine pays exactly one exec round trip. Only when work
+/// is needed does it escalate — directly when the exec landed on root, else
+/// through passwordless sudo — and an escalation that cannot run is reported
+/// as a failure rather than masked: a machine whose `RUSTUP_HOME` resolves to
+/// an unusable directory fails every rustup step at job time.
+pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
+    let home = format!("/home/{user}");
+    // The image's own toolchain homes. Official runner images install Rust
+    // under the runner's `$HOME` (`~/.rustup` with `settings.toml`, `~/.cargo`
+    // with the rustup shims) while preloop's contract exports
+    // `RUSTUP_HOME=/usr/local/rustup` to every user — rustup obeys that
+    // verbatim, so an image without those paths leaves `cargo` unable to
+    // resolve a toolchain at all: the shim reads an empty home and dies with
+    // `could not create home directory` (as the runner user) or `could not
+    // choose a version of cargo to run`. Point the contract at the image's
+    // home instead of refusing, which is what GitHub-hosted runners
+    // effectively have: one toolchain every user resolves identically.
+    let adopt_homes = format!(
+        "if [ ! -f /usr/local/rustup/settings.toml ] && [ -f {home}/.rustup/settings.toml ]; then \
+           rm -rf /usr/local/rustup; \
+           ln -s {home}/.rustup /usr/local/rustup; \
+         fi; \
+         if [ ! -d /usr/local/cargo/bin ] && [ -d {home}/.cargo/bin ]; then \
+           rm -rf /usr/local/cargo; \
+           ln -s {home}/.cargo /usr/local/cargo; \
+         fi"
+    );
+    // The privileged half, applied only after `needs=1`. `set -e` makes every
+    // required operation fail the script: this is the ownership jobs depend
+    // on, so a partial apply must not report success.
+    let apply = format!(
+        "set -e; \
+         {adopt_homes}; \
+         for d in /usr/local/rustup /usr/local/cargo; do \
+           if [ -e \"$d\" ]; then chown -R {uid}:{uid} \"$d\"; fi; \
+         done; \
+         if [ -d /opt/hostedtoolcache ]; then \
+           [ \"$(stat -c %a /opt/hostedtoolcache)\" = \"777\" ] || chmod -R 777 /opt/hostedtoolcache; \
+         fi; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment || \
+           printf 'AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\\nRUNNER_TOOL_CACHE=/opt/hostedtoolcache\\n' >> /etc/environment; \
+         mkdir -p /run/user/{uid}; \
+         chown {uid}:{uid} /run/user/{uid}"
+    );
+    use base64::Engine as _;
+    let apply_b64 = base64::engine::general_purpose::STANDARD.encode(&apply);
+    // Same predicate as `adopt_homes`, expressed as a `needs` signal so the
+    // fast path does not skip a machine that still needs the link.
+    let adopt_needs = format!(
+        "if [ ! -f /usr/local/rustup/settings.toml ] && [ -f {home}/.rustup/settings.toml ]; then needs=1; fi; \
+         if [ ! -d /usr/local/cargo/bin ] && [ -d {home}/.cargo/bin ]; then needs=1; fi"
+    );
+    format!(
+        "needs=0; \
+         {adopt_needs}; \
+         for d in /usr/local/rustup /usr/local/cargo; do \
+           if [ -e \"$d\" ]; then \
+             if [ \"$(stat -L -c %u \"$d\" 2>/dev/null)\" != \"{uid}\" ]; then needs=1; \
+             elif find \"$d/.\" ! -uid {uid} -print -quit 2>/dev/null | grep -q .; then needs=1; fi; \
+           fi; \
+         done; \
+         if [ -d /opt/hostedtoolcache ]; then \
+           [ \"$(stat -c %a /opt/hostedtoolcache 2>/dev/null)\" = \"777\" ] || needs=1; \
+         fi; \
+         grep -q AGENT_TOOLSDIRECTORY /etc/environment 2>/dev/null || needs=1; \
+         if [ \"$needs\" = \"0\" ]; then echo 'runner ownership already reconciled'; exit 0; fi; \
+         if [ \"$(id -u)\" -eq 0 ]; then printf %s '{apply_b64}' | base64 -d | sh; \
+         else printf %s '{apply_b64}' | base64 -d | sudo -n sh; fi"
+    )
+}
+
 /// The guest bootstrap script, one shell round trip.
 ///
 /// Every `exec` is a host process spawn plus a vsock round trip, and this runs
@@ -3555,10 +3636,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
                     .unwrap_or("unknown")
             )));
         }
-        // `base_install_script` already prepared the default account, and that
-        // fragment is fingerprinted. Re-run it here only for a configured
-        // non-default user, whose identity the fingerprint cannot know: the
-        // script is idempotent, so the default case is a cheap no-op skip.
+        // `base_install_script` already prepared the default account for
+        // curated bases, and provisioning reconciles it again before configure
+        // (custom bases get the fix there for the first time). Re-run it here
+        // only for a configured non-default user, whose identity the
+        // fingerprint cannot know: the script is idempotent either way.
         let runner_user = self
             .config
             .runner_user
@@ -5645,6 +5727,39 @@ async fn provision_runner<P: VmProvider + 'static>(
         }
     }
 
+    // Reconcile ownership of the paths a job writes on every machine, whatever
+    // its provenance: curated stock bases, custom/official images, and forked
+    // goldens alike. `base_install_script` runs the full account script only
+    // inside the curated bake, so custom bases reached jobs with root-owned
+    // `/usr/local/rustup`, `/usr/local/cargo`, and `/opt/hostedtoolcache` — and
+    // any step that writes them (`rustup component add`, `cargo fmt`, toolcache
+    // drops) died with EACCES. This is the ownership half only: privilege
+    // policy stays where it was baked. One exec round trip, and the script
+    // itself no-ops when the machine is already correct.
+    {
+        let runner_user = config.runner_user.as_deref().unwrap_or(DEFAULT_RUNNER_USER);
+        let runner_uid = config.runner_uid.unwrap_or(DEFAULT_RUNNER_UID);
+        let reconcile = runner_ownership_reconcile_script(runner_user, runner_uid);
+        let output = provider
+            .exec(name, &["sh".to_owned(), "-c".to_owned(), reconcile])
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OrchestratorError::Config(format!(
+                "runner-ownership reconciliation failed on {} (exit {}): {} — \
+                 /usr/local/rustup, /usr/local/cargo, and /opt/hostedtoolcache must be \
+                 writable by uid {}; the engine could not escalate (image user is not \
+                 root and passwordless sudo is unavailable)",
+                name.as_str(),
+                output.exit_code,
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("unknown"),
+                runner_uid
+            )));
+        }
+    }
+
     let runner = format!("/opt/preloop/bin/{}", config.runner_binary_name);
     let mut labels = config.labels.clone();
     for label in runner_environment_labels(&environment.base) {
@@ -6876,6 +6991,73 @@ chmod +x "$dest/bin/node"
         assert!(env.contains(&"PRELOOP_CONTROL_ORIGIN=http://127.0.0.1:9090".to_owned()));
         assert!(env.contains(&"PRELOOP_CONTROL_UPSTREAM=http://10.0.0.161:9090".to_owned()));
         assert!(!env.iter().any(|v| v.starts_with("PRELOOP_CONTROL_SOCKET")));
+    }
+
+    /// The always-run ownership reconciliation must not install privilege
+    /// policy — the security review's P1: custom/official images that never
+    /// had blanket sudo must not gain it just because a job runs there — and
+    /// it must not mask failures the way the account script's `|| true` tail
+    /// does.
+    #[test]
+    fn ownership_reconcile_script_keeps_privilege_policy_out() {
+        let script = runner_ownership_reconcile_script(DEFAULT_RUNNER_USER, 1001);
+        assert!(!script.contains("NOPASSWD"), "{script}");
+        assert!(!script.contains("usermod"), "{script}");
+        assert!(!script.contains("sudoers"), "{script}");
+        assert!(!script.contains("docker"), "{script}");
+        assert!(
+            script.contains("needs=0"),
+            "an already-correct machine must skip the privileged half: {script}"
+        );
+        assert!(
+            script.contains("sudo -n sh"),
+            "a machine that needs changes must escalate: {script}"
+        );
+        assert!(
+            !script.contains("|| true"),
+            "escalation and chown failures must stay observable: {script}"
+        );
+        // Official runner images ship rustup under the runner's $HOME while
+        // the exported contract points at /usr/local; without adopting it,
+        // every `cargo`/`rustup` invocation resolves an empty home. The apply
+        // half travels base64-encoded, so assert on the decoded text.
+        let decoded = script
+            .split("| base64 -d")
+            .filter_map(|part| {
+                let close = part.rfind('\'')?;
+                let open = part[..close].rfind('\'')?;
+                Some(part[open + 1..close].to_owned())
+            })
+            .filter_map(|blob| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(blob)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            decoded.contains("ln -s /home/runner/.rustup /usr/local/rustup"),
+            "the image's rustup home must be adopted: {decoded}"
+        );
+        assert!(
+            decoded.contains("ln -s /home/runner/.cargo /usr/local/cargo"),
+            "the image's cargo home must be adopted: {decoded}"
+        );
+        assert!(
+            script.contains("/home/runner/.rustup/settings.toml"),
+            "adoption must be gated on a usable rustup home: {script}"
+        );
+        // A runner-owned root with root-owned descendants passes a top-level
+        // `stat` and then skips the recursive chown; the probe must descend.
+        assert!(
+            script.contains("find \"$d/.\" ! -uid 1001 -print -quit"),
+            "the ownership probe must be recursive: {script}"
+        );
+        assert!(
+            script.contains("stat -L -c %u"),
+            "the probe must dereference an adopted symlink home: {script}"
+        );
     }
 
     #[test]

@@ -275,18 +275,14 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         ),
         ("GITHUB_ACTION", str_from_json(&github, "action")),
         ("GITHUB_TOKEN", {
-            let token = str_from_json(&github, "token");
-            if token.is_empty() {
-                // Fall back to variables.system.github.token
-                msg.get("variables")
-                    .and_then(|v| v.get("system.github.token"))
-                    .and_then(|v| v.get("value"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                token
-            }
+            // `github.token` only — never `variables.system.github.token`.
+            // That variable is the engine's job-scoped runtime JWT; exporting
+            // it sent a dead credential to api.github.com ("Bad credentials")
+            // on every job without an App/PAT. An empty GITHUB_TOKEN is the
+            // honest value: API clients go anonymous, and checkouts whose
+            // `token:` input defaults to `${{ github.token }}` fetch through
+            // the engine's forge relay.
+            str_from_json(&github, "token")
         }),
         // Runner variables — P1.12: runner name from .runner settings, not job name
         ("RUNNER_NAME", {

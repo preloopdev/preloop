@@ -246,6 +246,111 @@ pub async fn run_node_action(
         }
     }
 
+    // The host-side bundled-Node probe and its system-Node fallback live
+    // *after* the container branch below: a container job runs Node inside
+    // the container, and a probe against the runner's own filesystem must not
+    // decide whether that path can run.
+
+    // Set GITHUB_ACTION_PATH
+    env.insert(
+        "GITHUB_ACTION_PATH".to_string(),
+        action_dir.to_string_lossy().to_string(),
+    );
+
+    // A job container runs every step inside it — the official runner execs
+    // node actions through `docker exec` too, using the externals mounted at
+    // `/__e`. Running the host binary against container paths fails two ways:
+    // the action cannot see its inputs at their advertised locations, and the
+    // host-side externals probe reports `bundled nodeXX is missing` whenever
+    // the runner process cannot read the mount source, killing the job before
+    // the container ever gets a chance. The container path runs first.
+    let job_container_id = ctx
+        .job
+        .container_state
+        .as_ref()
+        .and_then(|state| state.job_container_id.clone());
+    if let Some(container_id) = job_container_id {
+        let host_work = Path::new(workspace)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // `/__e` is the read-only externals mount, sourced from
+        // `{runner_work}/../externals` (steps_runner.rs) — and `host_work` is
+        // that same runner work root, so this is exactly the path docker
+        // mounts. The probe is *advisory*: `is_file()` cannot distinguish an
+        // EACCES'd directory from an absent one, and the container (which the
+        // daemon mounts as root) may see the runtime regardless. Log and let
+        // docker exec produce the real error instead of failing here.
+        let mounted_node = Path::new(&host_work)
+            .join("..")
+            .join("externals")
+            .join(node_version)
+            .join("bin")
+            .join("node");
+        if !mounted_node.is_file() {
+            tracing::warn!(
+                path = %mounted_node.display(),
+                "container externals probe cannot see the bundled Node; trying docker exec anyway"
+            );
+        }
+        let container_node = format!("/__e/{node_version}/bin/node");
+        for key in [
+            "GITHUB_WORKSPACE",
+            "GITHUB_ENV",
+            "GITHUB_PATH",
+            "GITHUB_OUTPUT",
+            "GITHUB_STATE",
+            "GITHUB_STEP_SUMMARY",
+            "GITHUB_ARTIFACTS",
+            "GITHUB_ARTIFACTS_LIST",
+            "GITHUB_ACTION_PATH",
+            "RUNNER_TEMP",
+            "RUNNER_TOOL_CACHE",
+        ] {
+            if let Some(val) = env.get(key).cloned() {
+                env.insert(
+                    key.to_string(),
+                    crate::worker::container_ops::translate_to_container_path(&val, &host_work),
+                );
+            }
+        }
+        env.insert("HOME".to_string(), "/github/home".to_string());
+        let container_workdir =
+            crate::worker::container_ops::translate_to_container_path(workspace, &host_work);
+        let container_entry = crate::worker::container_ops::translate_to_container_path(
+            &entry_point.to_string_lossy(),
+            &host_work,
+        );
+        info!(
+            "Running node action in container {container_id}: {container_node} {container_entry}"
+        );
+        ctx.debug(&format!(
+            "Command line: docker exec -i {container_id} {container_node} [{container_entry}]"
+        ));
+        let ctx_ref = &mut *ctx;
+        let on_chunk = Box::new(move |chunk: &[u8]| {
+            ctx_ref.write_chunk(chunk);
+        });
+        let result = crate::worker::container_ops::docker_exec(
+            &container_id,
+            &container_node,
+            &[container_entry.as_str()],
+            &container_workdir,
+            &env,
+            Some(cancel_rx),
+            Some(on_chunk),
+        )
+        .await?;
+        if result.exit_code != 0 {
+            anyhow::bail!("node action exited with code {}", result.exit_code);
+        }
+        return Ok(());
+    }
+
+    // Not a container job: resolve the bundled Node on the runner's own
+    // filesystem. `runner_root_for_externals` walks up from the workspace to
+    // the runner root that carries `externals/`.
     let runner_root =
         runner_root_for_externals(Path::new(workspace), Path::new(LEGACY_BAKED_EXTERNALS_ROOT));
     let bundled_node = if cfg!(target_os = "windows") {
@@ -290,12 +395,6 @@ pub async fn run_node_action(
         info!("Bundled {node_version} not found, using system Node v{major} (--no-externals)");
         path.to_owned()
     };
-
-    // Set GITHUB_ACTION_PATH
-    env.insert(
-        "GITHUB_ACTION_PATH".to_string(),
-        action_dir.to_string_lossy().to_string(),
-    );
 
     info!("Running node action: {node_path} {}", entry_point.display());
     let ctx_ref = &mut *ctx;

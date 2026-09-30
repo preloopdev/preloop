@@ -258,6 +258,16 @@ impl ApiError {
             kind: ApiErrorKind::BadRequest,
         }
     }
+
+    /// A dependency is at capacity and the request was refused rather than
+    /// queued (the forge relay's concurrency bound).
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            kind: ApiErrorKind::BadRequest,
+        }
+    }
 }
 
 impl From<preloop_gha_parser::ParserError> for ApiError {

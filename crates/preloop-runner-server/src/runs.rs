@@ -2866,6 +2866,28 @@ pub fn build_job_artifacts(
         }
     }
 
+    // Checkouts the snapshot cannot serve (deep history, tags, cross-repo)
+    // fetch anonymously through the engine's forge relay when no GitHub
+    // credential exists — otherwise actions/checkout writes a bogus
+    // `x-access-token:` header and the fetch dies at github.com. With an App
+    // or an embeddable PAT the step keeps direct forge access.
+    let has_forge_credential = shared.state.github_app.is_some()
+        || matches!(github_token_override.as_ref(), Some(PatToken::Embed { .. }));
+    let rerouted = crate::snapshots::reroute_forge_checkouts(
+        &mut agent_msg,
+        base_url,
+        &runtime_token,
+        has_forge_credential,
+    );
+    if rerouted > 0 {
+        info!(
+            %run_id,
+            job = %job.id,
+            %rerouted,
+            "Rerouted non-snapshot checkouts through anonymous forge relay"
+        );
+    }
+
     // Fork-restricted jobs never receive an OIDC grant: no request URL is
     // emitted here (and the broker restates it only for granted jobs), and
     // the `oidctoken` endpoint refuses via `id_token_grants`.
@@ -2898,8 +2920,22 @@ pub fn build_job_artifacts(
         // builder wrote it) so consumers that parse it are not surprised; the
         // token's real authority goes in its own variable, which the runner
         // prints inside the same `GITHUB_TOKEN Permissions` group.
-        let (token, authority) = match pat {
-            PatToken::Embed { token, scopes } => (token, pat_scopes_wire_value(&scopes)),
+        let (token, authority) = match &pat {
+            PatToken::Embed { token, scopes } => {
+                // The github context predates PAT selection, so
+                // `${{ github.token }}` inputs (checkout's token, persist-
+                // credentials) resolve empty unless the PAT is patched in —
+                // same hole apply_minted_token_to_message fills for App mints.
+                if let Some(preloop_gha_protocol::azdo::PipelineContextData::Dict(github)) =
+                    agent_msg.context_data.get_mut("github")
+                {
+                    github.insert(
+                        "token".to_owned(),
+                        preloop_gha_protocol::azdo::PipelineContextData::String(token.clone()),
+                    );
+                }
+                (token.clone(), pat_scopes_wire_value(scopes))
+            }
             // H3: unverifiable authority means no PAT is embedded. The job
             // keeps the runtime token, which authenticates only against this
             // control plane, so a step that needs GitHub fails at the point of
@@ -2916,6 +2952,11 @@ pub fn build_job_artifacts(
         );
         token
     } else {
+        // No GitHub App and no PAT: `system.github.token` stays the
+        // job-scoped runtime JWT — engine endpoints (snapshots, forge relay,
+        // results) authenticate against it. It does NOT reach api.github.com:
+        // `${{ github.token }}` inputs resolve from the context (empty), and
+        // the runner no longer back-fills GITHUB_TOKEN from this variable.
         runtime_token.clone()
     };
     agent_msg.variables.insert(
