@@ -866,12 +866,12 @@ pub(crate) async fn update_agent(
         &headers,
         identity.as_ref().map(|axum::Extension(id)| id),
     )?;
-    if let crate::auth::AdminCaller::Runner(caller_runner_id) = caller {
-        if caller_runner_id != runner_id {
-            return Err(ApiError::forbidden(
-                "a runner may only update its own agent",
-            ));
-        }
+    if let crate::auth::AdminCaller::Runner(caller_runner_id) = caller
+        && caller_runner_id != runner_id
+    {
+        return Err(ApiError::forbidden(
+            "a runner may only update its own agent",
+        ));
     }
     let name = request
         .get("name")

@@ -2298,6 +2298,8 @@ async fn replay_flows_to_preloop_inner(
     let mut official_broker_job_ids = Vec::new();
     let mut preloop_broker_job_ids = Vec::new();
     let mut blob_upload_urls: VecDeque<String> = VecDeque::new();
+    // Agent id the golden flow's own `POST .../agents` registered.
+    let mut official_agent_id: Option<String> = None;
     for line in flows.lines().filter(|l| !l.trim().is_empty()) {
         let flow: Value = serde_json::from_str(line)?;
         let method = flow.get("method").and_then(Value::as_str).unwrap_or("GET");
@@ -2313,9 +2315,9 @@ async fn replay_flows_to_preloop_inner(
         {
             path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
         }
-        // Rewrite the disttask agent id to the registered replay runner as well:
-        // the golden PUTs/DELETEs target the official pool's agent id.
-        path = rewrite_replay_agent_id(&path, replay_runner_id);
+        // Rewrite the disttask agent id of the golden's own registered agent
+        // to the replay runner: the golden PUTs target the official pool's id.
+        path = rewrite_replay_agent_id(&path, official_agent_id.as_deref(), replay_runner_id);
         // Rewrite OIDC plan/job IDs to match local replay state
         if path.contains("/oidctoken")
             && let Some(rest) =
@@ -2543,6 +2545,19 @@ async fn replay_flows_to_preloop_inner(
             .await?;
         out.write_all(b"\n").await?;
         count += 1;
+        // The golden's own agent registration names the official agent id
+        // every later disttask `/agents/{id}` call targets.
+        if method.eq_ignore_ascii_case("POST")
+            && flow
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|golden| golden.split('?').next().unwrap_or("").ends_with("/agents"))
+            && let Some(id) = flow
+                .pointer("/response_body_json/id")
+                .and_then(Value::as_i64)
+        {
+            official_agent_id = Some(id.to_string());
+        }
     }
     let summary = serde_json::to_string_pretty(&json!({"status":"captured", "flows": count}))?;
     fs::write(out_dir.join("summary.json"), &summary)?;
@@ -3329,10 +3344,19 @@ fn rewrite_replay_plan_ids(path: &str, plan_ids: &HashMap<String, String>) -> St
 }
 
 /// Rewrite the pool agent id in a disttask `/agents/{n}` path to the runner the
-/// replay registered. The golden flow PUTs against the official pool's agent id
-/// (e.g. `agents/51`), which does not exist in the replay's state, so the id has
-/// to follow the same numeric mapping as the broker path.
-fn rewrite_replay_agent_id(path: &str, replay_runner_id: i64) -> String {
+/// replay registered. Only the agent the golden flow itself registered maps:
+/// the golden PUTs against the official pool's agent id (e.g. `agents/51`),
+/// which does not exist in the replay's state. Any other id — the stale agent a
+/// `config.sh` run deletes before registering — passes through untouched, or the
+/// replay would delete its own runner.
+fn rewrite_replay_agent_id(
+    path: &str,
+    official_agent_id: Option<&str>,
+    replay_runner_id: i64,
+) -> String {
+    let Some(official_agent_id) = official_agent_id else {
+        return path.to_owned();
+    };
     let Some(position) = path.find("/agents/") else {
         return path.to_owned();
     };
@@ -3341,7 +3365,7 @@ fn rewrite_replay_agent_id(path: &str, replay_runner_id: i64) -> String {
         Some(index) => (&tail[..index], &tail[index..]),
         None => (tail, ""),
     };
-    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+    if id != official_agent_id {
         return path.to_owned();
     }
     format!(
@@ -4563,18 +4587,32 @@ mod tests {
     }
 
     #[test]
-    fn replay_rewrites_disttask_agent_ids_to_the_registered_runner() {
+    fn replay_rewrites_only_the_golden_agent_id_to_the_registered_runner() {
         assert_eq!(
-            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents/51", 7),
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents/51", Some("51"), 7),
             "/_apis/distributedtask/pools/1/agents/7"
         );
-        // A query string keeps its position; a non-numeric tail is left alone.
+        // The stale agent `config.sh` deletes before registering is not ours:
+        // rewriting it would delete the replay's own runner.
         assert_eq!(
-            rewrite_replay_agent_id("/_apis/distributedtask/pools/0/agents?agentName=x", 7),
-            "/_apis/distributedtask/pools/0/agents?agentName=x"
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/0/agents/1", Some("51"), 7),
+            "/_apis/distributedtask/pools/0/agents/1"
         );
         assert_eq!(
-            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents", 7),
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/0/agents/1", None, 7),
+            "/_apis/distributedtask/pools/0/agents/1"
+        );
+        // A query string keeps its position; a collection path is left alone.
+        assert_eq!(
+            rewrite_replay_agent_id(
+                "/_apis/distributedtask/pools/1/agents/51?x=1",
+                Some("51"),
+                7
+            ),
+            "/_apis/distributedtask/pools/1/agents/7?x=1"
+        );
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents", Some("51"), 7),
             "/_apis/distributedtask/pools/1/agents"
         );
     }

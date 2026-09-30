@@ -400,15 +400,14 @@ pub async fn agent_request_get(
         .request(crate::control::backend::RequestKey::Id(request_id))
         .await
         .map_err(ApiError::from)?;
-    if let Some(runner_id) = runner_id {
-        if let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+    if let Some(runner_id) = runner_id
+        && let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
             .await
             .map_err(ApiError::from)?
-        {
-            return Err(ApiError::from(crate::control::ControlError::Forbidden(
-                "agent request belongs to another runner".to_owned(),
-            )));
-        }
+    {
+        return Err(ApiError::from(crate::control::ControlError::Forbidden(
+            "agent request belongs to another runner".to_owned(),
+        )));
     }
     Ok(Json(agent_request_json(pool_id, &request)))
 }
@@ -419,15 +418,14 @@ pub async fn agent_request_ack(
     Path((_pool_id, request_id)): Path<(i64, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id) {
-        if let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+    if let Some(runner_id) = identity.and_then(|axum::Extension(id)| id.runner_id)
+        && let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
             .await
             .map_err(ApiError::from)?
-        {
-            return Err(ApiError::from(crate::control::ControlError::Forbidden(
-                "agent request belongs to another runner".to_owned(),
-            )));
-        }
+    {
+        return Err(ApiError::from(crate::control::ControlError::Forbidden(
+            "agent request belongs to another runner".to_owned(),
+        )));
     }
     Ok(StatusCode::OK)
 }

@@ -1190,10 +1190,10 @@ async fn lock_gate_runs(
         .map_err(db)?;
     let mut runs = std::collections::BTreeSet::new();
     for row in rows {
-        if let Ok(run) = row.get::<_, String>(0).parse::<RunId>() {
-            if run != arriving_run {
-                runs.insert(run);
-            }
+        if let Ok(run) = row.get::<_, String>(0).parse::<RunId>()
+            && run != arriving_run
+        {
+            runs.insert(run);
         }
     }
     for run in runs {
@@ -1483,12 +1483,11 @@ pub(super) async fn release_concurrency_for_run(
             )
             .await
             .map_err(db)?;
-        if let Some(waiter) = waiter {
-            if let Ok(promoted) = waiter.get::<_, String>(0).parse::<RunId>() {
-                if promoted != run_id {
-                    promoted_runs.insert(promoted);
-                }
-            }
+        if let Some(waiter) = waiter
+            && let Ok(promoted) = waiter.get::<_, String>(0).parse::<RunId>()
+            && promoted != run_id
+        {
+            promoted_runs.insert(promoted);
         }
     }
     for promoted in promoted_runs {
@@ -1552,10 +1551,10 @@ async fn promote_after_release_inner(
         )
         .await
         .map_err(db)?;
-    if let Some(row) = next_run {
-        if let Ok(run_id) = row.get::<_, String>(0).parse::<RunId>() {
-            PgBackend::lock_run(tx, run_id).await?;
-        }
+    if let Some(row) = next_run
+        && let Ok(run_id) = row.get::<_, String>(0).parse::<RunId>()
+    {
+        PgBackend::lock_run(tx, run_id).await?;
     }
     let next = tx
         .query_opt(

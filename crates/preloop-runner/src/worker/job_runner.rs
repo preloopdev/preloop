@@ -1048,8 +1048,8 @@ fn spawn_renew_loop(
 
 /// Renewal timing knobs mirroring the official `JobDispatcher`:
 /// - first-renew gate: retry up to 5 times (random 1–10 s backoff, matching
-/// the official band) before the worker is allowed to start; exhaustion
-/// abandons the job (no steps run);
+///   the official band) before the worker is allowed to start; exhaustion
+///   abandons the job (no steps run);
 /// - steady-state renew: every 60 s.
 ///
 /// Defaults match the official runner; tests shrink the windows.

@@ -1037,32 +1037,33 @@ pub async fn poll_verdict(
                 // Postgres reader checkout can wait on the pool, and every
                 // other `inner` user on this node would stall behind us.
                 drop(inner);
-                if response.verdict == Some(Verdict::Retry) && response.snapshot_token.is_none() {
-                    if let Some((request_id, agent_job_id)) = record {
-                        let plan_id = match shared
-                            .state
-                            .backend
-                            .request(crate::control::backend::RequestKey::Id(request_id))
-                            .await
-                        {
-                            Ok(request) => Some(request.plan_id),
-                            Err(crate::control::ControlError::NotFound(_)) => None,
-                            Err(error) => return Err(ApiError::from(error)),
-                        };
-                        if let Some(plan_id) = plan_id {
-                            let fresh = shared.state.mint_runtime_token(&plan_id, &agent_job_id);
-                            response.snapshot_token = Some(fresh.clone());
-                            // The origin-rewrite `authHeader` the job env
-                            // carries is the same runtime token in Basic
-                            // form (see runs::build_job_artifacts and
-                            // broker::re_mint_snapshot_credentials); send it
-                            // too so a replayed `git fetch` authenticates.
-                            use base64::Engine as _;
-                            let credentials = base64::engine::general_purpose::STANDARD
-                                .encode(format!("x-access-token:{fresh}"));
-                            response.snapshot_auth_header =
-                                Some(format!("AUTHORIZATION: basic {credentials}"));
-                        }
+                if response.verdict == Some(Verdict::Retry)
+                    && response.snapshot_token.is_none()
+                    && let Some((request_id, agent_job_id)) = record
+                {
+                    let plan_id = match shared
+                        .state
+                        .backend
+                        .request(crate::control::backend::RequestKey::Id(request_id))
+                        .await
+                    {
+                        Ok(request) => Some(request.plan_id),
+                        Err(crate::control::ControlError::NotFound(_)) => None,
+                        Err(error) => return Err(ApiError::from(error)),
+                    };
+                    if let Some(plan_id) = plan_id {
+                        let fresh = shared.state.mint_runtime_token(&plan_id, &agent_job_id);
+                        response.snapshot_token = Some(fresh.clone());
+                        // The origin-rewrite `authHeader` the job env
+                        // carries is the same runtime token in Basic
+                        // form (see runs::build_job_artifacts and
+                        // broker::re_mint_snapshot_credentials); send it
+                        // too so a replayed `git fetch` authenticates.
+                        use base64::Engine as _;
+                        let credentials = base64::engine::general_purpose::STANDARD
+                            .encode(format!("x-access-token:{fresh}"));
+                        response.snapshot_auth_header =
+                            Some(format!("AUTHORIZATION: basic {credentials}"));
                     }
                 }
                 return Ok(Json(response));

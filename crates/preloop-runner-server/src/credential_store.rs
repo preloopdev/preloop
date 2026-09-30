@@ -772,7 +772,7 @@ impl CredentialStore for FileCredentialStore {
 /// `PRELOOP_CREDENTIAL_STORE`:
 /// - `os` (default) — the native keychain / secret-service / credential manager.
 /// - `file` — a private directory of `0600` files under `state_dir`; no OS
-/// prompt, survives rebuilds. Recommended for local dev and headless hosts.
+///   prompt, survives rebuilds. Recommended for local dev and headless hosts.
 /// - `memory` — non-persistent; secrets vanish on restart (tests only).
 ///
 /// Returns a boxed store so the server and CLI share one selection point.

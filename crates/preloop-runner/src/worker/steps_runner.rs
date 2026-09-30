@@ -1135,13 +1135,13 @@ pub async fn run_steps(
                         }
                         // The origin-rewrite `http.<snapshot>.extraheader`
                         // baked into job.env at start expires on the same
-                        // clock; swap in the verdict's fresh header so a
-                        // replayed `git fetch` (this step or a jumped
-                        // range) authenticates.
-                        if let Some(header) = decision
+                        // clock; the verdict carries a fresh one. Applied
+                        // after any state restore below, which rewinds
+                        // `job.env` to the pre-step snapshot.
+                        let fresh_auth_header = decision
                             .as_ref()
-                            .and_then(|d| d.snapshot_auth_header.as_deref())
-                        {
+                            .and_then(|d| d.snapshot_auth_header.clone());
+                        if let Some(header) = fresh_auth_header.as_deref() {
                             client.refresh_snapshot_auth_header(&mut step_ctx.job.env, header);
                         }
 
@@ -1169,6 +1169,9 @@ pub async fn run_steps(
                         // Retry just the current step.
                         super::file_commands::cleanup_file_commands(&file_command_paths);
                         step_state_snapshot.restore(step_ctx.job, &step.context_name);
+                        if let Some(header) = fresh_auth_header.as_deref() {
+                            client.refresh_snapshot_auth_header(&mut step_ctx.job.env, header);
+                        }
                         continue;
                     }
                     Some(preloop_gha_protocol::debug_session::Verdict::Continue) => {

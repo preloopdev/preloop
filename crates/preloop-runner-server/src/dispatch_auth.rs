@@ -8,15 +8,15 @@
 //!
 //! 1. **System bearer** (`PRELOOP_SYSTEM_TOKEN`) — trusted operator.
 //! 2. **PAT** (`PRELOOP_GITHUB_TOKEN` / config `github.pat`) — trusted
-//! operator; constant-time compare.
+//!    operator; constant-time compare.
 //! 3. **Own-App JWT** (RS256, `iss` = a registered App id) — verified against
-//! that App's PEM; offline-safe.
+//!    that App's PEM; offline-safe.
 //! 4. **Installation tokens**:
-//! - minted by preloop itself: validated against the in-memory mint ledger
-//! (offline-safe, no round-trip);
-//! - third-party: validated with a github.com round-trip
-//! (`GET /installation`, `GET /installation/repositories`), cached with a
-//! short TTL, and failing **closed** on network errors.
+//!    - minted by preloop itself: validated against the in-memory mint ledger
+//!      (offline-safe, no round-trip);
+//!    - third-party: validated with a github.com round-trip
+//!      (`GET /installation`, `GET /installation/repositories`), cached with a
+//!      short TTL, and failing **closed** on network errors.
 //! 5. Anything else — 401.
 //!
 //! The middleware inserts a [`DispatchIdentity`] extension; handlers use it
