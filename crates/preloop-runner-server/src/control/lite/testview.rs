@@ -10,13 +10,13 @@ use crate::models::{
     AssignmentRecord, GitHubTokenRequest, QueuedCancellation, TaskAgentJobRequestRecord,
 };
 use crate::state::{JobSetAdmission, JobSetGate, JobSetId, OidcJobContext};
-use jobs::{job_row, queued_job_of, JobRow, JOB_COLUMNS};
+use jobs::{JOB_COLUMNS, JobRow, job_row, queued_job_of};
 use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{
-    azdo, ExecutionStatus, JobId, RegisteredRunner, RunId, RunnerSession, SessionId,
+    ExecutionStatus, JobId, RegisteredRunner, RunId, RunnerSession, SessionId, azdo,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use steps::{step_row, STEP_COLUMNS};
+use steps::{STEP_COLUMNS, step_row};
 
 impl LiteBackend {
     /// Snapshot every scheduling table into a [`TestState`]. Single read

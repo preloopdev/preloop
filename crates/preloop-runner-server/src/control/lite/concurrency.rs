@@ -15,7 +15,7 @@ use crate::concurrency::{self, Holder};
 use crate::control::logic::{self, ConcurrencyRow};
 use crate::control::types::*;
 use preloop_gha_protocol::{JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
 /// `(holder_kind, holder_run_id, holder_job_id, holder_jobset_id)` for the

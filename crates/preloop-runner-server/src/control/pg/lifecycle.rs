@@ -3,12 +3,13 @@
 //! pool (a command that must see its own earlier writes takes a writer).
 
 use super::codec::{self, from_json, json, now_us, ts, us};
-use super::{db, lookups, PgBackend};
+use super::{PgBackend, db, lookups};
 use crate::control::backend::RegisterRunner;
 use crate::control::logic;
 use crate::control::types::{
-    AcquireContext, ControlError, OpenRunnerSession, PurgeGuard, RunQueueClaimability,
-    RunnerListing, RunnerRow, SessionProtocol, SessionRow,
+    AcquireContext, ControlError, EnvironmentApproval, EnvironmentApprovalOutcome,
+    EnvironmentApprovalResult, OpenRunnerSession, PurgeGuard, RunQueueClaimability, RunnerListing,
+    RunnerRow, SessionProtocol, SessionRow,
 };
 use crate::models::{RunRecord, RunnerCapabilities};
 use crate::runtime_scheduling;
@@ -1058,11 +1059,20 @@ impl PgBackend {
                 "INSERT INTO run_history (run_id, namespace_id, repository, \
                  workflow_path, run_number, run_attempt, run_name, event, ref, \
                  ref_type, head_ref, base_ref, head_sha, conclusion, submission, \
+                 record_details, \
+                 fork_approval_pending, fork_approval_requested_at, \
+                 fork_approval_approved_at, fork_approval_note, \
+                 reports_check_runs, \
                  created_at, started_at, completed_at) \
                  SELECT r.run_id, r.namespace_id, r.repository, r.workflow_path, \
                  r.run_number, r.run_attempt, r.run_name, r.event, r.ref, \
                  r.ref_type, r.head_ref, r.base_ref, r.head_sha, r.conclusion, \
-                 COALESCE(s.submission, '{}'::text::jsonb), r.created_at, \
+                 COALESCE(s.submission, '{}'::text::jsonb), \
+                 COALESCE(s.record_details, '{}'::text::jsonb), \
+                 r.fork_approval_pending, r.fork_approval_requested_at, \
+                 r.fork_approval_approved_at, r.fork_approval_note, \
+                 r.reports_check_runs, \
+                 r.created_at, \
                  r.started_at, r.completed_at \
                  FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
                  WHERE r.run_id = $1::text::uuid",
@@ -1127,6 +1137,140 @@ impl PgBackend {
         }
         tx.commit().await.map_err(db)?;
         Ok(archived)
+    }
+
+    /// `expired_terminal_runs`: terminal runs finished (else created) before
+    /// `cutoff_us`, oldest first, `limit` at most.
+    ///
+    /// Archived runs are selected from `run_history`: the archiver moves a
+    /// settled run there within a minute of completion, so that table is
+    /// where an expired run actually lives — a retention pass that only
+    /// looked at `runs` would delete nothing. A live run with an unfinished
+    /// or session-bound attempt is skipped (the archiver's own guard): its
+    /// callbacks are still in play and deleting it would strand them.
+    ///
+    /// Statement: one `SELECT .. FROM (runs UNION ALL run_history) GROUP BY
+    /// run_id HAVING MIN(finished_at) < $1 ORDER BY .. LIMIT $2` on the
+    /// reader pool.
+    pub(super) async fn expired_terminal_runs(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError> {
+        let client = self.reader().await?;
+        let limit = codec::limit(limit);
+        let rows = client
+            .query(
+                concat!(
+                    "SELECT run_id::text FROM ( \
+                         SELECT r.run_id AS run_id, \
+                                COALESCE(r.completed_at, r.created_at) AS finished_at \
+                         FROM runs r \
+                         WHERE r.status = 'completed' \
+                           AND NOT EXISTS (SELECT 1 FROM job_requests q \
+                                           WHERE q.run_id = r.run_id \
+                                             AND (q.result IS NULL OR q.session_id IS NOT NULL)) \
+                         UNION ALL \
+                         SELECT h.run_id, COALESCE(h.completed_at, h.created_at) \
+                         FROM run_history h) expired \
+                     GROUP BY run_id \
+                     HAVING MIN(finished_at) < ",
+                    ts!("$1"),
+                    " \
+                     ORDER BY MIN(finished_at), run_id \
+                     LIMIT $2"
+                ),
+                &[&cutoff_us, &limit],
+            )
+            .await
+            .map_err(db)?;
+        rows.iter()
+            .map(|row| codec::run_id(&row.get::<_, String>(0)))
+            .collect()
+    }
+
+    /// `delete_expired_run`: drop one terminal run for good — its live rows
+    /// (the `runs` row cascades its jobs, requests, attempts, steps, logs
+    /// and gates) and its history rows, plus the artifact metadata keyed by
+    /// the run.
+    ///
+    /// A live row that is not `completed` is `Conflict` and nothing is
+    /// written: retention must never delete a run that can still schedule,
+    /// whatever the caller's filter said. An unknown run is `Ok(())`, so an
+    /// interrupted pass can simply be repeated. The run's advisory lock
+    /// serializes this with scheduling transactions that also rewrite its
+    /// scalars. On-disk artifacts and the node-local key set are the
+    /// caller's to remove (the durable rows here answer neither once
+    /// deleted).
+    pub(super) async fn delete_expired_run(&self, run_id: RunId) -> Result<(), ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let key = run_id.0.to_string();
+        PgBackend::lock_run(&tx, run_id).await?;
+        let status: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM runs WHERE run_id = $1::text::uuid",
+                &[&key],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| row.get(0));
+        if let Some(status) = status.as_deref()
+            && status != "completed"
+        {
+            return Err(ControlError::Conflict(format!(
+                "run {run_id} is {status}, not terminal"
+            )));
+        }
+        // Timelines are keyed by id and shared across attempts of different
+        // runs (a rerun correlates on the same id), and they carry no FK to
+        // `runs`, so the weekly `prune_timelines` is the only other owner —
+        // and it can only match while a request row still names them. Drop
+        // the ones this run is the last referent of, records first.
+        for table in ["timeline_records", "timelines"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE timeline_id IN ( \
+                         SELECT q.timeline_id FROM job_requests q \
+                         WHERE q.run_id = $1::text::uuid \
+                           AND NOT EXISTS (SELECT 1 FROM job_requests o \
+                                           WHERE o.timeline_id = q.timeline_id \
+                                             AND o.run_id <> $1::text::uuid))"
+                ),
+                &[&key],
+            )
+            .await
+            .map_err(db)?;
+        }
+        // The archive tables have no FK to `runs`: without this the run would
+        // survive in `job_history`/`attempt_history` (and keep surfacing
+        // through `terminal_jobs`) after its record is gone. They are
+        // partitioned on time, so this scans partitions — acceptable for an
+        // hourly housekeeping pass that deletes a handful of runs.
+        for table in [
+            "step_history",
+            "attempt_history",
+            "job_history",
+            "run_history",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE run_id = $1::text::uuid"),
+                &[&key],
+            )
+            .await
+            .map_err(db)?;
+        }
+        tx.execute(
+            "DELETE FROM artifacts WHERE run_id = $1::text::uuid",
+            &[&key],
+        )
+        .await
+        .map_err(db)?;
+        tx.execute("DELETE FROM runs WHERE run_id = $1::text::uuid", &[&key])
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(())
     }
 
     /// `reconcile_on_boot`: drop holds of missing/terminal runs, release
@@ -1292,5 +1436,118 @@ impl PgBackend {
         };
         tx.commit().await.map_err(db)?;
         Ok(record)
+    }
+
+    /// `record_environment_approval`: append one operator approval to a job
+    /// parked on its environment's required-reviewer gate, then re-run the
+    /// run's promotion pass so a satisfied gate releases the job.
+    ///
+    /// A lapsed window records nothing: the promotion pass (run next)
+    /// re-evaluates the same window and settles the job `Failure` — one
+    /// fail-closed decision over the durable rows.
+    pub(crate) async fn record_environment_approval(
+        &self,
+        approval: EnvironmentApproval,
+    ) -> Result<EnvironmentApprovalOutcome, ControlError> {
+        let rules = self.environment_rules();
+        let run_id = approval.run_id;
+        let job_id = approval.job_id;
+        let note = approval.note.clone();
+        let now = crate::models::now_unix_nanos();
+        let result = {
+            let mut client = self.writer().await?;
+            let tx = client.transaction().await.map_err(db)?;
+            let run_key = run_id.0.to_string();
+            let repository: String = tx
+                .query_opt(
+                    "SELECT repository FROM runs WHERE run_id = $1::text::uuid",
+                    &[&run_key],
+                )
+                .await
+                .map_err(db)?
+                .map(|row| row.get(0))
+                .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
+            let row = tx
+                .query_opt(
+                    "SELECT j.status, j.environment_gate::text, s.environment::text \
+                     FROM jobs j \
+                     LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                     WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
+                    &[&run_key, &job_id.0],
+                )
+                .await
+                .map_err(db)?
+                .ok_or_else(|| ControlError::NotFound("job not found".to_owned()))?;
+            let status = crate::control::types::status_parse(row.get::<_, String>(0).as_str());
+            let environment: Option<serde_json::Value> = row
+                .get::<_, Option<String>>(2)
+                .and_then(|json| from_json(&json).ok());
+            let result = if status.is_terminal() {
+                EnvironmentApprovalResult::AlreadyTerminal
+            } else if let Some(env_name) =
+                crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
+            {
+                let required = rules
+                    .get(&repository)
+                    .and_then(|envs| envs.get(env_name))
+                    .map(|rule| rule.required_reviewers)
+                    .unwrap_or(0);
+                let gate = row
+                    .get::<_, Option<String>>(1)
+                    .and_then(|json| from_json::<crate::models::EnvironmentGateState>(&json).ok());
+                match gate {
+                    Some(mut gate) if required > 0 => match gate.approval_requested_at_unix_nanos {
+                        None => EnvironmentApprovalResult::NotAwaiting,
+                        Some(requested_at) => {
+                            if now.saturating_sub(requested_at)
+                                > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
+                            {
+                                EnvironmentApprovalResult::Expired
+                            } else {
+                                gate.approvals_unix_nanos.push(now);
+                                let approvals = gate.approvals_unix_nanos.len();
+                                let satisfied = (approvals as u32) >= required;
+                                tx.execute(
+                                    "UPDATE jobs SET environment_gate = $3::text::jsonb \
+                                         WHERE run_id = $1::text::uuid AND job_id = $2",
+                                    &[&run_key, &job_id.0, &json(&gate)?],
+                                )
+                                .await
+                                .map_err(db)?;
+                                tracing::info!(
+                                    run_id = %run_id.0,
+                                    job_id = %job_id.0,
+                                    environment = env_name,
+                                    approvals,
+                                    required,
+                                    note = note.as_deref().unwrap_or_default(),
+                                    "environment approval recorded"
+                                );
+                                EnvironmentApprovalResult::Recorded {
+                                    approvals,
+                                    required,
+                                    satisfied,
+                                }
+                            }
+                        }
+                    },
+                    _ => EnvironmentApprovalResult::NotAwaiting,
+                }
+            } else {
+                EnvironmentApprovalResult::NotAwaiting
+            };
+            tx.commit().await.map_err(db)?;
+            result
+        };
+        // Release or fail closed over the run's durable rows: a satisfied gate
+        // unparks the job, an expired window settles it Failure (and its
+        // dependents).
+        let promote = self.promote_ready_jobs(Some(run_id), &rules).await?;
+        Ok(EnvironmentApprovalOutcome {
+            result,
+            queue_depth: promote.queue_depth,
+            next_runs_on: promote.next_runs_on,
+            promoted: promote.promoted,
+        })
     }
 }

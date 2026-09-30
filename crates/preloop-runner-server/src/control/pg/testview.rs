@@ -12,9 +12,9 @@ use crate::models::{
 use crate::state::{JobSetAdmission, JobSetGate, JobSetId, OidcJobContext};
 use codec::us;
 use graph::queued_of;
-use lookups::{request_from_row, REQUEST_SELECT};
+use lookups::{REQUEST_SELECT, request_from_row};
 use preloop_gha_protocol::crypto::AgentRsaPublicKey;
-use preloop_gha_protocol::{azdo, JobId, RegisteredRunner, RunnerSession, SessionId};
+use preloop_gha_protocol::{JobId, RegisteredRunner, RunnerSession, SessionId, azdo};
 use std::collections::{BTreeMap, BTreeSet};
 
 impl PgBackend {

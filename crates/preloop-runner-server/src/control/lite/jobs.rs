@@ -10,7 +10,7 @@ use super::db;
 use crate::control::types::*;
 use crate::models::{QueuedJob, RunRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A `jobs` row decoded for scheduling decisions.
@@ -38,13 +38,15 @@ pub(super) struct JobRow {
     pub(super) concurrency_wait_at: Option<i64>,
     pub(super) concurrency_acquired_at: Option<i64>,
     pub(super) started_at: Option<i64>,
+    /// Environment protection gate progress (fail-closed runtime state).
+    pub(super) environment_gate: Option<crate::models::EnvironmentGateState>,
 }
 
 pub(super) const JOB_COLUMNS: &str = "run_id, job_id, namespace_id, kind, \
      parent_job_id, base_id, status, queue_state, remaining_needs, pool_key, \
      runs_on, runner_group, priority, run_order, job_order, enqueued_at, \
      claimed_by_runner_id, expand_generation, deps_ready_at, \
-     concurrency_wait_at, concurrency_acquired_at, started_at";
+     concurrency_wait_at, concurrency_acquired_at, started_at, environment_gate";
 
 pub(super) fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     Ok(JobRow {
@@ -70,6 +72,12 @@ pub(super) fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         concurrency_wait_at: row.get(19)?,
         concurrency_acquired_at: row.get(20)?,
         started_at: row.get(21)?,
+        // Fail closed: a present-but-unreadable gate reloads as the empty
+        // gate, which re-arms the wait/approval instead of dropping it.
+        environment_gate: match row.get::<_, Option<String>>(22)? {
+            Some(json) => Some(serde_json::from_str(&json).unwrap_or_default()),
+            None => None,
+        },
     })
 }
 
@@ -315,6 +323,7 @@ pub(super) fn queued_job_of(tx: &Transaction<'_>, job: JobRow) -> Result<QueuedJ
         matrix: spec.matrix,
         deferred_matrix: spec.deferred_matrix,
         reusable_call: spec.reusable_call,
+        environment_gate: job.environment_gate,
     })
 }
 
@@ -345,8 +354,8 @@ pub(super) fn insert_job(
              base_id, status, queue_state, remaining_needs, pool_key, runs_on, \
              runner_group, priority, run_order, job_order, enqueued_at, \
              deps_ready_at, concurrency_wait_at, concurrency_acquired_at, \
-             created_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?15,?16,?17,?18,?19) \
+             environment_gate, created_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?15,?16,?17,?18,?19,?20) \
          ON CONFLICT (run_id, job_id) DO NOTHING",
     )
     .map_err(db)?
@@ -371,6 +380,9 @@ pub(super) fn insert_job(
         job.dependencies_ready_at_unix_nanos.map(|v| v / 1000),
         job.concurrency_wait_started_at_unix_nanos.map(|v| v / 1000),
         job.concurrency_acquired_at_unix_nanos.map(|v| v / 1000),
+        job.environment_gate
+            .as_ref()
+            .and_then(|gate| serde_json::to_string(gate).ok()),
         now,
     ])
     .map_err(db)?;
@@ -866,7 +878,10 @@ pub(super) fn run_record(
             "SELECT 'completed', r.conclusion, r.run_number, r.run_attempt, \
                     r.run_name, r.event, r.head_sha, r.workflow_path, \
                     NULL, r.created_at, r.started_at, r.completed_at, \
-                    r.workflow_path, r.submission, NULL, NULL, NULL, r.record_details \
+                    r.workflow_path, r.submission, NULL, NULL, NULL, r.record_details, \
+                    r.fork_approval_pending, r.fork_approval_requested_at, \
+                    r.fork_approval_approved_at, r.fork_approval_note, \
+                    r.reports_check_runs \
              FROM run_history r WHERE r.run_id = ?1",
         )
         .map_err(db)?
@@ -890,6 +905,11 @@ pub(super) fn run_record(
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
                 row.get::<_, Option<String>>(17)?,
+                row.get::<_, i64>(18)?,
+                row.get::<_, Option<i64>>(19)?,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, i64>(22)?,
             ))
         })
         .optional()
@@ -900,7 +920,10 @@ pub(super) fn run_record(
                     r.run_name, r.event, r.head_sha, r.workflow_ref, \
                     r.webhook_delivery_id, r.created_at, r.started_at, r.completed_at, \
                     r.workflow_path, s.submission, s.github_context, \
-                    s.workspace_snapshot, s.snapshot_timing, s.record_details \
+                    s.workspace_snapshot, s.snapshot_timing, s.record_details, \
+                    r.fork_approval_pending, r.fork_approval_requested_at, \
+                    r.fork_approval_approved_at, r.fork_approval_note, \
+                    r.reports_check_runs \
              FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
              WHERE r.run_id = ?1",
         )
@@ -925,6 +948,11 @@ pub(super) fn run_record(
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
                 row.get::<_, Option<String>>(17)?,
+                row.get::<_, i64>(18)?,
+                row.get::<_, Option<i64>>(19)?,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, i64>(22)?,
             ))
         })
         .optional()
@@ -949,6 +977,11 @@ pub(super) fn run_record(
         snapshot_json,
         timing_json,
         details_json,
+        fork_pending,
+        fork_requested_at,
+        fork_approved_at,
+        fork_note,
+        reports_check_runs,
     )) = head
     else {
         return Ok(None);
@@ -1243,6 +1276,11 @@ pub(super) fn run_record(
         snapshot_timing: timing_json
             .as_deref()
             .and_then(|j| serde_json::from_str(j).ok()),
+        fork_approval_pending: fork_pending != 0,
+        fork_approval_requested_at_unix_nanos: fork_requested_at,
+        fork_approved_at_unix_nanos: fork_approved_at,
+        fork_approval_note: fork_note,
+        reports_check_runs: reports_check_runs != 0,
     };
     // `project_run_rows` parity: callers expanded into subtrees do not
     // appear in `run.jobs`; `jobs_list` keeps `display_order` (the SELECT

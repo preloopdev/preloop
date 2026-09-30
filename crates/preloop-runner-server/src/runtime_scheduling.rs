@@ -17,11 +17,13 @@ pub enum EnvironmentGateOutcome {
 /// How long a pending-approval gate stays open before the job fails closed.
 pub const ENVIRONMENT_APPROVAL_WINDOW_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
-/// Resolve the literal `environment:` name for rule lookup. Expression-based
-/// names arrive here unresolvable (same as the registry existence check in
-/// `build_job_artifacts`); they match no rules and proceed.
-fn environment_gate_name(job: &QueuedJob) -> Option<&str> {
-    match job.environment.as_ref()? {
+/// Resolve the literal `environment:` name for rule lookup from the raw
+/// `environment:` value — the form both a live `QueuedJob` and the persisted
+/// `job_specs` row expose. Expression-based names arrive here unresolvable
+/// (same as the registry existence check in `build_job_artifacts`); they match
+/// no rules and proceed.
+pub(crate) fn environment_gate_name_of(environment: Option<&serde_json::Value>) -> Option<&str> {
+    match environment? {
         serde_json::Value::String(name) => Some(name.as_str()),
         serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
         _ => None,
@@ -54,25 +56,50 @@ pub fn check_environment_gates(
     job: &mut QueuedJob,
     now_unix_nanos: i64,
 ) -> EnvironmentGateOutcome {
-    let env_name = environment_gate_name(job).map(str::to_owned);
+    evaluate_environment_gate(
+        rules,
+        repository,
+        git_ref,
+        job.run_id,
+        &job.job_id,
+        job.environment.as_ref(),
+        &mut job.environment_gate,
+        now_unix_nanos,
+    )
+}
+
+/// [`check_environment_gates`] over the persisted parts rather than a
+/// `QueuedJob`: the backend's admission path reads
+/// `job_specs.environment`, `runs.ref` and `jobs.environment_gate` back from
+/// its own rows, so the decision function takes them directly.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_environment_gate(
+    rules: &crate::config::EnvironmentRulesMap,
+    repository: &str,
+    git_ref: &str,
+    run_id: RunId,
+    job_id: &preloop_gha_protocol::JobId,
+    environment: Option<&serde_json::Value>,
+    gate: &mut Option<EnvironmentGateState>,
+    now_unix_nanos: i64,
+) -> EnvironmentGateOutcome {
+    let env_name = environment_gate_name_of(environment).map(str::to_owned);
     let Some(env_name) = env_name.as_deref() else {
         return EnvironmentGateOutcome::Proceed;
     };
     let Some(rule) = rules.get(repository).and_then(|envs| envs.get(env_name)) else {
         // No rules for this environment: release any stale gate state and
         // proceed. Today's behavior is preserved exactly.
-        job.environment_gate = None;
+        *gate = None;
         return EnvironmentGateOutcome::Proceed;
     };
-    let gate = job
-        .environment_gate
-        .get_or_insert_with(EnvironmentGateState::default);
+    let gate = gate.get_or_insert_with(EnvironmentGateState::default);
 
     // 1. Deployment branch policy: fail closed on mismatch.
     if !rule.deployment_branches.is_empty() && !branch_allowed(&rule.deployment_branches, git_ref) {
         tracing::warn!(
-            run_id = %job.run_id.0,
-            job_id = %job.job_id.0,
+            run_id = %run_id.0,
+            job_id = %job_id.0,
             environment = env_name,
             git_ref,
             "environment gate denied: ref not in deployment_branches"
@@ -87,8 +114,8 @@ pub fn check_environment_gates(
         let wait_nanos = (rule.wait_timer_minutes as i64).saturating_mul(60_000_000_000);
         gate.wait_until_unix_nanos = Some(now_unix_nanos.saturating_add(wait_nanos));
         tracing::info!(
-            run_id = %job.run_id.0,
-            job_id = %job.job_id.0,
+            run_id = %run_id.0,
+            job_id = %job_id.0,
             environment = env_name,
             wait_timer_minutes = rule.wait_timer_minutes,
             "environment gate: wait timer armed"
@@ -106,8 +133,8 @@ pub fn check_environment_gates(
     if gate.approval_requested_at_unix_nanos.is_none() && rule.required_reviewers > 0 {
         gate.approval_requested_at_unix_nanos = Some(now_unix_nanos);
         tracing::info!(
-            run_id = %job.run_id.0,
-            job_id = %job.job_id.0,
+            run_id = %run_id.0,
+            job_id = %job_id.0,
             environment = env_name,
             required_reviewers = rule.required_reviewers,
             "environment gate: waiting for approvals"
@@ -119,8 +146,8 @@ pub fn check_environment_gates(
         }
         if now_unix_nanos.saturating_sub(requested_at) > ENVIRONMENT_APPROVAL_WINDOW_NANOS {
             tracing::warn!(
-                run_id = %job.run_id.0,
-                job_id = %job.job_id.0,
+                run_id = %run_id.0,
+                job_id = %job_id.0,
                 environment = env_name,
                 "environment gate denied: approval window expired"
             );
@@ -1071,7 +1098,6 @@ mod assignment_tests {
         );
         assert_eq!(restored.enqueued_at_unix_nanos, job.enqueued_at_unix_nanos);
     }
-
 }
 
 #[cfg(test)]

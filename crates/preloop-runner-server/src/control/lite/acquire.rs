@@ -9,10 +9,10 @@
 
 use super::codec;
 use super::requests;
-use super::{db, jobs, LiteBackend};
+use super::{LiteBackend, db, jobs};
 use crate::control::types::*;
-use preloop_gha_protocol::{azdo, JobId, RunId};
-use rusqlite::{params, OptionalExtension};
+use preloop_gha_protocol::{JobId, RunId, azdo};
+use rusqlite::{OptionalExtension, params};
 
 impl LiteBackend {
     /// `acquire_context`: the request record, its job message, the deferred

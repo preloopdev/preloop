@@ -365,6 +365,10 @@ pub async fn warm_pat_scope_cache(pat: &str) {
                 "PRELOOP_GITHUB_TOKEN was rejected by the GitHub API at startup; jobs keep the \
                  job-scoped runtime token and any step that needs GitHub fails."
             );
+        }
+    }
+}
+
 fn secret_provider_error(shared: &SharedState, error: anyhow::Error) -> ApiError {
     ApiError::internal(format!(
         "secret provider `{}` failed: {error}",
@@ -1548,7 +1552,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let mut pre_job_needs: BTreeMap<JobId, Vec<JobId>> = BTreeMap::new();
     let mut pre_job_fail_fast: BTreeMap<String, bool> = BTreeMap::new();
     let mut pre_job_continue_on_error: BTreeMap<String, bool> = BTreeMap::new();
-    let mut pre_initially_skipped: Vec<(RunId, JobId)> = Vec::new();
     let mut pre_caller_plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan> = BTreeMap::new();
     let mut pre_job_names: BTreeMap<JobId, String> = BTreeMap::new();
 
@@ -1588,7 +1591,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 })?;
             if !should_run {
                 pre_statuses.insert(job.id.clone(), ExecutionStatus::Skipped);
-                pre_initially_skipped.push((run_id, job.id.clone()));
                 skipped = true;
             }
         }
@@ -1658,10 +1660,19 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         let job_needs = pre_job_needs;
         let job_fail_fast = pre_job_fail_fast;
         let job_continue_on_error = pre_job_continue_on_error;
-        let initially_skipped = pre_initially_skipped;
         let snapshot_timing = workspace_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.snapshot_timing);
+        // Fork-PR workflow policy: a run from the untrusted fork pull-request
+        // tier is stamped pending and held at scheduler admission until an
+        // operator approves it. The stamp starts the 24-hour fail-closed
+        // clock the reaper sweeps on.
+        let fork_approval_pending = crate::fork_policy::fork_approval_required(
+            &shared.state.fork_policy,
+            crate::events::trust_tier::tier_of(&submission),
+        );
+        let fork_approval_requested_at_unix_nanos =
+            fork_approval_pending.then(crate::models::now_unix_nanos);
 
         let record = RunRecord {
             run_id,
@@ -1694,28 +1705,45 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             conclusion: None,
             push_state: None,
             snapshot_timing,
+            reports_check_runs: false,
+            fork_approval_pending,
+            fork_approval_requested_at_unix_nanos,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
         };
 
-        // Skipped jobs are already `Skipped` in `record.jobs` (from
-        // `pre_statuses`) and carry no request/message — they are not
-        // submitted as `SubmitJob`s. The handler emits their `JobStatus`
-        // events from `pre_initially_skipped` below.
+        // Skipped jobs go to the backend as `SubmitJob`s with
+        // `initially_skipped` — they need `jobs`/`job_specs` rows for the run
+        // record (`run.jobs`, display order) but never mint a request or
+        // message. The handler emits their `JobStatus` events from
+        // `outcome.concluded` below.
         let mut submit_jobs: Vec<crate::control::types::SubmitJob> =
             Vec::with_capacity(prebuilt.len());
         // plan_ids = each job's agent_job_id (string form): the log masker
         // keys its provided-secret cache on them at accept below.
         let mut submit_plan_ids: Vec<String> = Vec::with_capacity(prebuilt.len());
         for pb in prebuilt {
-            if pb.skipped {
-                continue;
-            }
+            let agent_msg = pb.agent_msg.clone().unwrap_or_else(|| {
+                // Skipped jobs never reach the wire — a placeholder keeps
+                // `QueuedJob.message` satisfied without minting artifacts.
+                serde_json::from_value(serde_json::json!({
+                    "jobId": uuid::Uuid::nil(),
+                    "requestId": 0,
+                    "plan": {"planId": "", "planType": "", "version": 0, "artifactUri": "", "artifactLocation": ""},
+                    "timeline": {"id": uuid::Uuid::nil(), "changeId": 0},
+                    "jobName": pb.job.id.0,
+                    "lockedUntil": "",
+                    "resources": {"endpoints": []},
+                    "steps": []
+                }))
+                .expect("placeholder message shape is static")
+            });
             let step_manifest = pb
                 .agent_msg
                 .as_ref()
                 .map(|msg| StepRecord::manifest(&msg.steps))
                 .unwrap_or_default();
-            let agent_msg = pb.agent_msg.clone().expect("non-skipped job has agent_msg");
-            let queued_job = QueuedJob {
+            let mut queued_job = QueuedJob {
                 run_id,
                 job_id: pb.job.id.clone(),
                 base_id: pb.job.base_id.clone(),
@@ -1749,8 +1777,26 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                     .collect(),
                 deferred_matrix: pb.job.deferred_matrix.clone(),
                 reusable_call: pb.job.reusable_call.clone(),
+                // Stamped just below, at the point the job first reaches
+                // scheduler admission.
+                environment_gate: None,
             };
-            submit_plan_ids.push(queued_job.message.plan.plan_id.clone());
+            // Skipped jobs are terminal at submit: no gate evaluation (a
+            // `Wait` verdict would park a node that never admits), no plan-id
+            // in the masker cache.
+            if !pb.skipped {
+                if crate::runtime_scheduling::check_environment_gates(
+                    &shared.state.environment_rules,
+                    &submission.repository,
+                    &submission.git_ref,
+                    &mut queued_job,
+                    crate::models::now_unix_nanos(),
+                ) == crate::runtime_scheduling::EnvironmentGateOutcome::Proceed
+                {
+                    queued_job.environment_gate = None;
+                }
+                submit_plan_ids.push(queued_job.message.plan.plan_id.clone());
+            }
             submit_jobs.push(crate::control::types::SubmitJob {
                 queued: queued_job,
                 request: pb.job_request,
@@ -1758,7 +1804,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 id_token_granted: pb.id_token_granted,
                 oidc_context: Some(pb.oidc_ctx),
                 step_manifest,
-                initially_skipped: false,
+                initially_skipped: pb.skipped,
             });
         }
 
@@ -1838,17 +1884,8 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             );
         }
 
-        for (event_run_id, job_id) in initially_skipped {
-            shared
-                .state
-                .emit(NdjsonEvent::JobStatus {
-                    run_id: event_run_id,
-                    job_id,
-                    status: ExecutionStatus::Skipped,
-                    reason: None,
-                })
-                .await;
-        }
+        // Skipped jobs land in `outcome.concluded` (emitted below) — the
+        // backend concluded them inside `submit_run`.
         for (job_id, status, reason) in &outcome.concluded {
             shared
                 .state
@@ -2205,7 +2242,6 @@ pub fn build_job_artifacts(
     base_url: &str,
     workspace_snapshot: Option<&WorkspaceSnapshot>,
     job: &preloop_gha_protocol::JobPlan,
-
 ) -> Result<BuiltJobArtifacts, ApiError> {
     // One policy drives every job-facing authority decision for this tier:
     // stored secrets, the runner-visible `system.github.token.permissions`
@@ -3318,98 +3354,62 @@ pub async fn approve_job(
     Path((run_id, job_id)): Path<(RunId, JobId)>,
     Json(body): Json<ApproveJobRequest>,
 ) -> Result<Json<ApproveJobResponse>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    if run
-        .jobs
-        .get(&job_id)
-        .is_some_and(|status| status.is_terminal())
-    {
-        return Err(ApiError::conflict("job is already terminal"));
-    }
-    let repository = run.submission.repository.clone();
-    let job = inner
-        .pending_jobs
-        .iter_mut()
-        .find(|job| job.run_id == run_id && job.job_id == job_id)
-        .ok_or_else(|| ApiError::not_found("job is not waiting in the scheduler"))?;
-    let gate = job
-        .environment_gate
-        .as_mut()
-        .filter(|gate| gate.approval_requested_at_unix_nanos.is_some())
-        .ok_or_else(|| ApiError::conflict("job is not awaiting environment approval"))?;
-    let env_name = match job.environment.as_ref() {
-        Some(serde_json::Value::String(name)) => name.clone(),
-        Some(serde_json::Value::Object(map)) => map
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        _ => String::new(),
-    };
-    let required = shared
+    // One transaction records the approval — or fails the job closed when the
+    // window lapsed — and re-runs the run's promotion sweep, so a gate the
+    // approval satisfies releases its job before this returns.
+    let outcome = shared
         .state
-        .environment_rules
-        .get(&repository)
-        .and_then(|envs| envs.get(&env_name))
-        .map(|rule| rule.required_reviewers)
-        .unwrap_or(0);
-    // Fail closed on an expired window before recording anything.
-    if let Some(requested_at) = gate.approval_requested_at_unix_nanos
-        && crate::models::now_unix_nanos().saturating_sub(requested_at)
-            > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
-    {
-        crate::runtime_scheduling::promote_ready_jobs(
-            &mut inner,
-            &shared.state.environment_rules,
-            &shared.state.pool_status.snapshot().labels,
-        );
-        crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            crate::runtime_scheduling::finalize_run_if_complete(run);
-        }
-        return Err(ApiError::conflict(
-            "approval window expired; the job was failed closed",
-        ));
-    }
-    gate.approvals_unix_nanos
-        .push(crate::models::now_unix_nanos());
-    let approvals = gate.approvals_unix_nanos.len();
-    let satisfied = required > 0 && (approvals as u32) >= required;
-    tracing::info!(
-        run_id = %run_id.0,
-        job_id = %job_id.0,
-        environment = env_name,
-        approvals,
-        required,
-        note = body.note.as_deref().unwrap_or_default(),
-        "environment approval recorded"
-    );
-    let outcome = crate::runtime_scheduling::promote_ready_jobs(
-        &mut inner,
-        &shared.state.environment_rules,
-        &shared.state.pool_status.snapshot().labels,
-    );
+        .backend
+        .record_environment_approval(crate::control::types::EnvironmentApproval {
+            run_id,
+            job_id: job_id.clone(),
+            note: body.note.clone(),
+        })
+        .await
+        .map_err(ApiError::from)?;
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    let promoted = outcome.promoted;
-    drop(inner);
-    if promoted > 0 {
+        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
+    if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
     }
-    Ok(Json(ApproveJobResponse {
-        run_id: run_id.0.to_string(),
-        job_id: job_id.0.clone(),
-        approvals,
-        required,
-        satisfied,
-    }))
+    match outcome.result {
+        crate::control::types::EnvironmentApprovalResult::AlreadyTerminal => {
+            Err(ApiError::conflict("job is already terminal"))
+        }
+        crate::control::types::EnvironmentApprovalResult::NotAwaiting => Err(ApiError::conflict(
+            "job is not awaiting environment approval",
+        )),
+        crate::control::types::EnvironmentApprovalResult::Expired => {
+            shared.state.message_notify.notify_waiters();
+            Err(ApiError::conflict(
+                "approval window expired; the job was failed closed",
+            ))
+        }
+        crate::control::types::EnvironmentApprovalResult::Recorded {
+            approvals,
+            required,
+            satisfied,
+        } => {
+            tracing::info!(
+                run_id = %run_id.0,
+                job_id = %job_id.0,
+                approvals,
+                required,
+                note = body.note.as_deref().unwrap_or_default(),
+                "environment approval recorded"
+            );
+            Ok(Json(ApproveJobResponse {
+                run_id: run_id.0.to_string(),
+                job_id: job_id.0.clone(),
+                approvals,
+                required,
+                satisfied,
+            }))
+        }
+    }
 }
 pub async fn rerun_run_inner(
     shared: &Arc<SharedState>,
@@ -3490,27 +3490,29 @@ pub async fn approve_fork(
     Path(run_id): Path<RunId>,
     Json(body): Json<ApproveForkRequest>,
 ) -> Result<Json<ApproveForkResponse>, ApiError> {
-    let mut inner = shared.state.inner.lock().await;
-    let run = inner
-        .runs
-        .get_mut(&run_id)
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    // The durable record is the guard: only a non-terminal run still awaiting
+    // fork approval may be approved.
+    let run = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?;
     if run.status.is_terminal() {
         return Err(ApiError::conflict("run is already terminal"));
     }
     if !run.fork_approval_pending {
         return Err(ApiError::conflict("run is not awaiting fork approval"));
     }
-    // Fail closed on an expired window before recording anything.
+    let now_unix_nanos = crate::models::now_unix_nanos();
+    // Fail closed on an expired window before recording anything: the sweep
+    // fails the run closed exactly as the reaper would.
     if let Some(requested_at) = run.fork_approval_requested_at_unix_nanos
-        && crate::models::now_unix_nanos().saturating_sub(requested_at)
+        && now_unix_nanos.saturating_sub(requested_at)
             > crate::fork_policy::FORK_APPROVAL_WINDOW_NANOS
     {
-        let expired = crate::fork_policy::sweep_expired_fork_approvals(
-            &mut inner,
-            crate::models::now_unix_nanos(),
-        );
-        drop(inner);
+        let expired =
+            crate::fork_policy::sweep_expired_fork_approvals(&shared, now_unix_nanos).await;
         if !expired.is_empty() {
             shared.state.message_notify.notify_waiters();
         }
@@ -3518,33 +3520,51 @@ pub async fn approve_fork(
             "approval window expired; the run was failed closed",
         ));
     }
-    let run = inner.runs.get_mut(&run_id).expect("run exists");
-    run.fork_approval_pending = false;
-    run.fork_approved_at_unix_nanos = Some(crate::models::now_unix_nanos());
-    run.fork_approval_note = body.note.clone();
+    // Release the hold, then hand the run's parked jobs back to admission.
+    shared
+        .state
+        .backend
+        .set_fork_approval(crate::control::types::ForkApprovalStamp {
+            run_id,
+            pending: false,
+            requested_at_unix_nanos: run.fork_approval_requested_at_unix_nanos,
+            approved_at_unix_nanos: Some(now_unix_nanos),
+            note: body.note.clone(),
+        })
+        .await
+        .map_err(ApiError::from)?;
     tracing::info!(
         run_id = %run_id.0,
         note = body.note.as_deref().unwrap_or_default(),
         "fork-PR approval recorded; run released"
     );
-    let outcome = crate::runtime_scheduling::promote_ready_jobs(
-        &mut inner,
-        &shared.state.environment_rules,
-        &shared.state.pool_status.snapshot().labels,
-    );
+    let outcome = shared
+        .state
+        .backend
+        .promote_ready_jobs(Some(run_id), &shared.state.environment_rules)
+        .await
+        .map_err(ApiError::from)?;
     shared
         .state
         .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    crate::runtime_scheduling::sync_next_job_labels(&inner, &shared.state.next_job_runs_on);
-    let promoted = outcome.promoted;
-    drop(inner);
-    if promoted > 0 {
+        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+    *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
+    if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
     }
+    // The expiry sweep may have won the run's terminal transition between the
+    // guard read and the write (it clears the hold in its own transaction).
+    // Report that honestly: the run is no longer awaiting this approval.
+    let approved = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map(|run| !run.status.is_terminal())
+        .unwrap_or(false);
     Ok(Json(ApproveForkResponse {
         run_id: run_id.0.to_string(),
-        approved: true,
+        approved,
     }))
 }
 
@@ -4377,11 +4397,16 @@ mod tests {
             "unexpected error: {}",
             error.message()
         );
-        let inner = shared.state.inner.lock().await;
-        assert!(
-            inner.runs.is_empty(),
-            "denied submission must not create a run"
-        );
+        let runs = shared
+            .state
+            .backend
+            .list_runs(crate::control::backend::RunListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(runs.is_empty(), "denied submission must not create a run");
     }
 
     #[tokio::test]
@@ -4392,8 +4417,15 @@ mod tests {
         let accepted = submit_run_inner(&shared, push_submission())
             .await
             .expect("evaluate mode must not block submission");
-        let inner = shared.state.inner.lock().await;
-        assert!(inner.runs.contains_key(&accepted.run_id));
+        assert!(
+            shared
+                .state
+                .backend
+                .run_record(accepted.run_id)
+                .await
+                .is_ok(),
+            "evaluate mode must still create the run"
+        );
     }
 
     /// The shipped default — an unscoped `pull_request_target` event deny in
@@ -4425,9 +4457,13 @@ mod tests {
         let accepted = submit_run_inner(&shared, submission)
             .await
             .expect("the default pull_request_target rule is evaluate-only and must not block");
-        let inner = shared.state.inner.lock().await;
         assert!(
-            inner.runs.contains_key(&accepted.run_id),
+            shared
+                .state
+                .backend
+                .run_record(accepted.run_id)
+                .await
+                .is_ok(),
             "a logged-not-blocked submission must still create a run"
         );
     }
@@ -4458,8 +4494,12 @@ mod tests {
             ..Default::default()
         };
         let accepted = submit_run_inner(&shared, submission).await.unwrap();
-        let inner = state.inner.lock().await;
-        let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+        let run = shared
+            .state
+            .backend
+            .run_record(accepted.run_id)
+            .await
+            .expect("run is recorded");
         assert_eq!(run.jobs.len(), 1, "the gated job stays in the run");
         assert!(
             run.jobs.values().all(|status| status.is_terminal()),
@@ -4511,26 +4551,39 @@ mod tests {
 
         let first = submit_run_inner(&shared, submission.clone()).await.unwrap();
         let second = submit_run_inner(&shared, submission).await.unwrap();
-        let inner = state.inner.lock().await;
 
         for accepted in [&first, &second] {
-            let run = inner.runs.get(&accepted.run_id).expect("run is recorded");
+            let run = shared
+                .state
+                .backend
+                .run_record(accepted.run_id)
+                .await
+                .expect("run is recorded");
             assert!(
                 run.status.is_terminal(),
                 "run {} must not wait on a group: {:?}",
                 accepted.run_id,
                 run.status
             );
+            assert_eq!(
+                shared
+                    .state
+                    .backend
+                    .run_in_concurrency(accepted.run_id)
+                    .await
+                    .unwrap(),
+                crate::control::types::RunConcurrency::None,
+                "a workless run must not leave its group held"
+            );
+            assert!(
+                !shared
+                    .state
+                    .backend
+                    .run_held(accepted.run_id)
+                    .await
+                    .unwrap(),
+                "a workless run must not park on a busy group"
+            );
         }
-        assert!(
-            inner.concurrency_groups.is_empty(),
-            "a workless run must not leave its group held: {:?}",
-            inner.concurrency_groups.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            inner.held_runs.is_empty(),
-            "a workless run must not park on a busy group: {:?}",
-            inner.held_runs.keys().collect::<Vec<_>>()
-        );
     }
 }

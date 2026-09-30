@@ -137,11 +137,14 @@ async fn authorize_live_log_read(
     if bearer == shared.state.system_token {
         // The system credential bypasses ownership but still needs the
         // resolved key so the stream follows the same explicit-key contract.
-        let key = {
-            let inner = shared.state.inner.lock().await;
-            live_log_key_for_job(&inner, run_id, job_id)
-        }
-        .ok_or_else(|| ApiError::not_found("job not found"))?;
+        let key = shared
+            .state
+            .backend
+            .live_log_key(run_id, job_id)
+            .await
+            .map_err(ApiError::from)?
+            .map(|(key, _)| key)
+            .ok_or_else(|| ApiError::not_found("job not found"))?;
         return Ok((key, job_id.to_owned()));
     }
     let caller = shared
@@ -153,11 +156,14 @@ async fn authorize_live_log_read(
     // happens to be UUID-shaped — only resolution tells them apart. Missing
     // and foreign targets share one response so a mismatch never reveals
     // whether the target exists.
-    let key = {
-        let inner = shared.state.inner.lock().await;
-        live_log_key_for_job(&inner, run_id, job_id)
-    }
-    .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
+    let key = shared
+        .state
+        .backend
+        .live_log_key(run_id, job_id)
+        .await
+        .map_err(ApiError::from)?
+        .map(|(key, _)| key)
+        .ok_or_else(|| ApiError::forbidden("live-log read job mismatch"))?;
     if key != caller.to_string() {
         return Err(ApiError::forbidden("live-log read job mismatch"));
     }
@@ -215,7 +221,17 @@ pub async fn live_run_logs_sse(
                 }
             }
         };
-    live_log_stream(&shared, run_id, &job_id).await
+    // Backend: one indexed lookup for the run-scoped live-log key; the
+    // stream then follows that exact attempt rather than re-resolving it.
+    let key = shared
+        .state
+        .backend
+        .live_log_key(run_id, &job_id)
+        .await
+        .map_err(ApiError::from)?
+        .map(|(key, _)| key)
+        .ok_or_else(|| ApiError::not_found("job not found"))?;
+    live_log_stream(&shared, run_id, &job_id, &key).await
 }
 
 /// `key` is the concrete live-log key the caller was authorized for; the
@@ -225,10 +241,16 @@ async fn live_log_stream(
     shared: &Arc<SharedState>,
     run_id: RunId,
     job_id: &str,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    // Backend: one indexed lookup for the live-log key plus the run/job
-    // terminal flag.
-    let (key, run_terminal) = shared
+    key: &str,
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>>,
+    ApiError,
+> {
+    // Backend: the run/job terminal flag for this selector. Only the flag is
+    // read — `key` is the caller's already-authorized concrete key and is not
+    // re-resolved, or a retry between the authorization check and here would
+    // redirect the stream to an attempt that never passed the check.
+    let (_, run_terminal) = shared
         .state
         .backend
         .live_log_key(run_id, job_id)
@@ -240,10 +262,14 @@ async fn live_log_stream(
     // is closed (`live_log_*` are node-local).
     let (snapshot, subscription) = {
         let mut inner = shared.state.inner.lock().await;
-        let lines_arc = inner.live_log_lines.entry(key.clone()).or_default().clone();
+        let lines_arc = inner
+            .live_log_lines
+            .entry(key.to_owned())
+            .or_default()
+            .clone();
         let lines = lines_arc.lock().await;
         let snapshot = lines.clone();
-        let closed = inner.live_log_closed.contains(&key) || run_terminal;
+        let closed = inner.live_log_closed.contains(key) || run_terminal;
         let subscription = if closed {
             None
         } else {
@@ -336,13 +362,19 @@ pub async fn ws_live_logs(
         let agent_job_id = job_id
             .parse::<uuid::Uuid>()
             .map_err(|_| ApiError::forbidden("live-log ingest job mismatch"))?;
-        let request = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .agent_job_requests
-                .get(&agent_job_id)
-                .copied()
-                .and_then(|request_id| inner.job_requests.get(&request_id).cloned())
+        // Backend: resolve the agent job id to its request record so the
+        // credential can be checked against the job it names.
+        let request = match shared
+            .state
+            .backend
+            .request(crate::control::backend::RequestKey::AgentJobId(
+                agent_job_id,
+            ))
+            .await
+        {
+            Ok(record) => Some(record),
+            Err(crate::control::ControlError::NotFound(_)) => None,
+            Err(error) => return Err(ApiError::from(error)),
         };
         // Unresolved and foreign targets share one generic 403: distinct
         // messages would reveal whether the job UUID resolves.

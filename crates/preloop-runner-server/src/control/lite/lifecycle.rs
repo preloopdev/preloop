@@ -9,13 +9,13 @@
 //! away; every conditional `WHERE` stays.
 
 use super::codec::{self, now_us};
-use super::{concurrency, db, jobs, promote, settle, LiteBackend};
-use crate::control::backend::{self, event_run_id, ReconcileOutcome};
+use super::{LiteBackend, concurrency, db, jobs, promote, settle};
+use crate::control::backend::{self, ReconcileOutcome, event_run_id};
 use crate::control::logic;
 use crate::control::types::*;
 use crate::models::RunnerCapabilities;
 use preloop_gha_protocol::{JobId, RegisteredRunner, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
 /// Columns [`runner_row`] decodes from `runners`.
@@ -1167,6 +1167,167 @@ impl LiteBackend {
                     promote::on_job_enqueued(tx, self, &job)?;
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// `set_fork_approval`: write the run's fork-PR hold stamps. Scoped to
+    /// the `runs` row (the expiry sweep filters on these columns); callers
+    /// own promotion/fail-closed effects.
+    pub(crate) async fn set_fork_approval(
+        &self,
+        update: ForkApprovalStamp,
+    ) -> Result<(), ControlError> {
+        self.write(|tx| {
+            tx.prepare_cached(
+                "UPDATE runs SET fork_approval_pending = ?2, \
+                     fork_approval_requested_at = ?3, \
+                     fork_approval_approved_at = ?4, \
+                     fork_approval_note = ?5 \
+                 WHERE run_id = ?1",
+            )
+            .map_err(db)?
+            .execute(params![
+                codec::run_key(update.run_id),
+                update.pending as i64,
+                update.requested_at_unix_nanos,
+                update.approved_at_unix_nanos,
+                update.note,
+            ])
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// `set_environment_gate`: write one job's environment protection gate
+    /// state (`None` clears it). The JSON blob round-trips through `jobs`
+    /// so a restart re-arms an armed gate (fail closed).
+    pub(crate) async fn set_environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        gate: Option<crate::models::EnvironmentGateState>,
+    ) -> Result<(), ControlError> {
+        self.write(|tx| {
+            let gate_json = gate
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(ControlError::backend)?;
+            tx.prepare_cached(
+                "UPDATE jobs SET environment_gate = ?3 WHERE run_id = ?1 AND job_id = ?2",
+            )
+            .map_err(db)?
+            .execute(params![codec::run_key(run_id), job_id.0, gate_json])
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// `record_environment_approval`: append one operator approval to a job
+    /// parked on its environment's required-reviewer gate, then re-run the
+    /// run's promotion pass so a satisfied gate releases the job.
+    ///
+    /// A window that has already lapsed records nothing: the promotion pass
+    /// (run next) re-evaluates the same window and settles the job
+    /// `Failure` — one fail-closed decision over the durable rows.
+    pub(crate) async fn record_environment_approval(
+        &self,
+        approval: EnvironmentApproval,
+    ) -> Result<EnvironmentApprovalOutcome, ControlError> {
+        let rules = self.environment_rules();
+        let tx_rules = rules.clone();
+        let run_id = approval.run_id;
+        let job_id = approval.job_id;
+        let note = approval.note.clone();
+        let now = crate::models::now_unix_nanos();
+        let result = self.write(move |tx| {
+            let repository: String = tx
+                .prepare_cached("SELECT repository FROM runs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([codec::run_key(run_id)], |row| row.get(0))
+                .optional()
+                .map_err(db)?
+                .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
+            let job = jobs::job(tx, run_id, &job_id)?
+                .ok_or_else(|| ControlError::NotFound("job not found".to_owned()))?;
+            if job.status.is_terminal() {
+                return Ok(EnvironmentApprovalResult::AlreadyTerminal);
+            }
+            let spec = jobs::load_spec(tx, run_id, &job_id)?;
+            let environment = spec.and_then(|spec| spec.environment);
+            let Some(env_name) =
+                crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
+            else {
+                return Ok(EnvironmentApprovalResult::NotAwaiting);
+            };
+            let required = tx_rules
+                .get(&repository)
+                .and_then(|envs| envs.get(env_name))
+                .map(|rule| rule.required_reviewers)
+                .unwrap_or(0);
+            let Some(mut gate) = job.environment_gate.clone() else {
+                return Ok(EnvironmentApprovalResult::NotAwaiting);
+            };
+            let Some(requested_at) = gate.approval_requested_at_unix_nanos else {
+                return Ok(EnvironmentApprovalResult::NotAwaiting);
+            };
+            if required == 0 {
+                return Ok(EnvironmentApprovalResult::NotAwaiting);
+            }
+            if now.saturating_sub(requested_at)
+                > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
+            {
+                return Ok(EnvironmentApprovalResult::Expired);
+            }
+            gate.approvals_unix_nanos.push(now);
+            let approvals = gate.approvals_unix_nanos.len();
+            let satisfied = (approvals as u32) >= required;
+            let gate_json = serde_json::to_string(&gate).map_err(ControlError::backend)?;
+            tx.prepare_cached(
+                "UPDATE jobs SET environment_gate = ?3 WHERE run_id = ?1 AND job_id = ?2",
+            )
+            .map_err(db)?
+            .execute(params![codec::run_key(run_id), job_id.0, gate_json])
+            .map_err(db)?;
+            tracing::info!(
+                run_id = %run_id.0,
+                job_id = %job_id.0,
+                environment = env_name,
+                approvals,
+                required,
+                note = note.as_deref().unwrap_or_default(),
+                "environment approval recorded"
+            );
+            Ok(EnvironmentApprovalResult::Recorded {
+                approvals,
+                required,
+                satisfied,
+            })
+        })?;
+        // Release or fail closed over the run's durable rows: a satisfied gate
+        // unparks the job, an expired window settles it Failure (and its
+        // dependents).
+        let promote = self.promote_ready_jobs(Some(run_id), &rules).await?;
+        Ok(EnvironmentApprovalOutcome {
+            result,
+            queue_depth: promote.queue_depth,
+            next_runs_on: promote.next_runs_on,
+            promoted: promote.promoted,
+        })
+    }
+    /// `set_reports_check_runs`: stamp whether intake reported GitHub check
+    /// runs for this run (the late check-run mint gate).
+    pub(crate) async fn set_reports_check_runs(
+        &self,
+        run_id: RunId,
+        reported: bool,
+    ) -> Result<(), ControlError> {
+        self.write(|tx| {
+            tx.prepare_cached("UPDATE runs SET reports_check_runs = ?2 WHERE run_id = ?1")
+                .map_err(db)?
+                .execute(params![codec::run_key(run_id), reported as i64])
+                .map_err(db)?;
             Ok(())
         })
     }

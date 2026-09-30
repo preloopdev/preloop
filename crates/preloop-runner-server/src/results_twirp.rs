@@ -119,17 +119,17 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
         }),
         crate::memory_caps::PENDING_UPLOAD_TTL,
     )?;
+    // Re-check liveness against the backend before minting an upload
+    // credential: the job may have settled between the gate and now.
+    if let crate::auth::ResultsIdentity::Job(job) = &identity
+        && !crate::auth::job_is_live(&shared.state, job.job_id).await?
+    {
+        return Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ));
+    }
     {
         let mut inner = shared.state.inner.lock().await;
-        // In-lock re-check: the job may have settled between the gate and
-        // this lock — a settled job must not mint a fresh upload credential.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity
-            && !crate::auth::job_is_live_locked(&inner, job.job_id)
-        {
-            return Err(ApiError::forbidden(
-                "job is not live; writes are rejected for completed or unknown jobs",
-            ));
-        }
         // Per-job cap, same bound as the other pending maps: a live job can
         // otherwise mint unlimited diag URLs for the full TTL. Evict the
         // oldest token for this job rather than rejecting — the runner may
@@ -771,20 +771,18 @@ pub async fn twirp_cache_v2_create(
         .await
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
     let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
+    // Re-check liveness against the backend: a settled job must not mint a
+    // fresh upload credential.
+    if let crate::auth::ResultsIdentity::Job(job) = &identity
+        && !crate::auth::job_is_live(&shared.state, job.job_id).await?
+    {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ));
+    }
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
-        // In-lock re-check: the job may have settled between the gate above
-        // and this lock acquisition — a settled job must not mint a fresh
-        // upload credential in that window.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity
-            && !crate::auth::job_is_live_locked(&inner, job.job_id)
-        {
-            drop(inner);
-            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-            return Err(ApiError::forbidden(
-                "job is not live; writes are rejected for completed or unknown jobs",
-            ));
-        }
         if inner
             .cache_v2_pending
             .values()
@@ -1300,75 +1298,150 @@ mod cache_pb_tests {
             .unwrap()
     }
 
-    async fn bind_job_to_repository(state: &AppState, job_id: uuid::Uuid, repository: &str) {
+    /// Monotonic fixture run numbers: the schema enforces
+    /// `UNIQUE (namespace, repository, workflow_path, run_number, run_attempt)`,
+    /// so two seeds inside one test must not reuse a number.
+    static NEXT_SEEDED_RUN_NUMBER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    /// Seed a live run carrying one job attempt bound to `job_id`, through
+    /// the control backend — the authoritative writer, since the cutover left
+    /// no in-memory mirror to insert into. The request's `agent_job_id` is
+    /// what the job → run → submission lookups key on, and the submitted run
+    /// record supplies the submission the cache scoping reads back.
+    async fn seed_job_attempt(
+        state: &AppState,
+        job_id: uuid::Uuid,
+        request_id: i64,
+        submission: WorkflowSubmission,
+    ) {
         let run_id = RunId::new();
-        let request_id = 1;
-        let mut inner = state.inner.lock().await;
-        inner.agent_job_requests.insert(job_id, request_id);
-        inner.job_requests.insert(
-            request_id,
-            TaskAgentJobRequestRecord {
-                request_id,
-                run_id,
-                job_id: JobId("build".to_owned()),
-                agent_job_id: job_id,
-                plan_id: job_id.to_string(),
-                plan_type: "plan".to_owned(),
-                timeline_id: uuid::Uuid::new_v4(),
-                result: None,
-                locked_until: String::new(),
-                owner_runner_id: None,
-                started_at: None,
-                last_renewed_at: None,
-                timeout_triggered: false,
-                claimed_at: None,
-                debug_token_issued: false,
-            },
-        );
-        let submission = WorkflowSubmission {
-            repository: repository.to_owned(),
-            ..Default::default()
-        };
-        inner.runs.insert(
+        let nanos = crate::models::now_unix_nanos();
+        let record = RunRecord {
             run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: None,
-                run_name: None,
-                submission: Arc::new(submission),
-                jobs: BTreeMap::new(),
-                status: ExecutionStatus::InProgress,
-                job_outputs: BTreeMap::new(),
-                job_base_ids: BTreeMap::new(),
-                job_needs: BTreeMap::new(),
-                caller_plans: BTreeMap::new(),
-                job_names: BTreeMap::new(),
-                github: serde_json::Value::Null,
-                head_sha: String::new(),
-                workflow_ref: String::new(),
-                workspace_snapshot: None,
-                job_fail_fast: BTreeMap::new(),
-                job_continue_on_error: BTreeMap::new(),
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls: BTreeMap::new(),
-                jobs_list: Vec::new(),
-                created_at: chrono::Utc::now(),
-                started_at: None,
-                completed_at: None,
-                run_number: 1,
-                run_attempt: 1,
-                workflow_path_str: String::new(),
-                event: "push".to_owned(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing: None,
-                fork_approval_pending: false,
-                fork_approval_requested_at_unix_nanos: None,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
+            webhook_delivery_id: None,
+            run_name: None,
+            submission: Arc::new(submission),
+            jobs: BTreeMap::new(),
+            status: ExecutionStatus::InProgress,
+            job_outputs: BTreeMap::new(),
+            job_base_ids: BTreeMap::new(),
+            job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
+            job_check_run_ids: BTreeMap::new(),
+            reports_check_runs: false,
+            reusable_calls: BTreeMap::new(),
+            jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            run_number: NEXT_SEEDED_RUN_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            run_attempt: 1,
+            workflow_path_str: String::new(),
+            event: "push".to_owned(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing: None,
+            fork_approval_pending: false,
+            fork_approval_requested_at_unix_nanos: None,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
+        };
+        let job_id_owned = JobId("build".to_owned());
+        let queued = QueuedJob {
+            run_id,
+            job_id: job_id_owned.clone(),
+            base_id: "build".to_owned(),
+            created_at_unix_nanos: nanos,
+            dependencies_ready_at_unix_nanos: Some(nanos),
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
+            enqueued_at_unix_nanos: nanos,
+            needs: Vec::new(),
+            if_condition: None,
+            condition_context: preloop_gha_expressions::Context::default(),
+            max_parallel: None,
+            runs_on: vec!["self-hosted".to_owned()],
+            runner_group: None,
+            environment: None,
+            message: serde_json::from_value(serde_json::json!({
+                "jobId": job_id,
+                "requestId": request_id,
+                "plan": {"planId": job_id.to_string(), "planType": "build", "version": 1, "artifactUri": "", "artifactLocation": ""},
+                "timeline": {"id": uuid::Uuid::new_v4(), "changeId": 0, "location": null},
+                "jobName": "build",
+                "lockedUntil": "",
+                "resources": {"endpoints": []},
+                "steps": [],
+                "snapshot": null
+            }))
+            .unwrap(),
+            concurrency: None,
+            matrix: BTreeMap::new(),
+            deferred_matrix: None,
+            reusable_call: None,
+            environment_gate: None,
+        };
+        // The row's correlation id is allocated by the backend; only the
+        // `agent_job_id` → run mapping matters for job-token resolution.
+        let request = TaskAgentJobRequestRecord {
+            request_id,
+            run_id,
+            job_id: job_id_owned,
+            agent_job_id: job_id,
+            plan_id: job_id.to_string(),
+            plan_type: "plan".to_owned(),
+            timeline_id: uuid::Uuid::new_v4(),
+            result: None,
+            locked_until: String::new(),
+            owner_runner_id: None,
+            started_at: None,
+            last_renewed_at: None,
+            timeout_triggered: false,
+            claimed_at: None,
+            debug_token_issued: false,
+        };
+        state
+            .backend
+            .submit_run(crate::control::types::SubmitRun {
+                namespace: "default".to_owned(),
+                record,
+                jobs: vec![crate::control::types::SubmitJob {
+                    queued,
+                    request: Some(request),
+                    token_request: None,
+                    id_token_granted: false,
+                    oidc_context: None,
+                    step_manifest: Vec::new(),
+                    initially_skipped: false,
+                }],
+                workflow_concurrency: None,
+                empty_concurrency_group: false,
+                check_hostable: false,
+            })
+            .await
+            .expect("seed submit_run");
+    }
+
+    /// Bind a job token to a live run in `repository`.
+    async fn bind_job_to_repository(state: &AppState, job_id: uuid::Uuid, repository: &str) {
+        seed_job_attempt(
+            state,
+            job_id,
+            1,
+            WorkflowSubmission {
+                repository: repository.to_owned(),
+                ..Default::default()
             },
-        );
+        )
+        .await;
     }
 
     /// Bind a job token to a live run whose submission carries `repository`
@@ -1403,74 +1476,18 @@ mod cache_pb_tests {
         git_ref: &str,
         payload: serde_json::Value,
     ) {
-        let run_id = RunId::new();
-        let mut inner = state.inner.lock().await;
-        inner.agent_job_requests.insert(job_id, request_id);
-        inner.job_requests.insert(
+        seed_job_attempt(
+            state,
+            job_id,
             request_id,
-            TaskAgentJobRequestRecord {
-                request_id,
-                run_id,
-                job_id: JobId("build".to_owned()),
-                agent_job_id: job_id,
-                plan_id: job_id.to_string(),
-                plan_type: "plan".to_owned(),
-                timeline_id: uuid::Uuid::new_v4(),
-                result: None,
-                locked_until: String::new(),
-                owner_runner_id: None,
-                started_at: None,
-                last_renewed_at: None,
-                timeout_triggered: false,
-                claimed_at: None,
-                debug_token_issued: false,
+            WorkflowSubmission {
+                repository: repository.to_owned(),
+                git_ref: git_ref.to_owned(),
+                payload,
+                ..Default::default()
             },
-        );
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: None,
-                run_name: None,
-                submission: Arc::new(WorkflowSubmission {
-                    repository: repository.to_owned(),
-                    git_ref: git_ref.to_owned(),
-                    payload,
-                    ..Default::default()
-                }),
-                jobs: BTreeMap::new(),
-                status: ExecutionStatus::InProgress,
-                job_outputs: BTreeMap::new(),
-                job_base_ids: BTreeMap::new(),
-                job_needs: BTreeMap::new(),
-                caller_plans: BTreeMap::new(),
-                job_names: BTreeMap::new(),
-                github: serde_json::Value::Null,
-                head_sha: String::new(),
-                workflow_ref: String::new(),
-                workspace_snapshot: None,
-                job_fail_fast: BTreeMap::new(),
-                job_continue_on_error: BTreeMap::new(),
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls: BTreeMap::new(),
-                jobs_list: Vec::new(),
-                created_at: chrono::Utc::now(),
-                started_at: None,
-                completed_at: None,
-                run_number: 1,
-                run_attempt: 1,
-                workflow_path_str: String::new(),
-                event: "push".to_owned(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing: None,
-                fork_approval_pending: false,
-                fork_approval_requested_at_unix_nanos: None,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
-            },
-        );
+        )
+        .await;
     }
 
     #[tokio::test]

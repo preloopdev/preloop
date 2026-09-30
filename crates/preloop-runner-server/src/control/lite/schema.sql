@@ -89,6 +89,15 @@ CREATE TABLE runs (
     concurrency_group       TEXT,
     concurrency_cancel_in_progress INTEGER NOT NULL DEFAULT 0,
     event_seq               INTEGER NOT NULL DEFAULT 0,
+    -- Fork-PR policy: the run is held at scheduler admission until the
+    -- operator approves it; a hold past the window fails closed (reaper).
+    -- Real columns so the expiry sweep filters in SQL.
+    fork_approval_pending   INTEGER NOT NULL DEFAULT 0,
+    fork_approval_requested_at INTEGER,
+    fork_approval_approved_at  INTEGER,
+    fork_approval_note      TEXT,
+    -- Intake reported GitHub check runs for this run (late check-run mint).
+    reports_check_runs      INTEGER NOT NULL DEFAULT 0,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     started_at              INTEGER,
     completed_at            INTEGER
@@ -163,6 +172,10 @@ CREATE TABLE jobs (
     outputs                 TEXT,
     annotations             TEXT,
     check_run_id            INTEGER,
+    -- Environment protection gate state (`EnvironmentGateState` JSON): armed
+    -- at scheduler admission, updated on approval, cleared when satisfied.
+    -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
+    environment_gate        TEXT,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     deps_ready_at           INTEGER,
     concurrency_wait_at     INTEGER,
@@ -555,6 +568,11 @@ CREATE TABLE run_history (
     conclusion              TEXT,
     submission              TEXT NOT NULL,
     record_details          TEXT NOT NULL DEFAULT '{}',
+    fork_approval_pending   INTEGER NOT NULL DEFAULT 0,
+    fork_approval_requested_at INTEGER,
+    fork_approval_approved_at  INTEGER,
+    fork_approval_note      TEXT,
+    reports_check_runs      INTEGER NOT NULL DEFAULT 0,
     created_at              INTEGER NOT NULL,
     started_at              INTEGER,
     completed_at            INTEGER,

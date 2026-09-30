@@ -14,6 +14,7 @@
 
 use super::backend::*;
 use super::types::*;
+use crate::config::EnvironmentRulesMap;
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::collections::BTreeMap;
@@ -69,6 +70,11 @@ fn run_record(run_id: RunId) -> RunRecord {
         conclusion: None,
         push_state: None,
         snapshot_timing: None,
+        fork_approval_pending: false,
+        fork_approval_requested_at_unix_nanos: None,
+        fork_approved_at_unix_nanos: None,
+        fork_approval_note: None,
+        reports_check_runs: false,
     }
 }
 
@@ -133,6 +139,7 @@ fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
         matrix: BTreeMap::new(),
         deferred_matrix: None,
         reusable_call: None,
+        environment_gate: None,
     }
 }
 
@@ -358,6 +365,62 @@ pub(crate) mod suite {
         assert_eq!((inputs.runner_busy, inputs.runner_stale), (0, 0));
     }
 
+    /// The pool's busy gauge counts only busy runners the pool proved: a
+    /// runner registered outside the pool holding an active request is busy,
+    /// but not a pool machine. `PoolSnapshot.busy` previously had no writer
+    /// at all, so `preloop status` reported `pool busy: 0` while pool
+    /// machines ran jobs.
+    pub(crate) async fn pool_busy_counts_only_pool_proven_busy_runners(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut pool_registration = register_runner("pool-1");
+        pool_registration.pool_proven = true;
+        let pool_runner = backend.register_runner(pool_registration).await.unwrap();
+        let external = backend
+            .register_runner(register_runner("external-1"))
+            .await
+            .unwrap();
+        let pool_session = backend
+            .create_session(create_session(pool_runner.runner.id))
+            .await
+            .unwrap();
+        let external_session = backend
+            .create_session(create_session(external.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "one", 1), submit_job(run_id, "two", 2)],
+            ))
+            .await
+            .unwrap();
+        for (session_id, runner_id) in [
+            (&pool_session.session_id, pool_runner.runner.id),
+            (&external_session.session_id, external.runner.id),
+        ] {
+            let poll = backend
+                .poll_session(poll(session_id, runner_id))
+                .await
+                .unwrap();
+            assert!(
+                matches!(poll, PollOutcome::Claimed(_)),
+                "expected a claim, got {poll:?}"
+            );
+        }
+
+        let inputs = backend
+            .status_inputs(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(inputs.runner_busy, 2, "both runners hold an active request");
+        assert_eq!(
+            inputs.pool_busy, 1,
+            "only the pool-proven runner counts toward pool busy"
+        );
+    }
+
     pub(crate) async fn submit_poll_complete_lifecycle(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -454,43 +517,47 @@ pub(crate) mod suite {
 
         // In-progress report: renders the name, stamps start, keeps the
         // declared workflow step's runner number when absent.
-        assert!(backend
-            .report_steps(
-                &plan,
-                agent,
-                vec![serde_json::json!({
-                    "external_id": "step-1",
-                    "number": 2,
-                    "name": "Run build",
-                    "status": 2,
-                    "conclusion": 0
-                })],
-            )
-            .await
-            .unwrap());
-        // Terminal report on a second, undeclared step + a name-less update.
-        assert!(backend
-            .report_steps(
-                &plan,
-                agent,
-                vec![
-                    serde_json::json!({
+        assert!(
+            backend
+                .report_steps(
+                    &plan,
+                    agent,
+                    vec![serde_json::json!({
                         "external_id": "step-1",
-                        "name": "",
-                        "status": 6,
-                        "conclusion": 2
-                    }),
-                    serde_json::json!({
-                        "external_id": "step-9",
-                        "number": 5,
-                        "name": "Post job",
-                        "status": 6,
-                        "conclusion": 2
-                    }),
-                ],
-            )
-            .await
-            .unwrap());
+                        "number": 2,
+                        "name": "Run build",
+                        "status": 2,
+                        "conclusion": 0
+                    })],
+                )
+                .await
+                .unwrap()
+        );
+        // Terminal report on a second, undeclared step + a name-less update.
+        assert!(
+            backend
+                .report_steps(
+                    &plan,
+                    agent,
+                    vec![
+                        serde_json::json!({
+                            "external_id": "step-1",
+                            "name": "",
+                            "status": 6,
+                            "conclusion": 2
+                        }),
+                        serde_json::json!({
+                            "external_id": "step-9",
+                            "number": 5,
+                            "name": "Post job",
+                            "status": 6,
+                            "conclusion": 2
+                        }),
+                    ],
+                )
+                .await
+                .unwrap()
+        );
         let manifests = backend.run_step_manifests(run_id).await.unwrap();
         let steps = manifests.get(&agent).expect("manifest for the attempt");
         let s1 = steps.iter().find(|s| s.id == "step-1").expect("step-1");
@@ -506,14 +573,16 @@ pub(crate) mod suite {
         );
 
         // An unresolvable identity acknowledges and drops the report.
-        assert!(!backend
-            .report_steps(
-                "no-such-plan",
-                uuid::Uuid::new_v4(),
-                vec![serde_json::json!({"external_id": "x", "status": 6})],
-            )
-            .await
-            .unwrap());
+        assert!(
+            !backend
+                .report_steps(
+                    "no-such-plan",
+                    uuid::Uuid::new_v4(),
+                    vec![serde_json::json!({"external_id": "x", "status": 6})],
+                )
+                .await
+                .unwrap()
+        );
     }
 
     pub(crate) async fn webhook_replay_is_idempotent(backend: &dyn ControlBackend) {
@@ -699,9 +768,11 @@ pub(crate) mod suite {
         match poll {
             PollOutcome::Cancel(message) => {
                 assert_eq!(message.message_type, "JobCancellation");
-                assert!(message
-                    .body
-                    .contains(&claimed.request.agent_job_id.to_string()));
+                assert!(
+                    message
+                        .body
+                        .contains(&claimed.request.agent_job_id.to_string())
+                );
             }
             other => panic!("expected cancel, got {other:?}"),
         }
@@ -763,14 +834,18 @@ pub(crate) mod suite {
         let claim = backend.claim_webhook_deliveries(1, 60).await.unwrap();
         assert_eq!(claim.len(), 1);
         let token = claim[0].lease_token.clone().unwrap();
-        assert!(!backend
-            .renew_webhook_delivery("d1", "stale", 60)
-            .await
-            .unwrap());
-        assert!(backend
-            .complete_webhook_delivery("d1", &token)
-            .await
-            .unwrap());
+        assert!(
+            !backend
+                .renew_webhook_delivery("d1", "stale", 60)
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .complete_webhook_delivery("d1", &token)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             backend
                 .get_webhook_delivery("d1")
@@ -803,6 +878,13 @@ pub(crate) mod suite {
             pack_bytes: 99,
         });
         expected.job_fail_fast.insert("build".to_owned(), true);
+        // Fork-PR hold + late check-run reporting must survive persist/reload
+        // on both backends (real `runs` columns, not record_details).
+        expected.fork_approval_requested_at_unix_nanos = Some(1_700_000_000_000_002_000);
+        expected.fork_approved_at_unix_nanos = Some(1_700_000_000_000_003_000);
+        expected.fork_approval_note = Some("approved by operator".to_owned());
+        expected.fork_approval_pending = false;
+        expected.reports_check_runs = true;
         let build = JobId("build".to_owned());
         expected
             .job_base_ids
@@ -831,6 +913,191 @@ pub(crate) mod suite {
         // compare the projected record against the committed timestamp.
         expected.created_at = loaded.created_at;
         super::assert_same_run(&loaded, &expected);
+    }
+
+    /// The environment protection gate blob round-trips through `jobs` on
+    /// both backends: an armed gate (wait deadline, approval request stamp,
+    /// recorded approvals) reloads byte-identical, and clearing it reloads
+    /// as no gate. This is the fail-closed persistence contract — a lost
+    /// gate would silently release a protected job.
+    pub(crate) async fn environment_gate_round_trips(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]))
+            .await
+            .unwrap();
+        let gate = crate::models::EnvironmentGateState {
+            wait_until_unix_nanos: Some(1_700_000_000_000_000_000),
+            approval_requested_at_unix_nanos: Some(1_700_000_000_000_001_000),
+            approvals_unix_nanos: vec![1_700_000_000_000_002_000],
+        };
+        backend
+            .set_environment_gate(run_id, &job_id, Some(gate.clone()))
+            .await
+            .unwrap();
+        let armed = backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists");
+        assert_eq!(armed.gate, Some(gate));
+        backend
+            .set_environment_gate(run_id, &job_id, None)
+            .await
+            .unwrap();
+        let cleared = backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists");
+        assert_eq!(cleared.gate, None);
+    }
+
+    /// The fork-PR approval hold parks a run's jobs at submit and the release
+    /// admits them: while `fork_approval_pending` is set nothing reaches the
+    /// ready queue, and clearing the hold plus a `promote_ready_jobs` pass
+    /// puts the run's jobs on it. This is the policy's security contract — a
+    /// hold that does not hold would run untrusted fork code without an
+    /// operator go-ahead.
+    pub(crate) async fn fork_hold_parks_until_released(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let job_id = JobId("build".to_owned());
+        let requested_at = crate::models::now_unix_nanos();
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", 1)]);
+        submit.record.fork_approval_pending = true;
+        submit.record.fork_approval_requested_at_unix_nanos = Some(requested_at);
+        backend.submit_run(submit).await.unwrap();
+
+        assert_eq!(
+            backend.queue_stats().await.unwrap().ready,
+            0,
+            "a fork-held run must not queue a job"
+        );
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned())),
+            "the job parks at admission"
+        );
+        let run = backend.run_record(run_id).await.unwrap();
+        assert!(run.fork_approval_pending, "the hold is durable");
+        assert_eq!(
+            run.fork_approval_requested_at_unix_nanos,
+            Some(requested_at)
+        );
+
+        // Release: the hold clears, and the run's parked jobs are admitted.
+        backend
+            .set_fork_approval(ForkApprovalStamp {
+                run_id,
+                pending: false,
+                requested_at_unix_nanos: Some(requested_at),
+                approved_at_unix_nanos: Some(crate::models::now_unix_nanos()),
+                note: Some("lgtm".to_owned()),
+            })
+            .await
+            .unwrap();
+        let outcome = backend
+            .promote_ready_jobs(Some(run_id), &EnvironmentRulesMap::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.promoted, 1, "the released hold admits the job");
+        assert_eq!(outcome.queue_depth, 1);
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned()))
+        );
+        let run = backend.run_record(run_id).await.unwrap();
+        assert!(!run.fork_approval_pending);
+        assert_eq!(run.fork_approval_note.as_deref(), Some("lgtm"));
+    }
+
+    /// An armed environment protection gate keeps its job parked until the
+    /// gate admits it: an unexpired wait timer holds, the elapsed timer
+    /// releases, and a ref outside `deployment_branches` fails the job closed.
+    /// The job never dispatches on a gate that did not pass.
+    pub(crate) async fn environment_gate_parks_until_satisfied(backend: &dyn ControlBackend) {
+        let rules = |rule: crate::config::EnvironmentRules| {
+            let mut rules = EnvironmentRulesMap::new();
+            rules
+                .entry("owner/repo".to_owned())
+                .or_default()
+                .insert("prod".to_owned(), rule);
+            rules
+        };
+        let gate = |wait_until_unix_nanos: Option<i64>| crate::models::EnvironmentGateState {
+            wait_until_unix_nanos,
+            approval_requested_at_unix_nanos: None,
+            approvals_unix_nanos: Vec::new(),
+        };
+        let now = crate::models::now_unix_nanos();
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        submit.jobs[0].queued.environment_gate = Some(gate(Some(now + 60_000_000_000)));
+        backend.submit_run(submit).await.unwrap();
+        assert_eq!(backend.queue_stats().await.unwrap().ready, 0);
+
+        let wait_timer = rules(crate::config::EnvironmentRules {
+            deployment_branches: Vec::new(),
+            wait_timer_minutes: 1,
+            required_reviewers: 0,
+        });
+        // The wait timer has not elapsed: the job stays parked.
+        let outcome = backend
+            .promote_ready_jobs(Some(run_id), &wait_timer)
+            .await
+            .unwrap();
+        assert_eq!(outcome.promoted, 0, "an unexpired wait timer holds the job");
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned()))
+        );
+        // An elapsed deadline: the same sweep releases the job.
+        backend
+            .set_environment_gate(run_id, &job_id, Some(gate(Some(now - 1))))
+            .await
+            .unwrap();
+        let outcome = backend
+            .promote_ready_jobs(Some(run_id), &wait_timer)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.promoted, 1,
+            "the elapsed wait timer releases the job"
+        );
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned()))
+        );
+
+        // A ref outside `deployment_branches` fails the job closed.
+        let refused_run = RunId::new();
+        let refused_job = JobId("deploy".to_owned());
+        let mut submit = submit_run(refused_run, vec![submit_job(refused_run, "deploy", 2)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        backend.submit_run(submit).await.unwrap();
+        let branches = rules(crate::config::EnvironmentRules {
+            deployment_branches: vec!["main".to_owned()],
+            wait_timer_minutes: 0,
+            required_reviewers: 0,
+        });
+        let outcome = backend
+            .promote_ready_jobs(Some(refused_run), &branches)
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed, 1, "a denied ref fails the job closed");
+        assert_eq!(
+            backend
+                .job_queue_state(refused_run, &refused_job)
+                .await
+                .unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "a denied job never dispatches"
+        );
     }
 
     pub(crate) async fn concurrency_gate_serializes_group(backend: &dyn ControlBackend) {
@@ -1349,7 +1616,7 @@ async fn fresh_database() -> (PgGuard, String) {
 
 mod pg {
     use super::*;
-    use super::{fresh_database, PgGuard};
+    use super::{PgGuard, fresh_database};
     use crate::control::pg::PgBackend;
 
     async fn connect(url: &str) -> PgBackend {
@@ -1385,6 +1652,12 @@ mod pg {
     async fn sessionless_runner_is_not_idle_capacity() {
         let (_pg, backend) = backend().await;
         suite::sessionless_runner_is_not_idle_capacity(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn pool_busy_counts_only_pool_proven_busy_runners() {
+        let (_pg, backend) = backend().await;
+        suite::pool_busy_counts_only_pool_proven_busy_runners(&backend).await;
     }
 
     #[tokio::test]
@@ -1433,6 +1706,24 @@ mod pg {
     async fn run_record_round_trips_through_tables() {
         let (_pg, backend) = backend().await;
         suite::run_record_round_trips_through_tables(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn environment_gate_round_trips() {
+        let (_pg, backend) = backend().await;
+        suite::environment_gate_round_trips(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn fork_hold_parks_until_released() {
+        let (_pg, backend) = backend().await;
+        suite::fork_hold_parks_until_released(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn environment_gate_parks_until_satisfied() {
+        let (_pg, backend) = backend().await;
+        suite::environment_gate_parks_until_satisfied(&backend).await;
     }
 
     #[tokio::test]
@@ -1632,6 +1923,12 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn pool_busy_counts_only_pool_proven_busy_runners() {
+        suite::pool_busy_counts_only_pool_proven_busy_runners(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
     async fn step_reports_merge_into_manifest() {
         suite::step_reports_merge_into_manifest(&LiteBackend::in_memory().unwrap()).await;
     }
@@ -1676,6 +1973,21 @@ mod lite {
     #[tokio::test]
     async fn run_record_round_trips_through_tables() {
         suite::run_record_round_trips_through_tables(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn environment_gate_round_trips() {
+        suite::environment_gate_round_trips(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn fork_hold_parks_until_released() {
+        suite::fork_hold_parks_until_released(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn environment_gate_parks_until_satisfied() {
+        suite::environment_gate_parks_until_satisfied(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]

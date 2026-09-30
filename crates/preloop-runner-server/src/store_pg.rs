@@ -64,4 +64,3 @@ pub fn connect_url(url: &str) -> String {
     };
     format!("{before}sslmode=require{rest}")
 }
-

@@ -14,7 +14,7 @@
 //! with mode 0600 and secret values are never echoed back by
 //! `preloop secret list` or `preloop doctor`.
 
-use crate::credential_store::{CredentialRef, CredentialStore, SecretString};
+use crate::credential_store::{CredentialRef, CredentialStore, OsCredentialStore, SecretString};
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;

@@ -7,12 +7,12 @@
 
 use super::codec::{self, now_us};
 use super::concurrency as cg;
-use super::{db, jobs, promote, settle, LiteBackend};
+use super::{LiteBackend, db, jobs, promote, settle};
 use crate::concurrency::{self, Holder};
 use crate::control::types::*;
 use crate::models::{QueuedJob, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 impl LiteBackend {
@@ -334,8 +334,10 @@ fn submit_run_tx(
     // ── Per-job classification ──────────────────────────────────────────
     let platforms = jobs::registered_platforms(tx)?;
     let mut concluded: Vec<(JobId, ExecutionStatus, Option<String>)> = Vec::new();
+    // `inserted` counts `jobs` rows (outbox detail); `queued` counts
+    // dispatchable jobs — `RunAccepted.queued_jobs` and the waiter wake.
     let mut inserted = 0usize;
-
+    let mut queued = 0usize;
     for (job_order, submit_job) in submit_jobs.into_iter().enumerate() {
         let SubmitJob {
             queued: job,
@@ -402,8 +404,13 @@ fn submit_run_tx(
             continue;
         }
 
-        // Held run: every job parks behind the workflow gate.
-        if held {
+        // A job that reaches admission behind a hold parks: the workflow
+        // gate is not this run's turn yet (`held`), the run is held by the
+        // fork-PR approval policy, or its environment protection gate is not
+        // satisfied. All three park identically — held, pending, with no
+        // concurrency wait row of their own — and are released by
+        // `promote_ready_jobs` once the hold lifts.
+        if held || record.fork_approval_pending || job.environment_gate.is_some() {
             insert_classified_job(
                 tx,
                 &namespace,
@@ -428,6 +435,7 @@ fn submit_run_tx(
                 step_manifest,
             )?;
             inserted += 1;
+            queued += 1;
             continue;
         }
 
@@ -472,6 +480,7 @@ fn submit_run_tx(
                 step_manifest,
             )?;
             inserted += 1;
+            queued += 1;
             continue;
         }
 
@@ -535,6 +544,7 @@ fn submit_run_tx(
             step_manifest,
         )?;
         inserted += 1;
+        queued += 1;
     }
 
     // Jobs inserted terminal (initially_skipped / unhostable) settle their
@@ -571,6 +581,17 @@ fn submit_run_tx(
 
     // ── Run status ──────────────────────────────────────────────────────
     let summary = jobs::summarize_run_row(tx, run_id)?;
+    if summary.is_terminal() {
+        // A run that concluded at submit took its workflow gate before
+        // classification knew it was workless: drop the hold and the
+        // recorded group so it never admits.
+        settle::release_concurrency_for_run(tx, backend, run_id)?;
+        tx.prepare_cached("UPDATE runs SET concurrency_group = NULL WHERE run_id = ?1")
+            .map_err(db)?
+            .execute([codec::run_key(run_id)])
+            .map_err(db)?;
+        held = false;
+    }
     let status = if summary.is_terminal() {
         summary
     } else if held {
@@ -599,7 +620,7 @@ fn submit_run_tx(
     Ok(SubmitOutcome {
         run_id,
         run_number: record.run_number,
-        queued_jobs: inserted,
+        queued_jobs: queued,
         status,
         concluded,
         held,
@@ -662,8 +683,11 @@ fn insert_run_row(
              run_number, run_attempt, run_name, event, ref, ref_type, head_ref, \
              base_ref, head_sha, workflow_ref, status, conclusion, \
              webhook_delivery_id, origin, actor, tree_digest, concurrency_group, \
-             concurrency_cancel_in_progress, created_at, started_at, completed_at) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25) \
+             concurrency_cancel_in_progress, fork_approval_pending, \
+             fork_approval_requested_at, fork_approval_approved_at, \
+             fork_approval_note, reports_check_runs, created_at, started_at, \
+             completed_at) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30) \
          ON CONFLICT (run_id) DO NOTHING",
     )
     .map_err(db)?
@@ -692,6 +716,11 @@ fn insert_run_row(
         workflow_concurrency
             .map(|wf| wf.cancel_in_progress as i64)
             .unwrap_or(0),
+        record.fork_approval_pending as i64,
+        record.fork_approval_requested_at_unix_nanos,
+        record.fork_approved_at_unix_nanos,
+        record.fork_approval_note,
+        record.reports_check_runs as i64,
         record.created_at.timestamp_micros(),
         record.started_at.map(|at| at.timestamp_micros()),
         record.completed_at.map(|at| at.timestamp_micros()),

@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime};
 
 // Pure helpers shared with the runtime scheduler.
 pub(crate) use crate::runtime_scheduling::{
-    aggregate_need_status, matching_need_ids, matching_need_statuses, need_context,
-    needs_json_context, DependencyDecision, SchedulingOutcome,
+    DependencyDecision, SchedulingOutcome, aggregate_need_status, matching_need_ids,
+    matching_need_statuses, need_context, needs_json_context,
 };
 
 /// Namespace used to deterministically encode legacy non-UUID session ids.

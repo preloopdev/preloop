@@ -12,12 +12,12 @@
 
 use super::codec::{self, now_us};
 use super::concurrency as cg;
-use super::{db, jobs, promote, LiteBackend};
+use super::{LiteBackend, db, jobs, promote};
 use crate::concurrency::{self, Holder};
 use crate::control::logic;
 use crate::control::types::*;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
 /// The cancellation callback `concurrency::acquire` needs: displaced
@@ -760,4 +760,130 @@ pub(super) fn settle_node(
         cancelled_siblings,
         newly_terminal_success,
     })
+}
+
+// ── Fork-PR approval window ──────────────────────────────────────────
+
+/// `expire_fork_approvals`: fail closed every run whose fork-PR approval
+/// hold lapsed before `expired_before_unix_nanos`. A held run's jobs never
+/// left admission — they carry no runner and hold nothing — so expiry turns
+/// them `failure` outright (the operator can still see why on the run),
+/// clears the hold, finalizes the run as a `failure`, drops its scheduling
+/// rows and releases its concurrency holder so the group is not wedged by a
+/// run that will never start.
+///
+/// A run whose hold stamp is missing is left held: a bookkeeping gap must
+/// not auto-fail a run, and the operator can still approve or cancel it.
+///
+/// Statements: one candidate `SELECT .. FROM runs WHERE fork_approval_pending
+/// = 1 AND status <> 'completed' AND fork_approval_requested_at < ?1` at `now
+/// = ?2`, then per run one `UPDATE jobs ..` (non-terminal → `failure`),
+/// `retire_node_requests` for its expandable nodes, one `UPDATE runs ..
+/// fork_approval_pending = 0, status = 'completed', conclusion = 'failure'`,
+/// `DELETE FROM jobsets`, the dispatch-intent clear, the concurrency release
+/// (with waiter promotion) and one `run.completed.v1` outbox row.
+pub(super) fn expire_fork_approvals_inner(
+    tx: &Transaction<'_>,
+    backend: &LiteBackend,
+    expired_before_unix_nanos: i64,
+) -> Result<Vec<RunId>, ControlError> {
+    let expired: Vec<RunId> = {
+        let mut stmt = tx
+            .prepare_cached(
+                "SELECT run_id FROM runs \
+                 WHERE fork_approval_pending = 1 AND status <> 'completed' \
+                   AND fork_approval_requested_at IS NOT NULL \
+                   AND fork_approval_requested_at < ?1 \
+                 ORDER BY run_id",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([expired_before_unix_nanos], |row| {
+                Ok(codec::run_id(&row.get::<_, String>(0)?))
+            })
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+    };
+    let now = now_us();
+    let mut failed = Vec::with_capacity(expired.len());
+    for run_id in expired {
+        let run = codec::run_key(run_id);
+        // Expandable nodes (deferred matrix parents, reusable callers) minted
+        // placeholder requests at submit even though they never ran; settle
+        // them with the node so no in-flight marker outlives the run.
+        let nodes: Vec<JobId> = {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT job_id FROM jobs WHERE run_id = ?1 \
+                       AND status NOT IN ('success','failure','cancelled','skipped','timed_out')",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map([&run], |row| Ok(JobId(row.get::<_, String>(0)?)))
+                .map_err(db)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(db)?
+        };
+        tx.prepare_cached(
+            "UPDATE jobs SET status = 'failure', queue_state = 'none', \
+                 completed_at = ?2, started_at = COALESCE(started_at, ?2), \
+                 claimed_by_runner_id = NULL, claimed_at = NULL \
+             WHERE run_id = ?1 \
+               AND status NOT IN ('success','failure','cancelled','skipped','timed_out')",
+        )
+        .map_err(db)?
+        .execute(params![run, now])
+        .map_err(db)?;
+        for job_id in &nodes {
+            if is_expandable(tx, run_id, job_id)? {
+                retire_node_requests(tx, run_id, job_id, ExecutionStatus::Failure)?;
+            }
+        }
+        let finalized = tx
+            .prepare_cached(
+                "UPDATE runs SET fork_approval_pending = 0, status = 'completed', \
+                     conclusion = 'failure', \
+                     completed_at = COALESCE(completed_at, ?2), \
+                     started_at = COALESCE(started_at, ?2) \
+                 WHERE run_id = ?1 AND status <> 'completed'",
+            )
+            .map_err(db)?
+            .execute(params![run, now])
+            .map_err(db)?;
+        if finalized == 0 {
+            // A concurrent cancel/complete won the transition: it owns the
+            // run's terminal bookkeeping, but the hold must still be gone.
+            tx.prepare_cached("UPDATE runs SET fork_approval_pending = 0 WHERE run_id = ?1")
+                .map_err(db)?
+                .execute([&run])
+                .map_err(db)?;
+            continue;
+        }
+        tx.prepare_cached("DELETE FROM jobsets WHERE run_id = ?1")
+            .map_err(db)?
+            .execute([&run])
+            .map_err(db)?;
+        jobs::clear_run_dispatch_intent(tx, run_id)?;
+        release_concurrency_for_run(tx, backend, run_id)?;
+        jobs::emit_outbox(
+            tx,
+            jobs::namespace_of(tx, run_id)?.as_str(),
+            Some(run_id),
+            "run.completed.v1",
+            serde_json::json!({"status": "failure"}),
+        )?;
+        failed.push(run_id);
+    }
+    Ok(failed)
+}
+
+impl LiteBackend {
+    /// `expire_fork_approvals`: one transaction over every run whose hold
+    /// lapsed (see [`expire_fork_approvals_inner`]). Returns the failed run
+    /// ids for the caller's event and check-run fan-out.
+    pub(crate) async fn expire_fork_approvals(
+        &self,
+        expired_before_unix_nanos: i64,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.write(move |tx| expire_fork_approvals_inner(tx, self, expired_before_unix_nanos))
+    }
 }

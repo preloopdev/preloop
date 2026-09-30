@@ -322,7 +322,9 @@ impl AppState {
                 b.test_db_mutate(f).expect("test_db_mutate failed")
             }
             crate::control::Backend::Postgres(_) => {
-                panic!("test_db_mutate is SQLite-only; drive Postgres state through ControlBackend commands")
+                panic!(
+                    "test_db_mutate is SQLite-only; drive Postgres state through ControlBackend commands"
+                )
             }
         }
     }
@@ -1883,8 +1885,8 @@ pub(crate) fn wake_waiters(notify: &Notify, ready: usize, broadcast: bool) {
 
 #[cfg(test)]
 mod wake_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     /// Five runners wait; two jobs become ready: exactly two wake. Waking

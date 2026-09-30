@@ -498,14 +498,12 @@ pub async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
     }
     {
         let mut inner = shared.state.inner.lock().await;
-        let mut abandoned_completions = Vec::new();
-        let mut purged_count = 0;
         for runner_id in &runner_ids {
             inner.runner_public_keys.remove(runner_id);
         }
     }
     info!(
-        count = purged_count,
+        count = runner_ids.len(),
         "purged restored ephemeral runner identities"
     );
     shared.state.message_notify.notify_waiters();

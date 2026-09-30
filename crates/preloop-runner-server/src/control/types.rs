@@ -137,6 +137,22 @@ pub(crate) struct WorkflowConcurrency {
     pub(crate) raw: preloop_gha_parser::Concurrency,
 }
 
+/// The fork-PR approval hold written for one run: the stamps submitted at
+/// parking, stamped again on approval, and cleared by the expiry sweep.
+/// `pending=false` with both stamps `None` releases the hold.
+#[derive(Debug, Clone)]
+pub(crate) struct ForkApprovalStamp {
+    pub(crate) run_id: RunId,
+    /// The run is still held pending an operator decision.
+    pub(crate) pending: bool,
+    /// When the hold started (unix nanos) — the expiry-sweep filter.
+    pub(crate) requested_at_unix_nanos: Option<i64>,
+    /// When the hold was released by an approval (unix nanos).
+    pub(crate) approved_at_unix_nanos: Option<i64>,
+    /// Optional operator note recorded with the approval.
+    pub(crate) note: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct SubmitJob {
     pub(crate) queued: QueuedJob,
@@ -824,6 +840,47 @@ pub(crate) struct ReapSweepOutcome {
     pub(crate) starved: Vec<(RunId, JobId, String)>,
 }
 
+/// `record_environment_approval` input: one operator approval for a job
+/// waiting on its environment's required-reviewer gate.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvironmentApproval {
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    /// Operator note recorded with the approval (audit trail).
+    pub(crate) note: Option<String>,
+}
+
+/// What `record_environment_approval` decided for the job.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnvironmentApprovalResult {
+    /// The job already holds a terminal status.
+    AlreadyTerminal,
+    /// The job carries no armed approval gate (no rules, rules removed, or
+    /// the job is not awaiting approval).
+    NotAwaiting,
+    /// The 24h approval window had lapsed: the job was failed closed.
+    Expired,
+    /// One approval recorded; the gate may now be satisfied.
+    Recorded {
+        approvals: usize,
+        required: u32,
+        satisfied: bool,
+    },
+}
+
+/// `record_environment_approval` outcome plus the queue gauges the handler
+/// mirrors into the node-local store.
+#[derive(Debug)]
+pub(crate) struct EnvironmentApprovalOutcome {
+    pub(crate) result: EnvironmentApprovalResult,
+    /// Ready-queue depth after the command.
+    pub(crate) queue_depth: usize,
+    /// `runs-on` labels of the ready queue's front job after the command.
+    pub(crate) next_runs_on: Vec<String>,
+    /// Jobs released to ready by the post-approval promotion sweep.
+    pub(crate) promoted: usize,
+}
+
 /// Operational-status inputs derived from durable control state
 /// (`status_inputs`). Node-local facts (debug sessions, pool, GitHub) are
 /// added by the caller.
@@ -857,6 +914,12 @@ pub(crate) struct StatusInputs {
     pub(crate) runner_idle: u32,
     /// Runners one of whose sessions holds an active request.
     pub(crate) runner_busy: u32,
+    /// Busy runners (see `runner_busy`) the server pool proved: registered
+    /// through the pool provisioning path (`runners.pool_proven`). The pool's
+    /// busy gauge counts only these — a busy external runner is not a pool
+    /// machine, and counting it made `preloop status` report pool load that
+    /// the pool never provisioned.
+    pub(crate) pool_busy: u32,
     /// Runners whose every session last polled more than `stale_after` ago
     /// (a session never seen is not stale).
     pub(crate) runner_stale: u32,

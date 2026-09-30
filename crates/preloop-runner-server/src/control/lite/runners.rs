@@ -1,7 +1,7 @@
 //! Runner registrations: point reads and live assignments.
 
 use super::codec;
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::control::types::ControlError;
 use preloop_observability::status::RunnerAssignment;
 use rusqlite::OptionalExtension;

@@ -167,9 +167,7 @@ async fn render_session_message(
             shared
                 .state
                 .static_github_pat()
-                .and_then(|pat| {
-                    crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes))
-                })
+                .and_then(|pat| crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes)))
                 .map(|(pat, scopes)| {
                     msg.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),
@@ -892,13 +890,13 @@ pub(crate) async fn complete_job_settling(
         // A remote checkout cache is released rather than deleted with the
         // run: the configured retention window is what a rerun or a late
         // retry fetches from, and the sweep below is the only collector.
-        let released = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&completion.run_id)
-                .and_then(|run| run.workspace_snapshot.clone())
-        };
+        let released = shared
+            .state
+            .backend
+            .run_record(completion.run_id)
+            .await
+            .ok()
+            .and_then(|run| run.workspace_snapshot.clone());
         if let Some(snapshot) = released {
             release_remote_checkout_snapshot(&shared.state.state_dir, &snapshot, completion.run_id)
                 .await;

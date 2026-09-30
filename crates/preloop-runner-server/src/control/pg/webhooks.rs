@@ -13,7 +13,7 @@
 //! enqueue. Reads return the canonical JSON bytes.
 
 use super::codec::{self, now_us, ts, us};
-use super::{db, PgBackend};
+use super::{PgBackend, db};
 use crate::control::types::ControlError;
 use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,

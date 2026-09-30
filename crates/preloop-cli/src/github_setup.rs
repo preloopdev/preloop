@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use preloop_runner_server::config::{load_config, store_memory, write_config};
 use preloop_runner_server::credential_store::{
-    github_reference, github_reference_with_host, SecretString,
+    SecretString, github_reference, github_reference_with_host,
 };
 use std::collections::BTreeMap;
 use std::io::IsTerminal;

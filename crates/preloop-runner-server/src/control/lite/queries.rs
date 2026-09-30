@@ -3,12 +3,12 @@
 //! tables (decision round 4, Q10): an archived run has no `runs` row.
 
 use super::codec::{self, now_us};
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::control::types::*;
 use crate::models::{JobDetail, PushState, PushStatus};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension};
-use std::collections::BTreeSet;
+use rusqlite::{OptionalExtension, params};
+use std::collections::{BTreeMap, BTreeSet};
 type JobQueryRow = (String, String, Option<String>, Option<i64>, Option<String>);
 
 /// Keep a run live while its push state may still dedup an echo webhook:
@@ -68,7 +68,9 @@ impl LiteBackend {
     }
 
     /// Record the job's check-run id: one conditional UPDATE of the `jobs`
-    /// row. Returns whether the mapping changed (no row = no change).
+    /// row plus an upsert into `run_submissions.record_details` — the store
+    /// of record for jobs with no row yet (a matrix leg minted before its
+    /// expansion materializes). Returns whether the mapping changed.
     pub(crate) async fn set_job_check_run(
         &self,
         run_id: RunId,
@@ -85,11 +87,28 @@ impl LiteBackend {
                 .map_err(db)?
                 .execute(params![run, job_id.0, check_run_id as i64])
                 .map_err(db)?;
-            Ok(changed > 0)
+            // A job id with `"` cannot sit in a JSON path literal — the
+            // fragment embeds it escaped (`\"`), which json_set reads as the
+            // key verbatim.
+            let detail_changed = tx
+                .prepare_cached(
+                    "UPDATE run_submissions SET record_details = json_set(record_details, \
+                         '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"', ?3) \
+                     WHERE run_id = ?1 \
+                       AND COALESCE(json_extract(record_details, \
+                           '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"'), -1) <> ?3",
+                )
+                .map_err(db)?
+                .execute(params![run, job_id.0, check_run_id as i64])
+                .map_err(db)?;
+            Ok(changed > 0 || detail_changed > 0)
         })
     }
 
-    /// Clear the mapping only while it still points at `expected`.
+    /// Clear the mapping only while it still points at `expected` — in the
+    /// `jobs` row and in `record_details` (the latter holds legs minted
+    /// before materialization; a stale mapping there would re-mint a
+    /// deleted check run forever).
     pub(crate) async fn clear_job_check_run(
         &self,
         run_id: RunId,
@@ -101,6 +120,16 @@ impl LiteBackend {
             tx.prepare_cached(
                 "UPDATE jobs SET check_run_id = NULL \
                  WHERE run_id = ?1 AND job_id = ?2 AND check_run_id = ?3",
+            )
+            .map_err(db)?
+            .execute(params![run, job_id.0, expected as i64])
+            .map_err(db)?;
+            tx.prepare_cached(
+                "UPDATE run_submissions SET record_details = json_remove(record_details, \
+                     '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"') \
+                 WHERE run_id = ?1 \
+                   AND json_extract(record_details, \
+                       '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"') = ?3",
             )
             .map_err(db)?
             .execute(params![run, job_id.0, expected as i64])
@@ -147,7 +176,9 @@ impl LiteBackend {
         })
     }
 
-    /// The job's recorded check-run id (live, else archived).
+    /// The job's recorded check-run id: the live (then archived) `jobs`
+    /// row, else `record_details` — legs minted before their expansion
+    /// materializes have no row.
     pub(crate) async fn job_check_run_id(
         &self,
         run_id: RunId,
@@ -155,11 +186,30 @@ impl LiteBackend {
     ) -> Result<Option<u64>, ControlError> {
         let run = codec::run_key(run_id);
         self.read(|tx| {
+            let row_id = tx
+                .prepare_cached(
+                    "SELECT check_run_id FROM jobs WHERE run_id = ?1 AND job_id = ?2 \
+                     UNION ALL \
+                     SELECT check_run_id FROM job_history WHERE run_id = ?1 AND job_id = ?2 \
+                     LIMIT 1",
+                )
+                .map_err(db)?
+                .query_row(params![run, job_id.0], |row| row.get::<_, Option<i64>>(0))
+                .optional()
+                .map_err(db)?
+                .flatten();
+            if let Some(id) = row_id {
+                return Ok(Some(id as u64));
+            }
             tx.prepare_cached(
-                "SELECT check_run_id FROM jobs WHERE run_id = ?1 AND job_id = ?2 \
+                "SELECT json_extract(record_details, \
+                     '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"') \
+                 FROM run_submissions WHERE run_id = ?1 \
                  UNION ALL \
-                 SELECT check_run_id FROM job_history WHERE run_id = ?1 AND job_id = ?2 \
-                 LIMIT 1",
+                 SELECT json_extract(record_details, \
+                     '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"') \
+                 FROM run_history WHERE run_id = ?1 AND created_at = ( \
+                     SELECT MAX(created_at) FROM run_history WHERE run_id = ?1)",
             )
             .map_err(db)?
             .query_row(params![run, job_id.0], |row| row.get::<_, Option<i64>>(0))
@@ -209,32 +259,45 @@ impl LiteBackend {
         self.read(|tx| {
             let live = tx
                 .prepare_cached(
-                    "SELECT s.submission, r.started_at, r.completed_at \
+                    "SELECT s.submission, r.started_at, r.completed_at, s.record_details \
                      FROM runs r JOIN run_submissions s ON s.run_id = r.run_id \
                      WHERE r.run_id = ?1",
                 )
                 .map_err(db)?
-                .query_row([&run], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .query_row([&run], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
                 .optional()
                 .map_err(db)?;
-            let (head, archived): ((String, Option<i64>, Option<i64>), bool) = match live {
-                Some(head) => (head, false),
-                None => match tx
-                    .prepare_cached(
-                        "SELECT submission, started_at, completed_at FROM run_history \
-                         WHERE run_id = ?1 ORDER BY created_at DESC LIMIT 1",
-                    )
-                    .map_err(db)?
-                    .query_row([&run], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .optional()
-                    .map_err(db)?
-                {
-                    Some(head) => (head, true),
-                    None => return Ok(None),
-                },
-            };
-            let (submission, started_at, completed_at) = head;
+            let (head, archived): ((String, Option<i64>, Option<i64>, Option<String>), bool) =
+                match live {
+                    Some(head) => (head, false),
+                    None => match tx
+                        .prepare_cached(
+                            "SELECT submission, started_at, completed_at, record_details \
+                         FROM run_history WHERE run_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                        )
+                        .map_err(db)?
+                        .query_row([&run], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        })
+                        .optional()
+                        .map_err(db)?
+                    {
+                        Some(head) => (head, true),
+                        None => return Ok(None),
+                    },
+                };
+            let (submission, started_at, completed_at, details_json) = head;
             let value = submission_value(&submission)?;
+            // `job_check_run_ids` keys minted before the leg materialized are
+            // dispatch-relevant rows too — a terminal report mints for them.
+            let stored_ids: BTreeMap<String, i64> = details_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|json| json.get("job_check_run_ids").cloned())
+                .and_then(|map| serde_json::from_value(map).ok())
+                .unwrap_or_default();
             let job_rows: Vec<JobQueryRow> = {
                 let sql = if archived {
                     "SELECT job_id, status, display_name, check_run_id, annotations \
@@ -257,7 +320,15 @@ impl LiteBackend {
                         ))
                     })
                     .map_err(db)?;
-                rows.collect::<Result<_, _>>().map_err(db)?
+                let mut rows: Vec<JobQueryRow> = rows.collect::<Result<_, _>>().map_err(db)?;
+                // Legs minted before materialization have no jobs row; append
+                // them from `record_details` so reports can mint for them.
+                for (job_id, id) in &stored_ids {
+                    if !rows.iter().any(|row| row.0 == *job_id) {
+                        rows.push((job_id.clone(), "pending".to_owned(), None, Some(*id), None));
+                    }
+                }
+                rows
             };
             let mut jobs = Vec::with_capacity(job_rows.len());
             for (job, status, display_name, check_run_id, annotations) in job_rows {
@@ -348,7 +419,19 @@ impl LiteBackend {
                  SELECT j.run_id, j.job_id, j.check_run_id, j.display_name \
                  FROM job_history j JOIN run_history r \
                    ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
-                 WHERE r.repository = ?2 AND (?3 IS NULL OR r.head_sha = ?3)";
+                 WHERE r.repository = ?2 AND (?3 IS NULL OR r.head_sha = ?3) \
+                 UNION ALL \
+                 SELECT s.run_id, je.key, CAST(je.value AS INTEGER), je.key \
+                 FROM run_submissions s JOIN runs r ON r.run_id = s.run_id, \
+                     json_each(s.record_details, '$.job_check_run_ids') je \
+                 WHERE r.status = 'completed' AND r.repository = ?2 \
+                   AND (?3 IS NULL OR r.head_sha = ?3) \
+                 UNION ALL \
+                 SELECT h.run_id, je.key, CAST(je.value AS INTEGER), je.key \
+                 FROM run_history h, json_each(h.record_details, '$.job_check_run_ids') je \
+                 WHERE h.repository = ?2 AND (?3 IS NULL OR h.head_sha = ?3) \
+                   AND h.created_at = (SELECT MAX(created_at) FROM run_history \
+                                       WHERE run_id = h.run_id)";
             let exact = tx
                 .prepare_cached(&format!(
                     "SELECT run_id, job_id FROM ({CANDIDATES}) WHERE check_run_id = ?1 \
@@ -639,12 +722,18 @@ impl LiteBackend {
                     "INSERT INTO run_history (run_id, namespace_id, repository, workflow_path, \
                          run_number, run_attempt, run_name, event, ref, ref_type, head_ref, \
                          base_ref, head_sha, conclusion, submission, record_details, \
+                         fork_approval_pending, fork_approval_requested_at, \
+                         fork_approval_approved_at, fork_approval_note, \
+                         reports_check_runs, \
                          created_at, started_at, completed_at) \
                      SELECT r.run_id, r.namespace_id, r.repository, r.workflow_path, \
                          r.run_number, r.run_attempt, r.run_name, r.event, r.ref, r.ref_type, \
                          r.head_ref, r.base_ref, r.head_sha, r.conclusion, \
                          COALESCE(s.submission, '{}'), \
                          COALESCE(s.record_details, '{}'), \
+                         r.fork_approval_pending, r.fork_approval_requested_at, \
+                         r.fork_approval_approved_at, r.fork_approval_note, \
+                         r.reports_check_runs, \
                          r.created_at, r.started_at, \
                          r.completed_at \
                      FROM runs r LEFT JOIN run_submissions s ON s.run_id = r.run_id \
@@ -686,6 +775,122 @@ impl LiteBackend {
                 }
             }
             Ok(run_ids.iter().map(|run| codec::run_id(run)).collect())
+        })
+    }
+
+    /// `expired_terminal_runs`: terminal runs finished (else created) before
+    /// `cutoff_us`, oldest first, `limit` at most.
+    ///
+    /// Archived runs are selected from `run_history`: the archiver moves a
+    /// settled run there within a minute of completion, so that table is
+    /// where an expired run actually lives — a retention pass that only
+    /// looked at `runs` would delete nothing. A live run with an unfinished
+    /// or session-bound attempt is skipped (the archiver's own guard): its
+    /// callbacks are still in play and deleting it would strand them.
+    pub(crate) async fn expired_terminal_runs(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT run_id FROM ( \
+                         SELECT r.run_id AS run_id, \
+                                COALESCE(r.completed_at, r.created_at) AS finished_at \
+                         FROM runs r \
+                         WHERE r.status = 'completed' \
+                           AND NOT EXISTS (SELECT 1 FROM job_requests q \
+                                           WHERE q.run_id = r.run_id \
+                                             AND (q.result IS NULL OR q.session_id IS NOT NULL)) \
+                         UNION ALL \
+                         SELECT h.run_id, COALESCE(h.completed_at, h.created_at) \
+                         FROM run_history h) \
+                     GROUP BY run_id \
+                     HAVING MIN(finished_at) < ?1 \
+                     ORDER BY MIN(finished_at), run_id \
+                     LIMIT ?2",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![cutoff_us, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(db)?;
+            let runs = rows.collect::<Result<Vec<_>, _>>().map_err(db)?;
+            Ok(runs.iter().map(|run| codec::run_id(run)).collect())
+        })
+    }
+
+    /// `delete_expired_run`: drop one terminal run for good — its live rows
+    /// (the `runs` row cascades its jobs, requests, attempts, steps, logs
+    /// and gates) and its history rows, plus the artifact metadata keyed by
+    /// the run.
+    ///
+    /// A live row that is not `completed` is `Conflict` and nothing is
+    /// written: retention must never delete a run that can still schedule,
+    /// whatever the caller's filter said. An unknown run is `Ok(())`, so an
+    /// interrupted pass can simply be repeated. On-disk artifacts and the
+    /// node-local key set are the caller's to remove (the durable rows here
+    /// answer neither once deleted).
+    pub(crate) async fn delete_expired_run(&self, run_id: RunId) -> Result<(), ControlError> {
+        self.write(move |tx| {
+            let run = codec::run_key(run_id);
+            let status: Option<String> = tx
+                .prepare_cached("SELECT status FROM runs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([&run], |row| row.get(0))
+                .optional()
+                .map_err(db)?;
+            if let Some(status) = status.as_deref()
+                && status != "completed"
+            {
+                return Err(ControlError::Conflict(format!(
+                    "run {run_id} is {status}, not terminal"
+                )));
+            }
+            // Timelines are keyed by id and shared across attempts of
+            // different runs (a rerun correlates on the same id), and they
+            // carry no FK to `runs`, so the weekly `prune_timelines` is the
+            // only other owner — and it can only match while a request row
+            // still names them. Drop the ones this run is the last referent
+            // of, records first.
+            for table in ["timeline_records", "timelines"] {
+                tx.prepare_cached(&format!(
+                    "DELETE FROM {table} WHERE timeline_id IN ( \
+                         SELECT q.timeline_id FROM job_requests q \
+                         WHERE q.run_id = ?1 \
+                           AND NOT EXISTS (SELECT 1 FROM job_requests o \
+                                           WHERE o.timeline_id = q.timeline_id \
+                                             AND o.run_id <> ?1))"
+                ))
+                .map_err(db)?
+                .execute([&run])
+                .map_err(db)?;
+            }
+            // The archive tables have no FK to `runs`: without this the run
+            // would survive in `job_history`/`attempt_history` (and keep
+            // surfacing through `terminal_jobs`) after its record is gone.
+            for table in [
+                "step_history",
+                "attempt_history",
+                "job_history",
+                "run_history",
+            ] {
+                tx.prepare_cached(&format!("DELETE FROM {table} WHERE run_id = ?1"))
+                    .map_err(db)?
+                    .execute([&run])
+                    .map_err(db)?;
+            }
+            tx.prepare_cached("DELETE FROM artifacts WHERE run_id = ?1")
+                .map_err(db)?
+                .execute([&run])
+                .map_err(db)?;
+            tx.prepare_cached("DELETE FROM runs WHERE run_id = ?1")
+                .map_err(db)?
+                .execute([&run])
+                .map_err(db)?;
+            Ok(())
         })
     }
 }

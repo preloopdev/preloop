@@ -17,12 +17,12 @@
 //!   `jobs.queue_state = 'held'` covers both kinds of gate (decisions-5 B1).
 
 use super::codec::{self, us, us_to_system};
-use super::{db, PgBackend};
+use super::{PgBackend, db};
 use crate::control::logic::QueueState;
-use crate::control::types::{status_parse, ControlError};
+use crate::control::types::{ControlError, status_parse};
 use crate::models::{QueuedJob, RunRecord};
 use crate::snapshots::WorkspaceSnapshot;
-use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId, WorkflowSubmission};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, WorkflowSubmission, azdo};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio_postgres::Transaction;
@@ -71,6 +71,8 @@ pub(super) struct Node {
     pub(crate) continue_on_error: Option<bool>,
     pub(crate) id_token_granted: bool,
     pub(crate) oidc: crate::state::OidcJobContext,
+    /// Environment protection gate progress (fail-closed runtime state).
+    pub(crate) environment_gate: Option<crate::models::EnvironmentGateState>,
     /// `needs:` in declared order.
     pub(crate) needs: Vec<JobId>,
     /// The `if:`/`needs` expression context (secrets by name only).
@@ -234,6 +236,7 @@ pub(crate) fn queued_of(
         matrix: node.matrix.clone(),
         deferred_matrix: node.deferred_matrix.clone(),
         reusable_call: node.reusable.clone().and_then(|spec| spec.call),
+        environment_gate: node.environment_gate.clone(),
     }
 }
 
@@ -334,7 +337,10 @@ impl PgBackend {
                     us!("started_at"),
                     ", ",
                     us!("completed_at"),
-                    " FROM runs WHERE run_id = $1::text::uuid"
+                    ", fork_approval_pending, fork_approval_requested_at, \
+                     fork_approval_approved_at, fork_approval_note, \
+                     reports_check_runs \
+                     FROM runs WHERE run_id = $1::text::uuid"
                 ),
                 &[&run],
             )
@@ -347,7 +353,7 @@ impl PgBackend {
         let sub_row = tx
             .query_opt(
                 "SELECT submission::text, github_context::text, \
-                 workspace_snapshot::text, snapshot_timing::text \
+                 workspace_snapshot::text, snapshot_timing::text, record_details::text \
                  FROM run_submissions WHERE run_id = $1::text::uuid",
                 &[&run],
             )
@@ -400,7 +406,8 @@ impl PgBackend {
                      s.concurrency::text, s.reusable_call::text, s.fail_fast, \
                      s.continue_on_error, s.id_token_granted, s.oidc_environment, \
                      s.oidc_job_workflow_ref, s.oidc_job_workflow_sha, \
-                     m.condition_context::text, m.secret_names::text \
+                     m.condition_context::text, m.secret_names::text, \
+                     j.environment_gate::text \
                      FROM jobs j \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
                      LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
@@ -513,12 +520,18 @@ impl PgBackend {
                     .map(|t| codec::from_json(&t))
                     .transpose()?
                     .unwrap_or_default(),
+                // Fail closed: a present-but-unreadable gate reloads as the
+                // empty gate, which re-arms the wait/approval instead of
+                // dropping it.
+                environment_gate: row
+                    .get::<_, Option<String>>(43)
+                    .map(|t| serde_json::from_str(&t).unwrap_or_default()),
                 has_children: false,
             };
             nodes.insert(job_id, node);
         }
 
-        let (submission, github, snapshot, snapshot_timing) = match sub_row {
+        let (submission, github, snapshot, snapshot_timing, detail_maps) = match sub_row {
             Some(row) => {
                 let submission_json: String = row.get(0);
                 let submission: WorkflowSubmission =
@@ -534,13 +547,18 @@ impl PgBackend {
                     .map(|t| serde_json::from_str(&t))
                     .transpose()
                     .map_err(ControlError::backend)?;
-                (Arc::new(submission), github, snapshot, timing)
+                let details: serde_json::Value = row
+                    .get::<_, Option<String>>(4)
+                    .and_then(|t| serde_json::from_str(&t).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                (Arc::new(submission), github, snapshot, timing, details)
             }
             None => (
                 Arc::new(WorkflowSubmission::default()),
                 serde_json::Value::Null,
                 None,
                 None,
+                serde_json::json!({}),
             ),
         };
 
@@ -600,6 +618,16 @@ impl PgBackend {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default(),
             });
+        }
+        // Ids minted before their leg materialized live in
+        // `run_submissions.record_details`; the live `jobs` rows overlay them
+        // (lite `merge_details` parity).
+        if let Some(map) = detail_maps.get("job_check_run_ids") {
+            if let Ok(stored) = serde_json::from_value::<BTreeMap<JobId, u64>>(map.clone()) {
+                for (job_id, id) in stored {
+                    job_check_run_ids.entry(job_id).or_insert(id);
+                }
+            }
         }
 
         let record = RunRecord {
@@ -665,6 +693,11 @@ impl PgBackend {
                 }
             }),
             snapshot_timing,
+            fork_approval_pending: run_row.get::<_, Option<bool>>(21).unwrap_or(false),
+            fork_approval_requested_at_unix_nanos: run_row.get(22),
+            fork_approved_at_unix_nanos: run_row.get(23),
+            fork_approval_note: run_row.get(24),
+            reports_check_runs: run_row.get::<_, Option<bool>>(25).unwrap_or(false),
         };
 
         // A node whose `parent_job_id` names another node marks the parent as
@@ -741,5 +774,77 @@ impl PgBackend {
             return Ok(None);
         };
         Ok(Some(queued_of(job_id, graph.record.run_id, node, message)))
+    }
+
+    /// `set_fork_approval`: write the run's fork-PR hold stamps. Scoped to
+    /// the `runs` row (the expiry sweep filters on these columns); callers
+    /// own promotion/fail-closed effects.
+    pub(crate) async fn set_fork_approval(
+        &self,
+        update: crate::control::types::ForkApprovalStamp,
+    ) -> Result<(), ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        tx.execute(
+            "UPDATE runs SET fork_approval_pending = $2, \
+                 fork_approval_requested_at = $3, \
+                 fork_approval_approved_at = $4, \
+                 fork_approval_note = $5 \
+             WHERE run_id = $1::text::uuid",
+            &[
+                &update.run_id.0.to_string(),
+                &update.pending,
+                &update.requested_at_unix_nanos,
+                &update.approved_at_unix_nanos,
+                &update.note,
+            ],
+        )
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// `set_environment_gate`: write one job's environment protection gate
+    /// state (`None` clears it). The JSON blob round-trips through `jobs`
+    /// so a restart re-arms an armed gate (fail closed).
+    pub(crate) async fn set_environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        gate: Option<crate::models::EnvironmentGateState>,
+    ) -> Result<(), ControlError> {
+        let gate_json = gate
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(ControlError::backend)?;
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        tx.execute(
+            "UPDATE jobs SET environment_gate = $3::text::jsonb \
+             WHERE run_id = $1::text::uuid AND job_id = $2",
+            &[&run_id.0.to_string(), &job_id.0, &gate_json],
+        )
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// `set_reports_check_runs`: stamp whether intake reported GitHub check
+    /// runs for this run (the late check-run mint gate).
+    pub(crate) async fn set_reports_check_runs(
+        &self,
+        run_id: RunId,
+        reported: bool,
+    ) -> Result<(), ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        tx.execute(
+            "UPDATE runs SET reports_check_runs = $2 WHERE run_id = $1::text::uuid",
+            &[&run_id.0.to_string(), &reported],
+        )
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
     }
 }

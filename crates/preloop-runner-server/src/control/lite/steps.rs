@@ -1,11 +1,11 @@
 //! Per-attempt step manifests (`job_steps`, archived in `step_history`).
 
 use super::codec;
-use super::{db, LiteBackend};
-use crate::control::types::{step_report, ControlError, StepPatch};
+use super::{LiteBackend, db};
+use crate::control::types::{ControlError, StepPatch, step_report};
 use crate::models::{StepKind, StepRecord};
 use preloop_gha_protocol::RunId;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
 
 /// Step columns in [`step_row`] order; valid for `job_steps` and

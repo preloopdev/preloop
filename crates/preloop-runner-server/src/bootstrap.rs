@@ -195,6 +195,13 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .join(token);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
+    // Fork-PR workflow policy: fail closed runs whose 24h approval window
+    // expired while waiting for operator approval. The fail-closed mutation
+    // is one backend transaction; the per-job events are emitted below, once
+    // the run rows are final.
+    let expired_fork_approvals =
+        crate::fork_policy::sweep_expired_fork_approvals(shared, crate::models::now_unix_nanos())
+            .await;
     // Everything this tick decides from, read directly: no working-set
     // load and no lock. Transactions below run only when something is due,
     // and only over the runs involved.
@@ -375,6 +382,26 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
     };
 
+    // Run statuses for the jobs the sweep just failed, read back from the
+    // authoritative rows: `reap_sweep` applied the starvation failures and
+    // recomputed each affected run inside its transaction, so the post-sweep
+    // status is the run's conclusion. Several starved jobs can share a run,
+    // and the status after the first failure is not that conclusion — the
+    // reads happen after every failure was applied, not per job.
+    let mut starved_run_ids: Vec<RunId> = Vec::new();
+    for (run_id, _, _) in &starved {
+        if !starved_run_ids.contains(run_id) {
+            starved_run_ids.push(*run_id);
+        }
+    }
+    let mut starved_runs: Vec<(RunId, ExecutionStatus)> = Vec::new();
+    for run_id in starved_run_ids {
+        match shared.state.backend.run_record(run_id).await {
+            Ok(record) => starved_runs.push((run_id, record.status)),
+            Err(error) => debug!(?error, %run_id, "starved run status read failed"),
+        }
+    }
+
     // Liveness sweep: a session that stops polling is a deaf runner — its
     // in-guest control bridge died (e.g. the guest network was not up at
     // fork and the bridge gave up). Purge it so the unfinished job goes
@@ -420,13 +447,14 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // GitHub check runs: without this a check run created at webhook intake
     // stays `queued` on GitHub indefinitely for a terminal run.
     for run_id in &expired_fork_approvals {
-        let failed_jobs: Vec<JobId> = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(run_id)
-                .map(|run| run.jobs.keys().cloned().collect())
-                .unwrap_or_default()
+        // The run's jobs, from the authoritative rows: the sweep above
+        // already failed every non-terminal job in the database.
+        let failed_jobs: Vec<JobId> = match shared.state.backend.run_job_ids(*run_id).await {
+            Ok(job_ids) => job_ids.into_iter().map(JobId).collect(),
+            Err(error) => {
+                warn!(?error, %run_id, "fork-approval job list read failed");
+                Vec::new()
+            }
         };
         for job_id in failed_jobs {
             shared
@@ -501,26 +529,32 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     }
 
     // Environment protection gates: wait timers expire and approval windows
-    // close on wall-clock time, not on scheduling events. Re-run promotion
-    // so newly-satisfied gates release their jobs and expired approval
-    // windows fail closed. Skipped entirely when no job carries gate state.
+    // close on wall-clock time, not on scheduling events, so re-run admission
+    // for every run parking a gate-armed job — newly-satisfied gates release
+    // their jobs and expired approval windows fail closed. The command is a
+    // no-op for runs with no parked gate, so the tick can always ask.
+    match shared
+        .state
+        .backend
+        .promote_ready_jobs(None, &shared.state.environment_rules)
+        .await
     {
-        let mut inner = shared.state.inner.lock().await;
-        if inner
-            .pending_jobs
-            .iter()
-            .any(|job| job.environment_gate.is_some())
-        {
-            crate::runtime_scheduling::promote_ready_jobs(
-                &mut inner,
-                &shared.state.environment_rules,
-                &shared.state.pool_status.snapshot().labels,
-            );
+        Ok(outcome) => {
+            // Post-commit: refresh the node-local mirrors the runner
+            // supervisor and the pool read, then wake them if the sweep
+            // changed what is schedulable.
             shared
                 .state
                 .queue_depth
-                .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+                .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+            if let Ok(mut guard) = shared.state.next_job_runs_on.write() {
+                *guard = outcome.next_runs_on;
+            }
+            if outcome.promoted > 0 || outcome.failed > 0 {
+                shared.state.message_notify.notify_waiters();
+            }
         }
+        Err(error) => warn!(?error, "environment gate promotion sweep failed"),
     }
 }
 
@@ -1319,6 +1353,13 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             config.require_job_assignments,
             inner.runner_liveness_timeout,
         );
+        // Environment protection rules are pure config the backend evaluates
+        // inside its promotion and reaper transactions (where the job rows
+        // live). Hand the effective rules over now that the real server
+        // config is known; empty rules keep every gate open.
+        state
+            .backend
+            .set_environment_rules(std::sync::Arc::new(state.environment_rules.clone()));
         // Imported/persisted ready jobs were enqueued under the recovered
         // (default) config, so `on_job_enqueued` may not have run for them.
         // Now that the effective config is live, rebuild dispatch intent for
@@ -1767,55 +1808,6 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
-
-    #[test]
-    fn pool_busy_counts_only_pool_proven_busy_runners() {
-        // Regression: `PoolSnapshot.busy` had no writer, so `preloop status`
-        // always showed `pool busy: 0` even while pool machines ran jobs. The
-        // server now derives it from pool-proven runners holding an active
-        // session request; external busy runners must not inflate it.
-        use preloop_gha_protocol::{RunnerSession, SessionId};
-
-        let mut inner = InnerState {
-            pool_assignments_enabled: true,
-            ..Default::default()
-        };
-        let add_busy_runner = |inner: &mut InnerState, id: i64, pool_proven: bool| {
-            inner.runners.insert(
-                id,
-                RegisteredRunner {
-                    id,
-                    name: format!("runner-{id}"),
-                    labels: vec!["self-hosted".to_owned()],
-                    ephemeral: true,
-                    public_key: None,
-                    runner_group_id: None,
-                    runner_group_name: None,
-                },
-            );
-            let session_id = format!("sess-{id}");
-            inner.sessions.insert(
-                session_id.clone(),
-                RunnerSession {
-                    session_id: SessionId::new(),
-                    runner_id: id,
-                },
-            );
-            inner.session_active_requests.insert(session_id, id);
-            if pool_proven {
-                inner.pool_proven_runners.insert(id);
-            }
-        };
-        add_busy_runner(&mut inner, 7, true);
-        add_busy_runner(&mut inner, 8, false);
-
-        let inputs = collect_snapshot_inputs(&inner);
-        assert_eq!(inputs.runner_busy, 2, "both runners hold an active request");
-        assert_eq!(
-            inputs.pool_busy, 1,
-            "only the pool-proven runner counts toward pool busy"
-        );
-    }
 
     #[tokio::test]
     async fn incomplete_unix_http_message_is_a_routine_disconnect() {

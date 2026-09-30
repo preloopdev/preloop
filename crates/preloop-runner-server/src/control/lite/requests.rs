@@ -7,12 +7,12 @@
 //! that session row exists.
 
 use super::codec::{self, now_us};
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::control::backend::RequestKey;
 use crate::control::types::*;
 use crate::models::TaskAgentJobRequestRecord;
-use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
+use rusqlite::{OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Columns of [`record_row`], from `job_requests q LEFT JOIN job_leases l`.

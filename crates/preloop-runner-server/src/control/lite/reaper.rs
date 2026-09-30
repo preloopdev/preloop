@@ -9,11 +9,11 @@
 
 use super::codec::{self, now_us};
 use super::jobs;
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::control::logic::{self, StarvationCandidate, StarvationVerdict};
 use crate::control::types::*;
-use preloop_gha_protocol::{azdo, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use preloop_gha_protocol::{JobId, RunId, azdo};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
 
 /// One runner's `(labels, group)` for starvation matching.
@@ -658,6 +658,17 @@ impl LiteBackend {
                         .map_err(db)?;
                     if busy {
                         inputs.runner_busy += 1;
+                        // Pool gauge: only the pool's own machines count. A
+                        // runner row that is gone cannot be pool-proven.
+                        inputs.pool_busy += match tx
+                            .prepare_cached("SELECT pool_proven FROM runners WHERE runner_id = ?1")
+                            .map_err(db)?
+                            .query_row([runner_id], |row| row.get::<_, i64>(0))
+                        {
+                            Ok(flag) => u32::from(flag != 0),
+                            Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+                            Err(error) => return Err(db(error)),
+                        };
                     }
                     if stale {
                         inputs.runner_stale += 1;

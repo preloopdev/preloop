@@ -14,12 +14,12 @@
 use super::codec::{self, now_us};
 use super::jobs;
 use super::requests;
-use super::{db, promote, settle, LiteBackend};
+use super::{LiteBackend, db, promote, settle};
 use crate::control::backend::JobCompletionInput;
 use crate::control::types::*;
 use crate::models::TaskAgentJobRequestRecord;
-use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 /// Settle one request row in place (the tx half of

@@ -71,6 +71,44 @@ impl ControlBackend for PgBackend {
     ) -> Result<CancelOutcome, ControlError> {
         self.cancel_job(run_id, job_id).await
     }
+    async fn set_fork_approval(&self, update: ForkApprovalStamp) -> Result<(), ControlError> {
+        self.set_fork_approval(update).await
+    }
+    async fn set_environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        gate: Option<crate::models::EnvironmentGateState>,
+    ) -> Result<(), ControlError> {
+        self.set_environment_gate(run_id, job_id, gate).await
+    }
+    async fn record_environment_approval(
+        &self,
+        approval: EnvironmentApproval,
+    ) -> Result<EnvironmentApprovalOutcome, ControlError> {
+        self.record_environment_approval(approval).await
+    }
+    async fn set_reports_check_runs(
+        &self,
+        run_id: RunId,
+        reported: bool,
+    ) -> Result<(), ControlError> {
+        self.set_reports_check_runs(run_id, reported).await
+    }
+    async fn promote_ready_jobs(
+        &self,
+        run: Option<RunId>,
+        rules: &crate::config::EnvironmentRulesMap,
+    ) -> Result<PromoteOutcome, ControlError> {
+        self.promote_ready_jobs(run, rules).await
+    }
+    async fn environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentGateRead>, ControlError> {
+        self.environment_gate(run_id, job_id).await
+    }
     async fn renew_request(
         &self,
         request_id: i64,
@@ -118,6 +156,22 @@ impl ControlBackend for PgBackend {
     }
     async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
         self.archive_finished_runs(limit).await
+    }
+    async fn expired_terminal_runs(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.expired_terminal_runs(cutoff_us, limit).await
+    }
+    async fn delete_expired_run(&self, run_id: RunId) -> Result<(), ControlError> {
+        self.delete_expired_run(run_id).await
+    }
+    async fn expire_fork_approvals(
+        &self,
+        expired_before_unix_nanos: i64,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.expire_fork_approvals(expired_before_unix_nanos).await
     }
     async fn append_event(&self, event: &NdjsonEvent) -> Result<(), ControlError> {
         self.append_event(event).await

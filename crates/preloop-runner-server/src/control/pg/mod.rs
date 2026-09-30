@@ -38,7 +38,7 @@ use tokio_postgres::{Client, NoTls};
 
 /// The schema this build creates and accepts. Greenfield v1: there are no
 /// migrations, a database at any other version is refused.
-pub(crate) const SCHEMA_VERSION: &str = "1";
+pub(crate) const SCHEMA_VERSION: &str = "3";
 
 /// The agreed schema plus `schema_meta`.
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -164,6 +164,10 @@ pub(crate) struct PgBackend {
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
+    /// Operator environment protection rules (`[environment_rules]`), applied
+    /// after open from the real server config. Empty until then — no rules
+    /// means every environment gate proceeds, the pre-rules behavior.
+    environment_rules: parking_lot::RwLock<std::sync::Arc<crate::config::EnvironmentRulesMap>>,
     /// Stale claim bindings released since boot (`tx.released_bindings_count`
     /// parity — process-local, reset on restart).
     released_bindings: std::sync::atomic::AtomicU64,
@@ -193,6 +197,9 @@ impl PgBackend {
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
                 runner_liveness_timeout.as_nanos() as u64,
             ),
+            environment_rules: parking_lot::RwLock::new(std::sync::Arc::new(
+                crate::config::EnvironmentRulesMap::new(),
+            )),
             released_bindings: std::sync::atomic::AtomicU64::new(0),
             wakes: super::wake::spawn_listener(url.to_owned()),
         })
@@ -228,6 +235,20 @@ impl PgBackend {
             .store(require_job_assignments, Release);
         self.runner_liveness_timeout
             .store(runner_liveness_timeout.as_nanos() as u64, Release);
+    }
+
+    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
+    /// Empty rules preserve the pre-rules behavior: every gate proceeds.
+    pub(crate) fn set_environment_rules(
+        &self,
+        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+    ) {
+        *self.environment_rules.write() = rules;
+    }
+
+    /// The live environment protection rules (an `Arc` clone, cheap).
+    pub(super) fn environment_rules(&self) -> std::sync::Arc<crate::config::EnvironmentRulesMap> {
+        self.environment_rules.read().clone()
     }
 
     /// A connection for a command transaction.

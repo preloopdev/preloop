@@ -22,7 +22,6 @@ use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::ApiError;
 use crate::models::{WebhookDeliveryStatus, WebhookQueueStats};
 use crate::state::SharedState;
 use crate::webhook_status::{age_seconds, now_us};

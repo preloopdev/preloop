@@ -2,13 +2,13 @@
 //! repair rows. Every method is one statement or one short transaction.
 
 use super::codec::now_us;
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::control::types::ControlError;
 use crate::models::{
     WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
     WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeSet;
 
 /// A still-owned processing lease: the fence every lease-holder write

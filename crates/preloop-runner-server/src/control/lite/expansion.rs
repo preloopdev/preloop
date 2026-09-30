@@ -13,7 +13,7 @@
 
 use super::codec::{self, now_us};
 use super::jobs::{self, ReusableSpec};
-use super::{db, promote, settle, submit, LiteBackend};
+use super::{LiteBackend, db, promote, settle, submit};
 use crate::control::backend::ExpansionApply;
 use crate::control::logic::{
     BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan, MatrixExpansionInputs,
@@ -23,7 +23,7 @@ use crate::control::types::*;
 use crate::models::QueuedJob;
 use crate::runtime_scheduling::SchedulingOutcome;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The build inputs a deferred node snapshots under its generation fence
@@ -148,6 +148,8 @@ fn built_queued_job(run_id: RunId, built: &BuiltJob) -> QueuedJob {
             .collect(),
         deferred_matrix: plan.deferred_matrix.clone(),
         reusable_call: plan.reusable_call.clone(),
+        // Freshly registered legs are armed only at scheduler admission.
+        environment_gate: None,
     }
 }
 
@@ -284,6 +286,19 @@ fn register_built_jobs(
             0,
             &spec,
         )?;
+        // A check run minted before this leg materialized lives in
+        // `record_details.job_check_run_ids` — promote it onto the row so
+        // `jobs.check_run_id` stays the canonical live lookup.
+        tx.prepare_cached(
+            "UPDATE jobs SET check_run_id = json_extract( \
+                 (SELECT record_details FROM run_submissions WHERE run_id = ?1), \
+                 '$.\"job_check_run_ids\".\"' || replace(?2, '\"', '\\\"') || '\"') \
+             WHERE run_id = ?1 AND job_id = ?2 AND check_run_id IS NULL \
+               AND EXISTS (SELECT 1 FROM run_submissions WHERE run_id = ?1)",
+        )
+        .map_err(db)?
+        .execute(params![codec::run_key(run_id), job_id.0])
+        .map_err(db)?;
         if let Some(platform) = unhostable {
             tracing::warn!(
                 run_id = %run_id.0,

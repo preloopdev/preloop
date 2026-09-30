@@ -11,15 +11,16 @@
 
 use super::codec::{self, now_us, ts, us};
 use super::dispatch::{
-    clear_assignment, emit_outbox, enqueue_cancellation_job, release_concurrency_for_job,
-    retire_node_requests, summarize_run_tx, Retirement,
+    Retirement, clear_assignment, emit_outbox, enqueue_cancellation_job,
+    release_concurrency_for_job, release_concurrency_for_run, retire_node_requests,
+    summarize_run_tx,
 };
-use super::{db, PgBackend};
-use crate::control::logic::{starvation_verdict, StarvationCandidate, StarvationVerdict};
+use super::{PgBackend, db};
+use crate::control::logic::{StarvationCandidate, StarvationVerdict, starvation_verdict};
 use crate::control::types::{
     ControlError, ExpiredLease, ReapSweep, ReapSweepOutcome, StatusInputs,
 };
-use preloop_gha_protocol::ExecutionStatus;
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 
 impl PgBackend {
     /// `reap_sweep`: starvation verdicts for unmatched ready jobs
@@ -368,7 +369,8 @@ impl PgBackend {
                        count(s.session_id) > 0 AS has_sessions, \
                        bool_and(s.last_seen_at < ",
                     ts!("$1"),
-                    ") FILTER (WHERE s.session_id IS NOT NULL) AS all_stale \
+                    ") FILTER (WHERE s.session_id IS NOT NULL) AS all_stale, \
+                     r.pool_proven \
                      FROM runners r LEFT JOIN runner_sessions s ON s.runner_id = r.runner_id \
                      GROUP BY r.runner_id"
                 ),
@@ -382,6 +384,10 @@ impl PgBackend {
             let stale = has_sessions && row.get::<_, Option<bool>>(3).unwrap_or(false);
             if busy {
                 out.runner_busy += 1;
+                // Pool gauge: only the pool's own machines count.
+                if row.get::<_, bool>(4) {
+                    out.pool_busy += 1;
+                }
             }
             if stale {
                 out.runner_stale += 1;
@@ -470,5 +476,156 @@ impl PgBackend {
             .released_bindings
             .load(std::sync::atomic::Ordering::Relaxed);
         Ok(out)
+    }
+
+    /// `expire_fork_approvals`: fail closed every run whose fork-PR approval
+    /// hold lapsed before `expired_before_unix_nanos`. A held run's jobs
+    /// never left admission — they carry no runner and hold nothing — so
+    /// expiry turns them `failure` outright, clears the hold, finalizes the
+    /// run as a `failure`, drops its scheduling rows and releases its
+    /// concurrency holder so the group is not wedged by a run that will
+    /// never start. A run whose hold stamp is missing is left held: a
+    /// bookkeeping gap must not auto-fail a run, and the operator can still
+    /// approve or cancel it.
+    ///
+    /// One transaction (the run advisory lock serializes with an approve or
+    /// a cancel). Statements: one candidate `SELECT .. FROM runs WHERE
+    /// fork_approval_pending AND status <> 'completed' AND
+    /// fork_approval_requested_at < ts($1) ORDER BY run_id`; per run
+    /// `lock_run`, one guarded `UPDATE runs .. fork_approval_pending=false,
+    /// status='completed', conclusion='failure'` (0 rows = another writer
+    /// won: only the hold is cleared), one `UPDATE jobs ..` non-terminal →
+    /// `failure`, `retire_node_requests` for its expandable nodes, the
+    /// `DELETE`s of `job_assignments`/`provision_requests`/`jobsets`, the
+    /// concurrency release (with waiter promotion) and one
+    /// `run.completed.v1` outbox row.
+    pub(super) async fn expire_fork_approvals(
+        &self,
+        expired_before_unix_nanos: i64,
+    ) -> Result<Vec<RunId>, ControlError> {
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let candidates: Vec<String> = tx
+            .query(
+                concat!(
+                    "SELECT run_id::text FROM runs \
+                     WHERE fork_approval_pending AND status <> 'completed' \
+                       AND fork_approval_requested_at IS NOT NULL \
+                       AND fork_approval_requested_at < ",
+                    ts!("$1"),
+                    " ORDER BY run_id"
+                ),
+                &[&expired_before_unix_nanos],
+            )
+            .await
+            .map_err(db)?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        let now = now_us();
+        let mut failed = Vec::new();
+        for candidate in candidates {
+            let run_id = codec::run_id(&candidate)?;
+            if !PgBackend::lock_run(&tx, run_id).await? {
+                continue;
+            }
+            let claimed = tx
+                .execute(
+                    concat!(
+                        "UPDATE runs SET fork_approval_pending = false, \
+                             status = 'completed', conclusion = 'failure', \
+                             completed_at = COALESCE(completed_at, ",
+                        ts!("$2"),
+                        "), started_at = COALESCE(started_at, ",
+                        ts!("$2"),
+                        ") \
+                         WHERE run_id = $1::text::uuid AND fork_approval_pending \
+                           AND status <> 'completed' \
+                           AND fork_approval_requested_at IS NOT NULL \
+                           AND fork_approval_requested_at < ",
+                        ts!("$3")
+                    ),
+                    &[&candidate, &now, &expired_before_unix_nanos],
+                )
+                .await
+                .map_err(db)?;
+            if claimed == 0 {
+                // Approved, completed or cancelled concurrently: the winner
+                // owns the run's terminal bookkeeping, but a hold that is
+                // still set must not survive.
+                tx.execute(
+                    "UPDATE runs SET fork_approval_pending = false \
+                     WHERE run_id = $1::text::uuid AND fork_approval_pending",
+                    &[&candidate],
+                )
+                .await
+                .map_err(db)?;
+                continue;
+            }
+            // Expandable nodes (deferred matrix parents, reusable callers)
+            // minted placeholder requests at submit even though they never
+            // ran; settle them with the node so no in-flight marker outlives
+            // the run.
+            let expandable: Vec<JobId> = tx
+                .query(
+                    "SELECT j.job_id FROM jobs j LEFT JOIN job_specs s \
+                     ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                     WHERE j.run_id = $1::text::uuid \
+                       AND j.status NOT IN \
+                           ('success','failure','cancelled','skipped','timed_out') \
+                       AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null'::jsonb) \
+                            OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb) \
+                            OR j.queue_state IN ('pending_expansion','expanding'))",
+                    &[&candidate],
+                )
+                .await
+                .map_err(db)?
+                .iter()
+                .map(|row| JobId(row.get::<_, String>(0)))
+                .collect();
+            tx.execute(
+                concat!(
+                    "UPDATE jobs SET status='failure', queue_state='none', \
+                         completed_at=",
+                    ts!("$2"),
+                    ", started_at=COALESCE(started_at,",
+                    ts!("$2"),
+                    "), claimed_by_runner_id=NULL, claimed_at=NULL \
+                     WHERE run_id=$1::text::uuid AND status NOT IN \
+                         ('success','failure','cancelled','skipped','timed_out')"
+                ),
+                &[&candidate, &now],
+            )
+            .await
+            .map_err(db)?;
+            for job_id in &expandable {
+                retire_node_requests(
+                    &tx,
+                    run_id,
+                    job_id,
+                    Retirement::Settle(ExecutionStatus::Failure),
+                )
+                .await?;
+            }
+            // Clear dispatch intent for this run.
+            for sql in [
+                "DELETE FROM job_assignments WHERE run_id=$1::text::uuid",
+                "DELETE FROM provision_requests WHERE run_id=$1::text::uuid",
+                "DELETE FROM jobsets WHERE run_id=$1::text::uuid",
+            ] {
+                tx.execute(sql, &[&candidate]).await.map_err(db)?;
+            }
+            release_concurrency_for_run(self, &tx, run_id).await?;
+            emit_outbox(
+                &tx,
+                Some(run_id),
+                "run.completed.v1",
+                serde_json::json!({"status": "failure"}),
+            )
+            .await?;
+            failed.push(run_id);
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(failed)
     }
 }

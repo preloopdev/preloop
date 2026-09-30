@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{DEFAULT_BASE_IMAGE, is_stock_base_image};
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
-use preloop_runner_server::credential_store::{CredentialStore};
+use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::Read;

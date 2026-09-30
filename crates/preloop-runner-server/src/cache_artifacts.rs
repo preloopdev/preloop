@@ -192,16 +192,16 @@ pub async fn cache_reserve(
     }
     let job_uuid = claims.map(|claims| claims.job_id);
     let job_backend_id = job_uuid.map(|uuid| uuid.to_string()).unwrap_or_default();
-    let mut inner = shared.state.inner.lock().await;
-    // In-lock re-check: the job may have settled between the gate above and
-    // this lock — a settled job must not mint a fresh reservation.
+    // Re-check liveness against the backend: a settled job must not mint a
+    // fresh reservation.
     if let Some(job_uuid) = job_uuid
-        && !auth::job_is_live_locked(&inner, job_uuid)
+        && !auth::job_is_live(&shared.state, job_uuid).await?
     {
         return Err(ApiError::forbidden(
             "job is not live; writes are rejected for completed or unknown jobs",
         ));
     }
+    let mut inner = shared.state.inner.lock().await;
     // R1-6: bound in-flight legacy reservations per job, mirroring the v2
     // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
     // unbounded reservation state in server RAM.

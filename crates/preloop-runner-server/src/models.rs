@@ -488,7 +488,7 @@ pub struct QueuedJob {
 /// approval gate instead of dropping it — and every stamp is fail-closed
 /// under snapshot loss: a lost wait deadline re-arms the wait, a lost
 /// approval re-arms the approval, never the reverse.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentGateState {
     /// When the wait timer expires. `None` once satisfied or when no wait
     /// timer is configured.

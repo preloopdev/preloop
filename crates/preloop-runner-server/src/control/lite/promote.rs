@@ -8,13 +8,13 @@
 use super::codec::{self, now_us};
 use super::concurrency as cg;
 use super::jobs::{self, JobRow, RunGraph};
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::concurrency::{self, Holder};
 use crate::control::logic;
 use crate::control::types::*;
 use crate::runtime_scheduling::DependencyDecision;
-use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A job's declared `needs:` aggregate (`aggregate_need_status` over the
@@ -664,7 +664,7 @@ pub(super) fn advance_jobset(
             }
             cg::AcqOutcome::Parked => return Ok(Advance::Blocked),
             cg::AcqOutcome::ArrivalCancelled => {
-                return Ok(Advance::Fail(ExecutionStatus::Cancelled))
+                return Ok(Advance::Fail(ExecutionStatus::Cancelled));
             }
             cg::AcqOutcome::Failed => return Ok(Advance::Fail(ExecutionStatus::Failure)),
         }

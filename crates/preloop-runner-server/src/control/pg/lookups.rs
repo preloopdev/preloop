@@ -7,12 +7,12 @@
 //! the history query; a run lives in exactly one of them).
 
 use super::codec::{self, us};
-use super::timelines::{step_from_row, STEP_COLUMNS};
-use super::{db, PgBackend};
+use super::timelines::{STEP_COLUMNS, step_from_row};
+use super::{PgBackend, db};
 use crate::control::backend::RequestKey;
 use crate::control::types::{
-    check_key_fingerprint, CallbackJob, ControlError, QueueStats, RunConcurrency, RunDispatchInfo,
-    RunDispatchJob, SubmissionFields,
+    CallbackJob, ControlError, QueueStats, RunConcurrency, RunDispatchInfo, RunDispatchJob,
+    SubmissionFields, check_key_fingerprint,
 };
 use crate::models::{JobDetail, PushState, StepRecord, TaskAgentJobRequestRecord};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
@@ -99,39 +99,39 @@ impl PgBackend {
     ) -> Result<TaskAgentJobRequestRecord, ControlError> {
         let not_found = || ControlError::NotFound("request".to_owned());
         let client = self.reader().await?;
-        let row = match &key {
-            RequestKey::Id(id) => {
-                client
-                    .query_opt(&format!("{REQUEST_SELECT} WHERE q.request_id = $1"), &[id])
-                    .await
-            }
-            RequestKey::PlanId(plan) => {
-                let plan = plan_uuid(plan).ok_or_else(not_found)?;
-                client
-                    .query_opt(
-                        &format!("{REQUEST_SELECT} WHERE q.agent_job_id = $1::text::uuid"),
-                        &[&plan],
-                    )
-                    .await
-            }
-            RequestKey::AgentJobId(agent) => {
-                client
-                    .query_opt(
-                        &format!("{REQUEST_SELECT} WHERE q.agent_job_id = $1::text::uuid"),
-                        &[&agent.to_string()],
-                    )
-                    .await
-            }
-            RequestKey::TimelineId(timeline) => {
-                client
-                    .query_opt(
-                        &format!("{REQUEST_SELECT} WHERE q.timeline_id = $1::text::uuid"),
-                        &[&timeline.to_string()],
-                    )
-                    .await
-            }
-            RequestKey::Job(run_id, job_id) => {
-                client
+        let row =
+            match &key {
+                RequestKey::Id(id) => {
+                    client
+                        .query_opt(&format!("{REQUEST_SELECT} WHERE q.request_id = $1"), &[id])
+                        .await
+                }
+                RequestKey::PlanId(plan) => {
+                    let plan = plan_uuid(plan).ok_or_else(not_found)?;
+                    client
+                        .query_opt(
+                            &format!("{REQUEST_SELECT} WHERE q.agent_job_id = $1::text::uuid"),
+                            &[&plan],
+                        )
+                        .await
+                }
+                RequestKey::AgentJobId(agent) => {
+                    client
+                        .query_opt(
+                            &format!("{REQUEST_SELECT} WHERE q.agent_job_id = $1::text::uuid"),
+                            &[&agent.to_string()],
+                        )
+                        .await
+                }
+                RequestKey::TimelineId(timeline) => {
+                    client
+                        .query_opt(
+                            &format!("{REQUEST_SELECT} WHERE q.timeline_id = $1::text::uuid"),
+                            &[&timeline.to_string()],
+                        )
+                        .await
+                }
+                RequestKey::Job(run_id, job_id) => client
                     .query_opt(
                         &format!(
                             "{REQUEST_SELECT} WHERE q.run_id = $1::text::uuid AND q.job_id = $2 \
@@ -139,11 +139,10 @@ impl PgBackend {
                         ),
                         &[&run_text(*run_id), &job_id.0],
                     )
-                    .await
+                    .await,
             }
-        }
-        .map_err(db)?
-        .ok_or_else(not_found)?;
+            .map_err(db)?
+            .ok_or_else(not_found)?;
         request_from_row(&row)
     }
 
@@ -331,11 +330,13 @@ impl PgBackend {
             .collect())
     }
 
-    /// Record a job's GitHub check-run id. Writes nothing when the job has
-    /// no `jobs` row; returns whether the stored id changed.
+    /// Record a job's GitHub check-run id. Writes the `jobs` row when one
+    /// exists plus `run_submissions.record_details` — the store of record
+    /// for a job minted before its matrix leg materializes (lite parity).
+    /// Returns whether either mapping changed.
     ///
-    /// Statement: `UPDATE jobs SET check_run_id = $3 WHERE run_id, job_id
-    /// AND check_run_id IS DISTINCT FROM $3`.
+    /// Statements: `UPDATE jobs SET check_run_id`; `UPDATE run_submissions
+    /// SET record_details = jsonb_set(..) WHERE id IS DISTINCT FROM`.
     pub(super) async fn set_job_check_run(
         &self,
         run_id: RunId,
@@ -351,13 +352,27 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-        Ok(changed > 0)
+        let detail_changed = client
+            .execute(
+                "UPDATE run_submissions \
+                 SET record_details = jsonb_set(record_details, \
+                        ARRAY['job_check_run_ids', $2], to_jsonb($3::bigint), true) \
+                 WHERE run_id = $1::text::uuid \
+                   AND (record_details->'job_check_run_ids'->$2) IS DISTINCT FROM to_jsonb($3::bigint)",
+                &[&run_text(run_id), &job_id.0, &(check_run_id as i64)],
+            )
+            .await
+            .map_err(db)?;
+        Ok(changed > 0 || detail_changed > 0)
     }
 
-    /// Clear a job's check-run id only while it still equals `expected`.
+    /// Clear a job's check-run id only while it still equals `expected` —
+    /// in the `jobs` row and in `record_details` (legs minted before
+    /// materialization; a stale mapping there would re-mint a deleted check
+    /// run forever).
     ///
-    /// Statement: `UPDATE jobs SET check_run_id = NULL WHERE run_id, job_id
-    /// AND check_run_id = $3`.
+    /// Statements: `UPDATE jobs SET check_run_id = NULL`; `UPDATE
+    /// run_submissions SET record_details = record_details - $2`.
     pub(super) async fn clear_job_check_run(
         &self,
         run_id: RunId,
@@ -369,6 +384,16 @@ impl PgBackend {
             .execute(
                 "UPDATE jobs SET check_run_id = NULL WHERE run_id = $1::text::uuid \
                  AND job_id = $2 AND check_run_id = $3",
+                &[&run_text(run_id), &job_id.0, &(expected as i64)],
+            )
+            .await
+            .map_err(db)?;
+        client
+            .execute(
+                "UPDATE run_submissions \
+                 SET record_details = record_details #- ARRAY['job_check_run_ids', $2] \
+                 WHERE run_id = $1::text::uuid \
+                   AND (record_details->'job_check_run_ids'->$2) = to_jsonb($3::bigint)",
                 &[&run_text(run_id), &job_id.0, &(expected as i64)],
             )
             .await
@@ -414,18 +439,43 @@ impl PgBackend {
             .map(|row| row.get(0)))
     }
 
-    /// A job's recorded check-run id.
+    /// A job's recorded check-run id: the live `jobs` row, `job_history`,
+    /// then `record_details` — legs minted before their expansion
+    /// materializes have no row (lite parity).
     ///
-    /// Statement: `SELECT check_run_id FROM jobs WHERE run_id, job_id`.
+    /// Statements: `SELECT check_run_id FROM jobs UNION ALL job_history`;
+    /// fallback `SELECT record_details->'job_check_run_ids'->>$2` from
+    /// `run_submissions` UNION latest `run_history`.
     pub(super) async fn job_check_run_id(
         &self,
         run_id: RunId,
         job_id: &JobId,
     ) -> Result<Option<u64>, ControlError> {
         let client = self.reader().await?;
+        let row_id = client
+            .query_opt(
+                "SELECT check_run_id FROM jobs WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 UNION ALL \
+                 SELECT check_run_id FROM job_history \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 LIMIT 1",
+                &[&run_text(run_id), &job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .and_then(|row| row.get::<_, Option<i64>>(0));
+        if let Some(id) = row_id {
+            return Ok(Some(id as u64));
+        }
         Ok(client
             .query_opt(
-                "SELECT check_run_id FROM jobs WHERE run_id = $1::text::uuid AND job_id = $2",
+                "SELECT (record_details->'job_check_run_ids'->>$2)::bigint \
+                 FROM run_submissions WHERE run_id = $1::text::uuid \
+                 UNION ALL \
+                 SELECT (record_details->'job_check_run_ids'->>$2)::bigint \
+                 FROM run_history WHERE run_id = $1::text::uuid \
+                   AND created_at = (SELECT MAX(created_at) FROM run_history \
+                                     WHERE run_id = $1::text::uuid) \
+                 LIMIT 1",
                 &[&run_text(run_id), &job_id.0],
             )
             .await
@@ -457,7 +507,8 @@ impl PgBackend {
                     us!("r.started_at"),
                     ", ",
                     us!("r.completed_at"),
-                    " FROM runs r JOIN run_submissions s ON s.run_id = r.run_id \
+                    ", s.record_details::text FROM runs r JOIN run_submissions s \
+                     ON s.run_id = r.run_id \
                      WHERE r.run_id = $1::text::uuid"
                 ),
                 &[&run],
@@ -530,6 +581,32 @@ impl PgBackend {
                     steps: job_steps,
                 });
             }
+            // Legs minted before materialization live only in
+            // `record_details.job_check_run_ids`; reports mint for them too.
+            if let Some(details) = head
+                .get::<_, Option<String>>(3)
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            {
+                if let Ok(stored) = serde_json::from_value::<BTreeMap<String, i64>>(
+                    details
+                        .get("job_check_run_ids")
+                        .cloned()
+                        .unwrap_or_default(),
+                ) {
+                    for (job_id, id) in stored {
+                        if !jobs.iter().any(|job| job.job_id.0 == job_id) {
+                            jobs.push(RunDispatchJob {
+                                detail: None,
+                                job_id: JobId(job_id.clone()),
+                                status: ExecutionStatus::Pending,
+                                display_name: Some(job_id),
+                                check_run_id: Some(id as u64),
+                                steps: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
             return Ok(Some(RunDispatchInfo {
                 repository: submission["repository"]
                     .as_str()
@@ -548,7 +625,7 @@ impl PgBackend {
                     us!("started_at"),
                     ", ",
                     us!("completed_at"),
-                    ", created_at FROM run_history WHERE run_id = $1::text::uuid"
+                    ", created_at, record_details::text FROM run_history WHERE run_id = $1::text::uuid"
                 ),
                 &[&run],
             )
@@ -568,7 +645,7 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-        let jobs = job_rows
+        let mut jobs = job_rows
             .iter()
             .map(|row| {
                 let job_id: String = row.get(0);
@@ -595,6 +672,31 @@ impl PgBackend {
                 })
             })
             .collect::<Result<Vec<_>, ControlError>>()?;
+        // Legs minted before materialization live only in the archived
+        // `record_details`; their reports still mint.
+        if let Ok(details) = serde_json::from_str::<serde_json::Value>(
+            head.get::<_, Option<String>>(4).as_deref().unwrap_or("{}"),
+        ) {
+            if let Ok(stored) = serde_json::from_value::<BTreeMap<String, i64>>(
+                details
+                    .get("job_check_run_ids")
+                    .cloned()
+                    .unwrap_or_default(),
+            ) {
+                for (job_id, id) in stored {
+                    if !jobs.iter().any(|job| job.job_id.0 == job_id) {
+                        jobs.push(RunDispatchJob {
+                            detail: None,
+                            job_id: JobId(job_id.clone()),
+                            status: ExecutionStatus::Pending,
+                            display_name: Some(job_id),
+                            check_run_id: Some(id as u64),
+                            steps: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
         Ok(Some(RunDispatchInfo {
             repository: submission["repository"]
                 .as_str()
@@ -785,16 +887,30 @@ impl PgBackend {
         details_run_id: Option<RunId>,
     ) -> Result<Option<(RunId, JobId)>, ControlError> {
         const CANDIDATES: &str = "SELECT run_id::text AS run_id, job_id, check_run_id, \
-             display_name FROM (\
-               SELECT j.run_id, j.job_id, j.check_run_id, s.display_name FROM jobs j \
-               JOIN runs r ON r.run_id = j.run_id \
-               LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
-               WHERE r.status = 'completed' AND r.repository = $1 \
-                 AND ($2::text IS NULL OR r.head_sha = $2) \
-               UNION ALL \
-               SELECT j.run_id, j.job_id, j.check_run_id, j.display_name FROM job_history j \
-               JOIN run_history r ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
-               WHERE r.repository = $1 AND ($2::text IS NULL OR r.head_sha = $2)) c";
+            display_name FROM (\
+              SELECT j.run_id, j.job_id, j.check_run_id, s.display_name FROM jobs j \
+              JOIN runs r ON r.run_id = j.run_id \
+              LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+              WHERE r.status = 'completed' AND r.repository = $1 \
+                AND ($2::text IS NULL OR r.head_sha = $2) \
+              UNION ALL \
+              SELECT j.run_id, j.job_id, j.check_run_id, j.display_name FROM job_history j \
+              JOIN run_history r ON r.run_id = j.run_id AND r.created_at = j.run_created_at \
+              WHERE r.repository = $1 AND ($2::text IS NULL OR r.head_sha = $2) \
+              UNION ALL \
+              SELECT s.run_id, je.key, (je.value::text)::bigint, je.key \
+              FROM run_submissions s \
+              JOIN runs r ON r.run_id = s.run_id, \
+              jsonb_each(s.record_details->'job_check_run_ids') je \
+              WHERE r.status = 'completed' AND r.repository = $1 \
+                AND ($2::text IS NULL OR r.head_sha = $2) \
+              UNION ALL \
+              SELECT h.run_id, je.key, (je.value::text)::bigint, je.key \
+              FROM run_history h, \
+              jsonb_each(h.record_details->'job_check_run_ids') je \
+              WHERE h.repository = $1 AND ($2::text IS NULL OR h.head_sha = $2) \
+                AND h.created_at = (SELECT MAX(created_at) FROM run_history \
+                                    WHERE run_id = h.run_id)) c";
         let details = details_run_id.map(run_text);
         let client = self.reader().await?;
         let by_id = client
@@ -1153,7 +1269,9 @@ impl PgBackend {
             .collect())
     }
 
-    /// `(queue_state, status)` of one job.
+    /// `(queue_state, status)` of one job in the shared `QueueKind`
+    /// vocabulary (`blocked` = parked on a hold; parity with lite's
+    /// `QUEUE_KIND` mapping in `lite/queries.rs`).
     ///
     /// Statement: `SELECT queue_state, status FROM jobs WHERE run_id, job_id`.
     pub(super) async fn job_queue_state(
@@ -1164,7 +1282,13 @@ impl PgBackend {
         let client = self.reader().await?;
         Ok(client
             .query_opt(
-                "SELECT queue_state, status FROM jobs WHERE run_id = $1::text::uuid AND job_id = $2",
+                "SELECT CASE queue_state \
+                     WHEN 'blocked' THEN 'pending' \
+                     WHEN 'held' THEN 'blocked' \
+                     WHEN 'pending_expansion' THEN 'expand' \
+                     WHEN 'expanding' THEN 'expand' \
+                     ELSE queue_state END, \
+                 status FROM jobs WHERE run_id = $1::text::uuid AND job_id = $2",
                 &[&run_text(run_id), &job_id.0],
             )
             .await
@@ -1587,7 +1711,10 @@ pub(super) async fn archived_record_tx(
                 us!("started_at"),
                 ", ",
                 us!("completed_at"),
-                " FROM run_history WHERE run_id = $1::text::uuid \
+                ", fork_approval_pending, fork_approval_requested_at, \
+                 fork_approval_approved_at, fork_approval_note, \
+                 reports_check_runs, record_details::text \
+                 FROM run_history WHERE run_id = $1::text::uuid \
                  ORDER BY created_at DESC LIMIT 1"
             ),
             &[&run],
@@ -1607,7 +1734,7 @@ pub(super) async fn archived_record_tx(
     let created_at = codec::us_to_system(row.get::<_, Option<i64>>(10).unwrap_or(0));
     let jobs_rows = tx
         .query(
-            "SELECT job_id, status, display_name FROM job_history \
+            "SELECT job_id, status, display_name, check_run_id FROM job_history \
              WHERE run_id = $1::text::uuid \
              AND run_created_at = (SELECT max(created_at) FROM run_history \
                                    WHERE run_id = $1::text::uuid) \
@@ -1623,12 +1750,16 @@ pub(super) async fn archived_record_tx(
     let mut jobs = BTreeMap::new();
     let mut job_names = BTreeMap::new();
     let mut jobs_list = Vec::new();
+    let mut job_check_run_ids: BTreeMap<JobId, u64> = BTreeMap::new();
     for job_row in &jobs_rows {
         let job_id = JobId(job_row.get::<_, String>(0));
         let status = codec::status(job_row.get::<_, &str>(1));
         let name: String = job_row.get(2);
         jobs.insert(job_id.clone(), status);
         job_names.insert(job_id.clone(), name.clone());
+        if let Some(id) = job_row.get::<_, Option<i64>>(3) {
+            job_check_run_ids.insert(job_id.clone(), id as u64);
+        }
         jobs_list.push(JobDetail {
             job_id: job_id.0.clone(),
             name,
@@ -1636,6 +1767,19 @@ pub(super) async fn archived_record_tx(
             steps: Vec::new(),
             annotations: Vec::new(),
         });
+    }
+    // Ids minted for jobs that never materialized live in the archived
+    // `record_details`; history rows overlay them.
+    if let Ok(details) = serde_json::from_str::<serde_json::Value>(
+        row.get::<_, Option<String>>(18).as_deref().unwrap_or("{}"),
+    ) {
+        if let Some(map) = details.get("job_check_run_ids") {
+            if let Ok(stored) = serde_json::from_value::<BTreeMap<JobId, u64>>(map.clone()) {
+                for (job_id, id) in stored {
+                    job_check_run_ids.entry(job_id).or_insert(id);
+                }
+            }
+        }
     }
     Ok(crate::models::RunRecord {
         run_id,
@@ -1655,7 +1799,7 @@ pub(super) async fn archived_record_tx(
         workspace_snapshot: None,
         job_fail_fast: BTreeMap::new(),
         job_continue_on_error: BTreeMap::new(),
-        job_check_run_ids: BTreeMap::new(),
+        job_check_run_ids,
         reusable_calls: BTreeMap::new(),
         jobs_list,
         created_at: created_at.into(),
@@ -1672,5 +1816,10 @@ pub(super) async fn archived_record_tx(
         conclusion: row.get(7),
         push_state: None,
         snapshot_timing: None,
+        fork_approval_pending: row.get::<_, Option<bool>>(13).unwrap_or(false),
+        fork_approval_requested_at_unix_nanos: row.get(14),
+        fork_approved_at_unix_nanos: row.get(15),
+        fork_approval_note: row.get(16),
+        reports_check_runs: row.get::<_, Option<bool>>(17).unwrap_or(false),
     })
 }

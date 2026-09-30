@@ -1255,32 +1255,25 @@ jobs:
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
-    let run_id = {
-        let inner = state.inner.lock().await;
-        assert_eq!(inner.runs.len(), 1, "fork PR must create a run");
-        let (run_id, run) = inner.runs.iter().next().unwrap();
-        assert!(
-            run.fork_approval_pending,
-            "fork PR run must wait for approval"
-        );
-        // The needs-empty job must be held in Pending, not dispatched.
-        assert_eq!(run.jobs.len(), 1);
-        let status = run.jobs.values().next().unwrap();
-        assert_eq!(
-            *status,
-            ExecutionStatus::Pending,
-            "needs-empty fork job must hold in Pending"
-        );
-        assert!(
-            inner.queue.iter().all(|j| j.run_id != *run_id),
-            "needs-empty fork job must not reach the ready queue"
-        );
-        assert!(
-            inner.pending_jobs.iter().any(|j| j.run_id == *run_id),
-            "needs-empty fork job must wait in pending_jobs"
-        );
-        *run_id
-    };
+    let runs = request_json(&app, Method::GET, "/api/v1/runs", Value::Null).await;
+    let runs = runs.as_array().expect("run list is an array");
+    assert_eq!(runs.len(), 1, "fork PR must create a run");
+    let run = &runs[0];
+    assert_eq!(
+        run["fork_approval_pending"],
+        Value::Bool(true),
+        "fork PR run must wait for approval"
+    );
+    let jobs = run["jobs"].as_object().expect("job statuses");
+    assert_eq!(jobs.len(), 1);
+    // The needs-empty job parks in `pending`: `queued` would mean it reached
+    // the ready queue and a runner could claim it before the approval.
+    assert_eq!(
+        jobs.values().next().unwrap(),
+        "pending",
+        "needs-empty fork job must hold in Pending"
+    );
+    let run_id = run["run_id"].as_str().unwrap().to_owned();
 
     // Approving releases the hold; an empty JSON body must be accepted.
     let response = app
@@ -1296,10 +1289,21 @@ jobs:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let inner = state.inner.lock().await;
-    assert!(
-        !inner.runs[&run_id].fork_approval_pending,
+    let run = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/runs/{run_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        run["fork_approval_pending"],
+        Value::Bool(false),
         "approval must clear the hold"
+    );
+    assert_eq!(
+        run["jobs"]["build"], "queued",
+        "the released job reaches the ready queue"
     );
 }
 

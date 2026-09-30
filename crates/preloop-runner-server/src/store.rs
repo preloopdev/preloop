@@ -15,7 +15,6 @@ const MIGRATION_DOMAIN: &[u8] = b"preloop-store-v2";
 const KEY_INFO_ENCRYPT: &[u8] = b"aks-store-aead/v1";
 const KEY_INFO_MAC: &[u8] = b"aks-store-mac/v1";
 
-
 /// Where the server should look for durable state. Parsed from `PRELOOP_STORE_URL`
 /// (or an explicit override); see [`parse_store_url`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +55,6 @@ pub fn parse_store_url(value: &str) -> anyhow::Result<StoreUrl> {
          postgres://<user>:<pass>@<host>/<db>, or a bare sqlite path"
     )
 }
-
 
 /// AEAD envelope used to seal persisted blobs (runs, requests, session keys,
 /// metadata snapshot). Backend-independent: SQLite and Postgres both store
@@ -185,7 +183,6 @@ impl Envelope {
     }
 }
 
-
 struct DerivedKeys {
     aead: [u8; 32],
     mac: [u8; 32],
@@ -276,7 +273,6 @@ pub fn unix_us(value: chrono::DateTime<chrono::Utc>) -> i64 {
     value.timestamp_micros()
 }
 
-
 /// Deduplicate label strings case-insensitively, preserving first occurrence.
 ///
 /// The handler layer already runs this when a runner registers; this is the
@@ -295,4 +291,3 @@ pub fn dedupe_labels_ci(labels: &[String]) -> Vec<String> {
     }
     out
 }
-

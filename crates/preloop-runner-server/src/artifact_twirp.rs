@@ -189,19 +189,18 @@ pub async fn twirp_artifact_v2_create(
     tokio::fs::create_dir_all(&stage_dir)
         .await
         .map_err(|e| ApiError::internal(format!("failed to create artifact stage dir: {e}")))?;
+    // Re-check liveness against the backend: a settled job must not mint a
+    // fresh upload credential.
+    if let crate::auth::ResultsIdentity::Job(job) = &identity
+        && !crate::auth::job_is_live(&shared.state, job.job_id).await?
+    {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ));
+    }
     {
         let mut inner = shared.state.inner.lock().await;
-        // In-lock re-check: the job may have settled between the gate and
-        // this lock — a settled job must not mint a fresh upload credential.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity
-            && !crate::auth::job_is_live_locked(&inner, job.job_id)
-        {
-            drop(inner);
-            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-            return Err(ApiError::forbidden(
-                "job is not live; writes are rejected for completed or unknown jobs",
-            ));
-        }
         if inner.artifact_v2_registry.contains_key(&registry_key) {
             let _ = tokio::fs::remove_dir_all(&stage_dir).await;
             return Err(ApiError::conflict(format!(

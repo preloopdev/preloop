@@ -11,12 +11,12 @@
 //! AND result IS NULL`.
 
 use super::codec::{self, now_us, ts, us};
-use super::lookups::{request_from_row, REQUEST_SELECT};
-use super::{db, PgBackend};
+use super::lookups::{REQUEST_SELECT, request_from_row};
+use super::{PgBackend, db};
 use crate::control::backend::RegisterRunner;
 use crate::control::types::{
-    renew_miss, status_str, ActiveRequest, ControlError, ReadyRow, ReapInputs, RunnerRow,
-    DEFAULT_NAMESPACE,
+    ActiveRequest, ControlError, DEFAULT_NAMESPACE, ReadyRow, ReapInputs, RunnerRow, renew_miss,
+    status_str,
 };
 use crate::models::TaskAgentJobRequestRecord;
 use preloop_gha_protocol::crypto::AgentRsaPublicKey;

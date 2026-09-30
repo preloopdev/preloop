@@ -8,13 +8,13 @@
 use super::codec::{self, now_us};
 use super::jobs;
 use super::requests;
-use super::{db, LiteBackend};
+use super::{LiteBackend, db};
 use crate::control::backend::PollRequest;
 use crate::control::logic;
 use crate::control::types::*;
 use crate::models::{QueuedJob, RunnerCapabilities, TaskAgentJobRequestRecord};
-use preloop_gha_protocol::{azdo, JobId, RunId};
-use rusqlite::{params, OptionalExtension, Transaction};
+use preloop_gha_protocol::{JobId, RunId, azdo};
+use rusqlite::{OptionalExtension, Transaction, params};
 
 /// One session row's identity as the claim path needs it.
 struct SessionRef {

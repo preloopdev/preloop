@@ -7,11 +7,11 @@
 //! the row key.
 
 use super::codec::{self, ts, us};
-use super::{db, PgBackend};
-use crate::control::types::{step_report, ControlError, StepPatch, MAX_TIMELINE_RECORDS};
+use super::{PgBackend, db};
+use crate::control::types::{ControlError, MAX_TIMELINE_RECORDS, StepPatch, step_report};
 use crate::models::{StepKind, StepRecord};
-use preloop_gha_protocol::azdo::TimelineRecord;
 use preloop_gha_protocol::RunId;
+use preloop_gha_protocol::azdo::TimelineRecord;
 use std::collections::BTreeMap;
 
 /// Bounded retries for the per-plan log id race (two appenders computing the

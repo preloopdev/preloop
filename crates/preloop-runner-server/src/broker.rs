@@ -691,7 +691,7 @@ pub async fn next_message_broker_ref_root(
         _ => {
             return Err(ApiError::forbidden(
                 "broker session belongs to another runner",
-            ))
+            ));
         }
     };
 
@@ -1014,9 +1014,7 @@ pub async fn broker_acquire_job(
             shared
                 .state
                 .static_github_pat()
-                .and_then(|pat| {
-                    crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes))
-                })
+                .and_then(|pat| crate::runs::cached_pat_scopes(&pat).map(|scopes| (pat, scopes)))
                 .map(|(pat, scopes)| {
                     message.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),

@@ -18,7 +18,7 @@ use crate::control::types::{
     ControlError, PollOutcome, SessionProtocol, StepPatch, SubmitJob, SubmitRun,
 };
 use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
-use preloop_gha_protocol::{azdo, ExecutionStatus, JobId, RunId};
+use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -235,6 +235,11 @@ fn run_record(run_id: RunId) -> RunRecord {
         conclusion: None,
         push_state: None,
         snapshot_timing: None,
+        fork_approval_pending: false,
+        fork_approval_requested_at_unix_nanos: None,
+        fork_approved_at_unix_nanos: None,
+        fork_approval_note: None,
+        reports_check_runs: false,
     }
 }
 
@@ -276,6 +281,7 @@ fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
         matrix: BTreeMap::new(),
         deferred_matrix: None,
         reusable_call: None,
+        environment_gate: None,
     }
 }
 

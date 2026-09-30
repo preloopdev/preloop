@@ -752,8 +752,8 @@ impl DebugSessionRegistry {
             .collect();
         for id in stale {
             self.sessions.remove(&id);
-            self.agent_event_archive.remove(&id);
-            self.agent_audit_archive.remove(&id);
+            self.event_archive.remove(&id);
+            self.session_audit_archive.remove(&id);
             self.archive_order.retain(|archived| archived != &id);
         }
     }
@@ -1866,10 +1866,12 @@ mod tests {
                 .len(),
             5
         );
-        assert!(registry
-            .get(&second.session_id)
-            .unwrap()
-            .controller_lease
-            .is_some());
+        assert!(
+            registry
+                .get(&second.session_id)
+                .unwrap()
+                .controller_lease
+                .is_some()
+        );
     }
 }

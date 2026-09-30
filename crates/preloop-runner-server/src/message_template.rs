@@ -16,10 +16,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use preloop_gha_protocol::JobPlan;
 use preloop_gha_protocol::azdo::{
     AgentJobRequestMessage, MaskHint, MaskType, MessageSecretSpec, VariableValue,
 };
-use preloop_gha_protocol::JobPlan;
 
 use crate::secret_provider::{SecretProvider, SecretScope};
 

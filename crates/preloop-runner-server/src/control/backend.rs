@@ -18,9 +18,9 @@
 use super::logic::{BuiltExpansion, SchedulingOutcome};
 use super::types::*;
 use crate::models::{
-    JobDetail, PushState, QueuedJob, RunRecord, StepRecord, TaskAgentJobRequestRecord,
-    WebhookDeliveryRecord, WebhookDeliveryStatus, WebhookDeliverySummary, WebhookQueueStats,
-    WebhookRedeliveryRecord, WebhookWatchdogCursor,
+    EnvironmentGateState, JobDetail, PushState, QueuedJob, RunRecord, StepRecord,
+    TaskAgentJobRequestRecord, WebhookDeliveryRecord, WebhookDeliveryStatus,
+    WebhookDeliverySummary, WebhookQueueStats, WebhookRedeliveryRecord, WebhookWatchdogCursor,
 };
 use preloop_gha_protocol::{ExecutionStatus, JobId, NdjsonEvent, RunId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,6 +33,32 @@ pub(crate) struct RunListFilter {
     pub(crate) status: Option<String>,
     pub(crate) event: Option<String>,
     pub(crate) limit: usize,
+}
+
+/// Outcome of a promotion pass: the jobs a hold released and the queue gauges
+/// the caller stores after it (`promote_ready_jobs`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PromoteOutcome {
+    /// Jobs admitted to the ready queue by this pass.
+    pub(crate) promoted: usize,
+    /// Jobs failed closed by a denied or expired environment gate.
+    pub(crate) failed: usize,
+    /// Global ready-queue depth after the pass.
+    pub(crate) queue_depth: usize,
+    /// `runs-on` labels of the ready-queue front after the pass.
+    pub(crate) next_runs_on: Vec<String>,
+}
+
+/// One job's environment-gate state as the approve-job handler reads it.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvironmentGateRead {
+    /// The job's stored `environment:` value (`job_specs.environment`).
+    pub(crate) environment: Option<serde_json::Value>,
+    /// The armed gate progress (`jobs.environment_gate`); `None` when the job
+    /// never armed one (or it was already satisfied).
+    pub(crate) gate: Option<EnvironmentGateState>,
+    /// The job's current status.
+    pub(crate) status: ExecutionStatus,
 }
 
 /// Extract the optional run identity carried by a durable event.
@@ -202,6 +228,72 @@ pub(crate) trait ControlBackend: Send + Sync {
         job_id: &JobId,
     ) -> Result<CancelOutcome, ControlError>;
 
+    /// Persist a run's fork-PR approval hold: the parking stamp written at
+    /// submit, the approval release, or the expiry sweep's clear. Scoped to
+    /// the `runs` row; no job or queue state is touched here (the callers
+    /// own promotion/fail-closed effects).
+    async fn set_fork_approval(&self, update: ForkApprovalStamp) -> Result<(), ControlError>;
+
+    /// Persist one job's environment protection gate state (`None` clears
+    /// it). The gate is job runtime state — armed at scheduler admission,
+    /// updated when an approval is recorded, cleared once satisfied — and
+    /// travels with the job so a restart re-arms it (fail closed).
+    async fn set_environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        gate: Option<EnvironmentGateState>,
+    ) -> Result<(), ControlError>;
+
+    /// Stamp whether intake reported GitHub check runs for this run (webhook,
+    /// dispatch, push, or rerun path). Persisted so jobs materialized after
+    /// submission — runtime-expanded matrix legs, reusable callee jobs —
+    /// still mint checks after a restart (`report_check_run_queued` sets it
+    /// true on every reporting path).
+    async fn set_reports_check_runs(
+        &self,
+        run_id: RunId,
+        reported: bool,
+    ) -> Result<(), ControlError>;
+
+    /// Record one operator approval for a job waiting on its environment's
+    /// required-reviewer gate: fail the job closed when the approval window
+    /// lapsed, otherwise append the approval stamp, persist the gate and
+    /// re-run the run's promotion sweep so a satisfied gate releases the job.
+    /// `NotFound` when the job row does not exist; every other decision comes
+    /// back in the outcome (the handler maps them to HTTP).
+    async fn record_environment_approval(
+        &self,
+        approval: EnvironmentApproval,
+    ) -> Result<EnvironmentApprovalOutcome, ControlError>;
+
+    /// Re-run scheduler admission for the jobs a run parked at submit — the
+    /// fork-PR approval hold and armed environment protection gates — then
+    /// promote whatever the release unblocked. One transaction per run.
+    ///
+    /// `Some(run_id)` is the approve/release path (approve-fork, approve-job,
+    /// a hold lifting). `None` sweeps every run currently parking a
+    /// gate-armed job: wait timers and approval windows close on wall-clock
+    /// time, so the reaper drives that sweep. A parked job whose run is still
+    /// fork-approval-pending stays parked; a job whose gate fails closed
+    /// (deployment-branch mismatch, approval window expired) is concluded
+    /// `Failure`. Returns the promoted/failed counts and the post-pass queue
+    /// gauges the caller stores on its wake atomics.
+    async fn promote_ready_jobs(
+        &self,
+        run: Option<RunId>,
+        rules: &crate::config::EnvironmentRulesMap,
+    ) -> Result<PromoteOutcome, ControlError>;
+
+    /// One job's stored `environment:` value, its armed environment gate and
+    /// its current status — the approve-job handler's read before it records
+    /// an approval. `Ok(None)` when the run or job does not exist.
+    async fn environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentGateRead>, ControlError>;
+
     /// Renew a claimed request's lease. Returns the record on success;
     /// `Stale` if the runner no longer owns it, `NotFound` if unknown.
     async fn renew_request(
@@ -276,6 +368,49 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// immutable job/attempt history in one transaction per batch. Returns
     /// the archived run ids (their run-tier secrets can be dropped).
     async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError>;
+
+    /// Retention selection: ids of terminal runs whose completion (falling
+    /// back to creation) is older than `cutoff_us`, oldest first, up to
+    /// `limit` (and no more than the backend's own batch cap). Archived rows
+    /// count: once the archiver has moved a settled run into
+    /// `run_history`, that table is where the expired run actually lives, so
+    /// a retention pass that ignored it would never delete anything.
+    ///
+    /// Only terminal runs are ever candidates. A live run with an unfinished
+    /// or session-bound attempt is skipped (the same guard the archiver
+    /// uses). Read-only; the caller deletes what it selects with
+    /// [`ControlBackend::delete_expired_run`].
+    async fn expired_terminal_runs(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError>;
+
+    /// Retention delete of one terminal run: its live rows (cascading its
+    /// jobs, requests, attempts, steps, logs and gates) and its history
+    /// rows, plus its artifact metadata. `Conflict` when a live run row
+    /// exists and is not `completed` — retention must never delete a queued
+    /// or in-progress run, and the guard makes that structural rather than a
+    /// property of the caller's filter. An unknown (already deleted) run is
+    /// `Ok(())`, so a repeated or interrupted pass converges.
+    ///
+    /// Runs the deletion while holding the run's advisory lock, so it cannot
+    /// interleave with a scheduling transaction for the same run.
+    async fn delete_expired_run(&self, run_id: RunId) -> Result<(), ControlError>;
+
+    /// Fail closed every fork-PR run whose approval hold expired before
+    /// `expired_before_unix_nanos` (`now - FORK_APPROVAL_WINDOW_NANOS`): in
+    /// one transaction per run, every non-terminal job becomes `failure`,
+    /// the `fork_approval_pending` hold clears, the run finalizes as a
+    /// `failure`, its scheduling rows drop and its concurrency holder is
+    /// released (promoting the waiters it was wedging). Returns the failed
+    /// run ids, for the caller's per-job event and check-run fan-out. Runs
+    /// with no hold, a terminal status, or a missing request stamp are
+    /// untouched — a bookkeeping gap must not auto-fail a run.
+    async fn expire_fork_approvals(
+        &self,
+        expired_before_unix_nanos: i64,
+    ) -> Result<Vec<RunId>, ControlError>;
 
     /// Append one durable control event. This never reads or rewrites run
     /// state: the command that produced the event already committed it.
@@ -1206,6 +1341,19 @@ impl Backend {
         }
     }
 
+    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
+    /// The backend evaluates these inside its promotion and reaper
+    /// transactions, where the job rows live.
+    pub(crate) fn set_environment_rules(
+        &self,
+        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+    ) {
+        match self {
+            Self::Sqlite(backend) => backend.set_environment_rules(rules),
+            Self::Postgres(backend) => backend.set_environment_rules(rules),
+        }
+    }
+
     /// Current scheduling config — the counterpart to [`Backend::set_config`]
     /// for callers that need to flip one flag without knowing the rest.
     #[cfg(test)]
@@ -1308,6 +1456,62 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.cancel_job(run_id, job_id).await,
             Self::Postgres(b) => b.cancel_job(run_id, job_id).await,
+        }
+    }
+    async fn set_fork_approval(&self, update: ForkApprovalStamp) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_fork_approval(update).await,
+            Self::Postgres(b) => b.set_fork_approval(update).await,
+        }
+    }
+    async fn set_environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+        gate: Option<EnvironmentGateState>,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_environment_gate(run_id, job_id, gate).await,
+            Self::Postgres(b) => b.set_environment_gate(run_id, job_id, gate).await,
+        }
+    }
+    async fn record_environment_approval(
+        &self,
+        approval: EnvironmentApproval,
+    ) -> Result<EnvironmentApprovalOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.record_environment_approval(approval).await,
+            Self::Postgres(b) => b.record_environment_approval(approval).await,
+        }
+    }
+    async fn set_reports_check_runs(
+        &self,
+        run_id: RunId,
+        reported: bool,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.set_reports_check_runs(run_id, reported).await,
+            Self::Postgres(b) => b.set_reports_check_runs(run_id, reported).await,
+        }
+    }
+    async fn promote_ready_jobs(
+        &self,
+        run: Option<RunId>,
+        rules: &crate::config::EnvironmentRulesMap,
+    ) -> Result<PromoteOutcome, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.promote_ready_jobs(run, rules).await,
+            Self::Postgres(b) => b.promote_ready_jobs(run, rules).await,
+        }
+    }
+    async fn environment_gate(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentGateRead>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.environment_gate(run_id, job_id).await,
+            Self::Postgres(b) => b.environment_gate(run_id, job_id).await,
         }
     }
     async fn renew_request(
@@ -1416,6 +1620,31 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.archive_finished_runs(limit).await,
             Self::Postgres(b) => b.archive_finished_runs(limit).await,
+        }
+    }
+    async fn expired_terminal_runs(
+        &self,
+        cutoff_us: i64,
+        limit: usize,
+    ) -> Result<Vec<RunId>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.expired_terminal_runs(cutoff_us, limit).await,
+            Self::Postgres(b) => b.expired_terminal_runs(cutoff_us, limit).await,
+        }
+    }
+    async fn delete_expired_run(&self, run_id: RunId) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.delete_expired_run(run_id).await,
+            Self::Postgres(b) => b.delete_expired_run(run_id).await,
+        }
+    }
+    async fn expire_fork_approvals(
+        &self,
+        expired_before_unix_nanos: i64,
+    ) -> Result<Vec<RunId>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.expire_fork_approvals(expired_before_unix_nanos).await,
+            Self::Postgres(b) => b.expire_fork_approvals(expired_before_unix_nanos).await,
         }
     }
     async fn append_event(&self, event: &NdjsonEvent) -> Result<(), ControlError> {

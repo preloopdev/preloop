@@ -207,18 +207,25 @@ pub async fn require_live_results_job(
     require_live_job(state, job_uuid).await
 }
 
-/// Liveness predicate on the already-locked inner state — the in-lock
-/// re-check for handlers that mutate `inner`. Checking under a released
-/// lock leaves a check-then-mutate window where the job settles between
-/// the gate and the write; callers that hold `inner` should re-verify with
-/// this before committing the mutation.
-pub fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
-    inner
-        .agent_job_requests
-        .get(&job_uuid)
-        .copied()
-        .and_then(|request_id| inner.job_requests.get(&request_id))
-        .is_some_and(|record| !matches!(record.result, Some(status) if status.is_terminal()))
+/// Liveness predicate on a job, resolved from the control backend: a job is
+/// live while its request record still exists and has not settled to a
+/// terminal status. A purged or unknown job is not live.
+///
+/// Liveness follows the request record, not the projected run status:
+/// cancellation projects `run.jobs` to Cancelled immediately while the
+/// request stays unsettled until the runner finishes reporting — the window
+/// where its final step updates, logs, and uploads must still land. Only a
+/// settled (or purged) request is stale.
+pub async fn job_is_live(state: &AppState, job_uuid: uuid::Uuid) -> Result<bool, ApiError> {
+    match state
+        .backend
+        .request(crate::control::backend::RequestKey::AgentJobId(job_uuid))
+        .await
+    {
+        Ok(record) => Ok(!matches!(record.result, Some(status) if status.is_terminal())),
+        Err(crate::control::ControlError::NotFound(_)) => Ok(false),
+        Err(error) => Err(ApiError::from(error)),
+    }
 }
 
 /// R1-10: require a job UUID to be live before a write, for handlers that
@@ -227,13 +234,7 @@ pub fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
 /// [`require_live_results_job`]: the system identity bypasses, so callers
 /// must skip this helper for the system bearer themselves.
 pub async fn require_live_job(state: &AppState, job_uuid: uuid::Uuid) -> Result<(), ApiError> {
-    let inner = state.inner.lock().await;
-    // Liveness follows the request record, not the projected run status:
-    // cancellation projects `run.jobs` to Cancelled immediately while the
-    // request stays unsettled until the runner finishes reporting — the
-    // window where its final step updates, logs, and uploads must still
-    // land. Only a settled (or purged) request is stale.
-    if job_is_live_locked(&inner, job_uuid) {
+    if job_is_live(state, job_uuid).await? {
         Ok(())
     } else {
         Err(ApiError::forbidden(
@@ -1001,16 +1002,22 @@ pub async fn job_git_ref_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let inner = state.inner.lock().await;
-    let git_ref = inner
-        .agent_job_requests
-        .get(&job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-        .and_then(|record| inner.runs.get(&record.run_id))
-        .map(|run| run.submission.git_ref.clone())
+    let run_id = state
+        .backend
+        .run_for_attempt(job_id)
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::forbidden("job runtime token is not bound to a live workflow run")
         })?;
+    let git_ref = state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?
+        .submission
+        .git_ref
+        .clone();
     Ok(Some(git_ref))
 }
 
@@ -1051,15 +1058,19 @@ pub async fn job_cache_context_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let inner = state.inner.lock().await;
-    let run = inner
-        .agent_job_requests
-        .get(&job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-        .and_then(|record| inner.runs.get(&record.run_id))
+    let run_id = state
+        .backend
+        .run_for_attempt(job_id)
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::forbidden("job runtime token is not bound to a live workflow run")
         })?;
+    let run = state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?;
     let submission = &run.submission;
     let default_branch = submission
         .payload

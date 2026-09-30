@@ -36,11 +36,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::ControlBackend;
 use crate::github_app::GitHubAppCredentials;
 use crate::models::{WebhookRedeliveryRecord, WebhookRepairReason, WebhookWatchdogCursor};
 use crate::state::SharedState;
 use crate::webhook_status::now_us;
-use crate::ControlBackend;
 
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const MIN_INTERVAL_SECS: u64 = 10;

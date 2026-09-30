@@ -17,6 +17,7 @@ mod codec;
 mod concurrency;
 mod dispatch;
 mod expansion;
+mod fork_gate;
 mod impls;
 mod jobs;
 mod lifecycle;
@@ -47,7 +48,7 @@ use std::time::Duration;
 
 /// The schema this build reads and writes. Greenfield: any other stamped
 /// version is refused at open (no migrations).
-pub(crate) const SCHEMA_VERSION: &str = "1";
+pub(crate) const SCHEMA_VERSION: &str = "2";
 
 /// The translated schema (see the file header for the type mapping).
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -70,6 +71,10 @@ pub(crate) struct LiteBackend {
     require_job_assignments: AtomicBool,
     /// Runner liveness timeout in nanoseconds.
     runner_liveness_timeout: AtomicU64,
+    /// Operator environment protection rules (`[environment_rules]`), applied
+    /// after open from the real server config. Empty until then — no rules
+    /// means every environment gate proceeds, the pre-rules behavior.
+    environment_rules: parking_lot::RwLock<std::sync::Arc<crate::config::EnvironmentRulesMap>>,
     /// Stale bindings released since this node started (replaces
     /// `TxState::released_bindings_count`; node-local, not persisted).
     released_bindings: AtomicU64,
@@ -254,6 +259,9 @@ impl LiteBackend {
             pool_assignments_enabled: AtomicBool::new(pool_assignments_enabled),
             require_job_assignments: AtomicBool::new(require_job_assignments),
             runner_liveness_timeout: AtomicU64::new(runner_liveness_timeout.as_nanos() as u64),
+            environment_rules: parking_lot::RwLock::new(std::sync::Arc::new(
+                crate::config::EnvironmentRulesMap::new(),
+            )),
             released_bindings: AtomicU64::new(0),
         }
     }
@@ -292,6 +300,20 @@ impl LiteBackend {
             .store(require_job_assignments, Ordering::Release);
         self.runner_liveness_timeout
             .store(runner_liveness_timeout.as_nanos() as u64, Ordering::Release);
+    }
+
+    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
+    /// Empty rules preserve the pre-rules behavior: every gate proceeds.
+    pub(crate) fn set_environment_rules(
+        &self,
+        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+    ) {
+        *self.environment_rules.write() = rules;
+    }
+
+    /// The live environment protection rules (an `Arc` clone, cheap).
+    pub(super) fn environment_rules(&self) -> std::sync::Arc<crate::config::EnvironmentRulesMap> {
+        self.environment_rules.read().clone()
     }
 
     /// Run one command as a write transaction: `BEGIN IMMEDIATE`, `f`,

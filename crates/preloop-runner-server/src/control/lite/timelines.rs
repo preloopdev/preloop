@@ -2,10 +2,10 @@
 //! attempt's `timeline_id`.
 
 use super::codec::now_us;
-use super::{db, LiteBackend};
-use crate::control::types::{stamp_timeline_records, ControlError, MAX_TIMELINE_RECORDS};
+use super::{LiteBackend, db};
+use crate::control::types::{ControlError, MAX_TIMELINE_RECORDS, stamp_timeline_records};
 use preloop_gha_protocol::azdo::TimelineRecord;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 /// The timeline id addressed by a `'{plan_id}/{timeline_id}'` key: the uuid
 /// after the last `/` (decision round 1, Q1). `None` when it is not a uuid.
