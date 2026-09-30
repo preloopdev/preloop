@@ -1151,6 +1151,87 @@ fn lifecycle_fixture(
     )
 }
 
+/// A `$/` action lives in the workspace, which the primary checkout populates
+/// *after* the step list is built: lifecycle registration must not depend on
+/// the manifest being readable yet, or its post hook is never registered.
+#[test]
+fn self_repository_post_registers_before_the_checkout() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let workspace_dir = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let workspace = workspace_dir.to_string_lossy().to_string();
+    let step = Step {
+        id: "00000000-0000-0000-0000-0000000000a1".to_string(),
+        context_name: "setup".to_string(),
+        display_name: "Setup".to_string(),
+        step_type: StepType::Action {
+            uses: "$/.github/actions/setup".to_string(),
+            with: serde_json::json!({}),
+        },
+        condition: None,
+        continue_on_error: false,
+        timeout_minutes: None,
+        env: Default::default(),
+        raw: serde_json::json!({}),
+        is_background: false,
+    };
+
+    let steps = build_step_list_with_lifecycle(
+        vec![step],
+        &workspace,
+        &std::collections::HashMap::new(),
+        true,
+    );
+    let post: Vec<&Step> = steps
+        .iter()
+        .filter(|step| step.id.starts_with("__post_"))
+        .collect();
+    assert_eq!(
+        post.len(),
+        1,
+        "the post step must be registered even though the action is not checked out yet: {steps:#?}"
+    );
+    assert_eq!(
+        post[0].raw.get("__post").and_then(|value| value.as_bool()),
+        Some(true),
+        "post marker missing: {:?}",
+        post[0].raw
+    );
+    match &post[0].step_type {
+        StepType::Action { with, .. } => assert!(
+            with.get("__preloop_entry").is_none(),
+            "a deferred post step must carry no entry point (the manifest arrives later): {with:?}"
+        ),
+        other => panic!("unexpected step type: {other:?}"),
+    }
+
+    // With the gate closed nothing is registered for `$/`.
+    let steps = build_step_list_with_lifecycle(
+        vec![Step {
+            id: "00000000-0000-0000-0000-0000000000a2".to_string(),
+            context_name: "setup".to_string(),
+            display_name: "Setup".to_string(),
+            step_type: StepType::Action {
+                uses: "$/.github/actions/setup".to_string(),
+                with: serde_json::json!({}),
+            },
+            condition: None,
+            continue_on_error: false,
+            timeout_minutes: None,
+            env: Default::default(),
+            raw: serde_json::json!({}),
+            is_background: false,
+        }],
+        &workspace,
+        &std::collections::HashMap::new(),
+        false,
+    );
+    assert!(
+        steps.iter().all(|step| !step.id.starts_with("__post_")),
+        "a closed feature gate must not register `$/` lifecycle steps: {steps:#?}"
+    );
+}
+
 fn lifecycle_is_materialized(spec: &LifecycleSpec) -> bool {
     spec.manifest_present && spec.supported
 }

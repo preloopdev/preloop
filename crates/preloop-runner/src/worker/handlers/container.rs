@@ -86,6 +86,13 @@ pub async fn run_docker_action_from_manifest(
     expr_ctx.insert("inputs", inputs_to_json(&inputs));
     let manifest_env = evaluate_manifest_env(manifest.runs_env.as_ref(), &expr_ctx)?;
     let env = container_action_env(ctx, &inputs, Some(manifest_env), Some(&expr_ctx))?;
+    // A deferred `$/` post step (registered before the checkout, so with no
+    // `__preloop_entry`) has no post entry point to run: docker
+    // `post-entrypoint` is not part of the manifest model, so skip rather
+    // than re-running the main entrypoint.
+    if ctx.step_id.starts_with("__post_") && lifecycle_entry(with).is_none() {
+        return Ok(());
+    }
     let entrypoint = lifecycle_entry(with)
         .or(manifest.runs_entrypoint.as_deref())
         .map(|entry| evaluate_template_value(entry, &expr_ctx))

@@ -125,6 +125,27 @@ pub(crate) fn feature_enabled(raw: Option<&str>) -> bool {
     })
 }
 
+/// Validate a `$/path` self-repository reference and return the workspace path
+/// it names, whether or not the directory exists yet.
+///
+/// The primary checkout populates the workspace *after* the step list is
+/// built, so lifecycle registration needs the path before the action exists;
+/// [`self_repository_local_dir`] additionally proves existence and containment.
+pub(crate) fn self_repository_local_path(
+    uses: &str,
+    workspace: &str,
+) -> Option<std::path::PathBuf> {
+    let subpath = uses.strip_prefix("$/")?.trim_matches('/');
+    if subpath.is_empty()
+        || subpath
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return None;
+    }
+    Some(std::path::Path::new(workspace).join(subpath))
+}
+
 /// Resolve a `$/path` self-repository reference against the workspace.
 ///
 /// The reference names the root of the repository the workflow runs from —
@@ -134,20 +155,18 @@ pub(crate) fn feature_enabled(raw: Option<&str>) -> bool {
 /// directory does not exist; the caller then falls back to the staged remote
 /// copy, which is what the official runner uses.
 pub(crate) fn self_repository_local_dir(uses: &str, workspace: &str) -> Option<std::path::PathBuf> {
-    let subpath = uses.strip_prefix("$/")?.trim_matches('/');
-    if subpath.is_empty()
-        || subpath
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
+    let dir = self_repository_local_path(uses, workspace)?;
+    if !dir.is_dir() {
         return None;
     }
     // Canonical containment: `..` segments are already rejected, but a
     // symlink inside the workspace can still point outside it, and the
-    // manifest loader would happily read that action.yml.
+    // manifest loader would happily read that action.yml. A directory that
+    // does not exist yet (checkout has not run) is refused here and handled
+    // by the deferred lifecycle path instead.
     let root = std::fs::canonicalize(workspace).ok()?;
-    let dir = std::fs::canonicalize(std::path::Path::new(workspace).join(subpath)).ok()?;
-    (dir.starts_with(&root) && dir.is_dir()).then_some(dir)
+    let resolved = std::fs::canonicalize(&dir).ok()?;
+    resolved.starts_with(&root).then_some(resolved)
 }
 
 /// Resolve a remote action reference to a local directory.
@@ -853,6 +872,18 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&outside).ok();
+        // The validated path exists even before the checkout creates the
+        // directory (lifecycle registration runs first).
+        assert_eq!(
+            self_repository_local_path("$/.github/actions/setup-tox", &workspace),
+            Some(action.clone()),
+            "the validated path does not require the action to exist yet"
+        );
+        assert_eq!(
+            self_repository_local_path("$/../../etc", &workspace),
+            None,
+            "traversal is refused before the path is built"
+        );
         assert_eq!(
             self_repository_local_dir("./.github/actions/setup-tox", &workspace),
             None,

@@ -867,34 +867,40 @@ pub fn build_step_list_with_lifecycle(
         let StepType::Action { ref uses, ref with } = step.step_type else {
             continue;
         };
-        // `$/` references are only executable when the feature is advertised
-        // and the action is checked out in the workspace; `action_preparation`
-        // applies the same gate when it stages them.
-        let self_repo_local = self_repository_enabled
-            && uses.starts_with("$/")
-            && super::handlers::action::self_repository_local_dir(uses, workspace).is_some();
-        let is_local_action = uses.starts_with("./") || uses.starts_with("../") || self_repo_local;
+        // `$/` references are only executable when the feature is advertised;
+        // `action_preparation` applies the same gate when it stages them.
+        let self_repo_path = if self_repository_enabled && uses.starts_with("$/") {
+            super::handlers::action::self_repository_local_path(uses, workspace)
+        } else {
+            None
+        };
+        let is_local_action =
+            uses.starts_with("./") || uses.starts_with("../") || self_repo_path.is_some();
 
         // Resolve the action directory. Prefer the SHA-pinned path discovered
         // during the setup/download phase; fall back to local action paths.
         let action_dir = if let Some(path) = action_paths.get(uses) {
             std::path::PathBuf::from(path)
-        } else if self_repo_local {
-            match super::handlers::action::self_repository_local_dir(uses, workspace) {
-                Some(path) => path,
-                None => continue,
-            }
+        } else if let Some(path) = &self_repo_path {
+            path.clone()
         } else if is_local_action {
             std::path::Path::new(workspace).join(uses)
         } else {
             continue;
         };
 
+        // The primary checkout populates the workspace *after* this list is
+        // built, so a `$/` action's manifest may not exist yet. Register the
+        // lifecycle anyway and resolve `runs.post` when the step runs; a
+        // manifest that declares none makes the step a no-op.
         let manifest = match super::handlers::factory::load_action_manifest(&action_dir) {
-            Ok(m) => m,
+            Ok(manifest) => Some(manifest),
+            Err(_) if self_repo_path.is_some() => None,
             Err(_) => continue, // action not yet on disk — skip pre/post
         };
-        if !action_supports_lifecycle(&manifest) {
+        if let Some(manifest) = &manifest
+            && !action_supports_lifecycle(manifest)
+        {
             continue;
         }
 
@@ -904,7 +910,9 @@ pub fn build_step_list_with_lifecycle(
         // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L105-L110
         if !is_local_action {
             // Pre step
-            if let Some(pre_main) = &manifest.runs_pre {
+            if let Some(manifest) = &manifest
+                && let Some(pre_main) = &manifest.runs_pre
+            {
                 let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
                 let pre_context = format!("__pre_{}", step.context_name);
                 let pre_id = format!("__pre_{}", step.id);
@@ -931,11 +939,28 @@ pub fn build_step_list_with_lifecycle(
         }
 
         // Post step (will be reversed into LIFO)
-        if let Some(post_main) = &manifest.runs_post {
+        let post_entry = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.runs_post.clone());
+        if manifest.is_none() || post_entry.is_some() {
             // The official runner keys post registration by Action.Id. Each
             // workflow step is therefore a distinct invocation, including
             // repeated `uses:` references with separate saved state.
-            let post_if = manifest.runs_post_if.as_deref().unwrap_or("always()");
+            let post_if = manifest
+                .as_ref()
+                .and_then(|manifest| manifest.runs_post_if.clone())
+                .unwrap_or_else(|| "always()".to_string());
+            // A deferred `$/` post step carries no entry point: the manifest
+            // only exists once the checkout has run, so the handler resolves
+            // `runs.post` at execution time.
+            let post_with = match &post_entry {
+                Some(entry) => with_internal_entry(with, entry),
+                None => with.clone(),
+            };
+            let mut post_raw = serde_json::json!({"__post": true, "uses": uses});
+            if let Some(entry) = &post_entry {
+                post_raw["__post_main"] = serde_json::json!(entry);
+            }
             let post_context = format!("__post_{}", step.context_name);
             let post_id = format!("__post_{}", step.id);
             post_steps.push(Step {
@@ -944,17 +969,13 @@ pub fn build_step_list_with_lifecycle(
                 display_name: format!("Post {}", step.display_name),
                 step_type: StepType::Action {
                     uses: uses.clone(),
-                    with: with_internal_entry(with, post_main),
+                    with: post_with,
                 },
-                condition: Some(post_if.to_string()),
+                condition: Some(post_if),
                 continue_on_error: true, // post steps shouldn't block other posts
                 timeout_minutes: step.timeout_minutes,
                 env: step.env.clone(),
-                raw: serde_json::json!({
-                    "__post": true,
-                    "__post_main": post_main,
-                    "uses": uses,
-                }),
+                raw: post_raw,
                 is_background: false,
             });
         }
