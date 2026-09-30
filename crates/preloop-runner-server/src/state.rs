@@ -1587,6 +1587,13 @@ pub struct InnerState {
     /// the same node, and cancellation drops it so a build that finishes after
     /// the run was cancelled is discarded instead of resurrecting jobs.
     pub expanding: BTreeSet<(RunId, JobId)>,
+    /// Serializes GitHub check-run creation per run. Creation races — an
+    /// expansion mint, a claim-time in-progress report, and a completion
+    /// report for the same job can all decide to mint at once — and GitHub
+    /// allows duplicate check runs for the same name+SHA, which would leave
+    /// one stale `queued` check forever. Only minting takes this lock;
+    /// status PATCHes never do.
+    pub check_run_mint_locks: BTreeMap<RunId, std::sync::Arc<tokio::sync::Mutex<()>>>,
     pub runner_registered_at: BTreeMap<i64, std::time::Instant>,
     pub runners: BTreeMap<i64, RegisteredRunner>,
     pub sessions: BTreeMap<String, RunnerSession>,

@@ -965,7 +965,7 @@ pub(crate) async fn cmd_doctor(args: DoctorArgs) -> anyhow::Result<()> {
 /// Outcome of a live-engine call: applied through the engine, or the engine
 /// is unavailable/too old, in which case the caller falls back to writing
 /// the config file directly (applies on next engine start).
-enum ApiOutcome<T> {
+pub(crate) enum ApiOutcome<T> {
     Applied(T),
     Unavailable,
 }
@@ -1068,7 +1068,7 @@ async fn api_delete_secret(
 
 /// List stored secret names from the engine. `None` means the engine is
 /// unavailable; the caller falls back to reading the config file.
-async fn api_list_secrets(
+pub(crate) async fn api_list_secrets(
     repo: Option<&str>,
     env: Option<&str>,
 ) -> Result<ApiOutcome<Vec<(String, Option<String>, Option<String>)>>, anyhow::Error> {

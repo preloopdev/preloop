@@ -400,6 +400,14 @@ pub async fn push_run_to_github(
     //    loop may have been skipped or failed). Jobs with an existing check
     //    run were already updated through the normal lifecycle.
     for job_id in jobs.keys() {
+        // Expandable placeholders mint no check; materialized legs do.
+        let expandable = {
+            let inner = shared.state.inner.lock().await;
+            crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
+        };
+        if expandable {
+            continue;
+        }
         let has_check_run = {
             let inner = shared.state.inner.lock().await;
             inner

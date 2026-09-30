@@ -5982,6 +5982,7 @@ mod snapshot_sweep_tests {
             job_fail_fast: BTreeMap::new(),
             job_continue_on_error: BTreeMap::new(),
             job_check_run_ids: BTreeMap::new(),
+            reports_check_runs: false,
             reusable_calls: BTreeMap::new(),
             jobs_list: Vec::new(),
             created_at: chrono::Utc::now(),

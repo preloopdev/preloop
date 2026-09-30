@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
 use super::{
@@ -102,6 +103,46 @@ pub(super) fn collect_expression_references_from_expr(
             }
             for arg in args {
                 collect_expression_references_from_expr(arg, references);
+            }
+        }
+    }
+}
+
+/// Collect `context.property` reads from an expression tree.
+///
+/// `secrets.FOO` parses as a two-segment [`Expr::Path`], so only literal paths
+/// are inspected: GitHub has no dynamic context access (`secrets[key]` is
+/// invalid), and a deeper read keeps its first property (`secrets.FOO.bar`
+/// reports `FOO`). Computed member access (`fromJSON(...).name`) is skipped
+/// because its property is not knowable statically.
+pub(super) fn collect_context_properties_from_expr(
+    expr: &Expr,
+    properties: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    match expr {
+        Expr::Path(path) => {
+            if let [context, property, ..] = path.as_slice() {
+                properties
+                    .entry(context.to_ascii_lowercase())
+                    .or_default()
+                    .insert(property.clone());
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => {
+            collect_context_properties_from_expr(inner, properties);
+        }
+        Expr::Index { base, key } => {
+            collect_context_properties_from_expr(base, properties);
+            collect_context_properties_from_expr(key, properties);
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_context_properties_from_expr(left, properties);
+            collect_context_properties_from_expr(right, properties);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_context_properties_from_expr(arg, properties);
             }
         }
     }

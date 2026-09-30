@@ -504,6 +504,7 @@ fn submission_from_effective(
         changed_paths: vec![],
         changed_paths_known: false,
         resolved_sha: Some(sha.to_owned()),
+        status_check_sha: Some(sha.to_owned()),
         filter_branch: None,
         dispatch_inputs: BTreeMap::new(),
         dispatch_inputs_stringified: BTreeMap::new(),
@@ -540,11 +541,23 @@ async fn submit_and_report(
     let accepted = crate::submit_run_inner(shared, submission).await?;
     let run_id = accepted.run_id;
     let jobs = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .map(|run| run.jobs.keys().cloned().collect::<Vec<_>>())
+        let mut inner = shared.state.inner.lock().await;
+        // Stamped before filtering: an all-expandable run reports nothing at
+        // intake yet still needs the flag for its materialized legs.
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.reports_check_runs = true;
+        }
+        inner.runs.get(&run_id).map(|run| {
+            // Expandable nodes (deferred matrices, reusable callers) mint no
+            // check at intake — their materialized legs get their own.
+            run.jobs
+                .keys()
+                .filter(|job_id| {
+                    !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     };
     if let Some(jobs) = jobs {
         for job_id in jobs {

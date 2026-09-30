@@ -379,6 +379,12 @@ steps:
 Trust: submissions from untrusted events (fork PRs via the webhook path) do
 not receive stored secrets; native `preloop run` submissions always do.
 
+`preloop run` warns when a workflow reads a secret this engine has not stored,
+and prints the `preloop secret set` lines that fix it; `--strict-secrets`
+turns that warning into a failure. The engine never reads GitHub's secret
+store — values there are write-only, so nothing can import them — which means
+an unset name reaches its step as an empty string.
+
 ### Where secrets live
 
 By default stored secrets persist in the config file (`[secrets]`,

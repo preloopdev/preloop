@@ -769,6 +769,7 @@ async fn cron_loop(
             trust_tier: Some("schedule".to_owned()),
             workflow_run_upstream_names: vec![],
             activity_type: Some("schedule".to_owned()),
+            status_check_sha: resolved_sha.clone(),
             resolved_sha,
             changed_paths: vec![],
             changed_paths_known: true,
