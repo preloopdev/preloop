@@ -1112,7 +1112,6 @@ pub async fn run_steps(
                                     }
                                 }
                             }
-
                         }
                         step_ctx.log(&format!(
                             "##[group]Retry attempt {} — {}",

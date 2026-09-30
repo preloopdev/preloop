@@ -3666,39 +3666,39 @@ impl PgBackend {
                     )
                 ),
                 &[
-                &run,
-                &namespace,
-                &record.submission.repository,
-                &record.workflow_path_str,
-                &(record.run_number as i64),
-                &(record.run_attempt as i32),
-                &record.run_name,
-                &record.event,
-                &record.submission.git_ref,
-                &ref_type(&record.submission.git_ref, &record.event),
-                &Option::<String>::None,
-                &Option::<String>::None,
-                &record.head_sha,
-                &record.workflow_ref,
-                &record.webhook_delivery_id,
-                &run_origin(&record),
-                &record.submission.actor,
-                &record.submission.push_tree,
-                &workflow_concurrency.as_ref().map(|wf| wf.group.clone()),
-                &workflow_concurrency
-                    .as_ref()
-                    .is_some_and(|wf| wf.cancel_in_progress),
-                &record.fork_approval_pending,
-                &record.fork_approval_requested_at_unix_nanos,
-                &record.fork_approved_at_unix_nanos,
-                &record.fork_approval_note,
-                &record.reports_check_runs,
-                &now,
-                &record.started_at.map(|at| codec::system_to_us(at.into())),
-            ],
-        )
-        .await
-        .map_err(db)?;
+                    &run,
+                    &namespace,
+                    &record.submission.repository,
+                    &record.workflow_path_str,
+                    &(record.run_number as i64),
+                    &(record.run_attempt as i32),
+                    &record.run_name,
+                    &record.event,
+                    &record.submission.git_ref,
+                    &ref_type(&record.submission.git_ref, &record.event),
+                    &Option::<String>::None,
+                    &Option::<String>::None,
+                    &record.head_sha,
+                    &record.workflow_ref,
+                    &record.webhook_delivery_id,
+                    &run_origin(&record),
+                    &record.submission.actor,
+                    &record.submission.push_tree,
+                    &workflow_concurrency.as_ref().map(|wf| wf.group.clone()),
+                    &workflow_concurrency
+                        .as_ref()
+                        .is_some_and(|wf| wf.cancel_in_progress),
+                    &record.fork_approval_pending,
+                    &record.fork_approval_requested_at_unix_nanos,
+                    &record.fork_approved_at_unix_nanos,
+                    &record.fork_approval_note,
+                    &record.reports_check_runs,
+                    &now,
+                    &record.started_at.map(|at| codec::system_to_us(at.into())),
+                ],
+            )
+            .await
+            .map_err(db)?;
         if inserted == 0 {
             // A concurrent redelivery of the same delivery won: its run is
             // the answer for this one too.

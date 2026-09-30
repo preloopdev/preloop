@@ -214,7 +214,7 @@ impl RunTierFiles {
             // cached empty value would hide the later write for the life of
             // the process (the whole point of `put_run`'s durability).
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Arc::new(BTreeMap::new()))
+                return Ok(Arc::new(BTreeMap::new()));
             }
             Err(error) => return Err(error.into()),
         };

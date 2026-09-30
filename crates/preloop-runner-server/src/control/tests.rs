@@ -3332,6 +3332,354 @@ pub(crate) mod suite {
             "the timeline-id match must outrank the newer agent-job-id match"
         );
     }
+
+    /// Closing a runner's session releases the attempt's session binding but
+    /// keeps its recorded owner: the runner that claimed the attempt may
+    /// still renew and settle it, while no other runner may take it over
+    /// (legacy AgentRequest ownership, pinned at the HTTP level by
+    /// `legacy_agent_requests_are_bound_to_runner_identity`).
+    pub(crate) async fn close_session_keeps_request_owner(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let owner = backend
+            .register_runner(register_runner("session-owner"))
+            .await
+            .unwrap();
+        let other = backend
+            .register_runner(register_runner("session-other"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(owner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, owner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let request_id = claimed.request.request_id;
+
+        // Listener recovery deletes the session while the attempt is live.
+        assert!(
+            backend
+                .close_runner_session(&session.session_id, Some(owner.runner.id))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            backend.request_owner(request_id).await.unwrap(),
+            Some((Some(owner.runner.id), None, false)),
+            "the attempt's owner survives session teardown"
+        );
+        // The owner keeps its attempt: renewal works and nobody else may
+        // acquire it.
+        backend
+            .renew_request(request_id, owner.runner.id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend
+                .acquire_for_runner(request_id, other.runner.id)
+                .await,
+            Err(ControlError::Forbidden(_))
+        ));
+    }
+
+    /// A session teardown leaves the attempt's start stamp and lease row in
+    /// place: the trait doc hands its request and claimed job to the lease
+    /// reaper, and the reaper reads both of them from those columns.
+    pub(crate) async fn closed_session_attempt_stays_reapable(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("session-reapable"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let request_id = claimed.request.request_id;
+
+        assert!(
+            backend
+                .close_runner_session(&session.session_id, Some(runner.runner.id))
+                .await
+                .unwrap()
+        );
+
+        let inputs = backend.reap_inputs().await.unwrap();
+        let active = inputs
+            .active
+            .iter()
+            .find(|active| active.request_id == request_id)
+            .expect("the orphaned attempt must stay in the reaper's input");
+        assert!(
+            active.started_at.is_some(),
+            "session teardown must keep the attempt's start stamp"
+        );
+        assert!(
+            active.last_renewed_at.is_some(),
+            "session teardown must keep the attempt's lease"
+        );
+
+        // The lease arm of the sweep must be able to fail the attempt.
+        let now = std::time::SystemTime::now()
+            + std::time::Duration::from_secs(crate::distributed_task::JOB_LEASE_SECONDS + 3600);
+        let outcome = backend
+            .reap_sweep(ReapSweep {
+                now,
+                runs: std::iter::once(run_id).collect(),
+                ready: inputs.ready,
+                active: inputs.active,
+                paused: Default::default(),
+                pool_preparing: false,
+                warm_window_open: false,
+                first_seen: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .expired
+                .iter()
+                .any(|lease| lease.request_id == request_id),
+            "the reaper must be able to expire an attempt orphaned by session teardown"
+        );
+    }
+
+    /// An assigned-but-unowned request still acquires (session-less replay):
+    /// the ownership ladder keys on the claiming session row, not on a
+    /// recorded runner id.
+    pub(crate) async fn unowned_session_claim_still_acquires(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("acquire-unowned"))
+            .await
+            .unwrap();
+        // A compat session owns no runner, so the claim records no owner at
+        // all — only the session row binds the attempt.
+        let session = backend
+            .create_session(CreateSession {
+                runner_id: runner.runner.id,
+                protocol: SessionProtocol::Compat,
+                client_id: None,
+            })
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll_unverified(&session.session_id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let request_id = claimed.request.request_id;
+        assert_eq!(
+            backend.request_owner(request_id).await.unwrap(),
+            Some((None, None, true))
+        );
+        let context = backend
+            .acquire_for_runner(request_id, runner.runner.id)
+            .await
+            .unwrap();
+        assert_eq!(context.request.request_id, request_id);
+    }
+
+    /// `lookup_agent` follows the trait doc: the lowest-id runner named
+    /// `name`, synthesizing `<id:08x>-0000-4000-8000-000000000000` and
+    /// recording it when the runner has no client id.
+    pub(crate) async fn lookup_agent_uses_lowest_id_and_records_client(
+        backend: &dyn ControlBackend,
+    ) {
+        let mut first = register_runner("lookup-agent");
+        first.client_id = None;
+        let low = backend.register_runner(first).await.unwrap();
+        let mut second = register_runner("lookup-agent");
+        second.client_id = None;
+        let high = backend.register_runner(second).await.unwrap();
+        assert!(low.runner.id < high.runner.id);
+
+        let (runner, client_id) = backend
+            .lookup_agent("lookup-agent")
+            .await
+            .unwrap()
+            .expect("a runner is registered under that name");
+        assert_eq!(runner.id, low.runner.id, "the lowest-id runner wins");
+        let synthesized = format!("{:08x}-0000-4000-8000-000000000000", low.runner.id as u32);
+        assert_eq!(client_id, synthesized);
+        assert_eq!(
+            backend.runner_for_client(&client_id).await.unwrap(),
+            Some(low.runner.id),
+            "the synthesized client id must be recorded"
+        );
+        let (again, client_again) = backend.lookup_agent("lookup-agent").await.unwrap().unwrap();
+        assert_eq!((again.id, client_again), (low.runner.id, synthesized));
+    }
+
+    /// A session row cannot outlive its runner registration: the liveness
+    /// check and the insert share one transaction, so a purge racing token
+    /// validation cannot leave a session behind (the broker route maps the
+    /// `Forbidden` to 401).
+    pub(crate) async fn broker_session_requires_a_live_runner(backend: &dyn ControlBackend) {
+        assert!(matches!(
+            backend
+                .create_broker_session("session-unregistered", 999_999)
+                .await,
+            Err(ControlError::Forbidden(_))
+        ));
+        let runner = backend
+            .register_runner(register_runner("broker-session"))
+            .await
+            .unwrap();
+        backend
+            .create_broker_session("session-live", runner.runner.id)
+            .await
+            .unwrap();
+        // A compat session (`runner_id: None`) writes nothing and succeeds.
+        backend
+            .open_runner_session(OpenRunnerSession {
+                session_id: "session-compat".to_owned(),
+                runner_id: None,
+                protocol: SessionProtocol::Broker,
+                verified: false,
+                require_live_runner: false,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// `issue_debug_token` implements the trait doc's gates: `NotFound` when
+    /// no in-flight request owns the attempt, `Forbidden` without the run's
+    /// preserve-on-failure opt-in, `Conflict` on a second issue, and the
+    /// attempt's plan id on success.
+    pub(crate) async fn debug_token_gates_follow_the_contract(backend: &dyn ControlBackend) {
+        // No opt-in: the credential does not exist for this run.
+        let plain = RunId::new();
+        let submit = submit_run(plain, vec![submit_job(plain, "build", 1)]);
+        let agent = submit.jobs[0].request.as_ref().unwrap().agent_job_id;
+        backend.submit_run(submit).await.unwrap();
+        assert!(matches!(
+            backend.issue_debug_token(agent).await,
+            Err(ControlError::Forbidden(_))
+        ));
+
+        // Unknown attempt.
+        assert!(matches!(
+            backend.issue_debug_token(uuid::Uuid::new_v4()).await,
+            Err(ControlError::NotFound(_))
+        ));
+
+        // Opted-in run: the first issue succeeds and returns the plan id;
+        // the second one conflicts.
+        let opted_in = RunId::new();
+        let mut submit = submit_run(opted_in, vec![submit_job(opted_in, "build", 1)]);
+        let mut submission = (*submit.record.submission).clone();
+        submission.preserve_on_failure = true;
+        submit.record.submission = Arc::new(submission);
+        let agent = submit.jobs[0].request.as_ref().unwrap().agent_job_id;
+        backend.submit_run(submit).await.unwrap();
+        let (run_id, plan_id) = backend.issue_debug_token(agent).await.unwrap();
+        assert_eq!(run_id, opted_in);
+        assert_eq!(plan_id, agent.to_string());
+        assert!(matches!(
+            backend.issue_debug_token(agent).await,
+            Err(ControlError::Conflict(_))
+        ));
+    }
+
+    /// The implicit compat session (`sessionId=default`, any non-UUID id) is
+    /// materialized on demand and served: a legacy client polls it before
+    /// any session row exists and must still be handed work.
+    pub(crate) async fn azdo_compat_session_is_served(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_azdo_session(AzdoPoll {
+                session_id: "default".to_owned(),
+                verified_runner_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, AzdoPollOutcome::Claimed { .. }),
+            "the compat poll must be served, got {outcome:?}"
+        );
+    }
+
+    /// `renew_agent_request` renews an in-flight attempt through the
+    /// ownership ladder (recorded owner, else the claiming session's runner)
+    /// and reports `false` when no lease holder exists at all.
+    pub(crate) async fn renew_agent_request_follows_the_lease_ladder(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("renew-ladder"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll_unverified(&session.session_id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("expected a claim, got {outcome:?}");
+        };
+        let request_id = claimed.request.request_id;
+        let locked_until = crate::distributed_task::agent_request_locked_until();
+
+        // The claim recorded the session's runner as the lease holder, so
+        // the renewal lands and the reaper can see it.
+        assert!(
+            backend
+                .renew_agent_request(request_id, &locked_until)
+                .await
+                .unwrap()
+        );
+        // A released attempt has no lease holder at all: nothing is renewed,
+        // and a backend must not report a renewal it did not write.
+        assert!(
+            backend
+                .release_claimed_request(request_id, &locked_until)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .renew_agent_request(request_id, &locked_until)
+                .await
+                .unwrap()
+        );
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -3541,7 +3889,9 @@ mod pg {
 
     #[tokio::test]
     async fn pool_busy_counts_only_pool_proven_busy_runners() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::pool_busy_counts_only_pool_proven_busy_runners(&backend).await;
     }
 
@@ -3683,19 +4033,25 @@ mod pg {
 
     #[tokio::test]
     async fn environment_gate_round_trips() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::environment_gate_round_trips(&backend).await;
     }
 
     #[tokio::test]
     async fn fork_hold_parks_until_released() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::fork_hold_parks_until_released(&backend).await;
     }
 
     #[tokio::test]
     async fn environment_gate_parks_until_satisfied() {
-        let (_pg, backend) = backend().await;
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
         suite::environment_gate_parks_until_satisfied(&backend).await;
     }
 
@@ -4075,6 +4431,115 @@ mod pg {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn close_session_keeps_request_owner() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::close_session_keeps_request_owner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn closed_session_attempt_stays_reapable() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::closed_session_attempt_stays_reapable(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn unowned_session_claim_still_acquires() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unowned_session_claim_still_acquires(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn lookup_agent_uses_lowest_id_and_records_client() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::lookup_agent_uses_lowest_id_and_records_client(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn broker_session_requires_a_live_runner() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::broker_session_requires_a_live_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn debug_token_gates_follow_the_contract() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::debug_token_gates_follow_the_contract(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn azdo_compat_session_is_served() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::azdo_compat_session_is_served(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn renew_agent_request_follows_the_lease_ladder() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::renew_agent_request_follows_the_lease_ladder(&backend).await;
+    }
+
+    /// A dangling `job_requests.session_id` (no `runner_sessions` row behind
+    /// it) is not a live session binding: both status reads join the session
+    /// table, like the SQLite backend's.
+    #[tokio::test]
+    async fn dangling_session_binding_is_not_live() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("dangling"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PollOutcome::Claimed(_)));
+        assert!(backend.sole_inflight_request().await.unwrap().is_some());
+        assert_eq!(backend.live_assignments().await.unwrap().len(), 1);
+
+        // `job_requests.session_id` has no foreign key, so the binding has to
+        // be resolved by the join rather than by the column value.
+        let client = backend.writer().await.unwrap();
+        client
+            .execute(
+                "DELETE FROM runner_sessions WHERE session_id=$1::text::uuid",
+                &[&crate::control::logic::session_uuid(&session.session_id).to_string()],
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        assert!(backend.sole_inflight_request().await.unwrap().is_none());
+        assert!(backend.live_assignments().await.unwrap().is_empty());
     }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
@@ -4890,6 +5355,95 @@ mod lite {
             crate::control::lite::SCHEMA_VERSION
         );
     }
+
+    #[tokio::test]
+    async fn close_session_keeps_request_owner() {
+        suite::close_session_keeps_request_owner(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn closed_session_attempt_stays_reapable() {
+        suite::closed_session_attempt_stays_reapable(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn unowned_session_claim_still_acquires() {
+        suite::unowned_session_claim_still_acquires(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn lookup_agent_uses_lowest_id_and_records_client() {
+        suite::lookup_agent_uses_lowest_id_and_records_client(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn broker_session_requires_a_live_runner() {
+        suite::broker_session_requires_a_live_runner(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn debug_token_gates_follow_the_contract() {
+        suite::debug_token_gates_follow_the_contract(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn azdo_compat_session_is_served() {
+        suite::azdo_compat_session_is_served(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn renew_agent_request_follows_the_lease_ladder() {
+        suite::renew_agent_request_follows_the_lease_ladder(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    /// The same predicate on SQLite: a dangling `job_requests.session_id`
+    /// never counts, because the status reads join `runner_sessions`.
+    #[tokio::test]
+    async fn dangling_session_binding_is_not_live() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(super::register_runner("dangling"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(super::create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(super::submit_run(
+                run_id,
+                vec![super::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(super::poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::control::types::PollOutcome::Claimed(_)
+        ));
+        assert!(backend.sole_inflight_request().await.unwrap().is_some());
+        assert_eq!(backend.live_assignments().await.unwrap().len(), 1);
+
+        let session_uuid = crate::control::logic::session_uuid(&session.session_id).to_string();
+        backend
+            .test_db_mutate(|tx| {
+                tx.execute(
+                    "DELETE FROM runner_sessions WHERE session_id = ?1",
+                    [session_uuid.as_str()],
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(backend.sole_inflight_request().await.unwrap().is_none());
+        assert!(backend.live_assignments().await.unwrap().is_empty());
+    }
 }
 
 // ── Schema copies and legacy identity ───────────────────────────────────
@@ -4920,7 +5474,7 @@ fn docs_control_schema_matches_backend_schema() {
 /// (Python `uuid.uuid5` with the same namespace).
 #[test]
 fn session_uuid_keeps_the_legacy_v5_encoding() {
-    use crate::control::logic::{session_uuid, SESSION_ID_NAMESPACE};
+    use crate::control::logic::{SESSION_ID_NAMESPACE, session_uuid};
 
     assert_eq!(
         session_uuid("s1").to_string(),
