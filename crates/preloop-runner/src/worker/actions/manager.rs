@@ -726,8 +726,8 @@ mod tests {
         std::fs::write(&outside_file, b"initial").unwrap();
 
         // Archive has:
-        // 1. symlink `sub/evil_link` -> `../../escaped_target.txt`
-        // 2. file `sub/evil_link` trying to overwrite through it or traverse it
+        // symlink `sub/evil_link` -> `../../escaped_target.txt`
+        // file `sub/evil_link` trying to overwrite through it or traverse it
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
             let mut tar = tar::Builder::new(&mut enc);
@@ -765,9 +765,9 @@ mod tests {
         let dest = temp.path().join("action_dest");
 
         // Archive has:
-        // 1. directory `root/b`
-        // 2. symlink `root/a/deep` -> `../b`
-        // 3. symlink `root/a/deep/link` -> `../../outside` (lexically looks like depth 2 with 2 '..' = 0, but physically is depth 1 with 2 '..' = -1!)
+        // directory `root/b`
+        // symlink `root/a/deep` -> `../b`
+        // symlink `root/a/deep/link` -> `../../outside` (lexically looks like depth 2 with 2 '..' = 0, but physically is depth 1 with 2 '..' = -1!)
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
             let mut tar = tar::Builder::new(&mut enc);
@@ -817,8 +817,8 @@ mod tests {
         let dest = temp.path().join("action_dest");
 
         // Archive has:
-        // 1. regular file `lib/tool.js`
-        // 2. in-root relative symlink `bin/tool` -> `../lib/tool.js`
+        // regular file `lib/tool.js`
+        // in-root relative symlink `bin/tool` -> `../lib/tool.js`
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
             let mut tar = tar::Builder::new(&mut enc);

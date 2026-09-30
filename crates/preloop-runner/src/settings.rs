@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-// ─── .runner ─────────────────────────────────────────────────────────────
+// ───.runner ─────────────────────────────────────────────────────────────
 
 /// Runner settings persisted in `.runner`.
 ///
@@ -31,25 +31,25 @@ pub struct RunnerSettings {
     pub runner_group_name: Option<String>,
     #[serde(default)]
     pub ephemeral: bool,
-    /// F007: matches official .runner `isHostedServer` field.
+    /// matches official.runner `isHostedServer` field.
     #[serde(default)]
     pub is_hosted_server: bool,
-    /// F007: matches official .runner `useV2Flow` field.
+    /// matches official.runner `useV2Flow` field.
     #[serde(default = "default_true")]
     pub use_v2_flow: bool,
-    /// F007: matches official .runner `serverUrlV2` field.
+    /// matches official.runner `serverUrlV2` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_url_v2: Option<String>,
-    /// F052: Disable auto-update check.
+    /// Disable auto-update check.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_update: bool,
-    /// F052: Skip session recovery on broker reconnect.
+    /// Skip session recovery on broker reconnect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_session_recover: bool,
-    /// F052: Monitor socket address for diagnostics.
+    /// Monitor socket address for diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_socket_address: Option<String>,
-    /// F052: Use runner admin flow for registration.
+    /// Use runner admin flow for registration.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub use_runner_admin_flow: bool,
 }
@@ -58,7 +58,7 @@ fn default_true() -> bool {
     true
 }
 
-// ─── .credentials ────────────────────────────────────────────────────────
+// ───.credentials ────────────────────────────────────────────────────────
 
 /// Credential data persisted in `.credentials`.
 ///
@@ -83,7 +83,7 @@ impl CredentialData {
     }
 }
 
-// ─── .credentials_rsaparams ─────────────────────────────────────────────
+// ───.credentials_rsaparams ─────────────────────────────────────────────
 
 /// RSA key parameters persisted in `.credentials_rsaparams`.
 ///
@@ -466,7 +466,7 @@ mod tests {
         assert!(!RunnerConfig::is_configured(dir.path()));
     }
 
-    // --- P1 settings/credential gap coverage ---
+    // --- settings/credential gap coverage ---
 
     #[test]
     fn credential_data_accessors() {
@@ -562,7 +562,7 @@ mod tests {
             use_runner_admin_flow: false,
         };
         let json = serde_json::to_string(&settings).unwrap();
-        // Official .runner uses camelCase
+        // Official.runner uses camelCase
         assert!(json.contains("\"agentId\""));
         assert!(json.contains("\"agentName\""));
         assert!(json.contains("\"poolId\""));
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn runner_settings_default_use_v2_flow_is_true() {
-        // When loading a .runner file that doesn't have useV2Flow,
+        // When loading a.runner file that doesn't have useV2Flow,
         // it should default to true (matching official runner behavior)
         let json = r#"{
             "agentId": 1,

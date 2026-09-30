@@ -106,14 +106,14 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
 ///
 /// Two independent checks, because the workspace may not exist yet (it is
 /// created after this check):
-/// 1. Lexical: `.`/`..` components are collapsed; a `..` that would pop
-///    above the filesystem root is rejected outright — pure string math.
-/// 2. Symlink: the deepest existing ancestor is canonicalized and the
-///    not-yet-created suffix is re-appended, so a symlink anywhere in the
-///    payload path (or between `/var` and `/private/var` on macOS) cannot
-///    smuggle the workspace outside `root`. Containment is then verified
-///    against the canonicalized `root`, so both sides share the same
-///    symlink resolution.
+/// Lexical: `.`/`..` components are collapsed; a `..` that would pop
+/// above the filesystem root is rejected outright — pure string math.
+/// Symlink: the deepest existing ancestor is canonicalized and the
+/// not-yet-created suffix is re-appended, so a symlink anywhere in the
+/// payload path (or between `/var` and `/private/var` on macOS) cannot
+/// smuggle the workspace outside `root`. Containment is then verified
+/// against the canonicalized `root`, so both sides share the same
+/// symlink resolution.
 fn resolve_workspace_contained(path: &Path, root: &Path) -> std::io::Result<std::path::PathBuf> {
     use std::path::Component;
 
@@ -122,7 +122,7 @@ fn resolve_workspace_contained(path: &Path, root: &Path) -> std::io::Result<std:
     // on the same footing regardless of how `root` was obtained.
     let root = std::fs::canonicalize(root)?;
 
-    // 1. Lexical normalization.
+    // Lexical normalization.
     let mut normalized = std::path::PathBuf::new();
     for component in path.components() {
         match component {
@@ -146,7 +146,7 @@ fn resolve_workspace_contained(path: &Path, root: &Path) -> std::io::Result<std:
         }
     }
 
-    // 2. Symlink resolution on the deepest existing ancestor.
+    // Symlink resolution on the deepest existing ancestor.
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
     let mut probe: &Path = &normalized;
     let canonical = loop {
@@ -220,7 +220,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         .unwrap_or_else(|| serde_json::json!({}));
 
     // GitHub sends contextData in Azure DevOps typed-dictionary format:
-    // {"t": 2, "d": [{"k": "key", "v": value}, ...]}
+    // {"t": 2, "d": [{"k": "key", "v": value},...]}
     // Decode to a flat JSON object.
     let github = decode_typed_value(&raw_github);
 
@@ -284,9 +284,9 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
             // the engine's forge relay.
             str_from_json(&github, "token")
         }),
-        // Runner variables — P1.12: runner name from .runner settings, not job name
+        // Runner variables — runner name from.runner settings, not job name
         ("RUNNER_NAME", {
-            // Read from .runner settings file (CWD = runner root from spawn_job)
+            // Read from.runner settings file (CWD = runner root from spawn_job)
             crate::settings::RunnerConfig::load(std::path::Path::new("."))
                 .ok()
                 .map(|c| c.settings.agent_name)
@@ -353,7 +353,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         }
     }
 
-    // P1.9: RUNNER_DEBUG from system.debug variable
+    // RUNNER_DEBUG from system.debug variable
     let runner_debug = msg
         .get("variables")
         .and_then(|v| v.get("system.debug"))
@@ -404,7 +404,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         }
     }
 
-    // F021: ACTIONS_* runtime env plumbing.
+    // ACTIONS_* runtime env plumbing.
     // SystemVssConnection carries both the run-service URL/token and data URLs
     // used by cache, artifact, results, and OIDC actions.
     if let Some(endpoints) = msg
@@ -561,8 +561,8 @@ const fn entries_len() -> usize {
 ///
 /// GitHub/AzDO contextData uses `{"t": TYPE, "d": DATA}` encoding:
 /// - `t=1` (string): `{"t": 1, "d": "value"}` → `"value"`
-/// - `t=2` (dictionary): `{"t": 2, "d": [{"k": "key", "v": VALUE}, ...]}` → `{"key": decoded(VALUE), ...}`
-/// - `t=3` (array): `{"t": 3, "d": [VALUE, ...]}` → `[decoded(VALUE), ...]`
+/// - `t=2` (dictionary): `{"t": 2, "d": [{"k": "key", "v": VALUE},...]}` → `{"key": decoded(VALUE),...}`
+/// - `t=3` (array): `{"t": 3, "d": [VALUE,...]}` → `[decoded(VALUE),...]`
 /// - `t=4` (bool): `{"t": 4, "d": true/false}` → `true/false`
 /// - `t=5` (number): `{"t": 5, "d": N}` → `N`
 ///
@@ -638,7 +638,7 @@ fn bool_from_template_token(value: &serde_json::Value) -> bool {
 /// Build the ordered step list from the job message steps.
 pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Value) -> Vec<Step> {
     let mut result = Vec::new();
-    let mut run_counter: usize = 0; // F029: counts id-less script steps for __run / __run_N
+    let mut run_counter: usize = 0; // counts id-less script steps for __run / __run_N
 
     // Parse defaults.run from job message (working-directory, shell)
     let (default_working_dir, default_shell) = parse_job_defaults(job_message);
@@ -657,7 +657,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                 .is_some_and(|r| !r.is_empty()),
         };
 
-        // F029: Split wire ID (GUID) from context name (human-readable key).
+        // Split wire ID (GUID) from context name (human-readable key).
         // aksh-native payloads may only have `id` (which IS the context name).
         let raw_context_name = step.get("contextName").and_then(|v| v.as_str());
         let raw_id = step.get("id").and_then(|v| v.as_str());
@@ -843,10 +843,10 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 
 /// Discover pre/post steps from action manifests and return the full ordered list.
 ///
-/// F023: Official runner builds three lists:
-///   - pre steps: declared order, `pre-if` defaults to `always()`
-///   - main steps: the workflow steps
-///   - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
+/// Official runner builds three lists:
+/// - pre steps: declared order, `pre-if` defaults to `always()`
+/// - main steps: the workflow steps
+/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
 ///
 /// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
 /// via `save-state`; `StepContext::build_env()` exposes those values as
@@ -979,8 +979,8 @@ fn action_supports_lifecycle(manifest: &super::handlers::factory::ActionManifest
 /// GitHub sends `defaults` as an array of AzDO typed-dict entries:
 /// ```json
 /// [{"type":2,"map":[{"Key":{"lit":"run"},"Value":{"type":2,"map":[
-///   {"Key":{"lit":"working-directory"},"Value":{"lit":"subdir"}},
-///   {"Key":{"lit":"shell"},"Value":{"lit":"bash"}}
+/// {"Key":{"lit":"working-directory"},"Value":{"lit":"subdir"}},
+/// {"Key":{"lit":"shell"},"Value":{"lit":"bash"}}
 /// ]}}]}]
 /// ```
 ///
@@ -1092,7 +1092,7 @@ fn template_scalar(value: &serde_json::Value) -> Option<String> {
         })
 }
 
-/// F029: Generate display names matching official runner conventions.
+/// Generate display names matching official runner conventions.
 /// Script steps: "Run {first_line}" truncated to 80 chars.
 /// Action steps: "Run {uses}" (e.g. "Run actions/checkout@v4").
 pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {

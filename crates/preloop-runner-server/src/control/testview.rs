@@ -1,12 +1,10 @@
 //! Test-only read view of the control database.
 //!
-//! `TestState` carries the same field names as the old `TxState` working
-//! set, so the ~300 pre-cutover assertions keep their shape — but it is a
+//! `TestState` is the flat field set test assertions read. It is a
 //! *snapshot*: each backend fills it from its tables in `test_working_set()`
 //! and there is no write-back. Node-local fields are always empty; fields
-//! the new schema no longer persists (e.g. `queued_at` timing columns that
-//! became `jobs.*_at` columns are still mapped where a column exists)
-//! stay empty as well.
+//! that have no column in the schema (e.g. legacy `queued_at` timing data
+//! superseded by `jobs.*_at` timestamps) stay empty as well.
 
 use super::*;
 use crate::concurrency;

@@ -122,8 +122,9 @@ pub(crate) fn strip_template(msg: &mut AgentJobRequestMessage, secret_hints: usi
 /// `repository` and `run_id` scope the provider call: the run tier holds the
 /// values the submission supplied, outranking every stored tier.
 ///
-/// `None` spec = pre-M2 fully-formed message: filled as-is (no secret slot
-/// exists to populate) and `spec` left `None`.
+/// `None` spec = a fully-formed message stored before templates carried a
+/// spec: filled as-is (no secret slot exists to populate) and `spec` left
+/// `None`.
 pub(crate) fn fill_template(
     msg: &mut AgentJobRequestMessage,
     provider: &dyn SecretProvider,

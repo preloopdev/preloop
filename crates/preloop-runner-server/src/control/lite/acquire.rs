@@ -143,10 +143,9 @@ impl LiteBackend {
     }
 
     /// `record_token_request`: upsert the derived token-mint request for a
-    /// re-claim. Under M2 the stored template is never rewritten after
-    /// claim (the minted message is secret-filled in memory only), so this
-    /// is the whole method — the old `store_request_message` message half
-    /// is dead. pg locks the run row; the single writer covers it.
+    /// re-claim. The stored template is never rewritten after claim (the
+    /// minted message is secret-filled in memory only), so this is the whole
+    /// method. pg locks the run row; the single writer covers it.
     pub(crate) async fn record_token_request(
         &self,
         _run_id: RunId,

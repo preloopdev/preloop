@@ -152,7 +152,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 pending.created_unix = now_u;
             }
         }
-        // F7: drop pending cache/artifact uploads and download tokens older than
+        // drop pending cache/artifact uploads and download tokens older than
         // PENDING_UPLOAD_TTL. Entries restored from a persisted meta have no age
         // and are left alone, so a restart never sweeps a legitimate upload.
         let expired_cache: Vec<String> = inner
@@ -1482,7 +1482,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             });
         }
     }
-    // Read back the App's webhook event subscription at startup (D7). A new
+    // Read back the App's webhook event subscription at startup. A new
     // App created from the manifest gets the expanded default events, but an
     // App created earlier — or narrowed by hand — may miss trigger events,
     // and GitHub cannot change a subscription through the API. Warn loudly

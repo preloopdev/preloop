@@ -156,7 +156,7 @@ fn runner_volumes(
 }
 
 /// Populate the host-side externals directory, validating the manifest and
-/// binary version (R2) for each runtime instead of merely checking for a file.
+/// binary version for each runtime instead of merely checking for a file.
 ///
 /// Reuses the same shell routine the golden bake uses — now with temp-file
 /// download, SHA256 verification (pinned + SHASUMS), and manifest emission —
@@ -1389,7 +1389,7 @@ fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
-/// (`<hex>  <filename>`), lowercased. `None` when the file does not parse.
+/// (`<hex> <filename>`), lowercased. `None` when the file does not parse.
 fn parse_sha256_checksum(text: &str) -> Option<String> {
     let token = text.split_whitespace().next()?;
     let token = token.strip_prefix("sha256:").unwrap_or(token);
@@ -2048,7 +2048,7 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
 /// the zombie, concludes Docker is up, and leaves the runner with no daemon.
 /// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
-/// and is only removed once `docker info` has failed  so it is stale by
+/// and is only removed once `docker info` has failed so it is stale by
 /// definition.
 ///
 /// The storage driver is probed, never assumed: the golden's daemon auto-selects

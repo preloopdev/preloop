@@ -1,8 +1,8 @@
-//! Router-level tests for the GitHub-compatible dispatch API (M2/M3).
+//! Router-level tests for the GitHub-compatible dispatch API (/).
 //!
 //! Exercises the real axum router (`app_with_test_api`) against a local git
 //! workspace, the same way `concurrency_http_properties.rs` drives the real
-//! router. Auth coverage follows the D2 chain: system bearer, PAT, own-App
+//! router. Auth coverage follows the dispatch auth chain: system bearer, PAT, own-App
 //! JWT, own-minted installation token (offline ledger), third-party token
 //! (stubbed github.com round-trip), and fail-closed on network errors.
 
@@ -684,7 +684,7 @@ async fn list_actions_runs_reports_recent_runs_for_the_repo() {
     assert_eq!(run["workflow_path"], ".github/workflows/dispatch.yml");
 }
 
-// ─── Auth: the D2 chain ────────────────────────────────────────────────────
+// ─── Auth: the dispatch auth chain ────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn dispatch_without_token_is_401() {
@@ -1002,7 +1002,7 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
     assert!(recorded_runs(&state).await.is_empty());
 }
 
-// ─── M4: multi-App registry ────────────────────────────────────────────────
+// ─── multi-App registry ────────────────────────────────────────────────
 
 /// Build a two-App registry: the default App (secret `legacy-secret`) plus a
 /// second App with its own secret and key.
@@ -1281,7 +1281,7 @@ fn installation_stub(
         )
 }
 
-// ─── M3: third-party installation tokens (stubbed github.com) ──────────────
+// ─── third-party installation tokens (stubbed github.com) ──────────────
 
 #[tokio::test]
 async fn third_party_installation_token_dispatches_when_it_holds_actions_write() {

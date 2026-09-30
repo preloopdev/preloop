@@ -212,7 +212,7 @@ async fn render_session_message(
         // path delivers the message directly, so it must re-mint both from a
         // fresh job-scoped token exactly like `broker_acquire_job`.
         crate::broker::re_mint_snapshot_credentials(&mut msg, &shared.state);
-        // F030: inject SystemVssConnection so the worker's AzDO reporting
+        // inject SystemVssConnection so the worker's AzDO reporting
         // context has a server URL, access token, and ResultsServiceUrl —
         // same as broker_acquire_job.
         for endpoint in &mut msg.resources.endpoints {

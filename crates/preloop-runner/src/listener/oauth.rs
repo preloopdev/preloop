@@ -23,12 +23,12 @@ struct TokenResponse {
 ///
 /// Returns the token string and an optional `Instant` at which the token
 /// should be proactively refreshed (5 minutes before the server-reported
-/// expiry).  Callers that only need the token can discard the second element.
+/// expiry). Callers that only need the token can discard the second element.
 pub async fn get_oauth_token(
     http: &HttpClient,
     config: &RunnerConfig,
 ) -> anyhow::Result<(String, Option<std::time::Instant>)> {
-    // F053: Prefer authorizationUrlV2 when available (auth migration)
+    // Prefer authorizationUrlV2 when available (auth migration)
     let auth_url_v2 = config
         .credentials
         .data
@@ -53,7 +53,7 @@ pub async fn get_oauth_token(
         base_auth_url
     };
 
-    // F053: oauthEndpointUrl fallback (for back-compat with older .credentials)
+    // oauthEndpointUrl fallback (for back-compat with older.credentials)
     let oauth_endpoint = config
         .credentials
         .data

@@ -73,7 +73,7 @@ pub(crate) fn event_run_id(event: &NdjsonEvent) -> Option<RunId> {
     }
 }
 
-/// Project database rows into the public run shape without a `TxState` load.
+/// Project database rows into the public run shape from a row snapshot.
 pub(crate) fn project_run_rows(
     mut run: RunRecord,
     jobs: Vec<(JobId, ExecutionStatus, String, Option<Vec<StepRecord>>)>,
@@ -911,7 +911,7 @@ pub(crate) trait ControlBackend: Send + Sync {
         &self,
     ) -> Result<Vec<preloop_observability::status::RunnerAssignment>, ControlError>;
 
-    // ── Handler commands (formerly `TxState` closures in handlers) ────
+    // ── Handler commands (one transaction each) ────
     //
     // Each method is one transaction. "Session" below means a
     // `runner_sessions` row of either protocol; "owns" means

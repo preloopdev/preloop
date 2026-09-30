@@ -1,7 +1,7 @@
-//! `#[cfg(test)]` read view: rebuild the old `TxState` field shape from the
-//! control schema so pre-cutover assertions keep their vocabulary. Read-only
-//! mirror of `control/lite/testview.rs`; there is no write path — mutations
-//! must go through `ControlBackend` commands.
+//! `#[cfg(test)]` read view: build a [`TestState`] snapshot from the
+//! control schema so test assertions have a stable field vocabulary.
+//! Read-only mirror of `control/lite/testview.rs`; there is no write path —
+//! mutations must go through `ControlBackend` commands.
 
 use super::*;
 use crate::concurrency;

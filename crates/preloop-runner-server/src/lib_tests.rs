@@ -576,7 +576,7 @@ async fn run_apis_never_return_submitted_secret_values() {
         .unwrap();
     assert_eq!(resolved["NPM_TOKEN"].expose(), "npm_LIVE_CREDENTIAL");
 
-    // ...but no run-facing response may echo them back.
+    //..but no run-facing response may echo them back.
     for uri in [
         format!("/api/v1/runs/{run_id}"),
         "/api/v1/runs?limit=50".to_owned(),
@@ -4831,7 +4831,7 @@ async fn register_runner_dedupes_official_label_set() {
         .to_owned();
 
     // Mirrors the label set captured in
-    // .runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl:
+    //runner-watch/golden/v2.336.0/01-register-and-idle/flows.jsonl:
     // self-hosted appears as both system and user; Linux and linux coexist
     // (case-different today; collapsed under the same dedup rules).
     let body = json!({
@@ -6421,7 +6421,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         .await
         .unwrap();
 
-    // 1. Successful cache hit, with the signed ticket the server mints
+    // Successful cache hit, with the signed ticket the server mints
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -6557,7 +6557,7 @@ async fn download_action_tarball_serves_from_cache_and_rejects_traversal() {
         b"fetched-tar-content"
     );
 
-    // 2. Reject path traversal
+    // Reject path traversal
     let response = app
         .clone()
         .oneshot(
@@ -6652,7 +6652,7 @@ async fn runner_protocol_errors_use_official_envelopes_without_changing_native_a
     );
 
     // Auth middleware failures on _apis routes must be VSS/AzDO JSON, not the
-    // native {"error": ...} response used by local APIs.
+    // native {"error":...} response used by local APIs.
     let response = app
         .clone()
         .oneshot(
@@ -7634,7 +7634,7 @@ async fn admin_deletes_reject_job_tokens_and_confine_runners_to_themselves() {
     );
 }
 
-/// R2b-1. `PUT …/agents/{id}` is the official runner's in-place name/label
+/// `PUT …/agents/{id}` is the official runner's in-place name/label
 /// refresh, and it shares its route with the self-only DELETE above. A
 /// runner listen token must therefore only rewrite its own row: labels are
 /// the dispatch predicate, so a peer could otherwise strip a runner's labels
@@ -9254,7 +9254,7 @@ async fn cancel_run_refreshes_runner_pool_queue_metadata() {
     );
 }
 
-/// R8-4. The disttask (AzDO) claim is exactly when the ready queue shrinks,
+/// The disttask (AzDO) claim is exactly when the ready queue shrinks,
 /// so it must refresh the same supervisor gauges the broker claim and the
 /// completion path refresh — otherwise the on-demand pool keeps seeing
 /// phantom queued work and a stale next-job hint.
@@ -9322,7 +9322,7 @@ async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
     );
 }
 
-/// R8-3. A control-DB failure on the runner's disttask poll must not be
+/// A control-DB failure on the runner's disttask poll must not be
 /// answered as "nothing to deliver": the runner would long-poll forever
 /// against an outage. The mapped error (5xx) is the honest answer.
 #[tokio::test]
@@ -9358,7 +9358,7 @@ async fn disttask_poll_surfaces_control_db_failures() {
     );
 }
 
-/// R8-3. An empty timeline is a legitimate answer, so a failed timeline read
+/// An empty timeline is a legitimate answer, so a failed timeline read
 /// must not be reported as one.
 #[tokio::test]
 async fn timeline_read_surfaces_control_db_failures() {
@@ -9393,7 +9393,7 @@ async fn timeline_read_surfaces_control_db_failures() {
     );
 }
 
-/// R8-3. A timeline PATCH that the control DB rejects must not answer 200
+/// A timeline PATCH that the control DB rejects must not answer 200
 /// with `count: 0`: the runner would believe its records were persisted.
 #[tokio::test]
 async fn timeline_patch_surfaces_control_db_failures() {
@@ -9791,7 +9791,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 1. connectionData
+    // connectionData
     let (s, conn) = try_req(
         &app,
         Method::GET,
@@ -9802,7 +9802,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert!(s.is_success(), "1 connectionData: {}", s);
     assert!(conn["locationServiceData"]["serviceDefinitions"].is_array());
 
-    // 2. OAuth token
+    // OAuth token
     let (s, _) = try_req(
         &app,
         Method::POST,
@@ -9812,7 +9812,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert!(s.is_success(), "2 oauth2: {}", s);
 
-    // 3. Register runner
+    // Register runner
     let (s, reg) = try_req(
         &app,
         Method::POST,
@@ -9823,7 +9823,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert!(s.is_success(), "3 register: {} body={}", s, reg);
     let runner_id = reg["id"].as_i64().unwrap();
 
-    // 4. Create session
+    // Create session
     let (s, sess) = try_req(
         &app,
         Method::POST,
@@ -9834,13 +9834,13 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert!(s.is_success(), "4 session: {} body={}", s, sess);
     let session_id = sess["sessionId"].as_str().unwrap().to_owned();
 
-    // 5. Submit a workflow
+    // Submit a workflow
     let (s, accepted) = try_req(&app, Method::POST, "/api/v1/runs",
             json!({"workflow_yaml":"on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n","event":"push","repository":"owner/repo"})).await;
     assert!(s.is_success(), "5 submit: {} body={}", s, accepted);
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    // 6. Poll for messages — the runner uses the AzDO Message endpoint
+    // Poll for messages — the runner uses the AzDO Message endpoint
     let (s, msg) = try_req(
         &app,
         Method::GET,
@@ -9853,13 +9853,13 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert!(s.is_success(), "6 poll: {} body={}", s, msg);
 
-    // 7. Get the job from the run
+    // Get the job from the run
     let inner = state.test_tx().await;
     let run_record = inner.runs.get(&run_id).unwrap();
     let job_id = run_record.jobs.keys().next().unwrap().clone();
     drop(inner);
 
-    // 8. Complete the job
+    // Complete the job
     let (s, _) = try_req(
         &app,
         Method::POST,
@@ -9869,7 +9869,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert!(s.is_success(), "8 complete: {}", s);
 
-    // 9. Verify run succeeded
+    // Verify run succeeded
     let (_, final_run) = try_req(
         &app,
         Method::GET,
@@ -10983,7 +10983,7 @@ async fn fork_pr_runs_get_read_only_cache_access() {
     );
 }
 
-/// R2b-5. The cache v2 namespace (repository) must come from the caller's
+/// The cache v2 namespace (repository) must come from the caller's
 /// job token, exactly like the artifact path, and never from the request
 /// body: otherwise any job can read another repository's cache or plant
 /// entries in it.
@@ -12529,7 +12529,7 @@ async fn job_timeout_enforcement_cancels_job() {
         shutdown,
     });
 
-    // 1. Submit run
+    // Submit run
     let accepted = request_json(
             &app,
             Method::POST,
@@ -12543,7 +12543,7 @@ async fn job_timeout_enforcement_cancels_job() {
         .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    // 2. Poll to start job (transitions status to InProgress and sets started_at)
+    // Poll to start job (transitions status to InProgress and sets started_at)
     let _msg = request_json(
         &app,
         Method::GET,
@@ -12557,7 +12557,7 @@ async fn job_timeout_enforcement_cancels_job() {
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // 3. Override started_at to be in the past (beyond 360m/21600s default timeout)
+    // Override started_at to be in the past (beyond 360m/21600s default timeout)
     state
         .test_db_mutate(|tx| {
             tx.update_request(
@@ -12571,10 +12571,10 @@ async fn job_timeout_enforcement_cancels_job() {
         })
         .await;
 
-    // 4. Run reaper tick
+    // Run reaper tick
     reap_once(&shared).await;
 
-    // 5. Verify cancellation is enqueued
+    // Verify cancellation is enqueued
     {
         let inner = state.test_tx().await;
         let request = inner.job_requests.get(&request_id).unwrap();
@@ -13758,7 +13758,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
         shutdown,
     });
 
-    // 1. Submit run
+    // Submit run
     let accepted = request_json(
             &app,
             Method::POST,
@@ -13772,7 +13772,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
         .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    // 2. Poll to start job (sets last_renewed_at)
+    // Poll to start job (sets last_renewed_at)
     let _msg = request_json(
         &app,
         Method::GET,
@@ -13786,7 +13786,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // 3. Exercise the just-before-boundary case without sleeping.
+    // Exercise the just-before-boundary case without sleeping.
     state
         .test_db_mutate(|tx| {
             tx.set_lease_renewed(
@@ -13814,7 +13814,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
         );
     }
 
-    // 4. Move just beyond the same production lease boundary and reap.
+    // Move just beyond the same production lease boundary and reap.
     state
         .test_db_mutate(|tx| {
             tx.set_lease_renewed(
@@ -13829,7 +13829,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
 
     reap_once(&shared).await;
 
-    // 5. Verify the job was marked failed and run completes as failed
+    // Verify the job was marked failed and run completes as failed
     {
         let inner = state.test_tx().await;
         let request = inner.job_requests.get(&request_id).unwrap();
@@ -13853,7 +13853,7 @@ async fn github_webhook_flows_with_signature_and_check_runs() {
 
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. Create a dummy workflow file in a local workspace
+    // Create a dummy workflow file in a local workspace
     let ws_dir = temp.path().join("workspace");
     tokio::fs::create_dir_all(ws_dir.join(".github/workflows"))
         .await
@@ -13881,7 +13881,7 @@ jobs:
 
     let app = app(state.clone(), CancellationToken::new());
 
-    // 2. Prepare mock webhook push payload
+    // Prepare mock webhook push payload
     let payload = serde_json::json!({
         "ref": "refs/heads/main",
         "before": "0000000000000000000000000000000000000000",
@@ -13902,7 +13902,7 @@ jobs:
 
     let payload_bytes = serde_json::to_vec(&payload).unwrap();
 
-    // 3. Compute correct signature
+    // Compute correct signature
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
@@ -13915,7 +13915,7 @@ jobs:
         .collect::<String>();
     let signature_header = format!("sha256={}", sig_hex);
 
-    // 4. Send request with WRONG signature -> should fail with 401
+    // Send request with WRONG signature -> should fail with 401
     let response_401 = app
         .clone()
         .oneshot(
@@ -13932,7 +13932,7 @@ jobs:
         .unwrap();
     assert_eq!(response_401.status(), StatusCode::UNAUTHORIZED);
 
-    // 5. Send request with CORRECT signature -> should succeed with 200
+    // Send request with CORRECT signature -> should succeed with 200
     let response_200 = app
         .clone()
         .oneshot(
@@ -14598,7 +14598,7 @@ async fn github_webhook_same_delivery_is_deduped_but_new_delivery_creates_run() 
     );
 }
 
-/// R9a-4. A failed dedup read must not fall through to submitting: that
+/// A failed dedup read must not fall through to submitting: that
 /// re-runs the workflow push-back already tested and published, which is
 /// exactly the duplicate this gate exists to prevent.
 #[tokio::test]
@@ -14992,7 +14992,7 @@ jobs:
 async fn github_app_manifest_registration_flow() {
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. Setup a local mock GitHub API server for manifest conversion
+    // Setup a local mock GitHub API server for manifest conversion
     let mock_app = Router::new().route(
             "/app-manifests/:code/conversions",
             post(|Path(code): Path<String>| async move {
@@ -15011,7 +15011,7 @@ async fn github_app_manifest_registration_flow() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    // 2. Configure mock API URL in environment
+    // Configure mock API URL in environment
     // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     std::env::set_var(
@@ -15022,7 +15022,7 @@ async fn github_app_manifest_registration_flow() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 3. Request registration form (GET /api/v1/github/register)
+    // Request registration form (GET /api/v1/github/register)
     let response_reg = app
         .clone()
         .oneshot(
@@ -15042,7 +15042,7 @@ async fn github_app_manifest_registration_flow() {
     assert!(html.contains("https://github.com/settings/apps/new"));
     assert!(html.contains("preloop-local-app"));
 
-    // 4. Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
+    // Request callback conversion (GET /api/v1/github/callback?code=mock_code_123)
     let response_callback = app
         .clone()
         .oneshot(
@@ -15076,7 +15076,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 1. Generate RSA keypair for the runner using the protocol's library
+    // Generate RSA keypair for the runner using the protocol's library
     let keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
     let rsa_params = keypair.to_rsaparams();
 
@@ -15085,7 +15085,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
         rsa_params.modulus, rsa_params.exponent
     );
 
-    // 2. Register the runner
+    // Register the runner
     let reg_response = request_json(
         &app,
         Method::POST,
@@ -15109,7 +15109,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
         .unwrap()
         .to_owned();
 
-    // 3. Build a valid client assertion JWT signed with the runner's private RSA key
+    // Build a valid client assertion JWT signed with the runner's private RSA key
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -15130,7 +15130,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
 
     let client_assertion = sign_jwt_ps256(&header, &claims, &rsa_params).unwrap();
 
-    // 4. Request OAuth token using urlencoded body
+    // Request OAuth token using urlencoded body
     let form_body = serde_urlencoded::to_string([
         (
             "client_assertion_type",
@@ -15197,7 +15197,7 @@ async fn runner_oauth2_token_client_assertion_verification() {
     let rs256_token_resp: Value = serde_json::from_slice(&rs256_bytes).unwrap();
     assert!(rs256_token_resp["access_token"].is_string());
 
-    // 5. Test negative case: Invalid signature (wrong key)
+    // Test negative case: Invalid signature (wrong key)
     let wrong_keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate().unwrap();
     let wrong_rsa_params = wrong_keypair.to_rsaparams();
     let bad_assertion = sign_jwt_ps256(&header, &claims, &wrong_rsa_params).unwrap();
@@ -19998,7 +19998,7 @@ jobs:
         assert_eq!(inner.ready().next().unwrap().job_id.0, "lint");
     }
 
-    // Walk the chain: lint → build → test → deploy
+    // Walk the dispatch auth chain: lint → build → test → deploy
     for (job, next_queued) in [
         ("lint", Some("build")),
         ("build", Some("test")),
@@ -20417,7 +20417,7 @@ async fn snapshot_drops_unresolvable_gitlinks_but_keeps_registered_submodules() 
     // A nested repo added by hand: the parent index gets a gitlink entry
     // but no `.gitmodules` registers it — the state that makes
     // `git submodule foreach` inside the VM fail with `fatal: No url found
-    // for submodule path 'stream-docker-output' in .gitmodules`.
+    // for submodule path 'stream-docker-output' in.gitmodules`.
     let nested = workspace.join("stream-docker-output");
     fs::create_dir_all(&nested).unwrap();
     git_fixture_command(&nested, &["init", "-q", "-b", "main"]);
@@ -20521,11 +20521,11 @@ async fn snapshot_gitlink_resolution_matches_git() {
     // The keep/drop decision must mirror git's own resolution: git resolves a
     // gitlink by the section whose `path` matches it. Three registration
     // shapes git handles but a naive parser gets wrong:
-    //   `a#b`         git writes and decodes this path QUOTED in .gitmodules
-    //   `mixed`       [SUBMODULE]/Path/URL: config sections and keys are
-    //                 case-insensitive for git
-    //   `logical-only` section name only; its `path` points elsewhere, so a
-    //                 gitlink at the name itself is NOT resolvable
+    // `a#b` git writes and decodes this path QUOTED in.gitmodules
+    // `mixed` [SUBMODULE]/Path/URL: config sections and keys are
+    // case-insensitive for git
+    // `logical-only` section name only; its `path` points elsewhere, so a
+    // gitlink at the name itself is NOT resolvable
     for path in ["a#b", "mixed", "logical-only"] {
         let nested = workspace.join(path);
         fs::create_dir_all(&nested).unwrap();
@@ -26610,8 +26610,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 1. A --push submission reports queued check runs at accept time and
-    //    starts in `pending`.
+    // A --push submission reports queued check runs at accept time and
+    // starts in `pending`.
     let accepted = submit_push_run(&app, SHA, TREE).await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     {
@@ -26626,7 +26626,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         assert_eq!(run.push_state.as_ref().unwrap().status, PushStatus::Pending);
     }
 
-    // 2. Sync before the run is terminal is refused.
+    // Sync before the run is terminal is refused.
     let (status, _) = request_json_status(
         &app,
         Method::POST,
@@ -26636,8 +26636,8 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // 3. Terminal run: the sync verifies the tree, creates the draft PR,
-    //    and marks the run pushed.
+    // Terminal run: the sync verifies the tree, creates the draft PR,
+    // and marks the run pushed.
     state
         .test_db_mutate(|tx| {
             tx.set_run_status(run_id.parse().unwrap(), "completed", Some("success"))
@@ -26672,7 +26672,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
         "jobs with a check run at submit are not re-reported by the sync"
     );
 
-    // 4. Replay is a no-op: no second PR, same response.
+    // Replay is a no-op: no second PR, same response.
     let again = request_json(
         &app,
         Method::POST,
@@ -26683,7 +26683,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     assert_eq!(again["pr_number"], 42);
     assert_eq!(pr_creates.load(Ordering::SeqCst), 1, "idempotent replay");
 
-    // 5. A pushed tree that differs from the tested tree blocks the sync.
+    // A pushed tree that differs from the tested tree blocks the sync.
     let accepted = submit_push_run(&app, SHA, "cccccccccccccccccccccccccccccccccccccccc").await;
     let run_id = accepted["run_id"].as_str().unwrap().to_owned();
     state
@@ -26714,7 +26714,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
             .contains("does not match"));
     }
 
-    // 6. A run submitted without --push can never be pushed.
+    // A run submitted without --push can never be pushed.
     let accepted = request_json(
         &app,
         Method::POST,
@@ -26736,10 +26736,10 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // 7. Push-back lands the commit on GitHub, which answers with a push
-    //    webhook for that same commit. The workflow that was already tested
-    //    and published must not run a second time, while a workflow the user
-    //    never submitted still has to.
+    // Push-back lands the commit on GitHub, which answers with a push
+    // webhook for that same commit. The workflow that was already tested
+    // and published must not run a second time, while a workflow the user
+    // never submitted still has to.
     const PUBLISHED_WORKFLOW: &str = ".github/workflows/ci.yml";
     let accepted = submit_push_run(&app, SHA, TREE).await;
     let published_id = accepted["run_id"]
@@ -26862,7 +26862,7 @@ async fn submit_driven_push_publishes_pr_and_checks_idempotently() {
     );
 }
 
-/// R9a-4. The dedup gate decides whether a push webhook may submit at all,
+/// The dedup gate decides whether a push webhook may submit at all,
 /// so a backend failure must surface as an error: `None` means "not
 /// published — submit", which re-runs the workflow push-back already tested.
 #[tokio::test]
@@ -27043,7 +27043,7 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
     std::env::remove_var("PRELOOP_GITHUB_API_URL");
 }
 
-/// R9a-4. The terminal `Synced` write records `effective_sha`, which is what
+/// The terminal `Synced` write records `effective_sha`, which is what
 /// makes the push webhook's echo match `already_published`. Losing it
 /// silently re-runs CI, so a failed write must fail the sync.
 #[tokio::test]

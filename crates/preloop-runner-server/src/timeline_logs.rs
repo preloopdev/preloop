@@ -588,7 +588,7 @@ pub async fn finish_job(
     Json(serde_json::Value::Null)
 }
 
-// ── F030: standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
+// ── standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
 // These use the URL pattern our AzDO client sends (`plans/{planId}/...`) rather
 // than the scoped pattern (`Timeline/{scope}/{hub}/{planId}/{timelineId}`).
 // The logic is identical to the existing handlers above.
@@ -607,7 +607,7 @@ pub async fn patch_timeline_records_plan(
     .await
 }
 
-/// F6 — pagination controls for timeline GET. `top` is clamped to
+/// pagination controls for timeline GET. `top` is clamped to
 /// [`MAX_TOP_RECORDS`] server-side; `skip` pages further.
 #[derive(Debug, Deserialize)]
 pub struct TimelineQuery {

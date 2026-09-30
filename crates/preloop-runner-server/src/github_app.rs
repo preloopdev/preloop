@@ -462,7 +462,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
     let default_index = 0usize;
 
     // Legacy single-App env/config first — the default entry when configured
-    // (D6 back-compat).
+    // (back-compat).
     let app_id =
         env_non_empty("PRELOOP_GITHUB_APP_ID").or_else(|| file_config.github.app_id.clone());
     let key_source = PRIVATE_KEY_ENV
@@ -593,7 +593,7 @@ pub fn load_from(file_config: &crate::config::ConfigFile) -> anyhow::Result<Opti
 }
 
 /// Every registered App whose installation covers `repository`'s owner, in
-/// registry order (D6).
+/// registry order.
 ///
 /// With no registry, the legacy field (`shared.state.github_app`, tests and
 /// older callers) is the whole candidate list. With a registry, each App
@@ -1061,7 +1061,7 @@ async fn installation_id_for(
     app_jwt: &str,
     owner: &str,
 ) -> anyhow::Result<u64> {
-    // Per-App override first (D6 `AppConfig.installation_id`), then the
+    // Per-App override first (`AppConfig.installation_id`), then the
     // legacy global env override, then discovery (cached).
     if let Some(installation_id) = creds.installation_id {
         verify_override_installation_owner(api_base, creds, app_jwt, installation_id, owner)
@@ -1468,7 +1468,7 @@ pub struct TriggerEvent {
 }
 
 /// Webhook events a preloop GitHub App must receive for the full CI surface to
-/// work (D7). These are the Tier A + trigger events the adapters turn into
+/// work. These are the Tier A + trigger events the adapters turn into
 /// runs; without delivery of one, no workflow YAML can trigger on it.
 ///
 /// Every entry must be a real webhook event that `GET /app` can report.

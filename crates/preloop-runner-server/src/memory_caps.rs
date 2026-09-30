@@ -14,14 +14,14 @@ use crate::control::ControlError;
 // runner uploads separately; the `logs`/`log_chunks` path here is only the
 // live console stream, so these caps never drop real log data.
 
-/// F1 — per-log retained byte cap. `append_log` keeps only the newest bytes
+/// per-log retained byte cap. `append_log` keeps only the newest bytes
 /// within this budget in `InnerState::logs`. The durable `log_chunks` copy is
 /// the live-console recovery buffer (read only by a restart to refill this
-/// map) and is bounded to the SAME budget in `store_log_chunk` (D2) — keeping
+/// map) and is bounded to the SAME budget in `store_log_chunk` — keeping
 /// more on disk is pointless since a restart trims it back to this cap.
 pub const MAX_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 
-/// F1 — slack above `MAX_LOG_BYTES_PER_KEY` before the in-memory retained
+/// slack above `MAX_LOG_BYTES_PER_KEY` before the in-memory retained
 /// buffer is trimmed. `Vec::drain(0..excess)` front-shifts the whole tail, so
 /// trimming on every append (e.g. 64 KiB appends into a 16 MiB buffer) is
 /// O(n) per append. Letting the buffer grow one slack window past the cap and
@@ -29,41 +29,41 @@ pub const MAX_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 /// cost of at most one extra slack window of memory per key.
 pub const LOG_KEY_TRIM_SLACK: usize = 1024 * 1024;
 
-/// F1 — per-plan retained byte budget across all of a plan's logs. The oldest
+/// per-plan retained byte budget across all of a plan's logs. The oldest
 /// logs of the plan are evicted once the total (bytes or entry count) exceeds
 /// the budget, so a flood of distinct `log_id`s cannot grow the map either.
 pub const MAX_LOG_BYTES_PER_PLAN: usize = 64 * 1024 * 1024;
 
-/// F1 — per-plan retained log entry cap. Empty logs carry no bytes, so the
+/// per-plan retained log entry cap. Empty logs carry no bytes, so the
 /// byte budget alone would let an attacker create unbounded distinct keys.
 pub const MAX_LOGS_PER_PLAN: usize = 512;
 
-/// F1 — global retained byte budget across all plans. Prevents a runner
+/// global retained byte budget across all plans. Prevents a runner
 /// from fabricating unlimited `plan_id` values to bypass the per-plan cap.
 pub const MAX_LOG_BYTES_GLOBAL: usize = 256 * 1024 * 1024;
 
 /// F1 — global retained log entry cap.
 pub const MAX_LOGS_GLOBAL: usize = 4096;
 
-/// F2 — per-timeline record cap. PATCH upserts beyond this evict the oldest
+/// per-timeline record cap. PATCH upserts beyond this evict the oldest
 /// (deterministically first-keyed) records. Real jobs stay far below it.
 pub const MAX_TIMELINE_RECORDS: usize = 1024;
 
-/// F2 — per-timeline byte budget for stored records. Each record's
+/// per-timeline byte budget for stored records. Each record's
 /// `currentOperation` can be ~1 MiB; count caps alone leave an unbounded
 /// byte budget (1024 × 4096 × 1 MiB). Aggregate bytes are bounded here.
 pub const MAX_TIMELINE_BYTES_PER_TIMELINE: usize = 8 * 1024 * 1024;
 
-/// F3 — per-run ring-buffer cap for projected timeline events. The oldest
+/// per-run ring-buffer cap for projected timeline events. The oldest
 /// events are drained once the retained Vec exceeds this.
 pub const MAX_TIMELINE_EVENTS: usize = 2048;
 
-/// F2 — global bound on distinct timeline keys (`{plan}/{timeline}`), which a
+/// global bound on distinct timeline keys (`{plan}/{timeline}`), which a
 /// runner controls directly. Oldest-keyed timelines are evicted wholesale
 /// (records and change-id counter together) past the cap.
 pub const MAX_TIMELINE_KEYS: usize = 4096;
 
-/// F3 — global bound on distinct run ids in the timeline event map. A runner
+/// global bound on distinct run ids in the timeline event map. A runner
 /// can PATCH for fabricated plan ids, which would otherwise mint unbounded
 /// per-run event buckets (each itself capped by [`MAX_TIMELINE_EVENTS`]).
 pub const MAX_TIMELINE_EVENT_KEYS: usize = 4096;
@@ -80,16 +80,16 @@ pub const MAX_BLOCK_BYTES: usize = 128 * 1024 * 1024;
 /// F5 — cap on the number of block IDs in a blocklist commit request.
 pub const MAX_BLOCKLIST_BLOCKS: usize = 10_000;
 
-/// F5 — cap on the assembled blob size. Assembly streams block files into the
+/// cap on the assembled blob size. Assembly streams block files into the
 /// destination file and never materializes the whole blob in memory, but a
 /// blocklist referencing more than this budget is rejected up front.
 pub const MAX_ASSEMBLED_BYTES: usize = 512 * 1024 * 1024;
 
-/// F6 — server-side cap on timeline records returned by a single GET page.
+/// server-side cap on timeline records returned by a single GET page.
 /// `?top=` larger than this is clamped, `?skip=` pages further.
 pub const MAX_TOP_RECORDS: usize = 500;
 
-/// F7 — per-job cap on in-flight pending uploads (artifact v2 and cache v2).
+/// per-job cap on in-flight pending uploads (artifact v2 and cache v2).
 /// The job is taken from the signed runtime token scope, so a runner cannot
 /// evade the cap by inventing other job ids in request bodies.
 pub const MAX_PENDING_PER_JOB: usize = 32;
@@ -113,11 +113,11 @@ pub const MAX_PENDING_CACHE_BYTES_PER_JOB: u64 = 1024 * 1024 * 1024;
 /// F7 — global cap on minted cache download tokens; the oldest are evicted.
 pub const MAX_CACHE_DL_TOKENS: usize = 1024;
 
-/// F7 — per-run cap on finalized artifact v2 registry entries, mirroring
+/// per-run cap on finalized artifact v2 registry entries, mirroring
 /// GitHub's "500 artifacts per workflow run" limit.
 pub const MAX_ARTIFACTS_PER_RUN: usize = 500;
 
-/// F7 — global cap on the artifact v2 registry; the oldest finalized entries
+/// global cap on the artifact v2 registry; the oldest finalized entries
 /// are evicted past this so a flood of fabricated run ids stays bounded.
 pub const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 
@@ -135,7 +135,7 @@ pub const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 /// [`ControlBackend::archive_finished_runs`](crate::control::ControlBackend::archive_finished_runs).
 pub const MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE: usize = 16;
 
-/// F7 — how long a pending upload (or download token) survives without being
+/// how long a pending upload (or download token) survives without being
 /// finalized/consumed before the reaper sweeps it. Jobs that never finish
 /// their upload leave an entry behind; without a TTL those would accumulate.
 pub const PENDING_UPLOAD_TTL: Duration = Duration::from_secs(3600);
@@ -168,7 +168,7 @@ pub fn job_backend_id_from_bearer(state: &AppState, headers: &HeaderMap) -> Opti
 // Called at every write site, so the maps can never drift above their caps for
 // long. They are also idempotent and cheap on well-behaved state.
 
-/// F1 — bound one plan's retained logs to `MAX_LOG_BYTES_PER_PLAN` bytes and
+/// bound one plan's retained logs to `MAX_LOG_BYTES_PER_PLAN` bytes and
 /// `MAX_LOGS_PER_PLAN` entries by evicting the oldest logs first. Called after
 /// every append (and log creation). Returns the log keys evicted from memory
 /// so the caller can delete them from the durable store too — otherwise the
@@ -249,7 +249,7 @@ pub fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<String> {
     evicted
 }
 
-/// F2 — after a timeline PATCH upsert: bound the per-timeline record map to
+/// after a timeline PATCH upsert: bound the per-timeline record map to
 /// `MAX_TIMELINE_RECORDS` (evicting the oldest keys) and the number of
 /// distinct timeline keys to `MAX_TIMELINE_KEYS` (evicting whole timelines,
 /// records and change-id counter together).
@@ -356,7 +356,7 @@ pub fn trim_timeline_after_patch(
         .retain(|k, _| inner.timeline_records.contains_key(k));
 }
 
-/// F3 — after timeline events are projected: ring-buffer each run's event
+/// after timeline events are projected: ring-buffer each run's event
 /// Vec to `MAX_TIMELINE_EVENTS` and bound the number of distinct run buckets
 /// to `MAX_TIMELINE_EVENT_KEYS`.
 pub fn trim_timeline_events(inner: &mut InnerState, run_id: RunId) {
@@ -403,7 +403,7 @@ pub fn trim_timeline_events(inner: &mut InnerState, run_id: RunId) {
     }
 }
 
-/// F7 — bound the minted cache download-token map to `MAX_CACHE_DL_TOKENS`,
+/// bound the minted cache download-token map to `MAX_CACHE_DL_TOKENS`,
 /// evicting the oldest minted tokens first (restored tokens with no mint
 /// order fall back to map order).
 pub fn trim_cache_dl_tokens(inner: &mut InnerState) {
@@ -802,7 +802,7 @@ pub fn trim_artifact_registry(inner: &mut InnerState) {
     }
 }
 
-/// F7 — TTL sweep for pending uploads and download tokens. Entries with
+/// TTL sweep for pending uploads and download tokens. Entries with
 /// `created_unix == 0` (restored from a persisted meta, or engine-token
 /// reservations made before timestamps existed) are left alone, matching the
 /// session-liveness sweep's treatment of restored state. R1-6: the legacy

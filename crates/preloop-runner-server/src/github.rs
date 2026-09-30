@@ -1528,12 +1528,12 @@ pub async fn handle_github_webhook(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // 1. Verify Signature
+    // Verify Signature
     let sig_header = headers
         .get("x-hub-signature-256")
         .and_then(|h| h.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    // Every registered App's secret is a candidate (D6): a payload signed by
+    // Every registered App's secret is a candidate : a payload signed by
     // any App preloop fronts is accepted, one signed by none is rejected.
     // M3: identify WHICH credential verified the payload — the signer
     // binds the claimed repository below.

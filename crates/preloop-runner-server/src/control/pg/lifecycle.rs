@@ -71,9 +71,9 @@ impl PgBackend {
     // ── Sessions ─────────────────────────────────────────────────────
 
     /// `create_session`: mint a session row for `runner_id` (compat
-    /// sessions insert with NULL runner). Crypto material is sealed by the
-    /// caller-facing wrapper until the M2 column lands — the row stores no
-    /// keys (schema design rule).
+    /// sessions insert with NULL runner). The row stores no key material —
+    /// session crypto is caller-derived, never persisted (schema design
+    /// rule).
     pub(super) async fn create_session(
         &self,
         session: crate::control::backend::CreateSession,
@@ -1125,10 +1125,10 @@ impl PgBackend {
     /// last 3 days — is skipped: `preloop push` and the webhook watchdog can
     /// still act on it, and the echo of our own push must find the row.
     ///
-    /// Statements (one transaction): `SELECT .. FROM runs WHERE status =
+    /// Statements (one transaction): `SELECT.. FROM runs WHERE status =
     /// 'completed' AND completed_at <= now() - 60s AND NOT EXISTS (pending
     /// push-back state) ORDER BY completed_at LIMIT $1 FOR UPDATE SKIP
-    /// LOCKED`; four `INSERT INTO *_history .. SELECT`; `DELETE FROM runs`.
+    /// LOCKED`; four `INSERT INTO *_history.. SELECT`; `DELETE FROM runs`.
     pub(super) async fn archive_finished_runs(
         &self,
         limit: usize,

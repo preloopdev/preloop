@@ -1,4 +1,4 @@
-//! GitHub-compatible dispatch authentication (D2).
+//! GitHub-compatible dispatch authentication.
 //!
 //! The dispatch endpoints (`POST /repos/{owner}/{repo}/actions/workflows/
 //! {workflow_id}/dispatches`, `POST /repos/{owner}/{repo}/dispatches`, and the
@@ -8,15 +8,15 @@
 //!
 //! 1. **System bearer** (`PRELOOP_SYSTEM_TOKEN`) — trusted operator.
 //! 2. **PAT** (`PRELOOP_GITHUB_TOKEN` / config `github.pat`) — trusted
-//!    operator; constant-time compare.
+//! operator; constant-time compare.
 //! 3. **Own-App JWT** (RS256, `iss` = a registered App id) — verified against
-//!    that App's PEM; offline-safe.
+//! that App's PEM; offline-safe.
 //! 4. **Installation tokens**:
-//!    - minted by preloop itself: validated against the in-memory mint ledger
-//!      (offline-safe, no round-trip);
-//!    - third-party: validated with a github.com round-trip
-//!      (`GET /installation`, `GET /installation/repositories`), cached with a
-//!      short TTL, and failing **closed** on network errors.
+//! - minted by preloop itself: validated against the in-memory mint ledger
+//! (offline-safe, no round-trip);
+//! - third-party: validated with a github.com round-trip
+//! (`GET /installation`, `GET /installation/repositories`), cached with a
+//! short TTL, and failing **closed** on network errors.
 //! 5. Anything else — 401.
 //!
 //! The middleware inserts a [`DispatchIdentity`] extension; handlers use it
@@ -54,7 +54,7 @@ const ACTOR_CACHE_TTL: Duration = Duration::from_secs(60);
 /// PAT dispatch with native system auth when github.com cannot name the user.
 const PRELOOP_PAT_ACTOR: &str = "preloop-pat";
 
-/// The identity a dispatch request authenticated as (D2).
+/// The identity a dispatch request authenticated as.
 #[derive(Debug, Clone)]
 pub struct DispatchIdentity {
     /// Resolved sender login for the synthesized `sender` / `github.actor`.
@@ -163,7 +163,7 @@ pub async fn require_dispatch_auth(
     Ok(next.run(request).await)
 }
 
-/// Run the D2 chain against the request's Authorization header.
+/// Run the dispatch auth chain against the request's Authorization header.
 async fn authenticate(
     shared: &Arc<SharedState>,
     headers: &HeaderMap,
@@ -172,7 +172,7 @@ async fn authenticate(
         .filter(|token| !token.is_empty())
         .ok_or_else(|| ApiError::unauthorized("a bearer token is required"))?;
 
-    // 1. System bearer — the operator's native credential.
+    // System bearer — the operator's native credential.
     if constant_time_eq(bearer, &shared.state.system_token) {
         return Ok(DispatchIdentity {
             actor: "preloop-system".to_owned(),
@@ -193,7 +193,7 @@ async fn authenticate(
         });
     }
 
-    // 3. Own-App JWT — RS256, `iss` = one of the registered App ids.
+    // Own-App JWT — RS256, `iss` = one of the registered App ids.
     let mut verified_app_id: Option<String> = None;
     if let Some(registry) = &shared.state.github_apps {
         for app in &registry.apps {
@@ -217,14 +217,14 @@ async fn authenticate(
     }
     // A JWT-shaped bearer that did not verify against a registered App is
     // never accepted: third-party App JWTs have no PEM to verify against
-    // (D2.5), so reject locally instead of paying a network round-trip.
+    // so reject locally instead of paying a network round-trip.
     if looks_like_app_jwt(bearer) {
         return Err(ApiError::unauthorized(
             "App JWTs must be issued by a registered preloop App",
         ));
     }
 
-    // 4. Installation tokens.
+    // Installation tokens.
     //
     // Fast path first: a token preloop itself minted is proven by the mint
     // ledger with no network traffic, which keeps dispatch working offline.

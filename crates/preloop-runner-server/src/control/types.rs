@@ -736,7 +736,7 @@ pub(crate) fn step_report(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Handler command inputs/outputs (one per former `TxState` closure site)
+// Handler command inputs/outputs (one per `ControlBackend` method)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Registered runners plus, when a run was named, that run's claimability

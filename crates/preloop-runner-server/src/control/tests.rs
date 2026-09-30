@@ -1,10 +1,10 @@
 //! Behavioral suite for the `ControlBackend` contract. The same scenarios
-//! run against every backend (SQLite now, Postgres when it lands) so a
-//! backend can never diverge from the shared scheduling semantics.
+//! run against every backend (SQLite and Postgres) so a backend can never
+//! diverge from the shared scheduling semantics.
 //!
 //! Every assertion reads state back through a fresh `transact` (a full DB
-//! reload), so a bug in `load_txstate`/`write_txstate` fails here even when
-//! the in-memory path would have looked correct.
+//! reload), so a bug in the persisted write path fails here even when an
+//! in-memory read would have looked correct.
 //!
 //! Layout: [`suite`] holds the backend-neutral scenarios, each taking
 //! `&dyn ControlBackend`. `sqlite` and `postgres` are thin `#[tokio::test]`

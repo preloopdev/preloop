@@ -830,7 +830,7 @@ fn string_value(value: &Value) -> String {
         Value::Number(value) => {
             // GitHub Actions renders whole numbers as integers, not floats.
             // serde_yaml 0.9 may deserialise YAML integer `1` as f64(1.0),
-            // which serde_json prints as "1.0".  Normalise: if the number has
+            // which serde_json prints as "1.0". Normalise: if the number has
             // no fractional part, emit it as a plain integer string.
             if let Some(i) = value.as_i64() {
                 return i.to_string();
@@ -1182,7 +1182,7 @@ fn hash_files(values: &[Value], context: &Context) -> Result<String, ExpressionE
         None => return Ok(String::new()),
     };
 
-    // F055: Parse optional flags from the first argument.
+    // Parse optional flags from the first argument.
     // Official runner only recognises `--follow-symbolic-links`.
     let mut follow_symlinks = false;
     let mut patterns: Vec<String> = Vec::new();

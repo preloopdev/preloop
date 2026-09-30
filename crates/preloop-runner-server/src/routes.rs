@@ -161,7 +161,7 @@ pub fn build_app(
             "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
             get(live_logs_sse),
         )
-        // F030: standard AzDO API URL pattern used by the preloop-runner AzDO client.
+        // standard AzDO API URL pattern used by the preloop-runner AzDO client.
         // These alias the scope/hub-prefixed handlers above so both URL forms work.
         .route(
             "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
@@ -179,7 +179,7 @@ pub fn build_app(
             "/_apis/v1/plans/:plan_id/events",
             post(finish_job_plan_authenticated),
         )
-        // F030: /runner/server/ aliases — runner uses the SystemVssConnection URL
+        // /runner/server/ aliases — runner uses the SystemVssConnection URL
         // which is http://…/runner/server so all plan-level AzDO calls land here.
         .route(
             "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
@@ -294,7 +294,7 @@ pub fn build_app(
         .with_state(shared.clone());
 
     // GitHub-compatible dispatch API (surface 2): authenticated through the
-    // D2 chain (system bearer, PAT, own-App JWT, installation tokens) — see
+    // dispatch auth chain (system bearer, PAT, own-App JWT, installation tokens) — see
     // `dispatch_auth.rs`. Auth is mandatory; github.com returns 401 without a
     // token. One `route_layer` on the sub-router keeps the auth boundary in a
     // single place instead of repeating it on every route.
@@ -1013,7 +1013,7 @@ pub fn build_app(
                     require_legacy_runner_bearer,
                 )),
         )
-        // P1.10: Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
+        // Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
         // The runner PUTs logs/summaries here; we store them in the state directory.
         .route("/replay/results/*path", put(replay_results_put))
         // Twirp APIs accept only the system token or a locally signed Actions.Results job token.
@@ -1074,7 +1074,7 @@ pub fn build_app(
         )
         // Azure Block Blob compat blob store — upload (PUT) and download (GET).
         // Cache: /twirp-blob/cache/{token}
-        // Artifact: /twirp-blob/artifact/{token}  (download URL appends .zip for content-type detection)
+        // Artifact: /twirp-blob/artifact/{token} (download URL appends.zip for content-type detection)
         .route(
             "/twirp-blob/:kind/:token",
             put(blob_put)

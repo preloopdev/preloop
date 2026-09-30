@@ -573,7 +573,7 @@ async fn first_renew_gate_abandons_after_retry_budget() {
         .count();
     // Six logical gate failures (initial attempt + the official
     // firstRenewRetryLimit of 5); each 500 is retried 3× on the wire by the
-    // P1.7 client policy (2 s + 4 s backoff), so 6 × 3 = 18 POSTs.
+    // client policy (2 s + 4 s backoff), so 6 × 3 = 18 POSTs.
     assert_eq!(
         renews, 18,
         "retry budget is 5 retries after the first attempt"

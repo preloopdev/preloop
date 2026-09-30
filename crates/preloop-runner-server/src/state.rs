@@ -283,8 +283,8 @@ impl AppState {
     }
 
     /// Read a consistent snapshot of the authoritative scheduling state for
-    /// assertions. Post-cutover this is a [`TestState`]: same field names as
-    /// the old `TxState`, populated by `Backend::test_working_set`.
+    /// assertions, as a [`TestState`] populated by
+    /// `Backend::test_working_set`.
     pub(crate) async fn test_tx(&self) -> crate::control::testview::TestState {
         self.backend
             .test_working_set()
@@ -842,10 +842,10 @@ fn bounded_termination_reason(value: &str) -> &'static str {
     // Two distinct never-claimable conditions, and conflating them would hide
     // the difference between "wait or add capacity" and "this will never work
     // until you register that platform":
-    //   - the starvation sweep, which fires after a grace window;
-    //   - the external-host check, where the server has no runner of that
-    //     platform class at all (`no {platform} runner is registered with
-    //     this server, so `runs-on: …` cannot be scheduled`).
+    // - the starvation sweep, which fires after a grace window;
+    // - the external-host check, where the server has no runner of that
+    // platform class at all (`no {platform} runner is registered with
+    // this server, so `runs-on: …` cannot be scheduled`).
     // The starvation prose interpolates workflow-controlled `runs-on`
     // labels, so the anchored prefix MUST be checked before the substring:
     // a crafted label containing the platform phrase must not flip a

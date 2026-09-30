@@ -163,7 +163,7 @@ fn build_docker_run_args(
 
     push_inherited_env_args(&mut docker_args, env);
 
-    // F049: Inject proxy env vars from host into container
+    // Inject proxy env vars from host into container
     super::super::container_ops::inject_proxy_env_for_docker(&mut docker_args, env);
 
     docker_args.push(image.to_string());
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(&args[image_index + 1..], ["arg1", "arg2"]);
     }
 
-    // --- P0 container action gap coverage ---
+    // --- container action gap coverage ---
 
     #[test]
     fn docker_image_reference_builds_run_args() {

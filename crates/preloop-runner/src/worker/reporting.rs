@@ -12,7 +12,7 @@ use crate::worker::helpers::iso_now;
 /// Flush queued step-status updates to the server.
 ///
 /// Broker path: WorkflowStepsUpdate Twirp call.
-/// AzDO path (F030): PATCH timeline records via `update_timeline`.
+/// AzDO path: PATCH timeline records via `update_timeline`.
 pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<ServerQueue>>) {
     let pending = {
         let mut q = queue.lock().await;
@@ -24,7 +24,7 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
     };
 
     let published = if let Some(azdo) = &rpt.azdo {
-        // F030: translate StepUpdate → AzDO TimelineRecord and PATCH.
+        // translate StepUpdate → AzDO TimelineRecord and PATCH.
         let records: Vec<serde_json::Value> = body
             .steps
             .iter()
@@ -86,8 +86,8 @@ pub async fn flush_step_updates(rpt: &ReportingContext, queue: &Arc<Mutex<Server
 /// Convert a [`StepUpdate`] (Twirp-oriented) to an AzDO timeline record JSON value.
 ///
 /// AzDO `TimelineRecordState`: 0=Pending, 1=InProgress, 2=Completed.
-/// AzDO `TaskResult`:          0=Succeeded, 1=SucceededWithIssues, 2=Failed,
-///                             3=Canceled, 4=Skipped, 5=Abandoned.
+/// AzDO `TaskResult`: 0=Succeeded, 1=SucceededWithIssues, 2=Failed,
+/// 3=Canceled, 4=Skipped, 5=Abandoned.
 fn azdo_timeline_record_from_step_update(s: &super::server_queue::StepUpdate) -> serde_json::Value {
     use super::server_queue::{step_conclusion, step_status};
 
@@ -129,12 +129,12 @@ fn azdo_timeline_record_from_step_update(s: &super::server_queue::StepUpdate) ->
     record
 }
 
-// ── Log upload (F020) ────────────────────────────────────────────────
+// ── Log upload ────────────────────────────────────────────────
 
 /// Upload a single step's log content.
 ///
-/// Broker path (F020): POST GetStepLogsSignedBlobURL → PUT blob.
-/// AzDO path  (F030): POST create_log → PUT append_log → PATCH timeline log ref.
+/// Broker path: POST GetStepLogsSignedBlobURL → PUT blob.
+/// AzDO path: POST create_log → PUT append_log → PATCH timeline log ref.
 pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &str) {
     if content.is_empty() {
         return;
@@ -259,7 +259,7 @@ pub async fn upload_step_log(rpt: &ReportingContext, step_id: &str, content: &st
     }
 }
 
-/// F035: Upload step summary content to the results service.
+/// Upload step summary content to the results service.
 ///
 /// AzDO path: no-op — the AzDO protocol has no step summary equivalent.
 /// Broker path: GetStepSummarySignedBlobURL → PUT blob → CreateStepSummaryMetadata.
@@ -339,7 +339,7 @@ pub async fn upload_step_summary(rpt: &ReportingContext, step_id: &str, content:
 ///
 /// AzDO path: no-op — individual step logs are already uploaded via
 /// `upload_step_log`; there is no separate job-log endpoint in the AzDO path.
-/// Broker path (F020): POST GetJobLogsSignedBlobURL → PUT blob.
+/// Broker path: POST GetJobLogsSignedBlobURL → PUT blob.
 pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
     if rpt.azdo.is_some() {
         debug!("AzDO path: skipping job log upload (step logs already uploaded individually)");
@@ -399,7 +399,7 @@ pub(crate) async fn upload_job_log(rpt: &ReportingContext, content: &str) {
     }
 }
 
-/// F054: Upload diagnostic logs from the _diag/ directory (if present).
+/// Upload diagnostic logs from the _diag/ directory (if present).
 ///
 /// Matches official `DiagnosticLogManager.UploadDiagnosticLogs()`:
 /// - Collects log files from the runner's _diag/ directory

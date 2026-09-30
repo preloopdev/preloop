@@ -3,12 +3,12 @@
 //! Receives an `AgentJobRequestMessage`, sets up the execution context,
 //! runs steps, and reports results back to the server.
 //!
-//! ## Reporting pipeline (F018+F019+F020+F025)
+//! ## Reporting pipeline
 //!
 //! Golden 06 wire flow:
-//!   acquirejob → renewjob (background) → WorkflowStepsUpdate (step transitions)
-//!   → GetStepLogsSignedBlobURL + PUT (per-step) → GetJobLogsSignedBlobURL + PUT
-//!   → completejob
+//! acquirejob → renewjob (background) → WorkflowStepsUpdate (step transitions)
+//! → GetStepLogsSignedBlobURL + PUT (per-step) → GetJobLogsSignedBlobURL + PUT
+//! → completejob
 //!
 //! This module wires `ServerQueue`, `ResultsClient`, and `RunServiceClient` to
 //! implement the full reporting lifecycle.
@@ -32,7 +32,7 @@ use tokio::sync::{Mutex, watch};
 use tracing::{error, info, warn};
 
 /// AzDO-specific reporting state threaded into [`ReportingContext`] when
-/// `--via azdo` is active.  Contains only what the timeline and log endpoints
+/// `--via azdo` is active. Contains only what the timeline and log endpoints
 /// need; `pool_id` is intentionally absent (not required for those URLs).
 pub struct AzdoReportingContext {
     pub client: AzdoClient,
@@ -711,7 +711,7 @@ pub async fn run_job(
         );
         error!("{msg}");
         job_ctx.job_status = super::contexts::JobStatus::Failure;
-        // F048: Add job-level annotation for timeout
+        // Add job-level annotation for timeout
         job_ctx.add_job_annotation(super::execution_context::Annotation {
             level: super::execution_context::AnnotationLevel::Error,
             message: msg,
@@ -758,7 +758,7 @@ pub async fn run_job(
             Err(e) => {
                 let msg = format!("Job {job_name} failed: {e:#}");
                 error!("{msg}");
-                // F048: Add job-level annotation for infrastructure failure
+                // Add job-level annotation for infrastructure failure
                 job_ctx.add_job_annotation(super::execution_context::Annotation {
                     level: super::execution_context::AnnotationLevel::Error,
                     message: msg,
@@ -777,12 +777,12 @@ pub async fn run_job(
         handle.abort();
     }
 
-    // F019: Flush any final WorkflowStepsUpdate entries.
+    // Flush any final WorkflowStepsUpdate entries.
     if let Some(ref rpt) = reporting {
         flush_step_updates(rpt, &queue).await;
     }
 
-    // F020: Upload job log (concatenation of all step logs)
+    // Upload job log (concatenation of all step logs)
     if let Some(ref rpt) = reporting {
         let mut q = queue.lock().await;
         let all_logs = q.all_step_log_content();
@@ -792,7 +792,7 @@ pub async fn run_job(
         }
     }
 
-    // F054: Upload diagnostic logs from _diag/ directory
+    // Upload diagnostic logs from _diag/ directory
     if let Some(ref rpt) = reporting {
         // Derive runner root from workspace: workspace is <root>/_work/<repo>/<dir>
         // so runner root is workspace/../../..
@@ -1048,8 +1048,8 @@ fn spawn_renew_loop(
 
 /// Renewal timing knobs mirroring the official `JobDispatcher`:
 /// - first-renew gate: retry up to 5 times (random 1–10 s backoff, matching
-///   the official band) before the worker is allowed to start; exhaustion
-///   abandons the job (no steps run);
+/// the official band) before the worker is allowed to start; exhaustion
+/// abandons the job (no steps run);
 /// - steady-state renew: every 60 s.
 ///
 /// Defaults match the official runner; tests shrink the windows.

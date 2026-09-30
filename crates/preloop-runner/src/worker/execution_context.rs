@@ -420,7 +420,7 @@ impl<'a> StepContext<'a> {
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
 
-        // P1.6: Feed through job-level problem matchers to produce annotations
+        // Feed through job-level problem matchers to produce annotations
         let matched_annotations = self.job.matchers.match_line(
             &masked,
             &workspace,
@@ -1301,17 +1301,17 @@ mod tests {
 
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
 
-        // 1. Unsafe repository telemetry check
+        // Unsafe repository telemetry check
         ctx.log("fatal: unsafe repository ('/github/workspace' is owned by someone else)");
         assert_eq!(ctx.telemetry_errors.len(), 1);
         assert!(ctx.telemetry_errors[0].contains("fatal: unsafe repository"));
 
-        // 2. Composite action marker stripping check
+        // Composite action marker stripping check
         ctx.log("Some text ##[start-action display=fake;id=fake] more text");
         let last_log = ctx.log_lines.last().unwrap();
         assert!(last_log.contains("##[\\start-action"));
 
-        // 3. Problem matcher check
+        // Problem matcher check
         ctx.log("ERROR: compilation failed");
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "compilation failed");

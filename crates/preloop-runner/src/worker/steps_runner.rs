@@ -1,10 +1,10 @@
 //! Sequential step execution with condition evaluation.
 //!
 //! Each step is tracked through its lifecycle:
-//!   InProgress → queue update → execute → Completed → queue update → upload log
+//! InProgress → queue update → execute → Completed → queue update → upload log
 //!
 //! The `ReportingContext` from `job_runner` is threaded through so log upload
-//! can happen right after each step completes (F019 + F020).
+//! can happen right after each step completes.
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
@@ -16,7 +16,7 @@ use super::server_queue::{ServerQueue, StepUpdate, step_conclusion, step_status}
 
 /// A step to execute, with its metadata.
 ///
-/// F029: `id` is the wire GUID (used as `external_id` in step updates, `step_backend_id` in
+/// `id` is the wire GUID (used as `external_id` in step updates, `step_backend_id` in
 /// log uploads). `context_name` is the human-readable key (e.g. `__run`, `__run_2`,
 /// `__actions_checkout`, or the user's explicit `id:`) used in the `steps.<name>.outputs`
 /// expression context, state, file commands, and `__pre_`/`__post_` naming.
@@ -54,7 +54,7 @@ pub enum StepType {
 }
 
 /// Owns background step tasks until the main step loop reaches its implicit
-/// wait-all boundary.  Background actions are deliberately detached from the
+/// wait-all boundary. Background actions are deliberately detached from the
 /// foreground step's mutable context, but their observable result is merged
 /// back in one place after all tasks have been joined.
 struct BackgroundStepCoordinator {
@@ -154,8 +154,8 @@ fn is_synthetic_step(step: &Step, declared_step_ids: &std::collections::HashSet<
 /// Watches `cancel_rx` — when it becomes `true`, the current step is abandoned
 /// and remaining steps evaluate under `cancelled()` semantics.
 ///
-/// F019: Queues WorkflowStepsUpdate for each step transition (InProgress + Completed).
-/// F020: Uploads step logs right after each step completes.
+/// Queues WorkflowStepsUpdate for each step transition (InProgress + Completed).
+/// Uploads step logs right after each step completes.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_steps(
     steps: &[Step],
@@ -178,7 +178,7 @@ pub async fn run_steps(
     let mut background = BackgroundStepCoordinator::new(10);
     let now = crate::worker::helpers::iso_now();
 
-    // F019: Queue initial "Set up job" step as completed (number 1, official convention)
+    // Queue initial "Set up job" step as completed (number 1, official convention)
     let setup_step_id = uuid::Uuid::new_v4().to_string();
     job.setup_step_id = Some(setup_step_id.clone());
     {
@@ -459,7 +459,7 @@ pub async fn run_steps(
                         outputs: std::collections::HashMap::new(),
                     },
                 );
-                // F019: Queue skipped step
+                // Queue skipped step
                 let ts = crate::worker::helpers::iso_now();
                 {
                     let mut q = queue.lock().await;
@@ -539,7 +539,7 @@ pub async fn run_steps(
         info!("Running step: {}", resolved_display_name);
         let step_start = crate::worker::helpers::iso_now();
 
-        // F019: Queue InProgress update
+        // Queue InProgress update
         {
             let mut q = queue.lock().await;
             q.queue_update(StepUpdate {
@@ -703,7 +703,7 @@ pub async fn run_steps(
             };
             step_ctx.update_debug_flag();
 
-            // P2.2: Emit debug logs for condition evaluation
+            // Emit debug logs for condition evaluation
             let condition = step.condition.as_deref().unwrap_or("success()");
             step_ctx.debug(&format!(
                 "Evaluating condition for step: '{}'",
@@ -712,7 +712,7 @@ pub async fn run_steps(
             step_ctx.debug(&format!("Evaluating: {condition}"));
             step_ctx.debug("Result: true");
 
-            // P2.2: Emit debug logs for environment variables
+            // Emit debug logs for environment variables
             if step_ctx.debug {
                 step_ctx.debug("Env:");
                 let env = step_ctx.build_env();
@@ -755,7 +755,7 @@ pub async fn run_steps(
                 }
             }
 
-            // P1.4: When we're in cancel-unwind mode (cancelled=true), steps that
+            // When we're in cancel-unwind mode (cancelled=true), steps that
             // still run (always/cancelled conditions) must NOT be immediately killed
             // by the still-active cancel channel. Give them a fresh cancel receiver
             // bounded by a grace budget (5 minutes, matching upstream's default
@@ -902,7 +902,7 @@ pub async fn run_steps(
             }
 
             // Record a step result before applying file commands so GITHUB_OUTPUT can
-            // attach outputs to this step.  If file-command parsing fails, official
+            // attach outputs to this step. If file-command parsing fails, official
             // runner behavior is to mark the step failed after process execution.
             step_ctx.job.steps.insert(
                 step.context_name.clone(),
@@ -1254,7 +1254,7 @@ pub async fn run_steps(
 
         let step_end = crate::worker::helpers::iso_now();
         let conclusion_proto = ServerQueue::conclusion_to_proto(&conclusion_str);
-        // F035: Read and scrub step summary content before cleanup deletes the file.
+        // Read and scrub step summary content before cleanup deletes the file.
         let summary_content = if let Ok(metadata) =
             std::fs::metadata(&file_command_paths.summary_file)
         {
@@ -1293,7 +1293,7 @@ pub async fn run_steps(
         let annotations = step_ctx.annotations.clone();
         let log_content = step_ctx.log_content();
 
-        // F025: Store annotations in job context
+        // Store annotations in job context
         if !annotations.is_empty() {
             step_ctx.job.add_step_annotations_to_job(&annotations);
             step_ctx
@@ -1317,7 +1317,7 @@ pub async fn run_steps(
             step_ctx.job.job_status = JobStatus::Cancelled;
         }
 
-        // F019: Queue Completed update
+        // Queue Completed update
         {
             let mut q = queue.lock().await;
             q.queue_update(StepUpdate {
@@ -1335,12 +1335,12 @@ pub async fn run_steps(
             }
         }
 
-        // F020: Upload step log immediately after completion
+        // Upload step log immediately after completion
         if let Some(rpt) = reporting {
             if !log_content.is_empty() {
                 crate::worker::reporting::upload_step_log(rpt, &step.id, &log_content).await;
             }
-            // F035: Upload step summary if non-empty
+            // Upload step summary if non-empty
             if !summary_content.is_empty() {
                 crate::worker::reporting::upload_step_summary(rpt, &step.id, &summary_content)
                     .await;
@@ -1394,7 +1394,7 @@ pub async fn run_steps(
     }
 
     // The official runner waits for every background action before post-job
-    // actions and before publishing the terminal job result.  Joining here is
+    // actions and before publishing the terminal job result. Joining here is
     // also the shutdown guarantee: no process task survives run_steps.
     for result in background.wait_all().await {
         if result.result.conclusion == "Failure" {
@@ -1476,7 +1476,7 @@ pub async fn run_steps(
         }
     }
 
-    // F019: Queue "Complete job" step
+    // Queue "Complete job" step
     let ts = crate::worker::helpers::iso_now();
     // Step number: step_offset + user_steps + extra_steps (stop containers) + 1
     let complete_step_number = step_offset + steps.len() as u32 + extra_steps;
@@ -1605,7 +1605,7 @@ async fn execute_step(
             let mut expr_ctx = ctx.job.build_expression_context();
             // Step-level `env:` entries are part of the `env` context while
             // evaluating the step's own script (official runner behavior —
-            // `run: ${{ env.CMD }}` with a step-level `env: CMD: ...` must
+            // `run: ${{ env.CMD }}` with a step-level `env: CMD:...` must
             // resolve; the dump workflow relies on it). The process
             // environment gets them separately at command launch.
             if !ctx.env.is_empty() {

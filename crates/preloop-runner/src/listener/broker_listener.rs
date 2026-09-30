@@ -182,11 +182,11 @@ pub async fn run_broker_loop(
     runner_root: &std::path::Path,
 ) -> Result<()> {
     let mut config = config.clone();
-    // P1.1: Derive broker URL from settings.server_url_v2 (extracted from agent
+    // Derive broker URL from settings.server_url_v2 (extracted from agent
     // response properties.ServerUrlV2 at configure time). This is
     // "https://broker.actions.githubusercontent.com/" for github.com, and the
     // server's own URL for local aksh / self-hosted instances.
-    // Fall back to server_url if server_url_v2 is absent (pre-P1.1 configs).
+    // Fall back to server_url if server_url_v2 is absent (pre- configs).
     let broker_url = config
         .settings
         .server_url_v2
@@ -399,7 +399,7 @@ pub async fn run_broker_loop(
                 return Ok(());
             }
             // When a job is active, race between job completion and broker
-            // message polling.  The broker poll uses a short ~3s timeout when
+            // message polling. The broker poll uses a short ~3s timeout when
             // busy (matching the official runner's ~3s cancel-detection cadence)
             // so cancellation messages are detected promptly.
             result = async { active_job.as_mut().unwrap().wait().await }, if busy => {
@@ -461,7 +461,7 @@ pub async fn run_broker_loop(
 
                         info!("Received broker message {message_id}: {message_type}");
 
-                        // Parse body — decrypt if key present, else plaintext (F011)
+                        // Parse body — decrypt if key present, else plaintext
                         let body = match parse_message_body(
                             &msg,
                             session_key.as_deref(),
@@ -746,7 +746,7 @@ pub async fn run_broker_loop(
                                 }
                             }
                         } else if is_session_expired(&e) {
-                            // F052: Respect skip_session_recover setting
+                            // Respect skip_session_recover setting
                             if config.settings.skip_session_recover {
                                 warn!("Broker session expired. SkipSessionRecover is set — exiting.");
                                 return Err(e);
@@ -829,7 +829,7 @@ fn require_fips_cryptography(config: &RunnerConfig) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-/// F011: Extract session key only if present.
+/// Extract session key only if present.
 fn extract_session_key_if_present(
     session: &serde_json::Value,
     config: &RunnerConfig,
@@ -929,7 +929,7 @@ fn announce_busy() {
 /// Acquire a full job from a RunnerJobRequest reference via run-service.
 ///
 /// Golden flow 12: message body fields are snake_case:
-///   `runner_request_id`, `run_service_url`, `billing_owner_id`, `should_acknowledge`
+/// `runner_request_id`, `run_service_url`, `billing_owner_id`, `should_acknowledge`
 /// Golden flow 15: POST /{id}/acquirejob returns the full camelCase job payload.
 async fn acquire_job_from_ref(
     job_ref: &serde_json::Value,
@@ -1071,7 +1071,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    // --- P1 broker listener gap coverage ---
+    // --- broker listener gap coverage ---
 
     #[test]
     fn classify_message_maps_official_broker_types() {

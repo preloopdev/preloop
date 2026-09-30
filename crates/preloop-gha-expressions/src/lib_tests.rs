@@ -310,7 +310,7 @@ fn chained_bracket_access_on_from_json() {
 
 #[test]
 fn hashfiles_follow_symlinks_flag() {
-    // F055: hashFiles('--follow-symbolic-links', 'pattern') should parse
+    // hashFiles('--follow-symbolic-links', 'pattern') should parse
     // the flag without treating it as a glob pattern.
     // Without a workspace_dir, hashFiles returns "" regardless, but this
     // confirms the flag parsing doesn't cause errors.

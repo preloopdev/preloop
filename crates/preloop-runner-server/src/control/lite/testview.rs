@@ -1,5 +1,5 @@
-//! `#[cfg(test)]` read view: rebuild the old `TxState` field shape from the
-//! relational tables so pre-cutover assertions keep their vocabulary.
+//! `#[cfg(test)]` read view: build a [`TestState`] snapshot from the
+//! relational tables so test assertions have a stable field vocabulary.
 //! Read-only; there is deliberately no write path — tests that need to
 //! mutate go through real `ControlBackend` commands or `test_db_mutate`.
 
@@ -73,9 +73,9 @@ impl LiteBackend {
             })
             .map_err(db)?
         {
-            // TestState keys the counter by `repository\x1fworkflow_path`
-            // (the old TxState map shape); the table's natural key adds
-            // namespace, always 'default' for single-node lite.
+            // TestState keys the counter by `repository\x1fworkflow_path`;
+            // the table's natural key adds namespace, always 'default' for
+            // single-node lite.
             let (repository, path, n) = row.map_err(db)?;
             t.workflow_run_counters
                 .insert(format!("{repository}\x1f{path}"), n as u64);
@@ -253,7 +253,7 @@ impl LiteBackend {
         }
         t.reindex_requests();
         // Message bodies: the template lives per job; the view exposes it
-        // under the job's newest request id (pre-cutover shape).
+        // under the job's newest request id.
         for row in tx
             .prepare_cached(
                 "SELECT q.request_id, m.message_template FROM job_requests q \
@@ -808,8 +808,8 @@ fn status_of(s: &str) -> ExecutionStatus {
 }
 
 /// Typed seed/mutation helpers for tests, over a writer transaction. Every
-/// helper maps one old `TxState` field write to its relational row(s); they
-/// exist so pre-cutover tests keep short bodies instead of raw SQL.
+/// helper maps one `TestState` field write to its relational row(s), so
+/// tests keep short bodies instead of raw SQL.
 pub(crate) struct TestDb<'a>(pub &'a Transaction<'a>);
 
 impl TestDb<'_> {

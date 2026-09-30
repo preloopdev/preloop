@@ -2,7 +2,7 @@
 //!
 //! `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`
 //! and `POST /repos/{owner}/{repo}/dispatches` trigger runs exactly like
-//! github.com's Actions API: authenticated through the D2 chain
+//! github.com's Actions API: authenticated through the dispatch auth chain
 //! ([`crate::dispatch_auth`]), validated against the workflow's declared
 //! triggers and inputs, and submitted through the *same* event adapters the
 //! webhook path uses (`events::workflow_dispatch`,
@@ -90,7 +90,7 @@ pub async fn workflow_dispatch(
         },
         "sender": { "login": identity.actor },
     });
-    // D4: validate inputs against `on.workflow_dispatch.inputs` *before* any
+    // validate inputs against `on.workflow_dispatch.inputs` *before* any
     // run is created — missing required, type mismatch, and out-of-options
     // choices all surface as 422. Defaults are applied here so the run and
     // `github.event.inputs` carry them.
