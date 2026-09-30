@@ -456,12 +456,16 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
             "http://127.0.0.1:9090",
             "local-runtime-jwt",
         ),
-        1,
-        "a token-only primary checkout still targets the local snapshot"
+        0,
+        "a checkout that supplies its own token keeps it and stays on the forge: \
+         the redirect overwrites the token input with the snapshot credential, \
+         which strips the workflow's authority and breaks later authenticated \
+         Git commands (the token persists)"
     );
     assert_eq!(
         token_only.steps[0].inputs.get("token"),
-        Some(&"local-runtime-jwt".to_owned())
+        Some(&"submodule-token".to_owned()),
+        "the workflow's own token must survive untouched"
     );
     assert_eq!(
         redirect_primary_checkout(

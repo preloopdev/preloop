@@ -1753,7 +1753,8 @@ pub fn runner_ownership_reconcile_script(user: &str, uid: u32) -> String {
          {adopt_needs}; \
          for d in /usr/local/rustup /usr/local/cargo; do \
            if [ -e \"$d\" ]; then \
-             [ \"$(stat -c %u \"$d\" 2>/dev/null)\" = \"{uid}\" ] || needs=1; \
+             if [ \"$(stat -L -c %u \"$d\" 2>/dev/null)\" != \"{uid}\" ]; then needs=1; \
+             elif find \"$d/.\" ! -uid {uid} -print -quit 2>/dev/null | grep -q .; then needs=1; fi; \
            fi; \
          done; \
          if [ -d /opt/hostedtoolcache ]; then \
@@ -7046,6 +7047,16 @@ chmod +x "$dest/bin/node"
         assert!(
             script.contains("/home/runner/.rustup/settings.toml"),
             "adoption must be gated on a usable rustup home: {script}"
+        );
+        // A runner-owned root with root-owned descendants passes a top-level
+        // `stat` and then skips the recursive chown; the probe must descend.
+        assert!(
+            script.contains("find \"$d/.\" ! -uid 1001 -print -quit"),
+            "the ownership probe must be recursive: {script}"
+        );
+        assert!(
+            script.contains("stat -L -c %u"),
+            "the probe must dereference an adopted symlink home: {script}"
         );
     }
 
