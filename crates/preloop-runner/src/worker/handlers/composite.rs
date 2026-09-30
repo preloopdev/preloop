@@ -63,7 +63,7 @@ fn composite_inner_context(
     input_env: &std::collections::HashMap<String, String>,
     nested_step_results: &indexmap::IndexMap<String, crate::worker::contexts::StepResult>,
 ) -> preloop_gha_expressions::Context {
-    let mut expr_ctx = ctx.job.build_expression_context();
+    let mut expr_ctx = ctx.build_expression_context();
     let mut inputs_map = serde_json::Map::new();
     for (k, v) in input_env {
         if let Some(name) = k.strip_prefix("INPUT_") {
@@ -174,7 +174,7 @@ fn run_composite_action_inner<'a>(
         let result = async {
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
-        let expr_ctx_for_inputs = ctx.job.build_expression_context();
+        let expr_ctx_for_inputs = ctx.build_expression_context();
         if let Some(inputs) = with.as_object() {
             for (key, value) in inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
@@ -192,7 +192,7 @@ fn run_composite_action_inner<'a>(
 
         // Apply defaults from manifest for missing inputs, evaluating ${{ }} expressions
         if let Some(manifest_inputs) = &manifest.inputs {
-            let expr_ctx = ctx.job.build_expression_context();
+            let expr_ctx = ctx.build_expression_context();
             for (key, input_def) in manifest_inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
                 if let Some(default) = input_def
@@ -675,6 +675,51 @@ mod tests {
     use super::*;
     use crate::worker::contexts::JobContext;
     use crate::worker::execution_context::StepContext;
+
+    /// A step's `env:` block feeds the `env` context when that step's `with:`
+    /// values are evaluated. rustup's `tool: mdbook@${{ env.MDBOOK_VERSION }}`
+    /// otherwise reaches the action as `mdbook@`, which install-action rejects
+    /// ("semver operators are not supported in 'tool' input option: ''").
+    #[tokio::test]
+    async fn composite_inputs_see_the_calling_step_env() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let action_dir = workspace.path().join(".github/actions/probe");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: probe\ninputs:\n  tool:\n    required: true\nruns:\n  using: composite\n  steps:\n    - run: printf '%s' \"${{ inputs.tool }}\" > tool-input.txt\n      shell: bash\n",
+        )
+        .unwrap();
+
+        let mut job = JobContext::new(
+            "j3".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        ctx.env
+            .insert("MDBOOK_VERSION".to_owned(), "0.5.2".to_owned());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let manifest = crate::worker::handlers::factory::load_action_manifest(&action_dir).unwrap();
+        run_composite_action(
+            &manifest,
+            &action_dir,
+            &serde_json::json!({"tool": "mdbook@${{ env.MDBOOK_VERSION }}"}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            rx,
+        )
+        .await
+        .expect("composite action runs");
+
+        let written = std::fs::read_to_string(workspace.path().join("tool-input.txt")).unwrap();
+        assert_eq!(
+            written, "mdbook@0.5.2",
+            "the calling step's env must resolve in the composite's `with` inputs"
+        );
+    }
 
     /// Unix paths resolve the `_actions/{owner}/{repo}/{sha}` root,
     /// including sub-action directories beneath it.
