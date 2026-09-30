@@ -140,28 +140,30 @@ fn decode_template_token(value: &serde_json::Value) -> serde_json::Value {
 pub(crate) fn evaluate_expression_tokens(
     value: &serde_json::Value,
     ctx: &preloop_gha_expressions::Context,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     match value {
         serde_json::Value::Object(map) => {
             if map.get("type").and_then(|t| t.as_u64()) == Some(3)
                 && let Some(expr) = map.get("expr").and_then(|e| e.as_str())
-                && let Ok(evaluated) = preloop_gha_expressions::eval_expression(expr, ctx)
             {
-                return evaluated;
+                return preloop_gha_expressions::eval_expression(expr, ctx).map_err(|error| {
+                    format!("container/service expression `{expr}` could not be evaluated: {error}")
+                });
             }
-            serde_json::Value::Object(
-                map.iter()
-                    .map(|(k, v)| (k.clone(), evaluate_expression_tokens(v, ctx)))
-                    .collect(),
-            )
+            let mut evaluated = serde_json::Map::new();
+            for (key, item) in map {
+                evaluated.insert(key.clone(), evaluate_expression_tokens(item, ctx)?);
+            }
+            Ok(serde_json::Value::Object(evaluated))
         }
-        serde_json::Value::Array(items) => serde_json::Value::Array(
-            items
-                .iter()
-                .map(|item| evaluate_expression_tokens(item, ctx))
-                .collect(),
-        ),
-        other => other.clone(),
+        serde_json::Value::Array(items) => {
+            let mut evaluated = Vec::with_capacity(items.len());
+            for item in items {
+                evaluated.push(evaluate_expression_tokens(item, ctx)?);
+            }
+            Ok(serde_json::Value::Array(evaluated))
+        }
+        other => Ok(other.clone()),
     }
 }
 
@@ -1162,7 +1164,7 @@ mod tests {
             "expr": "matrix.build.container"
         });
 
-        let evaluated = evaluate_expression_tokens(&token, &ctx);
+        let evaluated = evaluate_expression_tokens(&token, &ctx).expect("expression evaluates");
         assert_eq!(evaluated, serde_json::json!("alpine:3.22"));
         let spec = parse_container_spec(&evaluated).expect("container spec parses");
         assert_eq!(spec.image, "alpine:3.22");
@@ -1175,10 +1177,26 @@ mod tests {
                 {"Key": {"type": 0, "lit": "options"}, "Value": {"type": 0, "lit": "--cpus 2"}}
             ]
         });
-        let evaluated = evaluate_expression_tokens(&mapping, &ctx);
+        let evaluated = evaluate_expression_tokens(&mapping, &ctx).expect("mapping evaluates");
         let spec = parse_container_spec(&evaluated).expect("mapping container spec parses");
         assert_eq!(spec.image, "alpine:3.22");
         assert_eq!(spec.options, "--cpus 2");
+
+        // A failing expression must be reported, not silently downgraded to a
+        // host job (`parse_container_spec` would return None and run_job would
+        // continue without the declared container).
+        let broken = serde_json::json!({
+            "type": 3,
+            "file": 1,
+            "line": 1,
+            "col": 1,
+            "expr": "fromJSON('not json')"
+        });
+        let error = evaluate_expression_tokens(&broken, &ctx).expect_err("bad JSON must fail");
+        assert!(
+            error.contains("could not be evaluated"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

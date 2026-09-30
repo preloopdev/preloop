@@ -32,6 +32,17 @@ pub fn run_action<'a>(
             let action_dir = std::path::Path::new(workspace).join(uses);
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         } else if uses.starts_with("$/") {
+            // Same gate `action_preparation` enforces: with the
+            // `actions_self_repository` feature off, a `$/` reference stays
+            // unresolved rather than executing a workspace-provided action
+            // (the workspace comes from the event's checkout, and the gated
+            // preparation path is what normally resolves these refs).
+            if !self_repository_enabled(ctx.job) {
+                anyhow::bail!(
+                    "self-repository action reference '{uses}' requires the \
+                     actions_self_repository feature"
+                );
+            }
             // `$/path` names the root of the repository the workflow runs
             // from. The official runner rewrites it to `<self repo>@<sha>`
             // and downloads it, which only works when that sha is fetchable;
@@ -88,6 +99,30 @@ pub(crate) async fn run_action_from_dir(
             anyhow::bail!("Unsupported action type: {other}")
         }
     }
+}
+
+/// Whether the server advertised the self-repository action feature.
+///
+/// Official `Constants.Runner.Features.SelfRepository` — the same gate
+/// [`crate::worker::action_preparation`] reads from the raw job message, here
+/// against the job context the handlers carry.
+pub(crate) fn self_repository_enabled(job: &crate::worker::contexts::JobContext) -> bool {
+    feature_enabled(
+        job.variables
+            .get("actions_self_repository")
+            .and_then(|value| value.get("value"))
+            .and_then(|value| value.as_str()),
+    )
+}
+
+/// Truthiness of a runner feature flag (`1`/`true`/`t`/`y`/`yes`/`on`).
+pub(crate) fn feature_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "t" | "y" | "yes" | "on"
+        )
+    })
 }
 
 /// Resolve a `$/path` self-repository reference against the workspace.
@@ -428,7 +463,8 @@ mod tests {
         let mut job = crate::worker::contexts::JobContext::new(
             "j2".into(),
             "Job".into(),
-            serde_json::json!({}),
+            // `actions_self_repository` is the gate the server advertises.
+            serde_json::json!({"actions_self_repository": {"value": "true"}}),
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
@@ -444,6 +480,48 @@ mod tests {
         .await;
         drop(cancel_tx);
         result.expect("$/ self-repository reference must run from the workspace");
+    }
+
+    /// Same gate `action_preparation` enforces: without the
+    /// `actions_self_repository` feature the workspace fallback must not
+    /// execute a workspace-provided action.
+    #[tokio::test]
+    async fn self_repository_action_requires_the_feature_flag() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let action_dir = workspace.path().join(".github/actions/probe");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: probe\nruns:\n  using: composite\n  steps:\n    - run: touch ran.txt\n      shell: bash\n",
+        )
+        .unwrap();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j4".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let result = run_action(
+            "$/.github/actions/probe",
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            rx,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a $/ reference without the feature flag must stay unresolved"
+        );
+        assert!(
+            !workspace.path().join("ran.txt").exists(),
+            "the workspace action must not run when the gate is closed"
+        );
     }
 
     #[test]

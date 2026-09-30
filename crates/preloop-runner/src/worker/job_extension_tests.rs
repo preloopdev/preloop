@@ -741,8 +741,12 @@ runs:
         action_dir.to_string_lossy().to_string(),
     );
 
-    let ordered =
-        build_step_list_with_lifecycle(main_steps, workspace.to_str().unwrap(), &action_paths);
+    let ordered = build_step_list_with_lifecycle(
+        main_steps,
+        workspace.to_str().unwrap(),
+        &action_paths,
+        true,
+    );
 
     assert_eq!(ordered.len(), 3);
     assert_eq!(ordered[0].id, "__pre_main-action");
@@ -797,6 +801,7 @@ fn lifecycle_registers_post_for_each_repeated_action_invocation() {
         vec![action_step("first"), action_step("second")],
         workspace.to_str().unwrap(),
         &action_paths,
+        true,
     );
 
     assert_eq!(
@@ -847,8 +852,12 @@ fn lifecycle_local_actions_skip_pre_but_retain_main_and_post() {
         remote_dir.to_string_lossy().to_string(),
     );
 
-    let ordered =
-        build_step_list_with_lifecycle(main_steps, workspace.to_str().unwrap(), &action_paths);
+    let ordered = build_step_list_with_lifecycle(
+        main_steps,
+        workspace.to_str().unwrap(),
+        &action_paths,
+        true,
+    );
 
     assert_eq!(
         ordered
@@ -918,8 +927,12 @@ runs:
         action_dir.to_string_lossy().to_string(),
     );
 
-    let ordered =
-        build_step_list_with_lifecycle(main_steps, workspace.to_str().unwrap(), &action_paths);
+    let ordered = build_step_list_with_lifecycle(
+        main_steps,
+        workspace.to_str().unwrap(),
+        &action_paths,
+        true,
+    );
 
     assert_eq!(ordered.len(), 3);
     assert_eq!(ordered[0].id, "__pre_docker-action");
@@ -1208,7 +1221,7 @@ proptest! {
     #[test]
     fn lifecycle_order_conditions_and_unique_ids(specs in arb_lifecycle_specs()) {
         let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
-        let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths);
+        let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths, true);
 
         let expected_pre: Vec<String> = specs
             .iter()
@@ -1269,7 +1282,7 @@ proptest! {
     #[test]
     fn lifecycle_steps_preserve_main_metadata(specs in arb_lifecycle_specs()) {
         let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
-        let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths);
+        let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths, true);
         for (index, step) in main_steps.iter().enumerate() {
             if lifecycle_has_pre(&specs[index]) {
                 let generated = result.iter().find(|candidate| candidate.id == format!("__pre_step-{index}")).unwrap();
@@ -1285,7 +1298,7 @@ proptest! {
     #[test]
     fn no_lifecycle_is_identity(specs in arb_no_lifecycle_specs()) {
         let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
-        let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths);
+        let result = build_step_list_with_lifecycle(main_steps.clone(), &workspace, &action_paths, true);
         prop_assert_eq!(result.len(), main_steps.len());
         for (actual, expected) in result.iter().zip(main_steps.iter()) {
             prop_assert_eq!(&actual.id, &expected.id);
@@ -1352,7 +1365,7 @@ fn mixed_lifecycle_regression_does_not_invent_steps() {
         },
     ];
     let (_temp, workspace, action_paths, main_steps) = lifecycle_fixture(&specs);
-    let result = build_step_list_with_lifecycle(main_steps, &workspace, &action_paths);
+    let result = build_step_list_with_lifecycle(main_steps, &workspace, &action_paths, true);
     assert_eq!(
         result
             .iter()

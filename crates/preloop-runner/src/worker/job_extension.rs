@@ -858,6 +858,7 @@ pub fn build_step_list_with_lifecycle(
     main_steps: Vec<Step>,
     workspace: &str,
     action_paths: &std::collections::HashMap<String, String>,
+    self_repository_enabled: bool,
 ) -> Vec<Step> {
     let mut pre_steps: Vec<Step> = Vec::new();
     let mut post_steps: Vec<Step> = Vec::new();
@@ -866,15 +867,19 @@ pub fn build_step_list_with_lifecycle(
         let StepType::Action { ref uses, ref with } = step.step_type else {
             continue;
         };
-        let is_local_action = uses.starts_with("./")
-            || uses.starts_with("../")
-            || super::handlers::action::self_repository_local_dir(uses, workspace).is_some();
+        // `$/` references are only executable when the feature is advertised
+        // and the action is checked out in the workspace; `action_preparation`
+        // applies the same gate when it stages them.
+        let self_repo_local = self_repository_enabled
+            && uses.starts_with("$/")
+            && super::handlers::action::self_repository_local_dir(uses, workspace).is_some();
+        let is_local_action = uses.starts_with("./") || uses.starts_with("../") || self_repo_local;
 
         // Resolve the action directory. Prefer the SHA-pinned path discovered
         // during the setup/download phase; fall back to local action paths.
         let action_dir = if let Some(path) = action_paths.get(uses) {
             std::path::PathBuf::from(path)
-        } else if uses.starts_with("$/") {
+        } else if self_repo_local {
             match super::handlers::action::self_repository_local_dir(uses, workspace) {
                 Some(path) => path,
                 None => continue,
