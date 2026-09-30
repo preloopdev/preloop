@@ -1371,9 +1371,9 @@ impl AppState {
         if let Err(error) = self.backend.append_event(&event).await {
             error!(?error, "failed to persist control-plane event");
         }
-        // Always broadcast: in-memory state is the source of truth and
-        // subscribers see live events. A store hiccup must never
-        // freeze the SSE/UI stream for a healthy run.
+        // Always broadcast so SSE/UI subscribers see live events. The
+        // broadcast is advisory, not authoritative — a store hiccup must
+        // never freeze the stream for a healthy run.
         let _ = self.events.send(event);
     }
 
