@@ -515,12 +515,12 @@ impl LiteBackend {
                 .optional()
                 .map_err(db)?;
             let Some(owner) = owner else { return Ok(false) };
-            if let (Some(owner), Some(caller)) = (owner, caller_runner_id) {
-                if owner != caller {
-                    return Err(ControlError::Forbidden(
-                        "session belongs to another runner".to_owned(),
-                    ));
-                }
+            if let (Some(owner), Some(caller)) = (owner, caller_runner_id)
+                && owner != caller
+            {
+                return Err(ControlError::Forbidden(
+                    "session belongs to another runner".to_owned(),
+                ));
             }
             // Release the session's live requests so the jobs can be retried.
             // runner_id stays: the attempt's owner survives session teardown

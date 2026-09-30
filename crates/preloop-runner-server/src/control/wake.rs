@@ -97,10 +97,10 @@ async fn drive<S, T>(
     use futures::StreamExt;
     let mut messages = futures::stream::poll_fn(move |cx| connection.poll_message(cx));
     while let Some(Ok(message)) = messages.next().await {
-        if let tokio_postgres::AsyncMessage::Notification(note) = message {
-            if notes.send(note.payload().to_owned()).is_err() {
-                return;
-            }
+        if let tokio_postgres::AsyncMessage::Notification(note) = message
+            && notes.send(note.payload().to_owned()).is_err()
+        {
+            return;
         }
     }
 }

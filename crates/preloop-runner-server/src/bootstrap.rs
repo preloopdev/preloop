@@ -1325,10 +1325,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         if let Ok(mut guard) = state.next_job_runs_on.write() {
             *guard = labels;
         }
-        if state.pool_status.snapshot().next_job_runs_on.is_empty() {
-            if let Ok(v) = state.next_job_runs_on.read() {
-                state.pool_status.set_next_job_runs_on(v.clone());
-            }
+        if state.pool_status.snapshot().next_job_runs_on.is_empty()
+            && let Ok(v) = state.next_job_runs_on.read()
+        {
+            state.pool_status.set_next_job_runs_on(v.clone());
         }
     }
     {

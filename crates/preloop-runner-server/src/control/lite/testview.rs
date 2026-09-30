@@ -96,10 +96,10 @@ impl LiteBackend {
             t.job_status.insert(key.clone(), jr.status);
             // Old `queued_at` was the reaper's ready-queue mark, retained only
             // while the job sits in the ready queue (`commands.rs` retain).
-            if jr.queue_state == "ready" {
-                if let Some(us) = jr.enqueued_at {
-                    t.queued_at.insert(key.clone(), codec::us_to_system(us));
-                }
+            if jr.queue_state == "ready"
+                && let Some(us) = jr.enqueued_at
+            {
+                t.queued_at.insert(key.clone(), codec::us_to_system(us));
             }
             match jr.queue_state.as_str() {
                 "ready" => {
@@ -206,10 +206,10 @@ impl LiteBackend {
                     timeout_triggered: timeout != 0,
                     debug_token_issued: dbg != 0,
                 };
-                if result.is_none() {
-                    if let Some(sid) = session_id {
-                        t.session_active_requests.insert(sid, request_id);
-                    }
+                if result.is_none()
+                    && let Some(sid) = session_id
+                {
+                    t.session_active_requests.insert(sid, request_id);
                 }
                 // Correlation indexes: the live map is keyed by request;
                 // timeline/agent lookups resolve to the NEWEST request.
@@ -368,10 +368,10 @@ impl LiteBackend {
                 if let Some(client_id) = client_id {
                     t.runner_client_ids.insert(client_id, id);
                 }
-                if let Some(pem) = public_key {
-                    if let Ok(key) = AgentRsaPublicKey::parse(&pem) {
-                        t.runner_rsa_public_keys.insert(id, key);
-                    }
+                if let Some(pem) = public_key
+                    && let Ok(key) = AgentRsaPublicKey::parse(&pem)
+                {
+                    t.runner_rsa_public_keys.insert(id, key);
                 }
                 let _ = rsa_key;
                 if pool_proven != 0 {

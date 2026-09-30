@@ -1089,32 +1089,32 @@ pub(super) async fn acquire_gate(
         None => false,
     };
     // Late deliveries must not pre-empt a newer holder.
-    if cancel_in_progress || queue == ConcurrencyQueue::Single {
-        if let Some(arrival) = run_event_order(tx, holder.holder.run_id()).await? {
-            let mut superseded = false;
-            for existing in group
-                .holder
-                .iter()
-                .chain(group.waiters.iter().map(|(_, h)| h))
+    if (cancel_in_progress || queue == ConcurrencyQueue::Single)
+        && let Some(arrival) = run_event_order(tx, holder.holder.run_id()).await?
+    {
+        let mut superseded = false;
+        for existing in group
+            .holder
+            .iter()
+            .chain(group.waiters.iter().map(|(_, h)| h))
+        {
+            if existing.holder.run_id() == holder.holder.run_id() {
+                continue;
+            }
+            if let Some(existing_order) = run_event_order(tx, existing.holder.run_id()).await?
+                && arrival.is_older_than(&existing_order)
             {
-                if existing.holder.run_id() == holder.holder.run_id() {
-                    continue;
-                }
-                if let Some(existing_order) = run_event_order(tx, existing.holder.run_id()).await? {
-                    if arrival.is_older_than(&existing_order) {
-                        superseded = true;
-                        break;
-                    }
-                }
+                superseded = true;
+                break;
             }
-            if superseded {
-                // Declining a group we only probed: drop the empty probe row
-                // so the next acquirer doesn't see a phantom empty mutex.
-                if group.holder.is_none() {
-                    unlock_group(tx, namespace, key).await?;
-                }
-                return Ok(GateOutcome::Cancelled);
+        }
+        if superseded {
+            // Declining a group we only probed: drop the empty probe row
+            // so the next acquirer doesn't see a phantom empty mutex.
+            if group.holder.is_none() {
+                unlock_group(tx, namespace, key).await?;
             }
+            return Ok(GateOutcome::Cancelled);
         }
     }
     if group.holder.is_none() {
@@ -1131,25 +1131,25 @@ pub(super) async fn acquire_gate(
         let prev = group.holder.clone();
         let stale_pending = group.waiters.clone();
         set_holder(tx, namespace, key, display_name, holder).await?;
-        if let Some(prev) = prev {
-            if prev.holder.run_id() != holder.holder.run_id() {
-                let (pk, prun, pjob, _) = concurrency::holder_row(&prev.holder);
-                let _ = (pk, prun, pjob);
-                tx.execute(
-                    "DELETE FROM concurrency_waits WHERE namespace_id=$1 \
+        if let Some(prev) = prev
+            && prev.holder.run_id() != holder.holder.run_id()
+        {
+            let (pk, prun, pjob, _) = concurrency::holder_row(&prev.holder);
+            let _ = (pk, prun, pjob);
+            tx.execute(
+                "DELETE FROM concurrency_waits WHERE namespace_id=$1 \
                      AND repository=$2 AND group_name=$3",
-                    &[&namespace, &key.0, &key.1],
-                )
-                .await
-                .map_err(db)?;
-                cancel_holder(
-                    backend,
-                    tx,
-                    &prev.holder,
-                    concurrency::cancelled_reason().as_deref(),
-                )
-                .await?;
-            }
+                &[&namespace, &key.0, &key.1],
+            )
+            .await
+            .map_err(db)?;
+            cancel_holder(
+                backend,
+                tx,
+                &prev.holder,
+                concurrency::cancelled_reason().as_deref(),
+            )
+            .await?;
         }
         for pending in stale_pending {
             if pending.1.holder.run_id() != holder.holder.run_id() {
@@ -2967,14 +2967,13 @@ fn sched_merge_gate(gates: &mut Vec<JobSetGate>, mut gate: JobSetGate) {
 
 /// Mirror a node status into `record.jobs` (contributing nodes only).
 fn set_status_in(graph: Option<&mut RunGraph>, job_id: &JobId, status: ExecutionStatus) {
-    if let Some(graph) = graph {
-        if graph
+    if let Some(graph) = graph
+        && graph
             .nodes
             .get(job_id)
             .is_some_and(|node| node.contributes())
-        {
-            graph.record.jobs.insert(job_id.clone(), status);
-        }
+    {
+        graph.record.jobs.insert(job_id.clone(), status);
     }
 }
 
@@ -3554,19 +3553,18 @@ impl PgBackend {
                 node.oidc = oidc;
             }
             // Unhostable platform: conclude immediately.
-            if check_hostable {
-                if let Some(platform) =
+            if check_hostable
+                && let Some(platform) =
                     crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
-                {
-                    node.status = ExecutionStatus::Failure;
-                    node.queue_state = logic::QueueState::None;
-                    node.completed_at_us = Some(now);
-                    concluded.push((
-                        job_id.clone(),
-                        ExecutionStatus::Failure,
-                        Some(format!("no {platform} runner registered")),
-                    ));
-                }
+            {
+                node.status = ExecutionStatus::Failure;
+                node.queue_state = logic::QueueState::None;
+                node.completed_at_us = Some(now);
+                concluded.push((
+                    job_id.clone(),
+                    ExecutionStatus::Failure,
+                    Some(format!("no {platform} runner registered")),
+                ));
             }
             if initially_skipped && node.status != ExecutionStatus::Failure {
                 node.status = ExecutionStatus::Skipped;
@@ -3769,10 +3767,10 @@ impl PgBackend {
                 let os = ["linux", "macos", "windows"]
                     .into_iter()
                     .find(|os| label == *os || label.starts_with(os));
-                if let Some(os) = os {
-                    if !platforms.contains(&os) {
-                        platforms.push(os);
-                    }
+                if let Some(os) = os
+                    && !platforms.contains(&os)
+                {
+                    platforms.push(os);
                 }
             }
         }
@@ -4845,10 +4843,10 @@ impl PgBackend {
             // must re-register rather than receive work it cannot decode.
             return Ok(AzdoPollOutcome::Forbidden);
         };
-        if let Some(verified) = poll.verified_runner_id {
-            if session.runner_id != Some(verified) {
-                return Ok(AzdoPollOutcome::Forbidden);
-            }
+        if let Some(verified) = poll.verified_runner_id
+            && session.runner_id != Some(verified)
+        {
+            return Ok(AzdoPollOutcome::Forbidden);
         }
         self.touch_session_row(&tx, &session.session_uuid).await?;
         if let Some(message) = self

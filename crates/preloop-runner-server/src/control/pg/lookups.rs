@@ -586,24 +586,23 @@ impl PgBackend {
             if let Some(details) = head
                 .get::<_, Option<String>>(3)
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            {
-                if let Ok(stored) = serde_json::from_value::<BTreeMap<String, i64>>(
+                && let Ok(stored) = serde_json::from_value::<BTreeMap<String, i64>>(
                     details
                         .get("job_check_run_ids")
                         .cloned()
                         .unwrap_or_default(),
-                ) {
-                    for (job_id, id) in stored {
-                        if !jobs.iter().any(|job| job.job_id.0 == job_id) {
-                            jobs.push(RunDispatchJob {
-                                detail: None,
-                                job_id: JobId(job_id.clone()),
-                                status: ExecutionStatus::Pending,
-                                display_name: Some(job_id),
-                                check_run_id: Some(id as u64),
-                                steps: Vec::new(),
-                            });
-                        }
+                )
+            {
+                for (job_id, id) in stored {
+                    if !jobs.iter().any(|job| job.job_id.0 == job_id) {
+                        jobs.push(RunDispatchJob {
+                            detail: None,
+                            job_id: JobId(job_id.clone()),
+                            status: ExecutionStatus::Pending,
+                            display_name: Some(job_id),
+                            check_run_id: Some(id as u64),
+                            steps: Vec::new(),
+                        });
                     }
                 }
             }
@@ -676,24 +675,22 @@ impl PgBackend {
         // `record_details`; their reports still mint.
         if let Ok(details) = serde_json::from_str::<serde_json::Value>(
             head.get::<_, Option<String>>(4).as_deref().unwrap_or("{}"),
+        ) && let Ok(stored) = serde_json::from_value::<BTreeMap<String, i64>>(
+            details
+                .get("job_check_run_ids")
+                .cloned()
+                .unwrap_or_default(),
         ) {
-            if let Ok(stored) = serde_json::from_value::<BTreeMap<String, i64>>(
-                details
-                    .get("job_check_run_ids")
-                    .cloned()
-                    .unwrap_or_default(),
-            ) {
-                for (job_id, id) in stored {
-                    if !jobs.iter().any(|job| job.job_id.0 == job_id) {
-                        jobs.push(RunDispatchJob {
-                            detail: None,
-                            job_id: JobId(job_id.clone()),
-                            status: ExecutionStatus::Pending,
-                            display_name: Some(job_id),
-                            check_run_id: Some(id as u64),
-                            steps: Vec::new(),
-                        });
-                    }
+            for (job_id, id) in stored {
+                if !jobs.iter().any(|job| job.job_id.0 == job_id) {
+                    jobs.push(RunDispatchJob {
+                        detail: None,
+                        job_id: JobId(job_id.clone()),
+                        status: ExecutionStatus::Pending,
+                        display_name: Some(job_id),
+                        check_run_id: Some(id as u64),
+                        steps: Vec::new(),
+                    });
                 }
             }
         }
@@ -1678,10 +1675,10 @@ async fn hydrate_steps(
         }
     }
     for job in jobs.iter_mut() {
-        if let Some(agent) = &job.4 {
-            if let Ok(agent) = uuid::Uuid::parse_str(agent) {
-                job.3 = steps.remove(&agent);
-            }
+        if let Some(agent) = &job.4
+            && let Ok(agent) = uuid::Uuid::parse_str(agent)
+        {
+            job.3 = steps.remove(&agent);
         }
     }
     Ok(())
@@ -1772,13 +1769,11 @@ pub(super) async fn archived_record_tx(
     // `record_details`; history rows overlay them.
     if let Ok(details) = serde_json::from_str::<serde_json::Value>(
         row.get::<_, Option<String>>(18).as_deref().unwrap_or("{}"),
-    ) {
-        if let Some(map) = details.get("job_check_run_ids") {
-            if let Ok(stored) = serde_json::from_value::<BTreeMap<JobId, u64>>(map.clone()) {
-                for (job_id, id) in stored {
-                    job_check_run_ids.entry(job_id).or_insert(id);
-                }
-            }
+    ) && let Some(map) = details.get("job_check_run_ids")
+        && let Ok(stored) = serde_json::from_value::<BTreeMap<JobId, u64>>(map.clone())
+    {
+        for (job_id, id) in stored {
+            job_check_run_ids.entry(job_id).or_insert(id);
         }
     }
     Ok(crate::models::RunRecord {

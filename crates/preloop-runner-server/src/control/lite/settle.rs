@@ -264,10 +264,10 @@ pub(super) fn apply_fail_fast(
     };
     let mut cancelled = Vec::new();
     for (job_id, status, request_id) in siblings {
-        if status == "in_progress" {
-            if let Some(request_id) = request_id {
-                queue_cancellation(tx, request_id)?;
-            }
+        if status == "in_progress"
+            && let Some(request_id) = request_id
+        {
+            queue_cancellation(tx, request_id)?;
         }
         let job_id = JobId(job_id);
         finish_job_row(tx, run_id, &job_id, ExecutionStatus::Cancelled)?;
@@ -357,10 +357,10 @@ fn release_jobset(
     for (ns, repo, group) in cg::jobset_holds(tx, set_id)? {
         let display = cg::hold_display_name(tx, &ns, &repo, &group)?;
         let holder: Option<Holder> = cg::hold_row(tx, &ns, &repo, &group)?.map(|(h, _)| h);
-        if let Some(holder) = holder {
-            if cg::release_hold(tx, &ns, &repo, &group, &holder)? {
-                promote_next_in_group(tx, backend, &ns, &repo, &group, display.as_deref())?;
-            }
+        if let Some(holder) = holder
+            && cg::release_hold(tx, &ns, &repo, &group, &holder)?
+        {
+            promote_next_in_group(tx, backend, &ns, &repo, &group, display.as_deref())?;
         }
     }
     tx.prepare_cached("DELETE FROM jobsets WHERE jobset_id = ?1")
@@ -652,11 +652,11 @@ pub(super) fn cancel_job_inner(
         .optional()
         .map_err(db)?;
     let mut count = 0;
-    if job.status == ExecutionStatus::InProgress {
-        if let Some(request_id) = live_request {
-            queue_cancellation(tx, request_id)?;
-            count = 1;
-        }
+    if job.status == ExecutionStatus::InProgress
+        && let Some(request_id) = live_request
+    {
+        queue_cancellation(tx, request_id)?;
+        count = 1;
     }
     finish_job_row(tx, run_id, job_id, ExecutionStatus::Cancelled)?;
     // Reusable callers own their callee subtree; a cancelled caller cancels

@@ -132,15 +132,14 @@ pub async fn patch_timeline_records(
             .iter()
             .filter_map(|record| step_patch(record, job_status, observed_us))
             .collect();
-        if let Some(agent_job_id) = agent_job_id {
-            if let Err(error) = shared
+        if let Some(agent_job_id) = agent_job_id
+            && let Err(error) = shared
                 .state
                 .backend
                 .patch_steps(agent_job_id, patches)
                 .await
-            {
-                warn!(?error, "failed to persist timeline steps");
-            }
+        {
+            warn!(?error, "failed to persist timeline steps");
         }
     }
     for event in projected {
@@ -312,7 +311,7 @@ pub fn log_key(plan_id: &str, log_id: &str) -> String {
 /// that lacks this run's secrets and leak them into the log. Instead a short
 /// negative-cache TTL bounds how often the unresolved plan re-probes the
 /// backend.
-pub async fn mask_log_bytes_cached(
+pub(crate) async fn mask_log_bytes_cached(
     shared: &Arc<SharedState>,
     plan_id: &str,
     body: &[u8],

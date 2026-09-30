@@ -440,16 +440,15 @@ pub async fn agent_request_patch(
                 ));
             }
         };
-        if let Some(runner_id) = verified_runner_id {
-            if let Some(false) =
+        if let Some(runner_id) = verified_runner_id
+            && let Some(false) =
                 agent_request_owned_by(&shared.state.backend, request_id, runner_id)
                     .await
                     .map_err(ApiError::from)?
-            {
-                return Err(ApiError::from(crate::control::ControlError::Forbidden(
-                    "agent request belongs to another runner".to_owned(),
-                )));
-            }
+        {
+            return Err(ApiError::from(crate::control::ControlError::Forbidden(
+                "agent request belongs to another runner".to_owned(),
+            )));
         }
         // One guarded UPDATE settles a live request; `None` means the row
         // was already completed (duplicate PATCH) or never existed.
@@ -494,15 +493,14 @@ pub async fn agent_request_patch(
     // Renewal — runner is still working; just extend the lock. Completed
     // requests are immutable, so a late duplicate cannot rewrite their
     // timing: the guarded UPDATE skips settled/unknown requests.
-    if let Some(runner_id) = verified_runner_id {
-        if let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
+    if let Some(runner_id) = verified_runner_id
+        && let Some(false) = agent_request_owned_by(&shared.state.backend, request_id, runner_id)
             .await
             .map_err(ApiError::from)?
-        {
-            return Err(ApiError::from(crate::control::ControlError::Forbidden(
-                "agent request belongs to another runner".to_owned(),
-            )));
-        }
+    {
+        return Err(ApiError::from(crate::control::ControlError::Forbidden(
+            "agent request belongs to another runner".to_owned(),
+        )));
     }
     shared
         .state

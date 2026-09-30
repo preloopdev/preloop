@@ -486,7 +486,7 @@ pub struct AppState {
     /// The database-authoritative control plane: scheduling state lives
     /// here, not in `inner`. `Arc<Backend>` (concrete enum) so
     /// `Backend::transact` stays generic.
-    pub backend: Arc<crate::control::Backend>,
+    pub(crate) backend: Arc<crate::control::Backend>,
     pub events: broadcast::Sender<NdjsonEvent>,
     pub message_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
@@ -637,7 +637,7 @@ pub struct AppState {
     pub secrets: Arc<parking_lot::RwLock<SecretStore>>,
     /// Resolves workflow secrets for a job's scope. The built-in provider
     /// reads `secrets`; hosted/bring-your-own providers plug in here.
-    pub secret_provider: Arc<dyn crate::secret_provider::SecretProvider>,
+    pub(crate) secret_provider: Arc<dyn crate::secret_provider::SecretProvider>,
     /// Serializes the live secrets API's load → mutate → persist → publish
     /// sequence. `set_secret`/`delete_secret` read the whole config file,
     /// change one entry and write the file back; without mutual exclusion
@@ -1542,10 +1542,10 @@ pub fn parse_hmac_key(value: &str) -> anyhow::Result<Vec<u8>> {
 /// persisted to `<state_dir>/hmac-key.bin`, which is correct only for a
 /// single node.
 pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    if let Ok(value) = std::env::var(HMAC_KEY_ENV) {
-        if !value.trim().is_empty() {
-            return parse_hmac_key(&value);
-        }
+    if let Ok(value) = std::env::var(HMAC_KEY_ENV)
+        && !value.trim().is_empty()
+    {
+        return parse_hmac_key(&value);
     }
     let key_path = state_dir.join("hmac-key.bin");
     if key_path.exists() {

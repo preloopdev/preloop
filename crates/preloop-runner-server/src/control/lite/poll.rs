@@ -610,10 +610,10 @@ impl LiteBackend {
                 // cannot decode.
                 None => return Ok(AzdoPollOutcome::Forbidden),
             };
-            if let Some(verified) = poll.verified_runner_id {
-                if session.runner_id != Some(verified) {
-                    return Ok(AzdoPollOutcome::Forbidden);
-                }
+            if let Some(verified) = poll.verified_runner_id
+                && session.runner_id != Some(verified)
+            {
+                return Ok(AzdoPollOutcome::Forbidden);
             }
             touch_session_row(tx, &session.session_uuid)?;
             if let Some(message) = oldest_session_message(tx, &session.session_uuid)? {

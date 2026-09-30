@@ -123,21 +123,21 @@ fn submit_run_tx(
             })
             .optional()
             .map_err(db)?;
-        if let Some(existing) = existing {
-            if let Some(existing) = jobs::run_record(tx, codec::run_id(&existing))? {
-                return Ok(SubmitOutcome {
-                    run_id: existing.run_id,
-                    run_number: existing.run_number,
-                    queued_jobs: 0,
-                    status: existing.status,
-                    concluded: Vec::new(),
-                    held: false,
-                    rejected: None,
-                    existing: Some(Box::new(existing)),
-                    queue_depth: jobs::ready_count(tx)?,
-                    next_runs_on: jobs::next_ready_labels(tx)?,
-                });
-            }
+        if let Some(existing) = existing
+            && let Some(existing) = jobs::run_record(tx, codec::run_id(&existing))?
+        {
+            return Ok(SubmitOutcome {
+                run_id: existing.run_id,
+                run_number: existing.run_number,
+                queued_jobs: 0,
+                status: existing.status,
+                concluded: Vec::new(),
+                held: false,
+                rejected: None,
+                existing: Some(Box::new(existing)),
+                queue_depth: jobs::ready_count(tx)?,
+                next_runs_on: jobs::next_ready_labels(tx)?,
+            });
         }
     }
 
@@ -572,10 +572,10 @@ fn submit_run_tx(
     let mut outcome = crate::runtime_scheduling::SchedulingOutcome::default();
     promote::promote_run(tx, backend, run_id, &mut outcome)?;
     for (rid, jid) in outcome.skipped.iter().chain(outcome.failed.iter()) {
-        if *rid == run_id {
-            if let Some(status) = jobs::job(tx, run_id, jid)?.map(|job| job.status) {
-                concluded.push((jid.clone(), status, None));
-            }
+        if *rid == run_id
+            && let Some(status) = jobs::job(tx, run_id, jid)?.map(|job| job.status)
+        {
+            concluded.push((jid.clone(), status, None));
         }
     }
 

@@ -204,12 +204,12 @@ impl PgBackend {
             .map_err(db)?;
         let Some(row) = owner else { return Ok(false) };
         let owner: Option<i64> = row.get(0);
-        if let (Some(owner), Some(caller)) = (owner, caller_runner_id) {
-            if owner != caller {
-                return Err(ControlError::Forbidden(
-                    "session belongs to another runner".to_owned(),
-                ));
-            }
+        if let (Some(owner), Some(caller)) = (owner, caller_runner_id)
+            && owner != caller
+        {
+            return Err(ControlError::Forbidden(
+                "session belongs to another runner".to_owned(),
+            ));
         }
         // Release the session's live request so the job can be retried.
         let requests = tx

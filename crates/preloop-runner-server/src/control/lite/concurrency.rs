@@ -538,47 +538,45 @@ pub(super) fn acquire(
     // every existing holder's. (`try_acquire_concurrency`'s superseded
     // check, verbatim.)
     let displacement = cancel_in_progress || queue == preloop_gha_parser::ConcurrencyQueue::Single;
-    if displacement {
-        if let Some(arrival) = event_order_of(tx, holder)? {
-            let mut superseded = false;
-            for existing in current
-                .iter()
-                .map(|(h, _)| h)
-                .chain(pending.iter().map(|(_, h)| h))
+    if displacement && let Some(arrival) = event_order_of(tx, holder)? {
+        let mut superseded = false;
+        for existing in current
+            .iter()
+            .map(|(h, _)| h)
+            .chain(pending.iter().map(|(_, h)| h))
+        {
+            if existing.run_id() == holder.run_id() {
+                continue;
+            }
+            if let Some(existing) = event_order_of(tx, existing)?
+                && arrival.is_older_than(&existing)
             {
-                if existing.run_id() == holder.run_id() {
-                    continue;
-                }
-                if let Some(existing) = event_order_of(tx, existing)? {
-                    if arrival.is_older_than(&existing) {
-                        superseded = true;
-                        break;
-                    }
-                }
+                superseded = true;
+                break;
             }
-            if superseded {
-                return Ok(AcqOutcome::ArrivalCancelled);
-            }
+        }
+        if superseded {
+            return Ok(AcqOutcome::ArrivalCancelled);
         }
     }
 
     // A holder wedged on unhostable external jobs is displaced outright.
-    if let Some((current_holder, _)) = &current {
-        if run_stuck_on_external_hosts(tx, current_holder.run_id())? {
-            // The stuck holder is evicted without a cancellation cascade:
-            // it never ran (it is still queued on external hosts), and
-            // GitHub treats its slot as abandoned.
-            release_hold(tx, namespace_id, repository, group_name, current_holder)?;
-            take_hold(
-                tx,
-                namespace_id,
-                repository,
-                group_name,
-                display_name,
-                holder,
-            )?;
-            return Ok(AcqOutcome::Acquired);
-        }
+    if let Some((current_holder, _)) = &current
+        && run_stuck_on_external_hosts(tx, current_holder.run_id())?
+    {
+        // The stuck holder is evicted without a cancellation cascade:
+        // it never ran (it is still queued on external hosts), and
+        // GitHub treats its slot as abandoned.
+        release_hold(tx, namespace_id, repository, group_name, current_holder)?;
+        take_hold(
+            tx,
+            namespace_id,
+            repository,
+            group_name,
+            display_name,
+            holder,
+        )?;
+        return Ok(AcqOutcome::Acquired);
     }
 
     let arrival = holder_row(holder, cancel_in_progress);

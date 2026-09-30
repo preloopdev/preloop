@@ -121,21 +121,21 @@ pub async fn push_run_to_github(
         })?;
     let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs, dirty) = {
         let run = &run;
-        if let Some(state) = &run.push_state {
-            if state.status == PushStatus::Synced {
-                // Already published; replay is a no-op.
-                return Ok(SyncResponse {
-                    status: "pushed",
-                    pr_number: state.pr_number,
-                    pr_url: state.pr_number.map(|number| {
-                        pr_web_url(
-                            &crate::github::github_api_base(),
-                            &run.submission.repository,
-                            number,
-                        )
-                    }),
-                });
-            }
+        if let Some(state) = &run.push_state
+            && state.status == PushStatus::Synced
+        {
+            // Already published; replay is a no-op.
+            return Ok(SyncResponse {
+                status: "pushed",
+                pr_number: state.pr_number,
+                pr_url: state.pr_number.map(|number| {
+                    pr_web_url(
+                        &crate::github::github_api_base(),
+                        &run.submission.repository,
+                        number,
+                    )
+                }),
+            });
         }
 
         let Some(push) = &run.submission.push else {

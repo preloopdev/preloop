@@ -83,48 +83,47 @@ impl PgBackend {
             let key = (run_id, job_id);
             // Status from the run projection when loaded (which is what old
             // assertions compared against), else from the row itself.
-            if let Some(run) = t.runs.get(&run_id) {
-                if let Some(status) = run.jobs.get(&key.1) {
-                    t.job_status.insert(key.clone(), *status);
-                }
+            if let Some(run) = t.runs.get(&run_id)
+                && let Some(status) = run.jobs.get(&key.1)
+            {
+                t.job_status.insert(key.clone(), *status);
             }
-            if let Some(graph) = self.load_graph(client, run_id).await? {
-                if let Some(node) = graph.nodes.get(&key.1) {
-                    // `queued_at` only while the job sits in the ready queue.
-                    if state == "ready" {
-                        if let Some(us) = node.enqueued_at_us {
-                            t.queued_at.insert(key.clone(), codec::us_to_system(us));
+            if let Some(graph) = self.load_graph(client, run_id).await?
+                && let Some(node) = graph.nodes.get(&key.1)
+            {
+                // `queued_at` only while the job sits in the ready queue.
+                if state == "ready"
+                    && let Some(us) = node.enqueued_at_us
+                {
+                    t.queued_at.insert(key.clone(), codec::us_to_system(us));
+                }
+                let Some(message) = Self::node_message(client, run_id, &key.1).await?
+                else {
+                    continue;
+                };
+                let job = queued_of(&key.1, run_id, node, message);
+                match state.as_str() {
+                    "ready" => {
+                        if job.enqueued_at_unix_nanos > 0 || job.created_at_unix_nanos > 0 {
+                            t.ready_index.push_back(job);
                         }
                     }
-                    let Some(message) =
-                        Self::node_message(client, run_id, &key.1).await?
-                    else {
-                        continue;
-                    };
-                    let job = queued_of(&key.1, run_id, node, message);
-                    match state.as_str() {
-                        "ready" => {
-                            if job.enqueued_at_unix_nanos > 0 || job.created_at_unix_nanos > 0 {
-                                t.ready_index.push_back(job);
-                            }
-                        }
-                        // Claimed jobs are off the ready queue (the runner
-                        // owns the claim); `claimed_jobs` holds them.
-                        "claimed" => {
-                            t.claimed_jobs.insert(key.clone(), job);
-                        }
-                        "blocked" => t.pending_jobs.push_back(job),
-                        "held" => {
-                            t.concurrency_blocked.push_back(job.clone());
-                            t.held_runs.entry(run_id).or_default().push(job);
-                        }
-                        "pending_expansion" => t.pending_expansions.push_back(job),
-                        "expanding" => {
-                            t.expanding.insert(key.clone());
-                            t.expanding_jobs.insert(key, job);
-                        }
-                        _ => {}
+                    // Claimed jobs are off the ready queue (the runner
+                    // owns the claim); `claimed_jobs` holds them.
+                    "claimed" => {
+                        t.claimed_jobs.insert(key.clone(), job);
                     }
+                    "blocked" => t.pending_jobs.push_back(job),
+                    "held" => {
+                        t.concurrency_blocked.push_back(job.clone());
+                        t.held_runs.entry(run_id).or_default().push(job);
+                    }
+                    "pending_expansion" => t.pending_expansions.push_back(job),
+                    "expanding" => {
+                        t.expanding.insert(key.clone());
+                        t.expanding_jobs.insert(key, job);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -272,10 +271,10 @@ impl PgBackend {
             if let Some(client_id) = row.get::<_, Option<String>>(6) {
                 t.runner_client_ids.insert(client_id, id);
             }
-            if let Some(pem) = public_key {
-                if let Ok(key) = AgentRsaPublicKey::parse(&pem) {
-                    t.runner_rsa_public_keys.insert(id, key);
-                }
+            if let Some(pem) = public_key
+                && let Ok(key) = AgentRsaPublicKey::parse(&pem)
+            {
+                t.runner_rsa_public_keys.insert(id, key);
             }
             if row.get::<_, bool>(9) {
                 t.pool_proven_runners.insert(id);

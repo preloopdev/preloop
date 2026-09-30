@@ -269,25 +269,25 @@ impl LiteBackend {
                 })
                 .optional()
                 .map_err(db)?;
-            let (head, archived): ((String, Option<i64>, Option<i64>, Option<String>), bool) =
-                match live {
-                    Some(head) => (head, false),
-                    None => match tx
-                        .prepare_cached(
-                            "SELECT submission, started_at, completed_at, record_details \
+            type RunHead = (String, Option<i64>, Option<i64>, Option<String>);
+            let (head, archived): (RunHead, bool) = match live {
+                Some(head) => (head, false),
+                None => match tx
+                    .prepare_cached(
+                        "SELECT submission, started_at, completed_at, record_details \
                          FROM run_history WHERE run_id = ?1 ORDER BY created_at DESC LIMIT 1",
-                        )
-                        .map_err(db)?
-                        .query_row([&run], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                        })
-                        .optional()
-                        .map_err(db)?
-                    {
-                        Some(head) => (head, true),
-                        None => return Ok(None),
-                    },
-                };
+                    )
+                    .map_err(db)?
+                    .query_row([&run], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })
+                    .optional()
+                    .map_err(db)?
+                {
+                    Some(head) => (head, true),
+                    None => return Ok(None),
+                },
+            };
             let (submission, started_at, completed_at, details_json) = head;
             let value = submission_value(&submission)?;
             // `job_check_run_ids` keys minted before the leg materialized are

@@ -247,35 +247,32 @@ fn hydrate_message(
         );
     }
     let spec = jobs::load_spec(tx, job.run_id, &job.job_id)?;
-    if let Some(spec) = spec {
-        if let Some(environment) = spec.environment.as_ref() {
-            let name = match environment {
-                serde_json::Value::String(name) => Some(name.as_str()),
-                serde_json::Value::Object(map) => {
-                    map.get("name").and_then(serde_json::Value::as_str)
-                }
-                _ => None,
-            };
-            if let Some(name) = name {
-                if preloop_gha_parser::eval::resolves_after_job_build(name) {
-                    if let Some(actions_environment) = message.actions_environment.as_mut() {
-                        let mut context = preloop_gha_expressions::Context::new();
-                        for (key, value) in &message.context_data {
-                            context.insert(key, value.to_json());
-                        }
-                        match preloop_gha_parser::eval::resolve_string(name, &context) {
-                            Ok(resolved) => actions_environment.name = resolved,
-                            Err(error) => {
-                                tracing::error!(
-                                    run_id = %job.run_id,
-                                    job = %job.job_id.0,
-                                    environment = %name,
-                                    %error,
-                                    "deployment environment expression failed to evaluate after needs completed"
-                                );
-                            }
-                        }
-                    }
+    if let Some(spec) = spec
+        && let Some(environment) = spec.environment.as_ref()
+    {
+        let name = match environment {
+            serde_json::Value::String(name) => Some(name.as_str()),
+            serde_json::Value::Object(map) => map.get("name").and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        if let Some(name) = name
+            && preloop_gha_parser::eval::resolves_after_job_build(name)
+            && let Some(actions_environment) = message.actions_environment.as_mut()
+        {
+            let mut context = preloop_gha_expressions::Context::new();
+            for (key, value) in &message.context_data {
+                context.insert(key, value.to_json());
+            }
+            match preloop_gha_parser::eval::resolve_string(name, &context) {
+                Ok(resolved) => actions_environment.name = resolved,
+                Err(error) => {
+                    tracing::error!(
+                        run_id = %job.run_id,
+                        job = %job.job_id.0,
+                        environment = %name,
+                        %error,
+                        "deployment environment expression failed to evaluate after needs completed"
+                    );
                 }
             }
         }

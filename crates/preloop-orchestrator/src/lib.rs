@@ -877,18 +877,23 @@ async fn download_prebaked_golden_with_space(
             target = %payload.display(),
             "Downloading pre-baked golden from release asset (this may take several minutes)"
         );
-        if download_release_asset(&client, &url, payload).await {
-            return true;
+        if download_release_asset(&client, &url, payload, available_space).await? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Fetch one release asset into `payload`: probe, checksum, transfer, install.
 ///
 /// The transfer resumes from whatever a previous attempt left behind, so a
 /// dropped connection costs the bytes in flight rather than the artifact.
-async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &Path) -> bool {
+async fn download_release_asset(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &Path,
+    available_space: AvailableSpace,
+) -> Result<bool, OrchestratorError> {
     let probe = match client.get(url).send().await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
@@ -904,7 +909,7 @@ async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &P
             return Ok(false);
         }
     };
-    let total_bytes = response.content_length();
+    let total_bytes = probe.content_length();
     ensure_golden_download_space(payload, total_bytes, available_space)?;
 
     // Fetch the companion checksum before committing bandwidth to the body.
@@ -1255,7 +1260,7 @@ async fn download_oci_golden(
                             downloaded_bytes,
                             "Downloaded OCI pre-baked golden microVM image successfully"
                         );
-                        return true;
+                        return Ok(true);
                     }
                 }
                 Ok(actual) => {
@@ -1280,7 +1285,7 @@ async fn download_oci_golden(
             );
         }
     }
-    false
+    Ok(false)
 }
 
 async fn registry_get(
@@ -9106,13 +9111,13 @@ mod golden_download_tests {
             Vec::new(),
         )
         .await;
-        std::env::set_var("PRELOOP_GOLDEN_URL", &url);
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
         let error = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(1024))
             .await
             .expect_err("the download must stop when the target filesystem is full");
 
-        std::env::remove_var("PRELOOP_GOLDEN_URL");
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         match error {
             OrchestratorError::GoldenDiskSpace {
                 path,

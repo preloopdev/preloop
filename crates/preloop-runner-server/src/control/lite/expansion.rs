@@ -430,21 +430,18 @@ fn splice_matrix_parents(
             meta: Some(mut meta),
             plan,
         } = ReusableSpec::decode(&json)
+            && let Some(pos) = meta.inner_job_ids.iter().position(|id| id == &node_id.0)
         {
-            if let Some(pos) = meta.inner_job_ids.iter().position(|id| id == &node_id.0) {
-                meta.inner_job_ids
-                    .splice(pos..pos + 1, leg_ids.iter().cloned());
-                if let Some(encoded) =
-                    ReusableSpec::encode(call.as_ref(), Some(&meta), plan.as_ref())
-                {
-                    tx.prepare_cached(
-                        "UPDATE job_specs SET reusable_call = ?3 \
+            meta.inner_job_ids
+                .splice(pos..pos + 1, leg_ids.iter().cloned());
+            if let Some(encoded) = ReusableSpec::encode(call.as_ref(), Some(&meta), plan.as_ref()) {
+                tx.prepare_cached(
+                    "UPDATE job_specs SET reusable_call = ?3 \
                          WHERE run_id = ?1 AND job_id = ?2",
-                    )
-                    .map_err(db)?
-                    .execute(params![run, job_id, encoded])
-                    .map_err(db)?;
-                }
+                )
+                .map_err(db)?
+                .execute(params![run, job_id, encoded])
+                .map_err(db)?;
             }
         }
     }

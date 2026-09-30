@@ -583,12 +583,11 @@ impl PgBackend {
                 job_needs.insert(job_id.clone(), node.needs.clone());
             }
             job_names.insert(job_id.clone(), node.display_name.clone());
-            if let Some(outputs) = &node.outputs {
-                if let Ok(map) =
+            if let Some(outputs) = &node.outputs
+                && let Ok(map) =
                     serde_json::from_value::<BTreeMap<String, serde_json::Value>>(outputs.clone())
-                {
-                    job_outputs.insert(job_id.clone(), map);
-                }
+            {
+                job_outputs.insert(job_id.clone(), map);
             }
             if let Some(spec) = &node.reusable {
                 if let Some(plan) = &spec.plan {
@@ -622,11 +621,11 @@ impl PgBackend {
         // Ids minted before their leg materialized live in
         // `run_submissions.record_details`; the live `jobs` rows overlay them
         // (lite `merge_details` parity).
-        if let Some(map) = detail_maps.get("job_check_run_ids") {
-            if let Ok(stored) = serde_json::from_value::<BTreeMap<JobId, u64>>(map.clone()) {
-                for (job_id, id) in stored {
-                    job_check_run_ids.entry(job_id).or_insert(id);
-                }
+        if let Some(map) = detail_maps.get("job_check_run_ids")
+            && let Ok(stored) = serde_json::from_value::<BTreeMap<JobId, u64>>(map.clone())
+        {
+            for (job_id, id) in stored {
+                job_check_run_ids.entry(job_id).or_insert(id);
             }
         }
 

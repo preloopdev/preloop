@@ -1084,7 +1084,6 @@ jobs:
             &serde_json::json!({}),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(msg.job_timeout, Some(3600));
@@ -1104,7 +1103,6 @@ jobs:
         let msg = build_agent_job_message(
             plan,
             &serde_json::json!({}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -1698,14 +1696,7 @@ jobs:
             "dummy-value-of-twenty-six".to_owned(),
         );
         let github = serde_json::json!({"event_name": "workflow_dispatch"});
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &secrets,
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &secrets, &BTreeMap::new()).unwrap();
 
         let x = msg.variables.get("X").expect("job env variable X");
         assert_eq!(x.value.as_deref(), Some("dummy-value-of-twenty-six"));
@@ -1764,9 +1755,7 @@ jobs:
             "dummy-value-of-twenty-six".to_owned(),
         );
         let github = serde_json::json!({"event_name": "push"});
-        let msg =
-            build_agent_job_message(&plan, &github, &BTreeMap::new(), &secrets, &BTreeMap::new())
-                .unwrap();
+        let msg = build_agent_job_message(&plan, &github, &secrets, &BTreeMap::new()).unwrap();
 
         let secret = msg
             .variables
@@ -1890,7 +1879,6 @@ jobs:
             &serde_json::json!({"event_name": "push"}),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -1953,7 +1941,6 @@ jobs:
         let msg = build_agent_job_message(
             callee_plan,
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )

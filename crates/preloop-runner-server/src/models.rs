@@ -378,19 +378,19 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TaskAgentJobRequestRecord {
-    pub(crate) request_id: i64,
-    pub(crate) run_id: RunId,
-    pub(crate) job_id: JobId,
-    pub(crate) agent_job_id: uuid::Uuid,
+pub struct TaskAgentJobRequestRecord {
+    pub request_id: i64,
+    pub run_id: RunId,
+    pub job_id: JobId,
+    pub agent_job_id: uuid::Uuid,
     /// Derived: always `agent_job_id` in string form (never read from a
     /// stored column). Kept on the record for runner-protocol surfaces.
-    pub(crate) plan_id: String,
+    pub plan_id: String,
     /// Derived: always `"actions"`.
-    pub(crate) plan_type: String,
-    pub(crate) timeline_id: uuid::Uuid,
-    pub(crate) result: Option<ExecutionStatus>,
-    pub(crate) locked_until: String,
+    pub plan_type: String,
+    pub timeline_id: uuid::Uuid,
+    pub result: Option<ExecutionStatus>,
+    pub locked_until: String,
     /// When a runner removed this job from the ready queue.
     pub claimed_at: Option<std::time::SystemTime>,
     /// Runner identity that claimed this request. Kept after completion so

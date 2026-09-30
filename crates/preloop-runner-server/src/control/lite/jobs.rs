@@ -74,10 +74,9 @@ pub(super) fn job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         started_at: row.get(21)?,
         // Fail closed: a present-but-unreadable gate reloads as the empty
         // gate, which re-arms the wait/approval instead of dropping it.
-        environment_gate: match row.get::<_, Option<String>>(22)? {
-            Some(json) => Some(serde_json::from_str(&json).unwrap_or_default()),
-            None => None,
-        },
+        environment_gate: row
+            .get::<_, Option<String>>(22)?
+            .map(|json| serde_json::from_str(&json).unwrap_or_default()),
     })
 }
 
@@ -631,10 +630,10 @@ pub(super) fn run_graph(tx: &Transaction<'_>, run_id: RunId) -> Result<RunGraph,
         let id = JobId(job_id);
         statuses.insert(id.clone(), status_parse(&status));
         base_ids.insert(id.clone(), base_id);
-        if let Some(json) = out {
-            if let Ok(map) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json) {
-                outputs.insert(id, map);
-            }
+        if let Some(json) = out
+            && let Ok(map) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json)
+        {
+            outputs.insert(id, map);
         }
     }
     let mut stmt = tx
@@ -722,10 +721,10 @@ pub(super) fn registered_platforms(
                 "windows" => Some("windows"),
                 _ => None,
             };
-            if let Some(os) = os {
-                if !platforms.contains(&os) {
-                    platforms.push(os);
-                }
+            if let Some(os) = os
+                && !platforms.contains(&os)
+            {
+                platforms.push(os);
             }
         }
     }
@@ -1030,11 +1029,10 @@ pub(super) fn run_record(
             let id = JobId(job_id);
             statuses.insert(id.clone(), status_parse(&status));
             base_ids.insert(id.clone(), base_id);
-            if let Some(json) = out {
-                if let Ok(map) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json)
-                {
-                    outputs.insert(id, map);
-                }
+            if let Some(json) = out
+                && let Ok(map) = serde_json::from_str::<BTreeMap<String, serde_json::Value>>(&json)
+            {
+                outputs.insert(id, map);
             }
         }
         RunGraph {

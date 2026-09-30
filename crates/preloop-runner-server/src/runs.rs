@@ -415,10 +415,10 @@ impl<'a> RunSecretsGuard<'a> {
 
 impl Drop for RunSecretsGuard<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            if let Err(error) = self.provider.delete_run(self.run_id) {
-                tracing::warn!(run_id = %self.run_id, %error, "failed to drop run secrets of an uncommitted run");
-            }
+        if self.armed
+            && let Err(error) = self.provider.delete_run(self.run_id)
+        {
+            tracing::warn!(run_id = %self.run_id, %error, "failed to drop run secrets of an uncommitted run");
         }
     }
 }
@@ -1473,26 +1473,25 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     // A committed run for this delivery already exists (replay observed
     // between reservation release and here): return it without burning a
     // run number.
-    if let Some(delivery_id) = webhook_delivery_id.as_deref() {
-        if let Some(run_id) = shared
+    if let Some(delivery_id) = webhook_delivery_id.as_deref()
+        && let Some(run_id) = shared
             .state
             .backend
             .run_for_webhook_delivery(delivery_id, &workflow_path)
             .await
             .map_err(ApiError::from)?
-        {
-            let existing = shared
-                .state
-                .backend
-                .run_record(run_id)
-                .await
-                .map_err(ApiError::from)?;
-            return Ok(RunAccepted {
-                run_id,
-                run_number: existing.run_number,
-                queued_jobs: existing.jobs.len(),
-            });
-        }
+    {
+        let existing = shared
+            .state
+            .backend
+            .run_record(run_id)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(RunAccepted {
+            run_id,
+            run_number: existing.run_number,
+            queued_jobs: existing.jobs.len(),
+        });
     }
     let run_number = shared
         .state
@@ -2127,12 +2126,12 @@ pub fn collect_string_array(values: &[serde_json::Value], out: &mut Vec<String>)
 
 /// Per-job runner artifacts: agent message plus the correlation records the
 /// broker and results/timeline services use to track the delivered request.
-pub struct BuiltJobArtifacts {
-    pub agent_msg: azdo::AgentJobRequestMessage,
-    pub job_request: TaskAgentJobRequestRecord,
-    pub id_token_granted: bool,
-    pub oidc_ctx: OidcJobContext,
-    pub github_token_request: Option<GitHubTokenRequest>,
+pub(crate) struct BuiltJobArtifacts {
+    pub(crate) agent_msg: azdo::AgentJobRequestMessage,
+    pub(crate) job_request: TaskAgentJobRequestRecord,
+    pub(crate) id_token_granted: bool,
+    pub(crate) oidc_ctx: OidcJobContext,
+    pub(crate) github_token_request: Option<GitHubTokenRequest>,
 }
 
 /// The `fileTable` entry naming the reusable workflow a job was inlined from.
@@ -2231,7 +2230,7 @@ fn job_source_identity(
 /// Names only — the built message is a secret-free template; values are
 /// resolved through the SecretProvider at acquire.
 #[allow(clippy::too_many_arguments)]
-pub fn build_job_artifacts(
+pub(crate) fn build_job_artifacts(
     shared: &SharedState,
     submission: &WorkflowSubmission,
     run_id: RunId,

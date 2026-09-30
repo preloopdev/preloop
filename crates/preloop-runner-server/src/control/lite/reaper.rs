@@ -288,32 +288,32 @@ impl LiteBackend {
                 }
                 let (request_id, run_id, job_id) =
                     (request.request_id, request.run_id, request.job_id.clone());
-                if let Some(started_at) = request.started_at {
-                    if !request.timeout_triggered {
-                        let pause = paused.get(&request_id).copied().unwrap_or_default();
-                        let elapsed = now
-                            .duration_since(started_at)
-                            .unwrap_or_default()
-                            .saturating_sub(pause);
-                        let job_timeout = request.job_timeout_s.unwrap_or(21600).max(0) as u64;
-                        if elapsed >= std::time::Duration::from_secs(job_timeout) {
-                            tracing::info!(
-                                %run_id,
-                                %job_id,
-                                request_id,
-                                "Job timed out after {}s",
-                                job_timeout
-                            );
-                            tx.prepare_cached(
-                                "UPDATE job_requests SET timeout_triggered = 1 \
+                if let Some(started_at) = request.started_at
+                    && !request.timeout_triggered
+                {
+                    let pause = paused.get(&request_id).copied().unwrap_or_default();
+                    let elapsed = now
+                        .duration_since(started_at)
+                        .unwrap_or_default()
+                        .saturating_sub(pause);
+                    let job_timeout = request.job_timeout_s.unwrap_or(21600).max(0) as u64;
+                    if elapsed >= std::time::Duration::from_secs(job_timeout) {
+                        tracing::info!(
+                            %run_id,
+                            %job_id,
+                            request_id,
+                            "Job timed out after {}s",
+                            job_timeout
+                        );
+                        tx.prepare_cached(
+                            "UPDATE job_requests SET timeout_triggered = 1 \
                                  WHERE request_id = ?1",
-                            )
-                            .map_err(db)?
-                            .execute([request_id])
-                            .map_err(db)?;
-                            if queue_job_cancellation(tx, run_id, &job_id)? {
-                                cancellations += 1;
-                            }
+                        )
+                        .map_err(db)?
+                        .execute([request_id])
+                        .map_err(db)?;
+                        if queue_job_cancellation(tx, run_id, &job_id)? {
+                            cancellations += 1;
                         }
                     }
                 }
