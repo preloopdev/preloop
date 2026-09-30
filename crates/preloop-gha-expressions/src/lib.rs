@@ -16,7 +16,8 @@ pub use conditions::{contains_status_check_function, effective_condition, is_tru
 pub use context::Context;
 
 use evaluator::{
-    EvalBudget, collect_expression_references_from_expr, eval, validate_function_calls,
+    EvalBudget, collect_context_properties_from_expr, collect_expression_references_from_expr,
+    eval, validate_function_calls,
 };
 use expr_parser::Parser;
 use lexer::Lexer;
@@ -178,6 +179,24 @@ pub fn collect_expression_references(input: &str) -> Result<ExpressionReferences
 /// Collect top-level data contexts and context-sensitive function names.
 pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>, ExpressionError> {
     collect_expression_references(input).map(|references| references.contexts)
+}
+
+/// Literal `context.property` reads in an expression, keyed by lowercase
+/// context: `${{ secrets.DEPLOY_KEY }}` yields `{"secrets": {"DEPLOY_KEY"}}`.
+///
+/// Only literal paths are reported. GitHub has no dynamic context access
+/// (`secrets[name]` is invalid) and computed member access
+/// (`fromJSON(...).name`) has no statically knowable property, so neither can
+/// contribute a name.
+pub fn collect_context_properties(
+    input: &str,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, ExpressionError>
+{
+    let trimmed = trim_expression_markers(input);
+    let expr = parse_cached(trimmed)?;
+    let mut properties = std::collections::BTreeMap::new();
+    collect_context_properties_from_expr(&expr, &mut properties);
+    Ok(properties)
 }
 
 /// Parse and evaluate a GitHub Actions expression.

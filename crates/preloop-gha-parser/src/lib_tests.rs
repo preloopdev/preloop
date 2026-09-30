@@ -3790,3 +3790,153 @@ jobs:
     modes.sort();
     assert_eq!(modes, vec!["eu".to_owned(), "us".to_owned()]);
 }
+
+fn expand_secret_workflow(yaml: &str) -> Vec<preloop_gha_protocol::JobPlan> {
+    let workflow = parse_workflow(yaml).expect("workflow parses");
+    expand_jobs_with_reusables(&workflow, &BTreeMap::new())
+        .expect("jobs expand")
+        .jobs
+}
+
+#[test]
+fn secret_requirements_cover_every_reference_shape() {
+    let jobs = expand_secret_workflow(
+        r#"
+name: secrets
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      JOB_TOKEN: ${{ secrets.JOB_TOKEN }}
+    steps:
+      - run: echo "${{ secrets.RUN_TOKEN }}"
+        env:
+          STEP_TOKEN: ${{ secrets.STEP_TOKEN }}
+      - uses: actions/github-script@v7
+        with:
+          script: ${{ secrets.WITH_TOKEN }}
+      - run: echo "${{ secrets.CONTAINER_TOKEN }}"
+"#,
+    );
+    let requirements = collect_secret_requirements(&jobs);
+    assert_eq!(
+        requirements.names,
+        std::collections::BTreeSet::from([
+            "CONTAINER_TOKEN".to_owned(),
+            "JOB_TOKEN".to_owned(),
+            "RUN_TOKEN".to_owned(),
+            "STEP_TOKEN".to_owned(),
+            "WITH_TOKEN".to_owned(),
+        ])
+    );
+    assert!(requirements.by_environment.is_empty());
+    assert!(requirements.inherits.is_empty());
+}
+
+#[test]
+fn secret_requirements_exclude_tokens_the_engine_mints() {
+    let jobs = expand_secret_workflow(
+        r#"
+name: tokens
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.GITHUB_TOKEN }} ${{ secrets.ACTIONS_RUNTIME_TOKEN }}"
+        env:
+          ID: ${{ secrets.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+          REAL: ${{ secrets.DEPLOY_KEY }}
+"#,
+    );
+    let requirements = collect_secret_requirements(&jobs);
+    assert_eq!(
+        requirements.names,
+        std::collections::BTreeSet::from(["DEPLOY_KEY".to_owned()])
+    );
+}
+
+#[test]
+fn secret_requirements_scope_names_by_declared_environment() {
+    let jobs = expand_secret_workflow(
+        r#"
+name: environments
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.SHARED_TOKEN }}"
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "${{ secrets.DEPLOY_KEY }}"
+"#,
+    );
+    let requirements = collect_secret_requirements(&jobs);
+    assert_eq!(
+        requirements.names,
+        std::collections::BTreeSet::from(["DEPLOY_KEY".to_owned(), "SHARED_TOKEN".to_owned()])
+    );
+    assert_eq!(
+        requirements.by_environment.get("production"),
+        Some(&std::collections::BTreeSet::from(["DEPLOY_KEY".to_owned()]))
+    );
+}
+
+#[test]
+fn secret_requirements_flag_inherited_callees() {
+    let mut reusable = BTreeMap::new();
+    reusable.insert(
+        "./.github/workflows/reuse.yml".to_owned(),
+        r#"
+name: reuse
+on:
+  workflow_call:
+    secrets:
+      INNER_TOKEN:
+        required: false
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.INNER_TOKEN }}"
+"#
+        .to_owned(),
+    );
+    let workflow = parse_workflow(
+        r#"
+name: inherit
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/reuse.yml
+    secrets: inherit
+"#,
+    )
+    .expect("workflow parses");
+    let jobs = expand_jobs_with_reusables(&workflow, &reusable)
+        .expect("jobs expand")
+        .jobs;
+    let requirements = collect_secret_requirements(&jobs);
+    assert_eq!(
+        requirements.inherits,
+        std::collections::BTreeSet::from(["call".to_owned()])
+    );
+    assert!(!requirements.is_empty());
+}
+
+#[test]
+fn secret_requirements_missing_from_diffs_against_stored_names() {
+    let requirements = SecretRequirements {
+        names: std::collections::BTreeSet::from(["STORED".to_owned(), "MISSING".to_owned()]),
+        ..SecretRequirements::default()
+    };
+    assert_eq!(
+        requirements.missing_from(["STORED"]),
+        std::collections::BTreeSet::from(["MISSING".to_owned()])
+    );
+    assert!(requirements.missing_from(["STORED", "MISSING"]).is_empty());
+}

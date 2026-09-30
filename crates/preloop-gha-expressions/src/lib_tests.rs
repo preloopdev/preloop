@@ -1290,3 +1290,50 @@ fn bracket_expression_key_indexes_dynamically() {
         Value::Null
     );
 }
+
+#[test]
+fn collect_context_properties_reports_literal_reads_only() {
+    let properties = collect_context_properties("${{ secrets.DEPLOY_KEY }}").unwrap();
+    assert_eq!(
+        properties.get("secrets"),
+        Some(&std::collections::BTreeSet::from(["DEPLOY_KEY".to_owned()]))
+    );
+
+    // A deeper read keeps its first property: the name is what gets stored.
+    let nested = collect_context_properties("${{ secrets.DEPLOY_KEY.public }}").unwrap();
+    assert_eq!(
+        nested.get("secrets"),
+        Some(&std::collections::BTreeSet::from(["DEPLOY_KEY".to_owned()]))
+    );
+
+    // Computed member access has no statically knowable property, and GitHub
+    // has no dynamic context access at all.
+    let computed = collect_context_properties("${{ fromJSON('{}').name }}").unwrap();
+    assert_eq!(computed.get("secrets"), None);
+
+    let indexed = collect_context_properties("${{ env[matrix.key] }}").unwrap();
+    assert_eq!(indexed.get("env"), None);
+}
+
+#[test]
+fn collect_context_properties_walks_functions_and_operators() {
+    let properties = collect_context_properties(
+        "${{ secrets.A == 'x' && format('{0}', secrets.B) || !secrets.C }}",
+    )
+    .unwrap();
+    assert_eq!(
+        properties.get("secrets"),
+        Some(&std::collections::BTreeSet::from([
+            "A".to_owned(),
+            "B".to_owned(),
+            "C".to_owned()
+        ]))
+    );
+    // Other contexts are reported under their own key, so a caller can ignore
+    // them.
+    let mixed = collect_context_properties("${{ vars.REGION }}").unwrap();
+    assert_eq!(
+        mixed.get("vars"),
+        Some(&std::collections::BTreeSet::from(["REGION".to_owned()]))
+    );
+}

@@ -14,12 +14,15 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use github_setup::{ApiOutcome, api_list_secrets};
+
 mod aenv_egress;
 mod app_manifest;
 mod dap_client;
 mod debug_session;
 mod github_auth;
 mod github_setup;
+
 mod push;
 mod server_install;
 mod update;
@@ -914,6 +917,13 @@ struct RunArgs {
     /// Inline secret as NAME=VALUE. Repeatable.
     #[arg(long = "secret", value_name = "NAME=VALUE")]
     secrets: Vec<String>,
+
+    /// Fail instead of warning when the workflow reads secrets this engine has
+    /// not stored. The engine resolves `secrets.*` from its own store and
+    /// never reads GitHub's (values there are write-only), so an unset name
+    /// reaches the step as an empty string.
+    #[arg(long)]
+    strict_secrets: bool,
 
     /// Submit and return immediately without streaming events.
     #[arg(short = 'd', long)]
@@ -2859,6 +2869,15 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    preflight_secrets(
+        &workflow_path,
+        &workflow_yaml,
+        &reusable_workflows,
+        &args.secrets,
+        args.strict_secrets,
+    )
+    .await?;
+
     let push_requested = args.push || args.create_pr;
     // A dirty working tree is allowed with --push: CI runs on the server's
     // snapshot of the uncommitted state, and after it passes the CLI
@@ -3606,6 +3625,108 @@ async fn cmd_push(args: PushArgs) -> anyhow::Result<()> {
         })?,
     };
     push::push_run(&client, &url, api_token(), &run_id, None).await
+}
+
+/// Report secrets a workflow reads that this engine has not stored.
+///
+/// The engine resolves `secrets.*` from its own store and never reads
+/// GitHub's — those values are write-only — so a name that is referenced but
+/// not seeded here reaches its step as an empty string. Warn before
+/// submitting; `--strict-secrets` turns the same finding into a failure.
+/// Anything that blocks the preflight itself (unparseable workflow, engine
+/// unreachable) is left to the submission path, which reports it with more
+/// context than a preflight could.
+async fn preflight_secrets(
+    workflow_path: &std::path::Path,
+    workflow_yaml: &str,
+    reusable_workflows: &BTreeMap<String, String>,
+    inline_secrets: &[String],
+    strict: bool,
+) -> anyhow::Result<()> {
+    let Ok(workflow) = preloop_gha_parser::parse_workflow(workflow_yaml) else {
+        return Ok(());
+    };
+    let Ok(expanded) =
+        preloop_gha_parser::expand_jobs_with_reusables(&workflow, reusable_workflows)
+    else {
+        return Ok(());
+    };
+    let Ok(jobs) = materialize_plan_jobs(expanded.jobs, reusable_workflows) else {
+        return Ok(());
+    };
+    let requirements = preloop_gha_parser::collect_secret_requirements(&jobs);
+    if requirements.is_empty() {
+        return Ok(());
+    }
+
+    // Every tier a job of this workflow can read: global, then the repository,
+    // then each environment the workflow declares.
+    let repo = detect_repository();
+    let mut scopes: Vec<(Option<String>, Option<String>)> = vec![(None, None)];
+    scopes.push((Some(repo.clone()), None));
+    for environment in requirements.by_environment.keys() {
+        scopes.push((Some(repo.clone()), Some(environment.clone())));
+    }
+
+    let mut stored: HashSet<String> = HashSet::new();
+    for (repo_scope, env_scope) in scopes {
+        match api_list_secrets(repo_scope.as_deref(), env_scope.as_deref()).await? {
+            ApiOutcome::Applied(entries) => {
+                stored.extend(entries.into_iter().map(|(name, ..)| name));
+            }
+            // No engine to ask: the submission reports that itself.
+            ApiOutcome::Unavailable => return Ok(()),
+        }
+    }
+    // A submission's own `--secret NAME=VALUE` wins over every stored tier.
+    for secret in inline_secrets {
+        if let Some((name, _)) = secret.split_once('=') {
+            stored.insert(name.to_owned());
+        }
+    }
+
+    let missing = requirements.missing_from(stored.iter().map(String::as_str));
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut report = format!(
+        "{} reads {} secret(s) this engine has not stored:\n",
+        workflow_path.display(),
+        missing.len()
+    );
+    for name in &missing {
+        report.push_str(&format!("  {name}\n"));
+    }
+    report.push_str("seed them before the run — the engine never reads GitHub's secret store:\n");
+    for name in &missing {
+        report.push_str(&format!("  preloop secret set {name}\n"));
+    }
+    if !requirements.by_environment.is_empty() {
+        let environments: Vec<&str> = requirements
+            .by_environment
+            .keys()
+            .map(String::as_str)
+            .collect();
+        report.push_str(&format!(
+            "note: jobs declaring `environment:` also read from that tier; scope them with \
+             `preloop secret set NAME --repo <owner/repo> --env <{}>` if you keep them per-environment\n",
+            environments.join("|")
+        ));
+    }
+    if !requirements.inherits.is_empty() {
+        let jobs: Vec<&str> = requirements.inherits.iter().map(String::as_str).collect();
+        report.push_str(&format!(
+            "note: {} passes `secrets: inherit`; the callee's secrets cannot be listed statically\n",
+            jobs.join(", ")
+        ));
+    }
+
+    if strict {
+        anyhow::bail!("{}", report.trim_end());
+    }
+    eprintln!("[warn] {}", report.trim_end());
+    Ok(())
 }
 
 fn materialize_plan_jobs(
