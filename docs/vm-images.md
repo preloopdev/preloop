@@ -644,6 +644,12 @@ one produced so a regression is recognizable.
   makes the two-step `crun create` deadlock.
 - **Disk fills from stale machine dirs**: a failed create can leak
   `~/Library/Caches/smolvm/vms/<hash>/storage.raw` sparse files that a later
-  `machine delete` does not reclaim. When the host reports "No space left on
-  device" or flaky EAGAINs appear, prune the vms cache and verify free space
-  with `df -h /System/Volumes/Data`.
+  `machine delete` does not reclaim. The engine now reconciles these while
+  serving: every 10 minutes it removes data dirs the SmolVM registry no longer
+  knows (older than 2 minutes) and kills hypervisors whose data dir is gone,
+  so a restart is no longer needed to reclaim them. It also refuses golden
+  builds/downloads that cannot fit (`PRELOOP_SKIP_DISK_PREFLIGHT` overrides)
+  and holds new job VMs below `PRELOOP_RUNNER_MIN_FREE_DISK_GB`. If the host
+  still reports "No space left on device", check what is growing with
+  `du -sh <preloop home>/smolvm-home/Library/Caches/smolvm/vms/*` and verify
+  free space with `df -h /System/Volumes/Data`.
