@@ -2537,6 +2537,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "preloop-control-load"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "hex",
+ "hmac 0.12.1",
+ "preloop-gha-protocol",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-postgres",
+ "uuid",
+]
+
+[[package]]
 name = "preloop-dap"
 version = "0.2.0"
 dependencies = [
@@ -2666,6 +2687,7 @@ dependencies = [
  "base64",
  "futures",
  "hex",
+ "nix",
  "preloop-gha-parser",
  "preloop-gha-protocol",
  "preloop-observability",

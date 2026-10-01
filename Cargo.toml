@@ -17,6 +17,7 @@ members = [
     "crates/preloop-cli",
     "crates/preloop-observability",
     "benchmarks/preloop-perf",
+    "benchmarks/control-load",
 ]
 resolver = "2"
 
