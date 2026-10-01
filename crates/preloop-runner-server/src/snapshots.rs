@@ -2260,6 +2260,22 @@ struct ObjectCache {
     ancestry_complete: bool,
 }
 
+/// Whether the snapshot object cache holds `sha` as a commit.
+///
+/// Any failure to ask counts as "does not hold it": the caller answers by
+/// fetching, which is the safe direction.
+async fn cache_holds_commit(repository: &FsPath, sha: &str) -> bool {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(repository)
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
+}
+
 async fn ensure_object_cache(
     state_dir: &FsPath,
     workspace: &FsPath,
@@ -2329,14 +2345,29 @@ async fn ensure_object_cache(
                 )));
             }
         };
-        // An unborn HEAD gives nothing to compare, so always refresh.
-        if source_head.is_none() || cached_head.as_deref() != source_head {
+        // An unborn HEAD gives nothing to compare, so always refresh. A
+        // recorded head the cache does not hold is stale as well: the marker
+        // alone cannot be trusted, or a cache that missed a commit once would
+        // keep missing it until the workspace moved on.
+        let head_missing = match source_head {
+            Some(head) => !cache_holds_commit(&repository, head).await,
+            None => false,
+        };
+        if source_head.is_none() || cached_head.as_deref() != source_head || head_missing {
             let mut fetch = Command::new("git");
             fetch
                 .env("GIT_DIR", &repository)
                 .args(["fetch", "--quiet", "--force", "--prune"])
                 .arg(workspace)
                 .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+            // A detached HEAD (a worktree at a CI merge sha, a bisect step, a
+            // review checkout) is reachable from no branch or tag, so the
+            // refspecs above never carry its commit and seeding the snapshot
+            // index fails with "failed to unpack tree object". A bare `HEAD`
+            // source stores its objects without creating a ref in the cache.
+            if source_head.is_some() {
+                fetch.arg("HEAD");
+            }
             run_git(&mut fetch, "refresh snapshot object cache").await?;
             record_cache_head(&last_head, source_head).await?;
             refreshed = true;
@@ -6267,5 +6298,131 @@ mod github_remote_slug_selection_tests {
                         backup\thttps://bitbucket.org/owner/repo.git (fetch)\n";
         assert_eq!(github_remote_slug(remote_v, "github.com"), None);
         assert_eq!(github_remote_slug("", "github.com"), None);
+    }
+}
+
+#[cfg(test)]
+mod object_cache_tests {
+    use super::*;
+
+    fn git(directory: &FsPath, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .env("GIT_AUTHOR_NAME", "preloop")
+            .env("GIT_AUTHOR_EMAIL", "preloop@example.com")
+            .env("GIT_COMMITTER_NAME", "preloop")
+            .env("GIT_COMMITTER_EMAIL", "preloop@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn commit(work: &FsPath, name: &str) -> String {
+        std::fs::write(work.join(name), name).unwrap();
+        git(work, &["add", "."]);
+        git(work, &["commit", "-m", name]);
+        git(work, &["rev-parse", "HEAD"])
+    }
+
+    /// Whether the cache's object database holds `sha` as a commit.
+    fn cache_has(cache: &ObjectCache, sha: &str) -> bool {
+        let repository = cache.objects.parent().expect("objects has a parent");
+        std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(repository)
+            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+            .status()
+            .expect("git runs")
+            .success()
+    }
+
+    /// A workspace whose `main` sits at one commit and whose HEAD is detached at
+    /// a later commit no branch or tag reaches, which is what a worktree at a CI
+    /// merge sha, a bisect step, or a review checkout looks like.
+    fn detached_workspace(root: &FsPath) -> (PathBuf, PathBuf, String, String) {
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-b", "main"]);
+        let on_branch = commit(&work, "a.txt");
+        git(&work, &["checkout", "--detach"]);
+        let detached = commit(&work, "b.txt");
+        assert_ne!(on_branch, detached);
+        let common_dir = std::fs::canonicalize(work.join(".git")).unwrap();
+        (work, common_dir, on_branch, detached)
+    }
+
+    #[tokio::test]
+    async fn first_build_holds_a_detached_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, _, detached) = detached_workspace(temp.path());
+        let state = temp.path().join("state");
+
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None)
+            .await
+            .unwrap();
+
+        assert!(cache_has(&cache, &detached));
+    }
+
+    /// The cache is keyed by the workspace's common dir and survives across
+    /// runs, so the commit a later run checks out is usually new to it. Before
+    /// the refresh fetched `HEAD`, a detached commit was never copied and
+    /// seeding the snapshot index died with "failed to unpack tree object".
+    #[tokio::test]
+    async fn refresh_copies_a_detached_head_the_cache_has_not_seen() {
+        let temp = tempfile::tempdir().unwrap();
+        let (work, common_dir, on_branch, _) = detached_workspace(temp.path());
+        let state = temp.path().join("state");
+        git(&work, &["checkout", "main"]);
+        ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+            .await
+            .unwrap();
+
+        git(&work, &["checkout", "--detach"]);
+        let later = commit(&work, "later.txt");
+        let cache = ensure_object_cache(&state, &work, &common_dir, Some(&later), None)
+            .await
+            .unwrap();
+
+        assert!(cache.refreshed);
+        assert!(cache_has(&cache, &later));
+    }
+
+    /// A cache that already recorded a head it never received must heal: the
+    /// recorded head matching the workspace used to skip the refresh forever.
+    #[tokio::test]
+    async fn a_recorded_head_the_cache_lacks_is_refetched() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-b", "main"]);
+        let on_branch = commit(&work, "a.txt");
+        let common_dir = std::fs::canonicalize(work.join(".git")).unwrap();
+        let state = temp.path().join("state");
+        let seeded = ensure_object_cache(&state, &work, &common_dir, Some(&on_branch), None)
+            .await
+            .unwrap();
+
+        // The state a failed refresh used to leave behind: the marker names
+        // the workspace's head although the cache never received it.
+        git(&work, &["checkout", "--detach"]);
+        let detached = commit(&work, "b.txt");
+        assert!(!cache_has(&seeded, &detached));
+        let repository = seeded.objects.parent().unwrap().to_path_buf();
+        let mut marker = repository.as_os_str().to_os_string();
+        marker.push(".last-head");
+        std::fs::write(PathBuf::from(marker), format!("{detached}\n")).unwrap();
+
+        let healed = ensure_object_cache(&state, &work, &common_dir, Some(&detached), None)
+            .await
+            .unwrap();
+
+        assert!(cache_has(&healed, &detached));
     }
 }

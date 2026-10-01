@@ -52,6 +52,17 @@ Releases before v0.27.0 predate the changelog.
   failure, so a full host does not trip the repeated-provision-failure alert;
   an unmeasurable volume warns once and proceeds.
 
+### Fixed
+
+- Workspace snapshots no longer fail for a detached `HEAD` that no branch or
+  tag reaches (a git worktree at a CI merge sha, a bisect step, a review
+  checkout). The snapshot object cache refreshed only `refs/heads/*` and
+  `refs/tags/*`, so that commit was never copied and seeding the snapshot index
+  died with `failed to unpack tree object`; the run then fell back to a plain
+  checkout of `github.server_url`. The refresh now also fetches `HEAD`, and a
+  cache whose recorded head it does not actually hold is refetched instead of
+  trusted, so caches already affected heal on the next run.
+
 ## [0.33.7] - 2026-09-28
 
 ### Added
