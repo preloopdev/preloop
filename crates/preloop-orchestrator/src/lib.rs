@@ -5,12 +5,14 @@ include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 pub mod environment;
 mod keys;
 pub mod node_externals;
+pub mod oci;
 
 use crate::environment::{
     APT_INDICES_MARKER_PATH, EnvironmentSpec, ToolchainLayer, curated_toolchains,
     is_stock_base_image,
 };
 use crate::keys::{KeyPool, StagedKey};
+use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
@@ -1431,48 +1433,10 @@ async fn sha256_file(path: &Path) -> Result<String, String> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct OciManifest {
-    #[serde(default)]
-    layers: Vec<OciLayer>,
-    /// Present on OCI indexes: the listed image manifests to select from.
-    #[serde(default)]
-    manifests: Vec<OciDescriptor>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciDescriptor {
-    digest: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciLayer {
-    digest: String,
-    #[serde(default)]
-    size: Option<u64>,
-    /// OCI descriptors name this field `mediaType`; without the rename every
-    /// standard manifest fails to parse and the OCI path silently falls back
-    /// to the release asset.
-    #[serde(rename = "mediaType")]
-    media_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciToken {
-    token: String,
-}
-
-/// Media types that mark the packed-VM layer: the engine's own historical
-/// artifacts and smolvm's native `pack push` media type.
-fn is_packed_vm_layer(media_type: &str) -> bool {
-    media_type == "application/vnd.preloop.smolmachine.v1+zstd"
-        || media_type == "application/vnd.smolmachines.smolmachine.v1"
-}
-
 /// Download the packed VM layer from a public OCI artifact without requiring
 /// `oras`, Docker, or any other host-side registry client.
 async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
-    let Some((registry, repository, version)) = split_oci_reference(reference) else {
+    let Ok(oci) = OciReference::parse(reference) else {
         warn!(reference, "invalid OCI golden reference");
         return false;
     };
@@ -1486,46 +1450,33 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
             return false;
         }
     };
-    let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
     // Accept indexes too: `smolvm pack push` publishes the packed artifact
-    // under an OCI index, so the digest/tags resolve to one indirection.
-    let accept = "application/vnd.oci.image.index.v1+json, \
-                  application/vnd.oci.image.manifest.v1+json, \
-                  application/vnd.docker.distribution.manifest.list.v2+json, \
-                  application/vnd.docker.distribution.manifest.v2+json";
-    let response = match registry_get(&client, &manifest_url, accept, None).await {
-        Ok(response) => response,
+    // under an OCI index, so the digest/tags resolve to one indirection. The
+    // shared client follows that one level, taking the first listed manifest
+    // (our packs publish exactly one platform entry).
+    let resolved = match get_manifest(&client, &oci, MANIFEST_ACCEPT, None).await {
+        Ok(resolved) => resolved,
         Err(error) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
             return false;
         }
     };
-    let mut manifest = match response.json::<OciManifest>().await {
+    if let Some(error) = &resolved.follow_error {
+        warn!(reference, %error, "OCI golden inner manifest unavailable");
+        return false;
+    }
+    let manifest = match serde_json::from_value::<OciManifest>(resolved.image) {
         Ok(manifest) => manifest,
         Err(error) => {
-            warn!(reference, %error, "OCI golden manifest parse failed");
+            let message = if resolved.selected_digest.is_some() {
+                "OCI golden inner manifest parse failed"
+            } else {
+                "OCI golden manifest parse failed"
+            };
+            warn!(reference, %error, message);
             return false;
         }
     };
-    // Index indirection: take the first listed manifest (our packs publish
-    // exactly one platform entry).
-    if manifest.layers.is_empty() && !manifest.manifests.is_empty() {
-        let digest = manifest.manifests[0].digest.clone();
-        let inner_url = format!("https://{registry}/v2/{repository}/manifests/{digest}");
-        manifest = match registry_get(&client, &inner_url, accept, None).await {
-            Ok(response) => match response.json::<OciManifest>().await {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    warn!(reference, %error, "OCI golden inner manifest parse failed");
-                    return false;
-                }
-            },
-            Err(error) => {
-                warn!(reference, %error, "OCI golden inner manifest unavailable");
-                return false;
-            }
-        };
-    }
     let Some(layer) = manifest
         .layers
         .into_iter()
@@ -1536,7 +1487,7 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
     };
     let layer_size = layer.size;
     let layer_digest = layer.digest;
-    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{layer_digest}");
+    let blob_url = oci.blob_url(&layer_digest);
     info!(
         "pulling pre-baked OCI golden ({} MB) from {} into {}",
         layer_size.map(megabytes).unwrap_or_default(),
@@ -1547,11 +1498,22 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
     let downloaded = {
         let client = client.clone();
         let blob_url = blob_url.clone();
+        let repository = oci.repository.clone();
         download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
             let client = client.clone();
             let url = blob_url.clone();
+            let repository = repository.clone();
             Box::pin(async move {
-                registry_get(&client, &url, "*/*", (offset > 0).then_some(offset)).await
+                crate::oci::registry_get(
+                    &client,
+                    &url,
+                    &repository,
+                    "*/*",
+                    None,
+                    (offset > 0).then_some(offset),
+                )
+                .await
+                .map_err(|error| error.to_string())
             }) as BoxFuture<'static, Result<reqwest::Response, String>>
         })
         .await
@@ -1607,93 +1569,6 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         }
     }
     false
-}
-
-async fn registry_get(
-    client: &reqwest::Client,
-    url: &str,
-    accept: &str,
-    resume_from: Option<u64>,
-) -> Result<reqwest::Response, String> {
-    let with_range = |request: reqwest::RequestBuilder| match resume_from {
-        Some(offset) => request.header(reqwest::header::RANGE, format!("bytes={offset}-")),
-        None => request,
-    };
-    let response = with_range(client.get(url).header(reqwest::header::ACCEPT, accept))
-        .send()
-        .await
-        .map_err(|error| format!("request failed: {error}"))?;
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Err(format!("registry returned HTTP {}", response.status()));
-    }
-    let challenge = response
-        .headers()
-        .get(reqwest::header::WWW_AUTHENTICATE)
-        .ok_or_else(|| "registry response has no auth challenge".to_owned())?
-        .to_str()
-        .map_err(|error| format!("invalid registry auth challenge: {error}"))?;
-    let realm = auth_parameter(challenge, "realm")
-        .ok_or_else(|| "registry auth challenge has no realm".to_owned())?;
-    let service = auth_parameter(challenge, "service")
-        .ok_or_else(|| "registry auth challenge has no service".to_owned())?;
-    let scope = auth_parameter(challenge, "scope")
-        .ok_or_else(|| "registry auth challenge has no scope".to_owned())?;
-    let token = client
-        .get(realm)
-        .query(&[("service", service), ("scope", scope)])
-        .send()
-        .await
-        .map_err(|error| format!("registry token request failed: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("registry token request failed: {error}"))?
-        .json::<OciToken>()
-        .await
-        .map_err(|error| format!("registry token response was invalid: {error}"))?;
-    let response = with_range(
-        client
-            .get(url)
-            .header(reqwest::header::ACCEPT, accept)
-            .bearer_auth(token.token),
-    )
-    .send()
-    .await
-    .map_err(|error| format!("authenticated registry request failed: {error}"))?;
-    if response.status().is_success() {
-        Ok(response)
-    } else {
-        Err(format!(
-            "authenticated registry request returned HTTP {}",
-            response.status()
-        ))
-    }
-}
-
-fn auth_parameter(challenge: &str, name: &str) -> Option<String> {
-    challenge.split(',').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        (key.trim()
-            .trim_start_matches("Bearer ")
-            .eq_ignore_ascii_case(name))
-        .then(|| value.trim_matches('"').to_owned())
-    })
-}
-
-fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
-    let (registry, remainder) = reference.split_once('/')?;
-    let (repository, version) = remainder
-        .rsplit_once('@')
-        .or_else(|| remainder.rsplit_once(':'))?;
-    if registry.is_empty() || repository.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((
-        registry.to_owned(),
-        repository.to_owned(),
-        version.to_owned(),
-    ))
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
@@ -7701,43 +7576,19 @@ chmod +x "$dest/bin/node"
 
     #[test]
     fn default_oci_golden_reference_targets_arm64_pack() {
-        let (registry, repository, version) =
-            split_oci_reference(GOLDEN_OCI_REF_ARM64).expect("valid OCI reference");
-        assert_eq!(registry, "ghcr.io");
-        assert_eq!(repository, "preloopdev/preloop-arm64-smolvm-golden");
+        let reference = OciReference::parse(GOLDEN_OCI_REF_ARM64).expect("valid OCI reference");
+        assert_eq!(reference.registry, "ghcr.io");
+        assert_eq!(
+            reference.repository,
+            "preloopdev/preloop-arm64-smolvm-golden"
+        );
         // Immutable digest pin: changing the default must be a reviewed code
         // change, not a registry retag.
         assert!(
-            version.len() == "sha256:".len() + 64 && version.starts_with("sha256:"),
-            "expected a digest-pinned default, got `{version}`"
-        );
-    }
-
-    #[test]
-    fn oci_layer_deserializes_camel_case_media_type() {
-        let manifest: OciManifest = serde_json::from_str(
-            r#"{"layers":[{"digest":"sha256:00","size":42,"mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
-        )
-        .expect("standard OCI manifest must parse");
-        let layer = manifest
-            .layers
-            .into_iter()
-            .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
-            .expect("packed VM layer present");
-        assert_eq!(layer.digest, "sha256:00");
-        assert_eq!(layer.size, Some(42));
-    }
-
-    #[test]
-    fn oci_auth_challenge_parameters_parse() {
-        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-arm64-smolvm-golden:pull""#;
-        assert_eq!(
-            auth_parameter(challenge, "realm").as_deref(),
-            Some("https://ghcr.io/token")
-        );
-        assert_eq!(
-            auth_parameter(challenge, "scope").as_deref(),
-            Some("repository:preloopdev/preloop-arm64-smolvm-golden:pull")
+            reference.reference.len() == "sha256:".len() + 64
+                && reference.reference.starts_with("sha256:"),
+            "expected a digest-pinned default, got `{}`",
+            reference.reference
         );
     }
 

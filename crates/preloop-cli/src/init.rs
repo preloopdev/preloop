@@ -99,6 +99,9 @@ pub(crate) fn exit_code(error: &anyhow::Error) -> Option<i32> {
     error.downcast_ref::<InitError>().map(|error| error.code)
 }
 
+use preloop_orchestrator::oci::{
+    MANIFEST_ACCEPT, OciError, OciReference, get_manifest, host_arch_aliases, platform_matches_host,
+};
 use preloop_orchestrator::{
     DISK_PREFLIGHT_OVERRIDE, GIB, GOLDEN_BUILD_DISK_HEADROOM_GIB, GOLDEN_DOWNLOAD_DISK_MARGIN,
     disk_preflight_overridden, golden_builder_storage_gib,
@@ -116,12 +119,6 @@ const OFFICIAL_GOLDEN_WORKING_SET_BYTES: u64 = 60 * GIB;
 /// --image` (its `--max-image-size` help text: default 8GiB). A base image over
 /// this fails at serve time with a smolvm error, so `init` says so up front.
 const SMOLVM_MAX_LOCAL_IMAGE_BYTES: u64 = 8 * GIB;
-
-/// Manifest media types we accept when resolving an image reference.
-const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
-     application/vnd.oci.image.manifest.v1+json, \
-     application/vnd.docker.distribution.manifest.list.v2+json, \
-     application/vnd.docker.distribution.manifest.v2+json";
 
 #[derive(Debug, Default, Parser)]
 pub(crate) struct InitArgs {
@@ -1046,7 +1043,17 @@ impl Session {
                  build one here"
             )));
         }
-        let parsed = OciReference::parse(&reference)?;
+        let trimmed = reference.trim();
+        if trimmed.is_empty() {
+            return Err(usage_error("--base-image must not be empty"));
+        }
+        if trimmed.contains(char::is_whitespace) {
+            return Err(usage_error(format!(
+                "`{trimmed}` is not a valid image reference (whitespace)"
+            )));
+        }
+        let parsed =
+            OciReference::parse(trimmed).map_err(|error| usage_error(error.to_string()))?;
         if !parsed.is_digest_pinned() {
             self.note(
                 "tip: pin the reference with @sha256:… so a retag cannot change what your \
@@ -1054,7 +1061,7 @@ impl Session {
             );
         }
         let client = oci_client()?;
-        let probe = parsed.manifest(&client).await?;
+        let probe = resolve_manifest(&parsed, &client).await?;
         let arch_ok = probe.supports_host_arch();
         if arch_ok == Some(false) {
             self.note(&format!(
@@ -1917,173 +1924,55 @@ fn oci_client() -> anyhow::Result<reqwest::Client> {
         .context("building the registry client")
 }
 
-/// A parsed image reference, split into the registry, repository, and the tag
-/// or digest, so an anonymous manifest request can be made before the choice
-/// is written to the config.
-struct OciReference {
-    registry: String,
-    repository: String,
-    reference: String,
+/// Resolve the reference anonymously and report what it holds, so a typo or a
+/// private image is caught before it reaches the config.
+///
+/// The shared client does the anonymous handshake and one level of index
+/// indirection; this function only decides how to present what came back.
+async fn resolve_manifest(
+    reference: &OciReference,
+    client: &reqwest::Client,
+) -> anyhow::Result<ManifestProbe> {
+    let resolved = get_manifest(
+        client,
+        reference,
+        MANIFEST_ACCEPT,
+        Some(&platform_matches_host),
+    )
+    .await
+    .map_err(|error| manifest_error(reference, error))?;
+    let mut probe = summarize_manifest(&resolved.top);
+    probe.host_manifest_digest = resolved.selected_digest;
+    // A multi-platform index names the per-architecture manifest by digest;
+    // following it is what turns "these platforms exist" into the real
+    // download size.
+    if probe.host_manifest_digest.is_some() {
+        probe.layers_bytes = layer_bytes(&resolved.image);
+    }
+    Ok(probe)
 }
 
-impl OciReference {
-    fn parse(raw: &str) -> anyhow::Result<Self> {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return Err(usage_error("--base-image must not be empty"));
-        }
-        if raw.contains(char::is_whitespace) {
-            return Err(usage_error(format!(
-                "`{raw}` is not a valid image reference (whitespace)"
-            )));
-        }
-        // `repo:tag@sha256:…` carries both a tag and a digest; the digest is
-        // the reference that resolves, and the tag must not survive into the
-        // repository path (`/v2/repo:tag/manifests/…` is a 404).
-        let (name, reference) = match raw.split_once('@') {
-            Some((name, digest)) => (strip_tag(name).to_owned(), digest.to_owned()),
-            None => match split_tag(raw) {
-                Some((name, tag)) => (name.to_owned(), tag.to_owned()),
-                None => (raw.to_owned(), "latest".to_owned()),
-            },
-        };
-        if name.is_empty() || reference.is_empty() {
-            return Err(usage_error(format!(
-                "`{raw}` is not a valid image reference"
-            )));
-        }
-        let (registry, repository) = match name.split_once('/') {
-            Some((first, rest))
-                if first.contains('.') || first.contains(':') || first == "localhost" =>
-            {
-                (normalize_registry(first), rest.to_owned())
-            }
-            // A name without a registry host is Docker Hub, where a single
-            // component means the official `library/` namespace.
-            Some(_) => ("registry-1.docker.io".to_owned(), name.clone()),
-            None => ("registry-1.docker.io".to_owned(), format!("library/{name}")),
-        };
-        Ok(Self {
-            registry,
-            repository,
-            reference,
-        })
-    }
-
-    fn display(&self) -> String {
-        let repository = self
-            .repository
-            .strip_prefix("library/")
-            .filter(|_| self.registry == "registry-1.docker.io")
-            .unwrap_or(&self.repository);
-        let separator = if self.is_digest_pinned() { '@' } else { ':' };
-        format!(
-            "{}/{repository}{separator}{}",
-            self.registry, self.reference
-        )
-    }
-
-    fn is_digest_pinned(&self) -> bool {
-        self.reference.starts_with("sha256:")
-    }
-
-    fn manifest_url(&self, reference: &str) -> String {
-        format!(
-            "https://{}/v2/{}/manifests/{}",
-            self.registry, self.repository, reference
-        )
-    }
-
-    /// Resolve the reference anonymously and report what it holds, so a typo
-    /// or a private image is caught before it reaches the config.
-    async fn manifest(&self, client: &reqwest::Client) -> anyhow::Result<ManifestProbe> {
-        let url = self.manifest_url(&self.reference);
-        let (status, headers, body) = registry_get(client, &url, None).await?;
-        // Docker Hub and GHCR both answer anonymous manifest requests with 401
-        // plus a `Bearer realm=…` challenge, so the token is part of the
-        // normal path, not an error path. It is carried on to the
-        // per-architecture manifest below: that request is authenticated the
-        // same way, and dropping the token would make every index resolve to
-        // an unknown size.
-        let (status, body, token) = if status == reqwest::StatusCode::UNAUTHORIZED {
-            let challenge = headers
-                .get(reqwest::header::WWW_AUTHENTICATE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-                .to_owned();
-            let Some(token) = bearer_token(client, &challenge, &self.repository).await? else {
-                return Err(build_error(private_registry_message(&self.display())));
-            };
-            let (status, _, body) = registry_get(client, &url, Some(&token)).await?;
-            (status, body, Some(token))
-        } else {
-            (status, body, None)
-        };
-        if matches!(
-            status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            return Err(build_error(private_registry_message(&self.display())));
-        }
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(build_error(format!(
-                "{} was not found in {} (check the repository and tag)",
-                self.display(),
-                self.registry
-            )));
-        }
-        if !status.is_success() {
-            return Err(build_error(format!(
-                "{} answered {status} for {}",
-                self.registry,
-                self.display()
-            )));
-        }
-        let value: Value = serde_json::from_slice(&body).map_err(|error| {
-            build_error(format!(
-                "{} returned a manifest this client cannot read ({error})",
-                self.registry
-            ))
-        })?;
-        let mut probe = summarize_manifest(&value);
-        // A multi-platform index names the per-architecture manifest by digest;
-        // fetching it is what turns "these platforms exist" into the real
-        // download size.
-        if let Some(digest) = probe.host_manifest_digest.clone() {
-            let url = self.manifest_url(&digest);
-            if let Ok((status, _, body)) = registry_get(client, &url, token.as_deref()).await
-                && status.is_success()
-                && let Ok(value) = serde_json::from_slice::<Value>(&body)
-            {
-                probe.layers_bytes = layer_bytes(&value);
-            }
-        }
-        Ok(probe)
-    }
-}
-
-/// The part of a reference before its tag, or the whole string when there is
-/// none. Only a `:` in the last path segment is a tag separator, so a registry
-/// port (`localhost:5000/team/base`) survives.
-fn strip_tag(reference: &str) -> &str {
-    split_tag(reference)
-        .map(|(name, _)| name)
-        .unwrap_or(reference)
-}
-
-fn split_tag(reference: &str) -> Option<(&str, &str)> {
-    let last = reference.rsplit('/').next().unwrap_or(reference);
-    let (_, tag) = last.split_once(':')?;
-    if tag.is_empty() {
-        return None;
-    }
-    Some((&reference[..reference.len() - tag.len() - 1], tag))
-}
-
-fn normalize_registry(host: &str) -> String {
-    match host {
-        "docker.io" | "index.docker.io" => "registry-1.docker.io".to_owned(),
-        other => other.to_owned(),
+/// Present a shared registry failure the way `init` promises scripts: a
+/// refusal gets the SmolVM registry hint, a missing manifest names the
+/// repository, and everything else keeps its own words.
+fn manifest_error(reference: &OciReference, error: OciError) -> anyhow::Error {
+    match error {
+        OciError::Unauthorized => build_error(private_registry_message(&reference.display())),
+        OciError::NotFound => build_error(format!(
+            "{} was not found in {} (check the repository and tag)",
+            reference.display(),
+            reference.registry
+        )),
+        OciError::Status(status) => build_error(format!(
+            "{} answered {status} for {}",
+            reference.registry,
+            reference.display()
+        )),
+        OciError::ManifestUnreadable(error) => build_error(format!(
+            "{} returned a manifest this client cannot read ({error})",
+            reference.registry
+        )),
+        OciError::Message(message) => build_error(message),
     }
 }
 
@@ -2097,118 +1986,6 @@ fn private_registry_message(reference: &str) -> String {
          `smolvm config registries edit` and retry `preloop init`. Those credentials are used for \
          the pull only and never enter the VM."
     )
-}
-
-async fn registry_get(
-    client: &reqwest::Client,
-    url: &str,
-    token: Option<&str>,
-) -> anyhow::Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>)> {
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, MANIFEST_ACCEPT);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| build_error(format!("cannot reach {url}: {error}")))?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| build_error(format!("cannot read the response from {url}: {error}")))?
-        .to_vec();
-    Ok((status, headers, body))
-}
-
-/// The anonymous token dance Docker Hub and GHCR both require: their manifest
-/// endpoints answer 401 with a `Bearer realm=…` challenge even for public
-/// images.
-async fn bearer_token(
-    client: &reqwest::Client,
-    challenge: &str,
-    repository: &str,
-) -> anyhow::Result<Option<String>> {
-    let Some(parameters) = challenge
-        .strip_prefix("Bearer ")
-        .or_else(|| challenge.strip_prefix("bearer "))
-    else {
-        return Ok(None);
-    };
-    let params = split_challenge_params(parameters);
-    let value = |key: &str| {
-        params
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
-    };
-    let Some(realm) = value("realm") else {
-        return Ok(None);
-    };
-    let scope = value("scope").unwrap_or_else(|| format!("repository:{repository}:pull"));
-    let mut url = reqwest::Url::parse(&realm)
-        .map_err(|error| build_error(format!("registry token realm `{realm}`: {error}")))?;
-    if url.scheme() != "https" {
-        return Err(build_error(format!(
-            "registry token realm `{realm}` is not https; refusing to request a token over plain \
-             HTTP"
-        )));
-    }
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("scope", &scope);
-        if let Some(service) = value("service") {
-            query.append_pair("service", &service);
-        }
-    }
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| build_error(format!("requesting a registry token: {error}")))?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|error| build_error(format!("reading the registry token: {error}")))?;
-    Ok(body
-        .get("token")
-        .or_else(|| body.get("access_token"))
-        .and_then(Value::as_str)
-        .map(str::to_owned))
-}
-
-fn split_challenge_params(raw: &str) -> Vec<(String, String)> {
-    let mut params = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for character in raw.chars() {
-        match character {
-            '"' => {
-                quoted = !quoted;
-                current.push(character);
-            }
-            ',' if !quoted => push_challenge_param(&mut params, &mut current),
-            _ => current.push(character),
-        }
-    }
-    push_challenge_param(&mut params, &mut current);
-    params
-}
-
-fn push_challenge_param(params: &mut Vec<(String, String)>, raw: &mut String) {
-    if let Some((key, value)) = raw.split_once('=') {
-        params.push((
-            key.trim().to_ascii_lowercase(),
-            value.trim().trim_matches('"').to_owned(),
-        ));
-    }
-    raw.clear();
 }
 
 #[derive(Debug, Default)]
@@ -2237,6 +2014,9 @@ impl ManifestProbe {
     }
 }
 
+/// Read the fields `init` reports from an index or single manifest. The
+/// per-host selection itself is the shared client's, so the digest it chose is
+/// filled in by the caller.
 fn summarize_manifest(value: &Value) -> ManifestProbe {
     let media_type = value
         .get("mediaType")
@@ -2258,13 +2038,7 @@ fn summarize_manifest(value: &Value) -> ManifestProbe {
             ) else {
                 continue;
             };
-            let name = format!("{os}/{arch}");
-            if platform_matches_host(&name)
-                && let Some(digest) = entry.get("digest").and_then(Value::as_str)
-            {
-                probe.host_manifest_digest = Some(digest.to_owned());
-            }
-            probe.platforms.push(name);
+            probe.platforms.push(format!("{os}/{arch}"));
         }
         probe.platforms.sort();
         probe.platforms.dedup();
@@ -2282,24 +2056,6 @@ fn layer_bytes(value: &Value) -> Option<u64> {
         .filter_map(|layer| layer.get("size").and_then(Value::as_u64))
         .sum();
     (total > 0).then_some(total)
-}
-
-/// Registries and Docker report GOARCH (`arm64`, `amd64`) while
-/// `std::env::consts::ARCH` says `aarch64`/`x86_64`; both spellings mean this
-/// host.
-fn host_arch_aliases() -> [&'static str; 2] {
-    match std::env::consts::ARCH {
-        "aarch64" => ["arm64", "aarch64"],
-        "x86_64" => ["amd64", "x86_64"],
-        other => [other, other],
-    }
-}
-
-fn platform_matches_host(platform: &str) -> bool {
-    let Some((os, arch)) = platform.split_once('/') else {
-        return false;
-    };
-    os == "linux" && host_arch_aliases().contains(&arch)
 }
 
 // -- Dockerfile -----------------------------------------------------------
@@ -2589,61 +2345,6 @@ mod tests {
     }
 
     #[test]
-    fn image_references_split_into_registry_and_repository() {
-        let hub = OciReference::parse("ubuntu:24.04").unwrap();
-        assert_eq!(hub.registry, "registry-1.docker.io");
-        assert_eq!(hub.repository, "library/ubuntu");
-        assert_eq!(hub.reference, "24.04");
-        assert!(!hub.is_digest_pinned());
-
-        let namespaced = OciReference::parse("ghcr.io/preloopdev/base:1.2").unwrap();
-        assert_eq!(namespaced.registry, "ghcr.io");
-        assert_eq!(namespaced.repository, "preloopdev/base");
-        assert_eq!(namespaced.reference, "1.2");
-
-        let local = OciReference::parse("localhost:5000/team/base").unwrap();
-        assert_eq!(local.registry, "localhost:5000");
-        assert_eq!(local.repository, "team/base");
-        assert_eq!(local.reference, "latest", "a bare repository pulls :latest");
-
-        let pinned =
-            OciReference::parse(&format!("ghcr.io/x/y@sha256:{}", "a".repeat(64))).unwrap();
-        assert_eq!(pinned.repository, "x/y");
-        assert!(
-            pinned.is_digest_pinned(),
-            "a digest is the immutable reference"
-        );
-        assert_eq!(pinned.reference, format!("sha256:{}", "a".repeat(64)));
-
-        // `repo:tag@sha256:…` is how a digest is recorded next to a tag: the
-        // tag must not leak into the repository path, or the manifest request
-        // 404s.
-        let tag_and_digest =
-            OciReference::parse(&format!("ghcr.io/x/y:1.2@sha256:{}", "b".repeat(64))).unwrap();
-        assert_eq!(tag_and_digest.repository, "x/y");
-        assert_eq!(
-            tag_and_digest.reference,
-            format!("sha256:{}", "b".repeat(64))
-        );
-        assert_eq!(
-            tag_and_digest.manifest_url(&tag_and_digest.reference),
-            format!("https://ghcr.io/v2/x/y/manifests/sha256:{}", "b".repeat(64)),
-        );
-        assert_eq!(
-            tag_and_digest.display(),
-            format!("ghcr.io/x/y@sha256:{}", "b".repeat(64)),
-        );
-        // A digest for a Docker Hub repository keeps the library/ namespace.
-        let hub_library =
-            OciReference::parse(&format!("ubuntu@sha256:{}", "c".repeat(64))).unwrap();
-        assert_eq!(hub_library.repository, "library/ubuntu");
-        assert_eq!(
-            hub_library.display(),
-            format!("registry-1.docker.io/ubuntu@sha256:{}", "c".repeat(64))
-        );
-    }
-
-    #[test]
     fn index_platforms_report_whether_the_host_is_supported() {
         let index = json!({
             "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -2659,13 +2360,10 @@ mod tests {
             vec!["linux/amd64", "linux/arm64", "windows/amd64"]
         );
         assert_eq!(probe.supports_host_arch(), Some(true));
-        // The matching entry's digest is what turns the index into a real size.
-        let expected = if std::env::consts::ARCH == "aarch64" {
-            "sha256:2"
-        } else {
-            "sha256:1"
-        };
-        assert_eq!(probe.host_manifest_digest.as_deref(), Some(expected));
+        // An index carries no layers of its own; the per-host digest the shared
+        // client selected is what turns it into a real size.
+        assert_eq!(probe.layers_bytes, None);
+        assert_eq!(probe.host_manifest_digest, None);
 
         let foreign = json!({
             "manifests": [
@@ -2690,27 +2388,6 @@ mod tests {
             probe.supports_host_arch(),
             None,
             "a single manifest carries no platform field, so arch support is unknown"
-        );
-    }
-
-    #[test]
-    fn challenge_parameters_survive_quoted_commas() {
-        let params = split_challenge_params(
-            "realm=\"https://auth.example/token\",service=\"registry.example\",scope=\"repository:a/b:pull\"",
-        );
-        assert_eq!(
-            params
-                .iter()
-                .find(|(key, _)| key == "realm")
-                .map(|(_, value)| value.as_str()),
-            Some("https://auth.example/token")
-        );
-        assert_eq!(
-            params
-                .iter()
-                .find(|(key, _)| key == "service")
-                .map(|(_, value)| value.as_str()),
-            Some("registry.example")
         );
     }
 
