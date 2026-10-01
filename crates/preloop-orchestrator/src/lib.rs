@@ -5,12 +5,14 @@ include!(concat!(env!("OUT_DIR"), "/pins.rs"));
 pub mod environment;
 mod keys;
 pub mod node_externals;
+pub mod oci;
 
 use crate::environment::{
     APT_INDICES_MARKER_PATH, EnvironmentSpec, ToolchainLayer, curated_toolchains,
     is_stock_base_image,
 };
 use crate::keys::{KeyPool, StagedKey};
+use crate::oci::{MANIFEST_ACCEPT, OciManifest, OciReference, get_manifest, is_packed_vm_layer};
 use preloop_gha_protocol::RUNNER_BUSY_SENTINEL;
 
 /// Line an ephemeral runner prints when it accepts a job. Re-exported so a
@@ -670,22 +672,361 @@ fn golden_partial_path(payload: &Path) -> PathBuf {
     payload.with_file_name(format!("{name}.partial"))
 }
 
-/// Public OCI artifact carrying the official arm64 packed VM golden.
+pub const GIB: u64 = 1024 * 1024 * 1024;
+/// Kept free beyond the bytes a golden download writes, so landing the
+/// artifact never takes the volume to zero.
+pub const GOLDEN_DOWNLOAD_DISK_MARGIN: u64 = GIB;
+/// Pack staging a golden bake needs beyond its builder disk. Same rule the
+/// golden workflows enforce (`need_gib = GOLDEN_GUEST_GIB + 20`), adopted after
+/// `smolvm pack` died with `tar error: No space` at 110G free for a 200G guest.
+pub const GOLDEN_BUILD_DISK_HEADROOM_GIB: u64 = 20;
+/// Floor for the one-shot builder's disk: packing exports a second copy of
+/// the guest filesystem, so the builder never gets less than this even when
+/// job VMs are configured smaller.
+pub const GOLDEN_BUILDER_MIN_STORAGE_GIB: u32 = 40;
+/// Escape hatch for hosts whose free space `df` misreports (thin pools,
+/// quotas): proceed past a disk refusal with a warning instead.
+pub const DISK_PREFLIGHT_OVERRIDE: &str = "PRELOOP_SKIP_DISK_PREFLIGHT";
+
+pub fn disk_preflight_overridden() -> bool {
+    std::env::var(DISK_PREFLIGHT_OVERRIDE)
+        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+}
+
+/// Builder disk a golden bake uses for job VMs configured at `storage_gib`.
+pub fn golden_builder_storage_gib(storage_gib: u32) -> u32 {
+    storage_gib.max(GOLDEN_BUILDER_MIN_STORAGE_GIB)
+}
+
+/// Volume golden and job-VM disks land on; the artifact directory stands in
+/// when the SmolVM data root cannot be resolved.
+fn golden_disk_root(config: &RunnerPoolConfig) -> PathBuf {
+    preloop_vm::machine_data_root().unwrap_or_else(|| {
+        config
+            .artifact_stem
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    })
+}
+
+fn golden_build_required_bytes(builder_storage_gib: u32) -> u64 {
+    (u64::from(builder_storage_gib) + GOLDEN_BUILD_DISK_HEADROOM_GIB) * GIB
+}
+
+fn format_gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// Refuse an operation needing `required` bytes on the volume holding `path`
+/// when they are not free. A volume `df` cannot measure is not a refusal: the
+/// check exists to fail early, never to block a host it cannot read.
+fn ensure_free_disk(path: &Path, required: u64, purpose: &str, remedy: &str) -> Result<(), String> {
+    let free = match preloop_vm::filesystem_available_bytes(path) {
+        Ok(free) => free,
+        Err(error) => {
+            warn!(path = %path.display(), %error, purpose, "free disk space unmeasurable; skipping check");
+            return Ok(());
+        }
+    };
+    if free >= required {
+        return Ok(());
+    }
+    let message = format!(
+        "{purpose} needs {} free on {} but only {} is available; {remedy}, or set {DISK_PREFLIGHT_OVERRIDE}=1 to proceed anyway",
+        format_gib(required),
+        path.display(),
+        format_gib(free),
+    );
+    if disk_preflight_overridden() {
+        warn!("{message} ({DISK_PREFLIGHT_OVERRIDE} set; continuing)");
+        return Ok(());
+    }
+    Err(message)
+}
+
+fn ensure_disk_for_golden_build(root: &Path, builder_storage_gib: u32) -> Result<(), String> {
+    ensure_free_disk(
+        root,
+        golden_build_required_bytes(builder_storage_gib),
+        "golden build",
+        &format!(
+            "free space or lower PRELOOP_RUNNER_STORAGE_GB (builder disk {builder_storage_gib} GiB \
+             + {GOLDEN_BUILD_DISK_HEADROOM_GIB} GiB pack staging)"
+        ),
+    )
+}
+
+/// Warn, never refuse, when the volume holding `path` has under `required`
+/// bytes free.
+fn warn_if_disk_below(path: &Path, required: u64, purpose: &str) {
+    if let Ok(free) = preloop_vm::filesystem_available_bytes(path)
+        && free < required
+    {
+        warn!(
+            path = %path.display(),
+            free = %format_gib(free),
+            needed = %format_gib(required),
+            purpose,
+            "low disk space: this volume may fill before the golden and job VMs settle"
+        );
+    }
+}
+
+/// Reserve kept free on the VM volume before a job VM is started.
 ///
-/// This is deliberately separate from the `runner-images` base-image package:
-/// the latter is an OCI rootfs image, while this package contains a
-/// `.smolmachine` payload ready for `machine create --from`.
+/// Deliberately not one VM's storage ceiling: the live engine runs ten VMs
+/// with 80 GiB ceilings that actually use 0.7-8 GB each, so refusing starts
+/// below a ceiling's worth of free space would throttle it to about two
+/// concurrent jobs. A reserve of the same order as the observed footprint
+/// keeps a full host from being filled further without capping concurrency.
+const DEFAULT_MIN_FREE_DISK_GIB: u64 = 20;
+/// Escape hatch for hosts with little free disk: `PRELOOP_RUNNER_MIN_FREE_DISK_GB`.
+/// `0` disables the reserve.
+const MIN_FREE_DISK_ENV: &str = "PRELOOP_RUNNER_MIN_FREE_DISK_GB";
+/// How often a slot held back by the reserve re-measures the volume.
+const DISK_WAIT_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// How often a held slot repeats its shortfall warning. The measurement runs
+/// every probe; the line is throttled to one per minute per waiting slot so a
+/// full host is visible without flooding the log.
+const DISK_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Reserve in bytes from a raw [`MIN_FREE_DISK_ENV`] value.
 ///
-/// Pinned to the immutable manifest digest of the mutable
-/// `ubuntu24-arm64-runner-large-latest` tag (verified reachable 2026-08-17):
-/// a mutable tag could be silently replaced between the manifest fetch and
-/// the blob pull, and moving the default stays a reviewed code change
-/// instead of a registry retag. The artifact is produced by the CI golden
-/// pipeline (pool-side bake of the official ubuntu24-arm64 runner image);
-/// the release flow retains the packed golden as a workflow artifact because
-/// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects a
-/// custom host when one is available.
-const DEFAULT_GOLDEN_OCI_REF: &str = "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+/// Unset, empty, or unparseable keeps the default: a typo in an environment
+/// variable must not silently disable a guard against filling the host.
+fn min_free_disk_bytes(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MIN_FREE_DISK_GIB)
+        .saturating_mul(GIB)
+}
+
+/// Free-space measurement of the volume holding a path.
+type FreeDiskMeasure = Arc<dyn Fn(&Path) -> Result<u64, VmError> + Send + Sync>;
+
+/// Free-space reserve that gates starting a job VM (fork or create).
+///
+/// A job VM is never started below the reserve: the slot waits and
+/// re-measures, so a full host stalls new jobs instead of filling up or
+/// failing them. `reserve_bytes == 0` disables the check, and a volume the
+/// measurement cannot read never blocks — the check exists to fail early on a
+/// host that is genuinely out of room, never to hold back one it cannot
+/// measure.
+#[derive(Clone)]
+pub struct JobVmDiskReserve {
+    reserve_bytes: u64,
+    probe_interval: Duration,
+    measure: FreeDiskMeasure,
+}
+
+impl JobVmDiskReserve {
+    /// Policy from the environment ([`MIN_FREE_DISK_ENV`], default 20 GiB).
+    pub fn from_env() -> Self {
+        Self::new(
+            min_free_disk_bytes(std::env::var(MIN_FREE_DISK_ENV).ok().as_deref()),
+            preloop_vm::filesystem_available_bytes,
+        )
+    }
+
+    /// Reserve `reserve_bytes` of the volume `measure` reports on.
+    pub fn new<F>(reserve_bytes: u64, measure: F) -> Self
+    where
+        F: Fn(&Path) -> Result<u64, VmError> + Send + Sync + 'static,
+    {
+        Self {
+            reserve_bytes,
+            probe_interval: DISK_WAIT_PROBE_INTERVAL,
+            measure: Arc::new(measure),
+        }
+    }
+
+    /// Override the re-measure cadence of a held slot.
+    pub fn with_probe_interval(mut self, probe_interval: Duration) -> Self {
+        self.probe_interval = probe_interval;
+        self
+    }
+
+    pub fn reserve_bytes(&self) -> u64 {
+        self.reserve_bytes
+    }
+
+    pub fn probe_interval(&self) -> Duration {
+        self.probe_interval
+    }
+
+    /// Free bytes on the volume holding `path`.
+    pub fn free_bytes(&self, path: &Path) -> Result<u64, VmError> {
+        (self.measure)(path)
+    }
+}
+
+impl Default for JobVmDiskReserve {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl std::fmt::Debug for JobVmDiskReserve {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JobVmDiskReserve")
+            .field("reserve_bytes", &self.reserve_bytes)
+            .field("probe_interval", &self.probe_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Wait until the VM volume has the configured reserve free.
+///
+/// Returns `false` when `shutdown` fired first: the caller then abandons the
+/// provision instead of booting a VM the teardown would immediately kill.
+///
+/// A shortfall is a wait, never an error. Failing here would feed
+/// `record_slot_failure` and `consecutive_provision_failures`, which is the
+/// crash-loop escalation meant for a broken provision — not for a host that is
+/// merely full.
+async fn wait_for_vm_disk(config: &RunnerPoolConfig, shutdown: &CancellationToken) -> bool {
+    let reserve = config.job_vm_disk.reserve_bytes();
+    if reserve == 0 {
+        return true;
+    }
+    let root = golden_disk_root(config);
+    let mut warned_at: Option<tokio::time::Instant> = None;
+    loop {
+        match config.job_vm_disk.free_bytes(&root) {
+            Ok(free) if free >= reserve => return true,
+            Ok(free) => {
+                let now = tokio::time::Instant::now();
+                if warned_at.is_none_or(|last| now.duration_since(last) >= DISK_WAIT_LOG_INTERVAL) {
+                    warned_at = Some(now);
+                    warn!(
+                        path = %root.display(),
+                        free = %format_gib(free),
+                        reserve = %format_gib(reserve),
+                        "waiting for disk: {} free on {}, reserve {}",
+                        format_gib(free),
+                        root.display(),
+                        format_gib(reserve),
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    path = %root.display(),
+                    %error,
+                    "free disk space unmeasurable; starting job VMs without the reserve"
+                );
+                return true;
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return false,
+            _ = tokio::time::sleep(config.job_vm_disk.probe_interval()) => {}
+        }
+    }
+}
+
+/// Cadence of the runtime orphan reconcile.
+///
+/// Startup reconciles once, and nothing reconciled again until the next
+/// restart: a `machine delete` that failed, or a data dir removed from under a
+/// live hypervisor, then leaked that VM's whole disk for as long as the engine
+/// served — one live engine grew from 99 GB to 168 GB of VM state in an
+/// afternoon. Ten minutes bounds a leak to a small multiple of that rate while
+/// costing almost nothing per tick: a registry `list()` with one `data-dir`
+/// query per registered machine, a directory scan, and a `ps` scan. The
+/// sweep's own 120 s grace for creates in flight is twelve times shorter than
+/// the interval, so an orphan is always old enough to collect on the first
+/// tick that sees it.
+const ORPHAN_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Stops the periodic orphan reconcile on every pool exit path.
+struct ReconcileGuard {
+    shutdown: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ReconcileGuard {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        // Each tick's work is idempotent cleanup; aborting only keeps a
+        // stopped pool from touching the host after it returned.
+        self.handle.abort();
+    }
+}
+
+/// Reclaim leaked VM state for as long as the pool serves.
+///
+/// Deliberately not `remove_stale_machines`: that deletes *every* runner
+/// machine, including the ones running jobs right now. It uses the
+/// registry-fenced sweep plus the mid-flight hypervisor purge scope, so a
+/// registered machine, a golden, and a create in flight are all out of reach.
+async fn reconcile_orphans<P: VmProvider + 'static>(
+    provider: Arc<P>,
+    shutdown: CancellationToken,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` ticks once immediately; the startup pass just ran.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        // Sweep first, so a data dir removed on this tick has the hypervisor
+        // still holding its blocks released by the purge below, in the same
+        // tick, instead of an interval later.
+        match provider.sweep_orphaned_data_dirs().await {
+            Ok(swept) if swept > 0 => info!(swept, "removed orphaned machine data directories"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "periodic orphaned data-dir sweep failed"),
+        }
+        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::RemovedDataDir) {
+            Ok(killed) if killed > 0 => {
+                info!(killed, "purged orphaned SmolVM hypervisor processes")
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "periodic orphaned hypervisor purge failed"),
+        }
+    }
+}
+
+/// Public OCI artifacts carrying the packed VM goldens, per architecture.
+///
+/// Deliberately separate from the `runner-images` base-image package: that
+/// is an OCI rootfs image (a bake input — users never download it), while
+/// these packages contain a `.smolmachine` payload ready for
+/// `machine create --from`.
+///
+/// Defaults are pinned to immutable manifest digests: a mutable tag could
+/// be silently replaced between the manifest fetch and the blob pull, and
+/// moving a default stays a reviewed code change instead of a registry
+/// retag. The artifacts are produced by the golden pipeline (host-side
+/// bake of the official runner image, packed via `smolvm pack`); the
+/// release flow retains packed goldens as workflow artifacts because
+/// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects
+/// a custom host when one is available.
+///
+/// An architecture with no published packed golden returns `None`; the
+/// engine then falls back to the release-asset path and a local bake.
+fn default_golden_oci_ref() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(GOLDEN_OCI_REF_ARM64),
+        // x86_64: `preloop-x86_64-smolvm-golden` is pending its first push;
+        // pin its digest here once published.
+        _ => None,
+    }
+}
+
+/// The arm64 packed golden, digest-pinned to the published
+/// `preloop-arm64-smolvm-golden` artifact (pushed 2026-09-30 from a
+/// macstudio `build-golden` bake of `runner-images@3884ef22…`).
+const GOLDEN_OCI_REF_ARM64: &str = "ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414";
 /// Deadline for a whole golden download, response body included.
 ///
 /// The packed golden runs to ~9.6 GB, so this budget is really a floor on
@@ -854,15 +1195,21 @@ async fn download_prebaked_golden_with_space(
     let forced_url = std::env::var("PRELOOP_GOLDEN_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    if std::env::consts::ARCH == "aarch64" && forced_url.is_none() {
+    // Per-architecture OCI golden: try it wherever a packed artifact is
+    // published for this platform; `PRELOOP_GOLDEN_OCI_REF` overrides the
+    // per-arch default regardless of platform. A missing package (e.g. an
+    // arch not yet published) falls through to the release-asset path.
+    if forced_url.is_none() {
         let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_GOLDEN_OCI_REF.to_owned());
-        if download_oci_golden(payload, &reference, available_space).await? {
-            return Ok(true);
+            .or_else(|| default_golden_oci_ref().map(str::to_owned));
+        if let Some(reference) = reference {
+            if download_oci_golden(payload, &reference, available_space).await? {
+                return Ok(true);
+            }
+            info!(reference, "OCI golden unavailable; trying release asset");
         }
-        info!(reference, "OCI golden unavailable; trying release asset");
     }
 
     let client = match reqwest::Client::builder()
@@ -1037,6 +1384,24 @@ async fn download_golden_with_resume(
             let _ = tokio::fs::remove_file(partial).await;
             continue;
         }
+        // A transfer that cannot land wastes the whole multi-GiB body and
+        // dies at ENOSPC partway through; refuse before requesting it. The
+        // probe's Content-Length stands in when the caller had no size.
+        let total = expected_total_bytes.or_else(|| {
+            pending_response
+                .as_ref()
+                .filter(|_| have == 0)
+                .and_then(reqwest::Response::content_length)
+        });
+        if let Some(total) = total {
+            let directory = partial.parent().unwrap_or(Path::new("."));
+            ensure_free_disk(
+                directory,
+                total.saturating_sub(have) + GOLDEN_DOWNLOAD_DISK_MARGIN,
+                "golden download",
+                "free space on this volume",
+            )?;
+        }
         let response = match pending_response.take().filter(|_| have == 0) {
             Some(response) => response,
             None => match request_at(have).await {
@@ -1156,29 +1521,6 @@ async fn sha256_file(path: &Path) -> Result<String, String> {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct OciManifest {
-    #[serde(default)]
-    layers: Vec<OciLayer>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciLayer {
-    digest: String,
-    #[serde(default)]
-    size: Option<u64>,
-    /// OCI descriptors name this field `mediaType`; without the rename every
-    /// standard manifest fails to parse and the OCI path silently falls back
-    /// to the release asset.
-    #[serde(rename = "mediaType")]
-    media_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OciToken {
-    token: String,
-}
-
 /// Download the packed VM layer from a public OCI artifact without requiring
 /// `oras`, Docker, or any other host-side registry client.
 async fn download_oci_golden(
@@ -1186,7 +1528,7 @@ async fn download_oci_golden(
     reference: &str,
     available_space: AvailableSpace,
 ) -> Result<bool, OrchestratorError> {
-    let Some((registry, repository, version)) = split_oci_reference(reference) else {
+    let Ok(oci) = OciReference::parse(reference) else {
         warn!(reference, "invalid OCI golden reference");
         return Ok(false);
     };
@@ -1200,27 +1542,37 @@ async fn download_oci_golden(
             return Ok(false);
         }
     };
-    let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
-    let accept = "application/vnd.oci.image.manifest.v1+json, \
-                  application/vnd.docker.distribution.manifest.v2+json";
-    let response = match registry_get(&client, &manifest_url, accept, None).await {
-        Ok(response) => response,
+    // Accept indexes too: `smolvm pack push` publishes the packed artifact
+    // under an OCI index, so the digest/tags resolve to one indirection. The
+    // shared client follows that one level, taking the first listed manifest
+    // (our packs publish exactly one platform entry).
+    let resolved = match get_manifest(&client, &oci, MANIFEST_ACCEPT, None).await {
+        Ok(resolved) => resolved,
         Err(error) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
             return Ok(false);
         }
     };
-    let manifest = match response.json::<OciManifest>().await {
+    if let Some(error) = &resolved.follow_error {
+        warn!(reference, %error, "OCI golden inner manifest unavailable");
+        return Ok(false);
+    }
+    let manifest = match serde_json::from_value::<OciManifest>(resolved.image) {
         Ok(manifest) => manifest,
         Err(error) => {
-            warn!(reference, %error, "OCI golden manifest parse failed");
+            let message = if resolved.selected_digest.is_some() {
+                "OCI golden inner manifest parse failed"
+            } else {
+                "OCI golden manifest parse failed"
+            };
+            warn!(reference, %error, message);
             return Ok(false);
         }
     };
     let Some(layer) = manifest
         .layers
         .into_iter()
-        .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+        .find(|layer| is_packed_vm_layer(&layer.media_type))
     else {
         warn!(reference, "OCI golden has no packed VM layer");
         return Ok(false);
@@ -1228,7 +1580,7 @@ async fn download_oci_golden(
     let layer_size = layer.size;
     ensure_golden_download_space(payload, layer_size, available_space)?;
     let layer_digest = layer.digest;
-    let blob_url = format!("https://{registry}/v2/{repository}/blobs/{layer_digest}");
+    let blob_url = oci.blob_url(&layer_digest);
     info!(
         "pulling pre-baked OCI golden ({} MB) from {} into {}",
         layer_size.map(megabytes).unwrap_or_default(),
@@ -1239,11 +1591,22 @@ async fn download_oci_golden(
     let downloaded = {
         let client = client.clone();
         let blob_url = blob_url.clone();
+        let repository = oci.repository.clone();
         download_golden_with_resume(&partial, "OCI", layer_size, None, move |offset| {
             let client = client.clone();
             let url = blob_url.clone();
+            let repository = repository.clone();
             Box::pin(async move {
-                registry_get(&client, &url, "*/*", (offset > 0).then_some(offset)).await
+                crate::oci::registry_get(
+                    &client,
+                    &url,
+                    &repository,
+                    "*/*",
+                    None,
+                    (offset > 0).then_some(offset),
+                )
+                .await
+                .map_err(|error| error.to_string())
             }) as BoxFuture<'static, Result<reqwest::Response, String>>
         })
         .await
@@ -1299,93 +1662,6 @@ async fn download_oci_golden(
         }
     }
     Ok(false)
-}
-
-async fn registry_get(
-    client: &reqwest::Client,
-    url: &str,
-    accept: &str,
-    resume_from: Option<u64>,
-) -> Result<reqwest::Response, String> {
-    let with_range = |request: reqwest::RequestBuilder| match resume_from {
-        Some(offset) => request.header(reqwest::header::RANGE, format!("bytes={offset}-")),
-        None => request,
-    };
-    let response = with_range(client.get(url).header(reqwest::header::ACCEPT, accept))
-        .send()
-        .await
-        .map_err(|error| format!("request failed: {error}"))?;
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Err(format!("registry returned HTTP {}", response.status()));
-    }
-    let challenge = response
-        .headers()
-        .get(reqwest::header::WWW_AUTHENTICATE)
-        .ok_or_else(|| "registry response has no auth challenge".to_owned())?
-        .to_str()
-        .map_err(|error| format!("invalid registry auth challenge: {error}"))?;
-    let realm = auth_parameter(challenge, "realm")
-        .ok_or_else(|| "registry auth challenge has no realm".to_owned())?;
-    let service = auth_parameter(challenge, "service")
-        .ok_or_else(|| "registry auth challenge has no service".to_owned())?;
-    let scope = auth_parameter(challenge, "scope")
-        .ok_or_else(|| "registry auth challenge has no scope".to_owned())?;
-    let token = client
-        .get(realm)
-        .query(&[("service", service), ("scope", scope)])
-        .send()
-        .await
-        .map_err(|error| format!("registry token request failed: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("registry token request failed: {error}"))?
-        .json::<OciToken>()
-        .await
-        .map_err(|error| format!("registry token response was invalid: {error}"))?;
-    let response = with_range(
-        client
-            .get(url)
-            .header(reqwest::header::ACCEPT, accept)
-            .bearer_auth(token.token),
-    )
-    .send()
-    .await
-    .map_err(|error| format!("authenticated registry request failed: {error}"))?;
-    if response.status().is_success() {
-        Ok(response)
-    } else {
-        Err(format!(
-            "authenticated registry request returned HTTP {}",
-            response.status()
-        ))
-    }
-}
-
-fn auth_parameter(challenge: &str, name: &str) -> Option<String> {
-    challenge.split(',').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        (key.trim()
-            .trim_start_matches("Bearer ")
-            .eq_ignore_ascii_case(name))
-        .then(|| value.trim_matches('"').to_owned())
-    })
-}
-
-fn split_oci_reference(reference: &str) -> Option<(String, String, String)> {
-    let (registry, remainder) = reference.split_once('/')?;
-    let (repository, version) = remainder
-        .rsplit_once('@')
-        .or_else(|| remainder.rsplit_once(':'))?;
-    if registry.is_empty() || repository.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((
-        registry.to_owned(),
-        repository.to_owned(),
-        version.to_owned(),
-    ))
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
@@ -2440,6 +2716,12 @@ pub struct RunnerPoolConfig {
     pub storage_gib: u32,
     /// Root overlay size per runner in GiB; `None` keeps the provider default.
     pub overlay_gib: Option<u32>,
+    /// Free-space reserve that gates starting a job VM (fork or create).
+    ///
+    /// Production builds this from `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default
+    /// 20 GiB, `0` disables); a fork or create below the reserve waits for
+    /// space instead of filling the host or failing the job.
+    pub job_vm_disk: JobVmDiskReserve,
     /// Directory for debug session markers (e.g. `~/.preloop/state/debug`).
     ///
     /// When set, a runner whose job requested `preserve_on_failure` and then
@@ -3129,6 +3411,16 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     {
         return Ok(());
     }
+    // Unpacking writes the golden's filesystem; its disk can grow to the
+    // configured storage ceiling, and job forks grow on top of it. Not a
+    // refusal: how much of the ceiling a given golden writes is image-specific
+    // and the disk is sparse, so only flag a host that could not hold one
+    // golden at its ceiling.
+    warn_if_disk_below(
+        &golden_disk_root(config),
+        u64::from(config.storage_gib) * GIB,
+        "packed golden unpack",
+    );
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
@@ -3259,6 +3551,22 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         }
         self.sweep_stale_artifacts().await;
         self.remove_stale_machines().await?;
+
+        // Reconcile leaked VM state for the whole time the pool serves. The
+        // startup pass above cannot see a delete that fails later, and an
+        // engine that serves for hours (or days) then holds every leaked
+        // machine and data dir until the next restart.
+        let reconciler_shutdown = shutdown.child_token();
+        let _reconciler = ReconcileGuard {
+            shutdown: reconciler_shutdown.clone(),
+            handle: {
+                let provider = self.provider.clone();
+                tokio::spawn(async move {
+                    reconcile_orphans(provider, reconciler_shutdown, ORPHAN_RECONCILE_INTERVAL)
+                        .await
+                })
+            },
+        };
 
         let golden_registry = Arc::new(GoldenRegistry::new(self.config.name_prefix.clone()));
 
@@ -3618,15 +3926,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if self.provider.status(&name).await? != MachineState::Missing {
             self.provider.delete(&name).await?;
         }
+        // Packing exports a second copy of the guest filesystem before
+        // producing the artifact. Give the one-shot builder headroom
+        // without increasing the storage allocated to job VMs.
+        let builder_storage_gib = golden_builder_storage_gib(self.config.storage_gib);
+        // Checked after the stale builder is gone, so its space counts as free.
+        ensure_disk_for_golden_build(&golden_disk_root(&self.config), builder_storage_gib)
+            .map_err(OrchestratorError::Config)?;
         let spec = MachineSpec {
             name: name.clone(),
             image: self.config.base_image.clone(),
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
-            // Packing exports a second copy of the guest filesystem before
-            // producing the artifact. Give the one-shot builder headroom
-            // without increasing the storage allocated to job VMs.
-            storage_gib: self.config.storage_gib.max(40),
+            storage_gib: builder_storage_gib,
             overlay_gib: self.config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
@@ -3851,7 +4163,11 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // smolvm DB no longer knows the machines, so the deletes above
         // cannot reach them and they keep the storage fds open — the
         // unlinked blocks leak until the process dies. Kill by config path.
-        match preloop_vm::purge_orphaned_vms() {
+        // `All` is only sound here: every Preloop machine is stale by now, so
+        // nothing of ours can be running. The periodic reconcile the pool
+        // runs while serving uses `RemovedDataDir`, which spares any process
+        // whose boot config still exists.
+        match preloop_vm::purge_orphaned_vms(preloop_vm::OrphanPurge::All) {
             Ok(killed) if killed > 0 => {
                 info!(killed, "purged orphaned SmolVM hypervisor processes")
             }
@@ -4546,7 +4862,7 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
 
     // Provision a single-use runner.
     let generation = 1_u64;
-    let runner = provision_slot(
+    let Some(runner) = provision_slot(
         &provider,
         &config,
         slot,
@@ -4554,8 +4870,12 @@ async fn run_on_demand_slot<P: VmProvider + 'static>(
         golden.as_ref(),
         &handles.keys,
         environment.clone(),
+        &shutdown,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
     // `provision_slot` returns only after runner registration succeeds. From
     // this point the starvation sweep can see a matching runner directly.
     drop(preparing);
@@ -4770,10 +5090,13 @@ async fn run_slot<P: VmProvider + 'static>(
                     golden.as_ref(),
                     &keys,
                     environment.clone(),
+                    &shutdown,
                 )
                 .await
                 {
-                    Ok(runner) => runner,
+                    Ok(Some(runner)) => runner,
+                    // The disk reserve held the start until shutdown.
+                    Ok(None) => break,
                     Err(error) => {
                         warn!(slot, %error, "provisioning runner failed; retrying");
                         tokio::select! {
@@ -4834,6 +5157,11 @@ async fn run_slot<P: VmProvider + 'static>(
 ///
 /// Names carry a generation so a replacement can boot while its predecessor is
 /// still being torn down; reusing one name per slot forced those to serialize.
+///
+/// `Ok(None)` means the pool is stopping: the disk reserve held the start and
+/// `shutdown` fired while the slot waited, so no VM was created and there is
+/// nothing to account for.
+#[allow(clippy::too_many_arguments)]
 async fn provision_slot<P: VmProvider + 'static>(
     provider: &Arc<P>,
     config: &RunnerPoolConfig,
@@ -4842,7 +5170,15 @@ async fn provision_slot<P: VmProvider + 'static>(
     golden: Option<&MachineName>,
     keys: &Arc<KeyPool>,
     environment: RunnerEnvironment,
-) -> Result<ReadyRunner, OrchestratorError> {
+    shutdown: &CancellationToken,
+) -> Result<Option<ReadyRunner>, OrchestratorError> {
+    // Refuse to start a job VM on a volume without room for it. Waiting here
+    // (rather than in `provision_runner`) keeps every path that forks or
+    // creates a runner behind one check.
+    if !wait_for_vm_disk(config, shutdown).await {
+        debug!(slot, "pool stopping; abandoning runner provisioning");
+        return Ok(None);
+    }
     let name = match MachineName::new(format!("{}-{slot}-{generation}", config.name_prefix)) {
         Ok(name) => name,
         Err(error) => {
@@ -4859,11 +5195,11 @@ async fn provision_slot<P: VmProvider + 'static>(
             if let Some(ps) = &config.pool_status {
                 ps.clear_provision_failures();
             }
-            Ok(ReadyRunner {
+            Ok(Some(ReadyRunner {
                 name,
                 run,
                 environment,
-            })
+            }))
         }
         Err(error) => {
             record_slot_failure(config, "provision");
@@ -5058,12 +5394,15 @@ async fn run_one_runner<P: VmProvider + 'static>(
             golden,
             keys,
             successor_environment,
+            &shutdown,
         )
         .await
         {
             Ok(successor) => {
                 drop(preparing);
-                Some(successor)
+                // `None` means the disk reserve held the start until shutdown:
+                // the slot keeps its current job and stops replenishing.
+                successor
             }
             Err(error) => {
                 drop(preparing);
@@ -7344,43 +7683,19 @@ chmod +x "$dest/bin/node"
 
     #[test]
     fn default_oci_golden_reference_targets_arm64_pack() {
-        let (registry, repository, version) =
-            split_oci_reference(DEFAULT_GOLDEN_OCI_REF).expect("valid OCI reference");
-        assert_eq!(registry, "ghcr.io");
-        assert_eq!(repository, "preloopdev/preloop-golden");
+        let reference = OciReference::parse(GOLDEN_OCI_REF_ARM64).expect("valid OCI reference");
+        assert_eq!(reference.registry, "ghcr.io");
+        assert_eq!(
+            reference.repository,
+            "preloopdev/preloop-arm64-smolvm-golden"
+        );
         // Immutable digest pin: changing the default must be a reviewed code
         // change, not a registry retag.
         assert!(
-            version.len() == "sha256:".len() + 64 && version.starts_with("sha256:"),
-            "expected a digest-pinned default, got `{version}`"
-        );
-    }
-
-    #[test]
-    fn oci_layer_deserializes_camel_case_media_type() {
-        let manifest: OciManifest = serde_json::from_str(
-            r#"{"layers":[{"digest":"sha256:00","size":42,"mediaType":"application/vnd.preloop.smolmachine.v1+zstd"}]}"#,
-        )
-        .expect("standard OCI manifest must parse");
-        let layer = manifest
-            .layers
-            .into_iter()
-            .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
-            .expect("packed VM layer present");
-        assert_eq!(layer.digest, "sha256:00");
-        assert_eq!(layer.size, Some(42));
-    }
-
-    #[test]
-    fn oci_auth_challenge_parameters_parse() {
-        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-golden:pull""#;
-        assert_eq!(
-            auth_parameter(challenge, "realm").as_deref(),
-            Some("https://ghcr.io/token")
-        );
-        assert_eq!(
-            auth_parameter(challenge, "scope").as_deref(),
-            Some("repository:preloopdev/preloop-golden:pull")
+            reference.reference.len() == "sha256:".len() + 64
+                && reference.reference.starts_with("sha256:"),
+            "expected a digest-pinned default, got `{}`",
+            reference.reference
         );
     }
 
@@ -7653,6 +7968,9 @@ chmod +x "$dest/bin/node"
             memory_mib: 128,
             storage_gib: 1,
             overlay_gib: None,
+            // Tests that must not depend on the host's free space start with
+            // the check disabled; the reserve tests script their own.
+            job_vm_disk: JobVmDiskReserve::new(0, |_| Ok(0)),
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
@@ -7731,6 +8049,13 @@ chmod +x "$dest/bin/node"
                 .await
                 .push(name.as_str().to_owned());
             Ok(true)
+        }
+
+        /// Records each reconcile sweep instead of removing anything, so a
+        /// test can watch the pool's periodic orphan pass without a registry.
+        async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+            self.events.lock().await.push("sweep".to_owned());
+            Ok(0)
         }
 
         async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
@@ -7972,6 +8297,7 @@ chmod +x "$dest/bin/node"
                 toolchains: Vec::new(),
                 curated: true,
             },
+            &CancellationToken::new(),
         )
         .await
         .expect_err("provisioning failure must propagate");
@@ -8053,6 +8379,7 @@ chmod +x "$dest/bin/node"
                 toolchains: Vec::new(),
                 curated: true,
             },
+            &CancellationToken::new(),
         )
         .await
         .expect_err("start-failure must propagate");
@@ -8074,10 +8401,313 @@ chmod +x "$dest/bin/node"
                 toolchains: Vec::new(),
                 curated: true,
             },
+            &CancellationToken::new(),
         )
         .await
         .expect("provisioning succeeds");
         assert_eq!(pool_status.snapshot().consecutive_provision_failures, 0);
+    }
+
+    /// The environment knob maps to the reserve: unset keeps the 20 GiB
+    /// default, `0` disables the check, and a typo keeps the default rather
+    /// than silently removing the guard against filling the host.
+    #[test]
+    fn min_free_disk_bytes_parses_env_policy() {
+        for raw in [None, Some(""), Some("   "), Some("nope"), Some("-1")] {
+            assert_eq!(
+                min_free_disk_bytes(raw),
+                20 * GIB,
+                "{raw:?} must keep the default reserve"
+            );
+        }
+        assert_eq!(min_free_disk_bytes(Some("0")), 0, "0 disables the reserve");
+        assert_eq!(min_free_disk_bytes(Some("7")), 7 * GIB);
+        assert_eq!(min_free_disk_bytes(Some(" 7 ")), 7 * GIB);
+    }
+
+    /// The reserve gates every job-VM start: below it the slot waits and
+    /// re-measures without creating or forking anything (and without
+    /// recording a provision failure); at or above it, with the reserve
+    /// disabled, and on a volume that cannot be measured, the VM starts.
+    #[tokio::test]
+    async fn job_vm_disk_reserve_gates_job_vm_starts() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            label: &'static str,
+            free: Result<u64, ()>,
+            reserve_bytes: u64,
+            starts: bool,
+        }
+        let cases = [
+            Case {
+                label: "below the reserve",
+                free: Ok(GIB),
+                reserve_bytes: 20 * GIB,
+                starts: false,
+            },
+            Case {
+                label: "at the reserve",
+                free: Ok(20 * GIB),
+                reserve_bytes: 20 * GIB,
+                starts: true,
+            },
+            Case {
+                label: "above the reserve",
+                free: Ok(64 * GIB),
+                reserve_bytes: 20 * GIB,
+                starts: true,
+            },
+            Case {
+                label: "reserve disabled",
+                free: Ok(0),
+                reserve_bytes: 0,
+                starts: true,
+            },
+            Case {
+                label: "unmeasurable volume",
+                free: Err(()),
+                reserve_bytes: 20 * GIB,
+                starts: true,
+            },
+        ];
+
+        for case in cases {
+            let mut config = test_config(false);
+            let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+                preloop_observability::status::PoolSnapshot::default(),
+            ));
+            config.pool_status = Some(pool_status.clone());
+            let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = probes.clone();
+            config.job_vm_disk = JobVmDiskReserve::new(case.reserve_bytes, move |_| {
+                counted.fetch_add(1, Ordering::AcqRel);
+                match case.free {
+                    Ok(free) => Ok(free),
+                    Err(()) => Err(test_error("df-failure")),
+                }
+            })
+            .with_probe_interval(Duration::from_millis(5));
+
+            let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+            let shutdown = CancellationToken::new();
+            let name = MachineName::new(format!("{}-0-1", config.name_prefix)).unwrap();
+            let keys = Arc::new(KeyPool::new());
+            let provision = provision_slot(
+                &provider,
+                &config,
+                0,
+                1,
+                None,
+                &keys,
+                test_runner_environment("base-image", Vec::new(), true),
+                &shutdown,
+            );
+            if case.starts {
+                let runner = tokio::time::timeout(Duration::from_secs(5), provision)
+                    .await
+                    .unwrap_or_else(|_| panic!("{}: the start must not wait", case.label))
+                    .expect("provisioning succeeds");
+                assert!(runner.is_some(), "{}: a runner was provisioned", case.label);
+                assert!(
+                    provider.has_machine(&name).await,
+                    "{}: the job VM must start",
+                    case.label
+                );
+                assert_eq!(
+                    probes.load(Ordering::Acquire),
+                    usize::from(case.reserve_bytes != 0),
+                    "{}: a disabled reserve never measures, an enabled one decides in one",
+                    case.label
+                );
+                continue;
+            }
+
+            let waited = tokio::time::timeout(Duration::from_millis(250), provision).await;
+            assert!(
+                waited.is_err(),
+                "{}: the start must be held, not resolved",
+                case.label
+            );
+            assert!(
+                !provider.has_machine(&name).await,
+                "{}: no machine may be created or forked",
+                case.label
+            );
+            assert!(
+                probes.load(Ordering::Acquire) > 1,
+                "{}: the held slot must keep re-measuring",
+                case.label
+            );
+            // A full host is not a broken provision: no slot failure, and no
+            // delete/cleanup churn on machines that were never created.
+            assert_eq!(
+                pool_status.snapshot().consecutive_provision_failures,
+                0,
+                "{}: waiting for disk must not count as a provision failure",
+                case.label
+            );
+            assert!(
+                provider.events().await.is_empty(),
+                "{}: the held slot must not touch the provider",
+                case.label
+            );
+        }
+    }
+
+    /// A slot held by the reserve starts its VM as soon as space frees (no
+    /// engine restart), and a shutdown during the wait abandons the start
+    /// cleanly instead of failing the provision.
+    #[tokio::test]
+    async fn held_slot_starts_when_space_frees_and_aborts_on_shutdown() {
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(GIB));
+        let probe_free = free.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = probes.clone();
+        let mut config = test_config(false);
+        config.job_vm_disk = JobVmDiskReserve::new(20 * GIB, move |_| {
+            counted.fetch_add(1, Ordering::AcqRel);
+            Ok(probe_free.load(Ordering::Acquire))
+        })
+        .with_probe_interval(Duration::from_millis(5));
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::new(
+            preloop_observability::status::PoolSnapshot::default(),
+        ));
+        config.pool_status = Some(pool_status.clone());
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let name = MachineName::new(format!("{}-0-1", config.name_prefix)).unwrap();
+
+        let provision = |generation: u64, shutdown: CancellationToken| {
+            let provider = provider.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                provision_slot(
+                    &provider,
+                    &config,
+                    0,
+                    generation,
+                    None,
+                    &Arc::new(KeyPool::new()),
+                    test_runner_environment("base-image", Vec::new(), true),
+                    &shutdown,
+                )
+                .await
+            })
+        };
+
+        // Held: the slot waits, nothing is created.
+        let settled = provision(1, CancellationToken::new());
+        while probes.load(Ordering::Acquire) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !provider.has_machine(&name).await,
+            "a slot below the reserve must not start a VM"
+        );
+
+        // Space frees: the same slot resumes without an engine restart.
+        free.store(64 * GIB, Ordering::Release);
+        let runner = tokio::time::timeout(Duration::from_secs(5), settled)
+            .await
+            .expect("a slot must resume once space frees")
+            .expect("task joins")
+            .expect("provisioning succeeds");
+        assert!(runner.is_some(), "the resumed slot provisions its runner");
+        assert!(provider.has_machine(&name).await);
+        assert_eq!(pool_status.snapshot().consecutive_provision_failures, 0);
+
+        // Shutdown while held: abandoned, not failed, and no VM is left.
+        free.store(GIB, Ordering::Release);
+        let shutdown = CancellationToken::new();
+        let held = provision(2, shutdown.clone());
+        while probes.load(Ordering::Acquire) < 6 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        shutdown.cancel();
+        let abandoned = tokio::time::timeout(Duration::from_secs(5), held)
+            .await
+            .expect("shutdown must end the wait")
+            .expect("task joins")
+            .expect("an aborted start is not an error");
+        assert!(
+            abandoned.is_none(),
+            "shutdown abandons the start instead of provisioning"
+        );
+        assert_eq!(
+            pool_status.snapshot().consecutive_provision_failures,
+            0,
+            "abandoning a held start must not record a provision failure"
+        );
+    }
+
+    /// The periodic reconcile sweeps while the pool serves, leaves every
+    /// registered machine alone, and stops when the pool's shutdown fires.
+    #[tokio::test]
+    async fn periodic_reconcile_sweeps_registered_machines_are_spared() {
+        let home = std::env::temp_dir().join(format!("preloop-reconcile-{}", std::process::id()));
+        let previous_home = std::env::var_os("PRELOOP_HOME");
+        // SAFETY: no other test in this crate reads PRELOOP_HOME; it is set
+        // only so the reconcile tick's hypervisor purge scans a scratch home
+        // instead of the developer's.
+        unsafe { std::env::set_var("PRELOOP_HOME", &home) };
+
+        let provider = Arc::new(TestProvider::new(false, false, false, false, false));
+        let registered = MachineName::new("lifecycle-test-0-1").unwrap();
+        provider
+            .machines
+            .lock()
+            .await
+            .insert(registered.as_str().to_owned(), MachineState::Running);
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(reconcile_orphans(
+            provider.clone(),
+            shutdown.clone(),
+            Duration::from_millis(20),
+        ));
+
+        let sweeps = |events: &[String]| events.iter().filter(|event| *event == "sweep").count();
+        let mut observed = 0;
+        for _ in 0..200 {
+            observed = sweeps(&provider.events().await);
+            if observed >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed >= 2,
+            "the pool must reconcile repeatedly while it serves, saw {observed} sweeps"
+        );
+        assert!(
+            provider.has_machine(&registered).await,
+            "a registered machine must survive the reconcile"
+        );
+        let events = provider.events().await;
+        assert!(
+            !events.iter().any(|event| {
+                event
+                    .strip_prefix("delete:")
+                    .or_else(|| event.strip_prefix("stop:"))
+                    .is_some_and(|name| name == registered.as_str())
+            }),
+            "the reconcile must never delete or stop a registered machine: {events:?}"
+        );
+
+        shutdown.cancel();
+        task.await.expect("reconcile task joins");
+        let after_shutdown = sweeps(&provider.events().await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            sweeps(&provider.events().await),
+            after_shutdown,
+            "the reconcile must stop with the pool"
+        );
+
+        match previous_home {
+            // SAFETY: see above.
+            Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
+            // SAFETY: see above.
+            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
+        }
     }
 
     fn packed_fork_config() -> RunnerPoolConfig {
@@ -8872,9 +9502,11 @@ chmod +x "$dest/bin/node"
                 toolchains: Vec::new(),
                 curated: true,
             },
+            &CancellationToken::new(),
         )
         .await
-        .expect("provisioning succeeds");
+        .expect("provisioning succeeds")
+        .expect("a runner is provisioned");
         let idle = std::sync::Mutex::new(0);
         let error = run_one_runner(
             provider,
@@ -9016,6 +9648,40 @@ mod golden_download_tests {
     /// which every test in this binary shares, so two of them pointing at
     /// different servers would otherwise interleave.
     static GOLDEN_URL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn disk_check_refuses_only_what_cannot_fit() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(ensure_free_disk(directory.path(), 0, "test", "remedy").is_ok());
+        assert!(ensure_free_disk(directory.path(), u64::MAX, "test", "remedy").is_err());
+    }
+
+    /// An artifact that cannot land must be refused before any byte is
+    /// requested: the failure being prevented is a multi-GiB body dying at
+    /// ENOSPC partway through.
+    #[tokio::test]
+    async fn download_larger_than_free_space_is_refused_before_requesting() {
+        let directory = tempfile::tempdir().unwrap();
+        let partial = directory.path().join("golden.smolmachine.partial");
+        let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&requested);
+        let result =
+            download_golden_with_resume(&partial, "test", Some(u64::MAX / 2), None, move |_| {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Err("must not be requested".to_owned()) })
+                    as BoxFuture<'static, Result<reqwest::Response, String>>
+            })
+            .await;
+        assert!(result.is_err(), "an artifact that cannot fit must fail");
+        assert!(
+            !requested.load(std::sync::atomic::Ordering::SeqCst),
+            "refusal must happen before the transfer is requested"
+        );
+        assert!(
+            !partial.exists(),
+            "nothing may be written for a refused transfer"
+        );
+    }
 
     #[test]
     fn custom_base_without_golden_url_does_not_adopt_stock_release() {

@@ -16,6 +16,48 @@ Releases before v0.27.0 predate the changelog.
   `$PRELOOP_HOME/credentials`, for headless hosts and containers where keychain
   prompts are unacceptable), or `memory` (non-persistent; tests only).
 
+- **`preloop init`** — one command for first-run setup, replacing the split
+  between `preloop setup` and choosing a golden by hand. In a terminal it is a
+  four-step wizard (credentials, golden, run mode, preflight); with stdin or
+  stdout not a TTY it takes the same answers as flags, never prompts, and exits
+  `2` on a missing flag, `3` on a failed preflight (disk, architecture,
+  hypervisor), `4` on a failure to resolve, pull, or build the base image.
+  `preloop init --probe --json` reports host capabilities (arch, free space on
+  the SmolVM data volume, hypervisor, docker, smolvm, existing config,
+  credential state, GHCR reachability) without side effects. The golden choices
+  are the packed official GitHub runner image (the default: drop-in parity,
+  ~60 GB on disk), an OCI reference verified anonymously before it is written,
+  a Dockerfile built here with `docker build`/`docker save` into a local tar
+  (`*.tar` is what smolvm's `--image` branch accepts), and a local
+  `.smolmachine` pack or rootfs directory. The credential step *is*
+  `preloop setup github` and is verified live the way `preloop doctor` does.
+  The choice is recorded in the existing config file as `[golden] base_image`,
+  which `serve` and `server install` read, with `PRELOOP_RUNNER_BASE_IMAGE`
+  still taking precedence; `serve` with no golden configured offers the wizard
+  on a TTY and otherwise prints one hint and proceeds with the official image.
+- Golden disk preflight. A golden download is refused before the transfer
+  starts when the artifact cannot fit on its volume, and a golden build is
+  refused when the SmolVM data volume has less than the builder disk + 20 GiB
+  of pack staging free (the rule the golden workflows already enforce).
+  Unpacking a packed golden warns when the volume cannot hold one golden at
+  its storage ceiling. `PRELOOP_SKIP_DISK_PREFLIGHT=1` proceeds with a
+  warning instead.
+- Runtime VM-state reconciliation. While `serve` runs, the pool sweeps
+  orphaned machine data directories and purges orphaned `_boot-vm`
+  hypervisors every 10 minutes instead of only at startup, so a `machine
+  delete` that fails mid-run no longer leaks its disk until the next engine
+  restart (long-lived engines grew 99 GB → 168 GB of VM state in an
+  afternoon). The mid-flight purge spares any hypervisor whose boot config is
+  still on disk, so a registered machine, a golden fork base, and a create in
+  flight are never touched; `remove_stale_machines` stays startup-only.
+- Job-VM disk reserve. Before a warm or on-demand slot forks or creates a job
+  VM it measures free space on the SmolVM data volume and waits (logging
+  `waiting for disk: … free on …, reserve …`) while it is below
+  `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB, `0` disables) instead of
+  filling the host or failing the job. The wait is not a provisioning
+  failure, so a full host does not trip the repeated-provision-failure alert;
+  an unmeasurable volume warns once and proceeds.
+
 ### Changed
 
 - Control-plane state is database-authoritative. Runs, jobs, runners, sessions,

@@ -403,5 +403,5 @@ jobs:
           sha256sum "dist/$GOLDEN_NAME.part."* > "dist/$GOLDEN_NAME.parts.sha256"
 
   # aarch64 golden: built once on macstudio (hosted macOS EINVAL blocks the
-  # bake), published to ghcr.io/preloopdev/preloop-golden and consumed via
-  # PRELOOP_GOLDEN_OCI_REF. No CI bake — the artifact is a release input.
+  # bake), published to ghcr.io/preloopdev/preloop-arm64-smolvm-golden
+  # and consumed via PRELOOP_GOLDEN_OCI_REF. No CI bake — the artifact is a release input.
