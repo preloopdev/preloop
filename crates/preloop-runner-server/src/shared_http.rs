@@ -18,7 +18,9 @@ use std::time::Duration;
 fn ca_certificates() -> Vec<reqwest::Certificate> {
     let mut out = Vec::new();
     for var in ["PRELOOP_GITHUB_CA_FILE", "SSL_CERT_FILE"] {
-        let Ok(path) = std::env::var(var) else { continue };
+        let Ok(path) = std::env::var(var) else {
+            continue;
+        };
         if path.trim().is_empty() {
             continue;
         }
@@ -83,11 +85,23 @@ mod tests {
 
     fn write_self_signed_pem(path: &std::path::Path) {
         let key = std::env::temp_dir().join("ghsim_ca_test_key.pem");
-        let _ = std::process::Command::new("openssl").args([
-            "req","-x509","-newkey","rsa:2048","-keyout",
-            key.to_str().unwrap(),"-out",path.to_str().unwrap(),
-            "-days","1","-nodes","-subj","/CN=gh-simulate-test",
-        ]).output();
+        let _ = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                path.to_str().unwrap(),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=gh-simulate-test",
+            ])
+            .output();
     }
 
     #[test]
