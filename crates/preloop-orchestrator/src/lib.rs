@@ -697,14 +697,10 @@ fn default_golden_oci_ref() -> Option<&'static str> {
     }
 }
 
-/// The arm64 packed golden.
-///
-/// TODO(golden-pin): replace the digest below with the manifest digest of
-/// `ghcr.io/preloopdev/preloop-arm64-smolvm-golden` once the artifact is
-/// pushed under its new name; the value shown is the pre-rename
-/// `preloop-golden` pin kept for continuity and is not yet published at
-/// this repository path.
-const GOLDEN_OCI_REF_ARM64: &str = "ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+/// The arm64 packed golden, digest-pinned to the published
+/// `preloop-arm64-smolvm-golden` artifact (pushed 2026-09-30 from a
+/// macstudio `build-golden` bake of `runner-images@3884ef22…`).
+const GOLDEN_OCI_REF_ARM64: &str = "ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414";
 /// Deadline for a whole golden download, response body included.
 ///
 /// The packed golden runs to ~9.6 GB, so this budget is really a floor on
@@ -1097,6 +1093,14 @@ async fn sha256_file(path: &Path) -> Result<String, String> {
 struct OciManifest {
     #[serde(default)]
     layers: Vec<OciLayer>,
+    /// Present on OCI indexes: the listed image manifests to select from.
+    #[serde(default)]
+    manifests: Vec<OciDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciDescriptor {
+    digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1114,6 +1118,13 @@ struct OciLayer {
 #[derive(Debug, Deserialize)]
 struct OciToken {
     token: String,
+}
+
+/// Media types that mark the packed-VM layer: the engine's own historical
+/// artifacts and smolvm's native `pack push` media type.
+fn is_packed_vm_layer(media_type: &str) -> bool {
+    media_type == "application/vnd.preloop.smolmachine.v1+zstd"
+        || media_type == "application/vnd.smolmachines.smolmachine.v1"
 }
 
 /// Download the packed VM layer from a public OCI artifact without requiring
@@ -1134,7 +1145,11 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         }
     };
     let manifest_url = format!("https://{registry}/v2/{repository}/manifests/{version}");
-    let accept = "application/vnd.oci.image.manifest.v1+json, \
+    // Accept indexes too: `smolvm pack push` publishes the packed artifact
+    // under an OCI index, so the digest/tags resolve to one indirection.
+    let accept = "application/vnd.oci.image.index.v1+json, \
+                  application/vnd.oci.image.manifest.v1+json, \
+                  application/vnd.docker.distribution.manifest.list.v2+json, \
                   application/vnd.docker.distribution.manifest.v2+json";
     let response = match registry_get(&client, &manifest_url, accept, None).await {
         Ok(response) => response,
@@ -1143,17 +1158,36 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
             return false;
         }
     };
-    let manifest = match response.json::<OciManifest>().await {
+    let mut manifest = match response.json::<OciManifest>().await {
         Ok(manifest) => manifest,
         Err(error) => {
             warn!(reference, %error, "OCI golden manifest parse failed");
             return false;
         }
     };
+    // Index indirection: take the first listed manifest (our packs publish
+    // exactly one platform entry).
+    if manifest.layers.is_empty() && !manifest.manifests.is_empty() {
+        let digest = manifest.manifests[0].digest.clone();
+        let inner_url = format!("https://{registry}/v2/{repository}/manifests/{digest}");
+        manifest = match registry_get(&client, &inner_url, accept, None).await {
+            Ok(response) => match response.json::<OciManifest>().await {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    warn!(reference, %error, "OCI golden inner manifest parse failed");
+                    return false;
+                }
+            },
+            Err(error) => {
+                warn!(reference, %error, "OCI golden inner manifest unavailable");
+                return false;
+            }
+        };
+    }
     let Some(layer) = manifest
         .layers
         .into_iter()
-        .find(|layer| layer.media_type == "application/vnd.preloop.smolmachine.v1+zstd")
+        .find(|layer| is_packed_vm_layer(&layer.media_type))
     else {
         warn!(reference, "OCI golden has no packed VM layer");
         return false;
