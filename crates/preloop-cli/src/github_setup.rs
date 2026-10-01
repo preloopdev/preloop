@@ -223,7 +223,7 @@ pub(crate) async fn cmd_setup(args: SetupArgs) -> anyhow::Result<()> {
     cmd_setup_github(args).await
 }
 
-async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
+pub(crate) async fn cmd_setup_github(args: GithubSetupArgs) -> anyhow::Result<()> {
     let via = match args.via {
         Some(via) => via,
         None => {
@@ -849,7 +849,7 @@ fn scalar_permission_lines(access: &str) -> Vec<String> {
         .collect()
 }
 
-async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result<()> {
+pub(crate) async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result<()> {
     let mut failed = false;
     for repo in repos {
         match preloop_runner_server::github_app::verify_app_config(app_id, pem, repo).await {
@@ -871,7 +871,7 @@ async fn doctor_app(app_id: &str, pem: &str, repos: &[String]) -> anyhow::Result
     Ok(())
 }
 
-async fn doctor_pat(token: &str, repos: &[String]) -> anyhow::Result<()> {
+pub(crate) async fn doctor_pat(token: &str, repos: &[String]) -> anyhow::Result<()> {
     let mut failed = false;
     for repo in repos {
         match preloop_runner_server::github_app::verify_repo_access_with_token(token, repo).await {

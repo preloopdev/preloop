@@ -670,21 +670,30 @@ fn golden_partial_path(payload: &Path) -> PathBuf {
     payload.with_file_name(format!("{name}.partial"))
 }
 
-const GIB: u64 = 1024 * 1024 * 1024;
+pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Kept free beyond the bytes a golden download writes, so landing the
 /// artifact never takes the volume to zero.
-const GOLDEN_DOWNLOAD_DISK_MARGIN: u64 = GIB;
+pub const GOLDEN_DOWNLOAD_DISK_MARGIN: u64 = GIB;
 /// Pack staging a golden bake needs beyond its builder disk. Same rule the
 /// golden workflows enforce (`need_gib = GOLDEN_GUEST_GIB + 20`), adopted after
 /// `smolvm pack` died with `tar error: No space` at 110G free for a 200G guest.
-const GOLDEN_BUILD_DISK_HEADROOM_GIB: u64 = 20;
+pub const GOLDEN_BUILD_DISK_HEADROOM_GIB: u64 = 20;
+/// Floor for the one-shot builder's disk: packing exports a second copy of
+/// the guest filesystem, so the builder never gets less than this even when
+/// job VMs are configured smaller.
+pub const GOLDEN_BUILDER_MIN_STORAGE_GIB: u32 = 40;
 /// Escape hatch for hosts whose free space `df` misreports (thin pools,
 /// quotas): proceed past a disk refusal with a warning instead.
-const DISK_PREFLIGHT_OVERRIDE: &str = "PRELOOP_SKIP_DISK_PREFLIGHT";
+pub const DISK_PREFLIGHT_OVERRIDE: &str = "PRELOOP_SKIP_DISK_PREFLIGHT";
 
-fn disk_preflight_overridden() -> bool {
+pub fn disk_preflight_overridden() -> bool {
     std::env::var(DISK_PREFLIGHT_OVERRIDE)
         .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+}
+
+/// Builder disk a golden bake uses for job VMs configured at `storage_gib`.
+pub fn golden_builder_storage_gib(storage_gib: u32) -> u32 {
+    storage_gib.max(GOLDEN_BUILDER_MIN_STORAGE_GIB)
 }
 
 /// Volume golden and job-VM disks land on; the artifact directory stands in
@@ -3938,7 +3947,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         // Packing exports a second copy of the guest filesystem before
         // producing the artifact. Give the one-shot builder headroom
         // without increasing the storage allocated to job VMs.
-        let builder_storage_gib = self.config.storage_gib.max(40);
+        let builder_storage_gib = golden_builder_storage_gib(self.config.storage_gib);
         // Checked after the stale builder is gone, so its space counts as free.
         ensure_disk_for_golden_build(&golden_disk_root(&self.config), builder_storage_gib)
             .map_err(OrchestratorError::Config)?;

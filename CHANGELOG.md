@@ -10,6 +10,25 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- **`preloop init`** — one command for first-run setup, replacing the split
+  between `preloop setup` and choosing a golden by hand. In a terminal it is a
+  four-step wizard (credentials, golden, run mode, preflight); with stdin or
+  stdout not a TTY it takes the same answers as flags, never prompts, and exits
+  `2` on a missing flag, `3` on a failed preflight (disk, architecture,
+  hypervisor), `4` on a failure to resolve, pull, or build the base image.
+  `preloop init --probe --json` reports host capabilities (arch, free space on
+  the SmolVM data volume, hypervisor, docker, smolvm, existing config,
+  credential state, GHCR reachability) without side effects. The golden choices
+  are the packed official GitHub runner image (the default: drop-in parity,
+  ~60 GB on disk), an OCI reference verified anonymously before it is written,
+  a Dockerfile built here with `docker build`/`docker save` into a local tar
+  (`*.tar` is what smolvm's `--image` branch accepts), and a local
+  `.smolmachine` pack or rootfs directory. The credential step *is*
+  `preloop setup github` and is verified live the way `preloop doctor` does.
+  The choice is recorded in the existing config file as `[golden] base_image`,
+  which `serve` and `server install` read, with `PRELOOP_RUNNER_BASE_IMAGE`
+  still taking precedence; `serve` with no golden configured offers the wizard
+  on a TTY and otherwise prints one hint and proceeds with the official image.
 - Golden disk preflight. A golden download is refused before the transfer
   starts when the artifact cannot fit on its volume, and a golden build is
   refused when the SmolVM data volume has less than the builder disk + 20 GiB
