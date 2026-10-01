@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use preloop_orchestrator::{
-    DEBUG_MARKER_IDLE, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig, artifact_payload,
-    node_externals,
+    DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
+    artifact_payload, node_externals,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
@@ -409,6 +409,9 @@ impl Fixture {
             memory_mib: 256,
             storage_gib: 10,
             overlay_gib: None,
+            // The hermetic provider writes no disks: keep the reserve off so
+            // these tests never depend on the host's free space.
+            job_vm_disk: JobVmDiskReserve::new(0, |_| Ok(0)),
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,

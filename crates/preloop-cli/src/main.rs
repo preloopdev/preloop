@@ -1213,6 +1213,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
+        // Unused by a bake (the builder VM is gated by
+        // `ensure_disk_for_golden_build`), but the pool config is shared.
+        job_vm_disk: preloop_orchestrator::JobVmDiskReserve::from_env(),
         debug_dir: None,
         runner_key_dir: None,
         pending_jobs: None,
@@ -2273,6 +2276,7 @@ fn local_runner_pool_config(
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
+        job_vm_disk: preloop_orchestrator::JobVmDiskReserve::from_env(),
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: None,
         // Warm the golden with the images this project's workflows declare,

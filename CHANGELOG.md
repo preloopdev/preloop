@@ -17,6 +17,21 @@ Releases before v0.27.0 predate the changelog.
   Unpacking a packed golden warns when the volume cannot hold one golden at
   its storage ceiling. `PRELOOP_SKIP_DISK_PREFLIGHT=1` proceeds with a
   warning instead.
+- Runtime VM-state reconciliation. While `serve` runs, the pool sweeps
+  orphaned machine data directories and purges orphaned `_boot-vm`
+  hypervisors every 10 minutes instead of only at startup, so a `machine
+  delete` that fails mid-run no longer leaks its disk until the next engine
+  restart (long-lived engines grew 99 GB → 168 GB of VM state in an
+  afternoon). The mid-flight purge spares any hypervisor whose boot config is
+  still on disk, so a registered machine, a golden fork base, and a create in
+  flight are never touched; `remove_stale_machines` stays startup-only.
+- Job-VM disk reserve. Before a warm or on-demand slot forks or creates a job
+  VM it measures free space on the SmolVM data volume and waits (logging
+  `waiting for disk: … free on …, reserve …`) while it is below
+  `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB, `0` disables) instead of
+  filling the host or failing the job. The wait is not a provisioning
+  failure, so a full host does not trip the repeated-provision-failure alert;
+  an unmeasurable volume warns once and proceeds.
 
 ## [0.33.7] - 2026-09-28
 

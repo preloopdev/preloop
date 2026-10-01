@@ -1965,6 +1965,88 @@ fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) ->
     candidates
 }
 
+/// Executable name libkrun's hypervisor shows up as in `ps`.
+const BOOT_VM_PROCESS: &str = "_boot-vm";
+/// Boot config `_boot-vm`'s argv names inside its machine data directory.
+///
+/// smolvm consumes the file while booting — a running machine's directory no
+/// longer contains it — but the path stays in argv for the life of the
+/// process and names the machine's data directory, which is the durable
+/// evidence of whether that machine still exists.
+const BOOT_CONFIG_FILE: &str = "boot-config.json";
+
+/// What a hypervisor's `ps` argv says about its machine data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineDataState {
+    /// The data directory the argv names still exists, so the machine is
+    /// live: registered, running a job, a golden fork base, or still being
+    /// created.
+    Present,
+    /// The data directory is gone: it was removed from under the hypervisor,
+    /// which still holds that machine's storage descriptors open.
+    Removed,
+    /// No token names a boot config, so nothing can be concluded. Treated as
+    /// live: the mid-flight purge only kills what it can positively identify
+    /// as orphaned, because the other answer is to kill a running machine.
+    Unknown,
+}
+
+/// Classify a `ps` line by the machine state its argv names.
+///
+/// The boot config is handed to `_boot-vm` as a path, either bare or behind a
+/// flag (`--boot-config=<path>`), so the path starts at the data-root marker
+/// inside whichever token carries it. The marker may be the shorter `smolvm`
+/// prefix of the macOS `smolvm-home` root, so the earliest occurrence bounds
+/// the path. Only a token that names `boot-config.json` decides anything; an
+/// argv shape this cannot parse yields [`MachineDataState::Unknown`].
+fn machine_data_state(line: &str, markers: &[String]) -> MachineDataState {
+    let mut state = MachineDataState::Unknown;
+    for token in line.split_whitespace() {
+        let Some(start) = markers
+            .iter()
+            .filter_map(|marker| token.find(marker.as_str()))
+            .min()
+        else {
+            continue;
+        };
+        let path = token[start..].trim_matches(['"', '\'']);
+        // The boot config itself is gone once the machine booted, so the
+        // directory is what proves the machine exists.
+        if !path.starts_with('/') || !path.ends_with(BOOT_CONFIG_FILE) {
+            continue;
+        }
+        let Some(dir) = Path::new(path).parent() else {
+            continue;
+        };
+        if dir.exists() {
+            return MachineDataState::Present;
+        }
+        state = MachineDataState::Removed;
+    }
+    state
+}
+
+/// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPurge {
+    /// Every hypervisor whose argv names this Preloop home's data root.
+    ///
+    /// Only safe where nothing of ours can be running: pool startup, after
+    /// the stale machines have been deleted, and shutdown.
+    All,
+    /// Only hypervisors whose machine data directory is already gone — the
+    /// directory the `boot-config.json` in their argv names no longer exists.
+    ///
+    /// Safe while the engine is serving. A registered machine, a running job
+    /// VM, a golden fork base, and a create in flight all have their data
+    /// directory on disk (smolvm writes the directory before it launches the
+    /// hypervisor that reads its config out of it), so none of them can
+    /// match. What does match is a hypervisor holding storage descriptors for
+    /// files nothing can reach again, which is exactly the leak a failed
+    /// `machine delete` leaves behind.
+    RemovedDataDir,
+}
+
 /// Kill any lingering SmolVM `_boot-vm` hypervisor processes whose machine
 /// state lives under this Preloop home.
 ///
@@ -1979,9 +2061,11 @@ fn agent_rootfs_candidates(host_home: Option<&Path>, data_dir: Option<&Path>) ->
 /// `boot-config.json` under the data dir, so orphaned processes are
 /// identifiable by path.
 ///
-/// Called at pool startup (crash recovery) and shutdown (unresponsive
-/// agent belt-and-suspenders). Returns the number of processes killed.
-pub fn purge_orphaned_vms() -> Result<usize, VmError> {
+/// `scope` decides which of those processes may be killed; see
+/// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
+/// interval while the pool serves (`RemovedDataDir`). Returns the number of
+/// processes killed.
+pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     let Some(preloop_home) = effective_preloop_home() else {
         return Ok(0);
     };
@@ -2005,10 +2089,18 @@ pub fn purge_orphaned_vms() -> Result<usize, VmError> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut killed = 0usize;
     for line in text.lines() {
-        if !line.contains("_boot-vm") {
+        if !line.contains(BOOT_VM_PROCESS) {
             continue;
         }
         if !markers.iter().any(|marker| line.contains(marker.as_str())) {
+            continue;
+        }
+        // Anything whose machine data directory still exists may be live:
+        // spare it rather than kill a machine that is registered, running a
+        // job, or still being created. See `OrphanPurge::RemovedDataDir`.
+        if scope == OrphanPurge::RemovedDataDir
+            && machine_data_state(line, &markers) != MachineDataState::Removed
+        {
             continue;
         }
         let Some(pid) = line
@@ -2548,6 +2640,60 @@ async fn stream_output(
 #[cfg(test)]
 mod tests {
 
+    /// Serializes the tests that rewrite `PRELOOP_HOME`: `purge_orphaned_vms`
+    /// resolves the Preloop home from the process environment, so two of them
+    /// running concurrently would purge each other's scratch home.
+    static PRELOOP_HOME_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Sets `PRELOOP_HOME` for the test's scope and restores it on drop.
+    struct PreloopHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl PreloopHomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PRELOOP_HOME");
+            // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
+            unsafe { std::env::set_var("PRELOOP_HOME", home) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for PreloopHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
+                Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
+                None => unsafe { std::env::remove_var("PRELOOP_HOME") },
+            }
+        }
+    }
+
+    /// Spawn a stand-in for a detached `_boot-vm` whose argv carries `args`.
+    ///
+    /// `sh -c '… & wait'` keeps the shell alive with the marker visible in its
+    /// argv (a bare `sh -c cmd` execs cmd, dropping the args).
+    fn spawn_fake_boot_vm(args: &[&str]) -> std::process::Child {
+        let argv = ["-c", "sleep 60 & wait", "_boot-vm"]
+            .into_iter()
+            .chain(args.iter().copied());
+        std::process::Command::new("sh")
+            .args(argv)
+            .spawn()
+            .expect("spawn dummy boot-vm")
+    }
+
+    fn process_alive(pid: i32) -> bool {
+        // A dead pid makes `kill` print "No such process"; the exit status is
+        // the answer, so keep its stderr out of the test output.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe process")
+            .success()
+    }
+
     /// Scratch machine data dir for the pack-prune tests: `<tmp>/pack-prune-<uuid>/`.
     fn pack_prune_scratch() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("preloop-pack-prune-{}", uuid::Uuid::new_v4()));
@@ -2707,40 +2853,83 @@ mod tests {
 
     #[test]
     fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = PRELOOP_HOME_LOCK.lock();
         let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
         let marker = home.join("smolvm-home/Library/Caches/smolvm/vms/deadbeef/boot-config.json");
         // A process that looks like an orphaned _boot-vm for this home: the
         // argv carries the marker path, so `ps` shows it in the command line.
-        // `sh -c '… & wait'` keeps the shell alive with the marker visible
-        // in its argv (a bare `sh -c cmd` execs cmd, dropping the args).
-        let mut child = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "sleep 60 & wait",
-                "_boot-vm",
-                marker.to_str().unwrap(),
-            ])
-            .spawn()
-            .expect("spawn dummy boot-vm");
+        let mut child = spawn_fake_boot_vm(&[marker.to_str().unwrap()]);
         let pid = child.id() as i32;
-        let previous = std::env::var_os("PRELOOP_HOME");
-        unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-        let killed = purge_orphaned_vms().expect("purge");
-        match previous {
-            Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
-            None => unsafe { std::env::remove_var("PRELOOP_HOME") },
-        }
+        let _home = PreloopHomeGuard::set(&home);
+        let killed = purge_orphaned_vms(OrphanPurge::All).expect("purge");
         assert!(killed >= 1, "purge should have killed the matching process");
         // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
         // zombie still succeeds until it is reaped).
         let _ = child.wait();
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .expect("probe process");
-        assert!(!alive.success(), "matching _boot-vm must be dead");
+        assert!(!process_alive(pid), "matching _boot-vm must be dead");
+    }
+
+    /// The mid-flight scope must spare every hypervisor whose machine data
+    /// directory still exists — a registered machine, a running job VM, a
+    /// golden, or a create in flight all keep theirs — spare an argv shape it
+    /// cannot classify, and still reclaim one whose data directory was
+    /// removed from under it. `All` kills every survivor, which is what makes
+    /// the scope, not the process match, the protection.
+    #[test]
+    fn removed_data_dir_purge_spares_live_and_unknown_data_dirs() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home =
+            std::env::temp_dir().join(format!("preloop-purge-live-{}", uuid::Uuid::new_v4()));
+        let vms = home.join("smolvm-home/Library/Caches/smolvm/vms");
+        // A live machine's directory, in the shape a running machine leaves on
+        // disk: smolvm consumes `boot-config.json` at boot, so only the
+        // directory — not that file — is durable evidence of the machine.
+        let live_dir = vms.join("live");
+        std::fs::create_dir_all(&live_dir).expect("create live machine dir");
+        std::fs::write(live_dir.join("vm.lock"), b"").unwrap();
+        let live = live_dir.join("boot-config.json");
+        // Same home, no data directory: the failed-delete leak.
+        let gone = vms.join("gone/boot-config.json");
+        // The data root itself, in an argv shape that names no boot config:
+        // nothing can be concluded about that process, so it must be spared.
+        let unclassified = home.join("smolvm-home");
+        let mut live_child = spawn_fake_boot_vm(&[live.to_str().unwrap()]);
+        let mut gone_child = spawn_fake_boot_vm(&[gone.to_str().unwrap()]);
+        let mut unknown_child = spawn_fake_boot_vm(&["--data-dir", unclassified.to_str().unwrap()]);
+        let live_pid = live_child.id() as i32;
+        let gone_pid = gone_child.id() as i32;
+        let unknown_pid = unknown_child.id() as i32;
+        let _home = PreloopHomeGuard::set(&home);
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::RemovedDataDir).expect("purge"),
+            1,
+            "only the hypervisor whose data directory is gone may be killed"
+        );
+        assert!(
+            process_alive(live_pid),
+            "a machine whose data directory exists must survive the mid-flight purge"
+        );
+        assert!(
+            process_alive(unknown_pid),
+            "an unclassifiable argv must survive the mid-flight purge"
+        );
+        let _ = gone_child.wait();
+        assert!(
+            !process_alive(gone_pid),
+            "the orphaned hypervisor must be dead"
+        );
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            2,
+            "the startup scope kills the hypervisors the mid-flight scope spared"
+        );
+        let _ = live_child.wait();
+        let _ = unknown_child.wait();
+        assert!(!process_alive(live_pid), "only the scope spared it");
+        assert!(!process_alive(unknown_pid), "only the scope spared it");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
