@@ -261,9 +261,23 @@ pub fn normalize_github_context(github: &Value) -> Value {
     object
         .entry("repository_owner_id".to_owned())
         .or_insert_with(|| json!("0"));
+    // `github.repositoryUrl` upstream is a `git://` URL. Keep that scheme but
+    // point its host at the configured forge (the `server_url` context value,
+    // defaulting to github.com) rather than a hardcoded github.com, so a
+    // redirected engine advertises the right checkout host.
+    let server_url = object
+        .get("server_url")
+        .and_then(Value::as_str)
+        .unwrap_or("https://github.com")
+        .to_owned();
+    let forge_host = server_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&server_url)
+        .trim_end_matches('/');
     object.insert(
         "repositoryUrl".to_owned(),
-        json!(format!("git://github.com/{repository}.git")),
+        json!(format!("git://{forge_host}/{repository}.git")),
     );
 
     for key in [
@@ -1947,5 +1961,19 @@ jobs:
         assert_eq!(wire["displayNameToken"]["file"], 2);
         assert_eq!(wire["environment"]["file"], 2);
         assert_eq!(wire["environment"]["map"][0]["Key"]["file"], 2);
+    }
+
+    /// `github.repositoryUrl` keeps the upstream `git://` scheme but must point
+    /// at the configured forge, not a hardcoded github.com.
+    #[test]
+    fn repository_url_uses_configured_server_host() {
+        let default = normalize_github_context(&serde_json::json!({"repository": "o/r"}));
+        assert_eq!(default["repositoryUrl"], "git://github.com/o/r.git");
+
+        let configured = normalize_github_context(&serde_json::json!({
+            "repository": "o/r",
+            "server_url": "http://127.0.0.1:9090/"
+        }));
+        assert_eq!(configured["repositoryUrl"], "git://127.0.0.1:9090/o/r.git");
     }
 }

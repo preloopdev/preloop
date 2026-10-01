@@ -410,6 +410,14 @@ async fn resolve_remote_workflows(
     client: &reqwest::Client,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let token = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
+    // Same override the engine reads (`PRELOOP_GITHUB_API_URL`), so a client
+    // driving a redirected forge fetches reusable workflows from it instead of
+    // hardcoded api.github.com.
+    let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned());
+    let api_base = api_base.trim_end_matches('/');
     let mut queue = vec![(root_yaml.to_owned(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
     while let Some((yaml, depth)) = queue.pop() {
@@ -432,7 +440,7 @@ async fn resolve_remote_workflows(
             }
             let mut request = client
                 .get(format!(
-                    "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
+                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github.raw+json");
             if let Some(token) = token.as_deref() {
