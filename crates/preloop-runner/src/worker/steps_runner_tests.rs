@@ -1458,7 +1458,6 @@ async fn post_step_executes_for_node_action_with_post_entrypoint() {
         vec![local_step, remote_step],
         workspace.to_str().unwrap(),
         &action_paths,
-        true,
     );
     // Two main steps plus two generated post steps.
     assert_eq!(ordered.len(), 4);

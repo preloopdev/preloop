@@ -28,13 +28,6 @@ pub async fn run_docker_action(
 }
 
 /// Run a docker action from a manifest (Dockerfile or image).
-///
-/// A `__post_` step without a string `with.__preloop_entry` returns success
-/// without running the container, after image preparation and environment
-/// evaluation. Those operations can still build an image or fail.
-/// Returns errors for a missing image, failed expressions in supplied inputs
-/// or `runs` fields, process invocation failures, or nonzero Docker build/run
-/// exit codes. Input-default template errors fall back to the default text.
 pub async fn run_docker_action_from_manifest(
     manifest: &ActionManifest,
     action_dir: &Path,
@@ -93,13 +86,6 @@ pub async fn run_docker_action_from_manifest(
     expr_ctx.insert("inputs", inputs_to_json(&inputs));
     let manifest_env = evaluate_manifest_env(manifest.runs_env.as_ref(), &expr_ctx)?;
     let env = container_action_env(ctx, &inputs, Some(manifest_env), Some(&expr_ctx))?;
-    // A deferred `$/` post step (registered before the checkout, so with no
-    // `__preloop_entry`) has no post entry point to run: docker
-    // `post-entrypoint` is not part of the manifest model, so skip rather
-    // than re-running the main entrypoint.
-    if ctx.step_id.starts_with("__post_") && lifecycle_entry(with).is_none() {
-        return Ok(());
-    }
     let entrypoint = lifecycle_entry(with)
         .or(manifest.runs_entrypoint.as_deref())
         .map(|entry| evaluate_template_value(entry, &expr_ctx))

@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Fixed
+
+- **`$/` self-repository actions resolve** (#346): job preparation read the
+  workflow identity from `system.github.*` variables (never sent) and from the
+  `github` context as plain JSON, but `contextData` is typed on the wire, so
+  every `$/` reference was left unstaged and failed with `action reference
+  must contain @ref` (pytest's `setup-tox`, curl's `pkg-install`). It now reads
+  `job.workflow_repository`/`job.workflow_sha` like runner v2.336.0, so a
+  reusable workflow resolves against the callee. Local-workspace runs fetch the
+  tested tree from the run's snapshot (including uncommitted edits), without
+  requiring `actions/checkout`; the broker refreshes its snapshot credential
+  at claim time. A composite restores its own `action_repository`/`action_ref`
+  after nested actions complete.
+- **`job.workflow_sha` is the workspace HEAD for local runs** (#346): it kept
+  the pre-snapshot fallback (all zeros for a payload-less run) while
+  `github.sha` moved to the HEAD.
+- **A step's own `env:` is visible to its `with:` expressions** (#346):
+  `tool: mdbook@${{ env.MDBOOK_VERSION }}` evaluated against the job env only.
+- **Expression tokens in `container:`/`services:` are evaluated** (#346):
+  `container: ${{ matrix.build.container }}` decoded to no container, and the
+  job ran on the VM instead; evaluation errors now fail setup, and logs report
+  presence without serializing credentials or environment.
+
 ## [0.33.7] - 2026-09-28
 
 ### Added

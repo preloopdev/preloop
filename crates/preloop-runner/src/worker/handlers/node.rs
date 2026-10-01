@@ -160,42 +160,7 @@ fn resolve_contained_entry_point(action_dir: &Path, main: &str) -> Result<PathBu
     Ok(entry_point)
 }
 
-/// Entry point for a node action step.
-///
-/// The lifecycle builder injects `__preloop_entry` for the pre/post steps it
-/// could inspect. A deferred `$/` step (registered before the primary checkout
-/// created the workspace) has no manifest at build time, so the handler picks
-/// the lifecycle entry from the manifest here — and reports `None` when the
-/// action declares none, which makes the step a no-op rather than re-running
-/// `main`.
-fn action_entry(
-    with: &serde_json::Value,
-    manifest: &ActionManifest,
-    step_id: &str,
-) -> Option<String> {
-    if let Some(entry) = with.get("__preloop_entry").and_then(|v| v.as_str()) {
-        return Some(entry.to_owned());
-    }
-    if step_id.starts_with("__post_") {
-        manifest.runs_post.clone()
-    } else if step_id.starts_with("__pre_") {
-        manifest.runs_pre.clone()
-    } else {
-        manifest.runs_main.clone()
-    }
-}
-
 /// Run a Node.js action.
-///
-/// Uses a string `with.__preloop_entry`, otherwise selects the manifest's
-/// pre, post, or main entry from the step ID. A missing pre/post entry returns
-/// success without launching a process. Inputs and defaults use the calling
-/// step's environment; template errors fall back to the original input text.
-/// Runs inside the job container when present, otherwise on the host.
-///
-/// Returns errors for missing main entries or entry-point files, paths found
-/// outside the containment root, unsupported or unavailable runtimes, process
-/// invocation failures, and nonzero exit codes.
 pub async fn run_node_action(
     manifest: &ActionManifest,
     action_dir: &Path,
@@ -204,19 +169,13 @@ pub async fn run_node_action(
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    // A deferred `$/` lifecycle step (registered before the primary checkout
-    // created the workspace) carries no entry point: resolve it from the
-    // manifest here, and treat an action that declares none as a no-op.
-    let entry = action_entry(with, manifest, &ctx.step_id);
-    let Some(main) = entry else {
-        if ctx.step_id.starts_with("__post_") || ctx.step_id.starts_with("__pre_") {
-            // The action declares no such lifecycle entry point.
-            return Ok(());
-        }
-        anyhow::bail!("node action missing runs.main");
-    };
+    let main = with
+        .get("__preloop_entry")
+        .and_then(|v| v.as_str())
+        .or(manifest.runs_main.as_deref())
+        .context("node action missing runs.main")?;
 
-    let entry_point = resolve_contained_entry_point(action_dir, &main)?;
+    let entry_point = resolve_contained_entry_point(action_dir, main)?;
 
     // Resolve the Node.js runtime. Removed majors (12/16/20) and the
     // never-supported node22 fail the step here with an actionable error.
@@ -484,60 +443,6 @@ mod tests {
             inputs: None,
             outputs: None,
         }
-    }
-
-    /// A deferred `$/` post step carries no injected entry point: the handler
-    /// must pick `runs.post` from the manifest, and report nothing when the
-    /// action declares none (so the step is a no-op instead of running main).
-    #[test]
-    fn action_entry_resolves_deferred_lifecycle_entries() {
-        let manifest = ActionManifest {
-            name: "probe".into(),
-            description: String::new(),
-            runs_using: "node20".into(),
-            runs_main: Some("main.js".into()),
-            runs_pre: Some("pre.js".into()),
-            runs_pre_if: None,
-            runs_post: Some("post.js".into()),
-            runs_post_if: None,
-            runs_steps: None,
-            runs_image: None,
-            runs_entrypoint: None,
-            runs_args: None,
-            runs_env: None,
-            inputs: None,
-            outputs: None,
-        };
-        let with = serde_json::json!({});
-        assert_eq!(
-            action_entry(&with, &manifest, "__post_abc"),
-            Some("post.js".to_owned())
-        );
-        assert_eq!(
-            action_entry(&with, &manifest, "__pre_abc"),
-            Some("pre.js".to_owned())
-        );
-        assert_eq!(
-            action_entry(&with, &manifest, "plain-step"),
-            Some("main.js".to_owned())
-        );
-        // An injected entry wins (the builder inspected the manifest).
-        assert_eq!(
-            action_entry(
-                &serde_json::json!({"__preloop_entry": "custom.js"}),
-                &manifest,
-                "__post_abc"
-            ),
-            Some("custom.js".to_owned())
-        );
-
-        let mut without_post = manifest.clone();
-        without_post.runs_post = None;
-        assert_eq!(
-            action_entry(&with, &without_post, "__post_abc"),
-            None,
-            "an action without runs.post makes the post step a no-op"
-        );
     }
 
     fn resolve(runs_using: &str, target_os: &str, target_arch: &str) -> Result<&'static str> {

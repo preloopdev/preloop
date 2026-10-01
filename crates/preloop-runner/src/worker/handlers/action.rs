@@ -12,11 +12,11 @@ use crate::worker::execution_context::StepContext;
 /// This function is recursive (composite actions can reference other actions),
 /// so it returns a boxed future to avoid infinite-size futures.
 ///
-/// `$/` references require the `actions_self_repository` feature and prefer
-/// a staged action, then an existing directory contained in `workspace`, then
-/// remote-reference resolution. Updates the job's GitHub action context and
-/// leaves it set after execution. Feature-gate, resolution, manifest-loading,
-/// and action-handler errors propagate to the caller.
+/// `$/` references run only from the directory job preparation staged for
+/// them (`job.workflow_repository@job.workflow_sha`, or the run's local
+/// snapshot); an unstaged one fails like the official runner's
+/// `GetDownloadInfoLookupKey`. Updates the job's GitHub action context and
+/// leaves it set after execution.
 pub fn run_action<'a>(
     uses: &'a str,
     with: &'a serde_json::Value,
@@ -38,31 +38,18 @@ pub fn run_action<'a>(
             let action_dir = std::path::Path::new(workspace).join(uses);
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         } else if uses.starts_with("$/") {
-            // Same gate `action_preparation` enforces: with the
-            // `actions_self_repository` feature off, a `$/` reference stays
-            // unresolved rather than executing a workspace-provided action
-            // (the workspace comes from the event's checkout, and the gated
-            // preparation path is what normally resolves these refs).
-            if !self_repository_enabled(ctx.job) {
-                anyhow::bail!(
-                    "self-repository action reference '{uses}' requires the \
-                     actions_self_repository feature"
-                );
-            }
-            // `$/path` names the root of the repository the workflow runs
-            // from. The official runner rewrites it to `<self repo>@<sha>`
-            // and downloads it, which only works when that sha is fetchable;
-            // for a run whose checkout *is* this workspace (local snapshots,
-            // or any ref the forge cannot serve) the action is already on
-            // disk. Prefer the staged copy when preparation produced one, and
-            // fall back to the workspace path — the same tree, no download.
-            let action_dir = match ctx.job.action_paths.get(uses) {
-                Some(path) => std::path::PathBuf::from(path),
-                None => match self_repository_local_dir(uses, workspace) {
-                    Some(path) => path,
-                    None => resolve_remote_action(uses, workspace, ctx)?,
-                },
-            };
+            // Preparation rewrote `$/path` to the workflow repository at its
+            // commit and staged it. Unstaged means unresolvable: never fall
+            // back to the workspace, whose contents the run's checkout (and
+            // an untrusted PR) controls.
+            let action_dir = ctx.job.action_paths.get(uses).with_context(|| {
+                format!(
+                    "Unable to resolve self-reference '{uses}'. This can occur when the \
+                     server does not support this syntax, the feature flag is disabled, \
+                     or the workflow context (repository/SHA) is unavailable."
+                )
+            })?;
+            let action_dir = std::path::PathBuf::from(action_dir);
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
@@ -105,79 +92,6 @@ pub(crate) async fn run_action_from_dir(
             anyhow::bail!("Unsupported action type: {other}")
         }
     }
-}
-
-/// Whether the server advertised the self-repository action feature.
-///
-/// Official `Constants.Runner.Features.SelfRepository` — the same gate
-/// [`crate::worker::action_preparation`] reads from the raw job message, here
-/// against the job context the handlers carry.
-pub(crate) fn self_repository_enabled(job: &crate::worker::contexts::JobContext) -> bool {
-    feature_enabled(
-        job.variables
-            .get("actions_self_repository")
-            .and_then(|value| value.get("value"))
-            .and_then(|value| value.as_str()),
-    )
-}
-
-/// Truthiness of a runner feature flag (`1`/`true`/`t`/`y`/`yes`/`on`).
-pub(crate) fn feature_enabled(raw: Option<&str>) -> bool {
-    raw.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "t" | "y" | "yes" | "on"
-        )
-    })
-}
-
-/// Validate a `$/path` self-repository reference and return the workspace path
-/// it names, whether or not the directory exists yet.
-///
-/// The primary checkout populates the workspace *after* the step list is
-/// built, so lifecycle registration needs the path before the action exists;
-/// [`self_repository_local_dir`] additionally proves existence and containment.
-///
-/// Returns `None` unless `uses` starts with `$/` and has a nonempty subpath
-/// after trimming surrounding slashes. Empty interior segments and `.` or
-/// `..` segments are rejected. The returned path is not canonicalized.
-pub(crate) fn self_repository_local_path(
-    uses: &str,
-    workspace: &str,
-) -> Option<std::path::PathBuf> {
-    let subpath = uses.strip_prefix("$/")?.trim_matches('/');
-    if subpath.is_empty()
-        || subpath
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return None;
-    }
-    Some(std::path::Path::new(workspace).join(subpath))
-}
-
-/// Resolve a `$/path` self-repository reference against the workspace.
-///
-/// The reference names the root of the repository the workflow runs from —
-/// the same tree the job checked out — so the action is already on disk when
-/// that checkout is this workspace. `None` when the reference has no subpath,
-/// escapes the workspace (`$/../..`, or a symlink resolving outside), or the
-/// directory does not exist. Also returns `None` for an invalid reference or
-/// if either path cannot be canonicalized. Returns the canonical directory
-/// on success; callers decide how to handle a failed lookup.
-pub(crate) fn self_repository_local_dir(uses: &str, workspace: &str) -> Option<std::path::PathBuf> {
-    let dir = self_repository_local_path(uses, workspace)?;
-    if !dir.is_dir() {
-        return None;
-    }
-    // Canonical containment: `..` segments are already rejected, but a
-    // symlink inside the workspace can still point outside it, and the
-    // manifest loader would happily read that action.yml. A directory that
-    // does not exist yet (checkout has not run) is refused here and handled
-    // by the deferred lifecycle path instead.
-    let root = std::fs::canonicalize(workspace).ok()?;
-    let resolved = std::fs::canonicalize(&dir).ok()?;
-    resolved.starts_with(&root).then_some(resolved)
 }
 
 /// Resolve a remote action reference to a local directory.
@@ -329,7 +243,7 @@ pub(crate) async fn ensure_remote_action_staged(
     Ok(action_dir)
 }
 
-fn validate_remote_action_reference(
+pub(crate) fn validate_remote_action_reference(
     owner: &str,
     repo: &str,
     git_ref: &str,
@@ -402,7 +316,14 @@ pub(crate) fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &st
         Some(serde_json::Value::String(ctx.step_id.clone())),
     );
 
-    if let Some((repository, git_ref)) = action_repository_context(uses) {
+    let repository_ref = if uses.starts_with("$/") {
+        // Official ResolveSelfRepositoryReferences rewrites the reference to
+        // `workflow_repository@workflow_sha` before the context is set.
+        crate::worker::action_preparation::self_repository_identity(&ctx.job.context_data)
+    } else {
+        action_repository_context(uses)
+    };
+    if let Some((repository, git_ref)) = repository_ref {
         ctx.job.set_github_context_value(
             "action_repository",
             Some(serde_json::Value::String(repository)),
@@ -475,48 +396,10 @@ mod tests {
         assert_eq!(resolved, staged);
     }
 
-    /// A `$/` reference whose action is checked out in the workspace runs from
-    /// there — the path pytest's `uses: $/.github/actions/setup-tox` takes
-    /// (the official rewrite would download `<self repo>@<sha>`, which a
-    /// snapshot commit cannot serve).
+    /// An unstaged `$/` reference fails with the official message and never
+    /// executes an action the workspace happens to contain.
     #[tokio::test]
-    async fn self_repository_action_reference_runs_from_the_workspace() {
-        let workspace = tempfile::TempDir::new().unwrap();
-        let action_dir = workspace.path().join(".github/actions/setup-tox");
-        std::fs::create_dir_all(&action_dir).unwrap();
-        std::fs::write(
-            action_dir.join("action.yml"),
-            "name: setup-tox\nruns:\n  using: composite\n  steps:\n    - run: echo ran-from-workspace\n      shell: bash\n",
-        )
-        .unwrap();
-
-        let mut job = crate::worker::contexts::JobContext::new(
-            "j2".into(),
-            "Job".into(),
-            // `actions_self_repository` is the gate the server advertises.
-            serde_json::json!({"actions_self_repository": {"value": "true"}}),
-            serde_json::json!({"github": {"workspace": workspace.path()}}),
-        );
-        job.workspace = Some(workspace.path().to_string_lossy().to_string());
-        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let result = run_action(
-            "$/.github/actions/setup-tox",
-            &serde_json::json!({}),
-            workspace.path().to_str().unwrap(),
-            &mut ctx,
-            cancel_rx,
-        )
-        .await;
-        drop(cancel_tx);
-        result.expect("$/ self-repository reference must run from the workspace");
-    }
-
-    /// Same gate `action_preparation` enforces: without the
-    /// `actions_self_repository` feature the workspace fallback must not
-    /// execute a workspace-provided action.
-    #[tokio::test]
-    async fn self_repository_action_requires_the_feature_flag() {
+    async fn unstaged_self_repository_reference_never_runs_from_the_workspace() {
         let workspace = tempfile::TempDir::new().unwrap();
         let action_dir = workspace.path().join(".github/actions/probe");
         std::fs::create_dir_all(&action_dir).unwrap();
@@ -529,29 +412,29 @@ mod tests {
         let mut job = crate::worker::contexts::JobContext::new(
             "j4".into(),
             "Job".into(),
-            serde_json::json!({}),
+            serde_json::json!({"actions_self_repository": {"value": "true"}}),
             serde_json::json!({"github": {"workspace": workspace.path()}}),
         );
         job.workspace = Some(workspace.path().to_string_lossy().to_string());
         let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let result = run_action(
+        let error = run_action(
             "$/.github/actions/probe",
             &serde_json::json!({}),
             workspace.path().to_str().unwrap(),
             &mut ctx,
             rx,
         )
-        .await;
+        .await
+        .expect_err("an unstaged $/ reference is unresolvable");
 
         assert!(
-            result.is_err(),
-            "a $/ reference without the feature flag must stay unresolved"
+            error
+                .to_string()
+                .contains("Unable to resolve self-reference"),
+            "unexpected error: {error}"
         );
-        assert!(
-            !workspace.path().join("ran.txt").exists(),
-            "the workspace action must not run when the gate is closed"
-        );
+        assert!(!workspace.path().join("ran.txt").exists());
     }
 
     #[test]
@@ -816,91 +699,36 @@ mod tests {
         );
     }
 
-    /// `$/path` names the repository root the workflow runs from; when the
-    /// run's checkout is the workspace, the action is already on disk.
+    /// `$/` reports the workflow repository and commit it was rewritten to.
     #[test]
-    fn self_repository_references_resolve_inside_the_workspace() {
-        let root = std::env::temp_dir().join(format!(
-            "preloop-self-repo-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let action = root.join(".github/actions/setup-tox");
-        std::fs::create_dir_all(&action).unwrap();
-        let workspace = root.to_string_lossy().to_string();
+    fn set_action_repository_context_names_the_self_repository() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/app"},
+                "job": {"t": 2, "d": [
+                    {"k": "workflow_repository", "v": "owner/shared"},
+                    {"k": "workflow_sha", "v": "6b2de6eb160186cd946fb2f0929e2b265624cd61"},
+                ]},
+            }),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
 
+        set_action_repository_context(&mut ctx, "$/.github/actions/setup");
+        let field = |ctx: &StepContext<'_>, key: &str| {
+            ctx.job
+                .github_context_value(key)
+                .and_then(|v| v.as_str().map(String::from))
+        };
         assert_eq!(
-            self_repository_local_dir("$/.github/actions/setup-tox", &workspace).as_deref(),
-            Some(
-                std::fs::canonicalize(&action)
-                    .expect("action dir canonicalizes")
-                    .as_path()
-            ),
-            "a $/ reference resolves to the workspace-relative directory"
+            field(&ctx, "action_repository").as_deref(),
+            Some("owner/shared")
         );
         assert_eq!(
-            self_repository_local_dir("$/", &workspace),
-            None,
-            "a bare $/ has no action path (the caller must resolve remotely)"
+            field(&ctx, "action_ref").as_deref(),
+            Some("6b2de6eb160186cd946fb2f0929e2b265624cd61")
         );
-        assert_eq!(
-            self_repository_local_dir("$/missing/action", &workspace),
-            None,
-            "a missing directory falls back to remote resolution"
-        );
-        assert_eq!(
-            self_repository_local_dir("$/../../etc", &workspace),
-            None,
-            "a $/ reference must not escape the workspace"
-        );
-        assert_eq!(
-            self_repository_local_dir("$/./.github/actions/setup-tox", &workspace),
-            None,
-            "dot segments are refused rather than normalized"
-        );
-        // A symlink inside the workspace that resolves outside it must not
-        // let the manifest loader read a foreign action.yml.
-        let outside = std::env::temp_dir().join(format!(
-            "preloop-outside-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(outside.join("evil")).unwrap();
-        let link = root.join(".github/actions/escaped");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(outside.join("evil"), &link).unwrap();
-            assert_eq!(
-                self_repository_local_dir("$/.github/actions/escaped", &workspace),
-                None,
-                "a symlink escaping the workspace is refused"
-            );
-        }
-        std::fs::remove_dir_all(&outside).ok();
-        // The validated path exists even before the checkout creates the
-        // directory (lifecycle registration runs first).
-        assert_eq!(
-            self_repository_local_path("$/.github/actions/setup-tox", &workspace),
-            Some(action.clone()),
-            "the validated path does not require the action to exist yet"
-        );
-        assert_eq!(
-            self_repository_local_path("$/../../etc", &workspace),
-            None,
-            "traversal is refused before the path is built"
-        );
-        assert_eq!(
-            self_repository_local_dir("./.github/actions/setup-tox", &workspace),
-            None,
-            "only $/ references are handled here; ./ and ../ stay caller-relative"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
     }
 }
