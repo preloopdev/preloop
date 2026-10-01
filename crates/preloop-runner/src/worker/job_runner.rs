@@ -877,6 +877,30 @@ pub async fn run_job(
 fn any_step_failed(steps: &indexmap::IndexMap<String, super::contexts::StepResult>) -> bool {
     steps.values().any(|result| result.outcome == "Failure")
 }
+/// Env knob gating the four fire-and-forget service health probes fired after
+/// the first `renewjob`.
+///
+/// The probes target real GitHub service hosts (`broker.`, `run.`,
+/// `results-receiver.`, `token.actions.githubusercontent.com`). Against a
+/// hermetic GitHub emulator those hosts are unreachable, so the probes are
+/// guaranteed-fail noise; setting this lets the engine run fully redirected.
+/// Unset retains the official runner's probe behavior.
+pub(crate) const DISABLE_ACTIONS_PROBES_ENV: &str = "PRELOOP_DISABLE_ACTIONS_PROBES";
+
+/// Parse the actions-probes toggle carried in `DISABLE_ACTIONS_PROBES_ENV`.
+///
+/// Accepts the same truthy vocabulary as the official
+/// `StringUtil.ConvertToBoolean` (`1`, `true`, `$true`, case-insensitive);
+/// unset and any other value leave the probes on.
+fn actions_probes_disabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "$true"
+        )
+    })
+}
+
 fn spawn_renew_loop(
     rpt: Arc<ReportingContext>,
     cancel_rx: watch::Receiver<bool>,
@@ -884,6 +908,9 @@ fn spawn_renew_loop(
     lease_lost: Arc<AtomicBool>,
     timing: LeaseTiming,
 ) -> tokio::task::JoinHandle<()> {
+    // Read the knob once per job run; probes otherwise stay at their default.
+    let probes_disabled =
+        actions_probes_disabled(std::env::var(DISABLE_ACTIONS_PROBES_ENV).ok().as_deref());
     tokio::spawn(async move {
         let mut cancel_rx = cancel_rx;
         let mut first_renew = true;
@@ -963,8 +990,15 @@ fn spawn_renew_loop(
                 }
             };
 
-            // Official runner probes service health after the first renewjob
-            if first_renew {
+            // Official runner probes service health after the first renewjob.
+            // Under a hermetic GitHub emulator the real service hosts are
+            // unreachable, so DISABLE_ACTIONS_PROBES_ENV skips the probes and
+            // leaves no ConnectivityCheck telemetry entries (the official
+            // "absent" equivalent) instead of making guaranteed-fail calls.
+            if first_renew && probes_disabled {
+                first_renew = false;
+                info!("Actions service health probes disabled by {DISABLE_ACTIONS_PROBES_ENV}");
+            } else if first_renew {
                 first_renew = false;
                 let http = rpt.results.http();
                 // Fire-and-forget health probes — matching official runner lifecycle
