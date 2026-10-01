@@ -62,6 +62,15 @@ Releases before v0.27.0 predate the changelog.
   checkout of `github.server_url`. The refresh now also fetches `HEAD`, and a
   cache whose recorded head it does not actually hold is refetched instead of
   trusted, so caches already affected heal on the next run.
+- Run logs and step records are kept for far longer after a run finishes. The
+  on-disk log blobs were pruned to the 64 most recent execution plans — one per
+  job, so only two or three pushes of history — and the in-memory step records
+  were dropped for every run but the newest 16, which left `steps: []` in the
+  run API and made `preloop logs --step N` unresolvable for anything older.
+  Logs now keep the 1024 most recent plans (roughly 150 MiB at the median plan
+  size, 650 MiB at worst), and step records live as long as the run record
+  (256 completed runs, about 3 KiB each). Only the large live-log buffers are
+  still released after 16 runs.
 
 ## [0.33.7] - 2026-09-28
 

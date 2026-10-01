@@ -128,12 +128,13 @@ pub const MAX_ARTIFACT_REGISTRY_ENTRIES: usize = 10_000;
 /// durable `runs` table keeps the full history regardless.
 pub const MAX_COMPLETED_RUNS_RETAINED: usize = 256;
 
-/// F8b — terminal runs whose heavy runtime state (live-log buffers, step
-/// records, timeline projections) stays in memory. `RunRecord`s are retained
-/// for `MAX_COMPLETED_RUNS_RETAINED`, but a finished run's live-log tail is
-/// capped at 64 MiB *per job* and its step/timeline projections are only
-/// dropped on request purge — neither is needed once the run is old enough
-/// that nothing follows it live. Without this bound, ~40 runs/hour of CI
+/// F8b — terminal runs whose heavy runtime state (live-log buffers and
+/// timeline projections) stays in memory. `RunRecord`s are retained for
+/// `MAX_COMPLETED_RUNS_RETAINED`, but a finished run's live-log tail is capped
+/// at 64 MiB *per job* and its timeline projections are only dropped on
+/// request purge — neither is needed once the run is old enough that nothing
+/// follows it live. Step records are not part of this window: they are tiny
+/// and live as long as the run record. Without this bound, ~40 runs/hour of CI
 /// accumulated ~4 GiB/hour of retained buffers on cpane and the kernel OOM
 /// killer kept restarting the engine mid-run (starving every queued job).
 pub const MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE: usize = 16;
@@ -446,10 +447,10 @@ pub fn trim_completed_runs(inner: &mut InnerState) {
 
     // F8b — drop heavy runtime state for terminal runs outside the newest
     // `MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`. The run record itself stays
-    // (subject to the 256 cap below); only the per-job live-log buffers,
-    // step records, and timeline projections go. These are the dominant
-    // heap consumers for finished runs and are unreachable once nothing
-    // follows the run live.
+    // (subject to the 256 cap below); only the per-job live-log buffers and
+    // timeline projections go. These are the dominant heap consumers for
+    // finished runs and are unreachable once nothing follows the run live.
+    // Step records stay with the run record (see `drop_run_runtime_state`).
     let keep_runtime = completed.saturating_sub(MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE);
     for (_, _, run_id) in keyed.iter().take(keep_runtime) {
         drop_run_runtime_state(inner, *run_id);
@@ -643,9 +644,15 @@ pub fn remove_run_everywhere(inner: &mut InnerState, run_id: RunId) -> RunRemova
 }
 
 /// Drop the heavy per-job runtime state of a run: retained live-log buffers
-/// (up to 64 MiB each), step records, and timeline projections. The durable
-/// store keeps the authoritative copies; this only frees the in-memory
-/// projections that exist to serve live followers and run-scoped reads.
+/// (up to 64 MiB each) and timeline projections, which exist to serve live
+/// followers and run-scoped reads.
+///
+/// Step records are deliberately kept. They are a few hundred bytes per step
+/// (about 3 KiB per run on a busy engine), they are the only place the run API
+/// and `preloop logs --step N` can learn a finished job's step names and
+/// order, and the durable `job_steps` rows are rewritten from memory on every
+/// full snapshot, so dropping them here also erased them from the database.
+/// They are released with the run record, by [`purge_evicted_run`].
 fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId) {
     // Logical job ids from the run record; agent job ids and plan ids from
     // the job requests that dispatched them.
@@ -671,10 +678,6 @@ fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId) {
         inner.live_log_lines.remove(&key);
         inner.live_log_tx.remove(&key);
         inner.live_log_closed.remove(&key);
-    }
-    for agent_id in &agent_ids {
-        inner.job_steps.remove(agent_id);
-        inner.job_steps_revision.remove(agent_id);
     }
     inner.timeline_events.remove(&run_id);
     inner.timeline_events_order.retain(|id| *id != run_id);
@@ -1334,5 +1337,146 @@ mod tests {
         assert!(inner.queued_at.is_empty());
         assert!(inner.job_assignments.is_empty());
         assert!(inner.pool_pending.is_empty());
+    }
+
+    fn terminal_run(index: usize, base: chrono::DateTime<chrono::Utc>) -> RunRecord {
+        let run_id = RunId::new();
+        RunRecord {
+            run_id,
+            webhook_delivery_id: None,
+            run_name: None,
+            submission: Arc::new(WorkflowSubmission {
+                repository: "test/repo".to_owned(),
+                ..Default::default()
+            }),
+            jobs: BTreeMap::new(),
+            status: ExecutionStatus::Success,
+            job_outputs: BTreeMap::new(),
+            job_base_ids: BTreeMap::new(),
+            job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
+            job_check_run_ids: BTreeMap::new(),
+            reports_check_runs: false,
+            reusable_calls: BTreeMap::new(),
+            jobs_list: Vec::new(),
+            created_at: base,
+            started_at: Some(base),
+            completed_at: Some(base + chrono::Duration::seconds(index as i64)),
+            run_number: index as u64,
+            run_attempt: 1,
+            workflow_path_str: ".github/workflows/ci.yml".to_owned(),
+            event: "push".to_owned(),
+            conclusion: Some("success".to_owned()),
+            push_state: None,
+            snapshot_timing: None,
+            fork_approval_pending: false,
+            fork_approval_requested_at_unix_nanos: None,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
+        }
+    }
+
+    /// Give `run_id` one dispatched job with a step record and a live-log
+    /// buffer, returning the attempt's agent job id.
+    fn seed_job_state(inner: &mut InnerState, run_id: RunId, request_id: i64) -> uuid::Uuid {
+        let agent_job_id = uuid::Uuid::new_v4();
+        inner.job_requests.insert(
+            request_id,
+            TaskAgentJobRequestRecord {
+                request_id,
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id,
+                plan_id: format!("plan-{request_id}"),
+                plan_type: "build".to_owned(),
+                timeline_id: uuid::Uuid::new_v4(),
+                result: Some(ExecutionStatus::Success),
+                locked_until: String::new(),
+                claimed_at: None,
+                owner_runner_id: None,
+                started_at: None,
+                last_renewed_at: None,
+                timeout_triggered: false,
+                debug_token_issued: false,
+            },
+        );
+        inner.job_steps.insert(
+            agent_job_id,
+            vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "step-1",
+                    "name": "Run tests",
+                    "conclusion": "failure",
+                }))
+                .unwrap(),
+            ],
+        );
+        inner.job_steps_revision.insert(agent_job_id, 3);
+        inner.live_log_lines.insert(
+            agent_job_id.to_string(),
+            Arc::new(tokio::sync::Mutex::new(Default::default())),
+        );
+        agent_job_id
+    }
+
+    /// A finished run's step records are what `preloop logs --step N` resolves
+    /// against and what the run API reports, and they are tiny. Only the
+    /// live-log buffers are the heap hazard `MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`
+    /// exists for, so a run past that window must keep its steps.
+    #[test]
+    fn runs_past_the_runtime_window_keep_step_records_but_lose_live_log_buffers() {
+        let mut inner = InnerState::default();
+        let base = chrono::Utc::now();
+        let mut seeded = Vec::new();
+        for index in 0..(MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE + 3) {
+            let run = terminal_run(index, base);
+            let run_id = run.run_id;
+            inner.runs.insert(run_id, run);
+            seeded.push(seed_job_state(&mut inner, run_id, index as i64 + 1));
+        }
+
+        trim_completed_runs(&mut inner);
+
+        let oldest = seeded[0];
+        assert!(
+            inner.job_steps.contains_key(&oldest),
+            "an old run must keep its step records"
+        );
+        assert_eq!(inner.job_steps_revision.get(&oldest), Some(&3));
+        assert!(
+            !inner.live_log_lines.contains_key(&oldest.to_string()),
+            "an old run's live-log buffer is what the window frees"
+        );
+        let newest = *seeded.last().unwrap();
+        assert!(inner.job_steps.contains_key(&newest));
+        assert!(inner.live_log_lines.contains_key(&newest.to_string()));
+    }
+
+    /// The step records are bounded by the run records: past
+    /// `MAX_COMPLETED_RUNS_RETAINED` the run is evicted and its steps go with it.
+    #[test]
+    fn steps_are_dropped_with_a_run_evicted_past_the_retention_cap() {
+        let mut inner = InnerState::default();
+        let base = chrono::Utc::now();
+        let mut seeded = Vec::new();
+        for index in 0..=MAX_COMPLETED_RUNS_RETAINED {
+            let run = terminal_run(index, base);
+            let run_id = run.run_id;
+            inner.runs.insert(run_id, run);
+            seeded.push(seed_job_state(&mut inner, run_id, index as i64 + 1));
+        }
+
+        trim_completed_runs(&mut inner);
+
+        assert!(!inner.job_steps.contains_key(&seeded[0]));
+        assert!(!inner.job_steps_revision.contains_key(&seeded[0]));
+        assert!(inner.job_steps.contains_key(&seeded[1]));
     }
 }
