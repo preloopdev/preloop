@@ -406,6 +406,7 @@ steps.
 | `PRELOOP_VERIFY_BASE_IMAGE` / `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Require a digest-pinned OCI base's GitHub attestation and Cosign signature before `build-golden` |
 | `PRELOOP_REQUIRE_BASE_DIGEST` | Reject mutable registry tags during `build-golden` (used by release provenance builds) |
 | `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 80 GiB) |
+| `PRELOOP_SKIP_DISK_PREFLIGHT` | Proceed past the golden disk check with a warning. Without it, a golden download is refused when the artifact cannot fit on its volume, and a golden build when the SmolVM data volume has less than the builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB of pack staging free |
 | `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |

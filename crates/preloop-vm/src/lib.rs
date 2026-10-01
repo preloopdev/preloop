@@ -1242,13 +1242,8 @@ impl VmProvider for SmolVmProvider {
         // Conventional roots cover the empty-registry case: with no machines
         // left, registered data dirs cannot reveal where orphans live.
         // Only scan the root belonging to the active registry configuration.
-        if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
-            roots.insert(data_dir.join("vms"));
-        } else if let Some(home) = effective_preloop_home() {
-            #[cfg(target_os = "macos")]
-            roots.insert(home.join("smolvm-home/Library/Caches/smolvm/vms"));
-            #[cfg(not(target_os = "macos"))]
-            roots.insert(home.join("smolvm/vms"));
+        if let Some(root) = machine_data_root() {
+            roots.insert(root);
         }
         let roots: Vec<PathBuf> = roots.into_iter().collect();
         tokio::task::spawn_blocking(move || {
@@ -1882,6 +1877,63 @@ fn effective_preloop_home() -> Option<PathBuf> {
     std::env::var_os("PRELOOP_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
+}
+
+/// Directory SmolVM keeps per-machine data dirs under for the active registry
+/// configuration: `$SMOLVM_DATA_DIR/vms`, else the isolated Preloop home's
+/// platform cache layout. This is where golden and job-VM disks land, so it is
+/// the filesystem disk-space checks must measure.
+pub fn machine_data_root() -> Option<PathBuf> {
+    if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
+        return Some(data_dir.join("vms"));
+    }
+    let home = effective_preloop_home()?;
+    #[cfg(target_os = "macos")]
+    return Some(home.join("smolvm-home/Library/Caches/smolvm/vms"));
+    #[cfg(not(target_os = "macos"))]
+    return Some(home.join("smolvm/vms"));
+}
+
+/// Bytes available to an unprivileged writer on the filesystem holding
+/// `path`, measured at its nearest existing ancestor (the target directory may
+/// not exist yet). Uses POSIX `df -Pk`, which every supported host ships, so
+/// no FFI dependency is needed for a `statvfs` call.
+pub fn filesystem_available_bytes(path: &Path) -> Result<u64, VmError> {
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent().ok_or_else(|| {
+            VmError::Protocol(format!("no existing ancestor for {}", path.display()))
+        })?;
+    }
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(probe)
+        .output()
+        .map_err(|error| VmError::Protocol(format!("df failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(VmError::Protocol(format!(
+            "df -Pk {} exited with {}",
+            probe.display(),
+            output.status
+        )));
+    }
+    parse_df_available_kib(&String::from_utf8_lossy(&output.stdout))
+        .map(|kib| kib.saturating_mul(1024))
+        .ok_or_else(|| VmError::Protocol(format!("unparseable df output for {}", probe.display())))
+}
+
+/// `Available` column (KiB) from `df -Pk` output. Located as the field just
+/// before the `Capacity` percentage rather than by fixed index, so a
+/// filesystem or mount name containing spaces cannot shift it.
+fn parse_df_available_kib(output: &str) -> Option<u64> {
+    let line = output.lines().nth(1)?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let capacity = fields.iter().position(|field| {
+        field
+            .strip_suffix('%')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    })?;
+    fields.get(capacity.checked_sub(1)?)?.parse().ok()
 }
 
 /// Candidate locations for the SmolVM guest agent rootfs, in probe order.
@@ -2558,6 +2610,40 @@ mod tests {
         assert!(known.is_dir(), "registered dir survives");
         assert!(!orphan.exists(), "orphaned dir is removed");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn df_available_column_survives_spaces_in_names() {
+        // Linux: plain layout.
+        let linux = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
+                     /dev/nvme0n1p2   960379920 512000000 399560000      57% /\n";
+        assert_eq!(parse_df_available_kib(linux), Some(399_560_000));
+        // macOS automounter: the filesystem name itself contains a space, so a
+        // fixed column index would read `Used` as `Available`.
+        let spaced_fs = "Filesystem    1024-blocks Used Available Capacity  Mounted on\n\
+                         map auto_home           0    0         0   100%    /System/Volumes/Data/home\n";
+        assert_eq!(parse_df_available_kib(spaced_fs), Some(0));
+        // A mount point containing spaces sits after Capacity and must not
+        // matter either.
+        let spaced_mount = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                            /dev/disk3s5 971350180 698000000 235000000 75% /Volumes/My Disk\n";
+        assert_eq!(parse_df_available_kib(spaced_mount), Some(235_000_000));
+    }
+
+    #[test]
+    fn df_output_without_a_data_row_is_rejected() {
+        assert_eq!(
+            parse_df_available_kib("Filesystem 1024-blocks Used Available Capacity Mounted on\n"),
+            None
+        );
+        assert_eq!(parse_df_available_kib(""), None);
+    }
+
+    #[test]
+    fn available_bytes_measures_nearest_existing_ancestor() {
+        let missing = std::env::temp_dir().join(format!("preloop-df-{}/a/b", uuid::Uuid::new_v4()));
+        let bytes = filesystem_available_bytes(&missing).expect("ancestor temp dir is measurable");
+        assert!(bytes > 0, "temp filesystem reports no free space");
     }
 
     /// The grace window keeps a dir too young to be proven orphaned: smolvm

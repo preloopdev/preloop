@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- Golden disk preflight. A golden download is refused before the transfer
+  starts when the artifact cannot fit on its volume, and a golden build is
+  refused when the SmolVM data volume has less than the builder disk + 20 GiB
+  of pack staging free (the rule the golden workflows already enforce).
+  Unpacking a packed golden warns when the volume cannot hold one golden at
+  its storage ceiling. `PRELOOP_SKIP_DISK_PREFLIGHT=1` proceeds with a
+  warning instead.
+
 ## [0.33.7] - 2026-09-28
 
 ### Added

@@ -670,6 +670,97 @@ fn golden_partial_path(payload: &Path) -> PathBuf {
     payload.with_file_name(format!("{name}.partial"))
 }
 
+const GIB: u64 = 1024 * 1024 * 1024;
+/// Kept free beyond the bytes a golden download writes, so landing the
+/// artifact never takes the volume to zero.
+const GOLDEN_DOWNLOAD_DISK_MARGIN: u64 = GIB;
+/// Pack staging a golden bake needs beyond its builder disk. Same rule the
+/// golden workflows enforce (`need_gib = GOLDEN_GUEST_GIB + 20`), adopted after
+/// `smolvm pack` died with `tar error: No space` at 110G free for a 200G guest.
+const GOLDEN_BUILD_DISK_HEADROOM_GIB: u64 = 20;
+/// Escape hatch for hosts whose free space `df` misreports (thin pools,
+/// quotas): proceed past a disk refusal with a warning instead.
+const DISK_PREFLIGHT_OVERRIDE: &str = "PRELOOP_SKIP_DISK_PREFLIGHT";
+
+fn disk_preflight_overridden() -> bool {
+    std::env::var(DISK_PREFLIGHT_OVERRIDE)
+        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "false"))
+}
+
+/// Volume golden and job-VM disks land on; the artifact directory stands in
+/// when the SmolVM data root cannot be resolved.
+fn golden_disk_root(config: &RunnerPoolConfig) -> PathBuf {
+    preloop_vm::machine_data_root().unwrap_or_else(|| {
+        config
+            .artifact_stem
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    })
+}
+
+fn golden_build_required_bytes(builder_storage_gib: u32) -> u64 {
+    (u64::from(builder_storage_gib) + GOLDEN_BUILD_DISK_HEADROOM_GIB) * GIB
+}
+
+fn format_gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+}
+
+/// Refuse an operation needing `required` bytes on the volume holding `path`
+/// when they are not free. A volume `df` cannot measure is not a refusal: the
+/// check exists to fail early, never to block a host it cannot read.
+fn ensure_free_disk(path: &Path, required: u64, purpose: &str, remedy: &str) -> Result<(), String> {
+    let free = match preloop_vm::filesystem_available_bytes(path) {
+        Ok(free) => free,
+        Err(error) => {
+            warn!(path = %path.display(), %error, purpose, "free disk space unmeasurable; skipping check");
+            return Ok(());
+        }
+    };
+    if free >= required {
+        return Ok(());
+    }
+    let message = format!(
+        "{purpose} needs {} free on {} but only {} is available; {remedy}, or set {DISK_PREFLIGHT_OVERRIDE}=1 to proceed anyway",
+        format_gib(required),
+        path.display(),
+        format_gib(free),
+    );
+    if disk_preflight_overridden() {
+        warn!("{message} ({DISK_PREFLIGHT_OVERRIDE} set; continuing)");
+        return Ok(());
+    }
+    Err(message)
+}
+
+fn ensure_disk_for_golden_build(root: &Path, builder_storage_gib: u32) -> Result<(), String> {
+    ensure_free_disk(
+        root,
+        golden_build_required_bytes(builder_storage_gib),
+        "golden build",
+        &format!(
+            "free space or lower PRELOOP_RUNNER_STORAGE_GB (builder disk {builder_storage_gib} GiB \
+             + {GOLDEN_BUILD_DISK_HEADROOM_GIB} GiB pack staging)"
+        ),
+    )
+}
+
+/// Warn, never refuse, when the volume holding `path` has under `required`
+/// bytes free.
+fn warn_if_disk_below(path: &Path, required: u64, purpose: &str) {
+    if let Ok(free) = preloop_vm::filesystem_available_bytes(path)
+        && free < required
+    {
+        warn!(
+            path = %path.display(),
+            free = %format_gib(free),
+            needed = %format_gib(required),
+            purpose,
+            "low disk space: this volume may fill before the golden and job VMs settle"
+        );
+    }
+}
+
 /// Public OCI artifacts carrying the packed VM goldens, per architecture.
 ///
 /// Deliberately separate from the `runner-images` base-image package: that
@@ -969,6 +1060,24 @@ async fn download_golden_with_resume(
         if expected_total_bytes.is_some_and(|total| have > total) {
             let _ = tokio::fs::remove_file(partial).await;
             continue;
+        }
+        // A transfer that cannot land wastes the whole multi-GiB body and
+        // dies at ENOSPC partway through; refuse before requesting it. The
+        // probe's Content-Length stands in when the caller had no size.
+        let total = expected_total_bytes.or_else(|| {
+            pending_response
+                .as_ref()
+                .filter(|_| have == 0)
+                .and_then(reqwest::Response::content_length)
+        });
+        if let Some(total) = total {
+            let directory = partial.parent().unwrap_or(Path::new("."));
+            ensure_free_disk(
+                directory,
+                total.saturating_sub(have) + GOLDEN_DOWNLOAD_DISK_MARGIN,
+                "golden download",
+                "free space on this volume",
+            )?;
         }
         let response = match pending_response.take().filter(|_| have == 0) {
             Some(response) => response,
@@ -3081,6 +3190,16 @@ async fn prepare_packed_golden<P: VmProvider + 'static>(
     {
         return Ok(());
     }
+    // Unpacking writes the golden's filesystem; its disk can grow to the
+    // configured storage ceiling, and job forks grow on top of it. Not a
+    // refusal: how much of the ceiling a given golden writes is image-specific
+    // and the disk is sparse, so only flag a host that could not hold one
+    // golden at its ceiling.
+    warn_if_disk_below(
+        &golden_disk_root(config),
+        u64::from(config.storage_gib) * GIB,
+        "packed golden unpack",
+    );
     remove_golden_record(config, golden);
     if provider.status(golden).await? != MachineState::Missing {
         provider.delete(golden).await?;
@@ -3570,15 +3689,19 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if self.provider.status(&name).await? != MachineState::Missing {
             self.provider.delete(&name).await?;
         }
+        // Packing exports a second copy of the guest filesystem before
+        // producing the artifact. Give the one-shot builder headroom
+        // without increasing the storage allocated to job VMs.
+        let builder_storage_gib = self.config.storage_gib.max(40);
+        // Checked after the stale builder is gone, so its space counts as free.
+        ensure_disk_for_golden_build(&golden_disk_root(&self.config), builder_storage_gib)
+            .map_err(OrchestratorError::Config)?;
         let spec = MachineSpec {
             name: name.clone(),
             image: self.config.base_image.clone(),
             cpus: self.config.cpus,
             memory_mib: self.config.memory_mib,
-            // Packing exports a second copy of the guest filesystem before
-            // producing the artifact. Give the one-shot builder headroom
-            // without increasing the storage allocated to job VMs.
-            storage_gib: self.config.storage_gib.max(40),
+            storage_gib: builder_storage_gib,
             overlay_gib: self.config.overlay_gib,
             network: NetworkPolicy::PublicOnly,
             volumes: Vec::new(),
@@ -8968,6 +9091,40 @@ mod golden_download_tests {
     /// which every test in this binary shares, so two of them pointing at
     /// different servers would otherwise interleave.
     static GOLDEN_URL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn disk_check_refuses_only_what_cannot_fit() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(ensure_free_disk(directory.path(), 0, "test", "remedy").is_ok());
+        assert!(ensure_free_disk(directory.path(), u64::MAX, "test", "remedy").is_err());
+    }
+
+    /// An artifact that cannot land must be refused before any byte is
+    /// requested: the failure being prevented is a multi-GiB body dying at
+    /// ENOSPC partway through.
+    #[tokio::test]
+    async fn download_larger_than_free_space_is_refused_before_requesting() {
+        let directory = tempfile::tempdir().unwrap();
+        let partial = directory.path().join("golden.smolmachine.partial");
+        let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&requested);
+        let result =
+            download_golden_with_resume(&partial, "test", Some(u64::MAX / 2), None, move |_| {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Err("must not be requested".to_owned()) })
+                    as BoxFuture<'static, Result<reqwest::Response, String>>
+            })
+            .await;
+        assert!(result.is_err(), "an artifact that cannot fit must fail");
+        assert!(
+            !requested.load(std::sync::atomic::Ordering::SeqCst),
+            "refusal must happen before the transfer is requested"
+        );
+        assert!(
+            !partial.exists(),
+            "nothing may be written for a refused transfer"
+        );
+    }
 
     #[test]
     fn custom_base_without_golden_url_does_not_adopt_stock_release() {
