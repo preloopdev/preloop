@@ -22,6 +22,7 @@ use crate::control::logic::{
     ReusableExpansionInputs,
 };
 use crate::control::txn_stats::RunRowOp;
+use crate::control::types::EnvironmentDeploymentRow;
 use crate::control::types::{
     AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
     ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
@@ -2816,6 +2817,82 @@ impl<'a> Sweep<'a> {
         if self.hydrate_and_reject_labels(run_id, job_id).await? {
             return Ok(());
         }
+        // Environment protection rules run ahead of concurrency gating: a
+        // denied or waiting job never occupies a slot, and a gate failure
+        // is the reason the job ends, not "no runner could match".
+        {
+            let environment_name = self.environment_name_for(run_id, job_id).await?;
+            if let Some(env_name) = environment_name {
+                let resolver = self.backend.environment_resolver();
+                let (repository, git_ref) = {
+                    let graph = self.graphs.get(&run_id).expect("loaded");
+                    (
+                        graph.record.submission.repository.clone(),
+                        graph.record.submission.git_ref.clone(),
+                    )
+                };
+                let lookup = resolver.lookup_sync(&repository, &env_name);
+                let mut gate = self
+                    .graphs
+                    .get(&run_id)
+                    .and_then(|g| g.nodes.get(job_id))
+                    .and_then(|n| n.environment_gate.clone());
+                let verdict = crate::runtime_scheduling::evaluate_environment_gate(
+                    &lookup,
+                    &git_ref,
+                    run_id,
+                    job_id,
+                    &env_name,
+                    &mut gate,
+                    crate::models::now_unix_nanos(),
+                );
+                match verdict {
+                    crate::runtime_scheduling::EnvironmentGateOutcome::Wait => {
+                        // Armed gates stamp progress on the node; a `Pending`
+                        // hold (GitHub rules not fetched yet) records only
+                        // the resolved name — the reaper sweep re-evaluates
+                        // once the resolver fills the entry.
+                        if let Some(node) = self.node_mut(run_id, job_id) {
+                            node.environment_gate = gate;
+                            node.queue_state = logic::QueueState::Held;
+                            node.status = ExecutionStatus::Pending;
+                        }
+                        self.mark(run_id, job_id);
+                        let graph = self.graphs.get_mut(&run_id).expect("loaded");
+                        graph
+                            .record
+                            .jobs
+                            .insert(job_id.clone(), ExecutionStatus::Pending);
+                        return Ok(());
+                    }
+                    crate::runtime_scheduling::EnvironmentGateOutcome::Failed => {
+                        if let Some(node) = self.node_mut(run_id, job_id) {
+                            node.environment_gate = gate;
+                        }
+                        self.mark(run_id, job_id);
+                        self.settle_node(run_id, job_id, ExecutionStatus::Failure)
+                            .await?;
+                        self.outcome
+                            .push(ExecutionStatus::Failure, run_id, job_id.clone());
+                        return Ok(());
+                    }
+                    crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
+                        if gate.is_some()
+                            || self
+                                .graphs
+                                .get(&run_id)
+                                .and_then(|g| g.nodes.get(job_id))
+                                .is_some_and(|n| n.environment_gate.is_some())
+                        {
+                            if let Some(node) = self.node_mut(run_id, job_id) {
+                                node.environment_gate = gate;
+                            }
+                            self.mark(run_id, job_id);
+                        }
+                    }
+                }
+            }
+        }
         // Job-level gate.
         if has_gates {
             match self.job_gate(run_id, job_id).await? {
@@ -2896,6 +2973,42 @@ impl<'a> Sweep<'a> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// The environment name a job's gate evaluates against: the armed gate's
+    /// stamp, else the hydrated message's `actions_environment` (deferred
+    /// names resolved), else the spec literal. `None` for environment-less
+    /// jobs.
+    async fn environment_name_for(
+        &mut self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<String>, ControlError> {
+        let node_gate = self
+            .graphs
+            .get(&run_id)
+            .and_then(|g| g.nodes.get(job_id))
+            .and_then(|n| n.environment_gate.clone());
+        if let Some(name) = node_gate.as_ref().and_then(|g| g.environment_name.clone()) {
+            return Ok(Some(name));
+        }
+        let message_name = self.message(run_id, job_id).await?.and_then(|message| {
+            message
+                .actions_environment
+                .map(|environment| environment.name)
+        });
+        if let Some(name) = message_name {
+            return Ok(Some(name));
+        }
+        let literal = self
+            .graphs
+            .get(&run_id)
+            .and_then(|g| g.nodes.get(job_id))
+            .and_then(|node| {
+                crate::runtime_scheduling::environment_gate_name_of(node.environment.as_ref())
+            })
+            .map(str::to_owned);
+        Ok(literal)
     }
 
     /// Hydrate + enqueue one promotable job.
@@ -6522,7 +6635,6 @@ impl PgBackend {
     pub(crate) async fn promote_ready_jobs(
         &self,
         run: Option<RunId>,
-        rules: &crate::config::EnvironmentRulesMap,
     ) -> Result<PromoteOutcome, ControlError> {
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
@@ -6539,10 +6651,13 @@ impl PgBackend {
             };
             let mut sweep = Sweep::new(self, &tx).await?;
             sweep.graphs.insert(run_id, graph);
-            release_parked_nodes(&tx, &mut sweep, run_id, rules).await?;
+            release_parked_nodes(&tx, &mut sweep, run_id).await?;
             sweep.sweep().await?;
             outcome.promoted += sweep.outcome.promoted;
             outcome.failed += sweep.outcome.failed.len();
+            outcome
+                .failed_jobs
+                .extend(sweep.outcome.failed.iter().map(|(_, job)| job.clone()));
             if let Some(graph) = sweep.graphs.get_mut(&run_id) {
                 graph.resummarize();
                 graph.touched = true;
@@ -6585,6 +6700,92 @@ impl PgBackend {
             status: crate::control::types::status_parse(row.get::<_, String>(0).as_str()),
         }))
     }
+
+    /// `environment_deployment`: check run + deployment + resolved
+    /// environment for one job, assembled from `jobs`, `runs`, `job_specs`
+    /// and `job_messages`. Works on any job state (the terminal deployment
+    /// status posts after the row leaves `held`). `None` when the job is
+    /// missing or no environment name resolves.
+    pub(crate) async fn environment_deployment(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Option<EnvironmentDeploymentRow>, ControlError> {
+        let client = self.reader().await?;
+        let row = client
+            .query_opt(
+                "SELECT r.repository, r.head_sha, j.environment_gate::text, \
+                        j.check_run_id, j.deployment_id, \
+                        s.environment::text, m.message_template \
+                 FROM jobs j \
+                 JOIN runs r ON r.run_id = j.run_id \
+                 LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
+                 LEFT JOIN job_messages m ON m.run_id = j.run_id AND m.job_id = j.job_id \
+                 WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let gate: Option<crate::models::EnvironmentGateState> = row
+            .get::<_, Option<String>>(2)
+            .and_then(|json| from_json(&json).ok());
+        let template_env: Option<serde_json::Value> = row
+            .get::<_, Option<String>>(6)
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|message| {
+                message
+                    .get("environment")
+                    .or_else(|| message.get("actionsEnvironment"))
+                    .cloned()
+            });
+        let spec_env: Option<serde_json::Value> = row
+            .get::<_, Option<String>>(5)
+            .and_then(|json| from_json(&json).ok());
+        let environment = gate
+            .and_then(|gate| gate.environment_name)
+            .or_else(|| {
+                template_env
+                    .as_ref()
+                    .and_then(|env| env.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                crate::runtime_scheduling::environment_gate_name_of(spec_env.as_ref())
+                    .map(str::to_owned)
+            });
+        let Some(environment) = environment else {
+            return Ok(None);
+        };
+        // The hydrated message URL wins: `environment.url` expressions
+        // resolve into it before dispatch, while the spec literal may still
+        // hold `${{}}`.
+        let environment_url = template_env
+            .as_ref()
+            .and_then(|env| env.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                spec_env
+                    .as_ref()
+                    .and_then(|value| value.get("url"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|url| !url.is_empty())
+                    .map(str::to_owned)
+            });
+        Ok(Some(EnvironmentDeploymentRow {
+            repository: row.get(0),
+            head_sha: row.get(1),
+            environment,
+            environment_url,
+            check_run_id: row.get::<_, Option<i64>>(3).map(|id| id as u64),
+            deployment_id: row.get::<_, Option<i64>>(4).map(|id| id as u64),
+        }))
+    }
 }
 
 /// The runs a pass must visit: the named one, or — for the reaper's
@@ -6615,11 +6816,16 @@ async fn parked_gate_runs(
 /// Re-evaluate every node `run_id` parked at submit and release the ones
 /// whose hold lifted. A run still awaiting fork approval admits nothing at
 /// all — that is the whole point of the hold.
+///
+/// Gate satisfaction is stamped, never cleared: a released job hands its
+/// gate row to the promotion sweep, which re-evaluates it against the same
+/// rules — a still-running wait timer re-arms instead of losing its
+/// deadline. Only a rule resolving to "no protection" clears the row
+/// (inside `evaluate_environment_gate`).
 async fn release_parked_nodes(
     tx: &Transaction<'_>,
     sweep: &mut Sweep<'_>,
     run_id: RunId,
-    rules: &crate::config::EnvironmentRulesMap,
 ) -> Result<(), ControlError> {
     let Some(row) = tx
         .query_opt(
@@ -6659,6 +6865,7 @@ async fn release_parked_nodes(
         .await
         .map_err(db)?;
     let now_unix_nanos = crate::models::now_unix_nanos();
+    let resolver = sweep.backend.environment_resolver();
     for row in parked {
         let job_id = JobId(row.get::<_, String>(0));
         let mut gate: Option<EnvironmentGateState> = row
@@ -6667,22 +6874,37 @@ async fn release_parked_nodes(
         let environment: Option<serde_json::Value> = row
             .get::<_, Option<String>>(2)
             .and_then(|json| from_json(&json).ok());
+        // The resolved name wins: a `Pending` arm records the post-hydration
+        // name so the sweep re-evaluates against the environment GitHub
+        // knows, not the expression text.
+        let env_name = gate
+            .as_ref()
+            .and_then(|gate| gate.environment_name.clone())
+            .or_else(|| {
+                crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
+                    .map(str::to_owned)
+            });
+        let Some(env_name) = env_name else {
+            continue;
+        };
+        let lookup = resolver.lookup_sync(&repository, &env_name);
         let verdict = crate::runtime_scheduling::evaluate_environment_gate(
-            rules,
-            &repository,
+            &lookup,
             &git_ref,
             run_id,
             &job_id,
-            environment.as_ref(),
+            &env_name,
             &mut gate,
             now_unix_nanos,
         );
         match verdict {
             crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
-                // The gate is satisfied (or no rule applies): drop the stamp
-                // and hand the node back to the ordinary promotion sweep.
+                // The gate is satisfied: keep the stamps (the promotion
+                // sweep re-evaluates them — losing them here would re-arm a
+                // satisfied wait timer as a fresh gate) and hand the node
+                // back to the ordinary promotion path.
                 if let Some(node) = sweep.node_mut(run_id, &job_id) {
-                    node.environment_gate = None;
+                    node.environment_gate = gate;
                     node.queue_state = logic::QueueState::Blocked;
                     node.status = ExecutionStatus::Queued;
                 }
@@ -6701,7 +6923,7 @@ async fn release_parked_nodes(
                 // Fail closed: the node never dispatches, and its dependents
                 // settle through the ordinary sweep.
                 if let Some(node) = sweep.node_mut(run_id, &job_id) {
-                    node.environment_gate = None;
+                    node.environment_gate = gate;
                 }
                 sweep.mark(run_id, &job_id);
                 // `settle_node` records the failure in the sweep's outcome,

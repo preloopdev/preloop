@@ -235,6 +235,10 @@ CREATE TABLE jobs (
     outputs                 jsonb,
     annotations             jsonb,
     check_run_id            bigint,
+    -- GitHub deployment id for jobs with `environment:` (created when the
+    -- run reports checks; deployment statuses update on gate decisions and
+    -- job completion). `NULL` for unreported or environment-less jobs.
+    deployment_id           bigint,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.

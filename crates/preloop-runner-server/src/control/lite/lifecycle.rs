@@ -1416,91 +1416,128 @@ impl LiteBackend {
         })
     }
 
-    /// `record_environment_approval`: append one operator approval to a job
+    /// `record_environment_approval`: append one review decision to a job
     /// parked on its environment's required-reviewer gate, then re-run the
-    /// run's promotion pass so a satisfied gate releases the job.
+    /// run's promotion pass so a satisfied gate releases the job (or a
+    /// rejection fails it closed).
     ///
     /// A window that has already lapsed records nothing: the promotion pass
     /// (run next) re-evaluates the same window and settles the job
-    /// `Failure` — one fail-closed decision over the durable rows.
+    /// `Failure` — one fail-closed decision over the durable rows. A
+    /// `Reject` records the rejecting identity and lets the same pass
+    /// conclude the job, matching GitHub's reviewer-rejection semantics.
     pub(crate) async fn record_environment_approval(
         &self,
         approval: EnvironmentApproval,
     ) -> Result<EnvironmentApprovalOutcome, ControlError> {
-        let rules = self.environment_rules();
-        let tx_rules = rules.clone();
         let run_id = approval.run_id;
-        let job_id = approval.job_id;
+        let job_id = approval.job_id.clone();
+        let decision = approval.decision;
+        let actor = approval.actor.clone();
+        let admin_override = approval.admin_override;
         let note = approval.note.clone();
         let now = crate::models::now_unix_nanos();
         let result = self.write(move |tx| {
-            let repository: String = tx
-                .prepare_cached("SELECT repository FROM runs WHERE run_id = ?1")
-                .map_err(db)?
-                .query_row([codec::run_key(run_id)], |row| row.get(0))
-                .optional()
-                .map_err(db)?
-                .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
             let job = jobs::job(tx, run_id, &job_id)?
                 .ok_or_else(|| ControlError::NotFound("job not found".to_owned()))?;
             if job.status.is_terminal() {
                 return Ok(EnvironmentApprovalResult::AlreadyTerminal);
             }
-            let spec = jobs::load_spec(tx, run_id, &job_id)?;
-            let environment = spec.and_then(|spec| spec.environment);
-            let Some(env_name) =
-                crate::runtime_scheduling::environment_gate_name_of(environment.as_ref())
-            else {
-                return Ok(EnvironmentApprovalResult::NotAwaiting);
-            };
-            let required = tx_rules
-                .get(&repository)
-                .and_then(|envs| envs.get(env_name))
-                .map(|rule| rule.required_reviewers)
-                .unwrap_or(0);
             let Some(mut gate) = job.environment_gate.clone() else {
                 return Ok(EnvironmentApprovalResult::NotAwaiting);
             };
-            let Some(requested_at) = gate.approval_requested_at_unix_nanos else {
-                return Ok(EnvironmentApprovalResult::NotAwaiting);
-            };
-            if required == 0 {
+            if gate.approval_requested_at_unix_nanos.is_none() {
                 return Ok(EnvironmentApprovalResult::NotAwaiting);
             }
+            // The required count was stamped when the gate armed (rules are
+            // deliberately not re-resolved inside this transaction: GitHub's
+            // required_reviewers gate is always one approval, and a rule
+            // edit must not move a gate that is already waiting). Gates
+            // armed before the stamp existed fall back to one — every prior
+            // rule shape required exactly that.
+            let required = gate.approvals_required.unwrap_or(1);
+            let requested_at = gate.approval_requested_at_unix_nanos.unwrap_or(now);
             if now.saturating_sub(requested_at)
                 > crate::runtime_scheduling::ENVIRONMENT_APPROVAL_WINDOW_NANOS
             {
                 return Ok(EnvironmentApprovalResult::Expired);
             }
-            gate.approvals_unix_nanos.push(now);
-            let approvals = gate.approvals_unix_nanos.len();
-            let satisfied = (approvals as u32) >= required;
-            let gate_json = serde_json::to_string(&gate).map_err(ControlError::backend)?;
-            tx.prepare_cached(
-                "UPDATE jobs SET environment_gate = ?3 WHERE run_id = ?1 AND job_id = ?2",
-            )
-            .map_err(db)?
-            .execute(params![codec::run_key(run_id), job_id.0, gate_json])
-            .map_err(db)?;
-            tracing::info!(
-                run_id = %run_id.0,
-                job_id = %job_id.0,
-                environment = env_name,
-                approvals,
-                required,
-                note = note.as_deref().unwrap_or_default(),
-                "environment approval recorded"
-            );
-            Ok(EnvironmentApprovalResult::Recorded {
-                approvals,
-                required,
-                satisfied,
-            })
+            let env_name = gate.environment_name.clone().unwrap_or_default();
+            match decision {
+                EnvironmentDecision::Approve => {
+                    gate.approvals
+                        .push(crate::models::EnvironmentApprovalRecord {
+                            at_unix_nanos: now,
+                            actor: actor.clone(),
+                            admin_override,
+                            note: note.clone(),
+                        });
+                    let approvals = gate.approvals.len();
+                    let satisfied = (approvals as u32) >= required;
+                    let gate_json = serde_json::to_string(&gate).map_err(ControlError::backend)?;
+                    tx.prepare_cached(
+                        "UPDATE jobs SET environment_gate = ?3 \
+                         WHERE run_id = ?1 AND job_id = ?2",
+                    )
+                    .map_err(db)?
+                    .execute(params![codec::run_key(run_id), job_id.0, gate_json])
+                    .map_err(db)?;
+                    if admin_override {
+                        tracing::warn!(
+                            run_id = %run_id.0,
+                            job_id = %job_id.0,
+                            environment = env_name,
+                            note = note.as_deref().unwrap_or_default(),
+                            "environment approval recorded via admin override \
+                             (reviewer list bypassed)"
+                        );
+                    } else {
+                        tracing::info!(
+                            run_id = %run_id.0,
+                            job_id = %job_id.0,
+                            environment = env_name,
+                            actor = actor.as_deref().unwrap_or_default(),
+                            approvals,
+                            required,
+                            note = note.as_deref().unwrap_or_default(),
+                            "environment approval recorded"
+                        );
+                    }
+                    Ok(EnvironmentApprovalResult::Recorded {
+                        approvals,
+                        required,
+                        satisfied,
+                    })
+                }
+                EnvironmentDecision::Reject => {
+                    gate.rejected_by = actor.clone();
+                    gate.rejected_at_unix_nanos = Some(now);
+                    gate.rejected_note = note.clone();
+                    let gate_json = serde_json::to_string(&gate).map_err(ControlError::backend)?;
+                    tx.prepare_cached(
+                        "UPDATE jobs SET environment_gate = ?3 \
+                         WHERE run_id = ?1 AND job_id = ?2",
+                    )
+                    .map_err(db)?
+                    .execute(params![codec::run_key(run_id), job_id.0, gate_json])
+                    .map_err(db)?;
+                    tracing::warn!(
+                        run_id = %run_id.0,
+                        job_id = %job_id.0,
+                        environment = env_name,
+                        actor = actor.as_deref().unwrap_or_default(),
+                        admin_override,
+                        note = note.as_deref().unwrap_or_default(),
+                        "environment deployment rejected"
+                    );
+                    Ok(EnvironmentApprovalResult::Rejected)
+                }
+            }
         })?;
-        // Release or fail closed over the run's durable rows: a satisfied gate
-        // unparks the job, an expired window settles it Failure (and its
-        // dependents).
-        let promote = self.promote_ready_jobs(Some(run_id), &rules).await?;
+        // Release or fail closed over the run's durable rows: a satisfied
+        // gate unparks the job; a rejection or expired window settles it
+        // `Failure` (and its dependents).
+        let promote = self.promote_ready_jobs(Some(run_id)).await?;
         Ok(EnvironmentApprovalOutcome {
             result,
             next_runs_on: promote.next_runs_on,

@@ -569,17 +569,21 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
     }
 
+    // Environment rules: refresh every key the resolver queued (first-seen
+    // misses on GitHub-sourced repos, TTL-expired entries) ahead of the gate
+    // sweep, so a `Pending` hold never outlives the fetch that unblocks it.
+    shared
+        .state
+        .environment_resolver
+        .refresh_stale(shared)
+        .await;
+
     // Environment protection gates: wait timers expire and approval windows
     // close on wall-clock time, not on scheduling events, so re-run admission
     // for every run parking a gate-armed job — newly-satisfied gates release
     // their jobs and expired approval windows fail closed. The command is a
     // no-op for runs with no parked gate, so the tick can always ask.
-    match shared
-        .state
-        .backend
-        .promote_ready_jobs(None, &shared.state.environment_rules)
-        .await
-    {
+    match shared.state.backend.promote_ready_jobs(None).await {
         Ok(outcome) => {
             // Post-commit: refresh the node-local mirrors the runner
             // supervisor and the pool read, then wake them if the sweep
@@ -595,6 +599,11 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         }
         Err(error) => warn!(?error, "environment gate promotion sweep failed"),
     }
+
+    // Post-commit: announce newly-armed gates on GitHub — the check run's
+    // Approve/Reject actions plus the deployment's `pending` status. Rows
+    // the announce fails on stay unannounced and retry on the next tick.
+    crate::github::announce_environment_gates(shared, None).await;
 }
 
 async fn run_background_reaper(shared: Arc<SharedState>) {
@@ -1485,13 +1494,18 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             config.require_job_assignments,
             runner_liveness_timeout,
         );
-        // Environment protection rules are pure config the backend evaluates
-        // inside its promotion and reaper transactions (where the job rows
-        // live). Hand the effective rules over now that the real server
-        // config is known; empty rules keep every gate open.
+        // Environment protection rules resolve through the shared resolver
+        // (TOML fallback + GitHub fetch): the backend consults it inside its
+        // promotion and reaper transactions, where the job rows live. GitHub
+        // sourcing engages when an App or `PRELOOP_GITHUB_TOKEN` is
+        // configured — flag that now so `lookup_sync` misses become pending
+        // fetches rather than silent TOML reads.
+        if state.github_apps.is_some() || state.github_pat.is_some() {
+            state.environment_resolver.set_github_configured();
+        }
         state
             .backend
-            .set_environment_rules(std::sync::Arc::new(state.environment_rules.clone()));
+            .set_environment_resolver(state.environment_resolver.clone());
         // Imported/persisted ready jobs were enqueued under the recovered
         // (default) config, so `on_job_enqueued` may not have run for them.
         // Now that the effective config is live, rebuild dispatch intent for

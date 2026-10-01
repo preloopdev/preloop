@@ -30,14 +30,56 @@ pub(crate) fn environment_gate_name_of(environment: Option<&serde_json::Value>) 
     }
 }
 
-/// Compare a configured branch entry against the run's git ref, ignoring a
-/// leading `refs/heads/` on either side so `main` matches `refs/heads/main`.
-fn branch_allowed(allowed: &[String], git_ref: &str) -> bool {
-    let run_branch = git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref);
-    allowed.iter().any(|entry| {
-        let entry_branch = entry.strip_prefix("refs/heads/").unwrap_or(entry);
-        !entry_branch.is_empty() && entry_branch == run_branch
-    })
+/// Does `git_ref` satisfy the environment's deployment branch policy?
+///
+/// GitHub semantics: a configured `deployment_branch_policy` restricts
+/// deploys — `protected_branches` allows only protected branches (expanded
+/// to exact names by the resolver), `custom_branch_policies` allows refs
+/// matching the branch/tag name patterns (fnmatch, `*` never crosses `/`).
+/// A restricted policy whose relevant list is empty denies the ref: GitHub
+/// creates the policy as "matching nothing deploys". The TOML fallback is
+/// the same shape: non-empty `deployment_branches`/`deployment_tags` means
+/// restricted; an entirely empty rule allows any ref.
+fn ref_allowed(rule: &crate::config::EnvironmentRules, git_ref: &str) -> bool {
+    let branch = git_ref.strip_prefix("refs/heads/");
+    let tag = git_ref.strip_prefix("refs/tags/");
+    let restricted = rule.branch_policy_restricted
+        || !rule.deployment_branches.is_empty()
+        || !rule.deployment_tags.is_empty();
+    if !restricted {
+        return true;
+    }
+    if rule.protected_branches_only {
+        // Exact-name match against the repo's protected branches; tags and
+        // other refs can never satisfy this policy.
+        return branch
+            .is_some_and(|branch| rule.deployment_branches.iter().any(|name| name == branch));
+    }
+    match (branch, tag) {
+        (Some(branch), _) => {
+            !rule.deployment_branches.is_empty()
+                && rule.deployment_branches.iter().any(|pattern| {
+                    let pattern = pattern.strip_prefix("refs/heads/").unwrap_or(pattern);
+                    preloop_gha_parser::glob_match(pattern, branch)
+                })
+        }
+        (None, Some(tag)) => {
+            !rule.deployment_tags.is_empty()
+                && rule.deployment_tags.iter().any(|pattern| {
+                    let pattern = pattern.strip_prefix("refs/tags/").unwrap_or(pattern);
+                    preloop_gha_parser::glob_match(pattern, tag)
+                })
+        }
+        // A bare `main`-style ref (defensive — submissions normally carry
+        // the full ref) is treated as a branch name.
+        (None, None) => {
+            !rule.deployment_branches.is_empty()
+                && rule.deployment_branches.iter().any(|pattern| {
+                    let pattern = pattern.strip_prefix("refs/heads/").unwrap_or(pattern);
+                    preloop_gha_parser::glob_match(pattern, git_ref)
+                })
+        }
+    }
 }
 
 /// Evaluate the operator's `[environment_rules]` for one job at scheduler
@@ -47,67 +89,112 @@ fn branch_allowed(allowed: &[String], git_ref: &str) -> bool {
 ///
 /// Gate progress is stamped on `job.environment_gate`, which travels in the
 /// persisted job snapshot: a restart re-arms from the stamps rather than
-/// dropping an armed gate (fail closed). The config file is the source of
-/// truth — removing an environment's rules releases its armed gates.
+/// dropping an armed gate (fail closed). Removing an environment's rules
+/// releases its armed gates.
 pub fn check_environment_gates(
-    rules: &crate::config::EnvironmentRulesMap,
+    resolver: &crate::environment_resolver::EnvironmentResolver,
     repository: &str,
     git_ref: &str,
     job: &mut QueuedJob,
     now_unix_nanos: i64,
 ) -> EnvironmentGateOutcome {
+    let env_name = environment_gate_name_of(job.environment.as_ref()).map(str::to_owned);
+    let Some(env_name) = env_name else {
+        return EnvironmentGateOutcome::Proceed;
+    };
     evaluate_environment_gate(
-        rules,
-        repository,
+        &resolver.lookup_sync(repository, &env_name),
         git_ref,
         job.run_id,
         &job.job_id,
-        job.environment.as_ref(),
+        &env_name,
         &mut job.environment_gate,
         now_unix_nanos,
     )
 }
 
-/// [`check_environment_gates`] over the persisted parts rather than a
-/// `QueuedJob`: the backend's admission path reads
-/// `job_specs.environment`, `runs.ref` and `jobs.environment_gate` back from
-/// its own rows, so the decision function takes them directly.
+/// Evaluate one job's environment gate against a resolved rule set.
+///
+/// `lookup` is what the [`crate::environment_resolver::EnvironmentResolver`]
+/// knows right now: `Resolved` answers from TOML or the GitHub cache,
+/// `Pending` means the repo is GitHub-sourced but the rules have never been
+/// fetched — the gate arms a bare hold (fail closed) and the job stays
+/// `held` until the reaper's `resolve` pass fills the cache. `env_name` is
+/// the post-hydration environment name; it is stamped onto the gate so the
+/// sweep re-evaluates against the same name.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_environment_gate(
-    rules: &crate::config::EnvironmentRulesMap,
-    repository: &str,
+    lookup: &crate::environment_resolver::EnvironmentLookup,
     git_ref: &str,
     run_id: RunId,
     job_id: &preloop_gha_protocol::JobId,
-    environment: Option<&serde_json::Value>,
+    env_name: &str,
     gate: &mut Option<EnvironmentGateState>,
     now_unix_nanos: i64,
 ) -> EnvironmentGateOutcome {
-    let env_name = environment_gate_name_of(environment).map(str::to_owned);
-    let Some(env_name) = env_name.as_deref() else {
-        return EnvironmentGateOutcome::Proceed;
+    use crate::environment_resolver::EnvironmentLookup;
+    let lookup = match lookup {
+        EnvironmentLookup::Resolved(rules) => rules.clone(),
+        EnvironmentLookup::Pending => {
+            let gate = gate.get_or_insert_with(EnvironmentGateState::default);
+            gate.environment_name
+                .get_or_insert_with(|| env_name.to_owned());
+            return EnvironmentGateOutcome::Wait;
+        }
     };
-    let Some(rule) = rules.get(repository).and_then(|envs| envs.get(env_name)) else {
+    let Some(rule) = lookup else {
         // No rules for this environment: release any stale gate state and
-        // proceed. Today's behavior is preserved exactly.
+        // proceed. A GitHub 404 resolves the same way — environments
+        // auto-create unprotected.
         *gate = None;
         return EnvironmentGateOutcome::Proceed;
     };
     let gate = gate.get_or_insert_with(EnvironmentGateState::default);
+    gate.environment_name
+        .get_or_insert_with(|| env_name.to_owned());
 
-    // 1. Deployment branch policy: fail closed on mismatch.
-    if !rule.deployment_branches.is_empty() && !branch_allowed(&rule.deployment_branches, git_ref) {
+    // 0. A recorded rejection concludes the deployment as a failure,
+    // regardless of what the current rules say (GitHub: rejecting a pending
+    // deployment fails the job).
+    if let Some(actor) = &gate.rejected_by {
+        tracing::warn!(
+            run_id = %run_id.0,
+            job_id = %job_id.0,
+            environment = env_name,
+            rejected_by = %actor,
+            "environment gate denied: deployment rejected"
+        );
+        return EnvironmentGateOutcome::Failed;
+    }
+
+    // 1. Custom deployment protection rules are third-party GitHub Apps
+    // driven over the `deployment_protection_rule` webhook + callback token
+    // — a contract preloop cannot impersonate. Fail closed, never bypass.
+    if !rule.custom_protection_rules.is_empty() {
+        tracing::warn!(
+            run_id = %run_id.0,
+            job_id = %job_id.0,
+            environment = env_name,
+            custom_rules = ?rule.custom_protection_rules,
+            "environment gate denied: custom deployment protection rules are enabled \
+             on GitHub and cannot be evaluated by preloop"
+        );
+        return EnvironmentGateOutcome::Failed;
+    }
+
+    // 2. Deployment branch policy: fail closed on mismatch.
+    if !ref_allowed(&rule, git_ref) {
         tracing::warn!(
             run_id = %run_id.0,
             job_id = %job_id.0,
             environment = env_name,
             git_ref,
-            "environment gate denied: ref not in deployment_branches"
+            "environment gate denied: ref not allowed by the deployment branch policy"
         );
         return EnvironmentGateOutcome::Failed;
     }
 
-    // 2. Wait timer: arm once, then hold until the deadline passes.
+    // 3. Wait timer: arm once, then hold until the deadline passes.
     if gate.wait_until_unix_nanos.is_none() && rule.wait_timer_minutes > 0 {
         // Safe: config load rejects wait_timer_minutes above the i64-nanos
         // bound, so this cast is the identity and the mul cannot saturate.
@@ -125,13 +212,18 @@ pub fn evaluate_environment_gate(
         if now_unix_nanos < deadline {
             return EnvironmentGateOutcome::Wait;
         }
-        gate.wait_until_unix_nanos = None;
+        // Keep the elapsed stamp: released jobs re-enter this evaluator on
+        // the promotion sweep, and clearing it would re-arm a fresh timer
+        // against a rule that still declares `wait_timer_minutes`.
     }
 
-    // 3. Required reviewers: hold until enough approvals are recorded, fail
-    // closed when the window expires.
+    // 4. Required reviewers: hold until enough approvals are recorded, fail
+    // closed when the window expires. The required count is stamped on the
+    // gate at arm time — a later rule edit does not move a waiting gate.
     if gate.approval_requested_at_unix_nanos.is_none() && rule.required_reviewers > 0 {
         gate.approval_requested_at_unix_nanos = Some(now_unix_nanos);
+        gate.approvals_required
+            .get_or_insert(rule.required_reviewers);
         tracing::info!(
             run_id = %run_id.0,
             job_id = %job_id.0,
@@ -141,7 +233,13 @@ pub fn evaluate_environment_gate(
         );
     }
     if let Some(requested_at) = gate.approval_requested_at_unix_nanos {
-        if (gate.approvals_unix_nanos.len() as u32) >= rule.required_reviewers {
+        // Gates armed before `approvals_required` existed fall back to the
+        // current rule's count.
+        let required = gate
+            .approvals_required
+            .unwrap_or(rule.required_reviewers)
+            .max(1);
+        if (gate.approvals.len() as u32) >= required {
             return EnvironmentGateOutcome::Proceed;
         }
         if now_unix_nanos.saturating_sub(requested_at) > ENVIRONMENT_APPROVAL_WINDOW_NANOS {
@@ -1074,11 +1172,19 @@ mod environment_gate_tests {
         job
     }
 
-    fn rules_for(env_rules: crate::config::EnvironmentRules) -> crate::config::EnvironmentRulesMap {
-        BTreeMap::from([(
+    fn rules_for(
+        env_rules: crate::config::EnvironmentRules,
+    ) -> std::sync::Arc<crate::environment_resolver::EnvironmentResolver> {
+        crate::environment_resolver::EnvironmentResolver::local(BTreeMap::from([(
             "owner/repo".to_owned(),
             BTreeMap::from([("prod".to_owned(), env_rules)]),
-        )])
+        )]))
+    }
+
+    fn no_rules() -> std::sync::Arc<crate::environment_resolver::EnvironmentResolver> {
+        crate::environment_resolver::EnvironmentResolver::local(
+            crate::config::EnvironmentRulesMap::new(),
+        )
     }
 
     const NOW: i64 = 1_700_000_000_000_000_000;
@@ -1087,13 +1193,8 @@ mod environment_gate_tests {
     #[test]
     fn no_rules_proceeds_without_stamping() {
         let mut job = gate_job("prod");
-        let outcome = check_environment_gates(
-            &crate::config::EnvironmentRulesMap::new(),
-            "owner/repo",
-            "refs/heads/main",
-            &mut job,
-            NOW,
-        );
+        let outcome =
+            check_environment_gates(&no_rules(), "owner/repo", "refs/heads/main", &mut job, NOW);
         assert_eq!(outcome, EnvironmentGateOutcome::Proceed);
         assert!(
             job.environment_gate.is_none(),
@@ -1207,7 +1308,7 @@ mod environment_gate_tests {
         // The config file is the source of truth: removing the rules
         // releases the armed gate and clears its stamps.
         let outcome = check_environment_gates(
-            &crate::config::EnvironmentRulesMap::new(),
+            &no_rules(),
             "owner/repo",
             "refs/heads/main",
             &mut job,
@@ -1236,11 +1337,14 @@ mod environment_gate_tests {
                 == Some(NOW)
         );
         // The single operator confirmation releases the gate.
-        job.environment_gate
-            .as_mut()
-            .unwrap()
-            .approvals_unix_nanos
-            .push(NOW + 1);
+        job.environment_gate.as_mut().unwrap().approvals.push(
+            crate::models::EnvironmentApprovalRecord {
+                at_unix_nanos: NOW + 1,
+                actor: None,
+                admin_override: true,
+                note: None,
+            },
+        );
         let outcome =
             check_environment_gates(&rules, "owner/repo", "refs/heads/main", &mut job, NOW + 2);
         assert_eq!(outcome, EnvironmentGateOutcome::Proceed);
@@ -1279,7 +1383,7 @@ mod environment_gate_tests {
         assert_eq!(outcome, EnvironmentGateOutcome::Wait);
         // Rules removed mid-wait: the armed approval gate is released.
         let outcome = check_environment_gates(
-            &crate::config::EnvironmentRulesMap::new(),
+            &no_rules(),
             "owner/repo",
             "refs/heads/main",
             &mut job,
@@ -1341,14 +1445,20 @@ bogus_field = true
         job.environment_gate = Some(EnvironmentGateState {
             wait_until_unix_nanos: Some(NOW + 10 * MIN),
             approval_requested_at_unix_nanos: Some(NOW),
-            approvals_unix_nanos: vec![NOW + 1],
+            approvals: vec![crate::models::EnvironmentApprovalRecord {
+                at_unix_nanos: NOW + 1,
+                actor: None,
+                admin_override: true,
+                note: None,
+            }],
+            ..Default::default()
         });
         let round_tripped: QueuedJob =
             serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
         let gate = round_tripped.environment_gate.expect("gate must persist");
         assert_eq!(gate.wait_until_unix_nanos, Some(NOW + 10 * MIN));
         assert_eq!(gate.approval_requested_at_unix_nanos, Some(NOW));
-        assert_eq!(gate.approvals_unix_nanos, vec![NOW + 1]);
+        assert_eq!(gate.approvals.len(), 1);
     }
 
     #[test]

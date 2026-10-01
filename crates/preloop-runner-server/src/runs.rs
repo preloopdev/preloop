@@ -1875,7 +1875,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             // in the masker cache.
             if !pb.skipped {
                 if crate::runtime_scheduling::check_environment_gates(
-                    &shared.state.environment_rules,
+                    &shared.state.environment_resolver,
                     &submission.repository,
                     &submission.git_ref,
                     &mut queued_job,
@@ -2197,6 +2197,18 @@ pub async fn submit_run(
             }
         }
     }
+    // Environment gates armed at submission announce themselves on GitHub:
+    // the check run PATCH and the deployment's pending status. Detached —
+    // the check runs themselves mint in a spawned task, and rows this pass
+    // misses retry on the reaper's sweep anyway.
+    {
+        let shared = shared.clone();
+        let run_id = accepted.run_id;
+        tokio::spawn(async move {
+            crate::github::announce_environment_gates(&shared, Some(run_id)).await;
+        });
+    }
+
     Ok(Json(accepted))
 }
 
@@ -3542,19 +3554,55 @@ pub async fn approve_job(
     Path((run_id, job_id)): Path<(RunId, JobId)>,
     Json(body): Json<ApproveJobRequest>,
 ) -> Result<Json<ApproveJobResponse>, ApiError> {
-    // One transaction records the approval — or fails the job closed when the
-    // window lapsed — and re-runs the run's promotion sweep, so a gate the
-    // approval satisfies releases its job before this returns.
+    // The native endpoint keeps working for operators but has no user
+    // identity to authorize against a GitHub reviewer list — every approval
+    // it records is an admin override (logged as such, stamped on the gate).
+    // One transaction records the decision — or fails the job closed when
+    // the window lapsed — and re-runs the run's promotion sweep, so a gate
+    // the approval satisfies releases its job before this returns.
     let outcome = shared
         .state
         .backend
         .record_environment_approval(crate::control::types::EnvironmentApproval {
             run_id,
             job_id: job_id.clone(),
+            decision: crate::control::types::EnvironmentDecision::Approve,
+            actor: None,
+            admin_override: true,
             note: body.note.clone(),
         })
         .await
         .map_err(ApiError::from)?;
+    // Settle the gate's GitHub side-channel post-commit, best-effort: a
+    // satisfied gate flips the check run back to `in_progress` and posts the
+    // deployment's `queued` status; a partial approval updates the summary.
+    match outcome.result {
+        crate::control::types::EnvironmentApprovalResult::Recorded {
+            satisfied: true, ..
+        } => {
+            crate::github::report_environment_review(
+                &shared,
+                run_id,
+                &job_id,
+                true,
+                None,
+                body.note.as_deref(),
+            )
+            .await;
+        }
+        crate::control::types::EnvironmentApprovalResult::Rejected => {
+            crate::github::report_environment_review(
+                &shared,
+                run_id,
+                &job_id,
+                false,
+                None,
+                body.note.as_deref(),
+            )
+            .await;
+        }
+        _ => {}
+    }
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
@@ -3567,6 +3615,12 @@ pub async fn approve_job(
         crate::control::types::EnvironmentApprovalResult::NotAwaiting => Err(ApiError::conflict(
             "job is not awaiting environment approval",
         )),
+        crate::control::types::EnvironmentApprovalResult::Rejected => {
+            shared.state.message_notify.notify_waiters();
+            // The native endpoint only ever issues Approve, so reaching this
+            // arm means the reject raced in via the webhook — report it.
+            Err(ApiError::conflict("job was rejected"))
+        }
         crate::control::types::EnvironmentApprovalResult::Expired => {
             shared.state.message_notify.notify_waiters();
             shared.state.sampler_notify.notify_waiters();
@@ -3746,7 +3800,7 @@ pub async fn approve_fork(
     let outcome = shared
         .state
         .backend
-        .promote_ready_jobs(Some(run_id), &shared.state.environment_rules)
+        .promote_ready_jobs(Some(run_id))
         .await
         .map_err(ApiError::from)?;
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;

@@ -130,7 +130,7 @@ fn timeline_record(id: u128, name: &str) -> preloop_gha_protocol::azdo::Timeline
     .unwrap()
 }
 
-fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
+pub(crate) fn queued_job(run_id: RunId, job_id: &str, request_id: i64) -> QueuedJob {
     let nanos = crate::models::now_unix_nanos();
     QueuedJob {
         run_id,
@@ -220,7 +220,7 @@ fn request_record_with_agent(
     }
 }
 
-fn submit_job(run_id: RunId, job_id: &str, request_id: i64) -> SubmitJob {
+pub(crate) fn submit_job(run_id: RunId, job_id: &str, request_id: i64) -> SubmitJob {
     SubmitJob {
         queued: queued_job(run_id, job_id, request_id),
         request: Some(request_record(run_id, job_id, request_id)),
@@ -303,7 +303,7 @@ fn built_matrix_leg(
     }
 }
 
-fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
+pub(crate) fn submit_run(run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
     let mut record = run_record(run_id);
     record.run_number = NEXT_FIXTURE_RUN_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     SubmitRun {
@@ -1741,7 +1741,13 @@ pub(crate) mod suite {
         let gate = crate::models::EnvironmentGateState {
             wait_until_unix_nanos: Some(1_700_000_000_000_000_000),
             approval_requested_at_unix_nanos: Some(1_700_000_000_000_001_000),
-            approvals_unix_nanos: vec![1_700_000_000_000_002_000],
+            approvals: vec![crate::models::EnvironmentApprovalRecord {
+                at_unix_nanos: 1_700_000_000_000_002_000,
+                actor: Some("octocat".to_owned()),
+                admin_override: false,
+                note: None,
+            }],
+            ..Default::default()
         };
         backend
             .set_environment_gate(run_id, &job_id, Some(gate.clone()))
@@ -1808,10 +1814,7 @@ pub(crate) mod suite {
             })
             .await
             .unwrap();
-        let outcome = backend
-            .promote_ready_jobs(Some(run_id), &EnvironmentRulesMap::new())
-            .await
-            .unwrap();
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
         assert_eq!(outcome.promoted, 1, "the released hold admits the job");
         assert_eq!(
             backend.job_queue_state(run_id, &job_id).await.unwrap(),
@@ -1884,8 +1887,7 @@ pub(crate) mod suite {
         };
         let gate = |wait_until_unix_nanos: Option<i64>| crate::models::EnvironmentGateState {
             wait_until_unix_nanos,
-            approval_requested_at_unix_nanos: None,
-            approvals_unix_nanos: Vec::new(),
+            ..Default::default()
         };
         let now = crate::models::now_unix_nanos();
         let run_id = RunId::new();
@@ -1897,15 +1899,14 @@ pub(crate) mod suite {
         assert_eq!(backend.queue_stats().await.unwrap().ready, 0);
 
         let wait_timer = rules(crate::config::EnvironmentRules {
-            deployment_branches: Vec::new(),
             wait_timer_minutes: 1,
-            required_reviewers: 0,
+            ..Default::default()
         });
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            wait_timer,
+        ));
         // The wait timer has not elapsed: the job stays parked.
-        let outcome = backend
-            .promote_ready_jobs(Some(run_id), &wait_timer)
-            .await
-            .unwrap();
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
         assert_eq!(outcome.promoted, 0, "an unexpired wait timer holds the job");
         assert_eq!(
             backend.job_queue_state(run_id, &job_id).await.unwrap(),
@@ -1916,10 +1917,7 @@ pub(crate) mod suite {
             .set_environment_gate(run_id, &job_id, Some(gate(Some(now - 1))))
             .await
             .unwrap();
-        let outcome = backend
-            .promote_ready_jobs(Some(run_id), &wait_timer)
-            .await
-            .unwrap();
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
         assert_eq!(
             outcome.promoted, 1,
             "the elapsed wait timer releases the job"
@@ -1939,13 +1937,12 @@ pub(crate) mod suite {
         backend.submit_run(submit).await.unwrap();
         let branches = rules(crate::config::EnvironmentRules {
             deployment_branches: vec!["main".to_owned()],
-            wait_timer_minutes: 0,
-            required_reviewers: 0,
+            ..Default::default()
         });
-        let outcome = backend
-            .promote_ready_jobs(Some(refused_run), &branches)
-            .await
-            .unwrap();
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            branches,
+        ));
+        let outcome = backend.promote_ready_jobs(Some(refused_run)).await.unwrap();
         assert_eq!(outcome.failed, 1, "a denied ref fails the job closed");
         assert_eq!(
             backend

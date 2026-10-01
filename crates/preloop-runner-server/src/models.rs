@@ -482,14 +482,41 @@ pub struct QueuedJob {
     pub environment_gate: Option<EnvironmentGateState>,
 }
 
+/// One recorded approval (or the identity trail of one) on an environment
+/// protection gate. GitHub records the approving login; the local fallback
+/// records the operator-override flag instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentApprovalRecord {
+    /// When the approval was recorded (unix nanos).
+    pub at_unix_nanos: i64,
+    /// The approver's GitHub login when the approval arrived through the
+    /// `check_run.requested_action` webhook; `None` for the native
+    /// operator-override endpoint (no user identity exists there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// `true` when the approval bypassed the reviewer list (the native
+    /// admin endpoint — kept for operators, logged as an override).
+    #[serde(default)]
+    pub admin_override: bool,
+    /// Optional note carried by the approval request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Progress markers for one job's environment protection gates. All
 /// timestamps are unix nanoseconds. The stamps travel in the persisted job
-/// snapshot (`payload_blob`) so a restart re-arms an armed wait timer or
-/// approval gate instead of dropping it — and every stamp is fail-closed
-/// under snapshot loss: a lost wait deadline re-arms the wait, a lost
-/// approval re-arms the approval, never the reverse.
+/// snapshot (`jobs.environment_gate`) so a restart re-arms an armed wait
+/// timer or approval gate instead of dropping it — and every stamp is
+/// fail-closed under snapshot loss: a lost wait deadline re-arms the wait, a
+/// lost approval re-arms the approval, never the reverse.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentGateState {
+    /// The environment name the gate was armed against, post-hydration for
+    /// expression `environment:` values (GitHub evaluates rules against the
+    /// resolved name). `None` for gates armed before the field existed or
+    /// before a deferred name resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_name: Option<String>,
     /// When the wait timer expires. `None` once satisfied or when no wait
     /// timer is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -498,9 +525,31 @@ pub struct EnvironmentGateState {
     /// no approval gate is (or was) armed for this job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_requested_at_unix_nanos: Option<i64>,
-    /// Unix-nanos timestamps of recorded approvals, oldest first.
+    /// Whether the gated job's check run was already PATCHed to
+    /// `action_required` with the Approve/Reject actions. Persisted so a
+    /// restart re-announces instead of silently losing the buttons.
     #[serde(default)]
-    pub approvals_unix_nanos: Vec<i64>,
+    pub approval_announced: bool,
+    /// Recorded approvals, oldest first.
+    #[serde(default)]
+    pub approvals: Vec<EnvironmentApprovalRecord>,
+    /// Approvals the gate requires, stamped when the required-reviewer gate
+    /// armed. Recorded on the gate (rather than re-read from the rules) so
+    /// `record_environment_approval` never resolves rules inside its
+    /// transaction — and so a rule edit does not move a gate that is already
+    /// waiting. `None` on gates armed before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_required: Option<u32>,
+    /// A rejection fails the deployment (GitHub: a reviewer rejection
+    /// concludes the job as a failure) — the next evaluation fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_by: Option<String>,
+    /// When the rejection was recorded (unix nanos).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at_unix_nanos: Option<i64>,
+    /// Optional review comment carried by the rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

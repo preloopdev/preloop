@@ -169,10 +169,12 @@ pub(crate) struct PgBackend {
     pool_assignments_enabled: std::sync::atomic::AtomicBool,
     require_job_assignments: std::sync::atomic::AtomicBool,
     runner_liveness_timeout: std::sync::atomic::AtomicU64,
-    /// Operator environment protection rules (`[environment_rules]`), applied
-    /// after open from the real server config. Empty until then — no rules
-    /// means every environment gate proceeds, the pre-rules behavior.
-    environment_rules: parking_lot::RwLock<std::sync::Arc<crate::config::EnvironmentRulesMap>>,
+    /// Environment protection rules resolver (TOML fallback + GitHub
+    /// environments API). `EnvironmentResolver::local(empty)` until
+    /// bootstrap installs the shared one — every gate proceeds, the
+    /// pre-rules behavior.
+    environment_resolver:
+        parking_lot::RwLock<std::sync::Arc<crate::environment_resolver::EnvironmentResolver>>,
     /// The co-hosted runner pool's shared status handle; its advertised
     /// labels decide whether a `runs-on` is satisfiable at submit and
     /// promotion. Detached (no labels) until bootstrap hands it over.
@@ -213,9 +215,11 @@ impl PgBackend {
             runner_liveness_timeout: std::sync::atomic::AtomicU64::new(
                 runner_liveness_timeout.as_nanos() as u64,
             ),
-            environment_rules: parking_lot::RwLock::new(std::sync::Arc::new(
-                crate::config::EnvironmentRulesMap::new(),
-            )),
+            environment_resolver: parking_lot::RwLock::new(
+                crate::environment_resolver::EnvironmentResolver::local(
+                    crate::config::EnvironmentRulesMap::new(),
+                ),
+            ),
             pool_status: parking_lot::RwLock::new(Default::default()),
             released_bindings: std::sync::atomic::AtomicU64::new(0),
             wakes: wake_listener.wakes,
@@ -256,18 +260,20 @@ impl PgBackend {
             .store(runner_liveness_timeout.as_nanos() as u64, Release);
     }
 
-    /// Apply the operator's `[environment_rules]` once bootstrap knows them.
-    /// Empty rules preserve the pre-rules behavior: every gate proceeds.
-    pub(crate) fn set_environment_rules(
+    /// Install the shared environment-rules resolver once bootstrap builds
+    /// it. The default resolves nothing: every gate proceeds.
+    pub(crate) fn set_environment_resolver(
         &self,
-        rules: std::sync::Arc<crate::config::EnvironmentRulesMap>,
+        resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     ) {
-        *self.environment_rules.write() = rules;
+        *self.environment_resolver.write() = resolver;
     }
 
-    /// The live environment protection rules (an `Arc` clone, cheap).
-    pub(super) fn environment_rules(&self) -> std::sync::Arc<crate::config::EnvironmentRulesMap> {
-        self.environment_rules.read().clone()
+    /// The live environment-rules resolver (an `Arc` clone, cheap).
+    pub(crate) fn environment_resolver(
+        &self,
+    ) -> std::sync::Arc<crate::environment_resolver::EnvironmentResolver> {
+        self.environment_resolver.read().clone()
     }
 
     /// Share the runner pool's status handle (bootstrap / `AppState`).

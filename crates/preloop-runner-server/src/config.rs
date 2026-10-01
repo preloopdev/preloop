@@ -399,6 +399,22 @@ pub struct CheckoutCacheConfig {
     pub max_bytes: u64,
 }
 
+/// One GitHub-configured deployment reviewer (`User` or `Team`), as
+/// `GET /repos/{o}/{r}/environments/{name}` reports inside a
+/// `required_reviewers` protection rule. Identity is what GitHub uses: a
+/// login for users, an org-scoped slug for teams. This field is never read
+/// from `[environment_rules]` — preloop's local fallback has no user
+/// identities to compare — so the serde surface skips it; it is populated
+/// only by the GitHub rules resolver (`environment_resolver`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvironmentReviewer {
+    /// A GitHub user, matched by login (case-insensitive).
+    User(String),
+    /// A GitHub team: org login + team slug, expanded via
+    /// `GET /orgs/{org}/teams/{slug}/members` at approval time.
+    Team { org: String, slug: String },
+}
+
 /// Operator protection rules for one registered environment, mirroring
 /// GitHub's environment protection rules. Every field is optional and
 /// empty/zero by default: a missing `[environment_rules."owner/repo".env]`
@@ -406,15 +422,29 @@ pub struct CheckoutCacheConfig {
 /// Rules are enforced at scheduler admission, before environment secrets are
 /// injected — a job that fails the branch policy never sees the environment's
 /// secrets.
+///
+/// The same struct carries rules fetched from GitHub's environments API when
+/// a GitHub App is configured (`environment_resolver`); the GitHub-only
+/// fields are `skip`ped in serde so a config file cannot set them — the TOML
+/// surface stays the single-operator fallback.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentRules {
-    /// Git refs allowed to deploy to this environment. Compared against the
-    /// run's `git_ref` after stripping a leading `refs/heads/` from both
-    /// sides, so `main` matches `refs/heads/main`. Empty means any ref may
-    /// deploy. A run on a disallowed ref fails the job closed at admission.
+    /// Git branch patterns allowed to deploy to this environment. Compared
+    /// against the run's `git_ref` after stripping a leading `refs/heads/`
+    /// from both sides, so `main` matches `refs/heads/main`. GitHub treats
+    /// deployment branch policies as `File.fnmatch` patterns (a `*` never
+    /// crosses `/`), so matching goes through
+    /// `preloop_gha_parser::glob_match`. Empty means any branch may deploy.
+    /// A run on a disallowed ref fails the job closed at admission.
     #[serde(default)]
     pub deployment_branches: Vec<String>,
+    /// Git tag patterns allowed to deploy to this environment, matched
+    /// against `refs/tags/*` refs (GitHub's `type: "tag"` deployment branch
+    /// policies). Branches are never checked against tag patterns and vice
+    /// versa. Empty means any tag may deploy.
+    #[serde(default)]
+    pub deployment_tags: Vec<String>,
     /// Minutes a job waits after becoming eligible before it may start.
     /// The wait is visible (job status `pending`) and cancellable. Zero
     /// means no wait.
@@ -426,13 +456,46 @@ pub struct EnvironmentRules {
     /// `preloop approve`. Zero means no approval gate. A job not approved
     /// within 24 hours of entering the gate fails closed.
     ///
-    /// Preloop has no user identities: every approval is authenticated with
-    /// the single operator system token, so an approval is a deliberate
-    /// operator confirmation, not a distinct human reviewer. Values above 1
-    /// would imply a separation-of-duties guarantee that cannot exist, so
-    /// config loading rejects them (fail closed).
+    /// Under the local TOML fallback there are no user identities: every
+    /// approval is authenticated with the single operator system token, so
+    /// values above 1 would imply a separation-of-duties guarantee that
+    /// cannot exist and config loading rejects them (fail closed). GitHub
+    /// sources this rule differently: its `required_reviewers` protection
+    /// rule is a *set* of up to six reviewers of which one approval suffices
+    /// (https://docs.github.com/en/rest/deployments/environments), so the
+    /// resolver writes `required_reviewers: 1` here and the reviewer list
+    /// into `reviewers`.
     #[serde(default)]
     pub required_reviewers: u32,
+    /// GitHub `required_reviewers` rule: the reviewers allowed to approve,
+    /// as GitHub reports them. Empty `reviewers` with
+    /// `required_reviewers > 0` means the local fallback (system-token
+    /// approval) — a GitHub-fetched rule always populates this.
+    #[serde(skip)]
+    pub reviewers: Vec<EnvironmentReviewer>,
+    /// GitHub `prevent_self_review`: the run's own actor may not approve.
+    #[serde(skip)]
+    pub prevent_self_review: bool,
+    /// GitHub `deployment_branch_policy` was set (`protected_branches` or
+    /// `custom_branch_policies`): deployment refs are restricted. Kept
+    /// separate from the pattern lists because GitHub denies *every* ref
+    /// when the policy is configured but matches nothing (e.g. a custom
+    /// policy with zero patterns).
+    #[serde(skip)]
+    pub branch_policy_restricted: bool,
+    /// GitHub `deployment_branch_policy.protected_branches`: only branches
+    /// carrying branch protection rules may deploy. The resolver expands
+    /// this to the repo's protected-branch list in `deployment_branches`;
+    /// exact matching applies (no globs), and non-branch refs are denied.
+    #[serde(skip)]
+    pub protected_branches_only: bool,
+    /// GitHub custom deployment protection rules enabled on this
+    /// environment (third-party App slugs). These are enforced by external
+    /// Apps over the `deployment_protection_rule` webhook + callback token —
+    /// a protocol preloop cannot impersonate — so a non-empty list fails the
+    /// job closed with an explicit message rather than bypass the rule.
+    #[serde(skip)]
+    pub custom_protection_rules: Vec<String>,
 }
 
 /// `[environment_rules]` table shape: `owner/repo` -> environment name ->

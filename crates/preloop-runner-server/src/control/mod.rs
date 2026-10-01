@@ -34,7 +34,7 @@ pub(crate) mod logic;
 pub mod logic;
 pub(crate) mod pg;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testview;
 pub(crate) mod txn_stats;

@@ -798,9 +798,10 @@ pub struct AppState {
     /// Default 90 follows GitHub; `0` disables the sweep. Resolved from
     /// `retention_days` in the config file, `PRELOOP_RETENTION_DAYS` wins.
     pub retention_days: u64,
-    /// Per-environment protection rules (`[environment_rules]`), loaded at
-    /// startup. Empty by default (no rules).
-    pub environment_rules: crate::config::EnvironmentRulesMap,
+    /// Environment protection rules resolver: `[environment_rules]` TOML as
+    /// the local fallback, GitHub's environments API when an App (or
+    /// `PRELOOP_GITHUB_TOKEN`) covers the run's repository.
+    pub environment_resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
     /// File-backed live log segments for real-time console tail persistence.
@@ -1497,7 +1498,9 @@ impl AppState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
             retention_days,
-            environment_rules: config.environment_rules.clone(),
+            environment_resolver: crate::environment_resolver::EnvironmentResolver::local(
+                config.environment_rules.clone(),
+            ),
             state_dir,
             log_segments,
             system_token,

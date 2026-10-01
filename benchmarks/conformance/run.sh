@@ -72,13 +72,13 @@ cargo build --quiet -p preloop-runner-server
 # server reads the developer's ~/.preloop/config.toml, so conformance would
 # depend on host credentials — and a stale or malformed App key there aborts
 # startup, failing the run for reasons that have nothing to do with protocol
-# fidelity. The file is minimal on purpose: the only content the corpus needs
-# is the `staging` environment registration — scenario 110's job declares
-# `environment: staging` and the M4 registry gate fails closed (403) on
-# unregistered names, matching GitHub's environment registry semantics.
+# fidelity. The file carries no settings on purpose: scenario 110's job
+# declares `environment: staging`, and protection rules now come from GitHub's
+# environments API — the replay has no credential to reach it, so no
+# `environment:` name needs registering (and a `[environments]` registry is
+# rejected by the loader).
 cat > "$STATE_DIR/config.toml" <<'EOF'
-[environments]
-"preloopdev/preloop-conformance-sample" = ["staging"]
+# Intentionally empty; see the comment in run.sh.
 EOF
 # The goldens carry real GitHub-issued registration tokens this control plane
 # cannot verify, so the replay server opts into the permissive registration

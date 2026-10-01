@@ -192,11 +192,15 @@ fn under_max_parallel(
 
 /// Hydrate `context_data.needs` (and a deferred environment name) into the
 /// stored message template — `hydrate_needs_context` + `sync_broker_message`.
+/// Returns the job's post-hydration environment name when it has one: a
+/// deferred `environment:` expression resolved against the needs context,
+/// else the literal spec name. The environment gate evaluates against this
+/// resolved name (GitHub evaluates rules against the resolved environment).
 fn hydrate_message(
     tx: &Transaction<'_>,
     graph: &RunGraph,
     job: &mut JobRow,
-) -> Result<(), ControlError> {
+) -> Result<Option<String>, ControlError> {
     let run = codec::run_key(job.run_id);
     let row: Option<(String, String)> = tx
         .prepare_cached(
@@ -210,8 +214,17 @@ fn hydrate_message(
         .optional()
         .map_err(db)?;
     let Some((template, _ctx)) = row else {
-        return Ok(());
+        return Ok(None);
     };
+    // The spec's literal `environment:` name is the gate fallback when
+    // nothing deferred resolves below (the same name
+    // `environment_gate_name_of` reports).
+    let mut environment_name = jobs::load_spec(tx, job.run_id, &job.job_id)?
+        .as_ref()
+        .and_then(|spec| {
+            crate::runtime_scheduling::environment_gate_name_of(spec.environment.as_ref())
+        })
+        .map(str::to_owned);
     let mut message: azdo::AgentJobRequestMessage = serde_json::from_str(&template)
         .map_err(|e| ControlError::backend(anyhow::anyhow!("job message decode: {e}")))?;
     // needs context from the graph (only terminal needs produce entries).
@@ -290,7 +303,10 @@ fn hydrate_message(
             && let Some(actions_environment) = message.actions_environment.as_mut()
         {
             match preloop_gha_parser::eval::resolve_string(name, &context) {
-                Ok(resolved) => actions_environment.name = resolved,
+                Ok(resolved) => {
+                    actions_environment.name = resolved.clone();
+                    environment_name = Some(resolved);
+                }
                 Err(error) => {
                     tracing::error!(
                         run_id = %job.run_id,
@@ -315,7 +331,7 @@ fn hydrate_message(
             .map_err(|e| ControlError::backend(anyhow::anyhow!("job message encode: {e}")))?,
     ])
     .map_err(db)?;
-    Ok(())
+    Ok(environment_name)
 }
 
 /// `on_job_enqueued`: record dispatch intent for a fresh ready row
@@ -779,6 +795,17 @@ pub(super) fn promote_run(
     run_id: RunId,
     outcome: &mut crate::runtime_scheduling::SchedulingOutcome,
 ) -> Result<(), ControlError> {
+    // The environment gate resolves rules against the run's repo + ref.
+    let (repository, git_ref): (String, String) = tx
+        .prepare_cached("SELECT repository, ref FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()
+        .map_err(db)?
+        .unwrap_or_default();
+    let resolver = backend.environment_resolver();
     loop {
         let mut settled = false;
         // Candidates in job_order: declared needs drained (remaining_needs
@@ -920,7 +947,65 @@ pub(super) fn promote_run(
                         spec.as_ref().and_then(|s| s.max_parallel),
                     )? =>
                 {
-                    hydrate_message(tx, &graph, &mut job)?;
+                    let environment_name = hydrate_message(tx, &graph, &mut job)?;
+                    // Environment protection rules run ahead of the
+                    // satisfiability check: a gate failure is the reason the
+                    // job ends, not "no runner could match".
+                    if let Some(env_name) = environment_name.as_deref() {
+                        let mut gate = job.environment_gate.clone();
+                        let lookup = resolver.lookup_sync(&repository, env_name);
+                        let verdict = crate::runtime_scheduling::evaluate_environment_gate(
+                            &lookup,
+                            &git_ref,
+                            run_id,
+                            &job.job_id,
+                            env_name,
+                            &mut gate,
+                            crate::models::now_unix_nanos(),
+                        );
+                        match verdict {
+                            crate::runtime_scheduling::EnvironmentGateOutcome::Wait => {
+                                // Armed gates stamp their progress on the
+                                // job row; a `Pending` hold (GitHub rules not
+                                // fetched yet) records only the resolved
+                                // name — the reaper sweep re-evaluates once
+                                // the resolver fills the entry.
+                                super::fork_gate::write_gate(
+                                    tx,
+                                    run_id,
+                                    &job.job_id,
+                                    gate.clone(),
+                                )?;
+                                job.environment_gate = gate;
+                                tx.prepare_cached(
+                                    "UPDATE jobs SET queue_state = 'held', status = 'pending' \
+                                     WHERE run_id = ?1 AND job_id = ?2",
+                                )
+                                .map_err(db)?
+                                .execute(params![codec::run_key(run_id), job.job_id.0])
+                                .map_err(db)?;
+                                continue;
+                            }
+                            crate::runtime_scheduling::EnvironmentGateOutcome::Failed => {
+                                super::fork_gate::write_gate(tx, run_id, &job.job_id, gate)?;
+                                settle_job_row(tx, backend, &job, ExecutionStatus::Failure)?;
+                                outcome.failed.push((run_id, job.job_id.clone()));
+                                settled = true;
+                                continue;
+                            }
+                            crate::runtime_scheduling::EnvironmentGateOutcome::Proceed => {
+                                if job.environment_gate.is_some() || gate.is_some() {
+                                    super::fork_gate::write_gate(
+                                        tx,
+                                        run_id,
+                                        &job.job_id,
+                                        gate.clone(),
+                                    )?;
+                                    job.environment_gate = gate;
+                                }
+                            }
+                        }
+                    }
                     if let Some(reason) = logic::promotion_unsatisfiable_reason(
                         &job.runs_on,
                         platforms.iter().copied(),
