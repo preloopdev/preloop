@@ -39,6 +39,8 @@ use secrets_api::*;
 pub mod execution_protection_api;
 use execution_protection_api::*;
 mod message_template;
+mod rerequest;
+mod rerun_checks;
 pub mod remote_workflows;
 pub mod reusable_workflows;
 pub mod runs;

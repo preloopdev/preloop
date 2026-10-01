@@ -713,10 +713,35 @@ pub(crate) async fn prune_outbox_once(shared: &SharedState, older_than: Duration
 /// Drain one archive pass: move settled runs to history in batches until a
 /// short batch or an error, and return how many runs moved. Split out so a
 /// test can drive a pass deterministically instead of racing the interval.
+///
+/// Runs a re-run can still use (completed with a failed/cancelled/timed-out
+/// job) are held live for `PRELOOP_RERUN_WINDOW_DAYS` (default 30, `0`
+/// disables) so `rerun_run` can reset them in place; everything else archives
+/// on the 60-second policy.
 pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
+    // Resolved once: the value is static for the process's lifetime and the
+    // 5s pass must not re-parse (or re-warn about) an env var.
+    static RERUN_HOLD: std::sync::LazyLock<Option<std::time::Duration>> =
+        std::sync::LazyLock::new(|| match crate::config::rerun_window_days() {
+            Ok(0) => None,
+            Ok(days) => Some(std::time::Duration::from_secs(days.saturating_mul(86_400))),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "invalid PRELOOP_RERUN_WINDOW_DAYS; disabling the in-place rerun hold"
+                );
+                None
+            }
+        });
+    let rerun_hold = *RERUN_HOLD;
     let mut archived_total = 0;
     loop {
-        match shared.state.backend.archive_finished_runs(32).await {
+        match shared
+            .state
+            .backend
+            .archive_finished_runs(32, rerun_hold)
+            .await
+        {
             Ok(archived) => {
                 archived_total += archived.len();
                 // Run-tier secrets are NOT dropped here. Archiving only moves

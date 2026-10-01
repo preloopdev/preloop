@@ -315,6 +315,22 @@ pub fn build_app(
             "/repos/:owner/:repo/actions/runs",
             get(crate::dispatch::list_actions_runs),
         )
+        .route(
+            "/repos/:owner/:repo/actions/runs/:run_id/rerun",
+            post(crate::dispatch::rerun_actions_run),
+        )
+        .route(
+            "/repos/:owner/:repo/actions/runs/:run_id/rerun-failed-jobs",
+            post(crate::dispatch::rerun_actions_run_failed),
+        )
+        .route(
+            "/repos/:owner/:repo/actions/runs/:run_id/cancel",
+            post(crate::dispatch::cancel_actions_run),
+        )
+        .route(
+            "/repos/:owner/:repo/actions/jobs/:job_id/rerun",
+            post(crate::dispatch::rerun_actions_job),
+        )
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
             crate::dispatch_auth::require_dispatch_auth,

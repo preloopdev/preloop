@@ -1194,7 +1194,11 @@ impl PgBackend {
     pub(super) async fn archive_finished_runs(
         &self,
         limit: usize,
+        rerun_hold: Option<std::time::Duration>,
     ) -> Result<Vec<RunId>, ControlError> {
+        let hold_us: Option<i64> = rerun_hold
+            .map(|hold| i64::try_from(hold.as_micros()).unwrap_or(i64::MAX))
+            .filter(|hold| *hold > 0);
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         let limit = codec::limit(limit);
@@ -1207,8 +1211,13 @@ impl PgBackend {
                                  WHERE p.run_id = r.run_id \
                                    AND (p.status = 'pending' \
                                         OR p.updated_at > now() - interval '3 days')) \
+                 AND ($2::bigint IS NULL \
+                      OR r.completed_at <= now() - ($2::bigint * interval '1 microsecond') \
+                      OR NOT EXISTS (SELECT 1 FROM jobs j \
+                                     WHERE j.run_id = r.run_id \
+                                       AND j.status IN ('failure','cancelled','timed_out'))) \
                  ORDER BY r.completed_at, r.run_id LIMIT $1 FOR UPDATE OF r SKIP LOCKED",
-                &[&limit],
+                &[&limit, &hold_us],
             )
             .await
             .map_err(db)?;

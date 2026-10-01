@@ -2527,18 +2527,23 @@ async fn process_check_run_rerequest(
         }
     }
 
-    let accepted = crate::rerun_run_inner(shared, run_id, Some((job_id.clone(), check_run_id)))
-        .await
-        .map_err(|error| {
-            error!(
-                %run_id,
-                %job_id,
-                check_run_id,
-                ?error,
-                "failed to resubmit check_run rerequest"
-            );
-            error.into_response().status()
-        })?;
+    let accepted = crate::rerun_run_inner(
+        shared,
+        run_id,
+        crate::control::types::RerunMode::Job(job_id.clone()),
+        Some((job_id.clone(), check_run_id)),
+    )
+    .await
+    .map_err(|error| {
+        error!(
+            %run_id,
+            %job_id,
+            check_run_id,
+            ?error,
+            "failed to resubmit check_run rerequest"
+        );
+        error.into_response().status()
+    })?;
     info!(
         %run_id,
         rerun_run_id = %accepted.run_id,
@@ -3377,6 +3382,26 @@ async fn process_delivery_payload_with_lease(
         }
     }
 
+    if delivery.event == "check_suite" {
+        // A rerequest re-runs the suite's run in place; the delivery still
+        // falls through to the `check_suite` adapter below so
+        // `on: check_suite` workflows see it.
+        let rerequest = tokio::select! {
+            _ = lease_lost.cancelled() => return WebhookOutcome::Success,
+            result = crate::rerequest::process_check_suite_rerequest(shared, &payload_val) => result,
+        };
+        match rerequest {
+            Ok(()) => {}
+            Err(status) if status.is_server_error() => {
+                return WebhookOutcome::TransientError(format!(
+                    "check suite rerequest failed with status {status}"
+                ));
+            }
+            Err(status) => {
+                info!(%status, "check suite rerequest ignored");
+            }
+        }
+    }
     let adapter = match crate::events::adapter_for(&delivery.event) {
         Some(a) => a,
         None => {

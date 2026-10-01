@@ -7,7 +7,7 @@ use utoipa::{
 };
 
 use crate::runs::{ApproveForkRequest, ApproveForkResponse};
-use crate::runs::{ApproveJobRequest, ApproveJobResponse};
+use crate::runs::{ApproveJobRequest, ApproveJobResponse, RerunRequest};
 
 // ---------------------------------------------------------------------------
 // Schemas
@@ -184,6 +184,10 @@ pub struct RunResponse {
         repository_dispatch_trigger,
         list_dispatch_workflows,
         list_dispatch_runs,
+        rerun_actions_run,
+        rerun_actions_run_failed,
+        rerun_actions_job,
+        cancel_actions_run,
         github_register,
         github_callback,
         list_runners,
@@ -413,13 +417,32 @@ fn live_run_logs() {}
 )]
 fn cancel_run() {}
 
-/// Rerun a completed workflow.
+/// Rerun a completed workflow as a new attempt on the same run.
+///
+/// `mode` selects the jobs that reset: `all` (GitHub's "Re-run all jobs"),
+/// `failed` (failed/cancelled jobs plus their dependents — the "Re-run
+/// failed jobs" button), or `job` (`job_id` required: that job plus its
+/// dependents). Non-selected jobs keep their prior results and outputs for
+/// dependents; `github.run_attempt` increments and the previous attempt is
+/// archived to history. An environment-gated job re-arms its protection
+/// gate for the new attempt, and workflow/job concurrency groups are
+/// re-acquired exactly as at submit.
+///
+/// A run whose live rows the archiver already moved to history can only be
+/// re-run in full: `all` resubmits the recorded submission as a new run
+/// (new `run_id`), while `failed`/`job` return 409. Errors: 404 (unknown
+/// run), 409 (run still in progress, nothing selected by `failed`, attempt
+/// limit ≥ 51, the 30-day rerun window has passed, or a partial re-run of an
+/// archived run), 400 (bad mode).
 #[utoipa::path(
     post, path = "/api/v1/runs/{run_id}/rerun", tag = "Runs",
     params(("run_id" = String, Path, description = "Run UUID")),
+    request_body(content = RerunRequest, description = "Rerun mode; absent body = all jobs"),
     responses(
         (status = 202, description = "Rerun accepted", body = RunAcceptedResponse),
-        (status = 404, description = "Run not found", body = ApiErrorResponse)
+        (status = 400, description = "Unknown mode or missing job_id", body = ApiErrorResponse),
+        (status = 404, description = "Run not found", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, nothing to re-run, or rerun window closed", body = ApiErrorResponse)
     ),
     security(("native_bearer" = []))
 )]
@@ -781,6 +804,103 @@ fn list_dispatch_workflows() {}
     )
 )]
 fn list_dispatch_runs() {}
+
+/// Re-run a workflow run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun` — GitHub's
+/// "Re-run all jobs": a new attempt on the same run when it is still live,
+/// otherwise a new run from the recorded submission. `201 Created` on
+/// acceptance. `run_id` accepts the preloop UUID or the numeric id
+/// `GET .../actions/runs` emits.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("run_id" = String, Path, description = "Run UUID or github.com-shaped numeric id")
+    ),
+    responses(
+        (status = 201, description = "Re-run accepted"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or run", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, nothing to re-run, or rerun window closed", body = ApiErrorResponse)
+    )
+)]
+fn rerun_actions_run() {}
+
+/// Re-run failed jobs of a workflow run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs` —
+/// failed/cancelled jobs plus every job that depends on them; succeeded jobs
+/// keep their results and outputs for the new attempt. `201 Created` on
+/// acceptance, `409` when the run has nothing failed or was archived.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("run_id" = String, Path, description = "Run UUID or github.com-shaped numeric id")
+    ),
+    responses(
+        (status = 201, description = "Re-run accepted"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or run", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, nothing failed, or run archived", body = ApiErrorResponse)
+    )
+)]
+fn rerun_actions_run_failed() {}
+
+/// Re-run a job (and its dependents) from a workflow run
+/// (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun`. `job_id` is the
+/// numeric id `stable_id("{run_uuid}:{job_id}")` — preloop does not track
+/// github.com's job database ids — or the raw preloop job id, matched against
+/// the newest terminal run of the repository. `201 Created` on acceptance.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/jobs/{job_id}/rerun", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("job_id" = String, Path, description = "Synthetic numeric job id or preloop job id")
+    ),
+    responses(
+        (status = 201, description = "Re-run accepted"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or job", body = ApiErrorResponse),
+        (status = 409, description = "Run not completed, or run archived", body = ApiErrorResponse)
+    )
+)]
+fn rerun_actions_job() {}
+
+/// Cancel a workflow run (github.com-compatible).
+///
+/// `POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel` — `202
+/// Accepted` once cancellation is initiated; `409` when the run is already
+/// completed, matching github.com's refusal to cancel a finished run.
+#[utoipa::path(
+    post, path = "/repos/{owner}/{repo}/actions/runs/{run_id}/cancel", tag = "GitHub",
+    security(("github_dispatch_bearer" = [])),
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("run_id" = String, Path, description = "Run UUID or github.com-shaped numeric id")
+    ),
+    responses(
+        (status = 202, description = "Cancellation initiated"),
+        (status = 401, description = "Missing or invalid credential", body = ApiErrorResponse),
+        (status = 403, description = "No `actions: write` on the repository", body = ApiErrorResponse),
+        (status = 404, description = "Unknown repository or run", body = ApiErrorResponse),
+        (status = 409, description = "Run already completed", body = ApiErrorResponse)
+    )
+)]
+fn cancel_actions_run() {}
 
 /// Receive a GitHub webhook event.
 ///

@@ -20,6 +20,12 @@ impl ControlBackend for PgBackend {
     async fn submit_run(&self, submit: SubmitRun) -> Result<SubmitOutcome, ControlError> {
         self.submit_run(submit).await
     }
+    async fn rerun_run(&self, rerun: RerunRun) -> Result<RerunOutcome, ControlError> {
+        self.rerun_run(rerun).await
+    }
+    async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
+        self.rerun_plan(run_id, mode).await
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,
@@ -206,8 +212,12 @@ impl ControlBackend for PgBackend {
     ) -> Result<std::collections::BTreeSet<(RunId, JobId)>, ControlError> {
         self.terminal_jobs().await
     }
-    async fn archive_finished_runs(&self, limit: usize) -> Result<Vec<RunId>, ControlError> {
-        self.archive_finished_runs(limit).await
+    async fn archive_finished_runs(
+        &self,
+        limit: usize,
+        rerun_hold: Option<std::time::Duration>,
+    ) -> Result<Vec<RunId>, ControlError> {
+        self.archive_finished_runs(limit, rerun_hold).await
     }
     async fn expired_terminal_runs(
         &self,
