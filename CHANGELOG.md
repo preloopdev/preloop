@@ -36,6 +36,9 @@ Releases before v0.27.0 predate the changelog.
   Unpacking a packed golden warns when the volume cannot hold one golden at
   its storage ceiling. `PRELOOP_SKIP_DISK_PREFLIGHT=1` proceeds with a
   warning instead.
+- Per-architecture official packed goldens are selected by host architecture,
+  digest-pinned in the engine, and downloaded from the matching public GHCR
+  artifact; `PRELOOP_GOLDEN_OCI_REF` still overrides the default.
 - Runtime VM-state reconciliation. While `serve` runs, the pool sweeps
   orphaned machine data directories and purges orphaned `_boot-vm`
   hypervisors every 10 minutes instead of only at startup, so a `machine

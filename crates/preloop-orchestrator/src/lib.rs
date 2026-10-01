@@ -1017,8 +1017,7 @@ async fn reconcile_orphans<P: VmProvider + 'static>(
 fn default_golden_oci_ref() -> Option<&'static str> {
     match std::env::consts::ARCH {
         "aarch64" => Some(GOLDEN_OCI_REF_ARM64),
-        // x86_64: `preloop-x86_64-smolvm-golden` is pending its first push;
-        // pin its digest here once published.
+        "x86_64" => Some(GOLDEN_OCI_REF_X86_64),
         _ => None,
     }
 }
@@ -1027,6 +1026,10 @@ fn default_golden_oci_ref() -> Option<&'static str> {
 /// `preloop-arm64-smolvm-golden` artifact (pushed 2026-09-30 from a
 /// macstudio `build-golden` bake of `runner-images@3884ef22…`).
 const GOLDEN_OCI_REF_ARM64: &str = "ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:cf50db4cbbb38f47f0a533e1e35b523c6427df30261a3cd5bb49d9ef7e072414";
+/// The x86_64 packed golden, digest-pinned to the published
+/// `preloop-x86_64-smolvm-golden` artifact (pushed 2026-10-01 from a cpane
+/// `build-golden` bake of `runner-images@4f7e4be4…`).
+const GOLDEN_OCI_REF_X86_64: &str = "ghcr.io/preloopdev/preloop-x86_64-smolvm-golden@sha256:5757a8319aba0604672e62425559f207cc9f21e9380be01e8e80227eaec21914";
 /// Deadline for a whole golden download, response body included.
 ///
 /// The packed golden runs to ~9.6 GB, so this budget is really a floor on
@@ -7575,21 +7578,29 @@ chmod +x "$dest/bin/node"
     }
 
     #[test]
-    fn default_oci_golden_reference_targets_arm64_pack() {
-        let reference = OciReference::parse(GOLDEN_OCI_REF_ARM64).expect("valid OCI reference");
-        assert_eq!(reference.registry, "ghcr.io");
-        assert_eq!(
-            reference.repository,
-            "preloopdev/preloop-arm64-smolvm-golden"
-        );
-        // Immutable digest pin: changing the default must be a reviewed code
-        // change, not a registry retag.
-        assert!(
-            reference.reference.len() == "sha256:".len() + 64
-                && reference.reference.starts_with("sha256:"),
-            "expected a digest-pinned default, got `{}`",
-            reference.reference
-        );
+    fn default_oci_golden_references_are_digest_pinned_per_arch() {
+        for (pin, repository) in [
+            (
+                GOLDEN_OCI_REF_ARM64,
+                "preloopdev/preloop-arm64-smolvm-golden",
+            ),
+            (
+                GOLDEN_OCI_REF_X86_64,
+                "preloopdev/preloop-x86_64-smolvm-golden",
+            ),
+        ] {
+            let reference = OciReference::parse(pin).expect("valid OCI reference");
+            assert_eq!(reference.registry, "ghcr.io");
+            assert_eq!(reference.repository, repository);
+            // Immutable digest pin: changing a default must be a reviewed code
+            // change, not a registry retag.
+            assert!(
+                reference.reference.len() == "sha256:".len() + 64
+                    && reference.reference.starts_with("sha256:"),
+                "expected a digest-pinned default, got `{}`",
+                reference.reference
+            );
+        }
     }
 
     #[test]

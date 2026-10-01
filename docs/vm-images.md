@@ -105,13 +105,12 @@ toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
   complete release, so a newly tagged engine never points at missing goldens.
   Every GitHub release then triggers `release-golden.yml`; release notes do not
   carry an opt-in marker. The x86_64 refresh runs on GitHub-hosted
-  `ubuntu-latest` (KVM-enabled) in `release-golden.yml`; the aarch64 golden is
-  baked out-of-band on the `macstudio` host and published to GHCR for
-  `PRELOOP_GOLDEN_OCI_REF`. Successful refreshes replace the seeded
-  `preloop-ubuntu-24.04-x86_64` asset; failed refreshes stay visible without
-  removing the valid seeded pair. The pool stores the downloaded artifact at
-  a base-image-specific path below `<preloop_home>/vms/` (`preloop_home` is
-  `~/.preloop` unless `PRELOOP_HOME` says otherwise).
+  `ubuntu-latest` (KVM-enabled) in `release-golden.yml`. Successful refreshes
+  replace the seeded `preloop-ubuntu-24.04-x86_64` asset; failed refreshes
+  stay visible without removing the valid seeded pair. The pool stores the
+  downloaded artifact at a base-image-specific path below
+  `<preloop_home>/vms/` (`preloop_home` is `~/.preloop` unless
+  `PRELOOP_HOME` says otherwise).
 - The pool fetches that asset from its own release first, then from the newest
   release that actually carries it (a GitHub API lookup, cached for five
   minutes, stable releases over prereleases), and finally from
@@ -120,6 +119,14 @@ toolchains from `.nvmrc`, `rust-toolchain.toml`, or similar files.
   failed, or the tag predates the artifact — therefore still finds the
   published one instead of baking locally. `PRELOOP_GOLDEN_URL` replaces every
   candidate.
+- The OCI goldens the engine downloads by default are baked out-of-band —
+  aarch64 on the `macstudio` host, x86_64 on the `cpane` host — and published
+  to GHCR as `preloop-<arch>-smolvm-golden`, digest-pinned in the engine and
+  overridable with `PRELOOP_GOLDEN_OCI_REF`. On a host whose guest unpacks
+  layers slower than GHCR's ~5-minute signed blob URLs allow, pull the pinned
+  base on the host first (`crane pull --platform linux/amd64 --format tarball
+  <ref> base.tar`) and bake from that archive; `PRELOOP_REQUIRE_BASE_DIGEST`
+  accepts local archives.
 - Transfers resume. The in-flight download lives at `<payload>.partial` and
   each retry asks for `Range: bytes=<have>-`, so a link that drops mid-body
   costs the bytes in flight rather than the whole artifact — the packed golden
