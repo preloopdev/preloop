@@ -670,22 +670,41 @@ fn golden_partial_path(payload: &Path) -> PathBuf {
     payload.with_file_name(format!("{name}.partial"))
 }
 
-/// Public OCI artifact carrying the official arm64 packed VM golden.
+/// Public OCI artifacts carrying the packed VM goldens, per architecture.
 ///
-/// This is deliberately separate from the `runner-images` base-image package:
-/// the latter is an OCI rootfs image, while this package contains a
-/// `.smolmachine` payload ready for `machine create --from`.
+/// Deliberately separate from the `runner-images` base-image package: that
+/// is an OCI rootfs image (a bake input — users never download it), while
+/// these packages contain a `.smolmachine` payload ready for
+/// `machine create --from`.
 ///
-/// Pinned to the immutable manifest digest of the mutable
-/// `ubuntu24-arm64-runner-large-latest` tag (verified reachable 2026-08-17):
-/// a mutable tag could be silently replaced between the manifest fetch and
-/// the blob pull, and moving the default stays a reviewed code change
-/// instead of a registry retag. The artifact is produced by the CI golden
-/// pipeline (pool-side bake of the official ubuntu24-arm64 runner image);
-/// the release flow retains the packed golden as a workflow artifact because
-/// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects a
-/// custom host when one is available.
-const DEFAULT_GOLDEN_OCI_REF: &str = "ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
+/// Defaults are pinned to immutable manifest digests: a mutable tag could
+/// be silently replaced between the manifest fetch and the blob pull, and
+/// moving a default stays a reviewed code change instead of a registry
+/// retag. The artifacts are produced by the golden pipeline (host-side
+/// bake of the official runner image, packed via `smolvm pack`); the
+/// release flow retains packed goldens as workflow artifacts because
+/// GitHub Release assets are capped at 2 GiB; `PRELOOP_GOLDEN_URL` selects
+/// a custom host when one is available.
+///
+/// An architecture with no published packed golden returns `None`; the
+/// engine then falls back to the release-asset path and a local bake.
+fn default_golden_oci_ref() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(GOLDEN_OCI_REF_ARM64),
+        // x86_64: `preloop-x86_64-smolvm-golden` is pending its first push;
+        // pin its digest here once published.
+        _ => None,
+    }
+}
+
+/// The arm64 packed golden.
+///
+/// TODO(golden-pin): replace the digest below with the manifest digest of
+/// `ghcr.io/preloopdev/preloop-arm64-smolvm-golden` once the artifact is
+/// pushed under its new name; the value shown is the pre-rename
+/// `preloop-golden` pin kept for continuity and is not yet published at
+/// this repository path.
+const GOLDEN_OCI_REF_ARM64: &str = "ghcr.io/preloopdev/preloop-arm64-smolvm-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361";
 /// Deadline for a whole golden download, response body included.
 ///
 /// The packed golden runs to ~9.6 GB, so this budget is really a floor on
@@ -773,15 +792,21 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
     let forced_url = std::env::var("PRELOOP_GOLDEN_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    if std::env::consts::ARCH == "aarch64" && forced_url.is_none() {
+    // Per-architecture OCI golden: try it wherever a packed artifact is
+    // published for this platform; `PRELOOP_GOLDEN_OCI_REF` overrides the
+    // per-arch default regardless of platform. A missing package (e.g. an
+    // arch not yet published) falls through to the release-asset path.
+    if forced_url.is_none() {
         let reference = std::env::var("PRELOOP_GOLDEN_OCI_REF")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_GOLDEN_OCI_REF.to_owned());
-        if download_oci_golden(payload, &reference).await {
-            return true;
+            .or_else(|| default_golden_oci_ref().map(str::to_owned));
+        if let Some(reference) = reference {
+            if download_oci_golden(payload, &reference).await {
+                return true;
+            }
+            info!(reference, "OCI golden unavailable; trying release asset");
         }
-        info!(reference, "OCI golden unavailable; trying release asset");
     }
 
     let client = match reqwest::Client::builder()
@@ -7238,9 +7263,9 @@ chmod +x "$dest/bin/node"
     #[test]
     fn default_oci_golden_reference_targets_arm64_pack() {
         let (registry, repository, version) =
-            split_oci_reference(DEFAULT_GOLDEN_OCI_REF).expect("valid OCI reference");
+            split_oci_reference(GOLDEN_OCI_REF_ARM64).expect("valid OCI reference");
         assert_eq!(registry, "ghcr.io");
-        assert_eq!(repository, "preloopdev/preloop-golden");
+        assert_eq!(repository, "preloopdev/preloop-arm64-smolvm-golden");
         // Immutable digest pin: changing the default must be a reviewed code
         // change, not a registry retag.
         assert!(
@@ -7266,14 +7291,14 @@ chmod +x "$dest/bin/node"
 
     #[test]
     fn oci_auth_challenge_parameters_parse() {
-        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-golden:pull""#;
+        let challenge = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:preloopdev/preloop-arm64-smolvm-golden:pull""#;
         assert_eq!(
             auth_parameter(challenge, "realm").as_deref(),
             Some("https://ghcr.io/token")
         );
         assert_eq!(
             auth_parameter(challenge, "scope").as_deref(),
-            Some("repository:preloopdev/preloop-golden:pull")
+            Some("repository:preloopdev/preloop-arm64-smolvm-golden:pull")
         );
     }
 
