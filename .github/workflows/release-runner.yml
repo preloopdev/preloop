@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust toolchain
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: "1.97"
           targets: ${{ matrix.triple }}
@@ -140,7 +140,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust toolchain
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: "1.97"
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
