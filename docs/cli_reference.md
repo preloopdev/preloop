@@ -459,7 +459,7 @@ stock base, or a local bake for a custom one.
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
-| `PRELOOP_GOLDEN_OCI_REF` | Override the per-architecture packed golden OCI reference (arm64 default: `ghcr.io/preloopdev/preloop-arm64-smolvm-golden` digest-pinned in the engine; x86_64 has no published packed golden yet — it falls back to the release asset, then a local bake) |
+| `PRELOOP_GOLDEN_OCI_REF` | Override the per-architecture packed golden OCI reference; the engine has digest-pinned defaults for both the official arm64 and x86_64 GHCR artifacts |
 | `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden. Wins over the `[golden] base_image` that `preloop init` records |
 | `PRELOOP_VERIFY_BASE_IMAGE` / `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Require a digest-pinned OCI base's GitHub attestation and Cosign signature before `build-golden` |
 | `PRELOOP_REQUIRE_BASE_DIGEST` | Reject mutable registry tags during `build-golden` (used by release provenance builds) |

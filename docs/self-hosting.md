@@ -264,7 +264,7 @@ a restart cannot resurrect them. Workflows see the effective value as
 | `PRELOOP_USE_FORK` | — | Fork machines from a prepared golden instead of building each |
 | `PRELOOP_USE_PACKED_GOLDEN` | `true` | Use a release or locally cached packed golden for on-demand and pooled runners |
 | `PRELOOP_GOLDEN_URL` | release asset | Packed golden URL; the optional checksum is fetched from the same URL plus `.sha256` |
-| `PRELOOP_GOLDEN_OCI_REF` | official arm64 GHCR artifact | OCI packed golden reference downloaded automatically on arm64 hosts |
+| `PRELOOP_GOLDEN_OCI_REF` | per-architecture official GHCR artifacts | OCI packed golden reference downloaded automatically on the matching host architecture |
 | `PRELOOP_RUNNER_BUNDLE` | — | Directory of runner binaries mounted into guests |
 | `PRELOOP_RUNNER_EXTERNALS` | `$PRELOOP_HOME/externals` | Host-side Node externals directory |
 | `PRELOOP_RUNNER_BASE_IMAGE` | digest-pinned Ubuntu 24.04 | OCI base identity for `runs-on` resolution; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
