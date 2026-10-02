@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pull a GitHub App's webhook delivery history into flows.jsonl.
 
-GitHub keeps every App webhook delivery it attempted (~30 days): the exact
+GitHub keeps every App webhook delivery it attempted for 3 days: the exact
 request headers and payload it sent, and the receiver's response. That is the
 ground truth for webhook fixtures, so no proxy is needed to record inbound
 traffic. Each delivery becomes one `direction: "inbound"` record in the same
@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "addons"))
-from redact import redact_headers, redact_json  # noqa: E402
+from redact import redact_bytes, redact_headers, redact_json  # noqa: E402
 
 CAPTURE_FORMAT = 1
 
@@ -79,15 +79,40 @@ def _headers(headers: dict | None) -> list[list[str]]:
     return redact_headers({k: str(v) for k, v in (headers or {}).items()})
 
 
+def _response_json(response: dict) -> object:
+    """Parse the receiver's response payload as JSON when its content type says
+    it is one; GitHub returns the payload as a string either way."""
+    payload = response.get("payload")
+    if not isinstance(payload, str) or not payload:
+        return None
+    headers = {str(k).lower(): str(v) for k, v in (response.get("headers") or {}).items()}
+    if "json" not in headers.get("content-type", ""):
+        return None
+    try:
+        return json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+
+
 def delivery_to_record(detail: dict, index: int) -> dict:
     """Map one `GET /app/hook/deliveries/{id}` body onto a flow record."""
     url = urllib.parse.urlsplit(detail.get("url") or "")
     request = detail.get("request") or {}
     response = detail.get("response") or {}
-    payload = request.get("payload")
-    body = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else b""
+    # Redact before every serialized form is derived: the base64 fields must
+    # carry the same scrubbed bytes as the JSON fields, or exports leak the
+    # credentials the JSON view was cleaned of.
+    payload = redact_json(request.get("payload"))
+    body = (
+        redact_bytes(json.dumps(payload, separators=(",", ":")).encode())
+        if payload is not None
+        else b""
+    )
     resp_payload = response.get("payload")
-    resp_bytes = (resp_payload or "").encode() if isinstance(resp_payload, str) else b""
+    resp_bytes = (
+        redact_bytes(resp_payload.encode()) if isinstance(resp_payload, str) else b""
+    )
+    resp_json = redact_json(_response_json(response))
     duration = detail.get("duration")
     return {
         "capture_format": CAPTURE_FORMAT,
@@ -102,11 +127,11 @@ def delivery_to_record(detail: dict, index: int) -> dict:
         "path": (url.path or "/") + (f"?{url.query}" if url.query else ""),
         "request_headers": _headers(request.get("headers")),
         "request_body_b64": base64.b64encode(body).decode(),
-        "request_body_json": redact_json(payload) if payload is not None else None,
+        "request_body_json": payload,
         "status": detail.get("status_code"),
         "response_headers": _headers(response.get("headers")),
         "response_body_b64": base64.b64encode(resp_bytes).decode(),
-        "response_body_json": None,
+        "response_body_json": resp_json,
         "github_delivery": {
             "id": detail.get("id"),
             "guid": detail.get("guid"),
@@ -132,22 +157,38 @@ def main() -> int:
     args = ap.parse_args()
 
     events = {e.strip() for e in args.event.split(",") if e.strip()}
-    token = app_jwt(args.app_id, args.pem.read_bytes())
+    pem = args.pem.read_bytes()
     api = args.api.rstrip("/")
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / "flows.jsonl"
+
+    # A minted JWT lives ~9 minutes; pagination and per-delivery detail
+    # requests in a long import outlive it, so re-mint 30s before expiry
+    # instead of reusing the first token until it dies mid-import.
+    token: str | None = None
+    token_expires_at = 0.0
+
+    def current_token() -> str:
+        nonlocal token, token_expires_at
+        if token is None or time.time() >= token_expires_at - 30:
+            now = int(time.time())
+            token = app_jwt(args.app_id, pem, now=now)
+            token_expires_at = now + 540
+        return token
 
     written = 0
     url: str | None = f"{api}/app/hook/deliveries?per_page=100"
     with out.open("a") as f:
         while url and written < args.limit:
-            page, headers = _get(url, token)
+            page, headers = _get(url, current_token())
             for summary in page:  # newest first
                 if written >= args.limit:
                     break
                 if events and summary.get("event") not in events:
                     continue
-                detail, _ = _get(f"{api}/app/hook/deliveries/{summary['id']}", token)
+                detail, _ = _get(
+                    f"{api}/app/hook/deliveries/{summary['id']}", current_token()
+                )
                 written += 1
                 f.write(json.dumps(delivery_to_record(detail, written), ensure_ascii=False) + "\n")
             url = _next_link(headers)

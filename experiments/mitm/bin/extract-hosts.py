@@ -28,10 +28,28 @@ SKIP_PATHS = ("/_dns",)  # capture-harness DNS probes, not service traffic
 
 
 def extract(roots: list[Path], hosts: list[str], out: Path) -> dict[str, int]:
+    # A reused corpus directory must not keep scenarios the new filter drops:
+    # reject anything but an empty/missing output so stale flows cannot sit in
+    # the corpus while counts omit them.
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"refusing to extract into nonempty directory: {out}")
+
     counts: dict[str, int] = {}
+    # scenario name -> the flows.jsonl that produced it; a second writer for
+    # the same name means two roots collided and one would silently overwrite.
+    sources: dict[str, Path] = {}
     for root in roots:
         for flows in sorted(root.rglob("flows.jsonl")):
-            scenario = flows.parent.relative_to(root).as_posix() or root.name
+            rel = flows.parent.relative_to(root).as_posix()
+            # A flows.jsonl directly under the root has rel "."; fall back to
+            # the directory name so multiple direct captures stay distinct.
+            scenario = rel if rel != "." else root.name
+            if scenario in sources and sources[scenario] != flows:
+                raise SystemExit(
+                    f"scenario name collision: {flows} and {sources[scenario]} "
+                    f"both map to {scenario!r}; rename one capture directory"
+                )
+            sources[scenario] = flows
             kept = []
             for line in flows.read_text().splitlines():
                 if not line.strip():

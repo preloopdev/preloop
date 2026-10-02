@@ -106,7 +106,7 @@ def _dump_flow(flow: http.HTTPFlow, index: int, cd: Path):
         "duration_ms": round(duration, 3) if duration is not None else None,
         "method": request.method,
         "scheme": request.scheme,
-        "host": request.host,
+        "host": flow.metadata.get("_original_host") or request.host,
         "path": request.path,
         "request_headers": redact_headers(request.headers),
         "request_body_b64": req_b64,
@@ -136,6 +136,10 @@ class Capture:
     counter: int = 0
 
     def request(self, flow: http.HTTPFlow):
+        # Stash the caller-visible host before any rewrite: mitmproxy's host
+        # setter also updates the Host header/authority, so pretty_host can no
+        # longer answer "which service was this" after the redirect below.
+        flow.metadata["_original_host"] = flow.request.pretty_host
         if _rewrite_local() and (
             flow.request.host in ("127.0.0.1", "localhost", "preloop.local")
             or flow.request.host.endswith(".local")
@@ -159,7 +163,7 @@ class Capture:
             return
         # Filter on the original host (pre-rewrite) so allowlists name the
         # service being recorded, not the local backend.
-        host = flow.request.pretty_host
+        host = flow.metadata.get("_original_host") or flow.request.pretty_host
         if not host_selected(host, _host_allowlist()):
             return
         index = flow.metadata.get("_capture_order", Capture.counter)

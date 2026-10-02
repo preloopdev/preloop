@@ -69,6 +69,44 @@ class TestExtractHosts:
         assert extract_hosts.extract([tmp_path / "golden"], ["github.com"], tmp_path / "out") == {}
         assert not (tmp_path / "out").exists()
 
+    def test_same_relative_scenario_in_two_roots_is_a_collision(self, tmp_path):
+        for root_name in ("golden-a", "golden-b"):
+            scenario = tmp_path / root_name / "10-checkout"
+            scenario.mkdir(parents=True)
+            (scenario / "flows.jsonl").write_text(
+                json.dumps({"host": "api.github.com", "path": "/x"}) + "\n"
+            )
+        import pytest
+
+        with pytest.raises(SystemExit, match="collision"):
+            extract_hosts.extract(
+                [tmp_path / "golden-a", tmp_path / "golden-b"], ["github.com"], tmp_path / "out"
+            )
+
+    def test_direct_flows_capture_names_its_root_directory(self, tmp_path):
+        (tmp_path / "my-capture").mkdir()
+        (tmp_path / "my-capture" / "flows.jsonl").write_text(
+            json.dumps({"host": "api.github.com", "path": "/x"}) + "\n"
+        )
+        counts = extract_hosts.extract([tmp_path / "my-capture"], ["api.github.com"], tmp_path / "out")
+        assert counts == {"my-capture": 1}
+        assert (tmp_path / "out" / "my-capture" / "flows.jsonl").exists()
+
+    def test_nonempty_output_directory_is_rejected(self, tmp_path):
+        scenario = tmp_path / "golden" / "01-idle"
+        scenario.mkdir(parents=True)
+        (scenario / "flows.jsonl").write_text(
+            json.dumps({"host": "api.github.com", "path": "/x"}) + "\n"
+        )
+        out = tmp_path / "out"
+        (out / "stale").mkdir(parents=True)
+        (out / "stale" / "flows.jsonl").write_text("{}\n")
+        import pytest
+
+        with pytest.raises(SystemExit, match="nonempty"):
+            extract_hosts.extract([tmp_path / "golden"], ["github.com"], out)
+
+
 
 class TestDeliveryMapping:
     DETAIL = {
@@ -111,6 +149,38 @@ class TestDeliveryMapping:
         assert record["github_delivery"]["redelivery"] is True
         names = [name.lower() for name, _ in record["request_headers"]]
         assert "x-github-delivery" in names
+
+    def test_json_response_payload_populates_response_body_json(self):
+        detail = dict(self.DETAIL)
+        detail["response"] = {
+            "headers": {"Content-Type": "application/json"},
+            "payload": '{"ok": false, "reason": "timeout"}',
+        }
+        record = pull_deliveries.delivery_to_record(detail, 1)
+        assert record["response_body_json"] == {"ok": False, "reason": "timeout"}
+
+    def test_non_json_response_leaves_response_body_json_none(self):
+        record = pull_deliveries.delivery_to_record(self.DETAIL, 1)
+        assert record["response_body_json"] is None
+
+    def test_b64_bodies_carry_the_redacted_bytes(self):
+        import base64 as b64
+
+        secret = "ghs_" + "a" * 20
+        detail = dict(self.DETAIL)
+        detail["request"] = {
+            "headers": {},
+            "payload": {"token": secret},
+        }
+        detail["response"] = {
+            "headers": {"Content-Type": "text/plain"},
+            "payload": f"authorized as {secret}",
+        }
+        record = pull_deliveries.delivery_to_record(detail, 1)
+        for field in ("request_body_b64", "response_body_b64"):
+            raw = b64.b64decode(record[field]).decode()
+            assert secret not in raw, f"{field} leaks the credential"
+        assert record["request_body_json"]["token"] == "***REDACTED***"
 
     def test_app_jwt_follows_github_claim_rules(self):
         from cryptography.hazmat.primitives import serialization

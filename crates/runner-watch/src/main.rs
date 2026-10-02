@@ -3556,6 +3556,26 @@ fn flows_diff(args: &FlowsDiffArgs) -> anyhow::Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // A gate on a missing capture is meaningless: `load_flows` yields an
+    // empty vector for a nonexistent flows.jsonl, and an empty pair compares
+    // clean — a wrong path or lost capture would pass. Require both files,
+    // and reject an empty reference so missing evidence cannot gate green.
+    for dir in [&args.left, &args.right] {
+        let flows = dir.join("flows.jsonl");
+        if !flows.exists() {
+            anyhow::bail!("flows-diff requires a capture: missing {}", flows.display());
+        }
+    }
+    let reference_count = std::fs::read_to_string(args.left.join("flows.jsonl"))?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if reference_count == 0 {
+        anyhow::bail!(
+            "flows-diff reference {} contains no flows; refusing to gate on empty evidence",
+            args.left.display()
+        );
+    }
     let report = compare::analyze(&compare::Args {
         scenario: &scenario,
         left_dir: &args.left,
