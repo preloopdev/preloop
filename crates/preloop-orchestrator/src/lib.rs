@@ -3015,7 +3015,11 @@ async fn prepare_rosetta_multiarch<P: VmProvider>(
     // image's security-update glibc, whose mutual Breaks pins block
     // installation. One suite per deb line; the one-line format misparses
     // extra suites as components. `sync` flushes before forking the golden.
-    let script = run_as_root_or_sudo(&format!(
+    // The strict wrapper is load-bearing: a refused passwordless sudo or a
+    // failed apt step must surface as a nonzero exit. The lenient
+    // `|| true` form would report success and bake a golden whose forks all
+    // fail `test -f /lib64/ld-linux-x86-64.so.2` consumers.
+    let script = run_as_root_or_sudo_strict(&format!(
         "set -e; \
          case \"$(uname -m)\" in \
            aarch64|arm64) ;; \
@@ -6297,11 +6301,29 @@ async fn provision_runner<P: VmProvider + 'static>(
 /// `USER runner`, and `machine exec` runs as that image user). The script is
 /// embedded base64 so every quoting form survives both shells.
 fn run_as_root_or_sudo(script: &str) -> String {
+    run_as_root_or_sudo_impl(script, true)
+}
+
+/// Same root-or-sudo fallback as [`run_as_root_or_sudo`], but status-
+/// preserving: a refused sudo or a failing script propagates a nonzero exit
+/// so the caller's exit-code check is authoritative. Required for provisioning
+/// that has no independent verification step — the lenient form would turn a
+/// passwordless-sudo miss into a false success.
+fn run_as_root_or_sudo_strict(script: &str) -> String {
+    run_as_root_or_sudo_impl(script, false)
+}
+
+fn run_as_root_or_sudo_impl(script: &str, best_effort: bool) -> String {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(script);
+    let fallback = if best_effort {
+        "sudo -n sh 2>/dev/null || true"
+    } else {
+        "sudo -n sh"
+    };
     format!(
         "if [ \"$(id -u)\" -eq 0 ]; then {script}; else \
-           printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; fi"
+           printf %s '{b64}' | base64 -d | {fallback}; fi"
     )
 }
 
@@ -7633,6 +7655,44 @@ chmod +x "$dest/bin/node"
             .status()
             .unwrap();
         assert!(!status.success(), "unknown source layouts must fail closed");
+    }
+
+    #[test]
+    fn sudo_wrapper_strict_variant_preserves_failures() {
+        // The wrappers only diverge off-root: uid 0 runs the script directly
+        // in both, so the distinction is untestable there (CI guests often
+        // exec as root).
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if uid == Some(0) {
+            return;
+        }
+        let run = |script: String| {
+            std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap()
+        };
+        // Best-effort: a failing script — or sudo not existing at all —
+        // collapses to success. Provisioning steps that cannot verify the
+        // outcome afterwards must never use this form.
+        assert!(run(run_as_root_or_sudo("exit 7")).status.success());
+        // Strict: the guest's status survives whether sudo refused (no
+        // passwordless rule / binary absent) or ran a failing script.
+        assert!(!run(run_as_root_or_sudo_strict("exit 7")).status.success());
+        // And a strict wrapper still reports real success when sudo works.
+        let sudo_usable = std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if sudo_usable {
+            assert!(run(run_as_root_or_sudo_strict("exit 0")).status.success());
+        }
     }
 
     #[test]
