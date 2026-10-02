@@ -58,12 +58,14 @@ fn actions_tarball_root_str(s: &str, separator: char) -> Option<String> {
 /// `if:`, `run:`, and nested-action `with:` values — against this context;
 /// without the nested results, an inner cache step keyed on
 /// `${{ steps.<id>.outputs.dir }}` resolves to an empty string.
+/// The calling step's environment overrides the job environment; `inputs`
+/// and `steps` replace the corresponding roots with composite-local values.
 fn composite_inner_context(
     ctx: &StepContext<'_>,
     input_env: &std::collections::HashMap<String, String>,
     nested_step_results: &indexmap::IndexMap<String, crate::worker::contexts::StepResult>,
 ) -> preloop_gha_expressions::Context {
-    let mut expr_ctx = ctx.job.build_expression_context();
+    let mut expr_ctx = ctx.build_expression_context();
     let mut inputs_map = serde_json::Map::new();
     for (k, v) in input_env {
         if let Some(name) = k.strip_prefix("INPUT_") {
@@ -134,6 +136,18 @@ pub async fn run_composite_action(
     run_composite_action_inner(manifest, action_dir, with, workspace, ctx, 0, cancel_rx).await
 }
 
+/// Run nested steps and publish composite outputs, restoring the calling
+/// step's environment and GitHub action path/status before returning.
+///
+/// `depth` starts at zero; values of 10 or more are rejected. Inputs and
+/// defaults use the calling step's environment, retaining their original
+/// text when template evaluation returns an error. Job environment and PATH
+/// changes from file commands persist after the composite returns.
+///
+/// Returns errors for missing `runs.steps`, condition evaluation, file-command
+/// creation, and output-file writes. Inner-step errors propagate after eligible
+/// cleanup steps run unless `continue-on-error` is set. Failed output
+/// expressions are skipped.
 fn run_composite_action_inner<'a>(
     manifest: &'a ActionManifest,
     action_dir: &'a Path,
@@ -167,6 +181,8 @@ fn run_composite_action_inner<'a>(
         // the inner directory into later steps.
         let previous_action_status = ctx.job.github_context_value("action_status");
         let previous_action_path = ctx.job.github_context_value("action_path");
+        let previous_action_repository = ctx.job.github_context_value("action_repository");
+        let previous_action_ref = ctx.job.github_context_value("action_ref");
         ctx.job.set_github_context_value(
             "action_path",
             Some(serde_json::json!(action_dir.to_string_lossy())),
@@ -174,7 +190,7 @@ fn run_composite_action_inner<'a>(
         let result = async {
         // Set up INPUT_* env from `with` inputs
         let mut input_env = std::collections::HashMap::new();
-        let expr_ctx_for_inputs = ctx.job.build_expression_context();
+        let expr_ctx_for_inputs = ctx.build_expression_context();
         if let Some(inputs) = with.as_object() {
             for (key, value) in inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
@@ -192,7 +208,7 @@ fn run_composite_action_inner<'a>(
 
         // Apply defaults from manifest for missing inputs, evaluating ${{ }} expressions
         if let Some(manifest_inputs) = &manifest.inputs {
-            let expr_ctx = ctx.job.build_expression_context();
+            let expr_ctx = ctx.build_expression_context();
             for (key, input_def) in manifest_inputs {
                 let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
                 if let Some(default) = input_def
@@ -512,6 +528,15 @@ fn run_composite_action_inner<'a>(
             } else {
                 Ok("Skipped".to_string())
             };
+            // Nested actions run in their own GitHub action context. Restore
+            // the composite's context before the next embedded step evaluates.
+            ctx.job.set_github_context_value(
+                "action_repository",
+                previous_action_repository.clone(),
+            );
+            ctx.job
+                .set_github_context_value("action_ref", previous_action_ref.clone());
+
 
             // Apply GITHUB_ENV and GITHUB_PATH from this composite step
             // so subsequent steps see the env changes (e.g. dtolnay/rust-toolchain
@@ -665,6 +690,10 @@ fn run_composite_action_inner<'a>(
             .set_github_context_value("action_status", previous_action_status);
         ctx.job
             .set_github_context_value("action_path", previous_action_path);
+        ctx.job
+            .set_github_context_value("action_repository", previous_action_repository);
+        ctx.job
+            .set_github_context_value("action_ref", previous_action_ref);
         ctx.env = saved_env;
         result
     }) // end Box::pin
@@ -675,6 +704,133 @@ mod tests {
     use super::*;
     use crate::worker::contexts::JobContext;
     use crate::worker::execution_context::StepContext;
+
+    /// A step's `env:` block feeds the `env` context when that step's `with:`
+    /// values are evaluated. rustup's `tool: mdbook@${{ env.MDBOOK_VERSION }}`
+    /// otherwise reaches the action as `mdbook@`, which install-action rejects
+    /// ("semver operators are not supported in 'tool' input option: ''").
+    #[tokio::test]
+    async fn composite_inputs_see_the_calling_step_env() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let action_dir = workspace.path().join(".github/actions/probe");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: probe\ninputs:\n  tool:\n    required: true\nruns:\n  using: composite\n  steps:\n    - run: printf '%s' \"${{ inputs.tool }}\" > tool-input.txt\n      shell: bash\n",
+        )
+        .unwrap();
+
+        let mut job = JobContext::new(
+            "j3".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        ctx.env
+            .insert("MDBOOK_VERSION".to_owned(), "0.5.2".to_owned());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let manifest = crate::worker::handlers::factory::load_action_manifest(&action_dir).unwrap();
+        run_composite_action(
+            &manifest,
+            &action_dir,
+            &serde_json::json!({"tool": "mdbook@${{ env.MDBOOK_VERSION }}"}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            rx,
+        )
+        .await
+        .expect("composite action runs");
+
+        let written = std::fs::read_to_string(workspace.path().join("tool-input.txt")).unwrap();
+        assert_eq!(
+            written, "mdbook@0.5.2",
+            "the calling step's env must resolve in the composite's `with` inputs"
+        );
+    }
+
+    /// A nested action's repository/ref context is scoped to that action.
+    /// After it returns, following composite steps and the caller still see
+    /// the outer self-repository action identity.
+    #[tokio::test]
+    async fn nested_action_restores_composite_repository_context() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outer_dir = workspace.path().join(".github/actions/outer");
+        std::fs::create_dir_all(&outer_dir).unwrap();
+        std::fs::write(
+            outer_dir.join("action.yml"),
+            "name: outer\nruns:\n  using: composite\n  steps:\n    - uses: owner/child@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    - shell: bash\n      run: printf '%s@%s' '${{ github.action_repository }}' '${{ github.action_ref }}' > action-context.txt\n",
+        )
+        .unwrap();
+
+        let child_dir = workspace
+            .path()
+            .join("_actions/owner/child/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("action.yml"),
+            "name: child\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: true\n",
+        )
+        .unwrap();
+
+        let workflow_sha = "6b2de6eb160186cd946fb2f0929e2b265624cd61";
+        let mut job = JobContext::new(
+            "j4".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"workspace": workspace.path()},
+                "job": {"t": 2, "d": [
+                    {"k": "workflow_repository", "v": "owner/outer"},
+                    {"k": "workflow_sha", "v": workflow_sha},
+                ]},
+            }),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        job.action_paths.insert(
+            "owner/child@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            child_dir.to_string_lossy().into_owned(),
+        );
+        let mut ctx = StepContext::new(&mut job, "outer-step".into(), "Outer".into());
+        crate::worker::handlers::action::set_action_repository_context(
+            &mut ctx,
+            "$/.github/actions/outer",
+        );
+        let manifest = crate::worker::handlers::factory::load_action_manifest(&outer_dir).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+
+        run_composite_action(
+            &manifest,
+            &outer_dir,
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            rx,
+        )
+        .await
+        .expect("outer composite action runs");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("action-context.txt")).unwrap(),
+            format!("owner/outer@{workflow_sha}"),
+            "the following embedded step sees the outer action context"
+        );
+        assert_eq!(
+            ctx.job
+                .github_context_value("action_repository")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .as_deref(),
+            Some("owner/outer")
+        );
+        assert_eq!(
+            ctx.job
+                .github_context_value("action_ref")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .as_deref(),
+            Some(workflow_sha)
+        );
+    }
 
     /// Unix paths resolve the `_actions/{owner}/{repo}/{sha}` root,
     /// including sub-action directories beneath it.

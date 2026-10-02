@@ -8,72 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
-### Added
-
-- **`preloop init`** — one command for first-run setup, replacing the split
-  between `preloop setup` and choosing a golden by hand. In a terminal it is a
-  four-step wizard (credentials, golden, run mode, preflight); with stdin or
-  stdout not a TTY it takes the same answers as flags, never prompts, and exits
-  `2` on a missing flag, `3` on a failed preflight (disk, architecture,
-  hypervisor), `4` on a failure to resolve, pull, or build the base image.
-  `preloop init --probe --json` reports host capabilities (arch, free space on
-  the SmolVM data volume, hypervisor, docker, smolvm, existing config,
-  credential state, GHCR reachability) without side effects. The golden choices
-  are the packed official GitHub runner image (the default: drop-in parity,
-  ~60 GB on disk), an OCI reference verified anonymously before it is written,
-  a Dockerfile built here with `docker build`/`docker save` into a local tar
-  (`*.tar` is what smolvm's `--image` branch accepts), and a local
-  `.smolmachine` pack or rootfs directory. The credential step *is*
-  `preloop setup github` and is verified live the way `preloop doctor` does.
-  The choice is recorded in the existing config file as `[golden] base_image`,
-  which `serve` and `server install` read, with `PRELOOP_RUNNER_BASE_IMAGE`
-  still taking precedence; `serve` with no golden configured offers the wizard
-  on a TTY and otherwise prints one hint and proceeds with the official image.
-- Golden disk preflight. A golden download is refused before the transfer
-  starts when the artifact cannot fit on its volume, and a golden build is
-  refused when the SmolVM data volume has less than the builder disk + 20 GiB
-  of pack staging free (the rule the golden workflows already enforce).
-  Unpacking a packed golden warns when the volume cannot hold one golden at
-  its storage ceiling. `PRELOOP_SKIP_DISK_PREFLIGHT=1` proceeds with a
-  warning instead.
-- Per-architecture official packed goldens are selected by host architecture,
-  digest-pinned in the engine, and downloaded from the matching public GHCR
-  artifact; `PRELOOP_GOLDEN_OCI_REF` still overrides the default.
-- Runtime VM-state reconciliation. While `serve` runs, the pool sweeps
-  orphaned machine data directories and purges orphaned `_boot-vm`
-  hypervisors every 10 minutes instead of only at startup, so a `machine
-  delete` that fails mid-run no longer leaks its disk until the next engine
-  restart (long-lived engines grew 99 GB → 168 GB of VM state in an
-  afternoon). The mid-flight purge spares any hypervisor whose boot config is
-  still on disk, so a registered machine, a golden fork base, and a create in
-  flight are never touched; `remove_stale_machines` stays startup-only.
-- Job-VM disk reserve. Before a warm or on-demand slot forks or creates a job
-  VM it measures free space on the SmolVM data volume and waits (logging
-  `waiting for disk: … free on …, reserve …`) while it is below
-  `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB, `0` disables) instead of
-  filling the host or failing the job. The wait is not a provisioning
-  failure, so a full host does not trip the repeated-provision-failure alert;
-  an unmeasurable volume warns once and proceeds.
-
 ### Fixed
 
-- Workspace snapshots no longer fail for a detached `HEAD` that no branch or
-  tag reaches (a git worktree at a CI merge sha, a bisect step, a review
-  checkout). The snapshot object cache refreshed only `refs/heads/*` and
-  `refs/tags/*`, so that commit was never copied and seeding the snapshot index
-  died with `failed to unpack tree object`; the run then fell back to a plain
-  checkout of `github.server_url`. The refresh now also fetches `HEAD`, and a
-  cache whose recorded head it does not actually hold is refetched instead of
-  trusted, so caches already affected heal on the next run.
-- Run logs and step records are kept for far longer after a run finishes. The
-  on-disk log blobs were pruned to the 64 most recent execution plans — one per
-  job, so only two or three pushes of history — and the in-memory step records
-  were dropped for every run but the newest 16, which left `steps: []` in the
-  run API and made `preloop logs --step N` unresolvable for anything older.
-  Logs now keep the 1024 most recent plans (roughly 150 MiB at the median plan
-  size, 650 MiB at worst), and step records live as long as the run record
-  (256 completed runs, about 3 KiB each). Only the large live-log buffers are
-  still released after 16 runs.
+- **`$/` self-repository actions resolve** (#346): job preparation read the
+  workflow identity from `system.github.*` variables (never sent) and from the
+  `github` context as plain JSON, but `contextData` is typed on the wire, so
+  every `$/` reference was left unstaged and failed with `action reference
+  must contain @ref` (pytest's `setup-tox`, curl's `pkg-install`). It now reads
+  `job.workflow_repository`/`job.workflow_sha` like runner v2.336.0, so a
+  reusable workflow resolves against the callee. Local-workspace runs fetch the
+  tested tree from the run's snapshot (including uncommitted edits), without
+  requiring `actions/checkout`; the broker refreshes its snapshot credential
+  at claim time. A composite restores its own `action_repository`/`action_ref`
+  after nested actions complete.
+- **`job.workflow_sha` is the workspace HEAD for local runs** (#346): it kept
+  the pre-snapshot fallback (all zeros for a payload-less run) while
+  `github.sha` moved to the HEAD.
+- **A step's own `env:` is visible to its `with:` expressions** (#346):
+  `tool: mdbook@${{ env.MDBOOK_VERSION }}` evaluated against the job env only.
+- **Expression tokens in `container:`/`services:` are evaluated** (#346):
+  `container: ${{ matrix.build.container }}` decoded to no container, and the
+  job ran on the VM instead; evaluation errors now fail setup, and logs report
+  presence without serializing credentials or environment.
 
 ## [0.33.7] - 2026-09-28
 

@@ -162,6 +162,27 @@ pub struct StepContext<'a> {
 }
 
 impl<'a> StepContext<'a> {
+    /// Expression context for this step's own fields.
+    ///
+    /// The job context with the step's `env:` overlaid on the `env` root:
+    /// GitHub evaluates a step's `run:`, `if:`, and `with:` values against an
+    /// `env` context that already includes that step's environment, so
+    /// rustup's `with: { tool: mdbook@${{ env.MDBOOK_VERSION }} }` resolves
+    /// with the version the step itself declares. Evaluating against the job
+    /// context alone leaves it empty (`mdbook@`), which actions reject.
+    pub fn build_expression_context(&self) -> preloop_gha_expressions::Context {
+        let mut expr_ctx = self.job.build_expression_context();
+        if !self.env.is_empty() {
+            let overlay = self
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                .collect();
+            expr_ctx.merge_root("env", serde_json::Value::Object(overlay));
+        }
+        expr_ctx
+    }
+
     /// Create a new step context.
     pub fn new(job: &'a mut JobContext, step_id: String, step_name: String) -> Self {
         let is_debug = |v: &str| v == "true" || v == "1";
