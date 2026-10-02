@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Changed
+
+- **Standalone runner release builds target Linux and macOS.** Windows users
+  can run the Linux runner under WSL2; the native Windows matrix leg and its
+  release assets are no longer built. On a co-hosted Preloop engine, set
+  `PRELOOP_GITHUB_SKIP_WORKFLOWS=release-runner.yml` to let GitHub Actions
+  alone own that release workflow and avoid duplicate checks.
+
+### Fixed
+
+- **Ubuntu 22.04 environment goldens on Apple Silicon.** Rosetta multiarch
+  setup assumed Ubuntu 24.04's `ubuntu.sources`; the pinned 22.04 rootfs uses
+  `/etc/apt/sources.list`. Both layouts now scope native apt sources to arm64
+  before adding amd64 repositories, so 22.04 jobs can provision runners
+  instead of looping on a missing-file error.
+
 ## [0.33.8] - 2026-10-02
 
 ### Added

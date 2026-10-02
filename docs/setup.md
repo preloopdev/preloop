@@ -6,9 +6,8 @@ secrets.
 
 ### Windows
 
-Windows is supported **via WSL2** for now tho native Windows support is coming
-(the standalone Windows runner binaries already ship; a WHP-backed VM backend
-is planned). Inside WSL2, everything works like Linux:
+Windows users run Preloop under WSL2; the standalone runner release targets
+Linux and macOS, not native Windows. Inside WSL2, everything works like Linux:
 
 ```sh
 # Homebrew and npm install the same binaries (macOS and Linux/WSL2):

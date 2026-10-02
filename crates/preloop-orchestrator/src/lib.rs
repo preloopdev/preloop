@@ -2961,6 +2961,32 @@ async fn preload_images<P: VmProvider>(
     Ok(())
 }
 
+/// Scope native Ubuntu apt repositories before installing amd64 libraries on
+/// an arm64 guest. The pinned 22.04 base uses `sources.list`; 24.04 uses a
+/// deb822 `ubuntu.sources`. A different root keeps the same shell behavior
+/// testable without modifying the host's `/etc/apt`.
+fn scope_rosetta_apt_sources(apt_dir: &str) -> String {
+    let mut script = format!("APT_DIR={}; ", shell_quote(apt_dir));
+    script.push_str(
+        r#"if [ -f "$APT_DIR/sources.list.d/ubuntu.sources" ]; then
+  grep -q '^Architectures: arm64$' "$APT_DIR/sources.list.d/ubuntu.sources" ||
+    sed -i '/^Types: deb$/a Architectures: arm64' "$APT_DIR/sources.list.d/ubuntu.sources"
+elif [ -f "$APT_DIR/sources.list" ] && grep -q '^deb ' "$APT_DIR/sources.list"; then
+  :
+else
+  echo 'no supported Ubuntu apt sources found for Rosetta multiarch' >&2
+  exit 1
+fi
+for source in "$APT_DIR/sources.list" "$APT_DIR"/sources.list.d/*.list; do
+  [ -f "$source" ] || continue
+  [ "$source" = "$APT_DIR/sources.list.d/preloop-amd64.list" ] && continue
+  sed -i -E '/^deb[[:space:]]/ { /\[arch=/b; s/^deb[[:space:]]+\[/deb [arch=arm64 /; t; s/^deb[[:space:]]+/deb [arch=arm64] /; }' "$source"
+done
+"#,
+    );
+    script
+}
+
 /// Install the amd64 loader + libc into an arm64 golden so dynamically
 /// linked x86_64 binaries can run under Rosetta translation.
 ///
@@ -2979,27 +3005,27 @@ async fn prepare_rosetta_multiarch<P: VmProvider>(
     if !(cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64") {
         return Ok(());
     }
-    // arm64 Ubuntu's deb822 sources (ubuntu.sources) point at
-    // ports.ubuntu.com, which does not carry amd64; once `dpkg
-    // --add-architecture amd64` runs, every source without an
-    // `Architectures:` line serves amd64 too and ports 404s. Scope the native
-    // stanzas to arm64 and add an explicit archive.ubuntu.com [arch=amd64]
-    // source across all four suites (the image carries security-update
-    // versions — noble main alone is older and the mutual glibc Breaks pins
-    // make the resolver fail). One suite per deb line: the one-line format
-    // takes a single suite and misparses extras as components. Without the
-    // scoping, every later apt-get update (including the per-fork
-    // hosted-baseline install) fails on the amd64 fetch.
-    let script = run_as_root_or_sudo(
+    // Ubuntu 24.04 uses deb822 `ubuntu.sources`; the pinned 22.04 image uses
+    // one-line `/etc/apt/sources.list` instead. Both arm64 sources point at
+    // ports.ubuntu.com, which has no amd64 packages. Scope native sources to
+    // arm64 before adding amd64, including any third-party `.list` entries
+    // without an architecture restriction, or every later apt-get update
+    // probes those mirrors for amd64 and fails. Add the explicit amd64 archive
+    // across all four suites: the base suite alone may be older than the
+    // image's security-update glibc, whose mutual Breaks pins block
+    // installation. One suite per deb line; the one-line format misparses
+    // extra suites as components. `sync` flushes before forking the golden.
+    let script = run_as_root_or_sudo(&format!(
         "set -e; \
          case \"$(uname -m)\" in \
            aarch64|arm64) ;; \
            *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
          esac; \
+         {}; \
          dpkg --add-architecture amd64; \
-         sed -i '/^Types: deb$/a Architectures: arm64' /etc/apt/sources.list.d/ubuntu.sources; \
          CODENAME=$(. /etc/os-release 2>/dev/null && echo \"$VERSION_CODENAME\"); \
          [ -n \"$CODENAME\" ] || CODENAME=noble; \
+         : > /etc/apt/sources.list.d/preloop-amd64.list; \
          for s in '' '-updates' '-backports' '-security'; do \
            printf 'deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ %s%s main restricted universe multiverse\\n' \"$CODENAME\" \"$s\" \
              >> /etc/apt/sources.list.d/preloop-amd64.list; \
@@ -3011,7 +3037,8 @@ async fn prepare_rosetta_multiarch<P: VmProvider>(
            libsystemd0:amd64; \
          sync; \
          test -f /lib64/ld-linux-x86-64.so.2",
-    );
+        scope_rosetta_apt_sources("/etc/apt")
+    ));
     let output = provider
         .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
         .await?;
@@ -7529,6 +7556,83 @@ chmod +x "$dest/bin/node"
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    /// The rootfs selected by `ubuntu-22.04` has one-line sources while
+    /// 24.04 uses deb822. Test the guest shell against both real layouts:
+    /// missing `ubuntu.sources` used to fail every environment-golden bake
+    /// before any runner could register.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rosetta_scopes_both_ubuntu_apt_source_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        for (release, native_file, native_contents) in [
+            (
+                "22.04",
+                "sources.list",
+                "deb http://ports.ubuntu.com/ubuntu-ports jammy main\n\
+                 deb [signed-by=/key] http://ports.ubuntu.com/ubuntu-ports jammy-updates main\n",
+            ),
+            (
+                "24.04",
+                "sources.list.d/ubuntu.sources",
+                "Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: noble\n\n\
+                 Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: noble-security\n",
+            ),
+        ] {
+            let apt = temp.path().join(release).join("apt");
+            std::fs::create_dir_all(apt.join("sources.list.d")).unwrap();
+            std::fs::write(apt.join(native_file), native_contents).unwrap();
+            std::fs::write(
+                apt.join("sources.list.d/extra.list"),
+                "deb https://example.invalid stable main\n",
+            )
+            .unwrap();
+            std::fs::write(
+                apt.join("sources.list.d/preloop-amd64.list"),
+                "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main\n",
+            )
+            .unwrap();
+
+            for _ in 0..2 {
+                let result = std::process::Command::new("sh")
+                    .args(["-ec", &scope_rosetta_apt_sources(apt.to_str().unwrap())])
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{release}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let native = std::fs::read_to_string(apt.join(native_file)).unwrap();
+            if release == "22.04" {
+                assert!(native.contains("deb [arch=arm64] http://ports.ubuntu.com"));
+                assert!(native.contains("deb [arch=arm64 signed-by=/key]"));
+                assert!(!native.contains("[arch=arm64 arch=arm64]"));
+            } else {
+                assert_eq!(native.matches("Architectures: arm64").count(), 2);
+            }
+            assert_eq!(
+                std::fs::read_to_string(apt.join("sources.list.d/extra.list")).unwrap(),
+                "deb [arch=arm64] https://example.invalid stable main\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(apt.join("sources.list.d/preloop-amd64.list")).unwrap(),
+                "deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main\n"
+            );
+        }
+
+        let unsupported = temp.path().join("no-sources");
+        std::fs::create_dir_all(&unsupported).unwrap();
+        let status = std::process::Command::new("sh")
+            .args([
+                "-ec",
+                &scope_rosetta_apt_sources(unsupported.to_str().unwrap()),
+            ])
+            .status()
+            .unwrap();
+        assert!(!status.success(), "unknown source layouts must fail closed");
     }
 
     #[test]
