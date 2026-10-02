@@ -1275,22 +1275,17 @@ pub fn promote_ready_jobs(
                             .unwrap_or(0)
                             < job.max_parallel.unwrap_or(u64::MAX) =>
                 {
-                    let had_deferred_runs_on =
-                        job.runs_on.iter().any(|label| label.contains("${{"));
                     if let Some(run) = inner.runs.get(&job.run_id) {
                         hydrate_needs_context(&mut job, run);
                     }
-                    // A deferred `runs-on` that resolved to a platform no
-                    // registered runner can host (e.g. a `needs` output
-                    // yielding `windows-latest`) concludes here, mirroring
-                    // the submit-time check that raw templates skip: the
-                    // labels only became known now, so this is their first
-                    // validation. Only jobs that actually had deferred labels
-                    // are checked — literal labels were already validated at
-                    // submit. Queueing such a job would leave it stuck behind
-                    // a host that may never appear, and its dependents would
-                    // never see a terminal status.
-                    if had_deferred_runs_on {
+                    // Submit-time label gates only cover needs-less jobs and
+                    // deferred labels that resolve early; needs-gated jobs park
+                    // before those checks so `if:` can skip them first. Every
+                    // job reaching a Run decision is therefore validated here:
+                    // an unhostable platform or a label set the pool can never
+                    // satisfy fails now instead of starving in the queue.
+                    let labels_concrete = !job.runs_on.iter().any(|label| label.contains("${{"));
+                    if labels_concrete {
                         let platforms = registered_runner_platforms(inner);
                         if let Some(platform) = unhostable_platform(&job.runs_on, platforms) {
                             tracing::warn!(
@@ -1310,20 +1305,7 @@ pub fn promote_ready_jobs(
                             settled = true;
                             continue;
                         }
-                        // Advertised-pool validation, mirroring the submit-time
-                        // check that raw templates skip: the labels only became
-                        // concrete now, so this is their first validation.
-                        // When the pool has published its labels and they can
-                        // never satisfy the resolved `runs-on`, the job fails
-                        // here instead of starving in the queue. Skipped while
-                        // the labels are still raw templates (unresolvable) or
-                        // the pool hasn't published — the starvation sweep
-                        // remains the backstop there.
-                        let resolved_concrete =
-                            !job.runs_on.iter().any(|label| label.contains("${{"));
-                        if resolved_concrete
-                            && !pool_labels.is_empty()
-                            && !job_matches_runner(&job.runs_on, pool_labels)
+                        if !pool_labels.is_empty() && !job_matches_runner(&job.runs_on, pool_labels)
                         {
                             tracing::warn!(
                                 run_id = %job.run_id.0,

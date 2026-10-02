@@ -2086,6 +2086,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         for mut queued_job in built_jobs {
             let job_id = queued_job.job_id.clone();
             let base_id = queued_job.base_id.clone();
+            let needs_empty = queued_job.needs.is_empty();
 
             // Deferred reusable-caller nodes are scheduling-only: they wait in
             // pending_jobs until their `if:` gate passes, when the scheduler
@@ -2111,9 +2112,16 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             // a step. Failing is loud, and the annotation below puts the
             // reason where the user reads it rather than only in the server
             // log.
+            // Defer label gates for needs-gated jobs: they park in
+            // pending_jobs anyway, and their `if:` — which can reference
+            // needs results — has not been evaluated yet. A job GitHub would
+            // skip must not fail here on labels it will never need; the
+            // promotion path re-runs both checks for every Run decision, so
+            // nothing escapes validation.
             let platforms = runtime_scheduling::registered_runner_platforms(&inner);
-            if let Some(platform) =
-                runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
+            if needs_empty
+                && let Some(platform) =
+                    runtime_scheduling::unhostable_platform(&queued_job.runs_on, platforms)
             {
                 let reason = format!(
                     "no {platform} runner is registered with this server, so `runs-on: {}` \
@@ -2131,7 +2139,6 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
                 continue;
             }
 
-            let needs_empty = queued_job.needs.is_empty();
             if needs_empty && queued_job.runs_on.iter().any(|label| label.contains("${{")) {
                 // A job with no `needs` never passes through the promotion
                 // path, so `runs-on` labels left raw at build time (they read
@@ -2155,13 +2162,19 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             // starvation sweep remains the backstop there. Also skipped for
             // jobs whose labels are still raw templates reading `needs.*`:
             // their real labels only exist once the needed jobs complete, so
-            // there is nothing meaningful to validate yet.
+            // there is nothing meaningful to validate yet. And deferred for
+            // `needs`-gated jobs entirely: they park in `pending_jobs` until
+            // their dependencies settle and `dependency_decision` evaluates
+            // `if:`; a job that will be skipped must not fail early on labels
+            // it was never going to run on. Promotion re-validates labels for
+            // every Run decision, so nothing escapes the gate.
             let pool_labels = shared.state.pool_status.snapshot().labels;
             let runs_on_deferred = queued_job
                 .runs_on
                 .iter()
                 .any(|label| preloop_gha_parser::eval::has_expressions(label));
-            if !runs_on_deferred
+            if needs_empty
+                && !runs_on_deferred
                 && !pool_labels.is_empty()
                 && !crate::runtime_scheduling::job_matches_runner(&queued_job.runs_on, &pool_labels)
             {
@@ -4168,6 +4181,52 @@ fn live_run_events(
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    /// A needs-gated job whose `if:` resolves false must be Skipped at
+    /// promotion, not failed at enqueue on labels it never needed. The
+    /// submit-time pool gate only sees literal labels; `vars`-driven `if:`
+    /// belongs to promotion, so the label check belongs there too.
+    #[tokio::test]
+    async fn needs_gated_unsatisfiable_labels_skip_on_if_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.pool_status.set_labels(vec![
+            "self-hosted".to_owned(),
+            "Linux".to_owned(),
+            "aarch64".to_owned(),
+            "preloop-cpane".to_owned(),
+        ]);
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  prep:\n    runs-on: self-hosted\n    steps:\n      - run: echo ok\n  sync:\n    needs: prep\n    if: vars.NONEXISTENT != ''\n    runs-on: [self-hosted, runner-sync]\n    steps:\n      - run: echo unreachable\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/runner-sync.yml".to_owned()),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let result = submit_run_inner_with_webhook_delivery(&shared, submission, None)
+            .await
+            .unwrap();
+        let inner = state.inner.lock().await;
+        let run = inner.runs.get(&result.run_id).expect("run exists");
+        // `sync` must not be failed at enqueue — its `if:` is pending until
+        // `prep` finishes, then promotion evaluates it to Skip.
+        let sync_status = run.jobs.get(&JobId("sync".to_owned())).copied();
+        assert_ne!(
+            sync_status,
+            Some(ExecutionStatus::Failure),
+            "needs-gated job failed at enqueue on labels before its if: was evaluated"
+        );
+        assert!(
+            matches!(
+                sync_status,
+                Some(ExecutionStatus::Queued | ExecutionStatus::Pending) | None
+            ),
+            "sync job must still be pending until needs settle, got {sync_status:?}"
+        );
+    }
 
     #[test]
     fn orchestration_id_matches_github_format() {
