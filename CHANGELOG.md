@@ -8,8 +8,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.33.8] - 2026-10-02
+
+### Added
+
+- **`preloop init`, one onboarding command** (`d91e8b3b`): credentials, golden,
+  run mode, and preflight in one step. In a terminal it is a four-step wizard
+  that keeps each stored answer unless you change it; non-interactive runs take
+  the same answers as flags (`--auth`, `--golden`, `--mode`) and never prompt,
+  `--json` emits one object per step, and `--probe --json` reports host
+  capabilities without side effects. `preloop serve` offers it when no golden
+  is configured.
+- **x86_64 packed golden** (`30fa78a3`, `3cbdd212`): the packed golden OCI
+  artifact is selected per host architecture
+  (`ghcr.io/preloopdev/preloop-<arch>-smolvm-golden`), and an x86_64 artifact is
+  now published and pinned, so x86_64 Linux engines download it instead of
+  baking locally. `PRELOOP_GOLDEN_OCI_REF` still overrides the default.
+- **Secrets preflight** (#341): `preloop run` reports `secrets.*` names the
+  workflow reads but the engine has not stored (they would reach steps as empty
+  strings); `--strict-secrets` makes that a failure.
+- **Disk guards** (`d9997a0a`, `31465e90`): golden downloads and builds refuse
+  up front when the volume cannot hold them, job VMs wait for
+  `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB) instead of filling the
+  host, and the pool reconciles orphaned VM data dirs and hypervisors every 10
+  minutes while serving rather than only at startup.
+
+### Changed
+
+- **Golden pack indexes accepted** (`fcff04e4`): `smolvm pack push` artifacts
+  (an OCI index with `application/vnd.smolmachines.smolmachine.v1` layers) now
+  download; the arm64 golden pin moved to the renamed package.
+- **SmolVM 1.18.2** (#356).
+- **Releases no longer bake goldens** (`268d9cc2`): the per-tag bake never
+  succeeded on hosted runners; goldens are baked on architecture-matched hosts
+  and published separately.
+
 ### Fixed
 
+- **Run logs and step records survive long enough to debug** (`83eb42f8`): log
+  retention kept only the 64 most recent execution plans (two or three pushes),
+  so `preloop logs` went empty within about 20 minutes; it now keeps 1024.
+- **Detached-HEAD workspaces snapshot correctly** (`fe0be93e`): the object
+  cache never copied a HEAD no branch or tag reaches, then recorded it as
+  current, so every later run fell back to a plain checkout.
+- **`needs`-gated jobs are skipped by `if:` before label checks**
+  (`1fcb835c`): a job whose `if:` was false failed at enqueue on `runs-on`
+  labels no runner had, instead of being skipped as on GitHub. Labels are now
+  validated at promotion for every job that will actually run.
+- **Workless runs release their concurrency group** (`4fb0c092`): a run whose
+  every job was gated off concluded on arrival but held its workflow
+  concurrency slot, parking every later run in the group.
+- **Check runs for runtime-materialized jobs** (#340): deferred matrix legs and
+  reusable-workflow callee jobs now get GitHub check runs.
+- **Runner account provisioned on every fork** (#344): official-image goldens
+  left toolchain directories root-owned, so steps writing rustup components or
+  cargo binaries failed with `EACCES`.
+- **Golden bake writes its provenance manifest** (`5253e445`), and refuses a
+  bake the host lacks space to pack.
+- **`release-runner` workflow dispatches again** (`4d7f47f3`): a split
+  `name`/`uses` step made GitHub reject the file, so published releases would
+  not have built runner bundles.
 - **`$/` self-repository actions resolve** (#346): job preparation read the
   workflow identity from `system.github.*` variables (never sent) and from the
   `github` context as plain JSON, but `contextData` is typed on the wire, so
