@@ -1033,7 +1033,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .next()
         .unwrap_or("owner")
         .to_string();
-    let sha = submission
+    let mut sha = submission
         .resolved_sha
         .clone()
         .or_else(|| {
@@ -1378,23 +1378,21 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         }
         // The github context was built before the snapshot existed; refresh
         // the pieces that now describe the local tree.
+        //
+        // `github.sha` is the workspace's real HEAD commit, not the
+        // synthetic snapshot commit: the snapshot commit exists only in
+        // this engine's store, so a workflow step that fetches
+        // `${{ github.sha }}` from the real remote (custom checkouts)
+        // would be answered "not our ref". The workspace HEAD is the
+        // identity the run is really based on. `sha` feeds every job's
+        // `job.workflow_sha` (what `$/` resolves against), so it moves too.
+        sha = snapshot
+            .head_sha
+            .clone()
+            .unwrap_or_else(|| snapshot.commit_sha.clone());
         if let Some(object) = github.as_object_mut() {
             object.insert("event".to_owned(), submission.payload.clone());
-            // `github.sha` is the workspace's real HEAD commit, not the
-            // synthetic snapshot commit: the snapshot commit exists only in
-            // this engine's store, so a workflow step that fetches
-            // `${{ github.sha }}` from the real remote (custom checkouts)
-            // would be answered "not our ref". The workspace HEAD is the
-            // identity the run is really based on.
-            object.insert(
-                "sha".to_owned(),
-                serde_json::json!(
-                    snapshot
-                        .head_sha
-                        .clone()
-                        .unwrap_or_else(|| snapshot.commit_sha.clone())
-                ),
-            );
+            object.insert("sha".to_owned(), serde_json::json!(sha));
         }
     }
 
@@ -2839,6 +2837,11 @@ pub fn build_job_artifacts(
                 source = ?snapshot.source,
                 "Redirected primary checkout to immutable snapshot"
             );
+        }
+        // Self-repository actions can use this snapshot even when the workflow
+        // has no actions/checkout step. Preserve the marker for local workspace
+        // snapshots independently of checkout rewriting.
+        if redirected > 0 || snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace {
             agent_msg.preloop_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
         // Local-workspace runs test code the forge has never seen, so anything

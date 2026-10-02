@@ -1193,27 +1193,38 @@ pub async fn broker_acquire_job(
     Ok(Json(payload))
 }
 
-/// Replace every pinned checkout credential — snapshot-served or rerouted
-/// onto the forge relay — with a freshly minted runtime token.
+/// Replace pinned checkout credentials and the snapshot Git credential with
+/// freshly minted runtime tokens at claim time.
 ///
-/// Returns the number of steps refreshed. The pinned ids travel on the
-/// message ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]),
-/// so this deliberately matches by step id rather than by token shape.
+/// Checkout input ids travel on the message
+/// ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]), so this
+/// deliberately matches steps by id rather than token shape. The origin
+/// rewrite credential is refreshed even for jobs without checkout steps,
+/// because a top-level `$/` action fetches directly from that snapshot.
 pub fn re_mint_snapshot_tokens(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     state: &AppState,
 ) -> usize {
-    let Some(pinned) = message.preloop_snapshot_token_steps.as_ref() else {
-        return 0;
-    };
-    let pinned: std::collections::HashSet<uuid::Uuid> = pinned
+    let pinned: std::collections::HashSet<uuid::Uuid> = message
+        .preloop_snapshot_token_steps
+        .as_deref()
+        .unwrap_or_default()
         .iter()
         .filter_map(|id| uuid::Uuid::parse_str(id).ok())
         .collect();
-    if pinned.is_empty() {
+    let refresh_origin = message.preloop_snapshot_origin_rewrite.is_some();
+    if pinned.is_empty() && !refresh_origin {
         return 0;
     }
+
     let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    if let Some(rewrite) = message.preloop_snapshot_origin_rewrite.as_mut() {
+        use base64::Engine as _;
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{fresh}"));
+        rewrite.auth_header = format!("AUTHORIZATION: basic {credentials}");
+    }
+
     let mut re_minted = 0;
     for step in &mut message.steps {
         if pinned.contains(&step.id) {

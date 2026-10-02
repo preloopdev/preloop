@@ -182,6 +182,13 @@ fn create_reporting_context(
 }
 
 /// Execute a job from the deserialized message.
+///
+/// Sets up the workspace, prepares actions, runs steps, and reports completion
+/// using `via`. Container and service expression tokens are evaluated against
+/// the job context before workspace setup; evaluation errors propagate.
+/// Workspace setup, reporting-client creation, and completion-reporting errors
+/// also propagate. Action-preparation and step-execution failures are reported
+/// as job results, so `Ok(())` does not imply a successful job conclusion.
 pub async fn run_job(
     job_message: serde_json::Value,
     via: ProtocolPath,
@@ -224,19 +231,26 @@ pub async fn run_job(
     {
         info!("Using locked actions versions from the workflow's lockfile");
     }
-    let raw_container = job_message.get("jobContainer");
-    let raw_services = job_message.get("jobServiceContainers");
-    info!(
-        "Container fields: jobContainer={}, jobServiceContainers={}",
-        raw_container
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "absent".to_string()),
-        raw_services
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "absent".to_string()),
-    );
-    let job_container_spec = raw_container.and_then(super::container_ops::parse_container_spec);
+    // The server keeps `container:`/`services:` raw, so a matrix-driven
+    // `container: ${{ matrix.build.container }}` reaches us as an expression
+    // token. Evaluate those against the job context before parsing, or the
+    // spec is dropped and the job runs on the VM instead of the container.
+    let container_expr_ctx = job_ctx.build_expression_context();
+    let raw_container = job_message
+        .get("jobContainer")
+        .map(|value| super::container_ops::evaluate_expression_tokens(value, &container_expr_ctx))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("job container: {error}"))?;
+    let raw_services = job_message
+        .get("jobServiceContainers")
+        .map(|value| super::container_ops::evaluate_expression_tokens(value, &container_expr_ctx))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("job services: {error}"))?;
+    let job_container_spec = raw_container
+        .as_ref()
+        .and_then(super::container_ops::parse_container_spec);
     let service_specs = raw_services
+        .as_ref()
         .map(super::container_ops::parse_service_specs)
         .unwrap_or_default();
     let has_containers = job_container_spec.is_some() || !service_specs.is_empty();

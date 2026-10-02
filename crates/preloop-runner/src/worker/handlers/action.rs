@@ -11,6 +11,12 @@ use crate::worker::execution_context::StepContext;
 ///
 /// This function is recursive (composite actions can reference other actions),
 /// so it returns a boxed future to avoid infinite-size futures.
+///
+/// `$/` references run only from the directory job preparation staged for
+/// them (`job.workflow_repository@job.workflow_sha`, or the run's local
+/// snapshot); an unstaged one fails like the official runner's
+/// `GetDownloadInfoLookupKey`. Updates the job's GitHub action context and
+/// leaves it set after execution.
 pub fn run_action<'a>(
     uses: &'a str,
     with: &'a serde_json::Value,
@@ -30,6 +36,20 @@ pub fn run_action<'a>(
             super::container::run_docker_action(uses, with, workspace, ctx).await
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
+            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
+        } else if uses.starts_with("$/") {
+            // Preparation rewrote `$/path` to the workflow repository at its
+            // commit and staged it. Unstaged means unresolvable: never fall
+            // back to the workspace, whose contents the run's checkout (and
+            // an untrusted PR) controls.
+            let action_dir = ctx.job.action_paths.get(uses).with_context(|| {
+                format!(
+                    "Unable to resolve self-reference '{uses}'. This can occur when the \
+                     server does not support this syntax, the feature flag is disabled, \
+                     or the workflow context (repository/SHA) is unavailable."
+                )
+            })?;
+            let action_dir = std::path::PathBuf::from(action_dir);
             run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx).await
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
@@ -223,7 +243,7 @@ pub(crate) async fn ensure_remote_action_staged(
     Ok(action_dir)
 }
 
-fn validate_remote_action_reference(
+pub(crate) fn validate_remote_action_reference(
     owner: &str,
     repo: &str,
     git_ref: &str,
@@ -296,7 +316,14 @@ pub(crate) fn set_action_repository_context(ctx: &mut StepContext<'_>, uses: &st
         Some(serde_json::Value::String(ctx.step_id.clone())),
     );
 
-    if let Some((repository, git_ref)) = action_repository_context(uses) {
+    let repository_ref = if uses.starts_with("$/") {
+        // Official ResolveSelfRepositoryReferences rewrites the reference to
+        // `workflow_repository@workflow_sha` before the context is set.
+        crate::worker::action_preparation::self_repository_identity(&ctx.job.context_data)
+    } else {
+        action_repository_context(uses)
+    };
+    if let Some((repository, git_ref)) = repository_ref {
         ctx.job.set_github_context_value(
             "action_repository",
             Some(serde_json::Value::String(repository)),
@@ -367,6 +394,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved, staged);
+    }
+
+    /// An unstaged `$/` reference fails with the official message and never
+    /// executes an action the workspace happens to contain.
+    #[tokio::test]
+    async fn unstaged_self_repository_reference_never_runs_from_the_workspace() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let action_dir = workspace.path().join(".github/actions/probe");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(
+            action_dir.join("action.yml"),
+            "name: probe\nruns:\n  using: composite\n  steps:\n    - run: touch ran.txt\n      shell: bash\n",
+        )
+        .unwrap();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j4".into(),
+            "Job".into(),
+            serde_json::json!({"actions_self_repository": {"value": "true"}}),
+            serde_json::json!({"github": {"workspace": workspace.path()}}),
+        );
+        job.workspace = Some(workspace.path().to_string_lossy().to_string());
+        let mut ctx = StepContext::new(&mut job, "step".into(), "Step".into());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let error = run_action(
+            "$/.github/actions/probe",
+            &serde_json::json!({}),
+            workspace.path().to_str().unwrap(),
+            &mut ctx,
+            rx,
+        )
+        .await
+        .expect_err("an unstaged $/ reference is unresolvable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unable to resolve self-reference"),
+            "unexpected error: {error}"
+        );
+        assert!(!workspace.path().join("ran.txt").exists());
     }
 
     #[test]
@@ -628,6 +696,39 @@ mod tests {
                 .and_then(|v| v.as_str().map(String::from)),
             Some("My Display Name".to_string()),
             "github.action must not be the display name"
+        );
+    }
+
+    /// `$/` reports the workflow repository and commit it was rewritten to.
+    #[test]
+    fn set_action_repository_context_names_the_self_repository() {
+        let mut job = crate::worker::contexts::JobContext::new(
+            "j1".into(),
+            "Job".into(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "github": {"repository": "owner/app"},
+                "job": {"t": 2, "d": [
+                    {"k": "workflow_repository", "v": "owner/shared"},
+                    {"k": "workflow_sha", "v": "6b2de6eb160186cd946fb2f0929e2b265624cd61"},
+                ]},
+            }),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
+
+        set_action_repository_context(&mut ctx, "$/.github/actions/setup");
+        let field = |ctx: &StepContext<'_>, key: &str| {
+            ctx.job
+                .github_context_value(key)
+                .and_then(|v| v.as_str().map(String::from))
+        };
+        assert_eq!(
+            field(&ctx, "action_repository").as_deref(),
+            Some("owner/shared")
+        );
+        assert_eq!(
+            field(&ctx, "action_ref").as_deref(),
+            Some("6b2de6eb160186cd946fb2f0929e2b265624cd61")
         );
     }
 }

@@ -194,7 +194,7 @@ pub async fn run_node_action(
     // below; composite RUN steps are unaffected (script path).
     env.retain(|key, _| !key.starts_with("INPUT_"));
 
-    let expr_ctx_for_inputs = ctx.job.build_expression_context();
+    let expr_ctx_for_inputs = ctx.build_expression_context();
     if let Some(inputs) = with.as_object() {
         for (key, value) in inputs {
             if key.starts_with("__preloop_") {
@@ -214,7 +214,7 @@ pub async fn run_node_action(
 
     // Apply defaults from manifest inputs, evaluating any ${{ }} expressions.
     if let Some(manifest_inputs) = &manifest.inputs {
-        let expr_ctx = ctx.job.build_expression_context();
+        let expr_ctx = ctx.build_expression_context();
         for (key, input_def) in manifest_inputs {
             let env_key = format!("INPUT_{}", key.to_uppercase().replace(' ', "_"));
             let default = input_def
