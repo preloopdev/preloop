@@ -39,6 +39,8 @@ def normalize_path(path: str) -> str:
     for p in base.split("/"):
         if p.isdigit():
             parts.append("{n}")
+        elif re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", p):
+            parts.append("{sha}")
         else:
             parts.append(p)
     base = "/".join(parts)
