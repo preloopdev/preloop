@@ -2635,8 +2635,13 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
     });
 
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-    unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}")) };
-    unsafe { std::env::set_var("PRELOOP_GITHUB_TOKEN", "sync-test-token") };
+    // TestEnvVar (not raw set_var): Drop restores declaration order in
+    // reverse — TOKEN first, then API_URL — so a parallel submit never sees
+    // the fake token aimed at live api.github.com, and a panic mid-test
+    // still cleans up.
+    let _api_url =
+        crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", format!("http://127.0.0.1:{port}"));
+    let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "sync-test-token");
 
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -2708,9 +2713,6 @@ async fn dirty_push_sync_verifies_the_branch_head_and_reports_checks_on_the_mate
             "the published commit is recorded for webhook dedup"
         );
     }
-
-    unsafe { std::env::remove_var("PRELOOP_GITHUB_TOKEN") };
-    unsafe { std::env::remove_var("PRELOOP_GITHUB_API_URL") };
 }
 
 #[tokio::test]
