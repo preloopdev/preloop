@@ -1261,56 +1261,73 @@ async fn run_state_sampler(
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     // Immediate sample then every 5s.
     interval.tick().await;
+    // When the last tick ran: the burst-reactive early tick below must not
+    // turn a submit storm back into per-operation counting.
+    let mut last_tick = std::time::Instant::now();
     loop {
+        let mut early = false;
+        let mut shutdown = false;
         tokio::select! {
-            _ = interval.tick() => {
-                heartbeat.beat("state_sampler");
-                publish_snapshot(&shared, &store_backend, false).await;
-                // Record pool/queue gauges into OTel instruments so `/metrics`
-                // has a single exposition source (the SDK renderer).
-                 {
-                     let s = shared.state.status_snapshot.read();
-                     // The co-hosted runner pool scales off this atomic; it
-                     // used to be refreshed by every submit/claim/complete
-                     // (a full count(*) each). The sampler's grouped count
-                     // is the same number at a fixed 5s cadence.
-                     shared
-                         .state
-                         .queue_depth
-                         .store(s.jobs.ready as usize, std::sync::atomic::Ordering::Release);
-                     shared.state.pool_status.set_queue_depth(s.jobs.ready);
-                     shared.state.observability.metrics().pool.record(
-                         s.service.uptime_seconds,
-                         s.pool.desired as u64,
-                         s.pool.preparing,
-                         s.pool.idle as u64,
-                         s.pool.busy as u64,
-                         s.jobs.ready as u64,
-                         s.jobs.claimable as u64,
-                         s.jobs.unclaimable as u64,
-                         s.jobs.dependency_blocked as u64,
-                     );
-                     // Host memory reality on the same cadence: a /proc scan
-                     // is microseconds next to everything else on this tick.
-                     // Recorded even when nothing else changed so OOM
-                     // proximity is a continuous signal, not a sampled one.
-                     shared
-                         .state
-                         .observability
-                         .metrics()
-                         .host
-                         .record(&preloop_observability::vm_telemetry::sample_host());
-                 }
-            }
-            _ = shared.shutdown.cancelled() => {
-                // Publish one last snapshot with the shutdown flag set so
-                // /api/v1/status reports `overall: shutting_down` and
-                // `shutdown_requested: true` while /healthz//readyz already
-                // 503 — without this the flag would only land on the next 5s
-                // tick that never comes.
-                heartbeat.beat("state_sampler");
-                publish_snapshot(&shared, &store_backend, true).await;
-                break;
+            _ = interval.tick() => {}
+            // A submit/claim/complete/cancel wakes the sampler early so the
+            // pool sees a burst in ~ms instead of at the next 5s tick. The
+            // Notify coalesces a flurry into one wakeup, and the 1s floor
+            // below caps a sustained storm at one extra count per second.
+            _ = shared.state.message_notify.notified() => { early = true; }
+            _ = shared.shutdown.cancelled() => { shutdown = true; }
+        }
+        if shutdown {
+            // Publish one last snapshot with the shutdown flag set so
+            // /api/v1/status reports `overall: shutting_down` and
+            // `shutdown_requested: true` while /healthz//readyz already
+            // 503 — without this the flag would only land on the next 5s
+            // tick that never comes.
+            heartbeat.beat("state_sampler");
+            publish_snapshot(&shared, &store_backend, true).await;
+            break;
+        }
+        if early && last_tick.elapsed() < Duration::from_secs(1) {
+            continue;
+        }
+        last_tick = std::time::Instant::now();
+        {
+            heartbeat.beat("state_sampler");
+            publish_snapshot(&shared, &store_backend, false).await;
+            // Record pool/queue gauges into OTel instruments so `/metrics`
+            // has a single exposition source (the SDK renderer).
+            {
+                let s = shared.state.status_snapshot.read();
+                // The co-hosted runner pool scales off this atomic; it
+                // used to be refreshed by every submit/claim/complete
+                // (a full count(*) each). The sampler's grouped count
+                // is the same number at a fixed cadence, plus a
+                // burst-reactive early tick above.
+                shared
+                    .state
+                    .queue_depth
+                    .store(s.jobs.ready as usize, std::sync::atomic::Ordering::Release);
+                shared.state.pool_status.set_queue_depth(s.jobs.ready);
+                shared.state.observability.metrics().pool.record(
+                    s.service.uptime_seconds,
+                    s.pool.desired as u64,
+                    s.pool.preparing,
+                    s.pool.idle as u64,
+                    s.pool.busy as u64,
+                    s.jobs.ready as u64,
+                    s.jobs.claimable as u64,
+                    s.jobs.unclaimable as u64,
+                    s.jobs.dependency_blocked as u64,
+                );
+                // Host memory reality on the same cadence: a /proc scan
+                // is microseconds next to everything else on this tick.
+                // Recorded even when nothing else changed so OOM
+                // proximity is a continuous signal, not a sampled one.
+                shared
+                    .state
+                    .observability
+                    .metrics()
+                    .host
+                    .record(&preloop_observability::vm_telemetry::sample_host());
             }
         }
     }
