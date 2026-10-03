@@ -401,8 +401,9 @@ impl Scheduler {
             return;
         };
         let client = crate::shared_http::CLIENT.clone();
+        let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
         let metadata = match client
-            .get(format!("https://api.github.com/repos/{repository}"))
+            .get(format!("{api_base}/repos/{repository}"))
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/vnd.github+json")
@@ -436,7 +437,7 @@ impl Scheduler {
             .to_owned();
         let sha = match client
             .get(format!(
-                "https://api.github.com/repos/{repository}/commits/{default_branch}"
+                "{api_base}/repos/{repository}/commits/{default_branch}"
             ))
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {token}"))
