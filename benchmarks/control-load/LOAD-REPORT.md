@@ -49,8 +49,9 @@ old r16 baseline.
 At 25/s, the claim path initially spent 563 seconds in 23,036 conditional
 claim updates with only 4,444 wins. `b892be5a` changed the candidate claim
 to `FOR UPDATE SKIP LOCKED` and joined assignments into the candidate read.
-The dominant remaining cost is per-run serialization (`runs.event_seq` and
-the run mutex); database CPU was not saturated.
+The dominant remaining cost at the time was believed to be per-run
+serialization (`runs.event_seq` and the run mutex); database CPU was not
+saturated. See the e2–e4 follow-up: that was tested and refuted.
 
 `ffe1bff4` fixed a separate pool self-deadlock: `acquire_for_runner`,
 status snapshots, OIDC grants, and completion paths could hold one pooled
@@ -74,12 +75,13 @@ validated for 5M jobs/day**.
 
 Remaining capacity work:
 
-- reduce per-run `event_seq`/run-mutex serialization;
+- find what the database is actually busy with (see the e2–e4 follow-up; the
+  per-run `event_seq`/run-mutex hypothesis was tested and refuted);
 - harden runner identity/session re-registration after node restart;
 - eliminate the remaining webhook enqueue timeouts and drain backlog;
 - repeat 50/s and burst rounds after those fixes;
-- run the chaos matrix again after claim recovery reaches zero in-progress
-  orphaned jobs.
+- run the chaos matrix again at 25/s: post-kill recovery reached zero
+  in-progress orphaned jobs at 8/s (r39, below).
 
 r11 injected:
 
@@ -110,10 +112,10 @@ Observed behavior:
    `ffe1bff4` releases connections before nested reads, uses transaction-
    scoped readers, bounds checkout at 30s, and drains webhook deliveries
    with bounded concurrency.
-5. The remaining dominant hotspot is per-run serialization: `runs.event_seq`
-   and the run mutex. At r21, the top event-sequence statement consumed
-   77 seconds; CPU was not saturated. Webhook enqueue timeouts and
-   post-node-kill orphan recovery also remain.
+5. The remaining dominant hotspot was thought to be per-run serialization
+   (`runs.event_seq` and the run mutex); the e2 experiment below shows it is
+   not: whole-table reads were. Webhook enqueue timeouts and post-node-kill
+   orphan recovery also remained (the latter fixed in r39).
 
 The control plane remains **not validated for 5M jobs/day**: 57.9 completed
 jobs/s is still above the current 22.85 jobs/s peak.
@@ -141,9 +143,11 @@ Run-row statement time (in-transaction wall clock, both nodes, 449 s total):
 Two corrections to the r21 reading: (1) ~65% of run-row time is `event_seq`
 bumps, not the mutex itself — and `pg_stat_statements` attributes only
 55.6 s of executor time to `UPDATE runs SET event_seq` across the same
-33,824 calls, so ~235 s of the instrumented span is client-visible wait
-(row-lock queueing plus scheduler delay inside the owning transaction), not
-statement execution. (2) Whole-database `pg_stat_statements` is dominated by
+33,824 calls, so ~235 s of the instrumented span is round-trip and client
+scheduling overhead, not lock queueing: executor time already includes
+row-lock waits. The overhead still matters, because every statement after
+the bump runs with the run row locked until COMMIT. (2) Whole-database
+`pg_stat_statements` is dominated by
 scheduler reads, not run-row writes: the ready-queue front probe
 (`SELECT runs_on::text FROM jobs WHERE queue_state='ready' ORDER BY pool_key,
 priority DESC, run_order, job_order`) accumulated 354.3 s at 36.1 ms mean —
@@ -173,3 +177,114 @@ Regression noted for later investigation, not fixed here: a `fork policy:
 approval sweep failed — operator does not exist: bigint < timestamp with
 time zone` warning loop in the node logs (fork-gate SQL type mismatch,
 pre-existing).
+
+## Follow-up: post-kill orphan recovery (r38–r39, 2026-10-02)
+
+Configuration: 2 nodes, 8 submissions/s for 30 s, 100 runners, node 0
+killed at 15 s and restarted 10 s later, 650 s drain.
+
+| Round | In-flight after drain | Stale leases >600 s | `duplicate_inflight` | `names_running_twice` | SQL errors |
+|---|---:|---:|---:|---:|---:|
+| r38 | 51 (40 leased, 11 unclaimed) | 40 | 0 | 0 | 0 |
+| r39 | 0 (all 254 runs completed and archived) | 0 | 0 | 0 | 0 |
+
+In r39 the 40 attempts orphaned by the kill failed 3:00.8–3:07 after their
+claim. A session that went silent still counts as live inside the 30 min
+runner liveness timeout, so the 180 s hung-worker window applies. The new
+600 s `DEAD_SESSION_LEASE_SECONDS` (previously the 2,700 s runner-facing
+lease, which is unchanged) bounds attempts whose session row is gone.
+
+Reaper changes behind r39: lease expiry is evaluated for every in-flight
+attempt each tick in both backends, not only for runs flagged due.
+Completed-run memory trimming now runs off the event path (spawned,
+single-flight), because a reaper-driven completion had wedged the only
+reaper task inside `broadcast` → `trim_completed_run_state`. Each
+reaper-driven completion is bounded at 30 s, and the reaper heartbeat beats
+after the sweep, so a wedged sweep surfaces as a stale critical task.
+
+r38's orphans came from a local regression that never landed: the
+background loop's `reap_once` call was dropped while removing diagnostic
+logging, so the loop ticked and beat its heartbeat without sweeping. Tests
+that call `reap_once` directly could not see it. The harness's
+`drain.backlog_left = 58` counts jobs its own runners never completed (40
+lost with the killed node, 18 never acquired). The database settled all of
+them: 764 success, 53 failure, 14 skipped, 8 cancelled.
+
+## Follow-up: `run_seq` experiment, read-path fixes, versions and the event feed (e1–e4, r40, 2026-10-03)
+
+All rounds: 2 nodes, 25 submissions/s for 90 s, 400 runners, 150 s drain,
+this workstation (one machine hosts Postgres, both nodes, the harness and
+all runners, so absolute numbers are low and noisy; the comparisons are what
+carry information).
+
+**Invalid pair (`e1-*`).** Both rounds ran against a node left over from an
+earlier kill round: the harness restarted node 0 from a subshell and never
+recorded its pid, so it kept port 18080 and served half the traffic from an
+old binary and database. `run-round.sh` now records the restarted pid, kills
+it on exit, and refuses to start when a node port is already in use. The e1
+numbers are discarded.
+
+**`run_seq` is not the ceiling (`e2-*`).** The hypothesis was that the
+per-event `UPDATE runs SET event_seq` serialized runs and capped throughput.
+With the bump (as shipped) and with it skipped by a temporary switch
+(removed afterwards), same binary, same configuration:
+
+| Round | Completed jobs/s | Submit p50 | Complete p99 | `lock_run` | `flush_run` |
+|---|---:|---:|---:|---:|---:|
+| `e2-with-run-seq` | 19.1 | 10.9 s | 17.5 s | 49.2 s / 40.3 s | 68.0 s / 68.8 s |
+| `e2-no-run-seq` | 17.9 | 10.3 s | 16.9 s | 41.5 s / 42.7 s | 66.3 s / 67.4 s |
+
+Skipping the bump removed ~170 s of `event_seq` statement time per node and
+did not move throughput (−6%, within noise) or the `lock_run`/`flush_run`
+totals. So finding 5 above and the "per-run serialization" conclusion in the
+capacity section are wrong as a cause of the ceiling: waiting on the run row
+was a symptom of the database being busy elsewhere.
+
+**What the database was busy with: whole-table reads.** The `e2` top
+statements by total time were reads, not run-row writes:
+
+| Statement | Total | Calls | Mean |
+|---|---:|---:|---:|
+| per-run job rows for check-run reporting (`run_dispatch_info`) | 415.7 s | 4,958 | 83.8 ms |
+| claim candidate read | 199.3 s | 13,859 | 14.4 ms |
+| run graph load | 189.5 s | 25,266 | 7.5 ms |
+| ready-queue front probe | 142.6 s | 9,928 | 14.4 ms |
+| `reap_inputs` active-attempt query | 43.9 s | 48 | 914 ms |
+
+Causes, each reproduced with `EXPLAIN (ANALYZE, BUFFERS)` on a scratch copy
+holding 5.9k runs, 48.8k jobs and 3.1k ready jobs:
+
+| Statement | Before | After | Cause and fix |
+|---|---:|---:|---|
+| `run_dispatch_info` job rows | 14.2 ms, 3,948 buffers | 1.2 ms | the latest-attempt subquery seq-scanned `job_requests`: the only `(run_id, job_id)` index was partial (`WHERE result IS NULL`). Added `job_requests_attempts (run_id, job_id, request_id DESC)`, which also serves the `jobs` → `job_requests` cascade (11 ms → 0.4 ms in `DELETE FROM runs`). |
+| claim read (`LIMIT 64`) | 10.5 ms | 0.6 ms | `jobs_ready` had `namespace_id` between the pool key and the priority, so `ORDER BY pool_key, priority ..` sorted the whole ready queue. Index is now `(pool_key, priority DESC, run_order, job_order)`. |
+| ready-queue front probe | 6.3 ms | 0.07 ms | same index |
+| `reap_inputs` | 141.6 ms | 27.4 ms | the reaper extracted `jobTimeout` from the large toasted `message_template` for every unfinished attempt every tick (isolated: 323 ms with the extraction, 20 ms for the same join without it). It is now a stored generated column, `job_messages.job_timeout_s`. |
+
+`e3-read-fixes` (these changes only): **21.0 completed jobs/s** (+10% over the
+`e2` pair's 19.1/17.9), submit p50 6.5 s, complete p99 11.4 s. The first
+three statements above fell out of the top ten. Not fixed: the run graph load
+(6.7–8.5 ms × ~30k calls, one per command), `SELECT count(*) FROM jobs WHERE
+queue_state='ready'` (6.8–10.4 ms × ~11.8k calls; the cause is not verified —
+likely heap fetches, since the table is updated too constantly for index-only
+scans), and `lock_run`/`flush_run`.
+
+**Versions and the event feed (`e4-versions-outbox`).** `jobs.version` and
+`runs.version` (triggers), `outbox_events.{job_id,version,origin}` instead of
+`run_seq`, a per-node consumer that reads the outbox on a batched NOTIFY or
+every second, and retention (see CHANGELOG). 21.2 completed jobs/s — the same
+as `e3`, as expected: this change removes a lock and a lost-event gap, it was
+never going to raise the ceiling. `INSERT INTO outbox_events` averages 0.3 ms.
+Smoke test (two nodes, one Postgres): a stream attached to node B received the
+`cancelled` `run_status` for a run cancelled through node A and closed 0.21 s
+later; before this change that client would have waited out its 5-minute
+stream timeout.
+
+`r40-kill-versions` (8/s for 30 s, 100 runners, node 0 killed at 15 s,
+restarted 10 s later, 420 s drain): `inflight_requests = 0`, all 95 webhooks
+`done`, `duplicate_inflight = 0`, `names_running_twice = 0`,
+`active_owner_mismatch = 0`, `sql_errors = 0`.
+
+Open at 25/s on this machine (identical in e2–e4, so not caused by these
+changes): the webhook inbox falls behind (≈800 deliveries still `received`
+after the drain) and the submit p50 is several seconds.

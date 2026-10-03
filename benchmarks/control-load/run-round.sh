@@ -35,6 +35,13 @@ cargo build --manifest-path "$root/Cargo.toml" --profile "$PROFILE" -p preloop-c
 bindir="$root/target/$PROFILE"
 [ "$PROFILE" = dev ] && bindir="$root/target/debug"
 
+for i in $(seq 0 $((NODES - 1))); do
+  if lsof -nP -iTCP:$((BASE_PORT + i)) -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "port $((BASE_PORT + i)) is already in use (leaked node from an earlier round?)" >&2
+    exit 1
+  fi
+done
+
 db="preloop_load_$(date +%s)"
 "$psql" "$PG_ADMIN_URL" -qc "CREATE DATABASE $db"
 db_url="${PG_ADMIN_URL%/*}/$db"
@@ -43,6 +50,10 @@ engine_db_url="$db_url"
 pids=()
 cleanup() {
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  # The chaos subshell cannot append to `pids`: its restarted node is
+  # recorded in a file. A leaked node keeps its port and silently serves
+  # the next round from a stale binary and database.
+  [ -s "$work/restarted.pid" ] && kill "$(cat "$work/restarted.pid")" 2>/dev/null || true
   wait 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -99,7 +110,7 @@ if [ -n "$KILL_NODE_AT" ]; then
     kill -9 "${node_pids[0]}" 2>/dev/null || true
     sleep 10
     echo "[chaos] restarting node0" >&2
-    start_node 0 >/dev/null
+    start_node 0 >"$work/restarted.pid"
   ) &
   pids+=($!)
 fi
@@ -133,8 +144,38 @@ SELECT 'duplicate_inflight', count(*) FROM (SELECT run_id, job_id FROM job_reque
 -- active request is owned by the runner whose session holds it.
 SELECT 'names_running_twice', count(*) FROM (SELECT r.name FROM job_requests q JOIN runners r ON r.runner_id = q.runner_id WHERE q.result IS NULL GROUP BY r.name HAVING count(*) > 1) d;
 SELECT 'active_owner_mismatch', count(*) FROM job_requests q JOIN runner_sessions s ON s.session_id = q.session_id WHERE q.result IS NULL AND q.runner_id IS DISTINCT FROM s.runner_id;
+-- Unfinished attempts by owner state and lease staleness. The reaper settles a
+-- stale lease after 180s while the session is live (polled within the runner
+-- liveness timeout, default 30 min) and after 600s once it is gone.
+SELECT 'inflight_state',
+       CASE WHEN l.request_id IS NULL THEN 'no_lease_row'
+            WHEN s.session_id IS NULL THEN 'no_session'
+            WHEN s.last_seen_at < now() - interval '60 seconds' THEN 'session_stale'
+            ELSE 'session_live' END AS owner,
+       CASE WHEN l.renewed_at IS NULL THEN 'n/a'
+            WHEN l.renewed_at < now() - interval '600 seconds' THEN '>600s'
+            WHEN l.renewed_at < now() - interval '180 seconds' THEN '180-600s'
+            ELSE '<180s' END AS lease_age,
+       count(*)
+FROM job_requests q
+LEFT JOIN job_leases l ON l.request_id = q.request_id
+LEFT JOIN runner_sessions s ON s.session_id = q.session_id
+WHERE q.result IS NULL GROUP BY 2, 3 ORDER BY 2, 3;
 SELECT 'webhook_states', state, count(*) FROM webhook_deliveries GROUP BY state;
 SELECT 'db_size_mb', pg_database_size(current_database()) / 1048576;
 SQL
 cat "$out/integrity.txt"
+
+# SQL-semantic errors (wrong operator/column/cast) are bugs, not load: a
+# warn-level retry loop hides them from every counter above. Connection
+# faults injected by chaos rounds never produce these messages.
+sql_error_pattern='operator does not exist|column .* does not exist|relation .* does not exist|function .* does not exist|syntax error at or near|invalid input syntax|could not determine data type|cannot cast type'
+sql_errors=$(cat "$out"/node*.log | grep -Ec "$sql_error_pattern" || true)
+echo "sql_errors|$sql_errors" | tee -a "$out/integrity.txt"
+if [ "$sql_errors" -gt 0 ]; then
+  echo "FAIL: $sql_errors SQL error line(s) in node logs; first distinct:" >&2
+  cat "$out"/node*.log | grep -Eo "ERROR: [^\"\\\\]*($sql_error_pattern)[^\"\\\\]*" | sort | uniq -c | sort -rn | head -5 >&2
+  sql_failed=1
+fi
 echo "results: $out"
+exit "${sql_failed:-0}"
