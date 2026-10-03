@@ -78,7 +78,7 @@ pub(crate) enum ServerCommand {
     Uninstall(UninstallArgs),
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub(crate) struct InstallArgs {
     /// Address to bind. Defaults to the engine default (127.0.0.1:9090); on
     /// Linux the port is published through socket activation.
@@ -160,6 +160,19 @@ pub(crate) fn run(args: ServerArgs) -> Result<()> {
     match args.command {
         ServerCommand::Install(args) => install(args),
         ServerCommand::Uninstall(args) => uninstall(args),
+    }
+}
+
+/// A `server install` invocation for callers that own the surrounding flow
+/// (`preloop init --mode service`): the CLI's own defaults, with an explicit
+/// state home only when the operator set one — so a system install keeps
+/// defaulting to [`DEFAULT_HOME`] instead of silently following `PRELOOP_HOME`.
+pub(crate) fn install_args(home: Option<PathBuf>) -> ServerArgs {
+    ServerArgs {
+        command: ServerCommand::Install(InstallArgs {
+            home,
+            ..InstallArgs::default()
+        }),
     }
 }
 

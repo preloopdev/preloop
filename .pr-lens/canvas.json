@@ -1,0 +1,11 @@
+{
+  "canvases": {
+    "HOuqyolIiCRk2ZNys7FS2w": {
+      "name": "Control-plane outbox: today vs proposed",
+      "source": ".pr-lens/control-plane-outbox-today-vs-proposed/drawn.graph.json",
+      "api": "https://prlens.dev",
+      "writeToken": "-eYB8_HzR-F3JA6g8MT3lQ",
+      "rev": 1
+    }
+  }
+}
