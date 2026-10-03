@@ -734,9 +734,9 @@ pub struct AppState {
     pub pool_status: Arc<preloop_observability::status::PoolStatus>,
     /// When this AppState was created (for uptime).
     pub started_at: std::time::Instant,
-    /// Jobs accepted and still waiting for a runner, refreshed whenever one
-    /// is claimed. A supervising runner pool reads it to decide whether the
-    /// work already queued outruns the runners it has left.
+    /// Jobs accepted and still waiting for a runner, refreshed by the 5s
+    /// state sampler. A supervising runner pool reads it to decide whether
+    /// the work already queued outruns the runners it has left.
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     /// Plan 000 step 4 probe — broker job-lifecycle calls (`renewjob`,
     /// `completejob`) that authenticated with the bare runner *listen* token

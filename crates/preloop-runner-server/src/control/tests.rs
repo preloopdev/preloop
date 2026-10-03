@@ -1813,7 +1813,6 @@ pub(crate) mod suite {
             .await
             .unwrap();
         assert_eq!(outcome.promoted, 1, "the released hold admits the job");
-        assert_eq!(outcome.queue_depth, 1);
         assert_eq!(
             backend.job_queue_state(run_id, &job_id).await.unwrap(),
             Some(("ready".to_owned(), "queued".to_owned()))
@@ -2892,15 +2891,18 @@ pub(crate) mod suite {
         let run_a = RunId::new();
         let mut submit_a = submit_run(run_a, vec![submit_job(run_a, "build", 1)]);
         submit_a.workflow_concurrency = Some(workflow_concurrency("g", true));
-        let outcome_a = backend.submit_run(submit_a).await.unwrap();
-        assert_eq!(outcome_a.queue_depth, 1);
+        backend.submit_run(submit_a).await.unwrap();
+        let stats = backend.queue_stats().await.unwrap();
+        assert_eq!((stats.ready, stats.claimed), (1, 0));
 
         let run_b = RunId::new();
         let mut submit_b = submit_run(run_b, vec![submit_job(run_b, "build", 2)]);
         submit_b.workflow_concurrency = Some(workflow_concurrency("g", true));
-        let outcome_b = backend.submit_run(submit_b).await.unwrap();
+        backend.submit_run(submit_b).await.unwrap();
+        let stats = backend.queue_stats().await.unwrap();
         assert_eq!(
-            outcome_b.queue_depth, 1,
+            (stats.ready, stats.claimed),
+            (1, 0),
             "cancelled job must not inflate depth"
         );
         let record_a = backend.run_record(run_a).await.unwrap();

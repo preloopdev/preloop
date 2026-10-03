@@ -1914,12 +1914,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         let tx_ms = t_tx.elapsed().as_secs_f64() * 1000.0;
         let t_tail = std::time::Instant::now();
 
-        // Post-commit: refresh the node-local gauges that wake the runner
-        // supervisor, then fan out the events the outcome carries.
-        shared
-            .state
-            .queue_depth
-            .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+        // Post-commit: refresh the node-local labels the runner supervisor
+        // reads, then fan out the events the outcome carries. The ready-queue
+        // depth itself now comes from the 5s sampler snapshot.
         *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
 
         if let Some(existing) = outcome.existing {
@@ -3415,7 +3412,6 @@ pub async fn cancel_run(
         cancellations: cancellation_count,
         record,
         cancelled_jobs,
-        queue_depth,
         next_runs_on,
         ..
     } = shared
@@ -3429,10 +3425,6 @@ pub async fn cancel_run(
             "run not found".to_owned(),
         ))
     })?;
-    shared
-        .state
-        .queue_depth
-        .store(queue_depth, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
@@ -3508,10 +3500,6 @@ pub async fn approve_job(
         })
         .await
         .map_err(ApiError::from)?;
-    shared
-        .state
-        .queue_depth
-        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
@@ -3703,10 +3691,6 @@ pub async fn approve_fork(
         .promote_ready_jobs(Some(run_id), &shared.state.environment_rules)
         .await
         .map_err(ApiError::from)?;
-    shared
-        .state
-        .queue_depth
-        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();

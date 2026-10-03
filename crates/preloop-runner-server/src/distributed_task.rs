@@ -54,16 +54,11 @@ pub async fn next_message(
                 message,
                 run_id,
                 job_id,
-                queue_depth,
                 next_runs_on,
             } => {
-                // Refresh the on-demand pool gauges from the committed
-                // claim, exactly like the broker claim path: the ready
-                // queue just shrank.
-                shared
-                    .state
-                    .queue_depth
-                    .store(queue_depth, std::sync::atomic::Ordering::Release);
+                // Refresh the next-job labels from the committed claim,
+                // exactly like the broker claim path. The ready-queue depth
+                // itself now comes from the 5s sampler snapshot.
                 *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 github::report_check_run_in_progress(&shared, run_id, &job_id).await;
                 shared
@@ -772,7 +767,6 @@ pub(crate) async fn complete_job_settling(
         queue_nonempty,
         newly_terminal_success,
         live_log_key,
-        queue_len: tx_queue_len,
         next_runs_on: tx_next_labels,
     } = settled;
 
@@ -783,14 +777,9 @@ pub(crate) async fn complete_job_settling(
         crate::live_logs::close_live_log(&mut inner, &live_log_key);
         inner.dap_ports.remove(&completion.run_id);
     }
-    // Refresh the on-demand pool wake atomic and the next-job labels from the
-    // committed scheduling state.
-    let (queue_len, next_labels) = (tx_queue_len, tx_next_labels);
-    shared
-        .state
-        .queue_depth
-        .store(queue_len, std::sync::atomic::Ordering::Release);
-    *shared.state.next_job_runs_on.write().unwrap() = next_labels;
+    // Refresh the next-job labels from the committed scheduling state. The
+    // ready-queue depth itself now comes from the 5s sampler snapshot.
+    *shared.state.next_job_runs_on.write().unwrap() = tx_next_labels;
 
     // Any reusable-caller or dynamic-matrix node the sweep above unblocked was
     // deferred rather than expanded under the lock. Build those subtrees now

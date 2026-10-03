@@ -2436,7 +2436,7 @@ impl PgBackend {
             return Err(ControlError::NotFound(format!("run {run_id}")));
         }
         let cancellations = cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
-        let (cancelled_jobs, queue_depth, next_runs_on, pending_cancels) =
+        let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
             .load_graph(&tx, run_id)
@@ -2446,10 +2446,9 @@ impl PgBackend {
         Ok(CancelOutcome {
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
-            queue_nonempty: queue_depth > 0 || pending_cancels,
+            queue_nonempty: queue_nonempty || pending_cancels,
             record,
             cancelled_jobs,
-            queue_depth,
             next_runs_on,
         })
     }
@@ -2466,7 +2465,7 @@ impl PgBackend {
         let tx = client.transaction().await.map_err(db)?;
         PgBackend::lock_run(&tx, run_id).await?;
         let cancellations = cancel_job_tx(self, &tx, run_id, job_id, None).await?;
-        let (cancelled_jobs, queue_depth, next_runs_on, pending_cancels) =
+        let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
             .load_graph(&tx, run_id)
@@ -2476,10 +2475,9 @@ impl PgBackend {
         Ok(CancelOutcome {
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
-            queue_nonempty: queue_depth > 0 || pending_cancels,
+            queue_nonempty: queue_nonempty || pending_cancels,
             record,
             cancelled_jobs,
-            queue_depth,
             next_runs_on,
         })
     }
@@ -2491,7 +2489,7 @@ impl PgBackend {
 async fn cancel_outcome_gauges(
     tx: &Transaction<'_>,
     run_id: RunId,
-) -> Result<(Vec<JobId>, usize, Vec<String>, bool), ControlError> {
+) -> Result<(Vec<JobId>, bool, Vec<String>, bool), ControlError> {
     let cancelled_jobs = tx
         .query(
             "SELECT job_id FROM jobs WHERE run_id=$1::text::uuid \
@@ -2503,12 +2501,14 @@ async fn cancel_outcome_gauges(
         .iter()
         .map(|row| JobId(row.get::<_, String>(0)))
         .collect();
-    let queue_depth: usize = tx
-        .query_one("SELECT count(*) FROM jobs WHERE queue_state='ready'", &[])
+    let queue_nonempty: bool = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE queue_state='ready')",
+            &[],
+        )
         .await
         .map_err(db)?
-        .get::<_, i64>(0)
-        .max(0) as usize;
+        .get(0);
     let next_runs_on: Vec<String> = tx
         .query_opt(
             "SELECT runs_on::text FROM jobs WHERE queue_state='ready' \
@@ -2528,7 +2528,12 @@ async fn cancel_outcome_gauges(
         .await
         .map_err(db)?
         .get(0);
-    Ok((cancelled_jobs, queue_depth, next_runs_on, pending_cancels))
+    Ok((
+        cancelled_jobs,
+        queue_nonempty,
+        next_runs_on,
+        pending_cancels,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3965,7 +3970,6 @@ impl PgBackend {
                 held: false,
                 rejected: Some(ExecutionStatus::Failure),
                 existing: None,
-                queue_depth: self.queue_depth().await?,
                 next_runs_on: Vec::new(),
                 events: Vec::new(),
             });
@@ -4249,7 +4253,6 @@ impl PgBackend {
                         held: false,
                         rejected: Some(ExecutionStatus::Cancelled),
                         existing: None,
-                        queue_depth: self.queue_depth().await?,
                         next_runs_on: self.ready_front_labels().await?,
                         events: Vec::new(),
                     });
@@ -4543,7 +4546,6 @@ impl PgBackend {
             concluded,
             held,
             rejected: None,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
             existing: None,
             events,
@@ -4584,21 +4586,6 @@ impl PgBackend {
         Ok(platforms)
     }
 
-    /// Ready-queue depth (the node-local gauge the runner supervisor reads).
-    pub(super) async fn queue_depth(&self) -> Result<usize, ControlError> {
-        Self::queue_depth_on(&*self.reader().await?).await
-    }
-
-    /// [`Self::queue_depth`] on a caller's connection or open transaction.
-    pub(super) async fn queue_depth_on(client: &impl GenericClient) -> Result<usize, ControlError> {
-        let count = client
-            .query_one("SELECT count(*) FROM jobs WHERE queue_state = 'ready'", &[])
-            .await
-            .map_err(db)?
-            .get::<_, i64>(0);
-        Ok(count.max(0) as usize)
-    }
-
     /// `runs-on` labels of the ready-queue front, for `next_job_runs_on`.
     pub(super) async fn ready_front_labels(&self) -> Result<Vec<String>, ControlError> {
         Self::ready_front_labels_on(&*self.reader().await?).await
@@ -4633,7 +4620,6 @@ impl PgBackend {
             concluded: Vec::new(),
             held: existing.status == ExecutionStatus::Pending,
             rejected: None,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
             existing: Some(Box::new(existing)),
             events: Vec::new(),
@@ -5387,7 +5373,6 @@ impl PgBackend {
             queued,
             request,
             runner_id,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
         })))
     }
@@ -5707,7 +5692,6 @@ impl PgBackend {
             scheduling,
             live_log_key: applied.live_log_key,
             queue_nonempty,
-            queue_depth: self.queue_depth().await?,
             replayed: applied.replayed,
         })
     }
@@ -5794,11 +5778,11 @@ impl PgBackend {
         }
         sweep.sweep().await?;
         let scheduling = std::mem::take(&mut sweep.outcome);
-        let (queue_len, next_runs_on) = (
-            Self::queue_depth_on(&tx).await?,
-            Self::ready_front_labels_on(&tx).await?,
-        );
-        let queue_nonempty = queue_len > 0;
+        // Cheap existence check: the handler only needs to know whether to
+        // wake pollers, not the exact depth (the supervisor reads that from
+        // the 5s sampler snapshot).
+        let queue_nonempty = Self::work_pending_on(&tx).await?;
+        let next_runs_on = Self::ready_front_labels_on(&tx).await?;
         sweep.flush().await?;
         tx.commit().await.map_err(db)?;
         Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
@@ -5808,7 +5792,6 @@ impl PgBackend {
             queue_nonempty,
             newly_terminal_success: applied.newly_terminal_success,
             live_log_key: applied.live_log_key,
-            queue_len,
             next_runs_on,
         })))
     }
@@ -6074,7 +6057,6 @@ impl PgBackend {
             message,
             run_id,
             job_id,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
         })
     }
@@ -6562,7 +6544,6 @@ impl PgBackend {
             }
             sweep.flush().await?;
         }
-        outcome.queue_depth = Self::queue_depth_on(&tx).await?;
         outcome.next_runs_on = Self::ready_front_labels_on(&tx).await?;
         tx.commit().await.map_err(db)?;
         Ok(outcome)

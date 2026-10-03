@@ -350,13 +350,8 @@ pub async fn next_message_broker_ref(
                     queued,
                     request,
                     runner_id,
-                    queue_depth,
                     next_runs_on,
                 } = *claimed;
-                shared
-                    .state
-                    .queue_depth
-                    .store(queue_depth, std::sync::atomic::Ordering::Release);
                 *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 record_claim_queue_wait(&shared, &Some(queued.clone()));
                 let run_id = queued.run_id;
@@ -746,13 +741,8 @@ pub async fn next_message_broker_ref_root(
                     queued,
                     request,
                     runner_id,
-                    queue_depth,
                     next_runs_on,
                 } = *claimed;
-                shared
-                    .state
-                    .queue_depth
-                    .store(queue_depth, std::sync::atomic::Ordering::Release);
                 *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
                 record_claim_queue_wait(&shared, &Some(queued));
                 Some(broker_job_ref_root(&request, runner_id))

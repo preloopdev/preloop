@@ -20,8 +20,9 @@ pub struct ServerConfig {
     pub record_flows: Option<PathBuf>,
     /// TLS mode (default: no TLS).
     pub tls: TlsMode,
-    /// Shared counter published with the number of jobs still queued after
-    /// each claim. Supply one to let a co-hosted runner pool scale to demand.
+    /// Shared counter with the number of jobs still queued, refreshed by the
+    /// 5s state sampler. Supply one to let a co-hosted runner pool scale to
+    /// demand.
     pub queue_depth: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Shared list, refreshed after each claim, of the `runs-on` labels of
     /// the job at the front of the dispatch queue. Supply one to let a
@@ -595,11 +596,8 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         Ok(outcome) => {
             // Post-commit: refresh the node-local mirrors the runner
             // supervisor and the pool read, then wake them if the sweep
-            // changed what is schedulable.
-            shared
-                .state
-                .queue_depth
-                .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+            // changed what is schedulable. The ready-queue depth itself now
+            // comes from the 5s sampler snapshot.
             if let Ok(mut guard) = shared.state.next_job_runs_on.write() {
                 *guard = outcome.next_runs_on;
             }
@@ -1272,6 +1270,15 @@ async fn run_state_sampler(
                 // has a single exposition source (the SDK renderer).
                  {
                      let s = shared.state.status_snapshot.read();
+                     // The co-hosted runner pool scales off this atomic; it
+                     // used to be refreshed by every submit/claim/complete
+                     // (a full count(*) each). The sampler's grouped count
+                     // is the same number at a fixed 5s cadence.
+                     shared
+                         .state
+                         .queue_depth
+                         .store(s.jobs.ready as usize, std::sync::atomic::Ordering::Release);
+                     shared.state.pool_status.set_queue_depth(s.jobs.ready);
                      shared.state.observability.metrics().pool.record(
                          s.service.uptime_seconds,
                          s.pool.desired as u64,
@@ -1400,19 +1407,11 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     }
     let queue = state.backend.queue_stats().await.unwrap_or_default();
     if let Some(queue_depth) = config.queue_depth.clone() {
+        // A co-hosted pool shares this atomic to scale to demand. The state
+        // sampler refreshes it every 5s (immediate first tick), and the
+        // constructor already seeded it from the recovered store — no
+        // per-operation re-arm needed.
         state.queue_depth = queue_depth;
-        // The pool shares this same atomic and only forks a runner while it
-        // is non-zero; a freshly restarted server has no runners yet, so
-        // nothing will refresh it from a broker poll. Re-arm it with the
-        // ready-queue size recovered from the store, or every job queued
-        // before the restart sits forever with the pool asleep.
-        let queue_len = queue.ready;
-        state
-            .queue_depth
-            .store(queue_len, std::sync::atomic::Ordering::Release);
-        state
-            .pool_status
-            .set_queue_depth(state.queue_depth.load(std::sync::atomic::Ordering::Acquire) as u32);
     }
     if let Some(next_job_runs_on) = config.next_job_runs_on.clone() {
         state.next_job_runs_on = next_job_runs_on;

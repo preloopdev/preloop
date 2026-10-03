@@ -283,8 +283,10 @@ fn complete_node(
 
 /// Ready-queue gauges a completion/cancellation reports back: depth,
 /// front labels, and whether any work (or pending cancellation) remains.
-fn queue_gauges(tx: &Transaction<'_>) -> Result<(usize, Vec<String>, bool), ControlError> {
-    let depth = jobs::ready_count(tx)?;
+/// Queue gauges for command outcomes: the ready-front labels plus whether
+/// any work remains. The exact ready count is intentionally not computed
+/// here — the runner supervisor reads it from the 5s sampler snapshot.
+fn queue_gauges(tx: &Transaction<'_>) -> Result<(Vec<String>, bool), ControlError> {
     let next = jobs::next_ready_labels(tx)?;
     let nonempty = jobs::queue_nonempty(tx)?
         || tx
@@ -295,7 +297,7 @@ fn queue_gauges(tx: &Transaction<'_>) -> Result<(usize, Vec<String>, bool), Cont
             .map_err(db)?
             .query_row([], |row| row.get::<_, bool>(0))
             .map_err(db)?;
-    Ok((depth, next, nonempty))
+    Ok((next, nonempty))
 }
 
 impl LiteBackend {
@@ -340,7 +342,7 @@ impl LiteBackend {
             }
             let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
             promote::promote_run(tx, self, run_id, &mut scheduling)?;
-            let (queue_depth, _next_runs_on, queue_nonempty) = queue_gauges(tx)?;
+            let (_next_runs_on, queue_nonempty) = queue_gauges(tx)?;
             let record = jobs::run_record(tx, run_id)?
                 .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
             Ok(CompleteOutcome {
@@ -351,7 +353,6 @@ impl LiteBackend {
                 scheduling,
                 live_log_key: applied.live_log_key,
                 queue_nonempty,
-                queue_depth,
                 replayed: applied.replayed,
             })
         })
@@ -468,8 +469,7 @@ impl LiteBackend {
             }
             let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
             promote::promote_run(tx, self, run_id, &mut scheduling)?;
-            let (queue_len, next_runs_on, _pending) = queue_gauges(tx)?;
-            let queue_nonempty = queue_len > 0;
+            let (next_runs_on, queue_nonempty) = queue_gauges(tx)?;
             Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
                 effective_status: applied.effective_status,
                 cancelled_siblings: applied.cancelled_siblings,
@@ -477,7 +477,6 @@ impl LiteBackend {
                 queue_nonempty,
                 newly_terminal_success: applied.newly_terminal_success,
                 live_log_key: applied.live_log_key,
-                queue_len,
                 next_runs_on,
             })))
         })
@@ -517,7 +516,7 @@ impl LiteBackend {
                     .map_err(db)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(db)?
             };
-            let (queue_depth, next_runs_on, queue_nonempty) = queue_gauges(tx)?;
+            let (next_runs_on, queue_nonempty) = queue_gauges(tx)?;
             let record = jobs::run_record(tx, run_id)?;
             Ok(CancelOutcome {
                 cancellations,
@@ -525,7 +524,6 @@ impl LiteBackend {
                 queue_nonempty,
                 record,
                 cancelled_jobs,
-                queue_depth,
                 next_runs_on,
             })
         })
@@ -556,7 +554,7 @@ impl LiteBackend {
                     .map_err(db)?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(db)?
             };
-            let (queue_depth, next_runs_on, queue_nonempty) = queue_gauges(tx)?;
+            let (next_runs_on, queue_nonempty) = queue_gauges(tx)?;
             let record = jobs::run_record(tx, run_id)?;
             Ok(CancelOutcome {
                 cancellations,
@@ -564,7 +562,6 @@ impl LiteBackend {
                 queue_nonempty,
                 record,
                 cancelled_jobs,
-                queue_depth,
                 next_runs_on,
             })
         })
