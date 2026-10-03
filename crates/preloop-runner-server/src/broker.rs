@@ -1138,7 +1138,10 @@ pub async fn broker_acquire_job(
 ///
 /// Returns the number of pinned steps refreshed. The pinned ids travel on the
 /// message ([`azdo::AgentJobRequestMessage::preloop_snapshot_token_steps`]),
-/// so this deliberately matches by step id rather than by token shape.
+/// so this deliberately matches by step id rather than by token shape. The
+/// origin-rewrite credential is refreshed even for jobs without checkout
+/// steps, because a top-level `$/` action fetches directly from that
+/// snapshot.
 ///
 /// Every delivery path must call this when it renders the stored template: a
 /// job can sit queued (or paused in a debug session) well past the runtime
@@ -1156,9 +1159,11 @@ pub fn re_mint_snapshot_credentials(
         .iter()
         .filter_map(|id| uuid::Uuid::parse_str(id).ok())
         .collect();
-    if pinned.is_empty() && message.preloop_snapshot_origin_rewrite.is_none() {
+    let refresh_origin = message.preloop_snapshot_origin_rewrite.is_some();
+    if pinned.is_empty() && !refresh_origin {
         return 0;
     }
+
     let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
     if let Some(rewrite) = message.preloop_snapshot_origin_rewrite.as_mut() {
         // Same credential shape `runs::build_job_artifacts` pinned at

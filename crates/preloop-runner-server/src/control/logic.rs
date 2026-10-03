@@ -149,6 +149,7 @@ pub(crate) fn promotion_unsatisfiable_reason(
 /// pool-unsatisfiable). Placeholders expand later and never conclude here.
 pub(crate) fn concludes_at_submit(
     initially_skipped: bool,
+    has_needs: bool,
     placeholder: bool,
     runs_on: &[String],
     check_hostable: bool,
@@ -159,7 +160,10 @@ pub(crate) fn concludes_at_submit(
     if initially_skipped {
         return true;
     }
-    if placeholder {
+    if placeholder || has_needs {
+        // Placeholders expand later, and needs-gated jobs park until their
+        // `if:` can be evaluated — label gates belong to promotion, so
+        // neither concludes here.
         return false;
     }
     if check_hostable && unhostable_platform(runs_on, platforms).is_some() {
@@ -1161,6 +1165,7 @@ mod decision_tests {
         assert!(concludes_at_submit(
             true,
             false,
+            false,
             &labels(&["ubuntu-latest"]),
             true,
             linux,
@@ -1168,6 +1173,7 @@ mod decision_tests {
             false
         ));
         assert!(!concludes_at_submit(
+            false,
             false,
             true,
             &labels(&["gpu-large"]),
@@ -1179,6 +1185,7 @@ mod decision_tests {
         assert!(concludes_at_submit(
             false,
             false,
+            false,
             &labels(&["gpu-large"]),
             true,
             linux,
@@ -1188,7 +1195,20 @@ mod decision_tests {
         assert!(!concludes_at_submit(
             false,
             false,
+            false,
             &labels(&["ubuntu-latest"]),
+            true,
+            linux,
+            &pool,
+            false
+        ));
+        // Needs-gated jobs never conclude at submit — even with labels the
+        // pool cannot serve — because their `if:` may skip them at promotion.
+        assert!(!concludes_at_submit(
+            false,
+            true,
+            false,
+            &labels(&["gpu-large"]),
             true,
             linux,
             &pool,

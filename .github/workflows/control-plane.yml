@@ -72,14 +72,28 @@ jobs:
         run: cargo install cargo-nextest --locked --version 0.9.144
       - name: Verify control filter matches at least one test
         run: |
-          count=$(cargo nextest list -p preloop-runner-server -E 'test(/^control::/)' | grep -c '^preloop-runner-server control::' || true)
+          # dtolnay/rust-toolchain exports CARGO_TERM_COLOR=always, which
+          # nextest honors even when piped: every line then begins with an
+          # ANSI escape and the anchored grep below matched nothing ("zero
+          # tests" on all three jobs). --color never makes the output
+          # parseable regardless of the ambient environment.
+          #
+          # The list exit status is checked on its own so a real failure of
+          # `nextest list` is reported as such instead of as a zero count.
+          if ! cargo nextest list --color never -p preloop-runner-server -E 'test(/^control::/)' > "$RUNNER_TEMP/control-list.txt"; then
+            echo "ERROR: cargo nextest list exited non-zero" >&2
+            exit 1
+          fi
+          count=$(grep -c '^preloop-runner-server control::' "$RUNNER_TEMP/control-list.txt" || true)
           if [ "$count" -eq 0 ]; then
             echo "ERROR: nextest filter 'test(/^control::/)' matched zero tests in preloop-runner-server" >&2
             exit 1
           fi
           echo "control: $count test(s) found"
       - name: Control tests (SQLite + PostgreSQL)
-        run: cargo nextest run --locked -p preloop-runner-server -E 'test(/^control::/)'
+        # --no-tests=fail also fails the run itself (exit 4) if the filter
+        # ever selects nothing, independent of list output format.
+        run: cargo nextest run --locked --no-tests=fail -p preloop-runner-server -E 'test(/^control::/)'
       - name: Target schema applies cleanly
         run: psql "$PRELOOP_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -q -f docs/control-schema.sql
       - name: No leaked per-test databases

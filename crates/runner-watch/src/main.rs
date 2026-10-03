@@ -65,6 +65,8 @@ enum Commands {
     Init(InitArgs),
     /// Report golden coverage of implemented runner-facing routes (finding #2).
     Coverage(CoverageArgs),
+    /// Compare any two flows.jsonl captures (service-agnostic contract gate).
+    FlowsDiff(FlowsDiffArgs),
 }
 
 #[derive(Debug, Args)]
@@ -195,6 +197,33 @@ struct CoverageArgs {
     /// `.runner-watch/coverage-allow.txt` allowlist).
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Debug, Args)]
+struct FlowsDiffArgs {
+    /// Reference capture directory (contains flows.jsonl), e.g. real GitHub.
+    #[arg(long)]
+    left: PathBuf,
+    /// Candidate capture directory, e.g. an emulator replay.
+    #[arg(long)]
+    right: PathBuf,
+    #[arg(long, default_value = "reference")]
+    left_label: String,
+    #[arg(long, default_value = "candidate")]
+    right_label: String,
+    /// Endpoint substrings whose status mismatches are ignored (repeatable).
+    #[arg(long = "status-ignore")]
+    status_ignore: Vec<String>,
+    /// Endpoint substrings whose response-schema removals fail the gate
+    /// (repeatable). `*` gates every endpoint.
+    #[arg(long = "schema-gate")]
+    schema_gate: Vec<String>,
+    /// Also gate normalized response values, except for these substrings.
+    #[arg(long = "value-gate-except")]
+    value_gate_except: Option<Vec<String>>,
+    /// Print the machine-readable result instead of a summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -428,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(args) => run_all(&config, &args).await,
         Commands::Init(args) => init_files(&config, &args).await,
         Commands::Coverage(args) => coverage_cmd(&config, &args).await,
+        Commands::FlowsDiff(args) => flows_diff(&args),
     }
 }
 
@@ -3515,6 +3545,96 @@ fn should_skip_replay_flow(host: &str, path: &str, flow: &Value) -> bool {
     // (requests in-flight when the runner was killed) and cannot be replayed meaningfully.
     let has_captured_response = flow.get("status").is_some_and(|status| !status.is_null());
     !has_captured_response
+}
+
+/// `runner-watch flows-diff`: gate a candidate capture against a reference by
+/// endpoint coverage, status sets, request shape, and (gated) response shape.
+/// Service-agnostic: used for the runner protocol and for GitHub API captures.
+fn flows_diff(args: &FlowsDiffArgs) -> anyhow::Result<()> {
+    let scenario = args
+        .left
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // A gate on a missing capture is meaningless: `load_flows` yields an
+    // empty vector for a nonexistent flows.jsonl, and an empty pair compares
+    // clean — a wrong path or lost capture would pass. Require both files,
+    // and reject an empty reference so missing evidence cannot gate green.
+    for dir in [&args.left, &args.right] {
+        let flows = dir.join("flows.jsonl");
+        if !flows.exists() {
+            anyhow::bail!("flows-diff requires a capture: missing {}", flows.display());
+        }
+    }
+    let reference_count = std::fs::read_to_string(args.left.join("flows.jsonl"))?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if reference_count == 0 {
+        anyhow::bail!(
+            "flows-diff reference {} contains no flows; refusing to gate on empty evidence",
+            args.left.display()
+        );
+    }
+    let report = compare::analyze(&compare::Args {
+        scenario: &scenario,
+        left_dir: &args.left,
+        right_dir: &args.right,
+        output: Path::new(""),
+        left_label: &args.left_label,
+        right_label: &args.right_label,
+    })?;
+    // `*` gates every endpoint: the gate matches by substring, and every key
+    // contains the empty string.
+    let gate = |entries: &[String]| -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| {
+                if entry == "*" {
+                    String::new()
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect()
+    };
+    let policy = compare::GatePolicy {
+        status_ignore: args.status_ignore.clone(),
+        response_schema_gate: gate(&args.schema_gate),
+        value_gate: match &args.value_gate_except {
+            Some(except) => compare::ValueGate::AllExcept(except.clone()),
+            None => compare::ValueGate::Off,
+        },
+    };
+    let failures = report.failures(&policy);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json(&policy))?
+        );
+    } else {
+        println!(
+            "{} flows ({}) vs {} flows ({}); {} shared endpoints",
+            report.left_flow_count,
+            args.left_label,
+            report.right_flow_count,
+            args.right_label,
+            report.endpoints.iter().filter(|e| e.is_shared()).count()
+        );
+        for failure in &failures {
+            println!(
+                "FAIL {} {}: {}",
+                failure.kind.as_str(),
+                failure.endpoint,
+                failure.detail
+            );
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{} contract failure(s)", failures.len())
+    }
 }
 
 async fn run_compare(

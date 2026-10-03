@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use preloop_orchestrator::{
-    DEBUG_MARKER_IDLE, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig, artifact_payload,
-    node_externals,
+    DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
+    artifact_payload, node_externals,
 };
 use preloop_vm::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk, SecretSource,
@@ -294,45 +294,62 @@ impl VmProvider for RecordingVmProvider {
 
 struct Fixture {
     _env_guard: std::sync::MutexGuard<'static, ()>,
-    _golden_url_guard: GoldenUrlGuard,
+    _hermetic_env: HermeticEnvGuard,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
     token: String,
 }
 
-/// Pins `PRELOOP_GOLDEN_URL` to an unreachable address for the fixture's
-/// lifetime and restores the previous value on drop.
+/// Pins the host-sensitive environment for the fixture's lifetime and
+/// restores the previous values on drop. The pool reads all of these from the
+/// process environment, so without the pins the tests depend on the host:
 ///
-/// The pool downloads a prebaked golden before building when one is
-/// reachable (`prepare_artifact` → `download_prebaked_golden`). The
-/// artifact-preparation tests assert the LOCAL build+pack path, so a host
-/// with network egress to the release asset would silently skip the pack and
-/// hang `wait_until(Event::Pack)` forever. Pinning the URL keeps the fixture
-/// hermetic — the pool falls back to building and packing locally, which is
-/// what the tests exercise.
-struct GoldenUrlGuard {
-    previous: Option<String>,
+/// - `PRELOOP_GOLDEN_URL` -> unreachable. The pool downloads a prebaked golden
+///   before building when one is reachable (`prepare_artifact` ->
+///   `download_prebaked_golden`); a host with egress to the release asset
+///   would skip the local build+pack these tests assert and hang
+///   `wait_until(Event::Pack)` forever.
+/// - `PRELOOP_SKIP_DISK_PREFLIGHT` -> on. The golden build refuses when the
+///   host volume lacks builder disk + pack staging (60 GiB for this fixture);
+///   the provider here is a recording mock that writes nothing, so a host
+///   with less free space would refuse the build and hang the same wait.
+/// - `PRELOOP_HOME` -> the fixture root. Startup reconciliation kills real
+///   `_boot-vm` processes and sweeps data dirs under the Preloop home; left
+///   unset it resolves to the developer's `~/.preloop`, where a running
+///   engine's VMs live.
+struct HermeticEnvGuard {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
-impl GoldenUrlGuard {
-    fn new() -> Self {
-        let previous = std::env::var("PRELOOP_GOLDEN_URL").ok();
-        unsafe {
-            std::env::set_var(
+impl HermeticEnvGuard {
+    fn new(root: &Path) -> Self {
+        let pins: [(&'static str, std::ffi::OsString); 3] = [
+            (
                 "PRELOOP_GOLDEN_URL",
-                "http://127.0.0.1:1/preloop-golden-unreachable",
-            )
-        };
+                "http://127.0.0.1:1/preloop-golden-unreachable".into(),
+            ),
+            ("PRELOOP_SKIP_DISK_PREFLIGHT", "1".into()),
+            ("PRELOOP_HOME", root.join("preloop-home").into_os_string()),
+        ];
+        let previous = pins
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in &pins {
+            unsafe { std::env::set_var(name, value) };
+        }
         Self { previous }
     }
 }
 
-impl Drop for GoldenUrlGuard {
+impl Drop for HermeticEnvGuard {
     fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", value) },
-            None => unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") },
+        for (name, value) in &self.previous {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
         }
     }
 }
@@ -392,6 +409,9 @@ impl Fixture {
             memory_mib: 256,
             storage_gib: 10,
             overlay_gib: None,
+            // The hermetic provider writes no disks: keep the reserve off so
+            // these tests never depend on the host's free space.
+            job_vm_disk: JobVmDiskReserve::new(0, |_| Ok(0)),
             debug_dir: None,
             runner_key_dir: None,
             pending_jobs: None,
@@ -405,7 +425,7 @@ impl Fixture {
         };
         Self {
             _env_guard: env_guard,
-            _golden_url_guard: GoldenUrlGuard::new(),
+            _hermetic_env: HermeticEnvGuard::new(&root),
             root,
             config,
             token_env,

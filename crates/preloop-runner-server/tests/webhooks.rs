@@ -580,9 +580,46 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     );
 }
 
-/// The claim-time re-mint must actually run on the real claim path: a queued
-/// redirected checkout carries the submission-time pinned token, and the job
-/// the runner acquires must carry a freshly minted one.
+/// A checkout-free job can still use a top-level `$/` action; refresh the
+/// snapshot Git credential at claim time even with no pinned checkout input.
+#[tokio::test]
+async fn claim_remints_snapshot_origin_credential_without_checkout() {
+    use base64::Engine as _;
+    let mut message = checkout_test_message(json!([]));
+    message.preloop_snapshot_origin_rewrite =
+        Some(preloop_gha_protocol::azdo::SnapshotOriginRewrite {
+            snapshot_url: "http://engine/snapshots/run".into(),
+            forge_url: "https://github.com/owner/repo".into(),
+            auth_header: "AUTHORIZATION: basic expired-token".into(),
+        });
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    assert_eq!(
+        crate::broker::re_mint_snapshot_credentials(&mut message, &state),
+        0,
+        "no checkout input was refreshed"
+    );
+
+    let header = &message
+        .preloop_snapshot_origin_rewrite
+        .as_ref()
+        .unwrap()
+        .auth_header;
+    let encoded = header.strip_prefix("AUTHORIZATION: basic ").unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    let (user, token) = std::str::from_utf8(&decoded)
+        .unwrap()
+        .split_once(':')
+        .unwrap();
+    assert_eq!(user, "x-access-token");
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .expect("snapshot origin token must be freshly minted");
+    assert_eq!(claims["sub"], format!("preloop-job-{}", message.job_id));
+}
 
 /// The claim-time re-mint must actually run on the real claim path: the
 /// stored template carries no checkout token at all (only the pinned step-id
@@ -1251,6 +1288,28 @@ jobs:
     assert_eq!(commit.len(), 40);
     assert!(commit.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(acquired["snapshot"], Value::Null);
+    // `job.workflow_sha` is what `$/` self-repository actions resolve
+    // against; it must name the same commit as `github.sha`, not the
+    // pre-snapshot fallback (all zeros for a payload-less local run).
+    let workflow_sha = acquired["contextData"]["job"]["d"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["k"].as_str() == Some("workflow_sha"))
+        })
+        .and_then(|entry| entry["v"].as_str().or_else(|| entry["v"]["d"].as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "job context should carry workflow_sha: {}",
+                acquired["contextData"]["job"]
+            )
+        });
+    assert_eq!(
+        workflow_sha,
+        workspace_head.trim(),
+        "job.workflow_sha must be the real workspace HEAD"
+    );
 
     let runtime_token = acquired["variables"]["system.github.token"]["value"]
         .as_str()
@@ -1433,6 +1492,106 @@ jobs:
             &["show", &format!("{commit}:tracked.txt")]
         ),
         b"tracked unstaged change\n"
+    );
+}
+
+/// Self-repository actions can use a local-workspace snapshot even when the
+/// workflow has no `actions/checkout` step to trigger checkout redirection.
+#[tokio::test]
+async fn local_workspace_snapshot_marker_is_sent_without_checkout() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir).await.unwrap();
+    state.local_workspace = Some(workspace);
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/probe
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    let expected_commit = state
+        .test_tx()
+        .await
+        .runs
+        .get(&run_id)
+        .expect("run exists")
+        .workspace_snapshot
+        .as_ref()
+        .expect("workspace snapshot")
+        .commit_sha
+        .clone();
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "snapshot-no-checkout"},
+            "ownerName": "snapshot test",
+            "sessionId": "00000000-0000-0000-0000-000000000000",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value = serde_json::from_str(broker_message["body"].as_str().unwrap())
+        .expect("broker message body should be JSON");
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "snapshot-no-checkout", &["self-hosted"], None).await;
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+
+    assert!(
+        !acquired["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["reference"]["name"].as_str() == Some("actions/checkout")),
+        "this test must not depend on checkout redirection"
+    );
+    assert_eq!(
+        acquired["preloopSnapshotCommit"].as_str(),
+        Some(expected_commit.as_str()),
+        "local self-repository resolution needs the snapshot even without checkout"
+    );
+    assert!(
+        acquired["preloopSnapshotOriginRewrite"]["snapshotUrl"]
+            .as_str()
+            .is_some(),
+        "runner needs the authenticated snapshot endpoint"
     );
 }
 
