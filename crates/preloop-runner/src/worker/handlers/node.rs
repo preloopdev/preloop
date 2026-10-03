@@ -160,6 +160,18 @@ fn resolve_contained_entry_point(action_dir: &Path, main: &str) -> Result<PathBu
     Ok(entry_point)
 }
 
+/// `GITHUB_ACTION_PATH` mirrors `github.action_path`, which the official
+/// runner sets only inside composite embedded steps: a nested `uses:` action
+/// inherits the parent composite's directory unchanged, so scripts can
+/// `require($GITHUB_ACTION_PATH/sibling-file)` (grafana's
+/// create-github-app-token does exactly this through `actions/github-script`).
+/// `build_env` already merged an inherited value; the action's own directory
+/// is only the default when none exists.
+fn set_action_path_env(env: &mut std::collections::HashMap<String, String>, action_dir: &Path) {
+    env.entry("GITHUB_ACTION_PATH".to_string())
+        .or_insert_with(|| action_dir.to_string_lossy().to_string());
+}
+
 /// Run a Node.js action.
 pub async fn run_node_action(
     manifest: &ActionManifest,
@@ -251,11 +263,7 @@ pub async fn run_node_action(
     // the container, and a probe against the runner's own filesystem must not
     // decide whether that path can run.
 
-    // Set GITHUB_ACTION_PATH
-    env.insert(
-        "GITHUB_ACTION_PATH".to_string(),
-        action_dir.to_string_lossy().to_string(),
-    );
+    set_action_path_env(&mut env, action_dir);
 
     // A job container runs every step inside it — the official runner execs
     // node actions through `docker exec` too, using the externals mounted at
@@ -751,6 +759,38 @@ mod tests {
         assert_eq!(
             runner_root_for_externals(&bare, &tmp.path().join("nolegacy")),
             tmp.path().join("bare").join("_work"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod action_path_env_tests {
+    use super::*;
+
+    #[test]
+    fn nested_action_keeps_composite_action_path() {
+        let mut env = std::collections::HashMap::from([(
+            "GITHUB_ACTION_PATH".to_string(),
+            "/work/_actions/grafana/shared-workflows/sha/actions/create-github-app-token"
+                .to_string(),
+        )]);
+        set_action_path_env(
+            &mut env,
+            Path::new("/work/_actions/actions/github-script/sha"),
+        );
+        assert_eq!(
+            env["GITHUB_ACTION_PATH"],
+            "/work/_actions/grafana/shared-workflows/sha/actions/create-github-app-token"
+        );
+    }
+
+    #[test]
+    fn top_level_action_defaults_to_own_dir() {
+        let mut env = std::collections::HashMap::new();
+        set_action_path_env(&mut env, Path::new("/work/_actions/actions/checkout/sha"));
+        assert_eq!(
+            env["GITHUB_ACTION_PATH"],
+            "/work/_actions/actions/checkout/sha"
         );
     }
 }
