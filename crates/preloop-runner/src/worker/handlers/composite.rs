@@ -449,6 +449,7 @@ fn run_composite_action_inner<'a>(
                                     workspace,
                                     ctx,
                                     cancel_rx.clone(),
+                                    Some(uses),
                                 )
                                 .await
                                 .map(|_| "Success".to_string()),
@@ -516,6 +517,7 @@ fn run_composite_action_inner<'a>(
                                         workspace,
                                         ctx,
                                         cancel_rx.clone(),
+                                        Some(uses),
                                     )
                                     .await
                                     .map(|_| "Success".to_string())
