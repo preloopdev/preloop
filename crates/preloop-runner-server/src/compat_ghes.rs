@@ -125,7 +125,7 @@ pub async fn next_message_compat_org(
     Path((_org, pool_id)): Path<(String, i64)>,
     identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
+) -> Result<(StatusCode, Json<Option<azdo::TaskAgentMessage>>), ApiError> {
     next_message_compat(State(shared), Path(pool_id), identity, Query(params)).await
 }
 
@@ -190,12 +190,12 @@ pub async fn patch_timeline_records_org(
         None,
     )
     .await?;
-    Ok(patch_timeline_records(
+    patch_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
         Json(wrapper),
     )
-    .await)
+    .await
 }
 
 pub async fn get_timeline_records_org(
@@ -213,12 +213,12 @@ pub async fn get_timeline_records_org(
         None,
     )
     .await?;
-    Ok(get_timeline_records(
+    get_timeline_records(
         State(shared),
         Path((scope, hub, plan_id, timeline_id)),
         Query(query),
     )
-    .await)
+    .await
 }
 
 pub async fn create_log_org(
@@ -229,7 +229,7 @@ pub async fn create_log_org(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     crate::timeline_logs::authorize_reporting_callback(&shared, &headers, &plan_id, None, None)
         .await?;
-    Ok(create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await)
+    create_log(State(shared), Path((scope, hub, plan_id)), Json(log)).await
 }
 
 pub async fn append_log_org(

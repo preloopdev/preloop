@@ -231,6 +231,70 @@ pub struct AgentJobRequestMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub preloop_snapshot_origin_rewrite: Option<SnapshotOriginRewrite>,
+
+    /// Preloop extension: what the acquire-time fill resolves back into this
+    /// stored template (secret names/scopes + reusable-call mappings).
+    ///
+    /// `None` on the wire and on legacy rows written before message
+    /// templates: a `None` spec means the message was persisted complete
+    /// (old format) and is delivered as-is.
+    #[serde(
+        rename = "preloopSecretSpec",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub preloop_secret_spec: Option<MessageSecretSpec>,
+}
+
+/// What the acquire-time fill must inject into a stored job-message template.
+///
+/// The control plane persists `AgentJobRequestMessage` minus every secret
+/// value and token (the "message template"); this spec rides inside it so the
+/// fill path needs no side table to reconstruct the secret surface:
+///
+/// - `names`: caller-scope secret names the job receives verbatim as
+///   `variables[<name>]` secret entries (regular jobs; reusable calls with
+///   `secrets: inherit` set `inherit` instead).
+/// - `environment`: the job's resolved `environment:` name, i.e. the
+///   SecretProvider scope tier `names` resolve against.
+/// - `inherit`: take every name resolved in scope (callee of
+///   `secrets: inherit`).
+/// - `map`: reusable-call `secrets:` mapping — callee name -> caller-side
+///   expression string, evaluated at fill time.
+/// - `run_names`: the non-secret names the submission supplied for the run
+///   tier. Values live only in the SecretProvider; the names are recorded so
+///   the fill can tell "this run declared no submission secrets" from "the
+///   run tier can no longer be resolved", which must fail loudly instead of
+///   delivering empty `secrets.*` values.
+///
+/// The spec is a server-internal carrier: it is removed from the message
+/// before the payload is serialized onto the wire (the runner derives its
+/// `secrets` context from the filled `variables` instead).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MessageSecretSpec {
+    /// Names resolved through the SecretProvider scope at acquire.
+    pub names: std::collections::BTreeSet<String>,
+    /// Deployment-environment tier name for provider scope resolution.
+    pub environment: Option<String>,
+    /// Reusable call with `secrets: inherit` — fill with every resolved name.
+    pub inherit: bool,
+    /// Reusable call `secrets:` map — callee name -> caller expression.
+    pub map: std::collections::BTreeMap<String, String>,
+    /// Names the submission supplied for the run tier (values are never
+    /// persisted). Every name must resolve at fill time.
+    pub run_names: std::collections::BTreeSet<String>,
+}
+
+impl MessageSecretSpec {
+    /// True when the spec carries no secret surface at all.
+    pub fn is_empty(&self) -> bool {
+        !self.inherit
+            && self.names.is_empty()
+            && self.map.is_empty()
+            && self.run_names.is_empty()
+            && self.environment.is_none()
+    }
 }
 
 /// Where to send git traffic a workflow aimed at the forge, and how to
@@ -658,10 +722,14 @@ impl Serialize for SerializedActionReference<'_> {
         let is_self = reference.path.is_some();
         let is_container_registry =
             reference.reference_type.as_deref() == Some("containerRegistry");
+        let emits_repository_type = !is_self
+            && !is_container_registry
+            && (reference.reference_type.is_none()
+                || reference.reference_type.as_deref() == Some("repository"));
         let field_count = 1
             + usize::from(reference.name.is_some() || is_self)
             + usize::from(reference.version.is_some())
-            + usize::from(reference.reference_type.is_some())
+            + usize::from(emits_repository_type)
             + usize::from(is_self);
         let mut map = serializer.serialize_map(Some(field_count))?;
         map.serialize_entry(
@@ -684,7 +752,12 @@ impl Serialize for SerializedActionReference<'_> {
             if let Some(version) = &reference.version {
                 map.serialize_entry("ref", version)?;
             }
-            if reference.reference_type.is_none() {
+            // `repositoryType: "GitHub"` is the canonical host marker for a
+            // remote action. `reference_type` round-trips `type: "repository"`
+            // back as `Some("repository")`, so emit it for both `None` and
+            // `Some("repository")` — dropping it on the second write loses
+            // the field the official runner sends.
+            if emits_repository_type {
                 map.serialize_entry("repositoryType", "GitHub")?;
             }
         }
@@ -875,6 +948,7 @@ mod tests {
 
         let wire = serde_json::to_value(&step).unwrap();
         assert_eq!(wire["reference"]["ref"], "v4");
+        assert_eq!(wire["reference"]["repositoryType"], "GitHub");
         assert!(
             wire["reference"].get("version").is_none(),
             "wire format must use the canonical `ref` field"
@@ -889,8 +963,12 @@ mod tests {
             Some("v4")
         );
 
+        // `type: "repository"` deserializes into `reference_type`, so the
+        // second serialize must still emit `repositoryType` — dropping it
+        // loses the host marker the official runner sends.
         let reserialized = serde_json::to_value(&decoded).unwrap();
         assert_eq!(reserialized["reference"]["ref"], "v4");
+        assert_eq!(reserialized["reference"]["repositoryType"], "GitHub");
         assert!(reserialized["reference"].get("version").is_none());
     }
 

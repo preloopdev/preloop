@@ -34,7 +34,7 @@ pub async fn run_message_loop(
             "name": config.settings.agent_name,
         },
         "useFipsEncryption": require_fips_cryptography(&config),
-        // F030: opt in to full AzDO message format (PipelineAgentJobRequest) with
+        // opt in to full AzDO message format (PipelineAgentJobRequest) with
         // encryption. AKSH-specific field; ignored by real GHES/GitHub servers.
         "preloopAzdo": true,
     });
@@ -43,8 +43,8 @@ pub async fn run_message_loop(
     tokio::pin!(shutdown);
 
     // Retry session creation on 409 conflict: a prior runner instance may still
-    // hold an active session.  GitHub typically frees it within ~30 s after the
-    // TCP connection drops.  Mirrors MessageListener.cs behaviour.
+    // hold an active session. GitHub typically frees it within ~30 s after the
+    // TCP connection drops. Mirrors MessageListener.cs behaviour.
     let mut conflict_retries = 0u32;
     let (session_resp, session_id) = loop {
         match client.create_session(token, &session_body).await {
@@ -152,7 +152,7 @@ pub async fn run_message_loop(
 
                         match dispatch {
                             Ok(Some(job_msg)) => {
-                                // F030: signal to GitHub that we accepted the job.
+                                // signal to GitHub that we accepted the job.
                                 // Mirrors JobDispatcher.cs PatchAgentRequestAsync(startTime).
                                 let request_id = job_msg
                                     .get("requestId")
@@ -176,7 +176,7 @@ pub async fn run_message_loop(
                                     crate::cli::ProtocolPath::Azdo,
                                 ).await?;
 
-                                // F030: signal job completed.
+                                // signal job completed.
                                 if request_id > 0 {
                                     let patch = serde_json::json!({
                                         "requestId": request_id,
@@ -408,7 +408,7 @@ fn require_fips_cryptography(config: &RunnerConfig) -> bool {
 mod tests {
     use super::*;
 
-    // --- P1 message listener gap coverage ---
+    // --- message listener gap coverage ---
 
     #[test]
     fn process_message_job_request() {

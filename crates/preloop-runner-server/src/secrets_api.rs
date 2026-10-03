@@ -236,7 +236,7 @@ pub async fn set_secret(
             // Storing an environment secret creates the environment, as on
             // GitHub: the environment becomes claimable by `environment:`.
             // Only this operator-held endpoint can register names this way;
-            // workflow authors cannot self-approve an environment (M4).
+            // workflow authors cannot self-approve an environment.
             config
                 .environments
                 .entry(repo.clone())
@@ -273,7 +273,7 @@ pub async fn set_secret(
                 .or_default()
                 .insert(name, value);
             // Mirror the persisted registration above: storing an
-            // environment secret creates the environment (M4).
+            // environment secret creates the environment.
             store
                 .environments
                 .entry(repo.clone())

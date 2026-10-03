@@ -286,12 +286,12 @@ pub struct RunRecord {
     pub status: ExecutionStatus,
     pub job_outputs: BTreeMap<JobId, BTreeMap<String, serde_json::Value>>,
     pub job_base_ids: BTreeMap<JobId, String>,
-    #[serde(skip)]
+    #[serde(default, skip_serializing)]
     pub job_needs: BTreeMap<JobId, Vec<JobId>>,
     /// Expanded plans for deferred reusable-caller nodes, consumed by the
     /// scheduler when a caller's `if:` gate passes and its callee subtree is
     /// materialized.
-    #[serde(skip)]
+    #[serde(default, skip_serializing)]
     pub caller_plans: BTreeMap<JobId, preloop_gha_protocol::JobPlan>,
     /// GitHub display name per job (evaluated `name:`, ` / ` caller/callee
     /// separator). The run record keys everything by job id; this maps ids to
@@ -300,18 +300,22 @@ pub struct RunRecord {
     pub job_names: BTreeMap<JobId, String>,
     /// GitHub context JSON captured at submission, reused when runtime
     /// expansion builds runner messages for a callee subtree.
-    #[serde(skip)]
+    #[serde(default, skip_serializing)]
     pub github: serde_json::Value,
     /// Resolved head SHA / workflow ref captured at submission for runtime
     /// expansion (message context data).
-    #[serde(skip)]
+    #[serde(default, skip_serializing)]
     pub head_sha: String,
-    #[serde(skip)]
+    #[serde(default, skip_serializing)]
     pub workflow_ref: String,
     /// Immutable workspace snapshot created at submission, when local
     /// checkout redirection is active; runtime-expanded jobs check out the
     /// same tree.
-    #[serde(skip)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "lenient_workspace_snapshot"
+    )]
     pub workspace_snapshot: Option<crate::snapshots::WorkspaceSnapshot>,
     pub job_fail_fast: BTreeMap<String, bool>,
     #[serde(default)]
@@ -360,13 +364,29 @@ pub struct RunRecord {
     pub fork_approval_note: Option<String>,
 }
 
+/// Lenient `workspace_snapshot` decode: a snapshot whose shape this binary no
+/// longer understands restores as `None` rather than failing the whole run
+/// load (the store is best-effort; one stale record must not brick startup).
+fn lenient_workspace_snapshot<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::snapshots::WorkspaceSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskAgentJobRequestRecord {
     pub request_id: i64,
     pub run_id: RunId,
     pub job_id: JobId,
     pub agent_job_id: uuid::Uuid,
+    /// Derived: always `agent_job_id` in string form (never read from a
+    /// stored column). Kept on the record for runner-protocol surfaces.
     pub plan_id: String,
+    /// Derived: always `"actions"`.
     pub plan_type: String,
     pub timeline_id: uuid::Uuid,
     pub result: Option<ExecutionStatus>,
@@ -468,7 +488,7 @@ pub struct QueuedJob {
 /// approval gate instead of dropping it — and every stamp is fail-closed
 /// under snapshot loss: a lost wait deadline re-arms the wait, a lost
 /// approval re-arms the approval, never the reverse.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentGateState {
     /// When the wait timer expires. `None` once satisfied or when no wait
     /// timer is configured.
@@ -696,7 +716,7 @@ pub struct PendingCache {
     #[serde(default)]
     pub job_backend_id: String,
     pub bytes: Vec<u8>,
-    /// R1-6 — unix seconds the reservation was made. The TTL sweeper frees
+    /// Unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.
     #[serde(default)]

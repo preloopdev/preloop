@@ -3229,9 +3229,9 @@ jobs:
 /// A reusable-workflow caller whose matrix reads `needs.*` is deferred at
 /// parse time like any other needs-driven matrix, but at runtime the matrix
 /// must be resolved *before* the callee subtree materializes — one leg per
-/// combination, each inheriting the caller's matrix cell. Before the fix the
-/// caller was expanded as a single call with an empty matrix, so the callee
-/// never fanned out.
+/// combination, each inheriting the caller's matrix cell. Expanding the
+/// caller as a single call with an empty matrix would leave the callee
+/// un-fanned.
 #[test]
 fn deferred_matrix_reusable_caller_fans_out_per_cell() {
     let caller = parse_workflow(
@@ -3619,9 +3619,9 @@ jobs:
 
 /// Issue #286: a `with:` expression on a reusable workflow caller must be
 /// evaluated in the caller's context (its inputs and matrix), the way
-/// literals already flow through. Before the fix the raw `${{ }}` text
-/// survived expansion and the server then replaced the whole input map
-/// with the dispatch inputs, so the callee saw an empty value.
+/// literals already flow through. If the raw `${{ }}` text survives
+/// expansion, the server replaces the whole input map with the dispatch
+/// inputs and the callee sees an empty value.
 #[test]
 fn reusable_with_expression_evaluated_in_caller_context() {
     fn expand_caller(

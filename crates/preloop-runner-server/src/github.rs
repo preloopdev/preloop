@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::models::{WebhookDeliveryRecord, WebhookDeliveryStatus};
 use crate::{
-    ExecutionStatus, SharedState, changed_paths_from_payload,
+    ControlBackend, ExecutionStatus, SharedState, changed_paths_from_payload,
     submit_run_inner_with_webhook_delivery,
 };
 use preloop_gha_protocol::{AnnotationLevel, JobId, NdjsonEvent, RunId, WorkflowSubmission};
@@ -261,22 +261,32 @@ pub async fn report_check_run_queued(
     job_id: &JobId,
     run_id: RunId,
 ) -> anyhow::Result<Option<u64>> {
-    let (existing_check_run_id, mint_lock) = {
+    // Every intake path that reports checks funnels through here; persist the
+    // flag so a job materialized later (runtime-expanded leg, reusable callee)
+    // still mints checks, including after a control-plane restart.
+    shared
+        .state
+        .backend
+        .set_reports_check_runs(run_id, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let existing_check_run_id = shared
+        .state
+        .backend
+        .job_check_run_id(run_id, job_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // The per-run mint lock is still node-local metadata: it only serializes
+    // concurrent reporters on this node so two of them cannot both observe
+    // "no mapping" and POST. Fetched before the (slow) token resolution so a
+    // caller that blocks on it does not re-resolve the token afterwards.
+    let mint_lock = {
         let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.reports_check_runs = true;
-        }
-        (
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.job_check_run_ids.get(job_id).copied()),
-            inner
-                .check_run_mint_locks
-                .entry(run_id)
-                .or_default()
-                .clone(),
-        )
+        inner
+            .check_run_mint_locks
+            .entry(run_id)
+            .or_default()
+            .clone()
     };
     let token = resolve_check_run_token(shared, repo).await;
 
@@ -292,12 +302,12 @@ pub async fn report_check_run_queued(
                     %error,
                     "persisted GitHub check run is stale; reconciling it"
                 );
-                let mut inner = shared.state.inner.lock().await;
-                if let Some(run) = inner.runs.get_mut(&run_id)
-                    && run.job_check_run_ids.get(job_id) == Some(&check_run_id)
-                {
-                    run.job_check_run_ids.remove(job_id);
-                }
+                shared
+                    .state
+                    .backend
+                    .clear_job_check_run(run_id, job_id, check_run_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             }
         }
     }
@@ -307,13 +317,12 @@ pub async fn report_check_run_queued(
     // can both see "no mapping" and POST, and GitHub accepts duplicate check
     // runs for the same name+SHA — the loser would strand a `queued` check.
     let _guard = mint_lock.lock().await;
-    let existing = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
-    };
+    let existing = shared
+        .state
+        .backend
+        .job_check_run_id(run_id, job_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     if let Some(check_run_id) = existing {
         return Ok(Some(check_run_id));
     }
@@ -346,31 +355,29 @@ pub async fn ensure_check_run_mapped(
     run_id: RunId,
     job_id: &JobId,
 ) -> Option<u64> {
-    let (coords, mint_lock) = {
+    let run = shared.state.backend.run_record(run_id).await.ok()?;
+    if let Some(id) = run.job_check_run_ids.get(job_id).copied() {
+        return Some(id);
+    }
+    let coords = check_run_report_coords(&run)?;
+    let mint_lock = {
         let mut inner = shared.state.inner.lock().await;
-        let run = inner.runs.get(&run_id)?;
-        if let Some(id) = run.job_check_run_ids.get(job_id).copied() {
-            return Some(id);
-        }
-        (
-            check_run_report_coords(run)?,
-            inner
-                .check_run_mint_locks
-                .entry(run_id)
-                .or_default()
-                .clone(),
-        )
+        inner
+            .check_run_mint_locks
+            .entry(run_id)
+            .or_default()
+            .clone()
     };
     let _guard = mint_lock.lock().await;
-    {
-        let inner = shared.state.inner.lock().await;
-        if let Some(id) = inner
-            .runs
-            .get(&run_id)
-            .and_then(|run| run.job_check_run_ids.get(job_id).copied())
-        {
-            return Some(id);
-        }
+    let existing = shared
+        .state
+        .backend
+        .job_check_run_id(run_id, job_id)
+        .await
+        .ok()
+        .flatten();
+    if let Some(id) = existing {
+        return Some(id);
     }
     let (repo, sha) = coords;
     let token = resolve_check_run_token(shared, &repo).await;
@@ -396,15 +403,13 @@ async fn mint_check_run(
     let check_run_id = if let Some(token) = token {
         let details_url = run_details_url(run_id);
 
-        let job_name = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.job_names.get(job_id))
-                .cloned()
-                .unwrap_or_else(|| job_id.0.clone())
-        };
+        let job_name = shared
+            .state
+            .backend
+            .job_display_name(run_id, job_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .unwrap_or_else(|| job_id.0.clone());
         let mut body = serde_json::json!({
             "name": job_name,
             "head_sha": sha,
@@ -462,20 +467,19 @@ async fn mint_check_run(
         rand::random::<u32>() as u64
     };
 
-    let mapping_changed = {
-        let mut inner = shared.state.inner.lock().await;
-        inner.runs.get_mut(&run_id).map(|run| {
-            run.job_check_run_ids
-                .insert(job_id.clone(), check_run_id)
-                .is_none_or(|previous| previous != check_run_id)
-        })
-    };
-    if mapping_changed == Some(true) {
+    let mapping_changed = shared
+        .state
+        .backend
+        .set_job_check_run(run_id, job_id, check_run_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    if mapping_changed {
         // The mapping is meaningful while the run lives, and the next status
-        // event may be hours away. Persist it before returning to the caller.
+        // event may be hours away. `set_job_check_run` persisted the event
+        // inside its own transaction; only the broadcast remains.
         shared
             .state
-            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+            .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
             .await;
     }
     Ok(Some(check_run_id))
@@ -620,32 +624,44 @@ pub async fn report_check_runs_for_run(
     reused_check_run: Option<(JobId, u64)>,
 ) {
     let (repository, sha, jobs) = {
-        let mut inner = shared.state.inner.lock().await;
         // The rerun reports checks even when every job is an expandable
         // placeholder — those mint nothing here, but their materialized legs
         // report later and need the flag.
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.reports_check_runs = true;
-        } else {
-            return;
+        if let Err(error) = shared
+            .state
+            .backend
+            .set_reports_check_runs(run_id, true)
+            .await
+        {
+            warn!(%run_id, ?error, "failed to stamp reports_check_runs for rerun");
         }
-        let run = inner.runs.get(&run_id).unwrap();
-        (
-            run.submission.repository.clone(),
-            run.submission.sha.clone(),
-            // Expandable nodes are placeholders: no check run. Materialized
-            // legs mint their own when the rerun re-expands them.
-            run.jobs
-                .keys()
-                .filter(|job_id| {
-                    !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
+        let outcome = shared
+            .state
+            .backend
+            .run_dispatch_info(run_id)
+            .await
+            .map_err(crate::ApiError::from)
+            .ok()
+            .flatten();
+        match outcome {
+            Some(info) => (
+                info.repository,
+                info.sha,
+                // Expandable nodes (deferred matrices, reusable callers) are
+                // placeholders: expansion replaces them, and their
+                // materialized legs mint their own checks. A `queued` check
+                // minted here would strand on GitHub (no delete API).
+                info.jobs
+                    .into_iter()
+                    .filter(|job| !job.placeholder)
+                    .map(|job| (job.job_id, job.status))
+                    .collect::<Vec<_>>(),
+            ),
+            None => return,
+        }
     };
 
-    for job_id in jobs {
+    for (job_id, status) in jobs {
         if let Some((reused_job_id, check_run_id)) = &reused_check_run {
             if reused_job_id == &job_id {
                 if let Err(error) = report_existing_check_run_queued(
@@ -670,14 +686,7 @@ pub async fn report_check_runs_for_run(
             warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
         }
 
-        let status = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.jobs.get(&job_id).copied())
-        };
-        if let Some(status) = status.filter(|status| status.is_terminal()) {
+        if status.is_terminal() {
             report_check_run_completed(shared, run_id, &job_id, status).await;
         }
     }
@@ -689,25 +698,32 @@ pub async fn report_check_run_in_progress(
     run_id: RunId,
     job_id: &JobId,
 ) {
-    let (repo, job_name) = {
-        let inner = shared.state.inner.lock().await;
-        let run = match inner.runs.get(&run_id) {
-            Some(r) => r,
-            None => return,
+    let (repo, check_run_id, job_name) = {
+        let backend = &shared.state.backend;
+        let Some(check_run_id) = backend
+            .job_check_run_id(run_id, job_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return;
         };
-        let repo = run.submission.repository.clone();
-        let job_name = run
-            .job_names
-            .get(job_id)
-            .cloned()
+        let repo = backend
+            .submission_fields(run_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|fields| fields.repository);
+        let Some(repo) = repo else {
+            return;
+        };
+        let job_name = backend
+            .job_display_name(run_id, job_id)
+            .await
+            .ok()
+            .flatten()
             .unwrap_or_else(|| job_id.0.clone());
-        (repo, job_name)
-    };
-
-    // Jobs materialized after intake (runtime matrix fan-out, reusable callee
-    // jobs) have no check run yet; mint one instead of dropping the report.
-    let Some(check_run_id) = ensure_check_run_mapped(shared, run_id, job_id).await else {
-        return;
+        (repo, check_run_id, job_name)
     };
 
     let token = resolve_check_run_token(shared, &repo).await;
@@ -815,37 +831,80 @@ pub async fn report_check_run_completed(
     job_id: &JobId,
     status: ExecutionStatus,
 ) {
-    let (repo, job_name, steps, started_at, completed_at, annotations, global_issues) = {
-        let inner = shared.state.inner.lock().await;
-        let run = match inner.runs.get(&run_id) {
-            Some(run) => run,
-            None => return,
+    // Backend: one indexed dispatch read. Node-local: `timeline_events` for
+    // annotations. Read each under its own owner.
+    let (repo, _check_run_id, job_name, steps, started_at, completed_at, detail) = {
+        let outcome = shared
+            .state
+            .backend
+            .run_dispatch_info(run_id)
+            .await
+            .map_err(crate::ApiError::from)
+            .ok()
+            .flatten();
+        let Some(info) = outcome else {
+            return;
         };
-        let repo = run.submission.repository.clone();
-        let projected = crate::runs::project_run(&inner, run.clone());
-        let detail = projected
-            .jobs_list
-            .iter()
-            .find(|detail| detail.job_id == job_id.0);
-        let job_name = detail
-            .map(|detail| detail.name.clone())
-            .or_else(|| run.job_names.get(job_id).cloned())
+        // A job minted on demand (deferred-matrix leg, reusable callee) may
+        // have no dispatch row at all — proceed with run-level defaults so
+        // `ensure_check_run_mapped` below can mint for it.
+        let job = info.jobs.iter().find(|job| job.job_id == *job_id);
+        let check_run_id = job.and_then(|job| job.check_run_id);
+        // `project_run`'s per-job projection, minus the pieces it derived
+        // from a second pass over the whole run: name, status conclusion and
+        // the latest attempt's step manifest.
+        let mut detail =
+            job.and_then(|job| job.detail.clone())
+                .unwrap_or(crate::models::JobDetail {
+                    job_id: job_id.0.clone(),
+                    name: job
+                        .and_then(|job| job.display_name.clone())
+                        .unwrap_or_else(|| job_id.0.clone()),
+                    conclusion: crate::runtime_scheduling::status_string(
+                        job.map(|job| job.status)
+                            .unwrap_or(ExecutionStatus::Pending),
+                    ),
+                    steps: Vec::new(),
+                    annotations: Vec::new(),
+                });
+        detail.job_id = job_id.0.clone();
+        detail.name = job
+            .and_then(|job| job.display_name.clone())
             .unwrap_or_else(|| job_id.0.clone());
-        let steps = detail
-            .map(|detail| detail.steps.clone())
-            .unwrap_or_default();
-        let started_at = steps
+        detail.conclusion = crate::runtime_scheduling::status_string(
+            job.map(|job| job.status)
+                .unwrap_or(ExecutionStatus::Pending),
+        );
+        let job_steps: Vec<crate::models::StepRecord> =
+            job.map(|job| job.steps.clone()).unwrap_or_default();
+        if !job_steps.is_empty() {
+            detail.steps = job_steps.clone();
+        }
+        let job_name = detail.name.clone();
+        let started_at = job_steps
             .iter()
             .filter_map(|step| step.started_at)
             .min()
-            .or(run.started_at);
-        let completed_at = steps
+            .or_else(|| info.started_at.map(chrono::DateTime::from));
+        let completed_at = job_steps
             .iter()
             .filter_map(|step| step.finished_at)
             .max()
-            .or(run.completed_at)
+            .or_else(|| info.completed_at.map(chrono::DateTime::from))
             .unwrap_or_else(chrono::Utc::now);
+        (
+            info.repository,
+            check_run_id,
+            job_name,
+            job_steps,
+            started_at,
+            completed_at,
+            Some(detail),
+        )
+    };
 
+    let (annotations, global_issues) = {
+        let inner = shared.state.inner.lock().await;
         let mut annotations = Vec::new();
         let mut global_issues = Vec::new();
         if let Some(events) = inner.timeline_events.get(&run_id) {
@@ -884,7 +943,7 @@ pub async fn report_check_run_completed(
                 }
             }
         }
-        if let Some(detail) = detail {
+        if let Some(detail) = &detail {
             for annotation in &detail.annotations {
                 let message = annotation
                     .get("message")
@@ -894,15 +953,7 @@ pub async fn report_check_run_completed(
                 global_issues.push(format!("- {}", markdown_cell(&message)));
             }
         }
-        (
-            repo,
-            job_name,
-            steps,
-            started_at,
-            completed_at,
-            annotations,
-            global_issues,
-        )
+        (annotations, global_issues)
     };
 
     // Jobs materialized after intake (runtime matrix fan-out, reusable callee
@@ -1401,7 +1452,7 @@ fn webhook_retry_backoff(ladder: &[Duration], attempts: u32) -> Duration {
 /// hands over what it read and the snapshot reads memory instead of taking the
 /// store's single connection for a query that usually reports "unchanged".
 pub async fn refresh_webhook_queue_stats(state: &crate::state::AppState) -> bool {
-    match state.store.webhook_queue_stats().await {
+    match state.backend.webhook_queue_stats().await {
         Ok(stats) => {
             state.webhook_status.set_queue_stats(stats);
             true
@@ -1433,7 +1484,7 @@ async fn enqueue_webhook_delivery_with_budget(
         let attempt_budget = remaining.min(Duration::from_secs(4));
         match tokio::time::timeout(
             attempt_budget,
-            shared.state.store.enqueue_webhook_delivery(delivery),
+            shared.state.backend.enqueue_webhook_delivery(delivery),
         )
         .await
         {
@@ -1464,7 +1515,7 @@ async fn enqueue_webhook_delivery_with_budget(
 /// Verifies the signature, atomically enqueues the delivery to the durable
 /// store, and acknowledges with HTTP 202 Accepted. Background workers drain
 /// the queue asynchronously.
-/// The `repository.full_name` a webhook payload claims, if any (M3).
+/// The `repository.full_name` a webhook payload claims, if any.
 ///
 /// Read before any event processing so the signer's installation coverage
 /// can be bound to the claimed repository. A payload without a repository
@@ -1483,14 +1534,14 @@ pub async fn handle_github_webhook(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // 1. Verify Signature
+    // Verify Signature
     let sig_header = headers
         .get("x-hub-signature-256")
         .and_then(|h| h.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    // Every registered App's secret is a candidate (D6): a payload signed by
+    // Every registered App's secret is a candidate : a payload signed by
     // any App preloop fronts is accepted, one signed by none is rejected.
-    // M3: identify WHICH credential verified the payload — the signer
+    // Identify WHICH credential verified the payload — the signer
     // binds the claimed repository below.
     let signers: Vec<(String, crate::github_app::WebhookSigner)> = match &shared.state.github_apps {
         Some(apps) => apps.webhook_signers(shared.state.webhook_secret.as_deref()),
@@ -1515,7 +1566,7 @@ pub async fn handle_github_webhook(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    // M3: bind the claimed repository to the signer's installation
+    // Bind the claimed repository to the signer's installation
     // coverage BEFORE any event processing (adapters and check_run
     // rerequests alike). The signature only proves *some* registered
     // credential sent the payload — without binding, a payload signed by
@@ -1652,54 +1703,33 @@ async fn process_check_run_rerequest(
                 .and_then(|value| value.parse::<RunId>().ok())
         });
 
-    let target = {
-        let inner = shared.state.inner.lock().await;
-        let mut candidates = Vec::new();
-        if let Some(run_id) = details_run_id {
-            candidates.push(run_id);
-        }
-        candidates.extend(
-            inner
-                .runs
-                .keys()
-                .filter(|run_id| Some(**run_id) != details_run_id),
-        );
+    let target = shared
+        .state
+        .backend
+        .check_run_target(check_run_id, repository, head_sha, job_name, details_run_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        candidates.into_iter().find_map(|run_id| {
-            let run = inner.runs.get(&run_id)?;
-            if run.submission.repository != repository
-                || head_sha.is_some_and(|sha| run.head_sha != sha)
-                || !run.status.is_terminal()
-            {
-                return None;
-            }
-
-            let job_id = run
-                .job_check_run_ids
-                .iter()
-                .find_map(|(job_id, id)| (*id == check_run_id).then(|| job_id.clone()))
-                .or_else(|| {
-                    job_name
-                        .map(|name| JobId(name.to_owned()))
-                        .filter(|job_id| run.jobs.contains_key(job_id))
-                })?;
-            Some((
-                run_id,
-                job_id,
-                run.submission.event.clone(),
-                run.submission.actor.clone(),
-                run.submission.workflow_file.clone(),
-            ))
-        })
-    };
-
-    let Some((run_id, job_id, event, actor, workflow_file)) = target else {
+    let Some((run_id, job_id)) = target else {
         warn!(
             repository,
             check_run_id, "check_run rerequest does not match a known terminal run"
         );
         return Ok((StatusCode::OK, Json(serde_json::json!([]))));
     };
+
+    // The backend target carries only the (run, job) identity; the
+    // execution-protection gate below also needs the original trigger's
+    // event, actor and workflow file, so reread the run it resolved.
+    let run = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let event = run.submission.event.clone();
+    let actor = run.submission.actor.clone();
+    let workflow_file = run.submission.workflow_file.clone();
 
     // Workflow execution protections: a rerequest re-triggers the original
     // run, so the original trigger must still pass policy — and so must the
@@ -1841,7 +1871,7 @@ async fn run_webhook_lease_heartbeat(
                     renewal_timeout,
                     shared
                         .state
-                        .store
+                        .backend
                         .renew_webhook_delivery(
                             &delivery_id,
                             &lease_token,
@@ -1903,7 +1933,7 @@ pub async fn run_webhook_queue_worker(
     // again on every loop; a stuck queue worker must not look healthy.
     heartbeat.beat();
     // Crash recovery: on boot, reset processing rows whose lease has expired back to received.
-    if let Err(error) = shared.state.store.recover_webhook_deliveries().await {
+    if let Err(error) = shared.state.backend.recover_webhook_deliveries().await {
         warn!(
             ?error,
             "failed to recover stale webhook deliveries on startup"
@@ -1940,7 +1970,7 @@ pub async fn run_webhook_queue_worker(
                 .saturating_sub(WEBHOOK_DELIVERY_RETENTION_SECS.saturating_mul(1_000_000));
             match shared
                 .state
-                .store
+                .backend
                 .prune_webhook_deliveries(cutoff, WEBHOOK_PRUNE_BATCH_SIZE)
                 .await
             {
@@ -1971,12 +2001,31 @@ pub async fn run_webhook_queue_worker(
     }
 }
 
-/// Drain pending webhook deliveries in FIFO order by `received_at_us`.
-pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
-    // Claim one row at a time so every processing lease is heartbeated; a
-    // claimed batch could let later rows expire while earlier ones run.
-    const BATCH_SIZE: usize = 1;
+/// Concurrent webhook deliveries processed per node
+/// (`PRELOOP_WEBHOOK_WORKERS`, default 8). Deliveries are independent:
+/// cross-delivery ordering is decided by GitHub event timestamps
+/// (`concurrency::EventOrder`), not by processing order, and other nodes
+/// already drain the same queue in parallel.
+fn webhook_workers() -> usize {
+    std::env::var("PRELOOP_WEBHOOK_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1)
+}
 
+/// Drain pending webhook deliveries (oldest received first) with
+/// [`webhook_workers`] concurrent claim loops.
+pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
+    let loops = (0..webhook_workers()).map(|_| drain_webhook_queue_loop(shared));
+    let mut total = 0;
+    for result in futures::future::join_all(loops).await {
+        total += result?;
+    }
+    Ok(total)
+}
+
+async fn drain_webhook_queue_loop(shared: &Arc<SharedState>) -> anyhow::Result<usize> {
     let mut total_processed = 0;
     loop {
         if shared.shutdown.is_cancelled() {
@@ -1993,21 +2042,18 @@ pub async fn drain_webhook_queue(shared: &Arc<SharedState>) -> anyhow::Result<us
             );
             break;
         }
+        // One row per claim so every processing lease is heartbeated; a
+        // claimed batch could let later rows expire while earlier ones run.
         let deliveries = shared
             .state
-            .store
-            .claim_webhook_deliveries(BATCH_SIZE, WEBHOOK_LEASE_DURATION_SECS)
+            .backend
+            .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
             .await?;
-        if deliveries.is_empty() {
+        let Some(delivery) = deliveries.first() else {
             break;
-        }
-        for delivery in &deliveries {
-            process_one_delivery(shared, delivery).await;
-            total_processed += 1;
-        }
-        if deliveries.len() < BATCH_SIZE {
-            break;
-        }
+        };
+        process_one_delivery(shared, delivery).await;
+        total_processed += 1;
     }
     Ok(total_processed)
 }
@@ -2123,7 +2169,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
         WebhookOutcome::Success => {
             match shared
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery(&delivery.delivery_id, lease_token)
                 .await
             {
@@ -2152,7 +2198,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             );
             match shared
                 .state
-                .store
+                .backend
                 .park_webhook_delivery(&delivery.delivery_id, lease_token, &error, retry_after_secs)
                 .await
             {
@@ -2180,7 +2226,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             );
             match shared
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(
                     &delivery.delivery_id,
                     lease_token,
@@ -2250,7 +2296,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
                         );
                         if let Err(store_error) = shared
                             .state
-                            .store
+                            .backend
                             .fail_webhook_delivery(
                                 &delivery.delivery_id,
                                 lease_token,
@@ -2275,7 +2321,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             }
             match shared
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(&delivery.delivery_id, lease_token, &error, true, None)
                 .await
             {
@@ -2299,7 +2345,7 @@ pub async fn process_one_delivery(shared: &Arc<SharedState>, delivery: &WebhookD
             );
             match shared
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(&delivery.delivery_id, lease_token, &err, true, None)
                 .await
             {
@@ -2779,7 +2825,7 @@ async fn process_delivery_payload_with_lease(
                 local_workspace: None,
                 vars: BTreeMap::new(),
                 secrets: BTreeMap::new(),
-                submission_names: BTreeSet::new(),
+                run_secret_names: BTreeSet::new(),
                 reusable_workflows: BTreeMap::new(),
                 reusable_workflow_shas: BTreeMap::new(),
                 enable_debugger: false,
@@ -2819,7 +2865,11 @@ async fn process_delivery_payload_with_lease(
                 push_tree: None,
             };
 
-            if let Some(tested_by) = crate::github_push::already_published(
+            // The dedup gate decides whether a run may be submitted at all.
+            // A failed read must abort the delivery (GitHub redelivers), not
+            // fall through to submitting: `None` would re-run CI on the exact
+            // commit push-back already tested and published.
+            let tested_by = match crate::github_push::already_published(
                 shared,
                 &repo_full_name,
                 &submission.sha,
@@ -2827,6 +2877,19 @@ async fn process_delivery_payload_with_lease(
             )
             .await
             {
+                Ok(tested_by) => tested_by,
+                Err(error) => {
+                    error!(
+                        ?error,
+                        sha = %submission.sha,
+                        "failed to read push-back publication state; refusing to submit a possible duplicate"
+                    );
+                    return WebhookOutcome::TransientError(format!(
+                        "failed to read push-back publication state: {error:?}"
+                    ));
+                }
+            };
+            if let Some(tested_by) = tested_by {
                 info!(
                     workflow = %filename,
                     sha = %submission.sha,
@@ -2850,38 +2913,38 @@ async fn process_delivery_payload_with_lease(
                         return WebhookOutcome::Success;
                     }
                     let run_id = accepted.run_id;
+                    // Stamped even when every job is an expandable node — the
+                    // dispatch list may be empty, so nothing downstream calls
+                    // report_check_run_queued, but legs still materialize later
+                    // and must report.
+                    if let Err(error) = shared
+                        .state
+                        .backend
+                        .set_reports_check_runs(run_id, true)
+                        .await
+                    {
+                        warn!(%run_id, ?error, "failed to stamp reports_check_runs for webhook run");
+                    }
                     let sha = effective
                         .status_check_sha
                         .clone()
                         .unwrap_or_else(|| resolved_sha.clone());
-                    // Expandable nodes (deferred matrices, reusable callers)
-                    // are placeholders: GitHub never shows a check for them,
-                    // and materialized jobs mint their own when they enter
-                    // the run. Skipping them here also keeps a dissolved
-                    // placeholder from stranding a `queued` check.
-                    let jobs = {
-                        let mut inner = shared.state.inner.lock().await;
-                        // Stamped even when every job is expandable — the
-                        // filtered list may be empty, so nothing downstream
-                        // ever calls report_check_run_queued, but legs still
-                        // materialize later and must report.
-                        if let Some(run) = inner.runs.get_mut(&run_id) {
-                            run.reports_check_runs = true;
-                        }
-                        inner.runs.get(&run_id).map(|r| {
-                            r.jobs
-                                .keys()
-                                .filter(|job_id| {
-                                    !crate::runtime_scheduling::is_expandable_node(
-                                        &inner, run_id, job_id,
-                                    )
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>()
-                        })
-                    };
-                    if let Some(jobs) = jobs {
-                        for job_id in jobs {
+                    let info = shared
+                        .state
+                        .backend
+                        .run_dispatch_info(run_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(info) = info {
+                        // Expandable nodes (deferred matrices, reusable
+                        // callers) are placeholders: expansion replaces them
+                        // and their materialized legs mint their own checks.
+                        // Minting a `queued` check here would strand it on
+                        // GitHub (there is no delete API) for a dissolved
+                        // placeholder that never dispatches.
+                        for job in info.jobs.iter().filter(|job| !job.placeholder) {
+                            let job_id = job.job_id.clone();
                             tokio::select! {
                                 _ = lease_lost.cancelled() => return WebhookOutcome::Success,
                                 res = report_check_run_queued(
@@ -2897,21 +2960,11 @@ async fn process_delivery_payload_with_lease(
                                         ));
                                     }
                                 }
-                            }
-                            let status = tokio::select! {
-                                _ = lease_lost.cancelled() => return WebhookOutcome::Success,
-                                status = async {
-                                    let inner = shared.state.inner.lock().await;
-                                    inner
-                                        .runs
-                                        .get(&run_id)
-                                        .and_then(|r| r.jobs.get(&job_id).copied())
-                                } => status,
                             };
-                            if let Some(status) = status.filter(|s| s.is_terminal()) {
+                            if job.status.is_terminal() {
                                 tokio::select! {
                                     _ = lease_lost.cancelled() => return WebhookOutcome::Success,
-                                    _ = report_check_run_completed(shared, run_id, &job_id, status) => {}
+                                    _ = report_check_run_completed(shared, run_id, &job_id, job.status) => {}
                                 }
                             }
                         }
@@ -3170,6 +3223,11 @@ mod tests {
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(workspace)
+            // Test fixtures must not depend on the developer's signing
+            // setup — a broken or locked signing agent (e.g. 1Password)
+            // would otherwise fail every commit fixture.
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .output()
             .unwrap();
@@ -3424,7 +3482,7 @@ mod tests {
         {
             let record = fixture
                 .state
-                .store
+                .backend
                 .get_webhook_delivery("delivery-fetch-fail")
                 .await
                 .unwrap()
@@ -3436,7 +3494,7 @@ mod tests {
             );
             assert_eq!(record.attempts, 1);
             assert!(record.last_error.is_some());
-            let inner = fixture.state.inner.lock().await;
+            let inner = fixture.state.test_tx().await;
             assert!(
                 inner.runs.is_empty(),
                 "a failed delivery must not create a run"
@@ -3450,13 +3508,13 @@ mod tests {
         fixture.drain().await;
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-fetch-fail")
             .await
             .unwrap()
             .expect("delivery row must exist");
         assert_eq!(record.state, WebhookDeliveryStatus::Done);
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -3495,7 +3553,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-outage-gate")
             .await
             .unwrap()
@@ -3526,7 +3584,7 @@ mod tests {
         std::fs::rename(&ws_dir, &hidden_ws).unwrap();
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&WebhookDeliveryRecord {
                 delivery_id: "delivery-outage-park".to_owned(),
                 event: "push".to_owned(),
@@ -3546,7 +3604,7 @@ mod tests {
         });
         let claimed = shared
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, WEBHOOK_LEASE_DURATION_SECS)
             .await
             .unwrap();
@@ -3558,7 +3616,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-outage-park")
             .await
             .unwrap()
@@ -3607,7 +3665,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-no-sha")
             .await
             .unwrap()
@@ -3619,7 +3677,7 @@ mod tests {
         );
         assert_eq!(record.attempts, 1);
         assert!(record.last_error.is_some());
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(
             inner.runs.is_empty(),
             "a failed delivery must not create a run"
@@ -3662,10 +3720,10 @@ mod tests {
         );
         fixture.drain().await;
 
-        let inner = fixture.state.inner.lock().await;
-        assert_eq!(inner.runs.len(), 1);
+        let runs = fixture.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 1);
         assert_eq!(
-            inner.runs.values().next().unwrap().workflow_path_str,
+            runs.values().next().unwrap().workflow_path_str,
             ".github/workflows/selected.yml"
         );
     }
@@ -3697,7 +3755,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-malformed")
             .await
             .unwrap()
@@ -3710,7 +3768,7 @@ mod tests {
                 .is_some_and(|error| error.contains("a-malformed.yml")),
             "permanent delivery error must identify malformed workflow"
         );
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -3763,7 +3821,7 @@ mod tests {
         });
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -3859,7 +3917,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-no-match")
             .await
             .unwrap()
@@ -3869,7 +3927,7 @@ mod tests {
             WebhookDeliveryStatus::Done,
             "a delivery that triggered no workflow is still completed successfully"
         );
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(inner.runs.is_empty());
     }
 
@@ -3898,7 +3956,7 @@ mod tests {
 
         let record = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-github-owned")
             .await
             .unwrap()
@@ -3908,7 +3966,7 @@ mod tests {
             WebhookDeliveryStatus::Done,
             "skipped github-owned workflow completes delivery"
         );
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert!(inner.runs.is_empty());
 
         unsafe { std::env::remove_var(GITHUB_OWNED_WORKFLOWS_ENV) };
@@ -3934,14 +3992,14 @@ mod tests {
         };
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&record)
             .await
             .unwrap();
 
         let recovered = fixture
             .state
-            .store
+            .backend
             .recover_webhook_deliveries()
             .await
             .unwrap();
@@ -3949,7 +4007,7 @@ mod tests {
 
         let rec = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-cancel")
             .await
             .unwrap()
@@ -3957,7 +4015,7 @@ mod tests {
         assert_eq!(rec.state, WebhookDeliveryStatus::Received);
 
         fixture.drain().await;
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -3979,7 +4037,7 @@ mod tests {
         });
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -3987,7 +4045,7 @@ mod tests {
         let outcome = process_delivery_payload(&shared, &claimed[0]).await;
         assert!(matches!(outcome, WebhookOutcome::Success));
         let (original_run_id, original_check_run_ids) = {
-            let inner = fixture.state.inner.lock().await;
+            let inner = fixture.state.test_tx().await;
             assert_eq!(inner.runs.len(), 1);
             let run = inner.runs.values().next().unwrap();
             assert_eq!(run.webhook_delivery_id.as_deref(), Some("delivery-replay"));
@@ -4000,7 +4058,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(
                     "delivery-replay",
                     lease_token,
@@ -4013,7 +4071,7 @@ mod tests {
         );
         fixture.drain().await;
 
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         assert_eq!(
             inner.runs.len(),
             1,
@@ -4046,14 +4104,14 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&delivery)
                 .await
                 .unwrap()
         );
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -4061,7 +4119,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(
                     &delivery.delivery_id,
                     lease_token,
@@ -4075,7 +4133,7 @@ mod tests {
 
         let failed = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery(&delivery.delivery_id)
             .await
             .unwrap()
@@ -4087,7 +4145,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&redelivery)
                 .await
                 .unwrap(),
@@ -4095,7 +4153,7 @@ mod tests {
         );
         let reopened = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery(&delivery.delivery_id)
             .await
             .unwrap()
@@ -4107,7 +4165,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&redelivery)
                 .await
                 .unwrap(),
@@ -4138,7 +4196,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&corrupt)
                 .await
                 .unwrap()
@@ -4146,7 +4204,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&valid)
                 .await
                 .unwrap()
@@ -4156,7 +4214,7 @@ mod tests {
         let connection = rusqlite::Connection::open(db_path).unwrap();
         connection
             .execute(
-                "UPDATE webhook_deliveries SET payload_blob = ?1 WHERE delivery_id = ?2",
+                "UPDATE webhook_deliveries SET payload = ?1 WHERE delivery_id = ?2",
                 rusqlite::params![vec![0_u8, 1, 2], corrupt.delivery_id],
             )
             .unwrap();
@@ -4164,7 +4222,7 @@ mod tests {
 
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -4175,7 +4233,7 @@ mod tests {
         assert_eq!(
             fixture
                 .state
-                .store
+                .backend
                 .count_dead_letter_webhook_deliveries()
                 .await
                 .unwrap(),
@@ -4184,7 +4242,7 @@ mod tests {
 
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 60)
             .await
             .unwrap();
@@ -4197,7 +4255,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery(&valid.delivery_id, lease_token)
                 .await
                 .unwrap()
@@ -4220,13 +4278,13 @@ mod tests {
         };
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&delivery)
             .await
             .unwrap();
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 1)
             .await
             .unwrap();
@@ -4236,7 +4294,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .renew_webhook_delivery("delivery-lease", "stale-token", 60)
                 .await
                 .unwrap(),
@@ -4245,7 +4303,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .renew_webhook_delivery("delivery-lease", lease_token, 60)
                 .await
                 .unwrap()
@@ -4253,7 +4311,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery("delivery-lease", "stale-token")
                 .await
                 .unwrap(),
@@ -4261,7 +4319,7 @@ mod tests {
         );
         let renewed = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery("delivery-lease")
             .await
             .unwrap()
@@ -4288,13 +4346,13 @@ mod tests {
         };
         fixture
             .state
-            .store
+            .backend
             .enqueue_webhook_delivery(&delivery)
             .await
             .unwrap();
         let claimed = fixture
             .state
-            .store
+            .backend
             .claim_webhook_deliveries(1, 0)
             .await
             .unwrap();
@@ -4304,7 +4362,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .renew_webhook_delivery(&delivery.delivery_id, lease_token, 60)
                 .await
                 .unwrap(),
@@ -4313,7 +4371,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .complete_webhook_delivery(&delivery.delivery_id, lease_token)
                 .await
                 .unwrap(),
@@ -4322,7 +4380,7 @@ mod tests {
         assert!(
             !fixture
                 .state
-                .store
+                .backend
                 .fail_webhook_delivery(
                     &delivery.delivery_id,
                     lease_token,
@@ -4336,7 +4394,7 @@ mod tests {
         );
         let retained = fixture
             .state
-            .store
+            .backend
             .get_webhook_delivery(&delivery.delivery_id)
             .await
             .unwrap()
@@ -4355,7 +4413,7 @@ mod tests {
         {
             fixture
                 .state
-                .store
+                .backend
                 .enqueue_webhook_delivery(&WebhookDeliveryRecord {
                     delivery_id: delivery_id.to_owned(),
                     event: "push".to_owned(),
@@ -4373,7 +4431,7 @@ mod tests {
 
         let pruned = fixture
             .state
-            .store
+            .backend
             .prune_webhook_deliveries(now - 1_000_000, 10)
             .await
             .unwrap();
@@ -4381,7 +4439,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .get_webhook_delivery("delivery-old")
                 .await
                 .unwrap()
@@ -4390,7 +4448,7 @@ mod tests {
         assert!(
             fixture
                 .state
-                .store
+                .backend
                 .get_webhook_delivery("delivery-fresh")
                 .await
                 .unwrap()
@@ -4429,13 +4487,19 @@ mod tests {
             ..Default::default()
         };
         let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
-        {
-            let mut inner = shared.state.inner.lock().await;
-            let run = inner.runs.get_mut(&accepted.run_id).unwrap();
-            run.status = preloop_gha_protocol::ExecutionStatus::Success;
-            run.job_check_run_ids
-                .insert(JobId("build".to_owned()), 12345);
-        }
+        // Force the run terminal and plant the known check-run mapping. Both
+        // go through the control database now — there is no in-memory mirror.
+        shared
+            .state
+            .test_db_mutate(|db| db.set_run_status(accepted.run_id, "completed", Some("success")))
+            .await
+            .unwrap();
+        shared
+            .state
+            .backend
+            .set_job_check_run(accepted.run_id, &JobId("build".to_owned()), 12345)
+            .await
+            .unwrap();
         // Keep the TempDir alive for the state's lifetime.
         (temp, shared)
     }
@@ -4461,12 +4525,8 @@ mod tests {
             .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.0, serde_json::json!([]));
-        let inner = shared.state.inner.lock().await;
-        assert_eq!(
-            inner.runs.len(),
-            1,
-            "blocked sender must not resubmit the run"
-        );
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 1, "blocked sender must not resubmit the run");
     }
 
     #[tokio::test]
@@ -4477,12 +4537,8 @@ mod tests {
             .unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_ne!(body.0, serde_json::json!([]), "clean sender must resubmit");
-        let inner = shared.state.inner.lock().await;
-        assert_eq!(
-            inner.runs.len(),
-            2,
-            "clean sender's rerequest must create a run"
-        );
+        let runs = shared.state.test_tx().await.runs;
+        assert_eq!(runs.len(), 2, "clean sender's rerequest must create a run");
     }
 
     /// Seed one plain run, reported or not. `submit_run_inner` never mints
@@ -4508,14 +4564,12 @@ mod tests {
             ..Default::default()
         };
         let accepted = crate::submit_run_inner(&shared, submission).await.unwrap();
-        {
-            let mut inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get_mut(&accepted.run_id)
-                .unwrap()
-                .reports_check_runs = reports_check_runs;
-        }
+        shared
+            .state
+            .backend
+            .set_reports_check_runs(accepted.run_id, reports_check_runs)
+            .await
+            .unwrap();
         (temp, shared, accepted.run_id)
     }
 
@@ -4529,11 +4583,9 @@ mod tests {
         let leg = JobId("build (linux)".to_owned());
         let id = ensure_check_run_mapped(&shared, run_id, &leg).await;
         assert!(id.is_some(), "reported runs mint checks for late jobs");
-        let inner = shared.state.inner.lock().await;
+        let runs = shared.state.test_tx().await.runs;
         assert!(
-            inner
-                .runs
-                .get(&run_id)
+            runs.get(&run_id)
                 .unwrap()
                 .job_check_run_ids
                 .contains_key(&leg),
@@ -4551,15 +4603,8 @@ mod tests {
             None,
             "plain local runs mint no check runs, matching intake"
         );
-        let inner = shared.state.inner.lock().await;
-        assert!(
-            inner
-                .runs
-                .get(&run_id)
-                .unwrap()
-                .job_check_run_ids
-                .is_empty()
-        );
+        let runs = shared.state.test_tx().await.runs;
+        assert!(runs.get(&run_id).unwrap().job_check_run_ids.is_empty());
     }
 
     #[tokio::test]
@@ -4572,11 +4617,9 @@ mod tests {
         // check rather than drop the report.
         report_check_run_completed(&shared, run_id, &leg, ExecutionStatus::Skipped).await;
 
-        let inner = shared.state.inner.lock().await;
+        let runs = shared.state.test_tx().await.runs;
         assert!(
-            inner
-                .runs
-                .get(&run_id)
+            runs.get(&run_id)
                 .unwrap()
                 .job_check_run_ids
                 .contains_key(&leg),
@@ -4654,5 +4697,146 @@ mod tests {
         quiet.submission = std::sync::Arc::new(submission);
         quiet.reports_check_runs = false;
         assert_eq!(check_run_report_coords(&quiet), None);
+    }
+
+    /// GitHub does not deliver webhooks in order, and retries/watchdog
+    /// redeliveries land late by design. A push for an OLDER commit processed
+    /// after a newer one must not use `cancel-in-progress` to cancel the newer
+    /// commit's run: the ref's newest head is what the group should keep.
+    #[tokio::test]
+    async fn late_older_push_does_not_cancel_newer_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/build.yml"),
+            "on: push\nconcurrency:\n  group: ci-${{ github.ref }}\n  cancel-in-progress: true\n\
+             jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n",
+        )
+        .unwrap();
+        // The fixture commits the workspace: that is the older commit.
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir.clone()).await;
+        let older = git_output(&ws_dir, &["rev-parse", "HEAD"]);
+        std::fs::write(ws_dir.join("change.txt"), "newer").unwrap();
+        git_output(&ws_dir, &["add", "-A"]);
+        git_output(&ws_dir, &["commit", "-qm", "newer"]);
+        let newer = git_output(&ws_dir, &["rev-parse", "HEAD"]);
+
+        // `repository.pushed_at` is GitHub's record of when each push happened.
+        let push = |before: &str, after: &str, pushed_at: i64| {
+            serde_json::to_vec(&serde_json::json!({
+                "ref": "refs/heads/main",
+                "before": before,
+                "after": after,
+                "repository": {
+                    "full_name": "owner/repo",
+                    "default_branch": "main",
+                    "pushed_at": pushed_at
+                },
+                "commits": [{"id": after, "added": [], "modified": ["change.txt"], "removed": []}],
+            }))
+            .unwrap()
+        };
+
+        // Newer push arrives (and is processed) first…
+        let status = fixture
+            .post_body(
+                "delivery-newer",
+                Some("push"),
+                &push(&older, &newer, 1_700_000_200),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        fixture.drain().await;
+        // …then the older push shows up late.
+        let status = fixture
+            .post_body(
+                "delivery-older",
+                Some("push"),
+                &push(
+                    "0000000000000000000000000000000000000000",
+                    &older,
+                    1_700_000_100,
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        fixture.drain().await;
+
+        let inner = fixture.state.test_tx().await;
+        let status_for = |sha: &str| {
+            inner
+                .runs
+                .values()
+                .find(|run| run.submission.sha == sha)
+                .map(|run| run.status)
+        };
+        let newer_status = status_for(&newer).expect("the newer push must have a run");
+        assert_ne!(
+            newer_status,
+            ExecutionStatus::Cancelled,
+            "a late push for an older commit cancelled the newer commit's run"
+        );
+        assert_eq!(
+            status_for(&older),
+            Some(ExecutionStatus::Cancelled),
+            "the stale push is the one superseded, as it would have been in GitHub's order"
+        );
+    }
+
+    /// ChatOps shape: a per-PR `cancel-in-progress` group fed by comments.
+    /// A comment delivered late must not cancel the run of a newer comment.
+    #[tokio::test]
+    async fn late_older_pr_comment_does_not_cancel_newer_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/chatops.yml"),
+            "on: issue_comment\nconcurrency:\n  group: pr-${{ github.event.issue.number }}\n  \
+             cancel-in-progress: true\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    \
+             steps:\n      - run: echo deploy\n",
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+
+        let comment = |id: u64, created_at: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "action": "created",
+                "issue": {"number": 42, "pull_request": {"url": "https://example.invalid/pr/42"}},
+                "comment": {"id": id, "body": "/deploy", "created_at": created_at},
+                "repository": {"full_name": "owner/repo", "default_branch": "main"},
+                "sender": {"login": "octocat"},
+            }))
+            .unwrap()
+        };
+
+        // The newer comment is processed first, the older one arrives late.
+        for (delivery, id, created_at) in [
+            ("delivery-comment-newer", 2, "2026-01-01T00:05:00Z"),
+            ("delivery-comment-older", 1, "2026-01-01T00:00:00Z"),
+        ] {
+            let status = fixture
+                .post_body(delivery, Some("issue_comment"), &comment(id, created_at))
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            fixture.drain().await;
+        }
+
+        let inner = fixture.state.test_tx().await;
+        let status_for = |id: u64| {
+            inner
+                .runs
+                .values()
+                .find(|run| run.submission.payload["comment"]["id"] == id)
+                .map(|run| run.status)
+        };
+        let newer = status_for(2).expect("the newer comment must have a run");
+        assert_ne!(
+            newer,
+            ExecutionStatus::Cancelled,
+            "a late comment cancelled the newer comment's run"
+        );
+        assert_eq!(status_for(1), Some(ExecutionStatus::Cancelled));
     }
 }

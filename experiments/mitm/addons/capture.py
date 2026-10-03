@@ -14,12 +14,18 @@ from mitmproxy import http
 # module importable regardless of the caller's working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from hosts import host_selected, parse_allowlist
 from redact import (
     REDACTED,
     redact_bytes,
     redact_headers,
     redact_json,
 )
+
+
+# Version of the flows.jsonl record layout (see ../FORMAT.md). Bump on any
+# field rename/removal; additions are backwards compatible.
+CAPTURE_FORMAT = 1
 
 
 def _capture_dir() -> Path | None:
@@ -29,6 +35,17 @@ def _capture_dir() -> Path | None:
     p = Path(d)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _host_allowlist() -> list[str]:
+    """`MITM_CAPTURE_HOSTS` (see hosts.parse_allowlist). Empty = all hosts."""
+    return parse_allowlist(os.environ.get("MITM_CAPTURE_HOSTS", ""))
+
+
+def _rewrite_local() -> bool:
+    """Local-host redirection to `BACKEND_PORT` is the runner-capture default;
+    `MITM_REWRITE_LOCAL=0` turns it off for engine-side or reverse captures."""
+    return os.environ.get("MITM_REWRITE_LOCAL", "1") != "0"
 
 
 def _safe_b64(data: bytes) -> str:
@@ -81,13 +98,15 @@ def _dump_flow(flow: http.HTTPFlow, index: int, cd: Path):
         duration = (response.timestamp_end - request.timestamp_start) * 1000
 
     record = {
+        "capture_format": CAPTURE_FORMAT,
+        "direction": os.environ.get("MITM_CAPTURE_DIRECTION", "outbound"),
         "flow_index": index,
         "ts_request": request.timestamp_start,
         "ts_response": ts_resp,
         "duration_ms": round(duration, 3) if duration is not None else None,
         "method": request.method,
         "scheme": request.scheme,
-        "host": request.host,
+        "host": flow.metadata.get("_original_host") or request.host,
         "path": request.path,
         "request_headers": redact_headers(request.headers),
         "request_body_b64": req_b64,
@@ -117,7 +136,14 @@ class Capture:
     counter: int = 0
 
     def request(self, flow: http.HTTPFlow):
-        if flow.request.host in ("127.0.0.1", "localhost", "preloop.local") or flow.request.host.endswith(".local"):
+        # Stash the caller-visible host before any rewrite: mitmproxy's host
+        # setter also updates the Host header/authority, so pretty_host can no
+        # longer answer "which service was this" after the redirect below.
+        flow.metadata["_original_host"] = flow.request.pretty_host
+        if _rewrite_local() and (
+            flow.request.host in ("127.0.0.1", "localhost", "preloop.local")
+            or flow.request.host.endswith(".local")
+        ):
             backend_port = int(os.environ.get("BACKEND_PORT", "5000"))
             flow.request.host = "127.0.0.1"
             flow.request.port = backend_port
@@ -134,6 +160,11 @@ class Capture:
     def _do_dump(self, flow: http.HTTPFlow):
         cd = _capture_dir()
         if cd is None:
+            return
+        # Filter on the original host (pre-rewrite) so allowlists name the
+        # service being recorded, not the local backend.
+        host = flow.metadata.get("_original_host") or flow.request.pretty_host
+        if not host_selected(host, _host_allowlist()):
             return
         index = flow.metadata.get("_capture_order", Capture.counter)
         try:

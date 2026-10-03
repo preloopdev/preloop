@@ -14,12 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::debug;
 
-/// R1-12: file-command inputs (GITHUB_ENV/OUTPUT/STATE/PATH) are bounded
+/// File-command inputs (GITHUB_ENV/OUTPUT/STATE/PATH) are bounded
 /// like step summaries already are (1 MiB). A step can otherwise grow these
 /// files without limit and have the runner read them whole into memory.
 const FILE_COMMAND_MAX_BYTES: u64 = 1_048_576;
 
-/// R1-12: read a file-command input through a single handle with a byte
+/// Read a file-command input through a single handle with a byte
 /// budget. A metadata size check followed by a separate read is two
 /// filesystem observations: a file growing between them passes the gate and
 /// then allocates to EOF. Open once, require a regular file (no
@@ -195,7 +195,7 @@ pub fn parse_kv_file(path: &Path) -> Result<HashMap<String, String>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    // R1-12: single-handle bounded read (no check-then-read race).
+    // Single-handle bounded read (no check-then-read race).
     let text = read_file_command(path)?;
 
     let mut result = HashMap::new();
@@ -306,7 +306,7 @@ pub fn parse_path_file(path: &Path) -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    // R1-12: single-handle bounded read (no check-then-read race).
+    // Single-handle bounded read (no check-then-read race).
     let content = read_file_command(path)?;
 
     Ok(content
@@ -614,7 +614,7 @@ fn make_file_subject(
         bail!("file '{declared_path}' does not exist");
     }
 
-    // R1-12: stream the file through the hasher instead of reading it whole
+    // Stream the file through the hasher instead of reading it whole
     // into memory. The declared path is attacker-chosen (absolute paths are
     // allowed) and may be gigabytes; a 2 GiB sparse file previously added
     // ~2 GiB to RSS.
@@ -716,7 +716,7 @@ mod tests {
         assert_eq!(result, vec!["/usr/local/bin", "/opt/bin"]);
     }
 
-    /// R1-12: artifact file subjects are hashed by streaming, not by reading
+    /// Artifact file subjects are hashed by streaming, not by reading
     /// the whole file into memory. Uses a 512 MiB sparse file (instant to
     /// create); the digest must match a streaming reference hash.
     #[test]
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(subject.digest, expected);
         assert_eq!(subject.kind, "file");
     }
-    /// R1-12: an over-budget file-command input errors with the size message
+    /// An over-budget file-command input errors with the size message
     /// instead of being read whole.
     #[test]
     fn oversized_file_command_rejected() {
@@ -954,7 +954,7 @@ mod tests {
         assert!(err.to_string().contains("EOF marker missing new line"));
     }
 
-    // --- P0 file command gap coverage ---
+    // --- file command gap coverage ---
 
     #[test]
     fn parse_kv_equals_in_value() {

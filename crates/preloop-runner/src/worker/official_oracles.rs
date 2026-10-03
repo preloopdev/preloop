@@ -96,7 +96,7 @@ pub enum StepRunOutcome {
 }
 
 /// (step if-condition, expected outcome) once job is in Failure status.
-pub fn p0_failure_conditions_oracle() -> &'static [(&'static str, StepRunOutcome)] {
+pub fn failure_conditions_oracle() -> &'static [(&'static str, StepRunOutcome)] {
     &[
         // After failure, default/success gated steps skip; failure/always run.
         ("success()", StepRunOutcome::Skip),
@@ -173,9 +173,9 @@ mod tests {
 
     /// p0-failure-conditions.yml oracle from live GitHub.
     #[test]
-    fn p0_failure_conditions_matches_github_run() {
+    fn failure_conditions_match_github_run() {
         let flags = OfficialJobStatus::Failure.to_flags();
-        for (cond, expected) in p0_failure_conditions_oracle() {
+        for (cond, expected) in failure_conditions_oracle() {
             let runs = evaluate_step_condition(Some(cond), flags).unwrap();
             match expected {
                 StepRunOutcome::Run => assert!(runs, "{cond} should run after failure"),

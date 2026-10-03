@@ -1,6 +1,6 @@
 # GitHub App API Compatibility — Implementation Plan
 
-Status: Implemented (M1–M5); see §11.
+Status: Implemented; see §11.
 Author: design session — see §11 for the implementation record
 Branch: `Bnjoroge/gh-app-api-compat` (historical, merged)
 
@@ -72,13 +72,13 @@ extends that to the *dispatch* contract.
 
 ## 4. Design Decisions
 
-### D1. Dispatch routes live in the protected router, authenticated by a new extractor
+### Dispatch routes live in the protected router, authenticated by a new extractor
 Add a `dispatch_auth` module. Routes are registered in `routes.rs` under the
 protected router. Auth is **mandatory** (github.com returns 401 without a token).
 `/repos/...` must be added to `auth.rs` classification so it is neither public nor
-accidentally denied — see M2.
+accidentally denied.
 
-### D2. Token validation chain (in order)
+### Token validation chain (in order)
 1. **System bearer** (the per-engine token from `PRELOOP_SYSTEM_TOKEN` or its secure store) — trusted operator; tier AdminManual.
 2. **PAT** (`PRELOOP_GITHUB_TOKEN`) — constant-time compare; tier AdminManual.
 3. **Own-App JWT** (RS256, `iss` = one of the registered App ids) — verify with that App's PEM; offline-safe; tier AdminManual.
@@ -108,7 +108,7 @@ Actor resolution for the synthesized `sender`:
   placeholder
 - System bearer → `preloop-system`
 
-### D3. Dispatch → run pipeline reuses the webhook adapters
+### Dispatch → run pipeline reuses the webhook adapters
 Do **not** write a parallel submit path. Synthesize the webhook-shaped payload,
 run it through the existing adapter, then `submit_run_inner`:
 
@@ -123,7 +123,7 @@ run it through the existing adapter, then `submit_run_inner`:
 `github.event` fidelity comes for free: `EffectiveEvent.payload` is stored raw and
 the parser resolves against it.
 
-### D4. Input validation for workflow_dispatch (github.com semantics)
+### Input validation for workflow_dispatch (github.com semantics)
 GitHub validates `inputs` against the workflow's `on.workflow_dispatch.inputs`:
 - missing **required** input → 422
 - type mismatch (`boolean|choice|number|string`) → 422
@@ -135,7 +135,7 @@ The adapter comment says defaulting already happens "in submission handling" —
 is created. Missing input validation must not reject a *webhook*-delivered dispatch
 (the webhook path must stay lenient, matching github.com).
 
-### D5. Trust tiers
+### Trust tiers
 - System/PAT/own-App-JWT dispatch → `TrustTier::AdminManual` (matches the adapter's
   existing stamp; secrets allowed).
 - Validated installation-token dispatch (actions:write proven) → a tier that
@@ -144,7 +144,7 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
   e.g. `AppDispatch` (secrets allowed). Check `TrustTier::allows_secrets` in
   `src/events/trust_tier.rs` before deciding.
 
-### D6. Multi-App registry (config + runtime)
+### Multi-App registry (config + runtime)
 - Config: extend `config.rs::Github` with `apps: Vec<AppConfig>` where
   `AppConfig { app_id, pem, webhook_secret, installation_id? }`. Keep the existing
   single-App env vars (`PRELOOP_GITHUB_APP_ID`, `PRELOOP_GITHUB_APP_PEM*`) as the
@@ -158,7 +158,7 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 - Native admin endpoint `GET/POST /api/v1/github/apps` (system bearer) to list and
   register Apps at runtime (nice-to-have; config-first is fine).
 
-### D7. Event subscription
+### Event subscription
 - Manifest `default_events` is configurable and defaults to the minimal CI set:
   `push`, `pull_request`. Operators who need additional events must add them
   manually in the App settings UI because GitHub's API cannot change event
@@ -182,7 +182,7 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 - `set_app_webhook_config` (github_app.rs ~915) stays URL/secret-only; extend its
   verification to report missing events too.
 
-### D8. Repository_dispatch broadcast + workflow_id resolution
+### Repository_dispatch broadcast + workflow_id resolution
 - `workflow_id` (path param) accepts: filename (`ci.yml`, `ci`, `.github/workflows/ci.yml`).
   Numeric workflow ids only if preloop already tracks them — otherwise filename-only,
   documented. (github.com accepts both; filename is the 99% case.)
@@ -193,7 +193,7 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 ## 5. Endpoint Contracts (match github.com)
 
 ### `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`
-- Auth: D2 chain. Requirement: `actions: write` on the repo (github.com requires
+- Auth: the token-validation chain. Requirement: `actions: write` on the repo (github.com requires
   `actions: write` for workflow dispatch).
 - Body: `{ "ref": string?, "inputs": {k: v}? }` (ref defaults to default branch)
 - Success: `204 No Content` (empty body)
@@ -207,7 +207,7 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
   reported exactly like webhook-driven runs.
 
 ### `POST /repos/{owner}/{repo}/dispatches`
-- Auth: D2 chain. Requirement: `contents: write` (github.com requires
+- Auth: the token-validation chain. Requirement: `contents: write` (github.com requires
   `contents: write` for repository dispatch; verified against the installation's
   granted permissions).
 - Body: `{ "event_type": string (required, ≤100 chars), "client_payload": object? }`
@@ -216,7 +216,7 @@ is created. Missing input validation must not reject a *webhook*-delivered dispa
 - Side effects: every workflow with a matching `on.repository_dispatch.types` entry
   runs (broadcast).
 
-### Read endpoints (for Apps that poll — secondary, include in M2 if cheap)
+### Read endpoints (for Apps that poll — secondary, added if cheap)
 - `GET /repos/{owner}/{repo}/actions/workflows` → list with `id`, `name`, `path`
 - `GET /repos/{owner}/{repo}/actions/runs` → recent runs with `status`, `conclusion`
 These are convenience; check runs remain the primary egress. Implement only if they
@@ -227,15 +227,15 @@ fall out of existing state queries cheaply.
 ```
 src/
   dispatch.rs            # NEW  — route handlers: workflow_dispatch + repository_dispatch
-  dispatch_auth.rs       # NEW  — token validation chain (D2), actor resolution, ledger, cache
+  dispatch_auth.rs       # NEW  — token validation chain, actor resolution, ledger, cache
   github_apps.rs         # NEW (or extend github_app.rs) — multi-App registry, per-App secret
                            #   verification for the webhook receiver, minting selection
   github.rs              # EDIT — receiver: multi-secret verification; expose fetch helpers
-  github_app.rs          # EDIT — manifest events (D7), mint ledger population (D2.4), GET /app read-back
+  github_app.rs          # EDIT — manifest events, mint ledger population, GET /app read-back
   routes.rs              # EDIT — register dispatch routes in protected router
   auth.rs                # EDIT — classify /repos/... dispatch routes (protected, dispatch_auth)
   config.rs              # EDIT — apps registry
-  events/*.rs            # small edits only if TrustTier needs the D5 extension
+  events/*.rs            # small edits only if TrustTier needs the trust-tier extension
   runs.rs                # EDIT — expose a submit helper if submit_run_inner needs an
                            #   actor/tier override hook (prefer minimal: reuse as-is)
   openapi.rs             # EDIT — document the new endpoints (native doc convention)
@@ -271,41 +271,41 @@ docs/
 
 ## 8. Milestones & Acceptance Criteria
 
-### M1 — Docs fix + event subscription
+### Docs fix + event subscription
 - [ ] `docs/github-app-webhook.md` corrected (full event list from `all_event_names()`)
 - [ ] Manifest `default_events` configurable, minimal `push`/`pull_request`
-      default with manual GitHub settings guidance for additional events (D7)
+      default with manual GitHub settings guidance for additional events
 - [ ] Startup read-back of `GET /app` events; loud warning when trigger events missing
 - [ ] Tests: manifest generation includes events; read-back warning path
 - **Exit**: existing deployments unchanged (no new required config); docs match code.
 
-### M2 — Dispatch shim (own auth)
+### Dispatch shim (own auth)
 - [ ] `POST .../actions/workflows/{id}/dispatches` + `POST /repos/{o}/{r}/dispatches`
       with system-bearer, PAT, own-App-JWT, own-minted-token (offline) auth
-- [ ] Input validation (D4) → 422 semantics; workflow not dispatchable → 409
+- [ ] Input validation → 422 semantics; workflow not dispatchable → 409
 - [ ] Fidelity: `github.event_name/inputs/client_payload/actor` correct
-- [ ] Read endpoints if cheap (D8/secondary)
+- [ ] Read endpoints if cheap (secondary)
 - [ ] Tests: integration + auth + fidelity + validation
 - **Exit**: an App (or curl) can dispatch a workflow to the local pool end to end,
   `github.event` matches github.com shapes, check runs report.
 
-### M3 — Third-party token validation
+### Third-party token validation
 - [ ] Online round-trip (`GET /installation`, `GET /installation/repositories`),
       cache, fail-closed
-- [ ] Mint ledger for offline own-token path (D2.4)
+- [ ] Mint ledger for offline own-token path
 - [ ] Actor resolution for third-party tokens
 - [ ] Tests with stubbed github.com (success, 401, network failure → fail closed)
 - **Exit**: a token minted by an *unrelated* GitHub App dispatches successfully when
   it holds actions:write, and is rejected (401/403) otherwise.
 
-### M4 — Multi-App registry
+### Multi-App registry
 - [ ] `github.apps` config; per-App webhook secrets in the receiver; minting selection
 - [ ] Native admin endpoints (optional)
 - [ ] Tests: per-App secret routing, minting selection
 - **Exit**: two Apps coexist; webhooks signed by either App are accepted; each run's
   `GITHUB_TOKEN` is minted from the App installed on its repo.
 
-### M5 — Fidelity hardening + gate
+### Fidelity hardening + gate
 - [ ] Property tests for dispatch payloads
 - [ ] `openapi.rs` docs; `docs/github-tokens.md` + `fidelity-gap.md` updated
 - [ ] Dogfood: add a fixture workflow to `fixtures/workflows/` exercising
@@ -331,14 +331,14 @@ docs/
    ledger also cover tokens minted by the `preloop setup github` flow before this
    feature shipped? (Answer: nothing to migrate — the ledger is populated at mint
    time going forward; old tokens expire.)
-4. Exact tier for installation-token dispatch (D5): extend `TrustTier` or reuse?
+4. Exact tier for installation-token dispatch: extend `TrustTier` or reuse?
    Check `allows_secrets` policy first.
 
 ## 11. Implementation Log
 
 Milestone status and open-question decisions, updated as the work lands.
 
-### M1 — Docs fix + event subscription (done)
+### Docs fix + event subscription (done)
 
 - `docs/github-app-webhook.md` rewritten: full event table from
   `all_event_names()` (Tier A/B/C + `schedule` note); signature verification
@@ -361,12 +361,12 @@ Milestone status and open-question decisions, updated as the work lands.
   fails closed on refusal; missing-trigger computation is canonical.
 
 **Open-question decisions so far:**
-- D7 manifest default: `push` and `pull_request`. Additional events can be
+- Manifest default: `push` and `pull_request`. Additional events can be
   selected at creation time with `PRELOOP_GITHUB_APP_DEFAULT_EVENTS`; after
   creation, operators must add subscriptions manually in GitHub's App
   settings because the API cannot change them.
 
-### M2 — Dispatch shim (done)
+### Dispatch shim (done)
 
 - `src/dispatch.rs` (new): `POST /repos/{owner}/{repo}/actions/workflows/
   {workflow_id}/dispatches`, `POST /repos/{owner}/{repo}/dispatches`, and the
@@ -374,14 +374,14 @@ Milestone status and open-question decisions, updated as the work lands.
   `GET /repos/{owner}/{repo}/actions/runs`. Workflow fetch/ref resolution/
   submission reuse the webhook machinery (`fetch_workflows`,
   `resolve_ref_sha`, the `workflow_dispatch` / `repository_dispatch`
-  adapters, `submit_run_inner`). Input validation (D4) runs through the
+  adapters, `submit_run_inner`). Input validation runs through the
   parser's `apply_workflow_dispatch_inputs` **before** any run is created
   (422 with the offending input named); a workflow without a
   `workflow_dispatch` trigger is 409; unknown workflow/ref/repo is 404;
   repo/actions-write failures are 403; malformed JSON is 400. `repository_dispatch`
   is a broadcast over matching `types` (absent `types` matches all), 204 even
   when nothing matches.
-- `src/dispatch_auth.rs` (new): the D2 chain — system bearer, PAT
+- `src/dispatch_auth.rs` (new): the token-validation chain — system bearer, PAT
   (constant-time), own-App JWT (RS256 verified offline against the registered
   App's key; JWT-shaped tokens that fail verification are rejected locally
   since third-party App JWTs are never accepted), installation tokens (mint
@@ -401,7 +401,7 @@ Milestone status and open-question decisions, updated as the work lands.
 - `src/routes.rs` / `src/auth.rs`: dispatch routes registered in the protected
   router; `/repos/...` denied on the runner control-socket surface.
 - 30 router/auth/fidelity tests in `src/dispatch_tests.rs`; full server crate
-  suite green (533 tests) — counts as of the M2 date.
+  suite green (533 tests) — counts as of this writing.
 
 **Open-question decisions:**
 - Q1 (actor/tier override): no new plumbing — `WorkflowSubmission.actor` and
@@ -417,7 +417,7 @@ Milestone status and open-question decisions, updated as the work lands.
   `allows_secrets` first — only `UntrustedForkPullRequest`/`Untrusted`
   withhold secrets, so `AppDispatch` allows them, matching github.com.
 
-### M3 — Third-party token validation (done, same module as M2)
+### Third-party token validation (done)
 
 - Online round-trip `GET /installation` + `GET /installation/repositories`
   (paginated) in `dispatch_auth.rs`, short-TTL cache (60s, keyed by token
@@ -430,7 +430,7 @@ Milestone status and open-question decisions, updated as the work lands.
   actions:write, 403 without repo access, 401 on github.com refusal,
   fail-closed 502 on transport failure, all-repos installs.
 
-### M4 — Multi-App registry (implemented; gate pending)
+### Multi-App registry (implemented; gate pending)
 
 - `src/config.rs`: `AppConfig { app_id, pem, webhook_secret?,
   installation_id? }` + `GitHubConfig.apps: Vec<AppConfig>` (env override
@@ -454,10 +454,10 @@ Milestone status and open-question decisions, updated as the work lands.
   `select_app_for_repo` routes by owner, falls back to the default App.
 
 Not done (budget cut): the optional native admin endpoints
-`GET/POST /api/v1/github/apps` (D6 nice-to-have), and the M4 minting-selection
+`GET/POST /api/v1/github/apps` (nice-to-have), and the minting-selection
 test proving a job's `GITHUB_TOKEN` comes from the installed App end to end.
 
-### M5 — Fidelity hardening + gate (done except the final gate)
+### Fidelity hardening + gate (done except the final gate)
 
 Shipped: dispatch-payload property tests (`events/property_tests.rs` style),
 `openapi.rs` docs for the new endpoints, `docs/github-tokens.md` +

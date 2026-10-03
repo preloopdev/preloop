@@ -1,8 +1,8 @@
-//! Router-level tests for the GitHub-compatible dispatch API (M2/M3).
+//! Router-level tests for the GitHub-compatible dispatch API (/).
 //!
 //! Exercises the real axum router (`app_with_test_api`) against a local git
 //! workspace, the same way `concurrency_http_properties.rs` drives the real
-//! router. Auth coverage follows the D2 chain: system bearer, PAT, own-App
+//! router. Auth coverage follows the dispatch auth chain: system bearer, PAT, own-App
 //! JWT, own-minted installation token (offline ledger), third-party token
 //! (stubbed github.com round-trip), and fail-closed on network errors.
 
@@ -110,6 +110,8 @@ fn git_ok(ws: &std::path::Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(ws)
+        .arg("-c")
+        .arg("commit.gpgsign=false")
         .args(args)
         .output()
         .unwrap();
@@ -184,9 +186,8 @@ async fn get_json(app: &Router, uri: &str, bearer: Option<&str>) -> (StatusCode,
 
 /// The runs currently recorded, newest last.
 async fn recorded_runs(state: &AppState) -> Vec<(String, crate::models::RunRecord)> {
-    let inner = state.inner.lock().await;
-    inner
-        .runs
+    let tx = state.test_tx().await;
+    tx.runs
         .iter()
         .map(|(id, run)| (id.to_string(), run.clone()))
         .collect()
@@ -683,7 +684,7 @@ async fn list_actions_runs_reports_recent_runs_for_the_repo() {
     assert_eq!(run["workflow_path"], ".github/workflows/dispatch.yml");
 }
 
-// ─── Auth: the D2 chain ────────────────────────────────────────────────────
+// ─── Auth: the dispatch auth chain ────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn dispatch_without_token_is_401() {
@@ -1001,7 +1002,7 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
     assert!(recorded_runs(&state).await.is_empty());
 }
 
-// ─── M4: multi-App registry ────────────────────────────────────────────────
+// ─── multi-App registry ────────────────────────────────────────────────
 
 /// Build a two-App registry: the default App (secret `legacy-secret`) plus a
 /// second App with its own secret and key.
@@ -1046,7 +1047,7 @@ fn extract_iss(headers: &axum::http::HeaderMap) -> String {
         .unwrap_or_default()
 }
 
-/// M3: each registered secret is accepted only for repositories covered by
+/// Each registered secret is accepted only for repositories covered by
 /// the App that owns it. A payload signed by App 525's secret claiming
 /// org-a/repo (App 424's installation) is a cross-App forgery and must be
 /// rejected, even though the signature itself is valid. Coverage is exact:
@@ -1112,13 +1113,13 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     assert_eq!(
         deliver_webhook(&app, "ping", &ping("org-b/other-repo"), "second-secret").await,
         StatusCode::FORBIDDEN,
-        "M3: same-owner sibling repo outside the installation must be rejected"
+        "same-owner sibling repo outside the installation must be rejected"
     );
     // App 525's secret for org-a/repo (App 424's installation) → 403.
     assert_eq!(
         deliver_webhook(&app, "ping", &ping("org-a/repo"), "second-secret").await,
         StatusCode::FORBIDDEN,
-        "M3: cross-App forgery must be rejected"
+        "cross-App forgery must be rejected"
     );
     // Legacy secret: no App identity, no binding — accepted as before.
     assert_eq!(
@@ -1280,7 +1281,7 @@ fn installation_stub(
         )
 }
 
-// ─── M3: third-party installation tokens (stubbed github.com) ──────────────
+// ─── third-party installation tokens (stubbed github.com) ──────────────
 
 #[tokio::test]
 async fn third_party_installation_token_dispatches_when_it_holds_actions_write() {

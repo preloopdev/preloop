@@ -64,13 +64,13 @@ pub const BRIDGE_IDLE_TIMEOUT_SECS_ENV: &str = "PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS
 
 /// Default cap on concurrent spliced connections.
 ///
-/// R1-13: every accepted connection spawns a task and opens an upstream
+/// Every accepted connection spawns a task and opens an upstream
 /// socket. Without a cap, a guest process can accumulate tasks and sockets
 /// without bound by opening connections and leaving them idle.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 /// Default idle timeout, in seconds, for a spliced connection.
 ///
-/// R1-13: a connection that moves zero bytes in either direction for this
+/// A connection that moves zero bytes in either direction for this
 /// long is closed. Polling HTTP clients and keep-alive pools reconnect
 /// transparently, so this only reaps truly idle splices.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -110,7 +110,7 @@ impl Drop for ControlBridge {
 /// normal GitHub-hosted case) or when the advertised origin is not a loopback
 /// address the guest can bind.
 ///
-/// R1-13: concurrent connections are capped at `PRELOOP_BRIDGE_MAX_CONNECTIONS`
+/// Concurrent connections are capped at `PRELOOP_BRIDGE_MAX_CONNECTIONS`
 /// (default 256); excess connections are closed immediately. Connections idle
 /// longer than `PRELOOP_BRIDGE_IDLE_TIMEOUT_SECS` (default 300) are closed.
 pub async fn spawn_from_env() -> Option<ControlBridge> {
@@ -250,7 +250,7 @@ async fn spawn(
     let address = listener.local_addr()?;
     let consecutive_failures = Arc::new(AtomicU32::new(0));
     let warned_at_threshold = Arc::new(AtomicBool::new(false));
-    // R1-13: bound the number of concurrent spliced connections. The permit
+    // Bound the number of concurrent spliced connections. The permit
     // is held for the whole connection lifetime, so at most `max_connections`
     // tasks and upstream sockets can exist at once.
     let connection_semaphore = Arc::new(Semaphore::new(max_connections));
@@ -342,7 +342,7 @@ fn idle_expired() -> std::io::Error {
 
 /// Bidirectional splice with an idle timeout and independent half-close.
 ///
-/// R1-13: `copy_bidirectional` never times out, so a guest could hold
+/// `copy_bidirectional` never times out, so a guest could hold
 /// connections open forever at near-zero cost. This closes a splice that
 /// moves no bytes in *either* direction for `idle_timeout`. Active traffic
 /// — bytes flowing either way — resets the deadline; only truly idle

@@ -297,18 +297,11 @@ pub fn normalize_github_context(github: &Value) -> Value {
 pub fn build_agent_job_message(
     plan: &JobPlan,
     github: &Value,
-    global_env: &BTreeMap<String, String>,
     secrets: &BTreeMap<String, String>,
     vars: &BTreeMap<String, String>,
 ) -> Result<AgentJobRequestMessage, String> {
     let github_context = normalize_github_context(github);
-    build_agent_job_message_with_normalized_context(
-        plan,
-        &github_context,
-        global_env,
-        secrets,
-        vars,
-    )
+    build_agent_job_message_with_normalized_context(plan, &github_context, secrets, vars)
 }
 
 /// Build a job message using a context already normalized for runner wire data.
@@ -318,7 +311,6 @@ pub fn build_agent_job_message(
 pub fn build_agent_job_message_with_normalized_context(
     plan: &JobPlan,
     github_context: &Value,
-    global_env: &BTreeMap<String, String>,
     secrets: &BTreeMap<String, String>,
     vars: &BTreeMap<String, String>,
 ) -> Result<AgentJobRequestMessage, String> {
@@ -416,46 +408,29 @@ pub fn build_agent_job_message_with_normalized_context(
         steps.push(task_step);
     }
 
-    // Materialize variables. Job/workflow `env:` values may carry `${{ }}`
-    // expressions (the canonical case is a boolean built from the github
-    // context: `SCCACHE_GHA_ENABLED: ${{ github.ref_name == 'main' }}`).
-    // GitHub resolves these server-side with the job context; preloop must
-    // too, or the raw template string lands in the step environment and
-    // tools that validate their inputs (sccache rejects anything that is not
-    // a boolean literal) fail on first use.
-    let mut resolved_env: BTreeMap<String, String> = BTreeMap::new();
+    // Validate job/workflow `env:` expressions against the job context.
+    // GitHub's server fails the workflow when an env expression cannot be
+    // evaluated (a parse error or unknown function); it never ships the raw
+    // template to the runner. Missing *properties* still coalesce to "" per
+    // the resolver. Contexts that only exist at step time
+    // (`resolves_after_job_build`) are skipped — the runner evaluates those
+    // from `environmentVariables` against the completed context.
     for (k, v) in &plan.env {
-        // Some contexts do not exist yet when the job message is built, and
-        // the resolver turns a missing property into "" rather than an error
-        // — so resolving them here silently destroys the value. Ship those
-        // untouched; `environment_variables` carries them as template tokens
-        // and the runner evaluates them at step time against the completed
-        // context. See [`resolves_after_job_build`].
         if crate::eval::resolves_after_job_build(v) {
-            resolved_env.insert(k.clone(), v.clone());
             continue;
         }
-        // GitHub's server fails the workflow when an env expression cannot be
-        // evaluated (a parse error or unknown function); it never ships the
-        // raw template to the runner. Missing *properties* still coalesce to
-        // "" per the resolver.
-        let resolved = resolve_string(v, &job_expr_context).map_err(|error| {
+        resolve_string(v, &job_expr_context).map_err(|error| {
             format!(
                 "job `{}` env `{}` failed to evaluate: {error}",
                 plan.name, k
             )
         })?;
-        resolved_env.insert(k.clone(), resolved);
     }
+    // `env:` does NOT go into `variables`: the official runner materializes
+    // job/workflow env from `environmentVariables` (below), and `variables`
+    // carries only vars/secrets/system bookkeeping. Mirroring env into
+    // `variables` both duplicates the field and diverges the wire schema.
     let mut variables = BTreeMap::new();
-    for (k, v) in &resolved_env {
-        variables.insert(k.clone(), VariableValue::new(v));
-    }
-    for (k, v) in global_env {
-        variables
-            .entry(k.clone())
-            .or_insert_with(|| VariableValue::new(v));
-    }
     for (k, v) in vars {
         variables.insert(k.clone(), VariableValue::new(v));
     }
@@ -489,7 +464,8 @@ pub fn build_agent_job_message_with_normalized_context(
     // runner must evaluate at step time — so serialize the value through
     // `template_string_token`, which emits a literal (type 0) for plain text
     // and an expression/format token for anything containing `${{ … }}`.
-    let environment_variables: Vec<serde_json::Value> = resolved_env
+    let environment_variables: Vec<serde_json::Value> = plan
+        .env
         .iter()
         .map(|(k, v)| {
             serde_json::json!({
@@ -706,6 +682,7 @@ pub fn build_agent_job_message_with_normalized_context(
         preloop_snapshot_commit: None,
         preloop_snapshot_token_steps: None,
         preloop_snapshot_origin_rewrite: None,
+        preloop_secret_spec: None,
     })
 }
 
@@ -740,7 +717,11 @@ fn non_empty_services(
     }
 }
 
-fn regex_escape(value: &str) -> String {
+/// Escape `value` into a regex that matches it literally — the form the
+/// runner's `MaskType::Regex` hints expect. `pub` so the server's
+/// acquire-time template fill re-derives the identical hints the builder
+/// produced at submit.
+pub fn regex_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         if matches!(
@@ -926,7 +907,7 @@ fn build_task_step(step: &crate::StepPlan, context: &Context, file_id: u32) -> T
     // The runner evaluates these at step execution time via evaluate_template()
     // with the full job context (including workspace for hashFiles, github.action,
     // steps.*.outputs, etc.). Pre-resolving at job-build time runs without a
-    // workspace and silently zeros out hashFiles() results (PEXP-01 root cause).
+    // workspace and silently zeros out hashFiles() results.
     //
     // `with` inputs are still resolved because action handlers need resolved values
     // to locate and configure the action before step execution.
@@ -1063,14 +1044,8 @@ jobs:
             "sha": "abc123"
         });
 
-        let msg = build_agent_job_message(
-            plan,
-            &github,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg =
+            build_agent_job_message(plan, &github, &BTreeMap::new(), &BTreeMap::new()).unwrap();
 
         assert!(!msg.steps.is_empty());
         assert_eq!(msg.steps[0].condition.as_deref(), Some("success()"));
@@ -1109,7 +1084,6 @@ jobs:
             &serde_json::json!({}),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(msg.job_timeout, Some(3600));
@@ -1129,7 +1103,6 @@ jobs:
         let msg = build_agent_job_message(
             plan,
             &serde_json::json!({}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -1156,7 +1129,6 @@ jobs:
         let message = build_agent_job_message(
             plan,
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -1190,7 +1162,6 @@ jobs:
         let error = build_agent_job_message(
             plan,
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -1236,17 +1207,14 @@ jobs:
             &serde_json::json!({"event_name": "push"}),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .unwrap();
 
-        assert_eq!(
-            message
-                .variables
-                .get("TARGET")
-                .and_then(|variable| variable.value.clone()),
-            Some("${{ needs.build.outputs.target }}".to_owned()),
-            "a needs-dependent env value must not be resolved against the empty needs context"
+        // `env:` must not be mirrored into `variables` — the runner builds the
+        // `env` context from `environmentVariables`, not `variables`.
+        assert!(
+            !message.variables.contains_key("TARGET"),
+            "env vars must not be mirrored into variables"
         );
         // A deferred value must reach the wire as an *expression* token, which
         // is what makes the runner evaluate it against the hydrated context.
@@ -1318,7 +1286,6 @@ jobs:
             &serde_json::json!({"event_name": "push"}),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -1351,13 +1318,12 @@ jobs:
                 "Value must be a token: {entry}"
             );
         }
-        assert_eq!(
-            message
-                .variables
-                .get("DESTDIR")
-                .and_then(|v| v.value.clone()),
-            Some("./build".to_owned()),
-            "the variable projection must stay intact for expression contexts"
+        // `env:` must NOT leak into `variables` — the official runner builds
+        // the `env` expression context from `environmentVariables`, and
+        // `variables` carries only vars/secrets/system bookkeeping.
+        assert!(
+            !message.variables.contains_key("DESTDIR"),
+            "env vars must not be mirrored into variables"
         );
     }
 
@@ -1365,7 +1331,7 @@ jobs:
     /// context before they reach the wire (GitHub resolves them server-side;
     /// passing the raw template breaks tools that validate their inputs).
     #[test]
-    fn env_values_resolve_expressions_with_the_job_context() {
+    fn env_values_reach_the_runner_as_unevaluated_tokens() {
         let workflow = parse_workflow(
             r#"
 on: push
@@ -1387,26 +1353,30 @@ jobs:
             "ref_name": "main",
             "base_ref": "",
         });
-        let message = build_agent_job_message(
-            plan,
-            &github,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let message =
+            build_agent_job_message(plan, &github, &BTreeMap::new(), &BTreeMap::new()).unwrap();
 
-        let env: std::collections::BTreeMap<String, String> = message
-            .environment_variables
-            .iter()
-            .flat_map(template_token_env_pairs)
-            .collect();
+        // The official runner receives `environmentVariables` as raw
+        // TemplateTokens and evaluates them at step time — it does not
+        // pre-resolve expressions server-side. `ENABLED` must therefore
+        // arrive as an expression token, not a resolved boolean literal.
+        let token_value = |name: &str| -> Option<serde_json::Value> {
+            message.environment_variables.iter().find_map(|entry| {
+                let map = entry.get("map")?.as_array()?;
+                let pair = map.first()?;
+                let key = pair.get("Key")?.get("lit")?.as_str()?;
+                (key == name).then(|| pair.get("Value").cloned()).flatten()
+            })
+        };
         assert_eq!(
-            env.get("ENABLED").map(String::as_str),
-            Some("true"),
-            "the ref_name comparison must resolve to a boolean literal"
+            token_value("ENABLED").and_then(|v| v.get("expr").cloned()),
+            Some(serde_json::json!("github.ref_name == 'main'")),
+            "env expressions ship as unevaluated tokens for the runner to resolve"
         );
-        assert_eq!(env.get("PLAIN").map(String::as_str), Some("hello"));
+        assert_eq!(
+            token_value("PLAIN").and_then(|v| v.get("lit").cloned()),
+            Some(serde_json::json!("hello"))
+        );
     }
 
     /// Runtime-only expressions (`github.workspace` is filled in by the runner)
@@ -1431,7 +1401,6 @@ jobs:
         let message = build_agent_job_message(
             plan,
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -1487,7 +1456,6 @@ jobs:
             &serde_json::json!({"event_name": "push"}),
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -1519,14 +1487,8 @@ jobs:
         assert_eq!(plans.len(), 2);
 
         let github = serde_json::json!({"event_name": "push"});
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
 
         // Matrix should be in context data
         assert!(msg.context_data.contains_key("matrix"));
@@ -1534,14 +1496,8 @@ jobs:
         // strategy.job-index / job-total must be per-cell (0-based index,
         // 1-based total), matching GitHub.
         let strategy_of = |plan: &crate::JobPlan| {
-            let msg = build_agent_job_message(
-                plan,
-                &github,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-            )
-            .unwrap();
+            let msg =
+                build_agent_job_message(plan, &github, &BTreeMap::new(), &BTreeMap::new()).unwrap();
             let strategy = msg
                 .context_data
                 .get("strategy")
@@ -1592,14 +1548,8 @@ jobs:
             "sha": "0123456789abcdef0123456789abcdef01234567",
             "repository": "mastodon/mastodon",
         });
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
         let cache = msg
             .steps
             .iter()
@@ -1648,7 +1598,6 @@ jobs:
         let message = build_agent_job_message(
             plan,
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -1713,14 +1662,8 @@ jobs:
         let plans = crate::expand_jobs(&workflow).unwrap();
         let github = serde_json::json!({"event_name": "push"});
 
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
 
         assert_eq!(msg.steps[0].inputs.get("path"), Some(&"target".to_owned()));
         assert_eq!(
@@ -1730,10 +1673,10 @@ jobs:
     }
 
     #[test]
-    fn job_env_secret_expression_carries_real_value() {
-        // Regression test for the issue where `${{ secrets.NAME }}` in
-        // job-level `env:` resolved to the log placeholder `***` instead of
-        // the secret value, so the step environment literally held `***`.
+    fn job_env_secret_expression_survives_as_token() {
+        // `${{ secrets.NAME }}` in job-level `env:` must neither resolve to
+        // the log placeholder `***` nor to a stored literal: the wire keeps
+        // the expression token and fill_template resolves it at acquire.
         let yaml = r#"
 on: workflow_dispatch
 jobs:
@@ -1753,41 +1696,30 @@ jobs:
             "dummy-value-of-twenty-six".to_owned(),
         );
         let github = serde_json::json!({"event_name": "workflow_dispatch"});
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &secrets,
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &secrets, &BTreeMap::new()).unwrap();
 
-        let x = msg.variables.get("X").expect("job env variable X");
-        assert_eq!(x.value.as_deref(), Some("dummy-value-of-twenty-six"));
-
-        // The wire field the runner materializes into the step environment
-        // must carry the real value too, not the placeholder.
-        let wire_values: Vec<String> = msg
+        // The stored message is a secret-free template: `env:` values
+        // referencing `secrets.*` must reach the wire as *expression* tokens
+        // (the runner never sees a literal or `***`); fill_template resolves
+        // them at acquire against the SecretProvider.
+        let x = msg
             .environment_variables
             .iter()
-            .filter_map(|token| {
-                token
-                    .get("map")?
-                    .as_array()?
-                    .first()?
-                    .get("Value")?
-                    .get("lit")?
-                    .as_str()
-                    .map(str::to_owned)
+            .find_map(|entry| {
+                let pair = entry.get("map")?.as_array()?.first()?;
+                (pair.get("Key")?.get("lit")?.as_str()? == "X").then(|| pair["Value"].clone())
             })
-            .collect();
-        assert!(
-            wire_values.contains(&"dummy-value-of-twenty-six".to_owned()),
-            "environment_variables wire values: {wire_values:?}"
+            .expect("job env variable X on the wire");
+        assert_eq!(
+            x["type"],
+            serde_json::json!(3),
+            "expected an expression token: {x}"
         );
+        assert_eq!(x["expr"], "secrets.PROBE_SECRET");
+        let wire_text = serde_json::to_string(&msg.environment_variables).unwrap();
         assert!(
-            !wire_values.iter().any(|v| v == "***"),
-            "placeholder leaked into environment_variables: {wire_values:?}"
+            !wire_text.contains("***"),
+            "placeholder leaked into environment_variables: {wire_text}"
         );
     }
 
@@ -1819,9 +1751,7 @@ jobs:
             "dummy-value-of-twenty-six".to_owned(),
         );
         let github = serde_json::json!({"event_name": "push"});
-        let msg =
-            build_agent_job_message(&plan, &github, &BTreeMap::new(), &secrets, &BTreeMap::new())
-                .unwrap();
+        let msg = build_agent_job_message(&plan, &github, &secrets, &BTreeMap::new()).unwrap();
 
         let secret = msg
             .variables
@@ -1848,14 +1778,7 @@ jobs:
         secrets.insert("MY_SECRET".to_owned(), "s3cr3t".to_owned());
         secrets.insert("SPECIAL_SECRET".to_owned(), "p@$$(word)".to_owned());
         let github = serde_json::json!({"event_name": "push"});
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &secrets,
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &secrets, &BTreeMap::new()).unwrap();
 
         let literal_hint = msg
             .mask_hints
@@ -1921,14 +1844,8 @@ jobs:
             "ref": "refs/heads/main"
         });
 
-        let msg = build_agent_job_message(
-            &plans[0],
-            &github,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let msg = build_agent_job_message(&plans[0], &github, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
 
         assert!(!msg.steps.is_empty());
     }
@@ -1956,7 +1873,6 @@ jobs:
         let msg = build_agent_job_message(
             &plans[0],
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -2021,7 +1937,6 @@ jobs:
         let msg = build_agent_job_message(
             callee_plan,
             &serde_json::json!({"event_name": "push"}),
-            &BTreeMap::new(),
             &BTreeMap::new(),
             &BTreeMap::new(),
         )

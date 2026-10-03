@@ -204,17 +204,17 @@ pub fn handle_command(
             }
         }
         "stop-commands" => {
-            // stop-commands: handled at a higher level (M10)
+            // stop-commands: handled at a higher level
         }
         "add-matcher" => {
-            // P1.6: Register problem matcher from JSON file
+            // Register problem matcher from JSON file
             let path = std::path::Path::new(&cmd.data);
             if let Err(e) = ctx.job.matchers.add_from_file(path) {
                 tracing::warn!("Failed to add problem matcher from {}: {e:#}", cmd.data);
             }
         }
         "remove-matcher" => {
-            // P1.6: Unregister problem matcher by owner name
+            // Unregister problem matcher by owner name
             let owner = cmd.properties.get("owner").unwrap_or(&cmd.data);
             ctx.job.matchers.remove(owner);
         }
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(cmd.data, "hello world");
     }
 
-    // --- P0 command handler integration tests ---
+    // --- command handler integration tests ---
 
     fn make_ctx<'a>(
         job: &'a mut crate::worker::contexts::JobContext,

@@ -104,7 +104,7 @@ impl ResultsClient {
             .context("creating step summary metadata")
     }
 
-    /// F054: Get a signed blob URL for diagnostic log upload.
+    /// Get a signed blob URL for diagnostic log upload.
     pub async fn get_diagnostic_logs_signed_url(
         &self,
         token: &str,

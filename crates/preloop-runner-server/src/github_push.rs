@@ -89,31 +89,22 @@ pub struct PushOverride {
 /// A dirty-tree run's submission sha is the *base* commit, not the commit
 /// the push webhook carries; once the sync ran, the published (materialized)
 /// commit is recorded in `push_state.effective_sha` and matched here too.
+///
+/// A backend failure is an error, never `None`: `None` means "submit the
+/// workflow", so reading a failed query as `None` would re-run the exact
+/// workflow push-back already tested and published.
 pub async fn already_published(
     shared: &Arc<SharedState>,
     repository: &str,
     sha: &str,
     workflow_path: &str,
-) -> Option<RunId> {
-    let inner = shared.state.inner.lock().await;
-    inner
-        .runs
-        .values()
-        .find(|run| {
-            run.push_state.is_some()
-                // `conclusion` is what the push path itself treats as
-                // terminal, so the two must agree or a published run would
-                // still be re-run by its own echo.
-                && run.conclusion.is_some()
-                && run.submission.repository == repository
-                && (run.submission.sha == sha
-                    || run.push_state
-                        .as_ref()
-                        .and_then(|state| state.effective_sha.as_deref())
-                        == Some(sha))
-                && run.submission.workflow_path.as_deref() == Some(workflow_path)
-        })
-        .map(|run| run.run_id)
+) -> Result<Option<RunId>, ApiError> {
+    shared
+        .state
+        .backend
+        .published_run(repository, sha, workflow_path)
+        .await
+        .map_err(ApiError::from)
 }
 
 pub async fn push_run_to_github(
@@ -123,13 +114,17 @@ pub async fn push_run_to_github(
 ) -> Result<SyncResponse, ApiError> {
     // Snapshot everything the sync needs under one lock, then work outside
     // it: the GitHub calls are slow and must not hold the state mutex.
-    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, jobs, dirty) = {
-        let inner = shared.state.inner.lock().await;
-        let run = inner
-            .runs
-            .get(&run_id)
-            .ok_or_else(|| ApiError::not_found("run not found"))?;
-
+    let run = shared
+        .state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(|error| match error {
+            crate::control::ControlError::NotFound(_) => ApiError::not_found("run not found"),
+            other => ApiError::from(other),
+        })?;
+    let (repository, git_ref, sha, push_tree, create_pr, draft_pr, actor, conclusion, dirty) = {
+        let run = &run;
         if let Some(state) = &run.push_state
             && state.status == PushStatus::Synced
         {
@@ -193,20 +188,33 @@ pub async fn push_run_to_github(
             draft_pr,
             run.submission.actor.clone(),
             conclusion.clone(),
-            run.jobs.clone(),
             push.dirty,
         )
     };
 
     async fn mark_blocked(shared: &Arc<SharedState>, run_id: RunId, error: String) {
-        let mut inner = shared.state.inner.lock().await;
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.push_state = Some(PushState {
-                status: PushStatus::Blocked,
-                error: Some(error),
-                pr_number: None,
-                effective_sha: None,
-            });
+        // The caller is already returning the real failure; a lost blocked
+        // marker would let a retry look like a fresh attempt, so at least
+        // never drop it silently.
+        if let Err(write_error) = shared
+            .state
+            .backend
+            .set_push_state(
+                run_id,
+                PushState {
+                    status: PushStatus::Blocked,
+                    error: Some(error),
+                    pr_number: None,
+                    effective_sha: None,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                %run_id,
+                ?write_error,
+                "failed to record the blocked push-back state"
+            );
         }
     }
 
@@ -291,13 +299,14 @@ pub async fn push_run_to_github(
 
     // 2. Default base branch for PR creation: explicit base_ref wins,
     //    otherwise the repository's default branch.
-    let base = match &{
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .and_then(|run| run.submission.base_ref.clone())
-    } {
+    let base = match &shared
+        .state
+        .backend
+        .submission_fields(run_id)
+        .await
+        .map_err(ApiError::from)?
+        .and_then(|fields| fields.base_ref)
+    {
         Some(base) => base
             .strip_prefix("refs/heads/")
             .map(str::to_owned)
@@ -398,22 +407,34 @@ pub async fn push_run_to_github(
 
     // 4. Report check runs for jobs that never got one (the submit-time
     //    loop may have been skipped or failed). Jobs with an existing check
-    //    run were already updated through the normal lifecycle.
-    for job_id in jobs.keys() {
-        // Expandable placeholders mint no check; materialized legs do.
-        let expandable = {
-            let inner = shared.state.inner.lock().await;
-            crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-        };
-        if expandable {
-            continue;
-        }
-        let has_check_run = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .is_some_and(|run| run.job_check_run_ids.contains_key(job_id))
+    //    run were already updated through the normal lifecycle. Expandable
+    //    placeholders (deferred-matrix parents, reusable callers) mint no
+    //    check: they never dispatch, expansion replaced them, and their
+    //    materialized legs report their own.
+    let dispatch_info = shared
+        .state
+        .backend
+        .run_dispatch_info(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let job_rows = dispatch_info.map(|info| info.jobs).unwrap_or_default();
+    for job in job_rows.iter().filter(|job| !job.placeholder) {
+        let job_id = &job.job_id;
+        let status = job.status;
+        // A failed read must not be read as "no check run yet": that would
+        // POST a second queued check run over the one the lifecycle already
+        // reported. Abort the sync instead — it is retryable.
+        let has_check_run = match shared.state.backend.job_check_run_id(run_id, job_id).await {
+            Ok(id) => id.is_some(),
+            Err(error) => {
+                tracing::warn!(
+                    %run_id,
+                    %job_id,
+                    ?error,
+                    "failed to read the job's check-run state; aborting push-back sync"
+                );
+                return Err(ApiError::from(error));
+            }
         };
         if !has_check_run {
             if let Err(error) = crate::github::report_check_run_queued(
@@ -427,25 +448,34 @@ pub async fn push_run_to_github(
             {
                 tracing::warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-            if jobs.get(job_id).is_some_and(|status| status.is_terminal()) {
-                crate::github::report_check_run_completed(shared, run_id, job_id, jobs[job_id])
-                    .await;
+            if status.is_terminal() {
+                crate::github::report_check_run_completed(shared, run_id, job_id, status).await;
             }
         }
     }
 
-    let mut inner = shared.state.inner.lock().await;
-    if let Some(run) = inner.runs.get_mut(&run_id) {
-        run.push_state = Some(PushState {
-            status: PushStatus::Synced,
-            error: None,
-            pr_number,
-            // The commit the push webhook echo will carry; `already_published`
-            // matches it so a dirty-tree push does not re-run CI.
-            effective_sha: Some(effective_sha),
-        });
-    }
-    drop(inner);
+    shared
+        .state
+        .backend
+        .set_push_state(
+            run_id,
+            PushState {
+                status: PushStatus::Synced,
+                error: None,
+                pr_number,
+                // The commit the push webhook echo will carry;
+                // `already_published` matches it so a dirty-tree push
+                // does not re-run CI.
+                effective_sha: Some(effective_sha),
+            },
+        )
+        .await
+        // Losing this write loses `effective_sha`, so the webhook echo no
+        // longer matches `already_published` and CI re-runs: surface it.
+        .map_err(|error| {
+            tracing::warn!(%run_id, ?error, "failed to record the push-back sync state");
+            ApiError::from(error)
+        })?;
 
     Ok(SyncResponse {
         status: "pushed",

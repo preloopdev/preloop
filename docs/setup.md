@@ -529,10 +529,19 @@ preloop serve --store 'postgres://user:password@host:5432/preloop?sslmode=requir
 ```
 
 - **`sqlite://<path>`**, a bare path, or nothing = SQLite (default).
-- **`postgres://…`** = the Postgres backend. The schema (tables, sealed-blob
-  payloads, migrations) mirrors SQLite exactly; the engine keeps a single
-  writer connection, so the database must not be shared with a second engine
-  process.
+- **`postgres://…`** = the Postgres backend. It creates the same control
+  schema as SQLite (in a `control` schema) on first use and stamps the version
+  in `schema_meta`; a database whose `control` schema is at another version is
+  refused at startup — there is no in-place upgrade from a pre-`ControlBackend`
+  database, and its old tables are left untouched rather than read. Unlike
+  SQLite, one Postgres database may be shared by several engine nodes: each
+  node opens its own pools (`PRELOOP_PG_WRITERS` / `PRELOOP_PG_READERS`,
+  default 16 connections each, plus one listener), transitions are conditional
+  updates, and queued jobs are claimed with `SELECT … FOR UPDATE SKIP LOCKED`,
+  so concurrent nodes take different jobs and a wake published on one node
+  reaches runners long-polling another. Size `max_connections` for every node's
+  writer + reader + listener connections. SQLite stays single-process — its file
+  must not be shared by two engine processes.
 - **TLS**: add `?sslmode=require` (or `verify-ca` / `verify-full`) for remote
   managed Postgres (Neon, RDS, Supabase, …) typically requires
   it. Verification always uses the system root store. Plaintext is the

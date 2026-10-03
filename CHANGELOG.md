@@ -9,6 +9,49 @@ Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
 
+### Added
+
+- A job attempt whose runner session is gone (closed, purged, or silent past
+  the runner liveness timeout) now fails 10 minutes after its last lease
+  renewal instead of 45. A machine that just died still fails at the
+  3-minute hung-worker window. The lease the runner is told about
+  (`LockedUntil`) is unchanged. The reaper now evaluates lease expiry for
+  every in-flight attempt on each tick, and completed-run memory trimming no
+  longer runs on the event path. Before, a reaper-driven completion could
+  wedge the only reaper task there and leave attempts `in_progress`
+  indefinitely after a node kill.
+
+- With several nodes on one Postgres, a client attached to one node now sees
+  events produced through another node as they happen. Before, `preloop run`
+  on node B did not see a run finish through node A until its stream timed out
+  (5 minutes) and it reconnected. Each node reads the transactional outbox
+  when another node signals (one batched `NOTIFY` per ~15 ms, sent outside the
+  command transactions) and at least once a second, skips its own rows, and
+  drops a state older than one it already delivered. Status events carry the
+  version of the job or run they report: `jobs.version` and `runs.version`
+  count status changes and are bumped by a trigger under the row lock the
+  change already holds. `runs.event_seq` (a counter on the run row that every
+  event took a lock to bump, and that nothing read) and `outbox_events.run_seq`
+  are removed. A status event appended after its row settled on a different
+  final state is not published. The outbox is pruned after
+  `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600). **Schema versions are now
+  `4` (Postgres) and `3` (SQLite); an existing control database is refused and
+  must be recreated.**
+
+- Postgres read paths that scanned whole tables on every command now use an
+  index: the latest-attempt lookup and the `jobs` -> `job_requests` cascade
+  (`job_requests_attempts`), the claim and ready-queue reads (`jobs_ready` no
+  longer carries `namespace_id` between the pool key and the priority, which
+  forced a sort of the whole ready queue), and the reaper's per-attempt
+  `timeout-minutes` read (a stored generated column, `job_messages.job_timeout_s`,
+  instead of extracting it from the toasted message template on every tick).
+
+- `PRELOOP_CREDENTIAL_STORE` selects where the engine's own credentials — the
+  system token and the GitHub App/PAT — are kept: `os` (the native
+  keychain/secret-service, default), `file` (`0600` files under
+  `$PRELOOP_HOME/credentials`, for headless hosts and containers where keychain
+  prompts are unacceptable), or `memory` (non-persistent; tests only).
+
 ### Fixed
 
 - **Runner no longer drops the job handed out at job completion**: when a
@@ -133,6 +176,46 @@ Releases before v0.27.0 predate the changelog.
   `container: ${{ matrix.build.container }}` decoded to no container, and the
   job ran on the VM instead; evaluation errors now fail setup, and logs report
   presence without serializing credentials or environment.
+
+### Changed
+
+- Control-plane state is database-authoritative. Runs, jobs, runners, sessions,
+  webhook deliveries and logs are mutated through one `ControlBackend` trait,
+  one short transaction per command, instead of an in-memory working set that
+  was snapshotted to the database. SQLite remains the default (single writer,
+  WAL); Postgres implements the same contract so **several engine nodes can
+  share one database** — jobs are claimed with `FOR UPDATE SKIP LOCKED` and
+  nodes wake each other through `LISTEN`/`NOTIFY`. The old `Store` snapshot
+  layer is gone. Cache and artifact reservations remain node-local, so a
+  multi-node deployment must route a job's cache/artifact requests back to the
+  node that reserved them (or run one node per job).
+- The control schema is greenfield v1, created on first use and versioned in
+  `schema_meta`. There is no upgrade path from an older control database:
+  SQLite refuses a pre-`ControlBackend` `preloop.db` and offers only
+  "recreate the database", while Postgres creates a fresh `control` schema and
+  leaves an older `public` layout untouched and unread. Export anything you need
+  and start from a fresh database.
+- The debug controller API moved to a single `/api/v1/debug/sessions/…` surface
+  from the older controller-only namespace, and the standalone verdict POST
+  folded into the same lease-gated, idempotent `/operations` surface as retry
+  and abort. Agents and scripts written against the old namespace must be
+  repointed; the bundled CLI already is.
+- Secret values are never written to the control database: a stored job message
+  carries secret names, and the values are resolved when a runner acquires the
+  job. The builtin secret provider is node-local (its tiers come from this
+  node's config, its run tiers from `<state_dir>/run-secrets/`), so a multi-node
+  deployment needs a shared secret provider.
+- Job messages and AzDO responses now match `actions/runner` v2.337.0: remote
+  action references always emit `repositoryType`, `actionsEnvironment.url` is an
+  explicit `null` when the workflow defines no deployment URL, and `plan.env`
+  is emitted as `environmentVariables` template maps.
+
+### Fixed
+
+- Pre-baked golden downloads now check free space on the destination filesystem
+  before writing the multi-gigabyte payload. An undersized host gets an
+  actionable size error instead of downloading a partial image and falling
+  through to an even larger local bake.
 
 ## [0.33.7] - 2026-09-28
 
@@ -371,7 +454,7 @@ Releases before v0.27.0 predate the changelog.
 - #299 — Align string comparison and case-insensitivity with the official runner
 - #298 — Close remaining masking races
 - #297 — Sign blob tokens as JWTs, enforce owner liveness on bearer writes
-- #296 — r1_12 rematerialization test matches record/head split
+- #296 — rematerialization test matches record/head split
 - #283 — Remove aarch64 golden bake jobs
 - #282 — Bump guest disk template to 200G for golden pack
 - #280 — Bump guest storage to 200G for golden pack

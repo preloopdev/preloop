@@ -361,7 +361,7 @@ jobs:
           done
           echo "Seeded golden assets from $source_tag:"
           ls -l artifacts/preloop-ubuntu-24.04-*
-      # M1: the updater pins the matching public key
+      # The updater pins the matching public key
       # (crates/preloop-cli/src/update.rs) and refuses any asset without a
       # valid detached signature. Sign every published asset with
       # `openssl dgst -sha256 -sign` (PKCS#1 v1.5 / SHA-256, raw binary

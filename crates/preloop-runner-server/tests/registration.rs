@@ -243,19 +243,6 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
 /// run that handler. Every completion path does funnel through
 /// `complete_job_inner`, so that is where the record is dropped, and this test
 /// completes through the non-broker compat route to prove it.
-
-/// The deferred App-token request is deliberately kept past the first claim so
-/// a re-claim after a runner disconnect re-mints under the build-time
-/// conditions (the original permission set and its fallback restrictions).
-/// It must not outlive the *job*, though: the record pins a repository and a
-/// permission set, it is persisted into the store snapshot, and a stale entry
-/// would let a re-claim mint fresh GitHub authority for work that is over.
-///
-/// Clearing it inside the broker's own `completejob` handler is not enough —
-/// the legacy `/_apis` completion endpoints and the lease-expiry reaper never
-/// run that handler. Every completion path does funnel through
-/// `complete_job_inner`, so that is where the record is dropped, and this test
-/// completes through the non-broker compat route to prove it.
 #[tokio::test]
 async fn a_completed_job_drops_its_deferred_token_request() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
@@ -348,7 +335,7 @@ async fn a_completed_job_drops_its_deferred_token_request() {
     // zeroes `requestId` because run-service payloads use the DTO default),
     // so read it from the correlation table the submit path populates.
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let ids: Vec<i64> = inner.job_requests.keys().copied().collect();
         assert_eq!(ids.len(), 1, "one job means one request record: {ids:?}");
         // Half one: the claim must NOT consume the record, or a re-claim after
@@ -373,7 +360,7 @@ async fn a_completed_job_drops_its_deferred_token_request() {
     )
     .await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         !inner.github_token_requests.contains_key(&request_id),
         "a terminal job must not leave its App-token request registered: \
@@ -388,11 +375,6 @@ async fn a_completed_job_drops_its_deferred_token_request() {
         "the completion must have settled the job request"
     );
 }
-
-/// A `GitHubTokenRequest` persisted by a pre-upgrade server has no
-/// `untrusted` field. Deserializing it as trusted would silently re-enable
-/// the PAT fallback after a restart, so missing trust metadata must fail
-/// closed — and the mint path must then refuse the PAT for such a request.
 
 /// A `GitHubTokenRequest` persisted by a pre-upgrade server has no
 /// `untrusted` field. Deserializing it as trusted would silently re-enable
@@ -459,11 +441,6 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
 /// the base repository's cache but cannot save to it, so a fork cannot poison
 /// entries a trusted run later restores. Every cache write surface must deny
 /// fork-restricted jobs while reads stay open.
-
-/// GitHub gives fork PR runs read-only cache access: they can restore from
-/// the base repository's cache but cannot save to it, so a fork cannot poison
-/// entries a trusted run later restores. Every cache write surface must deny
-/// fork-restricted jobs while reads stay open.
 #[tokio::test]
 async fn fork_pr_runs_get_read_only_cache_access() {
     let temp = tempfile::tempdir().unwrap();
@@ -503,7 +480,7 @@ async fn fork_pr_runs_get_read_only_cache_access() {
     let trusted_run_id = trusted.run_id.to_string();
 
     let (fork_token, fork_plan, fork_job) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, &fork_run_id);
         (
             state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
@@ -512,7 +489,7 @@ async fn fork_pr_runs_get_read_only_cache_access() {
         )
     };
     let trusted_token = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, &trusted_run_id);
         state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
     };
@@ -661,13 +638,6 @@ async fn fork_pr_runs_get_read_only_cache_access() {
 /// `fork_restricted_from_token` walks, and treating an unresolvable job
 /// token as a control-plane caller would let a fork worker poison cache
 /// entries with a leaked token. Unresolvable job tokens fail closed instead.
-
-/// A fork job's runtime JWT must not smuggle a cache write in after the
-/// job's request was retired. Retirement (`RequestRetirement::Purge` in
-/// `retire_node_requests`) removes the correlation records
-/// `fork_restricted_from_token` walks, and treating an unresolvable job
-/// token as a control-plane caller would let a fork worker poison cache
-/// entries with a leaked token. Unresolvable job tokens fail closed instead.
 #[tokio::test]
 async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     let temp = tempfile::tempdir().unwrap();
@@ -698,7 +668,7 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     let trusted = submit(None).await;
 
     let (fork_token, fork_job) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, fork["run_id"].as_str().unwrap());
         (
             state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
@@ -706,18 +676,24 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
         )
     };
     let trusted_token = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
         state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
     };
 
     // The same surgery `RequestRetirement::Purge` performs: drop the
     // job-to-request correlation while the worker still holds the runtime
-    // JWT.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.agent_job_requests.remove(&fork_job);
-    }
+    // JWT. `agent_job_requests` is derived from `job_requests` on load, so
+    // the record itself must go.
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute(
+                "DELETE FROM job_requests WHERE agent_job_id = ?1",
+                rusqlite::params![fork_job.to_string()],
+            )
+            .unwrap();
+        })
+        .await;
 
     // Both write surfaces reject the now-unresolvable fork token.
     assert_eq!(
@@ -760,7 +736,119 @@ async fn fork_cache_writes_fail_closed_when_the_job_no_longer_resolves() {
     );
 }
 
-/// Point PAT scope introspection (H3) at a dead local address so tests that
+/// The cache v2 namespace (repository) must come from the caller's
+/// job token, exactly like the artifact path, and never from the request
+/// body: otherwise any job can read another repository's cache or plant
+/// entries in it.
+#[tokio::test]
+async fn cache_v2_namespace_follows_the_job_token_not_the_request_body() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let submit = |repository: &'static str| {
+        let state = state.clone();
+        async move {
+            crate::submit_run_inner(
+                &state.shared(),
+                preloop_gha_protocol::WorkflowSubmission {
+                    workflow_yaml: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n".to_owned(),
+                    event: "push".to_owned(),
+                    payload: json!({"ref": "refs/heads/main", "commits": []}),
+                    repository: repository.to_owned(),
+                    git_ref: "refs/heads/main".to_owned(),
+                    trust_tier: None,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("trusted submission accepted")
+        }
+    };
+    let run_a = submit("owner/a").await;
+    let run_b = submit("owner/b").await;
+    let token_for = |run_id: &preloop_gha_protocol::RunId| {
+        let state = state.clone();
+        let run_id = run_id.to_string();
+        async move {
+            let inner = state.test_tx().await;
+            let message = queued_message_for(&inner, &run_id);
+            state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
+        }
+    };
+    let token_a = token_for(&run_a.run_id).await;
+    let token_b = token_for(&run_b.run_id).await;
+
+    // Repository B's own upload lands in B's namespace, under the job's own
+    // ref scope (the scope a job token may read).
+    let job_scope = Some("refs/heads/main");
+    let b_key = crate::results_twirp::scoped_cache_key("shared-key", job_scope, Some("owner/b"));
+    state
+        .cache
+        .put(&b_key, "v1", b"bytes-from-b")
+        .await
+        .expect("seed repository B cache");
+
+    let restore_uri = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL";
+    let restore_body = json!({"key": "shared-key", "version": "v1", "repository": "owner/b"});
+
+    // A's job token naming B in the body still reads A's namespace: a miss.
+    let as_a = request_json_with_bearer(
+        &app,
+        Method::POST,
+        restore_uri,
+        restore_body.clone(),
+        &token_a,
+    )
+    .await;
+    assert_eq!(
+        as_a["ok"], false,
+        "a job token must not read another repository's cache by naming it in the body"
+    );
+
+    // B's token resolves the same body to B's own namespace: a hit.
+    let as_b =
+        request_json_with_bearer(&app, Method::POST, restore_uri, restore_body, &token_b).await;
+    assert_eq!(
+        as_b["ok"], true,
+        "the owning repository's job still reads its own cache"
+    );
+
+    // A reservation is namespaced by the caller too, so A cannot plant an
+    // entry in B's namespace for B to restore later.
+    let create_uri = "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry";
+    let created = request_json_with_bearer(
+        &app,
+        Method::POST,
+        create_uri,
+        json!({"key": "poison-key", "version": "v1", "repository": "owner/b"}),
+        &token_a,
+    )
+    .await;
+    assert_eq!(
+        created["ok"], true,
+        "a trusted job may reserve a cache entry"
+    );
+    let inner = state.inner.lock().await;
+    let keys = inner
+        .cache_v2_pending
+        .values()
+        .map(|pending| pending.key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        keys.contains(
+            &crate::results_twirp::scoped_cache_key("poison-key", job_scope, Some("owner/a"))
+                .as_str()
+        ),
+        "A's reservation must be namespaced under A's repository, got {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|key| key.starts_with("owner/b:")),
+        "a body repository must not move a reservation into B's namespace, got {keys:?}"
+    );
+}
+
+/// Point PAT scope introspection at a dead local address so tests that
 /// submit runs with a configured PAT stay hermetic: the probe fails fast with
 /// connection-refused instead of reaching api.github.com, where a fake PAT
 /// would 401 and fail the run. The scopes are then `Unverifiable`, so the PAT
@@ -777,7 +865,7 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     // asserted token flips under parallelism.
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
-    // H3: PAT scope introspection must stay hermetic — without a stub the probe
+    // PAT scope introspection must stay hermetic — without a stub the probe
     // would reach api.github.com, where the fake PAT 401s and the run is
     // refused. A stub reporting read-only scopes lets the PAT be verified, and
     // therefore embedded, without a real credential.
@@ -796,7 +884,7 @@ async fn fork_job_never_receives_the_configured_pat_override() {
         .static_github_pat()
         .expect("config declares a PAT")
         .to_owned();
-    let _app = app(state.clone(), CancellationToken::new());
+    let app = app(state.clone(), CancellationToken::new());
     // Native `/api/v1/runs` clears client-supplied `trust_tier` (only the
     // webhook adapters stamp provenance); stamp it via `submit_run_inner`
     // like the webhook path does.
@@ -819,7 +907,7 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     )
     .await
     .expect("fork submission accepted");
-    let fork_run_id = fork.run_id.to_string();
+    let _ = fork.run_id;
     let trusted = crate::submit_run_inner(
         &shared,
         preloop_gha_protocol::WorkflowSubmission {
@@ -831,43 +919,50 @@ async fn fork_job_never_receives_the_configured_pat_override() {
     )
     .await
     .expect("trusted submission accepted");
-    let trusted_run_id = trusted.run_id.to_string();
+    let _ = trusted.run_id;
 
-    let inner = state.inner.lock().await;
-    let fork_message = queued_message_for(&inner, &fork_run_id);
-    let runtime_token = state.mint_runtime_token(&fork_message.plan.plan_id, &fork_message.job_id);
+    // The stored template carries no token; the broker fills it at claim.
+    // A fork-restricted job receives the job-scoped runtime token — never
+    // the repository-unscoped PAT.
+    let fork_acquired = acquire_queued_job(&app, "fork-runner").await;
+    let fork_job_id = fork_acquired["jobId"].as_str().expect("acquired job id");
+    let fork_plan = fork_acquired["plan"]["planId"]
+        .as_str()
+        .expect("acquired plan id");
+    let runtime_token =
+        state.mint_runtime_token(fork_plan, &uuid::Uuid::parse_str(fork_job_id).unwrap());
     // Compare token identity (`sub`), not token strings: JWT timestamps are
     // second-granularity, so a comparison token minted across a clock tick
-    // differs textually from the identical token minted at submission.
+    // differs textually from the identical token minted at acquire.
     let expected_sub = jwt_sub(runtime_token.as_str());
+    assert!(
+        expected_sub.is_some(),
+        "the runtime token carries a subject"
+    );
     for name in ["system.github.token", "github_token"] {
         assert_eq!(
-            variable_value(&fork_message, name).and_then(jwt_sub),
+            wire_variable(&fork_acquired, name).and_then(jwt_sub),
             expected_sub.clone(),
             "fork job must carry the local runtime token, not the PAT ({name})"
         );
+        assert_ne!(
+            wire_variable(&fork_acquired, name),
+            Some(pat.as_str()),
+            "the static PAT must not reach a fork-restricted job ({name})"
+        );
     }
     assert!(
-        variable_value(&fork_message, "GITHUB_TOKEN").is_none(),
+        wire_variable(&fork_acquired, "GITHUB_TOKEN").is_none(),
         "uppercase GITHUB_TOKEN is not part of the official acquire schema"
     );
-    assert_ne!(
-        variable_value(&fork_message, "system.github.token"),
-        Some(pat.as_str()),
-        "the static PAT must not reach a fork-restricted job"
-    );
 
-    let trusted_message = queued_message_for(&inner, &trusted_run_id);
+    let trusted_acquired = acquire_queued_job(&app, "trusted-runner").await;
     assert_eq!(
-        variable_value(&trusted_message, "system.github.token"),
+        wire_variable(&trusted_acquired, "system.github.token"),
         Some(pat.as_str()),
         "trusted jobs still receive the configured PAT"
     );
 }
-
-/// End-to-end through the webhook adapter: a fork `pull_request` delivery is
-/// stamped `UntrustedForkPullRequest` and the queued job must show the
-/// downgraded profile and no OIDC URL, and stored secrets stay denied.
 
 /// End-to-end through the webhook adapter: a fork `pull_request` delivery is
 /// stamped `UntrustedForkPullRequest` and the queued job must show the
@@ -963,7 +1058,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     });
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let (_, run_record) = inner.runs.iter().next().unwrap();
     assert_eq!(
         run_record.submission.trust_tier.as_deref(),
@@ -990,16 +1085,22 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
             .is_some_and(|url| !url.is_empty()),
         "webhook-delivered fork PR job gets no OIDC request URL"
     );
-    assert_eq!(
-        variable_value(&message, "REPO_TOKEN"),
-        None,
+    // Secrets denied: the stored template carries an explicit empty spec
+    // (never treated as a legacy fully-formed message) and no secret
+    // variable slots exist to fill.
+    let spec = message
+        .preloop_secret_spec
+        .as_ref()
+        .expect("a secrets-denied job still carries an explicit spec");
+    assert!(
+        spec.names.is_empty() && !spec.inherit && spec.map.is_empty(),
         "stored secrets stay denied for the fork PR job"
     );
     drop(inner);
 
     // Trusted control through the same build path: the same stored secret is
-    // injected and the declared writes survive.
-    let trusted = request_json(
+    // injected at acquire and the declared writes survive.
+    request_json(
         &app,
         Method::POST,
         "/api/v1/runs",
@@ -1010,25 +1111,21 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
         }),
     )
     .await;
-    let inner = state.inner.lock().await;
-    let trusted_message = queued_message_for(&inner, trusted["run_id"].as_str().unwrap());
+    // The fork job is still queued ahead; claim it first so the next acquire
+    // lands the trusted run's job.
+    let _fork_job = acquire_queued_job(&app, "fork-wh-first").await;
+    let acquired = acquire_queued_job(&app, "fork-wh-runner").await;
     assert_eq!(
-        variable_value(&trusted_message, "REPO_TOKEN"),
+        wire_variable(&acquired, "REPO_TOKEN"),
         Some("repo-value"),
         "trusted jobs still receive stored secrets"
     );
     assert_eq!(
-        variable_value(&trusted_message, "system.github.token.permissions"),
+        wire_variable(&acquired, "system.github.token.permissions"),
         Some(r#"{"Checks":"write","Metadata":"read"}"#),
         "trusted jobs keep declared writes and implicit metadata"
     );
 }
-
-/// A failed installation-token mint must never silently reach for the broad
-/// `PRELOOP_GITHUB_TOKEN` PAT: that would swap a repository-scoped,
-/// `permissions:`-bounded token for an unscoped one. Only
-/// `PRELOOP_GITHUB_APP_MINT_FAILURE` decides, and its default leaves the job on the
-/// local HMAC JWT, which carries no GitHub authority at all.
 
 /// A failed installation-token mint must never silently reach for the broad
 /// `PRELOOP_GITHUB_TOKEN` PAT: that would swap a repository-scoped,
@@ -1068,8 +1165,8 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
         .await;
         assert_eq!(status, StatusCode::OK, "policy {policy:?}");
         let request = {
-            let inner = state.inner.lock().await;
-            assert_eq!(inner.queue.len(), 1);
+            let inner = state.test_tx().await;
+            assert_eq!(inner.ready().count(), 1);
             inner
                 .github_token_requests
                 .values()
@@ -1096,12 +1193,6 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
         }
     }
 }
-
-/// By the time `acquirejob` mints, the poll has already dequeued the job,
-/// flipped the run to `InProgress` and pinned the request to the session. A
-/// refusal under the `error` policy is a permanent configuration fault, so if
-/// the 502 left the claim in place the runner would re-acquire forever and the
-/// run would hang until the 600s disconnect reaper mopped it up.
 
 /// By the time `acquirejob` mints, the poll has already dequeued the job,
 /// flipped the run to `InProgress` and pinned the request to the session. A
@@ -1175,7 +1266,7 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
     let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
     let runner_request_id = body["runner_request_id"].as_str().unwrap();
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner.runs.get(&run_id).unwrap().status,
             ExecutionStatus::InProgress,
@@ -1201,7 +1292,7 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     assert_eq!(run.status, ExecutionStatus::Failure);
     assert!(run.jobs.values().all(|status| status.is_terminal()));
@@ -1219,14 +1310,6 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
     );
     assert!(!inner.inflight_requests.contains_key(&request_id));
 }
-
-/// A settled attempt must not be acquirable. The broker retains
-/// `owner_runner_id` after completion so late protocol reads stay bound to the
-/// runner that ran the job, which means ownership alone cannot gate
-/// `acquirejob`: a runner that retries the call after reporting would be
-/// handed the job payload (and a freshly minted installation token) and would
-/// execute the same job's side effects twice, then fail to report because
-/// `renewjob` 409s and `completejob` ignores duplicates.
 
 /// A settled attempt must not be acquirable. The broker retains
 /// `owner_runner_id` after completion so late protocol reads stay bound to the
@@ -1276,7 +1359,7 @@ async fn a_settled_attempt_cannot_be_acquired_again() {
     let body: Value = serde_json::from_str(job_ref["body"].as_str().unwrap()).unwrap();
     let job_message_id = body["runner_request_id"].as_str().unwrap().to_owned();
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         *inner.job_requests.keys().next().unwrap()
     };
     let acquire =
@@ -1583,9 +1666,9 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
     // enough to fail.
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            inner.queue.len(),
+            inner.ready().count(),
             1,
             "job still queued inside the grace window"
         );
@@ -1598,19 +1681,21 @@ async fn queued_job_with_no_runner_is_failed_after_the_grace_window() {
 
     // Backdate the first-seen mark past the grace window and reap again: the
     // job must be failed with a visible reason and the run must conclude.
+    // The mark is node-local reaper state, not a column.
     {
         let mut inner = state.inner.lock().await;
-        inner.queued_at.insert(
-            (run_id, JobId("build".to_owned())),
-            SystemTime::now() - Duration::from_secs(300),
-        );
+        let mark = inner
+            .reaper_first_seen
+            .get_mut(&(run_id, JobId("build".to_owned())))
+            .expect("the first tick must mark the unmatched job");
+        *mark -= Duration::from_secs(300);
     }
     reap_once(&shared).await;
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
-            inner.queue.is_empty(),
+            inner.ready().next().is_none(),
             "starving job must leave the ready queue"
         );
         assert!(
@@ -1642,20 +1727,17 @@ async fn restored_job_without_enqueue_timestamp_is_not_granted_new_grace_window(
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    {
-        let mut inner = state.inner.lock().await;
-        inner
-            .queue
-            .front_mut()
-            .expect("submitted job must be ready")
-            .enqueued_at_unix_nanos = 0;
-        inner.queued_at.clear();
-    }
+    state
+        .test_db_mutate(|tx| {
+            tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), None)
+                .unwrap();
+        })
+        .await;
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
-        inner.queue.is_empty(),
+        inner.ready().next().is_none(),
         "a restored job with unknown age must not receive a fresh starvation grace window"
     );
     assert_eq!(
@@ -1692,7 +1774,7 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let message = poll_message(&app, &token, &session_id).await;
     assert!(!message.is_null(), "poll must claim the queued job");
     let (request_id, old_agent_job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
             inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "poll must record the claim in claimed_jobs"
@@ -1703,38 +1785,29 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             .expect("poll must pin the claim to the session");
         (request_id, inner.job_requests[&request_id].agent_job_id)
     };
-    {
-        let mut inner = state.inner.lock().await;
-        inner
-            .job_requests
-            .get_mut(&request_id)
-            .unwrap()
-            .debug_token_issued = true;
-    }
-    // Model a restart snapshot that retained the ready copy but not the
-    // process-local claimed_jobs stash.
-    {
-        let mut inner = state.inner.lock().await;
-        let restored_copy = inner
-            .claimed_jobs
-            .remove(&(run_id, job_id.clone()))
-            .expect("claimed job fixture must exist");
-        inner.queue.push_back(restored_copy);
-    }
+    // The attempt already minted its debug token before its runner went deaf.
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "UPDATE job_requests SET debug_token_issued = 1 WHERE request_id = ?1",
+                rusqlite::params![request_id],
+            )
+            .unwrap();
+        })
+        .await;
 
     // The runner goes deaf: backdate its last poll and shrink the timeout.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.runner_liveness_timeout = Duration::from_secs(600);
-        inner.session_last_seen.insert(
-            session_id.clone(),
-            std::time::Instant::now() - Duration::from_secs(3600),
-        );
-    }
+    state.test_set_runner_liveness(Duration::from_secs(600));
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 3_600_000_000;
+            tx.set_session_seen(&session_id, cutoff).unwrap();
+        })
+        .await;
     reap_once(&shared).await;
 
-    {
-        let inner = state.inner.lock().await;
+    let retry_id = {
+        let inner = state.test_tx().await;
         assert!(
             !inner.runners.contains_key(&runner_id),
             "deaf runner must be purged"
@@ -1751,61 +1824,80 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             !inner.claimed_jobs.contains_key(&(run_id, job_id.clone())),
             "deaf claim must leave claimed_jobs"
         );
-        let request = &inner.job_requests[&request_id];
-        assert_ne!(
-            request.agent_job_id, old_agent_job_id,
-            "a retry must rotate the runtime-token identity"
+        // The abandoned attempt settles: every credential minted for it —
+        // runtime token, debug token, renewals — stops validating, while its
+        // step manifest stays for the log blobs it already uploaded.
+        let abandoned = &inner.job_requests[&request_id];
+        assert_eq!(
+            abandoned.agent_job_id, old_agent_job_id,
+            "the abandoned attempt keeps its identity for its logs"
+        );
+        assert_eq!(
+            abandoned.result,
+            Some(ExecutionStatus::Cancelled),
+            "the abandoned attempt must settle"
         );
         assert!(
-            !inner.agent_job_requests.contains_key(&old_agent_job_id),
-            "the abandoned runtime identity must be revoked"
+            !inner.inflight_requests.contains_key(&request_id),
+            "the abandoned attempt must leave the in-flight set"
         );
         assert!(
             inner.job_steps.contains_key(&old_agent_job_id),
             "abandoned attempt step manifest must remain for log-blob mapping"
         );
+        let retry_id = inner
+            .inflight_requests
+            .keys()
+            .copied()
+            .find(|id| {
+                let record = &inner.job_requests[id];
+                record.run_id == run_id && record.job_id == job_id
+            })
+            .expect("the retry must be in flight");
+        let retry = &inner.job_requests[&retry_id];
+        assert_ne!(
+            retry.agent_job_id, old_agent_job_id,
+            "a retry must rotate the runtime-token identity"
+        );
+        assert_ne!(
+            retry.timeline_id, abandoned.timeline_id,
+            "a retry must own its timeline"
+        );
         assert!(
-            inner.job_steps.contains_key(&request.agent_job_id),
+            inner.job_steps.contains_key(&retry.agent_job_id),
             "retry identity must receive a fresh step manifest"
         );
         assert!(
-            inner
+            state
+                .inner
+                .lock()
+                .await
                 .live_log_closed
                 .contains(&old_agent_job_id.to_string()),
             "abandoned attempt live-log feed must close so followers exit"
         );
+        let queued = &inner
+            .ready()
+            .find(|job| job.run_id == run_id && job.job_id == job_id)
+            .expect("unfinished job must be requeued for a fresh machine")
+            .message;
         assert_eq!(
-            inner.agent_job_requests.get(&request.agent_job_id),
-            Some(&request_id),
-            "the replacement runtime identity must resolve to the request"
+            (queued.job_id, queued.request_id),
+            (retry.agent_job_id, retry_id),
+            "the queued message must carry the retry's identity"
         );
+        assert_eq!(queued.plan.plan_id, retry.agent_job_id.to_string());
+        assert_eq!(queued.timeline.id, retry.timeline_id);
+        assert_eq!(retry.result, None, "the retry must remain completable");
         assert_eq!(
-            inner
-                .queue
-                .front()
-                .expect("restored job must remain queued")
-                .message
-                .job_id,
-            request.agent_job_id,
-            "the queued message must use the replacement runtime identity"
+            retry.owner_runner_id, None,
+            "the purged runner must not own the retry"
         );
-        assert_eq!(
-            request.result, None,
-            "the requeued request must remain completable"
-        );
-        assert_eq!(
-            request.owner_runner_id, None,
-            "the purged runner must lose request ownership"
-        );
-        assert_eq!(request.started_at, None);
-        assert_eq!(request.last_renewed_at, None);
+        assert_eq!(retry.started_at, None);
+        assert_eq!(retry.last_renewed_at, None);
         assert!(
-            !request.debug_token_issued,
+            !retry.debug_token_issued,
             "a retried attempt must be allowed to mint a fresh debug token"
-        );
-        assert!(
-            inner.inflight_requests.contains_key(&request_id),
-            "the request must remain inflight for its replacement"
         );
         assert!(
             crate::runtime_scheduling::live_runner_assignments(
@@ -1816,20 +1908,17 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
             .is_empty(),
             "status must not report the purged runner as executing"
         );
-        assert!(
-            inner
-                .queue
-                .iter()
-                .any(|job| job.run_id == run_id && job.job_id == job_id),
-            "unfinished job must be requeued for a fresh machine"
-        );
-    }
+        retry_id
+    };
+    assert!(
+        !crate::auth::job_is_live(&state, old_agent_job_id)
+            .await
+            .unwrap(),
+        "the abandoned runtime identity must be revoked"
+    );
 
-    // A replacement claims the same request with a fresh runtime identity
-    // and completes the logical job.
-
-    // Settling the request before requeue would let the delivery happen but
-    // make both PATCHes no-ops.
+    // A replacement claims the retry under its fresh runtime identity and
+    // completes the logical job.
     let (replacement_id, replacement_token) =
         register_runner_with_token(&app, "replacement-runner", &["self-hosted"], None).await;
     let (_, replacement_session) =
@@ -1837,15 +1926,19 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     let replacement_session_id = replacement_session["sessionId"].as_str().unwrap();
     let delivered = poll_message(&app, &replacement_token, replacement_session_id).await;
     assert!(!delivered.is_null(), "replacement must receive the retry");
-    assert_ne!(
-        delivered["jobId"].as_str(),
-        Some(old_agent_job_id.to_string().as_str()),
-        "replacement must receive a fresh runtime-token identity"
+    assert_eq!(
+        state
+            .test_tx()
+            .await
+            .session_active_requests
+            .get(replacement_session_id),
+        Some(&retry_id),
+        "the replacement must claim the retry, not the abandoned attempt"
     );
     request_json_with_bearer(
         &app,
         Method::PATCH,
-        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        &format!("/_apis/v1/AgentRequest/1/{retry_id}"),
         json!({}),
         &replacement_token,
     )
@@ -1853,18 +1946,18 @@ async fn liveness_sweep_requeues_job_of_deaf_runner() {
     request_json_with_bearer(
         &app,
         Method::PATCH,
-        &format!("/_apis/v1/AgentRequest/1/{request_id}"),
+        &format!("/_apis/v1/AgentRequest/1/{retry_id}"),
         json!({"result": "Succeeded"}),
         &replacement_token,
     )
     .await;
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(
         inner.runs[&run_id].jobs[&job_id],
         ExecutionStatus::Success,
         "the replacement must be able to finish the retried job"
     );
-    assert!(!inner.inflight_requests.contains_key(&request_id));
+    assert!(!inner.inflight_requests.contains_key(&retry_id));
 }
 
 #[tokio::test]
@@ -1888,25 +1981,32 @@ async fn liveness_sweep_fails_job_without_recovery_copy() {
     let message = poll_message(&app, &token, &session_id).await;
     assert!(!message.is_null(), "poll must claim the queued job");
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         *inner
             .session_active_requests
             .get(&session_id)
             .expect("poll must pin the claim to the session")
     };
 
-    {
-        let mut inner = state.inner.lock().await;
-        inner.claimed_jobs.remove(&(run_id, job_id.clone()));
-        inner.runner_liveness_timeout = Duration::from_secs(600);
-        inner.session_last_seen.insert(
-            session_id,
-            std::time::Instant::now() - Duration::from_secs(3600),
-        );
-    }
-    reap_once(&shared).await;
+    // The runner goes deaf and the control plane restarts. The claim survives
+    // — the job row is still `claimed`, off the durable ready queue — but the
+    // restart did not restore the owning session, so there is no recovery
+    // copy to redeliver and nobody can ever complete the job. The liveness
+    // purge cannot reach this state at all (it always requeues a claimed job
+    // it can attribute); the claim is only ever failed by the boot reconcile.
+    state
+        .test_db_mutate(|tx| {
+            tx.execute(
+                "DELETE FROM runner_sessions WHERE runner_id = ?1",
+                rusqlite::params![runner_id],
+            )
+            .unwrap();
+        })
+        .await;
+    let settled = crate::broker::reconcile_orphaned_claims(&shared).await;
+    assert_eq!(settled, 1, "the unrecoverable claim must be settled once");
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runs[&run_id].jobs[&job_id], ExecutionStatus::Failure);
     assert!(
         inner.runs[&run_id].completed_at.is_some(),
@@ -1936,24 +2036,22 @@ async fn broker_session_keeps_registered_runner_from_phantom_reaping() {
     let (runner_id, _token) =
         register_runner_with_token(&app, "broker-runner", &["self-hosted"], None).await;
 
-    {
-        let mut inner = state.inner.lock().await;
-        inner.runner_liveness_timeout = Duration::from_secs(600);
-        inner.runner_registered_at.insert(
-            runner_id,
-            std::time::Instant::now() - Duration::from_secs(3600),
-        );
-        // Modern broker sessions are tracked separately from the legacy
-        // AzDO session map. The runner must not be treated as a phantom when
-        // only that map proves its session exists.
-        inner
-            .broker_session_runners
-            .insert("broker-session".to_owned(), runner_id);
-    }
+    state.test_set_runner_liveness(Duration::from_secs(600));
+    state
+        .test_db_mutate(|tx| {
+            tx.set_runner_registered_at(runner_id, crate::store::now_us() - 3_600_000_000)
+                .unwrap();
+            // Modern broker sessions are tracked separately from the legacy
+            // AzDO session map. The runner must not be treated as a phantom when
+            // only that row proves its session exists.
+            tx.insert_session("broker-session", runner_id, "broker", true)
+                .unwrap();
+        })
+        .await;
 
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         inner.runners.contains_key(&runner_id),
         "a broker-backed runner must not be reaped as a phantom registration"
@@ -1982,19 +2080,17 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     reap_once(&shared).await;
-    // Backdate the first-seen mark far past the grace window.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.queued_at.insert(
-            (run_id, JobId("build".to_owned())),
-            SystemTime::now() - Duration::from_secs(300),
-        );
-    }
+    // Backdate the first-seen mark far past the grace window. The mark is
+    // node-local reaper state.
+    state.inner.lock().await.reaper_first_seen.insert(
+        (run_id, JobId("build".to_owned())),
+        SystemTime::now() - Duration::from_secs(300),
+    );
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            inner.queue.len(),
+            inner.ready().count(),
             1,
             "job queued during the pool warm must not starve"
         );
@@ -2009,9 +2105,9 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
         .store(false, std::sync::atomic::Ordering::Release);
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            inner.queue.len(),
+            inner.ready().count(),
             1,
             "a fresh grace window starts once the pool is ready"
         );
@@ -2019,18 +2115,15 @@ async fn queued_job_survives_the_grace_window_while_the_pool_is_preparing() {
 
     // With nothing having claimed the job after a full fresh window, the
     // sweep fails it as before.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.queued_at.insert(
-            (run_id, JobId("build".to_owned())),
-            SystemTime::now() - Duration::from_secs(300),
-        );
-    }
+    state.inner.lock().await.reaper_first_seen.insert(
+        (run_id, JobId("build".to_owned())),
+        SystemTime::now() - Duration::from_secs(300),
+    );
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
-            inner.queue.is_empty(),
+            inner.ready().next().is_none(),
             "a job nobody can claim still fails once the pool is ready"
         );
     }
@@ -2044,21 +2137,13 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
         let app = app(state.clone(), CancellationToken::new());
         let accepted = submit_simple_run(&app).await;
         let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-        let snapshot = {
-            let mut inner = state.inner.lock().await;
-            let cutoff = (SystemTime::now() - Duration::from_secs(10))
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64;
-            inner
-                .queue
-                .iter_mut()
-                .find(|job| job.run_id == run_id)
-                .unwrap()
-                .enqueued_at_unix_nanos = cutoff;
-            crate::store::StoreSnapshot::from_inner(&inner)
-        };
-        state.store.store_inner(&snapshot).await.unwrap();
+        state
+            .test_db_mutate(|tx| {
+                let cutoff = crate::store::now_us() - 700_000_000;
+                tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
+                    .unwrap();
+            })
+            .await;
         run_id
     };
 
@@ -2072,9 +2157,9 @@ async fn restored_old_job_survives_the_restarted_pools_warm_window() {
     });
     reap_once(&shared).await;
 
-    let inner = restored.inner.lock().await;
+    let inner = restored.test_tx().await;
     assert_eq!(
-        inner.queue.len(),
+        inner.ready().count(),
         1,
         "durable queue age must not defeat the fresh process-local pool warm"
     );
@@ -2109,23 +2194,21 @@ async fn queued_job_starves_past_the_ceiling_even_while_the_pool_is_preparing() 
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     // Age the job's ready-enqueue past the absolute ceiling.
-    {
-        let mut inner = state.inner.lock().await;
-        let cutoff = (SystemTime::now() - Duration::from_secs(3700))
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        for job in inner.queue.iter_mut() {
-            if job.run_id == run_id {
-                job.enqueued_at_unix_nanos = cutoff;
-            }
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            tx.set_job_enqueued_us(
+                run_id,
+                &JobId("build".to_owned()),
+                Some(crate::store::now_us() - 3_700_000_000),
+            )
+            .unwrap();
+        })
+        .await;
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
-            inner.queue.is_empty(),
+            inner.ready().next().is_none(),
             "a job past the ceiling must starve even while the pool is preparing"
         );
         let run = inner.runs.get(&run_id).expect("run record must survive");
@@ -2155,15 +2238,15 @@ async fn starvation_sweep_publishes_terminal_run_status_for_a_failed_run() {
     // Subscribe before the sweep so the emitted events are observable.
     let mut events = state.events.subscribe();
 
-    // Backdate the first-seen mark past the grace window and reap: the job
-    // starves and the run concludes.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.queued_at.insert(
-            (run_id, JobId("build".to_owned())),
-            SystemTime::now() - Duration::from_secs(300),
-        );
-    }
+    // Backdate the job's ready-enqueue past the grace window and reap: the
+    // job starves and the run concludes.
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 300_000_000;
+            tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
+                .unwrap();
+        })
+        .await;
     reap_once(&shared).await;
 
     // Drain the broadcast channel. The sweep must publish the terminal
@@ -2228,17 +2311,17 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
     let mut events = state.events.subscribe();
 
     // Only the first job is old enough to starve; the second must survive.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.queued_at.insert(
-            (run_id, JobId("one".to_owned())),
-            SystemTime::now() - Duration::from_secs(300),
-        );
-    }
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 300_000_000;
+            tx.set_job_enqueued_us(run_id, &JobId("one".to_owned()), Some(cutoff))
+                .unwrap();
+        })
+        .await;
     reap_once(&shared).await;
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner
                 .runs
@@ -2260,7 +2343,7 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
             "the surviving job must stay queued"
         );
         assert!(
-            inner.queue.iter().any(|job| job.job_id.0 == "two"),
+            inner.ready().any(|job| job.job_id.0 == "two"),
             "the surviving job must stay on the ready queue"
         );
     }
@@ -2322,19 +2405,19 @@ async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
 
     // Both jobs old enough to starve: the sweep fails them together and the
     // run concludes.
-    {
-        let mut inner = state.inner.lock().await;
-        for job in ["one", "two"] {
-            inner.queued_at.insert(
-                (run_id, JobId(job.to_owned())),
-                SystemTime::now() - Duration::from_secs(300),
-            );
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 300_000_000;
+            for job in ["one", "two"] {
+                tx.set_job_enqueued_us(run_id, &JobId(job.to_owned()), Some(cutoff))
+                    .unwrap();
+            }
+        })
+        .await;
     reap_once(&shared).await;
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&run_id).unwrap();
         assert!(
             run.status.is_terminal(),
@@ -2393,19 +2476,19 @@ async fn queued_job_does_not_starve_while_a_runner_is_being_provisioned() {
 
     // Age the job past the 120s short grace but well under the absolute
     // backstop: with provisioning in flight it must not starve.
-    {
-        let mut inner = state.inner.lock().await;
-        inner.queued_at.insert(
-            (run_id, JobId("build".to_owned())),
-            SystemTime::now() - Duration::from_secs(300),
-        );
-    }
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 300_000_000;
+            tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
+                .unwrap();
+        })
+        .await;
     reap_once(&shared).await;
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            inner.queue.len(),
+            inner.ready().count(),
             1,
             "a job whose runner is being provisioned must not starve past the short grace"
         );
@@ -2433,18 +2516,14 @@ async fn starvation_clock_ignores_provisioning_time_across_a_retry_gap() {
 
     // The job has been queued for 200s — past the 120s short grace — and a
     // provision is in flight for it.
-    let enqueued_nanos = SystemTime::now() - Duration::from_secs(200);
-    let enqueued_nanos = enqueued_nanos
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
     state.pool_status.set_provisioning(1);
-    {
-        let mut inner = state.inner.lock().await;
-        for job in inner.queue.iter_mut() {
-            job.enqueued_at_unix_nanos = enqueued_nanos;
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            let cutoff = crate::store::now_us() - 200_000_000;
+            tx.set_job_enqueued_us(run_id, &JobId("build".to_owned()), Some(cutoff))
+                .unwrap();
+        })
+        .await;
     // While provisioning is in flight the sweep holds the job and re-stamps
     // its observation clock instead of letting the 200s of provisioning
     // time count against the short grace.
@@ -2458,9 +2537,9 @@ async fn starvation_clock_ignores_provisioning_time_across_a_retry_gap() {
     reap_once(&shared).await;
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
-            inner.queue.len(),
+            inner.ready().count(),
             1,
             "a job must not starve in a provisioning retry gap for time spent provisioning"
         );
@@ -2483,7 +2562,7 @@ async fn job_timeout_enforcement_cancels_job() {
         shutdown,
     });
 
-    // 1. Submit run
+    // Submit run
     let accepted = request_json(
             &app,
             Method::POST,
@@ -2497,7 +2576,7 @@ async fn job_timeout_enforcement_cancels_job() {
         .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    // 2. Poll to start job (transitions status to InProgress and sets started_at)
+    // Poll to start job (transitions status to InProgress and sets started_at)
     let _msg = request_json(
         &app,
         Method::GET,
@@ -2507,38 +2586,36 @@ async fn job_timeout_enforcement_cancels_job() {
     .await;
 
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // 3. Override started_at to be in the past (beyond 360m/21600s default timeout)
-    {
-        let mut inner = state.inner.lock().await;
-        let request = inner.job_requests.get_mut(&request_id).unwrap();
-        request.started_at = Some(SystemTime::now() - Duration::from_secs(22000));
-    }
+    // Override started_at to be in the past (beyond 360m/21600s default timeout)
+    state
+        .test_db_mutate(|tx| {
+            tx.update_request(
+                request_id,
+                Some(crate::store::now_us() - 22_000_000_000),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        })
+        .await;
 
-    // 4. Run reaper tick
+    // Run reaper tick
     reap_once(&shared).await;
 
-    // 5. Verify cancellation is enqueued
+    // Verify cancellation is enqueued
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner.job_requests.get(&request_id).unwrap();
         assert!(request.timeout_triggered);
         assert_eq!(inner.cancellation_queue.len(), 1);
         assert_eq!(inner.cancellation_queue[0].run_id, run_id);
     }
 }
-
-/// A paused debug session must suspend job-timeout enforcement.
-///
-/// Prerequisite covered separately by
-/// `preserve_on_failure_carries_the_run_id_for_the_debug_session`.
-///
-/// Without this the server reaper cancels a debug session out from under the
-/// user — and `timeout-minutes: 10` is a completely ordinary thing to write,
-/// so the failure would be common and would look like a crash.
 
 /// A paused debug session must suspend job-timeout enforcement.
 ///
@@ -2582,7 +2659,7 @@ async fn debug_session_suspends_job_timeout() {
     .await;
 
     let (request_id, agent_job_id, worker_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let (id, record) = inner.job_requests.iter().next().unwrap();
         (
             *id,
@@ -2622,10 +2699,21 @@ async fn debug_session_suspends_job_timeout() {
     // Backdate the job and its pause by the same amount, inside the pause
     // credit ceiling, so every elapsed second is debugging rather than
     // execution.
+    state
+        .test_db_mutate(|tx| {
+            tx.update_request(
+                request_id,
+                Some(crate::store::now_us() - 10_000_000_000),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        })
+        .await;
     {
         let mut inner = state.inner.lock().await;
         let past = SystemTime::now() - Duration::from_secs(10_000);
-        inner.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
         inner
             .debug_sessions
             .backdate_pause_for_test(&session_id, past);
@@ -2634,7 +2722,7 @@ async fn debug_session_suspends_job_timeout() {
     reap_once(&shared).await;
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
             !inner
                 .job_requests
@@ -2656,7 +2744,7 @@ async fn debug_session_suspends_job_timeout() {
     let lease = request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/lease"),
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
         json!({
             "controller": "test-agent",
             "capabilities": ["job.retry_from"]
@@ -2666,13 +2754,13 @@ async fn debug_session_suspends_job_timeout() {
     assert_eq!(lease["controller"], "test-agent");
     assert_eq!(
         lease["capabilities"],
-        json!(["step.retry", "job.retry_from", "job.abort"])
+        json!(["step.retry", "job.retry_from", "job.continue", "job.abort"])
     );
 
     let events = request_json(
         &app,
         Method::GET,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/events?after=0"),
+        &format!("/api/v1/debug/sessions/{session_id}/events?after=0"),
         Value::Null,
     )
     .await;
@@ -2683,7 +2771,7 @@ async fn debug_session_suspends_job_timeout() {
     let operation = request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/operations"),
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
         json!({
             "request_id": "agent-retry-1",
             "expected_version": 1,
@@ -2702,7 +2790,7 @@ async fn debug_session_suspends_job_timeout() {
     let audit = request_json(
         &app,
         Method::GET,
-        &format!("/api/v1/agent/debug/sessions/{session_id}/audit"),
+        &format!("/api/v1/debug/sessions/{session_id}/audit"),
         Value::Null,
     )
     .await;
@@ -2722,22 +2810,27 @@ async fn debug_session_suspends_job_timeout() {
     // Delivering the verdict banks the paused interval and restarts the clock.
     // Suspension is not amnesty: push the start back so that *executing* time
     // alone exceeds the timeout, and the reaper must act.
-    {
-        let mut inner = state.inner.lock().await;
-        let banked = inner
+    let banked = {
+        let inner = state.inner.lock().await;
+        inner
             .debug_sessions
-            .paused_for_request(request_id, SystemTime::now());
-        assert!(
-            banked >= Duration::from_secs(9_500),
-            "the pause should have banked its full duration, got {banked:?}"
-        );
-        inner.job_requests.get_mut(&request_id).unwrap().started_at =
-            Some(SystemTime::now() - Duration::from_secs(21_700) - banked);
-    }
+            .paused_for_request(request_id, SystemTime::now())
+    };
+    assert!(
+        banked >= Duration::from_secs(9_500),
+        "the pause should have banked its full duration, got {banked:?}"
+    );
+    state
+        .test_db_mutate(|tx| {
+            let us = crate::store::now_us() - (21_700_000_000 + banked.as_micros() as i64);
+            tx.update_request(request_id, Some(us), None, None, None)
+                .unwrap();
+        })
+        .await;
 
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
             inner
                 .job_requests
@@ -2775,7 +2868,7 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
     )
     .await;
     let run_id: RunId = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner.job_requests.values().next().unwrap().run_id
     };
 
@@ -2788,7 +2881,7 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
     .await;
 
     let (agent_job_id, victim_token, attacker_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let record = inner.job_requests.values().next().unwrap();
         (
             record.agent_job_id,
@@ -2838,12 +2931,25 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
     .await;
     let session_id = opened["session_id"].as_str().unwrap().to_owned();
 
-    // A controller queues a verdict for the paused worker.
+    // A controller leases the session and queues a continue operation for the
+    // paused worker.
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "cli" }),
+    )
+    .await;
     request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
-        json!({ "verdict": "continue", "controller": "cli" }),
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "test-continue-1",
+            "expected_version": lease["session_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "continue" }
+        }),
     )
     .await;
 
@@ -2878,8 +2984,6 @@ async fn a_job_token_cannot_touch_another_jobs_debug_session() {
     .await;
     assert_eq!(delivered["verdict"], "continue");
 }
-
-/// A runner listen token is not a worker token.
 
 /// A runner listen token is not a worker token.
 #[tokio::test]
@@ -2929,18 +3033,6 @@ async fn the_debug_surface_rejects_a_non_job_token() {
 /// choose which runner claims the job.
 ///
 /// So the assertion is on the message, not on any runner's projection of it.
-
-/// The debug-worker credential must never be a job variable.
-///
-/// Official runner v2.336.0 builds its `secrets` context from every `isSecret`
-/// variable in the job message, replacing only `system.github.token` with
-/// `GITHUB_TOKEN`. A secret variable is therefore a publication channel to the
-/// workflow being debugged: `${{ secrets['system.preloop.debug_worker_token'] }}`
-/// would have handed a `run:` step the credential that drives debug sessions.
-/// The Rust runner's own `system.*` filter is no defence — the server does not
-/// choose which runner claims the job.
-///
-/// So the assertion is on the message, not on any runner's projection of it.
 #[tokio::test]
 async fn the_job_message_never_carries_the_debug_worker_token() {
     let temp = tempfile::tempdir().unwrap();
@@ -2961,9 +3053,12 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
     )
     .await;
 
+    // The stored message is a secret-free template: `NPM_TOKEN` arrives only
+    // as a *name* in `preloopSecretSpec`, never as a value — so the debug
+    // credential is structurally absent, not merely filtered.
     let wire = {
-        let inner = state.inner.lock().await;
-        let queued = inner.queue.front().expect("job should be queued");
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("job should be queued");
         serde_json::to_value(&queued.message).unwrap()
     };
 
@@ -2971,32 +3066,34 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
         !wire.to_string().contains("debug_worker_token"),
         "the debug credential must not ship anywhere on the job message"
     );
-
-    // Rebuild the official runner's secrets projection over the real message.
-    let variables = wire["variables"]
-        .as_object()
-        .expect("job message variables");
-    let official_secrets: BTreeSet<&str> = variables
+    let spec = &wire["preloopSecretSpec"];
+    let names: BTreeSet<&str> = spec["names"]
+        .as_array()
+        .expect("the template carries its secret-name spec")
         .iter()
-        .filter(|(key, value)| {
-            value["isSecret"].as_bool().unwrap_or(false)
-                && !key.eq_ignore_ascii_case("system.github.token")
-        })
-        .map(|(key, _)| key.as_str())
+        .filter_map(Value::as_str)
         .collect();
-
-    // Non-vacuous: the projection does surface the run's own secrets, so its
-    // silence about the debug credential means absence rather than a broken
-    // filter.
     assert!(
-        official_secrets.contains("NPM_TOKEN"),
-        "the projection must be the real one: {official_secrets:?}"
+        names.contains("NPM_TOKEN"),
+        "the spec must carry the run's own secret names: {names:?}"
     );
     assert!(
-        !official_secrets
-            .iter()
-            .any(|key| key.contains("debug_worker_token")),
-        "an official-style secrets context must not see a debug credential: {official_secrets:?}"
+        !names.iter().any(|name| name.contains("debug_worker_token")),
+        "the debug credential must not be a declared secret name"
+    );
+
+    // The real claim path is what the runner consumes: the filled message's
+    // secret variables are the official runner's secrets context source.
+    let acquired = acquire_queued_job(&app, "debug-token-runner").await;
+    let acquired_wire = serde_json::to_string(&acquired).unwrap();
+    assert!(
+        !acquired_wire.contains("debug_worker_token"),
+        "the acquired message must not expose the debug credential"
+    );
+    assert_eq!(
+        wire_variable(&acquired, "NPM_TOKEN"),
+        Some("npm_LIVE_CREDENTIAL"),
+        "the filled message surfaces the run's secrets at acquire"
     );
 }
 
@@ -3038,7 +3135,7 @@ async fn the_debug_worker_token_exchange_is_narrowly_authorized() {
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
     let (agent_job_id, plan_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let (_, record) = inner.job_requests.iter().next().unwrap();
         (record.agent_job_id, record.plan_id.clone())
     };
@@ -3176,12 +3273,6 @@ async fn debug_worker_token_outlives_job_and_pause_windows() {
 /// The runner only builds a pause client for a run that asked for one, so
 /// issuing outside that case would grow the credential's blast radius to every
 /// job on the server for no behavioural gain.
-
-/// No pause-on-failure opt-in, no debug credential at all.
-///
-/// The runner only builds a pause client for a run that asked for one, so
-/// issuing outside that case would grow the credential's blast radius to every
-/// job on the server for no behavioural gain.
 #[tokio::test]
 async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
     let temp = tempfile::tempdir().unwrap();
@@ -3201,7 +3292,7 @@ async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
     .await;
 
     let (agent_job_id, plan_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let (_, record) = inner.job_requests.iter().next().unwrap();
         (record.agent_job_id, record.plan_id.clone())
     };
@@ -3218,8 +3309,6 @@ async fn the_exchange_refuses_a_run_that_never_asked_to_pause() {
         StatusCode::FORBIDDEN
     );
 }
-
-/// A completed job cannot acquire a debug credential.
 
 /// A completed job cannot acquire a debug credential.
 #[tokio::test]
@@ -3241,12 +3330,21 @@ async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
     )
     .await;
 
-    let (agent_job_id, plan_id) = {
-        let mut inner = state.inner.lock().await;
-        let (_, record) = inner.job_requests.iter_mut().next().unwrap();
-        record.result = Some(ExecutionStatus::Failure);
-        (record.agent_job_id, record.plan_id.clone())
+    let run_id = {
+        let inner = state.test_tx().await;
+        inner.runs.keys().next().copied().expect("submitted run")
     };
+    let (agent_job_id, plan_id) = state
+        .test_db_mutate(|tx| {
+            let (request_id, agent_job_id, _) = tx
+                .request_key_for(run_id, &JobId("build".to_owned()))
+                .unwrap()
+                .expect("dispatched request");
+            tx.update_request(request_id, None, None, Some("failure"), None)
+                .unwrap();
+            (agent_job_id, agent_job_id.to_string())
+        })
+        .await;
 
     assert_eq!(
         request_status_with_bearer(
@@ -3260,11 +3358,6 @@ async fn the_exchange_refuses_a_job_that_is_no_longer_running() {
         StatusCode::NOT_FOUND
     );
 }
-
-/// Pause credit is finite: past the ceiling the job times out normally.
-///
-/// Otherwise a worker that keeps polling opts its job out of `timeout-minutes`
-/// altogether, and holds its microVM for as long as it likes.
 
 /// Pause credit is finite: past the ceiling the job times out normally.
 ///
@@ -3304,7 +3397,7 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
     .await;
 
     let (request_id, agent_job_id, worker_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let (id, record) = inner.job_requests.iter().next().unwrap();
         (
             *id,
@@ -3341,10 +3434,18 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
     // The worker is still polling — `worker_seen_at` is fresh, so the
     // abandonment sweep does not apply. Only the credit ceiling can end this.
     let ceiling = crate::debug_sessions::MAX_PAUSE_CREDIT;
+    let past = SystemTime::now() - ceiling - Duration::from_secs(22_000);
+    state
+        .test_db_mutate(|tx| {
+            let us = crate::store::now_us()
+                - (crate::debug_sessions::MAX_PAUSE_CREDIT.as_micros()
+                    + std::time::Duration::from_secs(22_000).as_micros()) as i64;
+            tx.update_request(request_id, Some(us), None, None, None)
+                .unwrap();
+        })
+        .await;
     {
         let mut inner = state.inner.lock().await;
-        let past = SystemTime::now() - ceiling - Duration::from_secs(22_000);
-        inner.job_requests.get_mut(&request_id).unwrap().started_at = Some(past);
         inner
             .debug_sessions
             .backdate_pause_for_test(&session_id, past);
@@ -3352,7 +3453,7 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
 
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         inner
             .job_requests
@@ -3362,14 +3463,6 @@ async fn pause_credit_runs_out_and_the_job_times_out() {
         "pause credit must be finite — an endless pause is an endless job"
     );
 }
-
-/// Resuming a job must not hand its paused time back to the reaper.
-///
-/// The credit lived in the session record, and closing the session dropped it,
-/// so the subtraction that kept the job alive while paused disappeared the
-/// instant it resumed. A job paused for hours was then cancelled on the very
-/// next reaper tick, reported as an ordinary timeout, with the debugging time
-/// billed as execution and nothing in any client able to explain it.
 
 /// Resuming a job must not hand its paused time back to the reaper.
 ///
@@ -3412,7 +3505,7 @@ async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
     .await;
 
     let (request_id, agent_job_id, worker_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let (id, record) = inner.job_requests.iter().next().unwrap();
         (
             *id,
@@ -3451,12 +3544,9 @@ async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
     // the pause is subtracted.
     {
         let mut inner = state.inner.lock().await;
-        let now = SystemTime::now();
-        inner.job_requests.get_mut(&request_id).unwrap().started_at =
-            Some(now - Duration::from_secs(22_000));
         inner
             .debug_sessions
-            .backdate_pause_for_test(&session_id, now - Duration::from_secs(10_000));
+            .backdate_pause_for_test(&session_id, SystemTime::now() - Duration::from_secs(10_000));
     }
 
     // The controller says continue and the worker closes the session: from here
@@ -3488,7 +3578,7 @@ async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
 
     reap_once(&shared).await;
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         !inner
             .job_requests
@@ -3500,8 +3590,9 @@ async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
     assert!(inner.cancellation_queue.is_empty());
     // And the reaper's own sweep does not confiscate it either: the request is
     // still active, so the credit has to survive the tick.
+    let inner_local = state.inner.lock().await;
     assert!(
-        inner
+        inner_local
             .debug_sessions
             .paused_for_request(request_id, SystemTime::now())
             >= Duration::from_secs(9_500),
@@ -3510,19 +3601,10 @@ async fn resuming_a_job_does_not_rebill_the_time_it_spent_paused() {
 }
 
 /// An empty long poll must never be mistaken for a decision.
-
-/// An empty long poll must never be mistaken for a decision.
 #[tokio::test]
 async fn verdict_poll_timeout_is_not_an_abort() {
     verdict_poll_timeout_is_not_an_abort_impl().await;
 }
-
-/// The worker addresses its debug session by run id, so `preserve_on_failure`
-/// must carry one.
-///
-/// This was silently missing at first: the field was only populated for DAP
-/// runs, so the live-pause path constructed no client and fell through to the
-/// old post-mortem behaviour with no error anywhere.
 
 /// The worker addresses its debug session by run id, so `preserve_on_failure`
 /// must carry one.
@@ -3552,8 +3634,9 @@ async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
         let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
         let queued = {
-            let inner = state.inner.lock().await;
-            inner.queue.front().cloned().unwrap()
+            let inner = state.test_tx().await;
+            let q = inner.ready().next().cloned().unwrap();
+            q
         };
         assert_eq!(
             queued.message.preloop_debug_run_id.as_deref() == Some(run_id.as_str()),
@@ -3583,7 +3666,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
         shutdown,
     });
 
-    // 1. Submit run
+    // Submit run
     let accepted = request_json(
             &app,
             Method::POST,
@@ -3597,7 +3680,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
         .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    // 2. Poll to start job (sets last_renewed_at)
+    // Poll to start job (sets last_renewed_at)
     let _msg = request_json(
         &app,
         Method::GET,
@@ -3607,30 +3690,34 @@ async fn runner_lease_expiration_disconnect_reaper() {
     .await;
 
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // 3. Exercise the just-before-boundary case without sleeping. The session
+    // Exercise the just-before-boundary case without sleeping. The session
     // must be dead here: a *live* session with a stale lease is the hung-
     // worker case (reaped at HUNG_WORKER_LEASE_SECONDS), not the disconnect
     // boundary this test isolates. Age the session past liveness so only the
     // lease clock decides.
-    {
-        let mut inner = state.inner.lock().await;
-        let stale_seen =
-            std::time::Instant::now() - inner.runner_liveness_timeout - Duration::from_secs(1);
-        inner
-            .session_last_seen
-            .insert("default".to_owned(), stale_seen);
-        let request = inner.job_requests.get_mut(&request_id).unwrap();
-        request.last_renewed_at =
-            Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS - 1));
-    }
+    let liveness = state.test_tx().await.runner_liveness_timeout;
+    state
+        .test_db_mutate(|tx| {
+            let now = crate::store::now_us();
+            tx.set_session_seen("default", now - liveness.as_micros() as i64 - 1_000_000)
+                .unwrap();
+            tx.set_lease_renewed(
+                request_id,
+                1,
+                now - (JOB_LEASE_SECONDS as i64 - 1) * 1_000_000,
+                now + JOB_LEASE_SECONDS as i64 * 1_000_000,
+            )
+            .unwrap();
+        })
+        .await;
 
     reap_once(&shared).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner.job_requests.get(&request_id).unwrap();
         assert_eq!(
             request.result, None,
@@ -3643,19 +3730,24 @@ async fn runner_lease_expiration_disconnect_reaper() {
         );
     }
 
-    // 4. Move just beyond the same production lease boundary and reap.
-    {
-        let mut inner = state.inner.lock().await;
-        let request = inner.job_requests.get_mut(&request_id).unwrap();
-        request.last_renewed_at =
-            Some(SystemTime::now() - Duration::from_secs(JOB_LEASE_SECONDS + 1));
-    }
+    // Move just beyond the same production lease boundary and reap.
+    state
+        .test_db_mutate(|tx| {
+            tx.set_lease_renewed(
+                request_id,
+                1,
+                crate::store::now_us() - (JOB_LEASE_SECONDS as i64 + 1) * 1_000_000,
+                crate::store::now_us() - 1_000_000,
+            )
+            .unwrap();
+        })
+        .await;
 
     reap_once(&shared).await;
 
-    // 5. Verify the job was marked failed and run completes as failed
+    // Verify the job was marked failed and run completes as failed
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let request = inner.job_requests.get(&request_id).unwrap();
         assert_eq!(request.result, Some(ExecutionStatus::Failure));
         assert!(inner.inflight_requests.is_empty());

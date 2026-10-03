@@ -80,11 +80,11 @@ fn format_stdout_line(timestamp: &str, line: &str, prefix: bool) -> String {
     }
 }
 
-/// R1-12: maximum bytes retained for a newline-free partial output line.
+/// Maximum bytes retained for a newline-free partial output line.
 /// A step printing 64 MiB without a `\n` (progress bars, binary dumps)
 /// would otherwise be retained 1:1 in memory for the whole step.
 const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
-/// R1-12: maximum bytes of a single completed output line passed through
+/// Maximum bytes of a single completed output line passed through
 /// masking/logging. Longer lines are truncated with a marker instead of
 /// being copied whole several times over.
 const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
@@ -93,7 +93,7 @@ const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
 /// so scans never need more than the head.
 pub(crate) const LOG_HEAD_SCAN_BYTES: u64 = 1024 * 1024;
 
-/// R1-12: truncate an overlong completed log line, keeping the head so the
+/// Truncate an overlong completed log line, keeping the head so the
 /// start of the output stays visible.
 fn truncate_log_line(line: &str) -> std::borrow::Cow<'_, str> {
     if line.len() <= MAX_LOG_LINE_BYTES {
@@ -144,7 +144,7 @@ pub struct StepContext<'a> {
     pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
     /// Line buffer for accumulating partial lines from process output chunks.
     line_buffer: Arc<Mutex<Vec<u8>>>,
-    /// R1-12: set when the partial-line buffer overflowed its cap and the
+    /// Set when the partial-line buffer overflowed its cap and the
     /// head was dropped; surfaced as a truncation warning on the next flush.
     line_buffer_truncated: bool,
     /// Whether to also accumulate log lines in memory (for tests).
@@ -255,12 +255,12 @@ impl<'a> StepContext<'a> {
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
             let masked = self.job.mask_secrets(&line);
-            // R1-12: cap absurd single lines after the masking pass, so the
+            // Cap absurd single lines after the masking pass, so the
             // copies masking makes stay bounded too.
             complete_lines.push(truncate_log_line(&masked).into_owned());
         }
 
-        // R1-12: bound only the unterminated tail. Newline-free output (a
+        // Bound only the unterminated tail. Newline-free output (a
         // step dumping megabytes without `\n`) would otherwise be retained
         // 1:1 in memory for the whole step. Keep the tail so a later newline
         // still terminates the line; the dropped head is reported below.
@@ -281,7 +281,7 @@ impl<'a> StepContext<'a> {
         }
         drop(buf);
 
-        // R1-12: surface a swallowed head instead of silently dropping output.
+        // Surface a swallowed head instead of silently dropping output.
         if self.line_buffer_truncated {
             self.line_buffer_truncated = false;
             self.log(
@@ -308,7 +308,7 @@ impl<'a> StepContext<'a> {
     pub fn flush_line_buffer(&mut self) {
         let mut buf = self.line_buffer.lock();
         if buf.is_empty() {
-            // R1-12: the buffer may have overflowed and been capped while no
+            // The buffer may have overflowed and been capped while no
             // newline ever arrived; still surface the truncation warning.
             let truncated = self.line_buffer_truncated;
             self.line_buffer_truncated = false;
@@ -441,7 +441,7 @@ impl<'a> StepContext<'a> {
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
 
-        // P1.6: Feed through job-level problem matchers to produce annotations
+        // Feed through job-level problem matchers to produce annotations
         let matched_annotations = self.job.matchers.match_line(
             &masked,
             &workspace,
@@ -1051,7 +1051,7 @@ mod tests {
         ctx.log("token is secret-value here");
         assert!(ctx.log_lines[0].ends_with("token is *** here"));
     }
-    /// P1: a secret straddling the line-truncation cut must still be masked.
+    /// A secret straddling the line-truncation cut must still be masked.
     /// Masking runs on the complete line before truncation; truncating first
     /// would match against the survivor and log an unredacted fragment.
     #[test]
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn multiline_secret_retroactive_masking_preserves_line_checkpoints() {
-        // Codex review on #298: a cross-line secret value printed before
+        // A cross-line secret value printed before
         // `::add-mask::` registers it occupies two physical records.
         // Retroactive masking must redact it without collapsing those
         // records, or a debug-retry checkpoint captured at the attempt
@@ -1322,17 +1322,17 @@ mod tests {
 
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
 
-        // 1. Unsafe repository telemetry check
+        // Unsafe repository telemetry check
         ctx.log("fatal: unsafe repository ('/github/workspace' is owned by someone else)");
         assert_eq!(ctx.telemetry_errors.len(), 1);
         assert!(ctx.telemetry_errors[0].contains("fatal: unsafe repository"));
 
-        // 2. Composite action marker stripping check
+        // Composite action marker stripping check
         ctx.log("Some text ##[start-action display=fake;id=fake] more text");
         let last_log = ctx.log_lines.last().unwrap();
         assert!(last_log.contains("##[\\start-action"));
 
-        // 3. Problem matcher check
+        // Problem matcher check
         ctx.log("ERROR: compilation failed");
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "compilation failed");

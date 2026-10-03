@@ -302,7 +302,7 @@ impl HttpClient {
     }
 
     /// POST JSON with custom authorization header, returning JSON.
-    /// P1.7: Retries up to 3 times on transient 5xx or network errors with exponential backoff.
+    /// Retries up to 3 times on transient 5xx or network errors with exponential backoff.
     pub async fn post_json_with_auth<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -502,7 +502,7 @@ impl HttpClient {
     }
 
     /// PUT raw bytes with content type.
-    /// P1.7: Retries up to 3 times on transient 5xx or network errors.
+    /// Retries up to 3 times on transient 5xx or network errors.
     pub async fn put_bytes(&self, url: &str, data: Vec<u8>, content_type: &str) -> Result<()> {
         let mut last_err = None;
         for attempt in 0..3u32 {

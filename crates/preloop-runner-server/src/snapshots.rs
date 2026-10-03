@@ -2722,14 +2722,20 @@ pub async fn sweep_workspace_snapshots(shared: &Arc<SharedState>) {
     let runs: std::collections::BTreeMap<
         RunId,
         (ExecutionStatus, Option<chrono::DateTime<chrono::Utc>>),
-    > = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runs
-            .iter()
-            .map(|(id, run)| (*id, (run.status, run.completed_at)))
-            .collect()
-    };
+    > = shared
+        .state
+        .backend
+        .list_runs(crate::control::backend::RunListFilter {
+            workflow: None,
+            status: None,
+            event: None,
+            limit: 200,
+        })
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|run| (run.run_id, (run.status, run.completed_at)))
+        .collect();
     let snapshots_dir = shared.state.state_dir.join("snapshots");
     let mut entries = match tokio::fs::read_dir(&snapshots_dir).await {
         Ok(entries) => entries,
@@ -3863,28 +3869,28 @@ pub async fn snapshot_git_http(
         // demand. Snapshots without an upstream (local workspaces with no
         // GitHub remote, legacy snapshots) keep the previous miss-is-404
         // behavior.
-        let lfs_upstream: Option<(String, Option<u64>, bool)> = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.workspace_snapshot.as_ref())
-                .filter(|snapshot| snapshot.upstream_repository.is_some())
-                .and_then(|snapshot| {
-                    snapshot.upstream_repository.clone().map(|upstream| {
-                        (
-                            upstream,
-                            snapshot.upstream_repository_id,
-                            // Unknown visibility is treated as public so an
-                            // anonymous fetch is attempted — a private repo
-                            // 404s into the same fallback either way, while
-                            // a public repo with no configured credential
-                            // would otherwise never fetch.
-                            snapshot.upstream_private.unwrap_or(false),
-                        )
-                    })
+        let lfs_upstream: Option<(String, Option<u64>, bool)> = shared
+            .state
+            .backend
+            .run_record(run_id)
+            .await
+            .ok()
+            .and_then(|run| run.workspace_snapshot)
+            .filter(|snapshot| snapshot.upstream_repository.is_some())
+            .and_then(|snapshot| {
+                snapshot.upstream_repository.clone().map(|upstream| {
+                    (
+                        upstream,
+                        snapshot.upstream_repository_id,
+                        // Unknown visibility is treated as public so an
+                        // anonymous fetch is attempted — a private repo
+                        // 404s into the same fallback either way, while
+                        // a public repo with no configured credential
+                        // would otherwise never fetch.
+                        snapshot.upstream_private.unwrap_or(false),
+                    )
                 })
-        };
+            });
         let lfs_fetch = lfs_upstream.as_ref().map(
             |(upstream_repository, upstream_repository_id, upstream_private)| LfsFetch {
                 shared: shared.as_ref(),
@@ -4086,28 +4092,26 @@ async fn authorize_snapshot_token(
         }
     };
 
-    let inner = state.inner.lock().await;
-    let Some(request) = inner
-        .agent_job_requests
-        .get(&identity.job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-    else {
-        return Err(ApiError::forbidden(
-            "snapshot Git token is not bound to a live job",
-        ));
-    };
-    if request.run_id != run_id
-        || request.plan_id != identity.plan_id
-        || request.agent_job_id != identity.job_id
-    {
+    // Backend: agent_job → request → run membership check (`job_requests`
+    // rows, scoped to this run).
+    let belongs_to_run = state
+        .backend
+        .attempt_in_run(run_id, &identity.plan_id, identity.job_id)
+        .await
+        .map_err(ApiError::from)?;
+    if !belongs_to_run {
         return Err(ApiError::forbidden(
             "snapshot Git token does not belong to this run",
         ));
     }
-    let snapshot = inner
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.workspace_snapshot.as_ref())
+    let run = state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let snapshot = run
+        .workspace_snapshot
+        .as_ref()
         .ok_or_else(|| ApiError::not_found("checkout snapshot not found"))?;
     Ok(snapshot
         .storage_repository
@@ -4535,6 +4539,8 @@ mod deepen_and_redirect_tests {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(cwd)
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .status()
             .expect("git runs in tests");
@@ -5990,47 +5996,42 @@ mod remote_checkout_cache_tests {
 mod snapshot_sweep_tests {
     use super::*;
 
-    fn run_record(
-        status: ExecutionStatus,
+    /// Seed one run row through the real submit path and return its id. The
+    /// sweep reads status/completion from the control database, so a run that
+    /// should look terminal is forced terminal with one direct write — the
+    /// `test_db_mutate` escape hatch exists for exactly this, since no
+    /// `ControlBackend` command expresses a forced-terminal run.
+    async fn seed_run(
+        shared: &Arc<SharedState>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> RunRecord {
-        RunRecord {
-            run_id: RunId::new(),
-            webhook_delivery_id: None,
-            run_name: None,
-            submission: Arc::new(WorkflowSubmission::default()),
-            jobs: BTreeMap::new(),
-            status,
-            job_outputs: BTreeMap::new(),
-            job_base_ids: BTreeMap::new(),
-            job_needs: BTreeMap::new(),
-            caller_plans: BTreeMap::new(),
-            job_names: BTreeMap::new(),
-            github: serde_json::Value::Null,
-            head_sha: String::new(),
-            workflow_ref: String::new(),
-            workspace_snapshot: None,
-            job_fail_fast: BTreeMap::new(),
-            job_continue_on_error: BTreeMap::new(),
-            job_check_run_ids: BTreeMap::new(),
-            reports_check_runs: false,
-            reusable_calls: BTreeMap::new(),
-            jobs_list: Vec::new(),
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            completed_at,
-            run_number: 1,
-            run_attempt: 1,
-            workflow_path_str: ".github/workflows/ci.yml".to_owned(),
+    ) -> RunId {
+        let submission = WorkflowSubmission {
+            workflow_yaml:
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n"
+                    .to_owned(),
             event: "push".to_owned(),
-            conclusion: None,
-            push_state: None,
-            snapshot_timing: None,
-            fork_approval_pending: false,
-            fork_approval_requested_at_unix_nanos: None,
-            fork_approved_at_unix_nanos: None,
-            fork_approval_note: None,
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/ci.yml".to_owned()),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let accepted = crate::submit_run_inner(shared, submission).await.unwrap();
+        if let Some(at) = completed_at {
+            let run_key = accepted.run_id.0.to_string();
+            let completed_us = at.timestamp_micros();
+            shared
+                .state
+                .test_db_mutate(move |db| {
+                    db.execute(
+                        "UPDATE runs SET status = 'completed', conclusion = 'success', \
+                         completed_at = ?2 WHERE run_id = ?1",
+                        rusqlite::params![run_key, completed_us],
+                    )
+                })
+                .await
+                .unwrap();
         }
+        accepted.run_id
     }
 
     async fn fixture(retention_seconds: u64) -> (tempfile::TempDir, Arc<SharedState>) {
@@ -6062,25 +6063,14 @@ mod snapshot_sweep_tests {
     async fn sweep_collects_orphans_and_spares_live_runs() {
         let (_temp, shared) = fixture(60).await;
 
-        let live = RunId::new();
-        let terminal_old = RunId::new();
-        let terminal_fresh = RunId::new();
+        let live = seed_run(&shared, None).await;
+        let terminal_old = seed_run(
+            &shared,
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .await;
+        let terminal_fresh = seed_run(&shared, Some(chrono::Utc::now())).await;
         let unknown = RunId::new();
-        {
-            let mut inner = shared.state.inner.lock().await;
-            let mut live_run = run_record(ExecutionStatus::InProgress, None);
-            live_run.run_id = live;
-            inner.runs.insert(live, live_run);
-            let mut old = run_record(
-                ExecutionStatus::Success,
-                Some(chrono::Utc::now() - chrono::Duration::hours(1)),
-            );
-            old.run_id = terminal_old;
-            inner.runs.insert(terminal_old, old);
-            let mut fresh = run_record(ExecutionStatus::Success, Some(chrono::Utc::now()));
-            fresh.run_id = terminal_fresh;
-            inner.runs.insert(terminal_fresh, fresh);
-        }
         let live_dir = snapshot_dir(&shared, live);
         let old_dir = snapshot_dir(&shared, terminal_old);
         let fresh_dir = snapshot_dir(&shared, terminal_fresh);
@@ -6105,13 +6095,7 @@ mod snapshot_sweep_tests {
     async fn sweep_rearms_fresh_terminal_snapshot() {
         let (_temp, shared) = fixture(1).await;
 
-        let run_id = RunId::new();
-        {
-            let mut inner = shared.state.inner.lock().await;
-            let mut run = run_record(ExecutionStatus::Success, Some(chrono::Utc::now()));
-            run.run_id = run_id;
-            inner.runs.insert(run_id, run);
-        }
+        let run_id = seed_run(&shared, Some(chrono::Utc::now())).await;
         let dir = snapshot_dir(&shared, run_id);
 
         sweep_workspace_snapshots(&shared).await;

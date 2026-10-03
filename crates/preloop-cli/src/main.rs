@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use preloop_gha_protocol::{ExecutionStatus, NdjsonEvent, RunAccepted, RunId, WorkflowSubmission};
 use preloop_orchestrator::environment::{DEFAULT_BASE_IMAGE, is_stock_base_image};
 use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
-use preloop_runner_server::credential_store::{CredentialStore, OsCredentialStore};
+use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -386,7 +386,7 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
+            preloop_runner_server::credential_store::load_engine_token_from_env(&preloop_home())
                 .ok()
                 .flatten()
         })
@@ -400,7 +400,7 @@ pub(crate) fn api_token() -> Option<String> {
             if home == cwd_default {
                 return None;
             }
-            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
+            preloop_runner_server::credential_store::load_engine_token_from_env(&cwd_default)
                 .ok()
                 .flatten()
         })
@@ -1399,7 +1399,7 @@ fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Anonymous liveness probe for the local engine (H4).
+/// Anonymous liveness probe for the local engine.
 ///
 /// `/healthz` is a public, unauthenticated endpoint — the handler never reads
 /// credentials — so the probe must not attach the API bearer token. Sending
@@ -1424,7 +1424,7 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     let client = build_client();
     let url = server_url();
 
-    // H4: the liveness probe is anonymous — see `probe_engine_health`.
+    // The liveness probe is anonymous — see `probe_engine_health`.
     if probe_engine_health(&client, &url).await {
         return Ok(());
     }
@@ -1438,11 +1438,11 @@ async fn ensure_engine_running() -> anyhow::Result<()> {
     std::fs::create_dir_all(&state_dir)?;
     set_private_directory_permissions(&preloop_dir)?;
 
-    let store = OsCredentialStore;
+    let store = preloop_runner_server::credential_store::store_from_env(&preloop_dir);
     let token = prepare_engine_token(
         &preloop_dir,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
-        &store,
+        store.as_ref(),
     )?;
 
     let engine_bin = std::env::current_exe().context("resolve preloop executable")?;
@@ -1566,7 +1566,7 @@ fn prepare_engine_token(
 /// [`resolve_credential_references`]: preloop_runner_server::config
 fn migrate_legacy_github_credentials(
     config: &mut preloop_runner_server::config::ConfigFile,
-    store: &impl preloop_runner_server::credential_store::CredentialStore,
+    store: &dyn preloop_runner_server::credential_store::CredentialStore,
 ) -> anyhow::Result<bool> {
     use preloop_runner_server::credential_store::{SecretString, github_reference_with_host};
 
@@ -1732,7 +1732,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
     let mut file_config = preloop_runner_server::config::load_config()?;
-    let store = preloop_runner_server::credential_store::OsCredentialStore;
+    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
     // Read before migrating: migration moves the inline values out of
     // `config.github`, and the freshly stored ones are not re-resolved here.
     let from_file = github_auth::StoredAuth {
@@ -1741,7 +1741,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
         private_key_pem: file_config.github.app_pem().map(str::to_owned),
         webhook_secret: file_config.github.webhook_secret().map(str::to_owned),
     };
-    if migrate_legacy_github_credentials(&mut file_config, &store)? {
+    if migrate_legacy_github_credentials(&mut file_config, store.as_ref())? {
         preloop_runner_server::config::write_config(&file_config)?;
         eprintln!(
             "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
@@ -1777,8 +1777,12 @@ async fn cmd_engine(
 
     // Keep AppState's resolver on the same engine home as this CLI.
     unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-    let store = OsCredentialStore;
-    let token = prepare_engine_token(&home, std::env::var("PRELOOP_SYSTEM_TOKEN").ok(), &store)?;
+    let store = preloop_runner_server::credential_store::store_from_env(&home);
+    let token = prepare_engine_token(
+        &home,
+        std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
+        store.as_ref(),
+    )?;
     unsafe { std::env::set_var("PRELOOP_SYSTEM_TOKEN", &token) };
     let listen: std::net::SocketAddr = args
         .listen
@@ -6199,7 +6203,7 @@ mod tests {
         assert_eq!(mounted_control_origin("https://preloop.preloop.dev"), None);
     }
 
-    /// H4: the engine liveness probe must never carry the API bearer token.
+    /// The engine liveness probe must never carry the API bearer token.
     /// `/healthz` is public and unauthenticated, so an `Authorization`
     /// header on the probe only leaks the credential. Failing first: with
     /// `PRELOOP_TOKEN` set (so `api_token()` resolves to a real secret),
@@ -6240,7 +6244,7 @@ mod tests {
         assert!(healthy, "stub /healthz should answer the probe");
         assert!(
             !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
-            "H4: the /healthz probe must not send an Authorization header"
+            "the /healthz probe must not send an Authorization header"
         );
     }
 }

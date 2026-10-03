@@ -33,15 +33,15 @@ pub struct JobContext {
     pub job_status: JobStatus,
     /// State values saved by steps (for post-steps).
     pub state: HashMap<String, HashMap<String, String>>,
-    /// Annotations collected per step_id (F025).
+    /// Annotations collected per step_id.
     pub step_annotations: HashMap<String, Vec<Annotation>>,
-    /// Job-level annotations for completejob (F048).
+    /// Job-level annotations for completejob.
     /// These are infrastructure-level issues (container failures, action download errors)
     /// that are not tied to a specific step.
     pub job_annotations: Vec<Annotation>,
     /// Resolved action directories keyed by the original `uses:` reference.
     pub action_paths: HashMap<String, String>,
-    /// P1.6: Active problem matchers (cross-step, registered by actions like setup-node).
+    /// Active problem matchers (cross-step, registered by actions like setup-node).
     pub matchers: MatcherRegistry,
     /// Container state for job/service containers (Phase 2).
     pub container_state: Option<super::container_ops::ContainerState>,
@@ -125,7 +125,7 @@ impl JobContext {
                     && !val.is_empty()
                 {
                     masks.insert(val.to_string());
-                    // Also mask trimmed variant and base64-encoded form (F028)
+                    // Also mask trimmed variant and base64-encoded form.
                     let trimmed = val.trim();
                     if trimmed != val {
                         masks.insert(trimmed.to_string());
@@ -135,7 +135,7 @@ impl JobContext {
                     masks.insert(base64::engine::general_purpose::STANDARD_NO_PAD.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE.encode(val));
                     masks.insert(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(val));
-                    // H1: register each non-empty trimmed CR/LF-delimited
+                    // Register each non-empty trimmed CR/LF-delimited
                     // line too. Log masking runs per assembled line, so
                     // a multiline initial secret (PEM key, JSON blob)
                     // would otherwise never match the whole value and
@@ -334,7 +334,7 @@ impl JobContext {
         }
     }
 
-    /// F048: Add a job-level annotation (infrastructure issue).
+    /// Add a job-level annotation (infrastructure issue).
     pub fn add_job_annotation(&mut self, annotation: Annotation) {
         self.job_annotations.push(annotation);
     }
@@ -398,7 +398,7 @@ impl JobContext {
             ctx.insert("github", gh);
         }
 
-        // runner context — P1.12: add tool_cache and workspace
+        // runner context — add tool_cache and workspace
         let tool_cache = std::env::var("RUNNER_TOOL_CACHE").unwrap_or_else(|_| {
             // Default: runner root / _work / _tool, matching inject_github_env.
             self.workspace
@@ -454,7 +454,7 @@ impl JobContext {
         }
         ctx.insert("steps", serde_json::Value::Object(steps_map));
 
-        // job context — P1.12: add container and services (empty objects when not containerized)
+        // job context — add container and services (empty objects when not containerized)
         let job_decoded = self
             .context_data
             .get("job")
@@ -501,7 +501,7 @@ impl JobContext {
             .collect();
         ctx.insert("env", env_map);
 
-        // secrets context — from isSecret variables (F028)
+        // secrets context — from isSecret variables
         if let Some(vars) = self.variables.as_object() {
             let mut secrets_map = serde_json::Map::new();
             for (key, val) in vars {
@@ -560,7 +560,7 @@ impl JobContext {
             }
         }
 
-        // Set status function values, and pass workspace for hashFiles() (F027)
+        // Set status function values, and pass workspace for hashFiles()
         let mut ctx = ctx.with_status(
             self.job_status == JobStatus::Success,
             self.job_status == JobStatus::Failure,

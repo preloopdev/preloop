@@ -2,7 +2,7 @@
 //!
 //! `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`
 //! and `POST /repos/{owner}/{repo}/dispatches` trigger runs exactly like
-//! github.com's Actions API: authenticated through the D2 chain
+//! github.com's Actions API: authenticated through the dispatch auth chain
 //! ([`crate::dispatch_auth`]), validated against the workflow's declared
 //! triggers and inputs, and submitted through the *same* event adapters the
 //! webhook path uses (`events::workflow_dispatch`,
@@ -15,7 +15,7 @@
 //! (workflow exists but is not `workflow_dispatch`-triggered), 422 (input
 //! validation, missing `event_type`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -25,6 +25,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use crate::control::backend::ControlBackend as _;
 use crate::dispatch_auth::DispatchIdentity;
 use crate::events::EventAdapter;
 use crate::events::trust_tier::TrustTier;
@@ -89,7 +90,7 @@ pub async fn workflow_dispatch(
         },
         "sender": { "login": identity.actor },
     });
-    // D4: validate inputs against `on.workflow_dispatch.inputs` *before* any
+    // validate inputs against `on.workflow_dispatch.inputs` *before* any
     // run is created — missing required, type mismatch, and out-of-options
     // choices all surface as 422. Defaults are applied here so the run and
     // `github.event.inputs` carry them.
@@ -279,23 +280,37 @@ pub async fn list_actions_runs(
 ) -> Result<Json<Value>, ApiError> {
     authorize_read(&identity, &owner, &repo)?;
     let repository = format!("{owner}/{repo}");
-    let inner = shared.state.inner.lock().await;
-    let mut runs: Vec<&crate::models::RunRecord> = inner
-        .runs
-        .values()
-        .filter(|run| run.submission.repository.eq_ignore_ascii_case(&repository))
-        .collect();
+    let mut runs: Vec<crate::models::RunRecord> = shared
+        .state
+        .backend
+        .runs_for_repository(&repository)
+        .await
+        .map_err(ApiError::from)?;
     // github.com lists the newest runs first.
     runs.sort_by_key(|right| std::cmp::Reverse(right.created_at));
     let workflow_runs: Vec<Value> = runs
         .iter()
         .map(|run| {
+            // The stored status collapses `Queued`/`Pending`/`InProgress` into
+            // `InProgress`; recover the wire status the same way `project_run`
+            // does — a held run is `pending`, a runnable run with no started
+            // job is `queued`.
+            let effective = if run.status == preloop_gha_protocol::ExecutionStatus::InProgress
+                && !run
+                    .jobs
+                    .values()
+                    .any(|s| matches!(s, preloop_gha_protocol::ExecutionStatus::InProgress))
+            {
+                preloop_gha_protocol::ExecutionStatus::Queued
+            } else {
+                run.status
+            };
             json!({
                 "id": stable_id(&run.run_id.to_string()),
                 "run_id": run.run_id.to_string(),
                 "name": run.run_name,
                 "event": run.event,
-                "status": github_run_status(run.status),
+                "status": github_run_status(effective),
                 "conclusion": run.conclusion,
                 "head_sha": run.head_sha,
                 "created_at": run.created_at.to_rfc3339(),
@@ -488,7 +503,7 @@ fn submission_from_effective(
         local_workspace: None,
         vars: BTreeMap::new(),
         secrets: BTreeMap::new(),
-        submission_names: BTreeSet::new(),
+        run_secret_names: std::collections::BTreeSet::new(),
         reusable_workflows: BTreeMap::new(),
         reusable_workflow_shas: BTreeMap::new(),
         enable_debugger: false,
@@ -540,26 +555,32 @@ async fn submit_and_report(
 ) -> Result<RunAccepted, ApiError> {
     let accepted = crate::submit_run_inner(shared, submission).await?;
     let run_id = accepted.run_id;
-    let jobs = {
-        let mut inner = shared.state.inner.lock().await;
-        // Stamped before filtering: an all-expandable run reports nothing at
-        // intake yet still needs the flag for its materialized legs.
-        if let Some(run) = inner.runs.get_mut(&run_id) {
-            run.reports_check_runs = true;
-        }
-        inner.runs.get(&run_id).map(|run| {
-            // Expandable nodes (deferred matrices, reusable callers) mint no
-            // check at intake — their materialized legs get their own.
-            run.jobs
-                .keys()
-                .filter(|job_id| {
-                    !crate::runtime_scheduling::is_expandable_node(&inner, run_id, job_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-    };
-    if let Some(jobs) = jobs {
+    // Stamped before filtering: an all-expandable run mints nothing at intake
+    // yet still needs the flag for the legs it materializes later.
+    if let Err(error) = shared
+        .state
+        .backend
+        .set_reports_check_runs(run_id, true)
+        .await
+    {
+        warn!(%run_id, ?error, "failed to stamp reports_check_runs for dispatch run");
+    }
+    let info = shared
+        .state
+        .backend
+        .run_dispatch_info(run_id)
+        .await
+        .map_err(ApiError::from)?;
+    if let Some(info) = info {
+        // Expandable nodes (deferred matrices, reusable callers) are
+        // placeholders: they never dispatch, expansion replaces them, and
+        // their materialized legs mint their own checks — a `queued` check
+        // minted here would strand on GitHub (there is no delete API).
+        let jobs = info
+            .jobs
+            .into_iter()
+            .filter(|job| !job.placeholder)
+            .map(|job| job.job_id);
         for job_id in jobs {
             if let Err(error) =
                 crate::github::report_check_run_queued(shared, repository, sha, &job_id, run_id)
@@ -567,13 +588,19 @@ async fn submit_and_report(
             {
                 warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
             }
-            let status = {
-                let inner = shared.state.inner.lock().await;
-                inner
-                    .runs
-                    .get(&run_id)
-                    .and_then(|run| run.jobs.get(&job_id).copied())
-            };
+            // Re-read after the (slow) GitHub call: the job may have settled
+            // meanwhile, and its completed check run must follow the queued one.
+            let status = shared
+                .state
+                .backend
+                .run_job_statuses(run_id)
+                .await
+                .map_err(ApiError::from)?
+                .and_then(|jobs| {
+                    jobs.into_iter()
+                        .find(|(id, _)| *id == job_id)
+                        .map(|(_, status)| status)
+                });
             if let Some(status) = status.filter(|status| status.is_terminal()) {
                 crate::github::report_check_run_completed(shared, run_id, &job_id, status).await;
             }

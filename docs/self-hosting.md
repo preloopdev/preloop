@@ -166,6 +166,7 @@ All configuration is environment variables; CLI flags override them.
 | `PRELOOP_REGISTRATION_POLICY` | `strict` | Registration policy. `strict` requires the system credential (or a fresh pool provision token on legacy registration); `permissive` accepts any non-empty upstream token on TCP for conformance replay only, while the mounted socket remains strict — never use it on an exposed listener |
 | `PRELOOP_CONFIG` | `$PRELOOP_HOME/config.toml` | Config file path |
 | `PRELOOP_SECRETS_STORE` | config file | Secrets backend selector |
+| `PRELOOP_CREDENTIAL_STORE` | `os` | Credential backend for the engine token and GitHub App/PAT credentials. `os` uses the native keychain/secret-service; `file` stores `0600` files under `$PRELOOP_HOME/credentials` (no OS prompt — use for headless hosts, containers, and local iteration where repeated keychain prompts are unacceptable); `memory` is non-persistent (tests only) |
 | `PRELOOP_RUNNER_URL` | loopback listen address | Origin handed to runners. Set automatically; override only for remote runners |
 | `PRELOOP_CONTROL_UPSTREAM` | — | LAN address remote runners use when loopback is not reachable |
 

@@ -104,6 +104,9 @@ pub struct Decision {
     /// submission; a retry replays the step with that stale value unless the
     /// worker swaps it for this one.
     pub snapshot_token: Option<String>,
+    /// Fresh `http.<snapshot>.extraheader` value supplied with a retry
+    /// verdict, for jobs whose job env carries a snapshot origin rewrite.
+    pub snapshot_auth_header: Option<String>,
 }
 
 /// Everything needed to talk to the control plane about one job's sessions.
@@ -127,6 +130,10 @@ pub struct DebugPauseClient {
     /// checkout credential. Only those steps may have their token refreshed
     /// from a verdict.
     pinned_snapshot_steps: Vec<String>,
+    /// URL of the run's snapshot endpoint, copied from the job message's
+    /// `preloopSnapshotOriginRewrite`. Identifies which `GIT_CONFIG_*`
+    /// extraheader entry a retry verdict's fresh auth header must replace.
+    snapshot_url: Option<String>,
     /// Guest path of the pause marker the orchestrator watches to release
     /// its pool permit while this job sits paused. Absent when the pool did
     /// not configure debug preservation.
@@ -199,6 +206,7 @@ impl DebugPauseClient {
             workspace: None,
             snapshot_commit: None,
             pinned_snapshot_steps: Vec::new(),
+            snapshot_url: None,
             pause_marker: std::env::var_os("PRELOOP_PAUSE_MARKER").map(std::path::PathBuf::from),
             revision: Arc::new(AtomicU32::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -229,6 +237,7 @@ impl DebugPauseClient {
             workspace: None,
             snapshot_commit: None,
             pinned_snapshot_steps: Vec::new(),
+            snapshot_url: None,
             pause_marker: std::env::var_os("PRELOOP_PAUSE_MARKER").map(std::path::PathBuf::from),
             revision: Arc::new(AtomicU32::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -260,6 +269,14 @@ impl DebugPauseClient {
         self
     }
 
+    /// Record the snapshot endpoint's URL so a retry verdict's fresh
+    /// `extraheader` credential can be matched back to the env entry the job
+    /// extension injected at start.
+    pub fn with_snapshot_url(mut self, url: Option<String>) -> Self {
+        self.snapshot_url = url;
+        self
+    }
+
     /// Record which steps carry a pinned snapshot checkout credential, so a
     /// verdict-supplied replacement is applied only to them.
     pub fn with_pinned_snapshot_steps(mut self, ids: Vec<String>) -> Self {
@@ -288,6 +305,43 @@ impl DebugPauseClient {
                 with["token"] = serde_json::Value::String(token.to_owned());
             }
         }
+    }
+
+    /// Swap the stale `http.<snapshot>.extraheader` env entry a retry would
+    /// otherwise replay.
+    ///
+    /// The job extension wrote the origin rewrite into `GIT_CONFIG_*` pairs
+    /// at job start (`job_extension.rs`); the submission-time credential in
+    /// them expires on the same clock as the pinned checkout token, so a
+    /// retry verdict carries the fresh header the server just minted. The
+    /// entry is matched on its `http.{snapshot_url}.extraheader` key — the
+    /// same anchoring the injection used — rather than by index, so a
+    /// workflow-supplied `GIT_CONFIG_COUNT` base never confuses the lookup.
+    ///
+    /// Writes `job.env`, which `StepContext::build_env` re-reads on every
+    /// attempt, so both an in-place retry and a `retry_from` range replay
+    /// pick it up.
+    pub fn refresh_snapshot_auth_header(
+        &self,
+        env: &mut HashMap<String, String>,
+        auth_header: &str,
+    ) -> bool {
+        let Some(snapshot_url) = self.snapshot_url.as_deref() else {
+            return false;
+        };
+        let wanted = format!("http.{snapshot_url}.extraheader");
+        let count: usize = env
+            .get("GIT_CONFIG_COUNT")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        for index in 0..count {
+            let key_slot = format!("GIT_CONFIG_KEY_{index}");
+            if env.get(&key_slot).map(String::as_str) == Some(wanted.as_str()) {
+                env.insert(format!("GIT_CONFIG_VALUE_{index}"), auth_header.to_owned());
+                return true;
+            }
+        }
+        false
     }
 
     /// Label for the source revision the next attempt will run against.
@@ -434,6 +488,7 @@ impl DebugPauseClient {
             source_revision: response.source_revision,
             retry_from_step: response.retry_from_step,
             snapshot_token: response.snapshot_token,
+            snapshot_auth_header: response.snapshot_auth_header,
         }))
     }
 

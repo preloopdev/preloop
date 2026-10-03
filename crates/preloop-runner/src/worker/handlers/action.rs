@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(action_repository_context("docker://alpine:3.20"), None);
     }
 
-    // --- P0 action resolution gap coverage ---
+    // --- action resolution gap coverage ---
 
     #[test]
     fn resolve_remote_action_constructs_path() {
@@ -662,9 +662,9 @@ mod tests {
     }
     #[test]
     fn set_action_repository_context_sets_action_to_step_id_not_display_name() {
-        // RHAND-01 regression: github.action must equal the step ID, not the display name.
-        // Pre-fix: run_action() overrode set_action_repository_context() with step_name.
-        // Post-fix: only set_action_repository_context() runs, which correctly uses step_id.
+        // github.action must equal the step ID, not the display name.
+        // run_action() must not override set_action_repository_context();
+        // only the latter runs, and it uses step_id.
         let mut job = crate::worker::contexts::JobContext::new(
             "j1".into(),
             "Job".into(),
