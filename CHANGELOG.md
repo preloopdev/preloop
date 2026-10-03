@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+## [0.33.9] - 2026-10-02
+
 ### Changed
 
 - **Standalone runner release builds target Linux and macOS.** Windows users
@@ -15,6 +17,8 @@ Releases before v0.27.0 predate the changelog.
   release assets are no longer built. On a co-hosted Preloop engine, set
   `PRELOOP_GITHUB_SKIP_WORKFLOWS=release-runner.yml` to let GitHub Actions
   alone own that release workflow and avoid duplicate checks.
+- **Golden smolvm updated to 1.19.0** (`a6072aae`): the verified-release
+  golden pin tracks upstream; `smolvm_min_version` remains the runtime floor.
 
 ### Fixed
 
@@ -22,7 +26,10 @@ Releases before v0.27.0 predate the changelog.
   setup assumed Ubuntu 24.04's `ubuntu.sources`; the pinned 22.04 rootfs uses
   `/etc/apt/sources.list`. Both layouts now scope native apt sources to arm64
   before adding amd64 repositories, so 22.04 jobs can provision runners
-  instead of looping on a missing-file error.
+  instead of looping on a missing-file error. The bake additionally uses a
+  status-preserving sudo wrapper, so a refused passwordless sudo or a failed
+  apt step fails the bake instead of producing a golden without the amd64
+  loader.
 
 ## [0.33.8] - 2026-10-02
 
