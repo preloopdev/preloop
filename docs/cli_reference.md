@@ -217,6 +217,50 @@ never prints values.
 | `--repo <REPO>` | Remove from this repository scope instead of global |
 | `--env <ENV>` | Remove from this environment scope (requires `--repo`) |
 
+## `preloop init [OPTIONS]`
+
+One command for first-run setup: it configures GitHub credentials, the golden
+image every job VM forks from, and how to run. In a terminal (stdin *and*
+stdout are TTYs) it is a four-step wizard; anywhere else it takes the same
+answers as flags, never prompts, and exits instead of waiting. Re-running it
+reconfigures in place — each step shows the stored answer and only asks again
+if you change it.
+
+Steps: **1 credentials** (the `preloop setup github` flow, verified live like
+`preloop doctor`), **2 golden**, **3 run mode**, **4 preflight** (free space on
+the SmolVM data volume, host architecture, hypervisor) — then the config is
+written to `$PRELOOP_CONFIG` and the chosen mode starts.
+
+| Flag | Description |
+|---|---|
+| `--probe` | Print a side-effect-free capability report as JSON and exit (`arch`, `os`, `disk_free_bytes`, `data_root`, `hypervisor`, `docker`, `dockerfile_detected`, `smolvm`, `existing_config`, `credentials_configured`, `ghcr_reachable`, plus the base image `serve` would use) |
+| `--auth <app\|pat\|none>` | Credential step. `none` writes no credential (local-only engine) and leaves existing ones alone |
+| `--app-id <ID>`, `--pem-file <PATH>` | Existing App credentials (with `--auth app`); without them the browser flow creates one |
+| `--token <TOKEN>` | PAT (with `--auth pat`); falls back to `PRELOOP_GITHUB_PAT` |
+| `--org <NAME>`, `--public-url <URL>`, `--port <N>`, `--no-browser`, `--webhook-secret <SECRET>` | As in `preloop setup github` |
+| `--repo <OWNER/NAME>` | Repository to verify the credential against (repeatable) |
+| `--golden <official\|oci\|dockerfile\|file>` | Golden step. `official` (default) is the packed official GitHub runner golden: drop-in parity with GitHub-hosted runners, **~60 GB on disk** (≈9.6 GB download + the unpacked golden + per-job VM space) |
+| `--base-image <REF>` | OCI reference (with `--golden oci`). Resolved anonymously before it is written; pin `@sha256:…` for reproducibility (unpinned only warns). Private registries answer 401/403 — add their credentials with `smolvm config registries edit` and retry; they are used for the pull only and never enter the VM |
+| `--dockerfile <PATH>`, `--docker-context <DIR>` | Build a Dockerfile in this repo (with `--golden dockerfile`; defaults `./Dockerfile` and its directory). Offline-builds with `docker`/`nerdctl`, saves the result to a tar under `$PRELOOP_HOME/goldens/`, and uses that tar as the base image. The choice is only offered when a `Dockerfile` exists in the working directory and `docker`/`nerdctl` is on `PATH`; otherwise the wizard shows it disabled with the reason |
+| `--path <FILE-OR-DIR>` | Local `.smolmachine` pack or rootfs directory (with `--golden file`) |
+| `--mode <foreground\|service\|none>` | Run mode: `serve` here now, install as a systemd/launchd service (needs root), or write the config only |
+| `--yes` | Take the suggested answer for confirmation prompts |
+| `--json` | One JSON object per step (`{"step","decision","result"}`), ending with the written config path. Implies non-interactive: every step needs its flag |
+
+Exit codes: `2` a required flag is missing or invalid (stderr names it), `3`
+preflight failed (the JSON says what is short: disk, architecture, or
+hypervisor), `4` resolving/pulling/building the base image failed. Anything
+else — a failed credential check, a failed service install — is `1`.
+
+The golden is **recorded, not baked**: `init` writes
+`[golden] base_image = "…"` into the config file and `serve` prepares the
+golden through its existing path (download the packed official artifact, or
+bake a custom base on first run). The one exception is `--golden dockerfile`,
+whose `docker build`/`docker save` cannot be deferred to the engine, so `init`
+builds it and stores the tar. `PRELOOP_RUNNER_BASE_IMAGE` still overrides the
+recorded choice, and `--mode service` writes the config into the service's own
+state directory unless `PRELOOP_HOME` names one.
+
 ## `preloop setup github [OPTIONS]`
 
 Configure GitHub credentials.
@@ -385,6 +429,20 @@ See [VM images and version tracking](vm-images.md#building-a-golden) for the
 stock build, custom OCI base, checksum, publishing, and runtime configuration
 steps.
 
+For the everyday case — "run my workflows on something other than the official
+image" — `preloop init` records the choice instead:
+
+```toml
+[golden]
+kind = "oci"                                        # official | oci | dockerfile | file
+base_image = "ghcr.io/acme/preloop-base@sha256:…"   # read by `serve`/`server install`
+dockerfile = "ci/Dockerfile"                        # only for kind = "dockerfile"
+```
+
+`serve` reads `base_image` when `PRELOOP_RUNNER_BASE_IMAGE` is unset, and
+prepares the golden on its normal path: the packed official artifact for the
+stock base, or a local bake for a custom one.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -401,11 +459,13 @@ steps.
 | `PRELOOP_USE_FORK` | Run the pool as forked microVMs (default true with a packed golden) |
 | `PRELOOP_USE_PACKED_GOLDEN` | Use a release or locally cached packed golden (default on; set `false` for cold OCI provisioning) |
 | `PRELOOP_GOLDEN_URL` | Override the packed golden URL; checksum URL is this value plus `.sha256` |
-| `PRELOOP_GOLDEN_OCI_REF` | Override the default public OCI packed golden reference (arm64 default: `ghcr.io/preloopdev/preloop-golden@sha256:a2f7caf367e19efa4cb2d6f32a7093db8fae79e1b1525b65ac1190c1d2b44361`) |
-| `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden |
+| `PRELOOP_GOLDEN_OCI_REF` | Override the per-architecture packed golden OCI reference; the engine has digest-pinned defaults for both the official arm64 and x86_64 GHCR artifacts |
+| `PRELOOP_RUNNER_BASE_IMAGE` | Override the digest-pinned Ubuntu base identity at serve time; set it with `PRELOOP_GOLDEN_URL` for a custom packed golden. Wins over the `[golden] base_image` that `preloop init` records |
 | `PRELOOP_VERIFY_BASE_IMAGE` / `PRELOOP_VERIFY_BASE_IMAGE_REPO` | Require a digest-pinned OCI base's GitHub attestation and Cosign signature before `build-golden` |
 | `PRELOOP_REQUIRE_BASE_DIGEST` | Reject mutable registry tags during `build-golden` (used by release provenance builds) |
 | `PRELOOP_RUNNER_STORAGE_GB` | Persistent guest storage per runner and golden build (default 80 GiB) |
+| `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | Free space kept on the VM volume (`PRELOOP_RUNNER_STORAGE_GB`'s volume) before a job VM is forked or created (default 20 GiB; `0` disables). Below it the pool holds the slot and re-measures instead of starting a runner, logging `waiting for disk: …`; jobs wait, they are not failed. A volume that cannot be measured never blocks |
+| `PRELOOP_SKIP_DISK_PREFLIGHT` | Proceed past the golden disk check with a warning. Without it, a golden download is refused when the artifact cannot fit on its volume, and a golden build when the SmolVM data volume has less than the builder disk (`PRELOOP_RUNNER_STORAGE_GB`, min 40) + 20 GiB of pack staging free |
 | `PRELOOP_RUNNER_PACK_PROXY` | HTTP proxy for smolvm's separate registry export VM during golden packing; standard HTTP(S) proxy variables are fallbacks |
 | `PRELOOP_RUNNER_PACK_NO_PROXY` | Proxy bypass list for golden packing; `NO_PROXY` and `no_proxy` are fallbacks |
 | `PRELOOP_RUNNER_LABELS` | Extra `runs-on` labels the pool's runners declare |

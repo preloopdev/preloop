@@ -10,6 +10,7 @@ use preloop_orchestrator::{RunnerPool, RunnerPoolConfig, artifact_payload};
 use preloop_runner_server::credential_store::CredentialStore;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,6 +23,7 @@ mod dap_client;
 mod debug_session;
 mod github_auth;
 mod github_setup;
+mod init;
 
 mod push;
 mod server_install;
@@ -141,7 +143,9 @@ run_ci_or_resume() {
   else
     log_range="${remote_sha}..$local_sha"
   fi
-  if git log --format=%B "$log_range" 2>/dev/null | grep -qi '\[skip *ci\]'; then
+  # No pipe to grep -q here: under pipefail, grep's early exit SIGPIPEs
+  # git log, the pipeline reports 141, and the bypass never fires.
+  if grep -qi '\[skip *ci\]' <<< "$(git log --format=%B "$log_range" 2>/dev/null)"; then
     echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
     return 0
   fi
@@ -725,6 +729,15 @@ enum Command {
     /// Configure GitHub credentials (App or fine-grained PAT).
     Setup(github_setup::SetupArgs),
 
+    /// Configure credentials, the golden image, and how to run — in one step.
+    ///
+    /// In a terminal this is a four-step wizard (credentials, golden, run
+    /// mode, preflight); with stdin or stdout not a TTY it takes the same
+    /// answers as flags and never prompts, so scripts and agents get the same
+    /// config. `--probe --json` reports host capabilities without touching
+    /// anything. Re-running reconfigures in place.
+    Init(init::InitArgs),
+
     /// Verify the GitHub credential configuration.
     Doctor(github_setup::DoctorArgs),
 
@@ -1072,6 +1085,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Update(args) => update::run(args).await,
         // Local configuration commands must not spawn the engine.
         Command::Setup(args) => github_setup::cmd_setup(args).await,
+        Command::Init(args) => init::run(args, Some(observability.clone())).await,
         Command::Doctor(args) => github_setup::cmd_doctor(args).await,
         Command::Secret(args) => github_setup::cmd_secret(args).await,
         Command::Server(args) => server_install::run(args),
@@ -1103,6 +1117,7 @@ async fn main() -> anyhow::Result<()> {
                     | Command::GoldenPath(_)
                     | Command::Version
                     | Command::Setup(_)
+                    | Command::Init(_)
                     | Command::Doctor(_)
                     | Command::Secret(_)
                     | Command::Server(_) => {
@@ -1116,6 +1131,15 @@ async fn main() -> anyhow::Result<()> {
     // Bounded 2s flush of buffered telemetry on every exit path; a clean
     // shutdown must not drop the last flush window's records.
     observability_runtime.shutdown().await;
+    // `preloop init` promises scripts specific codes (2 missing flag, 3
+    // preflight, 4 pull/bake/build); everything else keeps the usual exit 1
+    // that `Result`'s termination supplies.
+    if let Err(error) = &result
+        && let Some(code) = init::exit_code(error)
+    {
+        eprintln!("preloop init: {error}");
+        std::process::exit(code);
+    }
     result
 }
 
@@ -1211,6 +1235,9 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
+        // Unused by a bake (the builder VM is gated by
+        // `ensure_disk_for_golden_build`), but the pool config is shared.
+        job_vm_disk: preloop_orchestrator::JobVmDiskReserve::from_env(),
         debug_dir: None,
         runner_key_dir: None,
         pending_jobs: None,
@@ -1796,6 +1823,11 @@ async fn cmd_engine(
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
     // inside `serve`, so anything published after that call is ignored.
+    //
+    // The offer comes first: `preloop init` writes credentials too, and a
+    // credential configured by the wizard must be the one this process picks
+    // up, not the one it read a moment earlier.
+    offer_init_when_unconfigured().await?;
     resolve_github_auth(&args, &state_dir)?;
 
     // Shared with the runner pool so it can size provisioning to the work
@@ -2078,6 +2110,55 @@ fn truncate_reason(s: &str) -> String {
     }
 }
 
+/// Base image the runner pool boots its golden from.
+///
+/// `PRELOOP_RUNNER_BASE_IMAGE` wins, then the `[golden]` section
+/// `preloop init` writes to the config file, then the engine's stock base —
+/// the digest-pinned Ubuntu pin whose packed official golden the pool
+/// downloads. Reading the file here is what makes one `preloop init` enough:
+/// `serve` and `server install` never needed a separate golden flag.
+fn configured_base_image() -> anyhow::Result<String> {
+    let config = preloop_runner_server::config::load_config()?;
+    Ok(preloop_runner_server::config::golden_base_image(&config)
+        .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_owned()))
+}
+
+/// `serve` with no golden configured: offer the wizard when a human is
+/// watching, otherwise say the one line an operator needs. A non-interactive
+/// `serve` (systemd, CI, a pipe) must never block on a prompt.
+async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
+    let config = preloop_runner_server::config::load_config()?;
+    if preloop_runner_server::config::golden_base_image(&config).is_some() {
+        return Ok(());
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        eprintln!("[preloop] custom base? run `preloop init`");
+        return Ok(());
+    }
+    eprintln!(
+        "[preloop] no golden image configured — the engine will download the packed official \
+         GitHub runner golden (≈9.6 GB download, ~60 GB on disk)."
+    );
+    eprint!("[preloop] run `preloop init` first to choose one? [y/N] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        eprintln!(
+            "[preloop] continuing with the official golden; `preloop init` reconfigures later"
+        );
+        return Ok(());
+    }
+    // Configure only: this process is already the foreground engine, so a
+    // nested `serve` would fight it for the socket. Boxed because the call
+    // graph is genuinely cyclic (`serve` offers `init`, which can start
+    // `serve`); the mode this entry point forces is what keeps it from
+    // recursing at runtime.
+    Box::pin(init::run_from_serve()).await?;
+    eprintln!("[preloop] configuration written; continuing to serve");
+    Ok(())
+}
+
 // Configuration assembly, not a public API: the parameter list mirrors the
 // inputs the pool genuinely needs.
 #[allow(clippy::too_many_arguments)]
@@ -2190,8 +2271,9 @@ fn local_runner_pool_config(
     } else {
         control_socket
     };
-    let base_image = std::env::var("PRELOOP_RUNNER_BASE_IMAGE")
-        .unwrap_or_else(|_| preloop_orchestrator::environment::DEFAULT_BASE_IMAGE.into());
+    // The golden's base image: `PRELOOP_RUNNER_BASE_IMAGE`, else the choice
+    // `preloop init` persisted, else the stock pin.
+    let base_image = configured_base_image()?;
     // A custom base image (`.smolmachine` artifact or any non-stock OCI
     // reference) serves every queued job itself, so environment-based runner
     // replacement has nothing to switch to: the job's implied stock base
@@ -2275,6 +2357,7 @@ fn local_runner_pool_config(
         overlay_gib: std::env::var("PRELOOP_RUNNER_OVERLAY_GB")
             .ok()
             .and_then(|v| v.parse().ok()),
+        job_vm_disk: preloop_orchestrator::JobVmDiskReserve::from_env(),
         debug_dir: Some(home.join("state").join("debug")),
         runner_key_dir: None,
         // Warm the golden with the images this project's workflows declare,
@@ -5161,6 +5244,65 @@ mod tests {
             std::env::remove_var("PRELOOP_RUNNER_LABELS");
         }
         assert_eq!(labels.len(), 3);
+    }
+
+    /// `preloop init` is only one command if `serve` actually reads what it
+    /// wrote: the pool's base image comes from `[golden]`, and
+    /// `PRELOOP_RUNNER_BASE_IMAGE` still overrides it.
+    #[test]
+    fn the_pool_reads_the_golden_init_recorded() {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = preloop_runner_server::config::ConfigFile::default();
+        config.golden = preloop_runner_server::config::GoldenConfig {
+            kind: Some("oci".to_owned()),
+            base_image: Some("ghcr.io/acme/base:1".to_owned()),
+            dockerfile: None,
+        };
+        preloop_runner_server::config::write_config_to(&config_path, &config).unwrap();
+        let previous_config = std::env::var_os(preloop_runner_server::config::CONFIG_PATH_ENV);
+        let previous_base = std::env::var_os(preloop_runner_server::config::BASE_IMAGE_ENV);
+        unsafe {
+            std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, &config_path);
+            std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV);
+        }
+
+        assert_eq!(
+            configured_base_image().unwrap(),
+            "ghcr.io/acme/base:1",
+            "the recorded golden is what the pool boots from"
+        );
+
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::config::BASE_IMAGE_ENV,
+                "ubuntu:24.04",
+            )
+        };
+        assert_eq!(
+            configured_base_image().unwrap(),
+            "ubuntu:24.04",
+            "the environment variable still wins over the recorded choice"
+        );
+        // An exported-but-blank variable must not become an empty base image.
+        unsafe { std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, " ") };
+        assert_eq!(configured_base_image().unwrap(), "ghcr.io/acme/base:1");
+
+        unsafe {
+            match previous_config {
+                Some(value) => {
+                    std::env::set_var(preloop_runner_server::config::CONFIG_PATH_ENV, value)
+                }
+                None => std::env::remove_var(preloop_runner_server::config::CONFIG_PATH_ENV),
+            }
+            match previous_base {
+                Some(value) => {
+                    std::env::set_var(preloop_runner_server::config::BASE_IMAGE_ENV, value)
+                }
+                None => std::env::remove_var(preloop_runner_server::config::BASE_IMAGE_ENV),
+            }
+        }
     }
 
     #[test]

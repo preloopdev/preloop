@@ -29,6 +29,53 @@ use std::path::{Path, PathBuf};
 /// `{preloop_home}/config.toml`; the default matches when HOME is used.
 pub const CONFIG_PATH_ENV: &str = "PRELOOP_CONFIG";
 
+/// Env var overriding the golden's base image at serve time. Always wins
+/// over the `[golden]` section, so a deployment can override the persisted
+/// choice without rewriting the file.
+pub const BASE_IMAGE_ENV: &str = "PRELOOP_RUNNER_BASE_IMAGE";
+
+/// The golden every job VM forks from, as chosen by `preloop init`.
+///
+/// Only `base_image` is read at serve time; the other keys exist so the
+/// wizard can show the previous answer on a re-run and change one step
+/// without re-asking the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoldenConfig {
+    /// How the base image was chosen: `official`, `oci`, `dockerfile`, or
+    /// `file`. Recorded for the wizard's re-run story; `serve` ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Base image `serve` boots its golden from: an OCI reference, a
+    /// docker-save `.tar`, or a `.smolmachine`/rootfs path. Absent means the
+    /// engine's stock base — the packed official GitHub runner golden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
+    /// Dockerfile a `kind = "dockerfile"` tar was built from, so a re-run can
+    /// rebuild the same context without asking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<PathBuf>,
+}
+
+/// Effective golden base image: [`BASE_IMAGE_ENV`] when set to a non-blank
+/// value, else the `[golden]` section. `None` means the engine's stock base.
+///
+/// An exported-but-blank variable behaves like an unset one — the same rule
+/// `PRELOOP_GOLDEN_URL` follows — so a shell that exports an empty value
+/// cannot silently configure an empty base image.
+pub fn golden_base_image(config: &ConfigFile) -> Option<String> {
+    if let Ok(value) = std::env::var(BASE_IMAGE_ENV)
+        && !value.trim().is_empty()
+    {
+        return Some(value);
+    }
+    config
+        .golden
+        .base_image
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// GitHub credential configuration, mirrored 1:1 by the `PRELOOP_GITHUB_*`
 /// environment variables.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -634,6 +681,11 @@ impl Default for ForkPolicyConfig {
 pub struct ConfigFile {
     #[serde(default)]
     pub github: GitHubConfig,
+    /// Golden (the VM image every job forks from) chosen by `preloop init`.
+    /// `serve` reads it when `PRELOOP_RUNNER_BASE_IMAGE` is unset; the
+    /// environment variable always takes precedence.
+    #[serde(default)]
+    pub golden: GoldenConfig,
     /// Optional checkout-object reuse. `off` is the default and preserves
     /// direct per-job forge checkout.
     #[serde(default)]
@@ -1015,8 +1067,9 @@ impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ConfigFile {{ github: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
+            "ConfigFile {{ github: {:?}, golden: {:?}, secrets: {} names, repo_secrets: {} repos, env_secrets: {} repos, environments: {} repos, environment_rules: {} repos, token_permissions_ceiling: {}, fork_policy: {:?}, execution_protection: {:?} ({} event rules, {} actor rules) }}",
             self.github,
+            self.golden,
             self.secrets.len(),
             self.repo_secrets.len(),
             self.env_secrets.len(),
@@ -1659,6 +1712,7 @@ mod tests {
             secrets_store: None,
             checkout_cache: CheckoutCacheConfig::default(),
             retention_days: DEFAULT_RETENTION_DAYS,
+            golden: GoldenConfig::default(),
         }
     }
 

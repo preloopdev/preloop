@@ -33,13 +33,21 @@ less install.sh
 sh install.sh
 ```
 ```
+preloop init              # wizard: credentials, golden image, how to run
 preloop serve            # engine on 127.0.0.1:9090
 ```
 ```
 cd my-repo
 preloop run -f .github/workflows/ci.yml --event pull_request
 ```
-This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so atleast 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
+`preloop init` walks through four steps (GitHub credential, the golden image
+every job forks from, run mode, preflight) and writes the result to
+`~/.preloop/config.toml`. Without a terminal it takes the same answers as
+flags — `preloop init --probe --json` reports what this host supports without
+changing anything, and `preloop init --help` documents every flag. It is the
+one-command front door to what `preloop setup github` and a hand-picked
+`PRELOOP_RUNNER_BASE_IMAGE` used to be.
+This starts the server in the foreground, but you can detach it too(add a `-d`). First run can take a few minutes as we need to download a packed vm artifact of the SBOM-attested Official Github Runner OCI image ([runner-image-blobs](https://github.com/preloopdev/runner-image-blobs)) and create a "golden" vm locally. This golden vm will be forked per job in 300 ms. The official Github image is around 9GB compressed, and unpacks to almost 50 GB so atleast 80GB disk is recommended. You can alternatively define your own golden vm from an OCI image — `preloop init` records it for you. [docs/vm-images.md](docs/vm-images.md) for more detailed info. Each vm's memory is elastic so it only consumes what's actually being used in the job. The control plane idle rss is around 25MB. 
 Prefer not to run a script: take `preloop-cli-<target>.tar.gz` and its `.sha256`
 from the [latest release](https://github.com/preloopdev/preloop/releases/latest),
 verify the checksum, put `preloop` on your `PATH`, and run `preloop update` to

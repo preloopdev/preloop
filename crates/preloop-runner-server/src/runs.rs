@@ -1040,7 +1040,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         .next()
         .unwrap_or("owner")
         .to_string();
-    let sha = submission
+    let mut sha = submission
         .resolved_sha
         .clone()
         .or_else(|| {
@@ -1398,23 +1398,21 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         }
         // The github context was built before the snapshot existed; refresh
         // the pieces that now describe the local tree.
+        //
+        // `github.sha` is the workspace's real HEAD commit, not the
+        // synthetic snapshot commit: the snapshot commit exists only in
+        // this engine's store, so a workflow step that fetches
+        // `${{ github.sha }}` from the real remote (custom checkouts)
+        // would be answered "not our ref". The workspace HEAD is the
+        // identity the run is really based on. `sha` feeds every job's
+        // `job.workflow_sha` (what `$/` resolves against), so it moves too.
+        sha = snapshot
+            .head_sha
+            .clone()
+            .unwrap_or_else(|| snapshot.commit_sha.clone());
         if let Some(object) = github.as_object_mut() {
             object.insert("event".to_owned(), submission.payload.clone());
-            // `github.sha` is the workspace's real HEAD commit, not the
-            // synthetic snapshot commit: the snapshot commit exists only in
-            // this engine's store, so a workflow step that fetches
-            // `${{ github.sha }}` from the real remote (custom checkouts)
-            // would be answered "not our ref". The workspace HEAD is the
-            // identity the run is really based on.
-            object.insert(
-                "sha".to_owned(),
-                serde_json::json!(
-                    snapshot
-                        .head_sha
-                        .clone()
-                        .unwrap_or_else(|| snapshot.commit_sha.clone())
-                ),
-            );
+            object.insert("sha".to_owned(), serde_json::json!(sha));
         }
     }
 
@@ -2428,6 +2426,11 @@ pub(crate) fn build_job_artifacts(
                 source = ?snapshot.source,
                 "Redirected primary checkout to immutable snapshot"
             );
+        }
+        // Self-repository actions can use this snapshot even when the workflow
+        // has no actions/checkout step. Preserve the marker for local workspace
+        // snapshots independently of checkout rewriting.
+        if redirected > 0 || snapshot.source == crate::snapshots::SnapshotSource::LocalWorkspace {
             agent_msg.preloop_snapshot_commit = Some(snapshot.commit_sha.clone());
         }
         // Local-workspace runs test code the forge has never seen, so anything
@@ -3762,6 +3765,58 @@ fn live_run_events(
 mod tests {
     use super::*;
     use futures::FutureExt;
+
+    /// A needs-gated job whose `if:` resolves false must be Skipped at
+    /// promotion, not failed at enqueue on labels it never needed. The
+    /// submit-time pool gate only sees literal labels; `vars`-driven `if:`
+    /// belongs to promotion, so the label check belongs there too.
+    #[tokio::test]
+    async fn needs_gated_unsatisfiable_labels_skip_on_if_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        state.pool_status.set_labels(vec![
+            "self-hosted".to_owned(),
+            "Linux".to_owned(),
+            "aarch64".to_owned(),
+            "preloop-cpane".to_owned(),
+        ]);
+        let shared = state.shared();
+        let submission = preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: "on: push\njobs:\n  prep:\n    runs-on: self-hosted\n    steps:\n      - run: echo ok\n  sync:\n    needs: prep\n    if: vars.NONEXISTENT != ''\n    runs-on: [self-hosted, runner-sync]\n    steps:\n      - run: echo unreachable\n"
+                .to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            workflow_path: Some(".github/workflows/runner-sync.yml".to_owned()),
+            sha: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned(),
+            ..Default::default()
+        };
+        let result = submit_run_inner_with_webhook_delivery(&shared, submission, None)
+            .await
+            .unwrap();
+        // `sync` must not be failed at enqueue — its `if:` is pending until
+        // `prep` finishes, then promotion evaluates it to Skip.
+        let sync_status = state
+            .backend
+            .run_job_statuses(result.run_id)
+            .await
+            .expect("backend read")
+            .expect("run exists")
+            .into_iter()
+            .find(|(job_id, _)| *job_id == JobId("sync".to_owned()))
+            .map(|(_, status)| status);
+        assert_ne!(
+            sync_status,
+            Some(ExecutionStatus::Failure),
+            "needs-gated job failed at enqueue on labels before its if: was evaluated"
+        );
+        assert!(
+            matches!(
+                sync_status,
+                Some(ExecutionStatus::Queued | ExecutionStatus::Pending)
+            ),
+            "sync job must still be pending until needs settle, got {sync_status:?}"
+        );
+    }
 
     #[test]
     fn orchestration_id_matches_github_format() {

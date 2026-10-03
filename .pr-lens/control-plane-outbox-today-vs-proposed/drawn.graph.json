@@ -1,0 +1,1146 @@
+{
+  "schemaVersion": "0.1.0",
+  "kind": "graph",
+  "generatedAt": "2026-10-01T21:42:17.000Z",
+  "title": "Control-plane outbox: today vs proposed",
+  "summary": "The control-plane outbox is write-only today: every command writes its event in-transaction, then state.emit writes it again and broadcasts SSE only on the committing node; GitHub check runs bypass the outbox entirely via fire-and-forget PATCH. Two tables already planned for the fix (consumer_offsets, check_run_updates) have no readers. The proposal: write once, let a leased relay feed ordered streams, and drive GitHub from a per-job queue with isolated retries.",
+  "lenses": [
+    "architecture",
+    "data-flow"
+  ],
+  "provenance": {
+    "repo": {
+      "owner": "preloopdev",
+      "name": "preloop",
+      "host": "github.com"
+    },
+    "base": {
+      "sha": "d66433d",
+      "ref": "Bnjoroge/lock-refactor"
+    },
+    "head": {
+      "sha": "b457987",
+      "ref": "Bnjoroge/lock-refactor"
+    },
+    "generator": {
+      "name": "pr-lens-manual",
+      "version": "0.1.0"
+    }
+  },
+  "lanes": [
+    {
+      "id": "commands",
+      "label": "Commands",
+      "subtitle": "control/pg per-function txns",
+      "order": 0
+    },
+    {
+      "id": "postgres",
+      "label": "Postgres",
+      "subtitle": "one DB, txid ordering",
+      "order": 1
+    },
+    {
+      "id": "node-local",
+      "label": "Engine process",
+      "subtitle": "per node, in-memory",
+      "order": 2
+    },
+    {
+      "id": "consumers",
+      "label": "Consumers",
+      "subtitle": "planned / external",
+      "order": 3
+    }
+  ],
+  "nodes": [
+    {
+      "id": "command-fns",
+      "label": "Command functions",
+      "kind": "function",
+      "delta": "unchanged",
+      "lane": "commands",
+      "group": "pg-commands",
+      "summary": "~20 command functions each run their own transaction: lock rows, mutate state, emit outbox.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 3771,
+          "endLine": 4340
+        },
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 4905,
+          "endLine": 5048
+        },
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 5308,
+          "endLine": 5370
+        }
+      ],
+      "badges": [
+        "submit_run",
+        "poll_session",
+        "complete_job",
+        "cancel",
+        "promote",
+        "expansion"
+      ]
+    },
+    {
+      "id": "cmd-submit",
+      "label": "submit_run",
+      "kind": "function",
+      "delta": "unchanged",
+      "lane": "commands",
+      "group": "pg-commands",
+      "subtitle": "dispatch.rs:3771",
+      "summary": "REST + webhook intake. Emits run.created.v1, job.queued.v1 (+NOTIFY).",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 3771,
+          "endLine": 3771
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "cmd-claim",
+      "label": "poll_session",
+      "kind": "function",
+      "delta": "unchanged",
+      "lane": "commands",
+      "group": "pg-commands",
+      "subtitle": "dispatch.rs:4905",
+      "summary": "Runner claim: jobs row FOR UPDATE SKIP LOCKED, then flush_run + emit_outbox job.started.v1.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 4905,
+          "endLine": 4905
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "cmd-complete",
+      "label": "complete_job / settle_job",
+      "kind": "function",
+      "delta": "unchanged",
+      "lane": "commands",
+      "group": "pg-commands",
+      "subtitle": "dispatch.rs:5308/5372",
+      "summary": "lock_run, settle_node: job.completed.v1 + run.completed.v1 when terminal.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 5308,
+          "endLine": 5308
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "cmd-other",
+      "label": "Other commands",
+      "kind": "other",
+      "delta": "added",
+      "lane": "commands",
+      "group": "pg-commands",
+      "summary": "cancel, promote, expansion, reaper, fork-approval expiry: same txn shape, same run-row lock.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/lifecycle.rs",
+          "startLine": 1144,
+          "endLine": 1752
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "cmd-txn",
+      "label": "Command transaction",
+      "kind": "module",
+      "delta": "unchanged",
+      "lane": "postgres",
+      "subtitle": "dispatch.rs emit_outbox:3363",
+      "summary": "State change + outbox row + event_seq bump in ONE transaction. pg_notify on commit.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 3343,
+          "endLine": 3420
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "outbox-table",
+      "label": "outbox_events",
+      "kind": "datastore",
+      "delta": "unchanged",
+      "lane": "postgres",
+      "subtitle": "schema.sql:527",
+      "summary": "Insert-only log: (event_id identity, txid, run_id, run_seq, topic, payload). Today: write-only, no readers.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/schema.sql",
+          "startLine": 527,
+          "endLine": 537
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "runs-row",
+      "label": "runs.event_seq",
+      "kind": "datastore",
+      "delta": "unchanged",
+      "lane": "postgres",
+      "subtitle": "schema.sql:123",
+      "summary": "Per-run counter bumped by every emit_outbox. Row lock serializes all events of one run. Written, never read.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/schema.sql",
+          "startLine": 122,
+          "endLine": 123
+        }
+      ],
+      "badges": [
+        "runs row"
+      ]
+    },
+    {
+      "id": "pg-notify",
+      "label": "pg_notify wake",
+      "kind": "queue",
+      "delta": "unchanged",
+      "lane": "postgres",
+      "subtitle": "wake.rs",
+      "summary": "Commit-time hint only: ready count + broadcast flag. A lost one only delays a poll.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/wake.rs",
+          "startLine": 1,
+          "endLine": 60
+        }
+      ],
+      "badges": [
+        "preloop_wake"
+      ]
+    },
+    {
+      "id": "listen-conn",
+      "label": "LISTEN conn / wakes",
+      "kind": "service",
+      "delta": "unchanged",
+      "lane": "node-local",
+      "subtitle": "wake.rs:62, state.rs:1401",
+      "summary": "One LISTEN connection per node; wakes only that node's long-poll waiters.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/wake.rs",
+          "startLine": 62,
+          "endLine": 87
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "poll-waiters",
+      "label": "Long-poll waiters",
+      "kind": "service",
+      "delta": "unchanged",
+      "lane": "node-local",
+      "subtitle": "runners blocked in poll",
+      "summary": "Runners blocked in long-poll; woken by notify. Cross-node wake arrives via LISTEN.",
+      "files": [],
+      "badges": []
+    },
+    {
+      "id": "handler-layer",
+      "label": "Post-commit handlers",
+      "kind": "function",
+      "delta": "modified",
+      "lane": "node-local",
+      "subtitle": "distributed_task.rs:859-908",
+      "summary": "After commit: tokio::spawn check-run report + state.emit JobStatus/RunStatus per completion.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/distributed_task.rs",
+          "startLine": 839,
+          "endLine": 913
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "state-emit",
+      "label": "state.emit",
+      "kind": "function",
+      "delta": "modified",
+      "lane": "node-local",
+      "subtitle": "state.rs:1493",
+      "summary": "append_event writes a SECOND outbox row per event in its own txn, then broadcasts SSE in-process.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/state.rs",
+          "startLine": 1493,
+          "endLine": 1586
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "sse-stream",
+      "label": "SSE run events",
+      "kind": "route",
+      "delta": "modified",
+      "lane": "consumers",
+      "subtitle": "runs.rs:3663 run_events",
+      "summary": "Subscribes to the node's broadcast channel: misses events committed on the other node.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/runs.rs",
+          "startLine": 3663,
+          "endLine": 3683
+        }
+      ],
+      "badges": [
+        "node-local only"
+      ]
+    },
+    {
+      "id": "github-direct",
+      "label": "report_check_run_completed",
+      "kind": "function",
+      "delta": "modified",
+      "lane": "node-local",
+      "subtitle": "github.rs:826 (since 2026-08 push-back)",
+      "summary": "Direct PATCH after commit via tokio::spawn. Warn-and-return on failure: no retry, lost on crash.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/github.rs",
+          "startLine": 826,
+          "endLine": 1037
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "github-api",
+      "label": "GitHub Checks API",
+      "kind": "external",
+      "delta": "unchanged",
+      "lane": "consumers",
+      "subtitle": "PATCH check-runs/:id",
+      "summary": "External sink. Only safe-repeat calls (set-status) may be retried from a log.",
+      "files": [],
+      "badges": []
+    },
+    {
+      "id": "checkrun-queue",
+      "label": "check_run_updates (planned)",
+      "kind": "queue",
+      "delta": "modified",
+      "lane": "postgres",
+      "subtitle": "schema.sql:596, no Rust users",
+      "summary": "One row per (run_id, job_id): latest check state + attempts/not_before/lease. Built for, used by nothing.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/schema.sql",
+          "startLine": 596,
+          "endLine": 606
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "consumer-offsets",
+      "label": "consumer_offsets (planned)",
+      "kind": "datastore",
+      "delta": "modified",
+      "lane": "postgres",
+      "subtitle": "schema.sql:543, no Rust users",
+      "summary": "One bookmark row per consumer: (last_txid, last_event_id) + lease_owner/lease_until.",
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/schema.sql",
+          "startLine": 543,
+          "endLine": 548
+        }
+      ],
+      "badges": []
+    },
+    {
+      "id": "relay-loop",
+      "label": "Relay loop (proposed)",
+      "kind": "job",
+      "delta": "added",
+      "lane": "node-local",
+      "subtitle": "one loop per consumer, leased",
+      "summary": "Reads outbox below the xmin safe point, acts per event, advances the bookmark. At-least-once: actions must be idempotent.",
+      "files": [],
+      "badges": []
+    },
+    {
+      "id": "stream-relay",
+      "label": "Stream relay (proposed)",
+      "kind": "service",
+      "delta": "added",
+      "lane": "node-local",
+      "subtitle": "SSE + metering consumer",
+      "summary": "Tails the outbox into every node's local broadcast: any node serves any run's live events.",
+      "files": [],
+      "badges": []
+    },
+    {
+      "id": "checkrun-worker",
+      "label": "Check-run worker (proposed)",
+      "kind": "job",
+      "delta": "added",
+      "lane": "node-local",
+      "subtitle": "SKIP LOCKED drain",
+      "summary": "Claims check_run_updates rows, PATCHes GitHub, deletes on success, backs off per row on failure.",
+      "files": [],
+      "badges": []
+    }
+  ],
+  "edges": [
+    {
+      "id": "cmd-to-txn",
+      "from": "command-fns",
+      "to": "cmd-txn",
+      "kind": "call",
+      "delta": "unchanged",
+      "label": "each command runs one txn",
+      "emphasis": "normal",
+      "animated": false,
+      "files": []
+    },
+    {
+      "id": "txn-to-outbox",
+      "from": "cmd-txn",
+      "to": "outbox-table",
+      "kind": "data",
+      "delta": "unchanged",
+      "label": "INSERT outbox_events",
+      "emphasis": "hero",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 3363,
+          "endLine": 3395
+        }
+      ]
+    },
+    {
+      "id": "txn-to-runs",
+      "from": "cmd-txn",
+      "to": "runs-row",
+      "kind": "data",
+      "delta": "unchanged",
+      "label": "locks runs row (event_seq, flush_run)",
+      "emphasis": "normal",
+      "animated": false,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 150,
+          "endLine": 181
+        }
+      ]
+    },
+    {
+      "id": "complete-to-txn",
+      "from": "cmd-complete",
+      "to": "cmd-txn",
+      "kind": "call",
+      "delta": "unchanged",
+      "label": "runs in",
+      "emphasis": "normal",
+      "animated": false,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 2959,
+          "endLine": 3098
+        }
+      ]
+    },
+    {
+      "id": "claim-to-txn",
+      "from": "cmd-claim",
+      "to": "cmd-txn",
+      "kind": "call",
+      "delta": "unchanged",
+      "label": "runs in",
+      "emphasis": "normal",
+      "animated": false,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 4905,
+          "endLine": 5048
+        }
+      ]
+    },
+    {
+      "id": "txn-to-notify",
+      "from": "cmd-txn",
+      "to": "pg-notify",
+      "kind": "event",
+      "delta": "unchanged",
+      "label": "pg_notify preloop_wake",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/dispatch.rs",
+          "startLine": 3397,
+          "endLine": 3413
+        }
+      ]
+    },
+    {
+      "id": "notify-to-listen",
+      "from": "pg-notify",
+      "to": "listen-conn",
+      "kind": "event",
+      "delta": "unchanged",
+      "label": "LISTEN fan-out",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/wake.rs",
+          "startLine": 40,
+          "endLine": 60
+        }
+      ]
+    },
+    {
+      "id": "listen-to-wakes",
+      "from": "listen-conn",
+      "to": "poll-waiters",
+      "kind": "event",
+      "delta": "unchanged",
+      "label": "wakes long-polls",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/state.rs",
+          "startLine": 1401,
+          "endLine": 1417
+        }
+      ]
+    },
+    {
+      "id": "handler-to-emit",
+      "from": "handler-layer",
+      "to": "state-emit",
+      "kind": "call",
+      "delta": "modified",
+      "label": "state.emit after commit",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/distributed_task.rs",
+          "startLine": 859,
+          "endLine": 908
+        }
+      ]
+    },
+    {
+      "id": "emit-to-append",
+      "from": "state-emit",
+      "to": "outbox-table",
+      "kind": "call",
+      "delta": "modified",
+      "label": "append_event: 2nd outbox write",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/lifecycle.rs",
+          "startLine": 1188,
+          "endLine": 1199
+        }
+      ]
+    },
+    {
+      "id": "emit-to-sse",
+      "from": "state-emit",
+      "to": "sse-stream",
+      "kind": "event",
+      "delta": "modified",
+      "label": "broadcast to SSE (node-local)",
+      "emphasis": "normal",
+      "animated": false,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/runs.rs",
+          "startLine": 3663,
+          "endLine": 3670
+        }
+      ]
+    },
+    {
+      "id": "handler-to-github",
+      "from": "handler-layer",
+      "to": "github-direct",
+      "kind": "call",
+      "delta": "modified",
+      "label": "tokio::spawn report after commit",
+      "emphasis": "normal",
+      "animated": false,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/distributed_task.rs",
+          "startLine": 859,
+          "endLine": 908
+        }
+      ]
+    },
+    {
+      "id": "github-to-ghapi",
+      "from": "github-direct",
+      "to": "github-api",
+      "kind": "http",
+      "delta": "modified",
+      "label": "PATCH check-runs/:id (fire-and-forget)",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/github.rs",
+          "startLine": 826,
+          "endLine": 1037
+        }
+      ]
+    },
+    {
+      "id": "outbox-to-relay",
+      "from": "outbox-table",
+      "to": "relay-loop",
+      "kind": "queue",
+      "delta": "added",
+      "label": "relay tails outbox past bookmark",
+      "emphasis": "hero",
+      "animated": true,
+      "files": []
+    },
+    {
+      "id": "relay-to-ssefan",
+      "from": "stream-relay",
+      "to": "sse-stream",
+      "kind": "event",
+      "delta": "added",
+      "label": "per-node SSE fan-out",
+      "emphasis": "normal",
+      "animated": true,
+      "files": []
+    },
+    {
+      "id": "relay-to-bookmark",
+      "from": "relay-loop",
+      "to": "consumer-offsets",
+      "kind": "data",
+      "delta": "added",
+      "label": "advance (txid, event_id) bookmark",
+      "emphasis": "normal",
+      "animated": true,
+      "files": []
+    },
+    {
+      "id": "txn-to-checkrun",
+      "from": "cmd-txn",
+      "to": "checkrun-queue",
+      "kind": "data",
+      "delta": "added",
+      "label": "upsert latest check state (in-txn)",
+      "emphasis": "normal",
+      "animated": true,
+      "files": [
+        {
+          "path": "crates/preloop-runner-server/src/control/pg/schema.sql",
+          "startLine": 596,
+          "endLine": 606
+        }
+      ]
+    },
+    {
+      "id": "worker-claims",
+      "from": "checkrun-queue",
+      "to": "checkrun-worker",
+      "kind": "queue",
+      "delta": "added",
+      "label": "SKIP LOCKED claim, PATCH, retry w/ backoff",
+      "emphasis": "normal",
+      "animated": true,
+      "files": []
+    },
+    {
+      "id": "checkrun-to-gh",
+      "from": "checkrun-worker",
+      "to": "github-api",
+      "kind": "http",
+      "delta": "added",
+      "label": "PATCH check-runs/:id, per-row retry",
+      "emphasis": "normal",
+      "animated": true,
+      "files": []
+    },
+    {
+      "id": "cmds-to-cmd",
+      "from": "command-fns",
+      "to": "cmd-other",
+      "kind": "call",
+      "delta": "unchanged",
+      "label": "entry: REST, webhook, polls, reaper",
+      "emphasis": "muted",
+      "animated": false,
+      "files": []
+    }
+  ],
+  "flows": [
+    {
+      "id": "claim-today",
+      "title": "Claim / acquire path today",
+      "summary": "A claim writes its outbox row in-transaction, then state.emit writes it again. The SSE broadcast never leaves the node.",
+      "delta": "unchanged",
+      "participants": [
+        {
+          "node": "cmd-claim",
+          "label": "claim command"
+        },
+        {
+          "node": "cmd-txn",
+          "label": "command txn"
+        },
+        {
+          "node": "handler-layer",
+          "label": "handler"
+        },
+        {
+          "node": "state-emit",
+          "label": "state.emit"
+        }
+      ],
+      "messages": [
+        {
+          "id": "c-claim",
+          "from": "cmd-claim",
+          "to": "cmd-txn",
+          "label": "claim jobs row SKIP LOCKED",
+          "kind": "sync",
+          "delta": "unchanged",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "c-write",
+          "from": "cmd-txn",
+          "to": "cmd-txn",
+          "label": "flush_run + event_seq bump + INSERT job.started.v1",
+          "kind": "self",
+          "delta": "unchanged",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "c-commit",
+          "from": "cmd-txn",
+          "to": "handler-layer",
+          "label": "commit; outcome returns",
+          "kind": "return",
+          "delta": "unchanged",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "c-emit",
+          "from": "handler-layer",
+          "to": "state-emit",
+          "label": "state.emit: 2nd outbox write + node-local broadcast",
+          "kind": "async",
+          "delta": "modified",
+          "animated": true,
+          "files": []
+        }
+      ]
+    },
+    {
+      "id": "complete-today",
+      "title": "Completion path today",
+      "summary": "One completion locks the runs row ~4 times: lock_run, event_seq bump, then two more append_event transactions.",
+      "delta": "unchanged",
+      "participants": [
+        {
+          "node": "cmd-complete",
+          "label": "complete command"
+        },
+        {
+          "node": "handler-layer",
+          "label": "handler"
+        },
+        {
+          "node": "github-direct",
+          "label": "direct reporter"
+        },
+        {
+          "node": "state-emit",
+          "label": "state.emit"
+        }
+      ],
+      "messages": [
+        {
+          "id": "m-write",
+          "from": "cmd-complete",
+          "to": "cmd-complete",
+          "label": "lock_run + event_seq bump + INSERT job.completed.v1",
+          "kind": "self",
+          "delta": "unchanged",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "m-return",
+          "from": "cmd-complete",
+          "to": "handler-layer",
+          "label": "commit; terminal status returns",
+          "kind": "return",
+          "delta": "unchanged",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "m-spawn",
+          "from": "handler-layer",
+          "to": "github-direct",
+          "label": "tokio::spawn report_check_run_completed",
+          "kind": "async",
+          "delta": "unchanged",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "m-patch",
+          "from": "github-direct",
+          "to": "github-direct",
+          "label": "PATCH check-runs; warn-and-return, no retry",
+          "kind": "self",
+          "delta": "modified",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "m-emit",
+          "from": "handler-layer",
+          "to": "state-emit",
+          "label": "emit JobStatus + RunStatus: 2 more outbox writes",
+          "kind": "async",
+          "delta": "modified",
+          "animated": true,
+          "files": []
+        }
+      ]
+    },
+    {
+      "id": "proposed-relay",
+      "title": "Proposed: log for streams, queue for GitHub",
+      "summary": "Write once; the outbox feeds ordered streams, and a per-job queue (not a log) drives GitHub with isolated retries.",
+      "delta": "added",
+      "participants": [
+        {
+          "node": "cmd-txn",
+          "label": "command txn"
+        },
+        {
+          "node": "outbox-table",
+          "label": "outbox"
+        },
+        {
+          "node": "relay-loop",
+          "label": "relay loop"
+        },
+        {
+          "node": "sse-stream",
+          "label": "SSE"
+        },
+        {
+          "node": "checkrun-queue",
+          "label": "check queue"
+        },
+        {
+          "node": "checkrun-worker",
+          "label": "check worker"
+        },
+        {
+          "node": "github-api",
+          "label": "GitHub"
+        }
+      ],
+      "messages": [
+        {
+          "id": "p-write",
+          "from": "cmd-txn",
+          "to": "outbox-table",
+          "label": "one txn: state + outbox row",
+          "kind": "sync",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "p-tail",
+          "from": "outbox-table",
+          "to": "relay-loop",
+          "label": "read batch below xmin safe point",
+          "kind": "async",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "p-fanout",
+          "from": "relay-loop",
+          "to": "sse-stream",
+          "label": "fan out: every node serves live events",
+          "kind": "async",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "p-bookmark",
+          "from": "relay-loop",
+          "to": "relay-loop",
+          "label": "advance (txid, event_id) bookmark",
+          "kind": "self",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "p-check",
+          "from": "cmd-txn",
+          "to": "checkrun-queue",
+          "label": "same txn upserts latest check state",
+          "kind": "sync",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "p-claim",
+          "from": "checkrun-queue",
+          "to": "checkrun-worker",
+          "label": "SKIP LOCKED claim",
+          "kind": "async",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        },
+        {
+          "id": "p-send",
+          "from": "checkrun-worker",
+          "to": "github-api",
+          "label": "PATCH; per-row retry w/ backoff",
+          "kind": "sync",
+          "delta": "added",
+          "animated": true,
+          "files": []
+        }
+      ]
+    }
+  ],
+  "stats": {
+    "filesChanged": 0,
+    "additions": 0,
+    "deletions": 0,
+    "chips": [
+      {
+        "label": "Outbox writes/job",
+        "value": "~4x today",
+        "tone": "hero"
+      },
+      {
+        "label": "Planned tables, 0 readers",
+        "value": "2",
+        "tone": "removed"
+      },
+      {
+        "label": "Outbox topics",
+        "value": "7 fixed",
+        "tone": "neutral"
+      },
+      {
+        "label": "New workers",
+        "value": "2",
+        "tone": "added"
+      }
+    ]
+  },
+  "views": [
+    {
+      "id": "overview",
+      "title": "Outbox system overview",
+      "lens": "architecture",
+      "summary": "Write side, duplicate write side, node-local sinks, planned-but-unused tables, and the proposed relay.",
+      "scope": {
+        "kind": "all"
+      },
+      "defaultOpen": true,
+      "children": [
+        {
+          "id": "write-side",
+          "title": "The write side (all used today)",
+          "lens": "architecture",
+          "summary": "Every command writes state + outbox + event_seq bump in one transaction.",
+          "scope": {
+            "kind": "selection",
+            "lanes": [],
+            "nodes": [
+              "command-fns",
+              "cmd-submit",
+              "cmd-claim",
+              "cmd-complete",
+              "cmd-txn",
+              "outbox-table",
+              "runs-row",
+              "pg-notify"
+            ],
+            "edges": [
+              "cmd-to-txn",
+              "complete-to-txn",
+              "claim-to-txn",
+              "txn-to-outbox",
+              "txn-to-runs",
+              "txn-to-notify"
+            ],
+            "flows": []
+          },
+          "defaultOpen": false,
+          "children": []
+        },
+        {
+          "id": "duplication",
+          "title": "The duplication (to remove)",
+          "lens": "architecture",
+          "summary": "The double-write and the two node-local sinks that the outbox was meant to replace.",
+          "scope": {
+            "kind": "selection",
+            "lanes": [],
+            "nodes": [
+              "github-api",
+              "github-direct",
+              "handler-layer",
+              "sse-stream",
+              "state-emit"
+            ],
+            "edges": [
+              "emit-to-sse",
+              "github-to-ghapi",
+              "handler-to-emit",
+              "handler-to-github",
+              "emit-to-append"
+            ],
+            "flows": []
+          },
+          "defaultOpen": false,
+          "children": []
+        },
+        {
+          "id": "unused-tables",
+          "title": "Planned but unwired",
+          "lens": "architecture",
+          "summary": "Schema that exists with zero Rust readers: the relay bookmarks and the check-run retry queue.",
+          "scope": {
+            "kind": "selection",
+            "lanes": [],
+            "nodes": [
+              "checkrun-queue",
+              "checkrun-worker",
+              "consumer-offsets"
+            ],
+            "edges": [
+              "checkrun-to-gh",
+              "relay-to-bookmark",
+              "txn-to-checkrun",
+              "worker-claims"
+            ],
+            "flows": []
+          },
+          "defaultOpen": false,
+          "children": []
+        },
+        {
+          "id": "claim-flow",
+          "title": "Data flow: claim today",
+          "lens": "data-flow",
+          "summary": "A claim writes in-transaction, then writes again via state.emit; SSE stays on one node.",
+          "scope": {
+            "kind": "selection",
+            "lanes": [],
+            "nodes": [],
+            "edges": [],
+            "flows": [
+              "claim-today"
+            ]
+          },
+          "defaultOpen": false,
+          "children": []
+        },
+        {
+          "id": "complete-flow",
+          "title": "Data flow: completion today",
+          "lens": "data-flow",
+          "summary": "A completion locks runs ~4x and reports GitHub fire-and-forget with no retry.",
+          "scope": {
+            "kind": "selection",
+            "lanes": [],
+            "nodes": [],
+            "edges": [],
+            "flows": [
+              "complete-today"
+            ]
+          },
+          "defaultOpen": false,
+          "children": []
+        },
+        {
+          "id": "proposed-flow",
+          "title": "Data flow: proposed relay + queue",
+          "lens": "data-flow",
+          "summary": "Write once; relay feeds streams, queue drives GitHub with per-row retry.",
+          "scope": {
+            "kind": "selection",
+            "lanes": [],
+            "nodes": [],
+            "edges": [],
+            "flows": [
+              "proposed-relay"
+            ]
+          },
+          "defaultOpen": false,
+          "children": []
+        }
+      ]
+    }
+  ],
+  "layout": {
+    "direction": "right",
+    "laneOrder": [
+      "commands",
+      "postgres",
+      "node-local",
+      "consumers"
+    ]
+  }
+}
