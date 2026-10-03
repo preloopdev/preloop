@@ -564,9 +564,18 @@ pub async fn blob_get(
 /// Execution plans whose uploaded logs are kept on disk.
 ///
 /// `preloop logs` prefers these blobs and falls back to the in-memory log
-/// blocks when they are gone, so a pruned run still reports its logs for as
-/// long as the engine lives.
-pub const REPLAY_PLANS_RETAINED: usize = 64;
+/// blocks, which are dropped for all but the newest few finished runs (see
+/// `memory_caps::MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`). Once a run's plan is
+/// pruned from here its logs are gone for good, so this is the real log
+/// retention window.
+///
+/// There is one plan per *job*, and a single push fans out to 20+ of them, so
+/// the earlier 64 covered only two or three pushes — minutes on a busy engine,
+/// not enough to read the logs of a failure that was noticed later. A plan's
+/// blobs measured a median of 144 KiB and at most 644 KiB, so 1024 plans stay
+/// under roughly 650 MiB in the worst case (about 150 MiB at the median) while
+/// covering several days of a lightly used engine and many hours of a busy one.
+pub const REPLAY_PLANS_RETAINED: usize = 1024;
 
 /// Bound the replay directory to the most recently written plans.
 ///

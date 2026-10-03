@@ -62,6 +62,7 @@ pub fn strip_transport_prefixes(path: &str) -> &str {
 /// - strip a single-segment random base before `/_apis/`
 /// - replace GUIDs with `{guid}`
 /// - replace all-digit path segments with `{n}`
+/// - replace git object ids (40/64 lowercase hex) path segments with `{sha}`
 /// - replace all-digit or GUID-prefixed query values with `{n}` / `{guid}`
 pub fn normalize_path(path: &str) -> String {
     // Strip transport prefixes (/runner/server, single random base before
@@ -87,6 +88,10 @@ pub fn normalize_path(path: &str) -> String {
         .map(|seg| {
             if seg.chars().all(|c| c.is_ascii_digit()) && !seg.is_empty() {
                 "{n}"
+            } else if matches!(seg.len(), 40 | 64)
+                && seg.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            {
+                "{sha}"
             } else {
                 seg
             }
@@ -1206,6 +1211,19 @@ mod tests {
         assert_eq!(
             normalize_path("/_apis/distributedtask/pools/42/agents"),
             "/_apis/distributedtask/pools/{n}/agents"
+        );
+    }
+
+    #[test]
+    fn normalize_collapses_git_object_ids_but_not_short_hex_names() {
+        assert_eq!(
+            normalize_path("/actions/checkout/tar.gz/11d5960a326750d5838078e36cf38b85af677262"),
+            "/actions/checkout/tar.gz/{sha}"
+        );
+        // A branch or repo that merely looks hex keeps its identity.
+        assert_eq!(
+            normalize_path("/repos/o/deadbeef/commits/main"),
+            "/repos/o/deadbeef/commits/main"
         );
     }
 

@@ -127,6 +127,51 @@ fn decode_template_token(value: &serde_json::Value) -> serde_json::Value {
 
 // ── Parsing ──────────────────────────────────────────────────────────
 
+/// Evaluate TemplateToken expression nodes (`type: 3`) against the job
+/// expression context, recursively.
+///
+/// The server keeps `container:`/`services:` raw and encodes a `${{ }}` value
+/// as an expression token, so a matrix-driven
+/// `container: ${{ matrix.build.container }}` arrives unevaluated. Without
+/// this, [`parse_container_spec`] sees an object with no `image` key, returns
+/// `None`, and the job silently runs on the VM instead of the container —
+/// which is how `apk add` ended up executing on an Ubuntu host for curl's
+/// Alpine matrix legs.
+///
+/// Returns a copy with expression tokens replaced by their evaluated values;
+/// other objects and arrays are traversed, and scalar values are preserved.
+/// Returns an error containing the expression and its evaluation error if any
+/// token fails to evaluate.
+pub(crate) fn evaluate_expression_tokens(
+    value: &serde_json::Value,
+    ctx: &preloop_gha_expressions::Context,
+) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|t| t.as_u64()) == Some(3)
+                && let Some(expr) = map.get("expr").and_then(|e| e.as_str())
+            {
+                return preloop_gha_expressions::eval_expression(expr, ctx).map_err(|error| {
+                    format!("container/service expression `{expr}` could not be evaluated: {error}")
+                });
+            }
+            let mut evaluated = serde_json::Map::new();
+            for (key, item) in map {
+                evaluated.insert(key.clone(), evaluate_expression_tokens(item, ctx)?);
+            }
+            Ok(serde_json::Value::Object(evaluated))
+        }
+        serde_json::Value::Array(items) => {
+            let mut evaluated = Vec::with_capacity(items.len());
+            for item in items {
+                evaluated.push(evaluate_expression_tokens(item, ctx)?);
+            }
+            Ok(serde_json::Value::Array(evaluated))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
 /// Parse a `jobContainer` value (string, mapping, or TemplateToken) into a ContainerSpec.
 pub fn parse_container_spec(value: &serde_json::Value) -> Option<ContainerSpec> {
     // Decode TemplateToken if present
@@ -1105,6 +1150,59 @@ fn rand_bytes() -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A matrix-driven `container: ${{ matrix.build.container }}` arrives as a
+    /// type-3 expression token; evaluating it is what turns the job into a
+    /// container job (curl's Alpine legs otherwise ran `apk` on the host).
+    #[test]
+    fn expression_container_token_evaluates_against_the_matrix() {
+        let mut ctx = preloop_gha_expressions::Context::new();
+        ctx.insert(
+            "matrix",
+            serde_json::json!({"build": {"container": "alpine:3.22"}}),
+        );
+        let token = serde_json::json!({
+            "type": 3,
+            "file": 1,
+            "line": 1,
+            "col": 1,
+            "expr": "matrix.build.container"
+        });
+
+        let evaluated = evaluate_expression_tokens(&token, &ctx).expect("expression evaluates");
+        assert_eq!(evaluated, serde_json::json!("alpine:3.22"));
+        let spec = parse_container_spec(&evaluated).expect("container spec parses");
+        assert_eq!(spec.image, "alpine:3.22");
+
+        // Mapping form: the expression sits on the `image` entry.
+        let mapping = serde_json::json!({
+            "type": 2,
+            "map": [
+                {"Key": {"type": 0, "lit": "image"}, "Value": token.clone()},
+                {"Key": {"type": 0, "lit": "options"}, "Value": {"type": 0, "lit": "--cpus 2"}}
+            ]
+        });
+        let evaluated = evaluate_expression_tokens(&mapping, &ctx).expect("mapping evaluates");
+        let spec = parse_container_spec(&evaluated).expect("mapping container spec parses");
+        assert_eq!(spec.image, "alpine:3.22");
+        assert_eq!(spec.options, "--cpus 2");
+
+        // A failing expression must be reported, not silently downgraded to a
+        // host job (`parse_container_spec` would return None and run_job would
+        // continue without the declared container).
+        let broken = serde_json::json!({
+            "type": 3,
+            "file": 1,
+            "line": 1,
+            "col": 1,
+            "expr": "fromJSON('not json')"
+        });
+        let error = evaluate_expression_tokens(&broken, &ctx).expect_err("bad JSON must fail");
+        assert!(
+            error.contains("could not be evaluated"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn path_translation() {

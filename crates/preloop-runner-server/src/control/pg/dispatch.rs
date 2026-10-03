@@ -4030,6 +4030,7 @@ impl PgBackend {
         let has_runnable = jobs.iter().any(|job| {
             !logic::concludes_at_submit(
                 job.initially_skipped,
+                !job.queued.needs.is_empty(),
                 job.queued.reusable_call.is_some() || job.queued.deferred_matrix.is_some(),
                 &job.queued.runs_on,
                 check_hostable,
@@ -4122,8 +4123,12 @@ impl PgBackend {
             if let Some(oidc) = oidc_context {
                 node.oidc = oidc;
             }
-            // Unhostable platform: conclude immediately.
+            // Unhostable platform: conclude immediately. Deferred for
+            // needs-gated jobs — they park until their `if:` can be
+            // evaluated, and a job GitHub would skip must not fail here on
+            // labels it will never need; promotion re-runs this check.
             if check_hostable
+                && queued.needs.is_empty()
                 && let Some(platform) =
                     crate::runtime_scheduling::unhostable_platform(&node.runs_on, platforms.clone())
             {
@@ -4145,11 +4150,14 @@ impl PgBackend {
             // Labels the co-hosted pool can never satisfy and no registered
             // runner serves: conclude now instead of starving in the queue.
             // Placeholders are skipped — expansion materializes their jobs.
+            // Needs-gated jobs defer too: they park until their `if:` can be
+            // evaluated, and the promotion path re-runs this check.
             if !matches!(
                 node.status,
                 ExecutionStatus::Failure | ExecutionStatus::Skipped
             ) && queued.reusable_call.is_none()
                 && queued.deferred_matrix.is_none()
+                && queued.needs.is_empty()
                 && let Some(reason) = logic::unschedulable_reason(
                     &node.runs_on,
                     &pool_labels,

@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
           lfs: true
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
           version: 0.26.3
