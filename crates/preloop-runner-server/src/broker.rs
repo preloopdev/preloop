@@ -777,10 +777,12 @@ pub async fn next_message_broker_ref_root(
         if wait == 0 || std::time::Instant::now() >= deadline {
             return Ok(Json(serde_json::Value::Null).into_response());
         }
-        // Wake promptly on cancel/enqueue rather than fixed 250ms sleep.
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let slice = remaining.min(Duration::from_secs(3));
-        let _ = tokio::time::timeout(slice, shared.state.message_notify.notified()).await;
+        // One wait per window, like `next_message_broker_ref` and the azdo
+        // path: the poll above is a cheap reader probe now, and
+        // `message_notify` fires on every enqueue, cancellation and
+        // promotion. A lost wake only delays until the window ends.
+        let _ =
+            tokio::time::timeout_at(deadline.into(), shared.state.message_notify.notified()).await;
     }
 }
 
