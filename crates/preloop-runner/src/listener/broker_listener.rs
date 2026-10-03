@@ -4,6 +4,9 @@
 //! matching the official runner's JobDispatcher.cs behavior. This allows
 //! JobCancellation to arrive mid-job.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use tracing::{debug, info, warn};
@@ -14,6 +17,8 @@ use crate::client::run_service::RunServiceClient;
 use crate::listener::job_dispatcher::{self, RunningJob, cancellation_timing, parse_timespan_secs};
 use crate::settings::RunnerConfig;
 use crate::worker::helpers::extract_service_endpoint;
+
+type BrokerPoll = Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrokerMessageKind {
@@ -233,6 +238,13 @@ pub async fn run_broker_loop(
     let mut consecutive_errors: u32 = 0;
     let mut retry_backoff = SessionBackoff::default();
     let mut active_job: Option<RunningJob> = None;
+    // The in-flight message poll lives across loop iterations so that a job
+    // finishing (or the cancel-grace timer firing) does not abort it. The
+    // service may hand the next job to this runner on the open Busy poll at
+    // the moment the previous job completes; dropping the request then loses
+    // that job (actions/runner#4728). The new status goes out on the next
+    // poll instead. Only the poll branch clears it.
+    let mut pending_poll: Option<BrokerPoll> = None;
 
     // We start in a "need session" state.
     let mut need_session = true;
@@ -389,6 +401,16 @@ pub async fn run_broker_loop(
 
         let busy = active_job.is_some();
         let kill_at = active_job.as_ref().and_then(|j| j.kill_at);
+        if pending_poll.is_none() {
+            let poll_client = client.clone();
+            let poll_token = token.clone();
+            let poll_session = session_id.clone();
+            pending_poll = Some(Box::pin(async move {
+                poll_client
+                    .get_message(&poll_token, &poll_session, busy)
+                    .await
+            }));
+        }
 
         tokio::select! {
             _ = &mut shutdown => {
@@ -398,10 +420,8 @@ pub async fn run_broker_loop(
                 }
                 return Ok(());
             }
-            // When a job is active, race between job completion and broker
-            // message polling. The broker poll uses a short ~3s timeout when
-            // busy (matching the official runner's ~3s cancel-detection cadence)
-            // so cancellation messages are detected promptly.
+            // Job completion races the broker poll. Completion leaves the
+            // poll in flight; see `pending_poll`.
             result = async { active_job.as_mut().unwrap().wait().await }, if busy => {
                 match result {
                     Ok(success) => {
@@ -440,7 +460,8 @@ pub async fn run_broker_loop(
                     job.kill_at = None;
                 }
             }
-            result = client.get_message(&token, &session_id, busy) => {
+            result = pending_poll.as_mut().expect("poll created above") => {
+                pending_poll = None;
                 match result {
                     Ok(Some(msg)) => {
                         consecutive_errors = 0;

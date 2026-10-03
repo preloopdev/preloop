@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use std::time::Duration;
 
 #[tokio::test]
 async fn workflow_steps_update_terminal_first_sighting_does_not_fake_zero_duration() {
@@ -919,6 +920,110 @@ jobs:
     );
     assert_ne!(b_msg["messageId"], cancel_msg["messageId"]);
     assert_ne!(b_msg["messageId"], job_msg["messageId"]);
+}
+
+#[tokio::test]
+async fn broker_busy_poll_ends_promptly_once_job_completes() {
+    // Runners keep the Busy poll open across job completion
+    // (actions/runner#4728). While the job runs, that poll must long-poll
+    // (cancel channel); once the job completes it must end within the drain
+    // beat — never dispatching the successor on Busy — so the Online poll
+    // that follows can claim it.
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let registered = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/v1/Agent/1/0",
+        json!({"name": "busy-drain-runner", "version": "2.336.0"}),
+    )
+    .await;
+    let registered_runner_id = registered["id"].as_i64().unwrap();
+    let runner_token = state
+        .local_jwt(json!({
+            "sub": format!("preloop-runner-listen-{registered_runner_id}"),
+            "scp": "ActionsRuntime.RunnerListen",
+        }))
+        .unwrap();
+    let session = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/runner/server/session",
+        json!({}),
+        &runner_token,
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+"#;
+    let a = submit_yaml(&app, yaml, "owner/repo").await;
+    let a_id = a["run_id"].as_str().unwrap().to_owned();
+    let a_msg = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    assert_eq!(a_msg["messageType"], "RunnerJobRequest");
+    let b = submit_yaml(&app, yaml, "owner/repo").await;
+    let b_id = b["run_id"].as_str().unwrap().to_owned();
+
+    let busy_poll = tokio::spawn({
+        let app = app.clone();
+        let runner_token = runner_token.clone();
+        let uri =
+            format!("/runner/server/message?sessionId={session_id}&status=Busy&waitSeconds=50");
+        async move {
+            let reply =
+                request_json_with_bearer(&app, Method::GET, &uri, Value::Null, &runner_token).await;
+            (reply, std::time::Instant::now())
+        }
+    });
+    // Longer than the drain beat: a running job keeps the Busy poll open.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !busy_poll.is_finished(),
+        "Busy poll ended while the job was still running"
+    );
+
+    let completed_at = std::time::Instant::now();
+    complete_via_api(&app, &a_id, "build").await;
+    let (reply, returned_at) = tokio::time::timeout(Duration::from_secs(5), busy_poll)
+        .await
+        .expect("Busy poll must end promptly after the job completes")
+        .unwrap();
+    assert!(
+        reply.is_null(),
+        "Busy poll must not carry the successor: {reply}"
+    );
+    assert!(returned_at.duration_since(completed_at) < Duration::from_secs(3));
+
+    let b_msg = request_json_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/runner/server/message?sessionId={session_id}&status=Online&waitSeconds=0"),
+        Value::Null,
+        &runner_token,
+    )
+    .await;
+    assert_eq!(
+        b_msg["messageType"], "RunnerJobRequest",
+        "Online poll must claim B: {b_msg}"
+    );
+    assert_eq!(
+        get_run_json(&app, &b_id).await["jobs"]["build"],
+        "in_progress"
+    );
 }
 
 #[tokio::test]

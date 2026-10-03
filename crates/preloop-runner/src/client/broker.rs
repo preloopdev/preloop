@@ -8,12 +8,15 @@ use std::time::Duration;
 
 use super::http::{HttpClient, HttpError};
 
-// Runner.Listener uses the broker's normal 50-second long poll for both
-// Online and Busy status. A status transition cancels the in-flight request;
-// shortening Busy polls creates a request storm while a job is running.
-const MESSAGE_POLL_TIMEOUT: Duration = Duration::from_secs(50);
+// The broker holds a message poll open for up to 50 seconds. The client
+// deadline must outlast that window, or a job the server hands out at the
+// end of the window is written to a request the client already abandoned.
+// Official runner: `VssUtil.GetHttpRequestSettings` defaults `SendTimeout`
+// to 100 seconds for the broker connection.
+const MESSAGE_POLL_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Client for the broker endpoints (GitHub-current path).
+#[derive(Clone)]
 pub struct BrokerClient {
     http: HttpClient,
     base_url: String,
@@ -75,10 +78,14 @@ impl BrokerClient {
             os_label(),
             arch_label(),
         );
-        self.http
+        let message: Option<serde_json::Value> = self
+            .http
             .get_long_poll(&url, &format!("Bearer {token}"), MESSAGE_POLL_TIMEOUT)
             .await
-            .context("polling broker message")
+            .context("polling broker message")?;
+        // A 200 with a `null` body is an empty poll; the official listener
+        // deserializes it to no message and polls again.
+        Ok(message.filter(|message| !message.is_null()))
     }
 
     /// Acknowledge a message (POST, matching official runner).
@@ -182,8 +189,24 @@ mod tests {
         assert!(!is_runner_version_deprecated(&error));
     }
 
-    #[test]
-    fn busy_and_online_messages_use_the_official_long_poll_window() {
-        assert_eq!(MESSAGE_POLL_TIMEOUT, Duration::from_secs(50));
+    #[tokio::test]
+    async fn null_poll_body_is_no_message() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnull")
+                .await
+                .unwrap();
+        });
+        let client = BrokerClient::new(HttpClient::new(None).unwrap(), format!("http://{address}"));
+
+        let message = client.get_message("token", "session", true).await.unwrap();
+
+        assert_eq!(message, None);
     }
 }
