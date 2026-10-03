@@ -615,6 +615,17 @@ pub const JOB_LEASE_SECONDS: u64 = 2700;
 /// reachable — the lease is only stale because the worker died.
 pub const HUNG_WORKER_LEASE_SECONDS: u64 = 180;
 
+/// How stale a job lease may grow once its session is no longer live before
+/// the reaper fails the attempt. Live means the session row exists and has
+/// polled within the runner liveness timeout
+/// (`PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS`, default 30 min): a machine that
+/// just died still counts as live, so its attempt fails at
+/// [`HUNG_WORKER_LEASE_SECONDS`]. This bound covers attempts whose session
+/// was closed, purged, or silent past that timeout — ten minutes at most,
+/// where waiting out [`JOB_LEASE_SECONDS`] (still the lock the runner is
+/// told about, and what its renew loop honours) held the job for 45.
+pub const DEAD_SESSION_LEASE_SECONDS: u64 = 600;
+
 pub fn agent_request_locked_until() -> String {
     server_iso_at(SystemTime::now() + Duration::from_secs(JOB_LEASE_SECONDS))
 }

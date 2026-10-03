@@ -117,3 +117,59 @@ Observed behavior:
 
 The control plane remains **not validated for 5M jobs/day**: 57.9 completed
 jobs/s is still above the current 22.85 jobs/s peak.
+
+## Follow-up: per-path run-row attribution (p0, 2026-10-02)
+
+Round `p0-baseline-25rps` re-ran the r23 configuration (2 nodes, 25
+submissions/s for 90 s, 400 runners) on this workstation after adding
+per-statement labels to `control::txn_stats` (`lock_run`, `flush_run`,
+`event_seq.command`, `event_seq.append_event`) — the r21 "top event-sequence
+statement" is now split by call path. The local run is throughput-throttled
+by laptop hardware (6.25 completed jobs/s vs cpane's 22.85) and self-inflicted
+`completejob` client timeouts churned runner sessions; ratios are
+representative, absolute numbers are not.
+
+Run-row statement time (in-transaction wall clock, both nodes, 449 s total):
+
+| Op | Time | Share | Calls | Note |
+|---|---|---|---|---|
+| `event_seq.command` | 181.1 s | 40.3% | 17,944 | outbox bumps inside command txns |
+| `event_seq.append_event` | 109.1 s | 24.3% | 15,880 | post-commit `emit()` appends |
+| `flush_run` | 116.5 s | 25.9% | 9,733 | `UPDATE runs SET status ..` |
+| `lock_run` | 42.3 s | 9.4% | 3,735 | `FOR NO KEY UPDATE` mutex |
+
+Two corrections to the r21 reading: (1) ~65% of run-row time is `event_seq`
+bumps, not the mutex itself — and `pg_stat_statements` attributes only
+55.6 s of executor time to `UPDATE runs SET event_seq` across the same
+33,824 calls, so ~235 s of the instrumented span is client-visible wait
+(row-lock queueing plus scheduler delay inside the owning transaction), not
+statement execution. (2) Whole-database `pg_stat_statements` is dominated by
+scheduler reads, not run-row writes: the ready-queue front probe
+(`SELECT runs_on::text FROM jobs WHERE queue_state='ready' ORDER BY pool_key,
+priority DESC, run_order, job_order`) accumulated 354.3 s at 36.1 ms mean —
+`jobs_ready` leads with `pool_key`, which these queries do not constrain, so
+each call sorts the entire ready queue (~9,800 calls over the round). The
+claim-side point-read fanout (`SELECT j.job_id, j.kind, .. FROM jobs`,
+429.9 s across 116,439 calls at 3.7 ms mean) is the next target.
+
+Integrity: `duplicate_inflight=0`, `names_running_twice=0`,
+`active_owner_mismatch=0`. Two new invariants replace the retired
+`active_request_id` joins after the `runner_sessions` schema change.
+
+Fixes landed from this round: timeline `PATCH` projected step `succeeded`
+records as job status events, masking the job's real conclusion for
+subscribers (`patch_timeline_records` now gates `JobStatus` on non-step
+records; regression test
+`successful_step_does_not_mask_the_jobs_real_completion`). `RunAccepted`,
+submit-time `JobStatus`, held `RunStatus`, `CheckRunCreated`, and timeline
+`Annotation` events moved from post-commit `emit()` appends into their
+producing transactions (`SubmitOutcome::events`, `set_job_check_run`,
+`patch_timeline`), cutting the `event_seq.append_event` class and making
+records+annotations atomic. Post-expansion `RunStatus` re-reads
+(`complete_job_settling`, starved-run report) deliberately stay on `emit` —
+their status is only knowable post-commit.
+
+Regression noted for later investigation, not fixed here: a `fork policy:
+approval sweep failed — operator does not exist: bigint < timestamp with
+time zone` warning loop in the node logs (fork-gate SQL type mismatch,
+pre-existing).

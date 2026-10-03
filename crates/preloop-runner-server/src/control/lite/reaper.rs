@@ -210,9 +210,6 @@ impl LiteBackend {
         &self,
         sweep: ReapSweep,
     ) -> Result<ReapSweepOutcome, ControlError> {
-        if sweep.runs.is_empty() {
-            return Ok(ReapSweepOutcome::default());
-        }
         self.write(move |tx| {
             let ReapSweep {
                 now,
@@ -289,9 +286,6 @@ impl LiteBackend {
             let mut cancellations = 0usize;
             let mut expired = Vec::new();
             for request in &active {
-                if !in_scope(request.run_id) {
-                    continue;
-                }
                 let (request_id, run_id, job_id) =
                     (request.request_id, request.run_id, request.job_id.clone());
                 if let Some(started_at) = request.started_at
@@ -328,7 +322,7 @@ impl LiteBackend {
                     let lease_seconds = if request.session_live {
                         crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
                     } else {
-                        crate::distributed_task::JOB_LEASE_SECONDS
+                        crate::distributed_task::DEAD_SESSION_LEASE_SECONDS
                     };
                     if elapsed >= std::time::Duration::from_secs(lease_seconds) {
                         tracing::info!(

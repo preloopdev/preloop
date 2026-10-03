@@ -697,6 +697,9 @@ pub struct AppState {
     /// `Backend::transact` stays generic.
     pub(crate) backend: Arc<crate::control::Backend>,
     pub events: broadcast::Sender<NdjsonEvent>,
+    /// Single-flight guard for asynchronous completed-run runtime trimming.
+    /// Terminal events must not spawn one expensive planner per job.
+    pub completed_trim_in_progress: Arc<std::sync::atomic::AtomicBool>,
     pub message_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
     /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
@@ -1427,6 +1430,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             backend,
             events,
+            completed_trim_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             message_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
@@ -1586,9 +1590,27 @@ impl AppState {
         }
         // A run just completed: bound the node-local runtime state retained
         // for completed runs, so the heap cannot grow one run's live-log
-        // buffers and projections per completed run forever.
-        if event.terminal_run_status().is_some() {
-            self.trim_completed_run_state().await;
+        // buffers and projections per completed run forever. Spawned and
+        // single-flight: an emitter (e.g. the reaper settling a job) must not
+        // wait on heap housekeeping.
+        if event.terminal_run_status().is_some()
+            && self
+                .completed_trim_in_progress
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            let state = self.clone();
+            tokio::spawn(async move {
+                state.trim_completed_run_state().await;
+                state
+                    .completed_trim_in_progress
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
         }
         // Always broadcast so SSE/UI subscribers see live events. The
         // broadcast is advisory, not authoritative — a store hiccup must

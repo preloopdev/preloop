@@ -10,6 +10,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- A job attempt whose runner session is gone (closed, purged, or silent past
+  the runner liveness timeout) now fails 10 minutes after its last lease
+  renewal instead of 45. A machine that just died still fails at the
+  3-minute hung-worker window. The lease the runner is told about
+  (`LockedUntil`) is unchanged. The reaper now evaluates lease expiry for
+  every in-flight attempt on each tick, and completed-run memory trimming no
+  longer runs on the event path. Before, a reaper-driven completion could
+  wedge the only reaper task there and leave attempts `in_progress`
+  indefinitely after a node kill. The fork-approval expiry sweep no longer
+  fails on a bigint/timestamptz comparison (the node logs spammed
+  `fork policy: approval sweep failed` and holds never expired).
+
 - `PRELOOP_CREDENTIAL_STORE` selects where the engine's own credentials — the
   system token and the GitHub App/PAT — are kept: `os` (the native
   keychain/secret-service, default), `file` (`0600` files under

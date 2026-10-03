@@ -131,8 +131,8 @@ SELECT 'duplicate_inflight', count(*) FROM (SELECT run_id, job_id FROM job_reque
 -- reconfigured real runner) leaves a stale row for the liveness sweep; that
 -- is expected. The invariants: one name never runs two jobs at once, and an
 -- active request is owned by the runner whose session holds it.
-SELECT 'names_running_twice', count(*) FROM (SELECT r.name FROM runner_sessions s JOIN runners r ON r.runner_id = s.runner_id WHERE s.active_request_id IS NOT NULL GROUP BY r.name HAVING count(*) > 1) d;
-SELECT 'active_owner_mismatch', count(*) FROM runner_sessions s JOIN job_requests q ON q.request_id = s.active_request_id WHERE q.owner_runner_id IS DISTINCT FROM s.runner_id;
+SELECT 'names_running_twice', count(*) FROM (SELECT r.name FROM job_requests q JOIN runners r ON r.runner_id = q.runner_id WHERE q.result IS NULL GROUP BY r.name HAVING count(*) > 1) d;
+SELECT 'active_owner_mismatch', count(*) FROM job_requests q JOIN runner_sessions s ON s.session_id = q.session_id WHERE q.result IS NULL AND q.runner_id IS DISTINCT FROM s.runner_id;
 SELECT 'webhook_states', state, count(*) FROM webhook_deliveries GROUP BY state;
 SELECT 'db_size_mb', pg_database_size(current_database()) / 1048576;
 SQL

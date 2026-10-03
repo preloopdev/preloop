@@ -183,9 +183,6 @@ impl PgBackend {
 
         // ── Timeout + lease expiry over active requests ───────────────
         for request in &active {
-            if !runs.contains(&request.run_id) {
-                continue;
-            }
             if let Some(started_at) = request.started_at {
                 // Already timed out: the arm is spent, but the lease check
                 // below still applies (trait doc `reap_sweep` step 3 is
@@ -222,7 +219,7 @@ impl PgBackend {
                 let lease_seconds = if request.session_live {
                     crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
                 } else {
-                    crate::distributed_task::JOB_LEASE_SECONDS
+                    crate::distributed_task::DEAD_SESSION_LEASE_SECONDS
                 };
                 if elapsed >= std::time::Duration::from_secs(lease_seconds) {
                     // Conditional settle: whoever stamps the result reports
@@ -529,7 +526,7 @@ impl PgBackend {
     /// One transaction (the run advisory lock serializes with an approve or
     /// a cancel). Statements: one candidate `SELECT .. FROM runs WHERE
     /// fork_approval_pending AND status <> 'completed' AND
-    /// fork_approval_requested_at < ts($1) ORDER BY run_id`; per run
+    /// fork_approval_requested_at < $1 ORDER BY run_id`; per run
     /// `lock_run`, one guarded `UPDATE runs .. fork_approval_pending=false,
     /// status='completed', conclusion='failure'` (0 rows = another writer
     /// won: only the hold is cleared), one `UPDATE jobs ..` non-terminal →
@@ -545,14 +542,11 @@ impl PgBackend {
         let tx = client.transaction().await.map_err(db)?;
         let candidates: Vec<String> = tx
             .query(
-                concat!(
-                    "SELECT run_id::text FROM runs \
-                     WHERE fork_approval_pending AND status <> 'completed' \
-                       AND fork_approval_requested_at IS NOT NULL \
-                       AND fork_approval_requested_at < ",
-                    ts!("$1"),
-                    " ORDER BY run_id"
-                ),
+                "SELECT run_id::text FROM runs \
+                 WHERE fork_approval_pending AND status <> 'completed' \
+                   AND fork_approval_requested_at IS NOT NULL \
+                   AND fork_approval_requested_at < $1 \
+                 ORDER BY run_id",
                 &[&expired_before_unix_nanos],
             )
             .await
@@ -580,8 +574,7 @@ impl PgBackend {
                          WHERE run_id = $1::text::uuid AND fork_approval_pending \
                            AND status <> 'completed' \
                            AND fork_approval_requested_at IS NOT NULL \
-                           AND fork_approval_requested_at < ",
-                        ts!("$3")
+                           AND fork_approval_requested_at < $3"
                     ),
                     &[&candidate, &now, &expired_before_unix_nanos],
                 )
@@ -611,7 +604,7 @@ impl PgBackend {
                      WHERE j.run_id = $1::text::uuid \
                        AND j.status NOT IN \
                            ('success','failure','cancelled','skipped','timed_out') \
-                       AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null'::jsonb) \
+                       AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
                             OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb) \
                             OR j.queue_state IN ('pending_expansion','expanding'))",
                     &[&candidate],

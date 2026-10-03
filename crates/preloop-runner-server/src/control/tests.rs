@@ -624,6 +624,166 @@ pub(crate) mod suite {
         assert!(backend.live_assignments().await.unwrap().is_empty());
     }
 
+    /// Status events appended after the change are stamped with the version
+    /// of the row they report on. Drives one job through claim and success and
+    /// one run through queued and completed, appending a status event at each
+    /// point, plus events that no longer match the row.
+    pub(crate) async fn status_events_are_stamped_with_row_versions(backend: &dyn ControlBackend) {
+        use preloop_gha_protocol::NdjsonEvent;
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let job = |status| NdjsonEvent::JobStatus {
+            run_id,
+            job_id: JobId("build".to_owned()),
+            status,
+            reason: None,
+        };
+        let run = |status| NdjsonEvent::RunStatus {
+            run_id,
+            status,
+            reason: None,
+        };
+        backend
+            .append_event(&job(ExecutionStatus::Queued))
+            .await
+            .unwrap();
+        backend
+            .append_event(&run(ExecutionStatus::Queued))
+            .await
+            .unwrap();
+
+        let poll = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = poll else {
+            panic!("expected a claim, got {poll:?}");
+        };
+        // The same state twice: reading the row must not move its version.
+        for _ in 0..2 {
+            backend
+                .append_event(&job(ExecutionStatus::InProgress))
+                .await
+                .unwrap();
+        }
+        // The row is in progress, not queued: a non-final mismatch is
+        // published without an ordering claim.
+        backend
+            .append_event(&job(ExecutionStatus::Queued))
+            .await
+            .unwrap();
+
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner.runner.id),
+            })
+            .await
+            .unwrap();
+        // The job and the run settled on success: events for any other state
+        // are stale and are not published at all.
+        backend
+            .append_event(&job(ExecutionStatus::Failure))
+            .await
+            .unwrap();
+        backend
+            .append_event(&run(ExecutionStatus::InProgress))
+            .await
+            .unwrap();
+        backend
+            .append_event(&job(ExecutionStatus::Success))
+            .await
+            .unwrap();
+        backend
+            .append_event(&run(ExecutionStatus::Success))
+            .await
+            .unwrap();
+    }
+
+    /// What [`status_events_are_stamped_with_row_versions`] must have left in
+    /// the outbox, from `(topic, job_id, version)` rows in write order.
+    pub(crate) fn assert_status_stamps(stamps: &[(String, Option<String>, Option<i64>)]) {
+        let versions = |topic: &str| -> Vec<Option<i64>> {
+            stamps
+                .iter()
+                .filter(|(t, _, _)| t == topic)
+                .map(|(_, _, version)| *version)
+                .collect()
+        };
+        let jobs = versions("job_status.v1");
+        // queued, in progress twice, the mismatched queued, success; the
+        // failure after success was dropped.
+        assert_eq!(jobs.len(), 5, "job status rows: {jobs:?}");
+        let (queued, claimed, claimed_again, moved_on, done) =
+            (jobs[0], jobs[1], jobs[2], jobs[3], jobs[4]);
+        assert!(queued.is_some() && claimed.is_some() && done.is_some());
+        assert!(queued < claimed, "claiming bumps the version: {jobs:?}");
+        assert_eq!(claimed, claimed_again, "appending must not bump: {jobs:?}");
+        assert_eq!(moved_on, None, "a state the row left makes no claim");
+        assert!(claimed < done, "completing bumps the version: {jobs:?}");
+        assert!(
+            stamps
+                .iter()
+                .filter(|(t, _, _)| t == "job_status.v1")
+                .all(|(_, job, _)| job.as_deref() == Some("build")),
+            "job status rows carry their job id"
+        );
+        let runs = versions("run_status.v1");
+        // queued, then success; the in-progress event after completion was
+        // dropped.
+        assert_eq!(runs.len(), 2, "run status rows: {runs:?}");
+        assert!(runs[0].is_some() && runs[1].is_some());
+        assert!(runs[0] < runs[1], "settling bumps the run: {runs:?}");
+    }
+
+    /// Outbox retention: rows younger than the window survive, a batch never
+    /// exceeds its limit, and a pass past the window empties the table.
+    pub(crate) async fn prune_outbox_keeps_fresh_rows_and_bounds_a_batch(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            backend
+                .append_event(&preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+                .await
+                .unwrap();
+        }
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            backend.prune_outbox(hour, 1000).await.unwrap(),
+            0,
+            "rows inside the window are kept"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let now = std::time::Duration::ZERO;
+        assert_eq!(
+            backend.prune_outbox(now, 1).await.unwrap(),
+            1,
+            "one per batch"
+        );
+        assert!(backend.prune_outbox(now, 1000).await.unwrap() >= 2);
+        assert_eq!(backend.prune_outbox(now, 1000).await.unwrap(), 0, "empty");
+    }
+
     /// `report_steps` merges a runner's `WorkflowStepsUpdate` into the
     /// attempt's step rows: a reported display name wins, `runner_number`
     /// persists, a non-terminal report stamps `started_at`, a terminal-only
@@ -1943,12 +2103,12 @@ pub(crate) mod suite {
         let fill: Vec<_> = (1..=MAX_TIMELINE_RECORDS as u128)
             .map(|id| timeline_record(id, "small"))
             .collect();
-        backend.patch_timeline(&key, fill).await.unwrap();
+        backend.patch_timeline(&key, fill, &[]).await.unwrap();
 
         let mut huge = timeline_record(u128::MAX, "huge");
         huge.current_operation =
             Some("x".repeat(crate::memory_caps::MAX_TIMELINE_BYTES_PER_TIMELINE + 1024));
-        let (_, patched) = backend.patch_timeline(&key, vec![huge]).await.unwrap();
+        let (_, patched) = backend.patch_timeline(&key, vec![huge], &[]).await.unwrap();
         assert!(
             patched
                 .iter()
@@ -3474,8 +3634,9 @@ pub(crate) mod suite {
             .await
             .unwrap();
         let mut job = submit_job(run_id, "build", 1);
-        // 10 minutes: the timeout must fire well before the 45-minute lease.
-        job.queued.message.job_timeout = Some(600);
+        // Keep the timeout below both lease windows so the first tick can
+        // trigger cancellation without also settling the attempt.
+        job.queued.message.job_timeout = Some(60);
         backend
             .submit_run(submit_run(run_id, vec![job]))
             .await
@@ -3497,11 +3658,10 @@ pub(crate) mod suite {
             .expect("the claim stamps started_at");
 
         // Tick 1: the job timeout fires; the lease is still live.
-        let mut inputs = backend.reap_inputs().await.unwrap();
-        silence_sessions(&mut inputs);
+        let inputs = backend.reap_inputs().await.unwrap();
         let outcome = backend
             .reap_sweep(sweep_at(
-                started + std::time::Duration::from_secs(601),
+                started + std::time::Duration::from_secs(61),
                 run_id,
                 inputs,
             ))
@@ -3509,12 +3669,16 @@ pub(crate) mod suite {
             .unwrap();
         assert_eq!(outcome.cancellations, 1, "the job timeout must fire");
 
-        // Tick 2: the runner never renewed; the lease expires past 45 min.
+        // Tick 2: the runner never renewed; the dead-session lease expires
+        // after the dedicated ten-minute server-side window.
         let mut inputs = backend.reap_inputs().await.unwrap();
         silence_sessions(&mut inputs);
         let outcome = backend
             .reap_sweep(sweep_at(
-                started + std::time::Duration::from_secs(2701),
+                std::time::SystemTime::now()
+                    + std::time::Duration::from_secs(
+                        crate::distributed_task::DEAD_SESSION_LEASE_SECONDS + 3600,
+                    ),
                 run_id,
                 inputs,
             ))
@@ -3785,7 +3949,9 @@ pub(crate) mod suite {
 
         // The lease arm of the sweep must be able to fail the attempt.
         let now = std::time::SystemTime::now()
-            + std::time::Duration::from_secs(crate::distributed_task::JOB_LEASE_SECONDS + 3600);
+            + std::time::Duration::from_secs(
+                crate::distributed_task::DEAD_SESSION_LEASE_SECONDS + 3600,
+            );
         let outcome = backend
             .reap_sweep(ReapSweep {
                 now,
@@ -4342,6 +4508,23 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn status_events_are_stamped_with_row_versions() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::status_events_are_stamped_with_row_versions(&backend).await;
+        suite::assert_status_stamps(&backend.test_working_set().await.unwrap().outbox_stamps);
+    }
+
+    #[tokio::test]
+    async fn prune_outbox_keeps_fresh_rows_and_bounds_a_batch() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::prune_outbox_keeps_fresh_rows_and_bounds_a_batch(&backend).await;
+    }
+
+    #[tokio::test]
     async fn sessionless_runner_is_not_idle_capacity() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -4515,6 +4698,14 @@ mod pg {
             return skip_no_postgres();
         };
         suite::fork_hold_parks_until_released(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn expired_fork_hold_fails_closed() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::expired_fork_hold_fails_closed(&backend).await;
     }
 
     #[tokio::test]
@@ -5253,6 +5444,19 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn status_events_are_stamped_with_row_versions() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::status_events_are_stamped_with_row_versions(&backend).await;
+        suite::assert_status_stamps(&backend.test_working_set().unwrap().outbox_stamps);
+    }
+
+    #[tokio::test]
+    async fn prune_outbox_keeps_fresh_rows_and_bounds_a_batch() {
+        suite::prune_outbox_keeps_fresh_rows_and_bounds_a_batch(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
     async fn sessionless_runner_is_not_idle_capacity() {
         suite::sessionless_runner_is_not_idle_capacity(&LiteBackend::in_memory().unwrap()).await;
     }
@@ -5492,7 +5696,7 @@ mod lite {
             claimed.request.plan_id, claimed.request.timeline_id
         );
         backend
-            .patch_timeline(&key, vec![super::timeline_record(1, "one")])
+            .patch_timeline(&key, vec![super::timeline_record(1, "one")], &[])
             .await
             .unwrap();
         assert_eq!(

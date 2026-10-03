@@ -258,7 +258,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 >= Duration::from_secs(if request.session_live {
                     crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
                 } else {
-                    JOB_LEASE_SECONDS
+                    crate::distributed_task::DEAD_SESSION_LEASE_SECONDS
                 });
         if timed_out || lease_expired {
             due_runs.insert(request.run_id);
@@ -449,8 +449,8 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // in-guest control bridge died (e.g. the guest network was not up at
     // fork and the bridge gave up). Purge it so the unfinished job goes
     // back on the queue for a fresh machine instead of sitting in_progress
-    // until the 45-minute job lease fails it, and so the pool stops handing
-    // the dead machine new jobs. Restored sessions from a restart have no
+    // until the lease reaper fails it, and so the pool stops handing the
+    // dead machine new jobs. Restored sessions from a restart have no
     // last-seen entry and are deliberately skipped here (the runner
     // re-registers and polls, or the lease reaper bounds them).
     // Liveness sweep on the authoritative backend: `sessions`,
@@ -566,9 +566,19 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .await;
     }
 
-    // Process completions for disconnected runners
+    // A completion is post-sweep housekeeping. Never let one stuck
+    // completion wedge the only reaper task and prevent later lease expiry
+    // attempts from being processed.
     for completion in disconnected_completions {
-        let _ = complete_job_inner(shared.clone(), completion).await;
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            complete_job_inner(shared.clone(), completion),
+        )
+        .await
+        {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => warn!("reaper completion exceeded 30s; will retry on the next tick"),
+        }
     }
 
     // Environment protection gates: wait timers expire and approval windows
