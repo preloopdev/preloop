@@ -837,8 +837,10 @@ pub(super) fn summarize_run_row(
     Ok(status)
 }
 
-/// Write an `outbox_events` row and stamp `run_seq` from the run's
-/// incremented `event_seq` (contract rule 9). `payload` is ids/states only.
+/// Write an `outbox_events` row for a state change a command just made.
+/// `payload` is ids/states only. Rows written here are not `NdjsonEvent`s
+/// and carry no version; a `job_id` in the payload is copied to the column.
+/// No run or job row is touched.
 pub(super) fn emit_outbox(
     tx: &Transaction<'_>,
     namespace_id: &str,
@@ -846,33 +848,44 @@ pub(super) fn emit_outbox(
     topic: &str,
     payload: serde_json::Value,
 ) -> Result<(), ControlError> {
-    let run_seq = match run_id {
-        Some(run_id) => {
-            let seq: i64 = tx
-                .prepare_cached(
-                    "UPDATE runs SET event_seq = event_seq + 1 WHERE run_id = ?1 \
-                     RETURNING event_seq",
-                )
-                .map_err(db)?
-                .query_row([codec::run_key(run_id)], |row| row.get(0))
-                .optional()
-                .map_err(db)?
-                .unwrap_or(0);
-            Some(seq)
-        }
-        None => None,
-    };
+    let job_id = payload
+        .get("job_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    insert_outbox(
+        tx,
+        namespace_id,
+        run_id,
+        job_id.as_deref(),
+        None,
+        topic,
+        &payload.to_string(),
+    )
+}
+
+/// The one `INSERT INTO outbox_events` (see the pg backend's
+/// `insert_outbox`).
+pub(super) fn insert_outbox(
+    tx: &Transaction<'_>,
+    namespace_id: &str,
+    run_id: Option<RunId>,
+    job_id: Option<&str>,
+    version: Option<i64>,
+    topic: &str,
+    payload: &str,
+) -> Result<(), ControlError> {
     tx.prepare_cached(
-        "INSERT INTO outbox_events (namespace_id, run_id, run_seq, topic, payload) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO outbox_events (namespace_id, run_id, job_id, version, topic, payload) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .map_err(db)?
     .execute(params![
         namespace_id,
         run_id.map(codec::run_key),
-        run_seq,
+        job_id,
+        version,
         topic,
-        payload.to_string(),
+        payload,
     ])
     .map_err(db)?;
     Ok(())

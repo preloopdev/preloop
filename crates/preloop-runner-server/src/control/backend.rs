@@ -68,6 +68,7 @@ pub(crate) fn event_run_id(event: &NdjsonEvent) -> Option<RunId> {
         | NdjsonEvent::JobStatus { run_id, .. }
         | NdjsonEvent::RunStatus { run_id, .. }
         | NdjsonEvent::JobCompleted { run_id, .. }
+        | NdjsonEvent::Annotation { run_id, .. }
         | NdjsonEvent::CheckRunCreated { run_id } => Some(*run_id),
         _ => None,
     }
@@ -462,13 +463,15 @@ pub(crate) trait ControlBackend: Send + Sync {
     ) -> Result<Option<(i64, crate::models::RunnerCapabilities)>, ControlError>;
 
     /// Apply one timeline PATCH: bump the timeline's change counter, stamp
-    /// and upsert the patched records, and return the new change id plus
-    /// every stored record (ordered by record id). One transaction, shared
-    /// by every node.
+    /// and upsert the patched records, write `events` to the transactional
+    /// outbox (the PATCH projected them — annotations sit on the timeline's
+    /// run), and return the new change id plus every stored record (ordered
+    /// by record id). One transaction, shared by every node.
     async fn patch_timeline(
         &self,
         timeline_key: &str,
         records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+        events: &[NdjsonEvent],
     ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError>;
 
     /// A timeline's change id and records (`skip`/`top` paging).
@@ -481,6 +484,14 @@ pub(crate) trait ControlBackend: Send + Sync {
 
     /// Drop timelines not patched since `before_us`. Returns timelines removed.
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError>;
+
+    /// Delete up to `limit` outbox rows older than `older_than`, oldest
+    /// first. Returns rows removed.
+    async fn prune_outbox(
+        &self,
+        older_than: std::time::Duration,
+        limit: usize,
+    ) -> Result<u64, ControlError>;
 
     /// One reaper tick's inputs, read directly (no working-set load, no lock).
     async fn reap_inputs(&self) -> Result<ReapInputs, ControlError>;
@@ -1267,6 +1278,57 @@ impl Backend {
         }
     }
 
+    /// This node process's id as stamped on its outbox rows. `None` on
+    /// SQLite: one process owns the database, so there is no other node to
+    /// receive events from.
+    pub(crate) fn event_origin(&self) -> Option<&str> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(b) => Some(b.origin()),
+        }
+    }
+
+    /// Notifications that another node committed events to the outbox.
+    /// `None` on SQLite.
+    pub(crate) fn subscribe_event_notifications(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(b) => Some(b.subscribe_event_notifications()),
+        }
+    }
+
+    /// The outbox position a consumer that starts now reads from. `None`
+    /// on SQLite.
+    pub(crate) async fn outbox_head(&self) -> Result<Option<OutboxBookmark>, ControlError> {
+        match self {
+            Self::Sqlite(_) => Ok(None),
+            Self::Postgres(b) => b.outbox_head().await.map(Some),
+        }
+    }
+
+    /// Up to `limit` outbox rows after `after`, from finished transactions,
+    /// in `(txid, event_id)` order. Empty on SQLite.
+    pub(crate) async fn outbox_read(
+        &self,
+        after: OutboxBookmark,
+        limit: usize,
+    ) -> Result<Vec<OutboxRow>, ControlError> {
+        match self {
+            Self::Sqlite(_) => Ok(Vec::new()),
+            Self::Postgres(b) => b.outbox_read(after, limit).await,
+        }
+    }
+
+    /// Tell the other nodes that events were committed. A no-op on SQLite.
+    pub(crate) async fn notify_events(&self) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(_) => Ok(()),
+            Self::Postgres(b) => b.notify_events().await,
+        }
+    }
+
     /// `#[cfg(test)]` working-set snapshot for test assertions. Each
     /// backend rebuilds the old field names from its own tables.
     #[cfg(any(test, feature = "test-support"))]
@@ -1718,10 +1780,11 @@ impl ControlBackend for Backend {
         &self,
         timeline_key: &str,
         records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+        events: &[NdjsonEvent],
     ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
         match self {
-            Self::Sqlite(b) => b.patch_timeline(timeline_key, records).await,
-            Self::Postgres(b) => b.patch_timeline(timeline_key, records).await,
+            Self::Sqlite(b) => b.patch_timeline(timeline_key, records, events).await,
+            Self::Postgres(b) => b.patch_timeline(timeline_key, records, events).await,
         }
     }
     async fn get_timeline(
@@ -1739,6 +1802,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.prune_timelines(before_us).await,
             Self::Postgres(b) => b.prune_timelines(before_us).await,
+        }
+    }
+    async fn prune_outbox(
+        &self,
+        older_than: std::time::Duration,
+        limit: usize,
+    ) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.prune_outbox(older_than, limit).await,
+            Self::Postgres(b) => b.prune_outbox(older_than, limit).await,
         }
     }
     async fn runner_exists(&self, runner_id: i64) -> Result<bool, ControlError> {

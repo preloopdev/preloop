@@ -108,7 +108,16 @@ impl LiteBackend {
                 .map_err(db)?
                 .execute(params![run, job_id.0, check_run_id as i64])
                 .map_err(db)?;
-            Ok(changed > 0 || detail_changed > 0)
+            let mapping_changed = changed > 0 || detail_changed > 0;
+            if mapping_changed {
+                // The mapping's `CheckRunCreated` event persists atomically
+                // with it; the caller broadcasts via `emit_persisted`.
+                super::lifecycle::append_event_tx(
+                    tx,
+                    &preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id },
+                )?;
+            }
+            Ok(mapping_changed)
         })
     }
 

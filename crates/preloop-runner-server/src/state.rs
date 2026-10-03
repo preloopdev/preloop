@@ -697,9 +697,10 @@ pub struct AppState {
     /// `Backend::transact` stays generic.
     pub(crate) backend: Arc<crate::control::Backend>,
     pub events: broadcast::Sender<NdjsonEvent>,
-    /// Single-flight guard for asynchronous completed-run runtime trimming.
-    /// Terminal events must not spawn one expensive planner per job.
-    pub completed_trim_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Marked after events were committed to the outbox; the notifier turns
+    /// it into one `NOTIFY` per ~15 ms for the other nodes
+    /// ([`crate::event_feed`]).
+    pub(crate) events_dirty: Arc<Notify>,
     pub message_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
     /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
@@ -726,6 +727,9 @@ pub struct AppState {
     /// `JobStatus` (repeated timeline PATCH after completion) is recorded
     /// exactly once per job.
     pub terminal_jobs_recorded: Arc<std::sync::Mutex<BTreeSet<(RunId, JobId)>>>,
+    /// Single-flight guard for asynchronous completed-run runtime trimming.
+    /// Terminal events must not spawn one expensive planner per job.
+    pub completed_trim_in_progress: Arc<std::sync::atomic::AtomicBool>,
     /// Consolidated pool handle replacing the four ad-hoc Option<Arc<…>> fields.
     pub pool_status: Arc<preloop_observability::status::PoolStatus>,
     /// When this AppState was created (for uptime).
@@ -1418,6 +1422,9 @@ impl AppState {
                 }
             });
         }
+        // Cross-node live events: the notifier and the outbox consumer.
+        let events_dirty = Arc::new(Notify::new());
+        crate::event_feed::spawn(&backend, events.clone(), events_dirty.clone());
         crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
         let log_segments = LiveLogSegments::new(state_dir.join("live-logs"));
         let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
@@ -1430,7 +1437,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             backend,
             events,
-            completed_trim_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            events_dirty,
             message_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
@@ -1442,6 +1449,7 @@ impl AppState {
                 preloop_observability::status::OperationalSnapshot::default(),
             )),
             terminal_jobs_recorded,
+            completed_trim_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pool_status,
             started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
@@ -1494,8 +1502,36 @@ impl AppState {
         })
     }
 
+    /// Emit an event the backend never persisted — write it to the event
+    /// stream and broadcast it.
     pub async fn emit(&self, event: NdjsonEvent) {
-        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = &event {
+        // authoritative backend. Persist exactly the event; never reload or
+        // rewrite run state as an observer side effect.
+        if !self.dedupe_and_record(&event) {
+            return;
+        }
+        if let Err(error) = self.backend.append_event(&event).await {
+            error!(?error, "failed to persist control-plane event");
+        } else {
+            self.events_dirty.notify_one();
+        }
+        self.broadcast(event).await;
+    }
+
+    /// Emit an event the producing command already wrote to the outbox
+    /// inside its own transaction — side effects and broadcast only.
+    pub async fn emit_persisted(&self, event: NdjsonEvent) {
+        if !self.dedupe_and_record(&event) {
+            return;
+        }
+        self.events_dirty.notify_one();
+        self.broadcast(event).await;
+    }
+
+    /// Per-event observability and terminal dedup. Returns false when the
+    /// event must be dropped entirely (a repeated terminal `JobStatus`).
+    fn dedupe_and_record(&self, event: &NdjsonEvent) -> bool {
+        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = event {
             self.observability.export_log(
                 "INFO",
                 "run.accepted",
@@ -1517,7 +1553,7 @@ impl AppState {
         // emits. A duplicate event is still a duplicate — drop it entirely
         // (side effects, persistence and broadcast) rather than re-append the
         // same terminal record to the timeline.
-        match &event {
+        match event {
             NdjsonEvent::JobStatus {
                 run_id,
                 job_id,
@@ -1531,7 +1567,7 @@ impl AppState {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert((*run_id, job_id.clone()));
                 if !first_terminal {
-                    return;
+                    return false;
                 }
                 let conclusion = execution_conclusion(*status);
                 // `reason: None` is the common case (most terminal transitions
@@ -1582,17 +1618,16 @@ impl AppState {
             // call here would make the record look double-sourced.
             _ => {}
         }
-        // The transition that produced this event is already committed in the
-        // authoritative backend. Persist exactly the event; never reload or
-        // rewrite run state as an observer side effect.
-        if let Err(error) = self.backend.append_event(&event).await {
-            error!(?error, "failed to persist control-plane event");
-        }
-        // A run just completed: bound the node-local runtime state retained
-        // for completed runs, so the heap cannot grow one run's live-log
-        // buffers and projections per completed run forever. Spawned and
-        // single-flight: an emitter (e.g. the reaper settling a job) must not
-        // wait on heap housekeeping.
+        true
+    }
+
+    /// Broadcast a live event to SSE/UI subscribers. The broadcast is
+    /// advisory, not authoritative — a store hiccup must never freeze the
+    /// stream for a healthy run. Terminal run statuses first bound the
+    /// node-local runtime state retained for completed runs, so the heap
+    /// cannot grow one run's live-log buffers and projections per completed
+    /// run forever.
+    async fn broadcast(&self, event: NdjsonEvent) {
         if event.terminal_run_status().is_some()
             && self
                 .completed_trim_in_progress
@@ -1612,9 +1647,6 @@ impl AppState {
                     .store(false, std::sync::atomic::Ordering::Release);
             });
         }
-        // Always broadcast so SSE/UI subscribers see live events. The
-        // broadcast is advisory, not authoritative — a store hiccup must
-        // never freeze the stream for a healthy run.
         let _ = self.events.send(event);
     }
 

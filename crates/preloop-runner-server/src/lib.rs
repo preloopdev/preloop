@@ -12,6 +12,7 @@ pub mod concurrency;
 pub mod config;
 pub mod credential_store;
 pub mod errors;
+mod event_feed;
 pub mod events;
 pub mod execution_protection;
 pub mod fork_policy;

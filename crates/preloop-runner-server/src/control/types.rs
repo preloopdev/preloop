@@ -105,6 +105,28 @@ pub(crate) fn status_parse(s: &str) -> ExecutionStatus {
     }
 }
 
+/// A position in the outbox. Rows are read in `(txid, event_id)` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct OutboxBookmark {
+    pub(crate) txid: u64,
+    pub(crate) event_id: i64,
+}
+
+/// One `outbox_events` row, as the stream consumer reads it.
+#[derive(Debug, Clone)]
+pub(crate) struct OutboxRow {
+    pub(crate) bookmark: OutboxBookmark,
+    pub(crate) run_id: Option<RunId>,
+    pub(crate) job_id: Option<String>,
+    /// `jobs.version` / `runs.version` the event reports; `None` makes no
+    /// ordering claim.
+    pub(crate) version: Option<i64>,
+    /// The writing node process.
+    pub(crate) origin: String,
+    pub(crate) topic: String,
+    pub(crate) payload: serde_json::Value,
+}
+
 /// Everything the submit path pre-built outside the transaction: the run
 /// record plus one queue entry per non-skipped job and the correlation
 /// records minted for dispatchable jobs.
@@ -194,6 +216,11 @@ pub(crate) struct SubmitOutcome {
     pub(crate) queue_depth: usize,
     /// `runs-on` labels of the next ready job, for `next_job_runs_on`.
     pub(crate) next_runs_on: Vec<String>,
+    /// Events the submit transaction already wrote to the outbox — the
+    /// handler broadcasts them (`broadcast_persisted`), never re-appends.
+    /// Empty on early-return outcomes (rejects/replays), where the handler
+    /// still emits normally.
+    pub(crate) events: Vec<preloop_gha_protocol::NdjsonEvent>,
 }
 
 /// What a session poll produced. The handler maps each variant onto the

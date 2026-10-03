@@ -614,15 +614,20 @@ impl PgBackend {
         }
         for row in client
             .query(
-                "SELECT run_id::text, topic FROM outbox_events ORDER BY event_id",
+                "SELECT run_id::text, topic, job_id, version FROM outbox_events \
+                 ORDER BY event_id",
                 &[],
             )
             .await
             .map_err(db)?
         {
             let run: Option<String> = row.get(0);
-            t.outbox_topics
-                .push((run.map(|run| codec::run_id(&run)).transpose()?, row.get(1)));
+            let topic: String = row.get(1);
+            t.outbox_topics.push((
+                run.map(|run| codec::run_id(&run)).transpose()?,
+                topic.clone(),
+            ));
+            t.outbox_stamps.push((topic, row.get(2), row.get(3)));
         }
 
         // ── Counters ─────────────────────────────────────────────────

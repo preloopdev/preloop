@@ -967,6 +967,69 @@ pub(crate) fn count_run_statuses(
     counts
 }
 
+/// How an outbox event relates to the state row it reports on, decided when
+/// the event is appended in its own transaction after the change committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventStamp {
+    /// The row still holds the reported state: the event carries the row's
+    /// version, so a consumer can order it against other events.
+    Version(i64),
+    /// The row has moved to a different state that is not final yet: the
+    /// event is published with no ordering claim.
+    Unversioned,
+    /// The row has already settled on a different final state. A newer
+    /// event describes that state; this one must not be published.
+    Stale,
+}
+
+/// [`EventStamp`] for a `JobStatus` event against the job's `status` and
+/// `version`. A `timed_out` row reports as `Failure`, the only form the
+/// event enum has.
+pub(crate) fn job_event_stamp(
+    event: ExecutionStatus,
+    row_status: &str,
+    row_version: i64,
+) -> EventStamp {
+    let row = if row_status == "timed_out" {
+        ExecutionStatus::Failure
+    } else {
+        crate::control::types::status_parse(row_status)
+    };
+    if row == event {
+        EventStamp::Version(row_version)
+    } else if row.is_terminal() {
+        EventStamp::Stale
+    } else {
+        EventStamp::Unversioned
+    }
+}
+
+/// [`EventStamp`] for a `RunStatus` event against the run's `status`,
+/// `conclusion` and `version`. A run held for a gate is `Pending` on the
+/// wire while its row says `queued`.
+pub(crate) fn run_event_stamp(
+    event: ExecutionStatus,
+    row_status: &str,
+    row_conclusion: Option<&str>,
+    row_version: i64,
+) -> EventStamp {
+    let settled = row_status == "completed";
+    let row = match (row_status, row_conclusion) {
+        ("completed", Some("timed_out")) | ("completed", None) => ExecutionStatus::Failure,
+        ("completed", Some(conclusion)) => crate::control::types::status_parse(conclusion),
+        (status, _) => crate::control::types::status_parse(status),
+    };
+    let matches =
+        row == event || (row == ExecutionStatus::Queued && event == ExecutionStatus::Pending);
+    if matches {
+        EventStamp::Version(row_version)
+    } else if settled {
+        EventStamp::Stale
+    } else {
+        EventStamp::Unversioned
+    }
+}
+
 #[cfg(test)]
 mod decision_tests {
     use super::*;

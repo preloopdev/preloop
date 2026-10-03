@@ -623,8 +623,10 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
     while !shared.shutdown.is_cancelled() {
         tokio::select! {
             _ = interval.tick() => {
-                heartbeat.beat("reaper");
                 reap_once(&shared).await;
+                // Beat after the sweep: a wedged or missing sweep must
+                // surface as a stale critical task, not a live heartbeat.
+                heartbeat.beat("reaper");
             }
             _ = shared.shutdown.cancelled() => {
                 break;
@@ -670,10 +672,45 @@ async fn run_history_archiver(shared: Arc<SharedState>) {
                 if let Err(error) = shared.state.backend.prune_timelines(week_ago).await {
                     tracing::warn!(?error, "timeline prune failed; will retry");
                 }
+                prune_outbox_once(&shared, outbox_retention()).await;
             }
             _ = shared.shutdown.cancelled() => break,
         }
     }
+}
+
+/// Outbox rows are only needed for the live fan-out window (no durable
+/// consumer reads them yet): older rows are deleted. Env:
+/// `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600).
+fn outbox_retention() -> Duration {
+    Duration::from_secs(
+        std::env::var("PRELOOP_OUTBOX_RETENTION_SECONDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(3600),
+    )
+}
+
+/// Delete expired outbox rows in batches until a short batch or an error.
+/// Returns rows removed. Split out so a test can drive a pass.
+pub(crate) async fn prune_outbox_once(shared: &SharedState, older_than: Duration) -> u64 {
+    const BATCH: usize = 5_000;
+    let mut removed_total = 0;
+    loop {
+        match shared.state.backend.prune_outbox(older_than, BATCH).await {
+            Ok(removed) => {
+                removed_total += removed;
+                if removed < BATCH as u64 {
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, "outbox prune failed; will retry");
+                break;
+            }
+        }
+    }
+    removed_total
 }
 
 /// Drain one archive pass: move settled runs to history in batches until a
@@ -1615,7 +1652,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
-    crate::runner_lifecycle::purge_restored_ephemeral_runners(&shared).await;
 
     // 5s sampler — clone needed state under lock, release, then publish.
     let sampler_shared = shared.clone();

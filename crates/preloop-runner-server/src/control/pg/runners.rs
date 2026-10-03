@@ -600,7 +600,7 @@ impl PgBackend {
                     us!("q.started_at"),
                     ", ",
                     us!("l.renewed_at"),
-                    ", q.timeout_triggered, (m.message_template->>'jobTimeout')::int8, \
+                    ", q.timeout_triggered, m.job_timeout_s, \
                      EXISTS (SELECT 1 FROM runner_sessions s \
                              WHERE s.session_id = q.session_id AND ",
                     us!("s.last_seen_at"),

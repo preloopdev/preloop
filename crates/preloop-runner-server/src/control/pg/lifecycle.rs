@@ -1185,9 +1185,10 @@ impl PgBackend {
 
     // ── Events / archive / reconcile ─────────────────────────────────
 
-    /// `append_event`: one outbox row. `run_seq` is the run's monotonic
-    /// event counter (`runs.event_seq`), bumped in the same write so two
-    /// events of one run never share a sequence.
+    /// `append_event`: one outbox row, in its own transaction after the
+    /// producing command committed. A status event is stamped with the
+    /// version of the row it reports on, or dropped when that row has
+    /// already settled on a different final state (`append_event_tx`).
     pub(super) async fn append_event(
         &self,
         event: &preloop_gha_protocol::NdjsonEvent,

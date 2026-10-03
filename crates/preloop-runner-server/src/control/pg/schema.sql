@@ -120,7 +120,7 @@ CREATE TABLE runs (
     -- workflow-level `concurrency:` (was run_concurrency.concurrency_blob)
     concurrency_group       text,
     concurrency_cancel_in_progress boolean NOT NULL DEFAULT false,
-    event_seq               bigint NOT NULL DEFAULT 0,   -- bumped per outbox event (run_seq)
+    version                 bigint NOT NULL DEFAULT 0,   -- status/conclusion-change counter (trigger `runs_version`)
     -- Fork-PR policy: the run is held at scheduler admission until the
     -- operator approves it; a hold past the window fails closed (reaper).
     -- Real columns so the expiry sweep filters in SQL.
@@ -141,6 +141,18 @@ CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 -- archiver scan: terminal runs not yet moved to history
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
+
+-- `version` counts status/conclusion changes of the run (see `jobs_version`).
+CREATE FUNCTION bump_run_version() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.version := OLD.version + 1;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER runs_version BEFORE UPDATE ON runs
+    FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status
+                       OR OLD.conclusion IS DISTINCT FROM NEW.conclusion)
+    EXECUTE FUNCTION bump_run_version();
 
 -- Per-workflow run numbers: `UPDATE .. SET next = next + 1 RETURNING`.
 CREATE TABLE workflow_run_numbers (
@@ -212,6 +224,7 @@ CREATE TABLE jobs (
     claimed_by_runner_id    bigint,
     claimed_at              timestamptz,
     expand_generation       integer NOT NULL DEFAULT 0,  -- expansion fencing token
+    version                 bigint NOT NULL DEFAULT 0,   -- status-change counter (trigger `jobs_version`)
     -- results
     outputs                 jsonb,
     annotations             jsonb,
@@ -231,8 +244,12 @@ CREATE TABLE jobs (
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 ) WITH (fillfactor = 80);
--- claim: SELECT .. WHERE queue_state='ready' AND pool_key=$1 ORDER BY .. FOR UPDATE SKIP LOCKED
-CREATE INDEX jobs_ready ON jobs(pool_key, namespace_id, priority DESC, run_order, job_order)
+-- claim and ready-queue front: SELECT .. WHERE queue_state='ready' ORDER BY
+-- pool_key, priority DESC, run_order, job_order. The key columns are exactly
+-- the ORDER BY so the first rows are read in order; a column between the
+-- pool key and the priority (this index used to carry `namespace_id` there)
+-- forces a sort of the whole ready queue on every call.
+CREATE INDEX jobs_ready ON jobs(pool_key, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
 CREATE INDEX jobs_pending_expansion ON jobs(enqueued_at) WHERE queue_state = 'pending_expansion';
 CREATE INDEX jobs_run_active ON jobs(run_id, queue_state) WHERE queue_state <> 'none';
@@ -241,6 +258,19 @@ CREATE INDEX jobs_run_base ON jobs(run_id, base_id);
 CREATE INDEX jobs_namespace_running ON jobs(namespace_id, pool_key) WHERE queue_state = 'claimed';
 CREATE INDEX jobs_namespace_queued ON jobs(namespace_id)
     WHERE queue_state IN ('blocked','held','ready','pending_expansion');
+
+-- `version` counts status changes of the job, bumped under the row lock the
+-- changing statement already holds. Events carry it so a consumer can drop
+-- an older state that arrives after a newer one.
+CREATE FUNCTION bump_job_version() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.version := OLD.version + 1;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER jobs_version BEFORE UPDATE ON jobs
+    FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status)
+    EXECUTE FUNCTION bump_job_version();
 
 -- ── Job spec (immutable, written once at submit/expansion) ───────────
 CREATE TABLE job_specs (
@@ -288,6 +318,12 @@ CREATE TABLE job_messages (
     message_template        jsonb NOT NULL,     -- AgentJobRequestMessage minus secrets/tokens
     secret_names            jsonb NOT NULL DEFAULT '[]',
     condition_context       jsonb NOT NULL,     -- `if:` context; secrets by name only
+    -- `timeout-minutes` in seconds, extracted once at write. The reaper reads
+    -- it for every unfinished attempt on every tick; extracting it from the
+    -- (large, toasted) template per read cost ~15x the rest of that query.
+    job_timeout_s           bigint GENERATED ALWAYS AS (
+        CASE WHEN jsonb_typeof(message_template->'jobTimeout') = 'number'
+             THEN (message_template->>'jobTimeout')::numeric::int8 END) STORED,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
 );
@@ -317,6 +353,10 @@ CREATE TABLE job_requests (
 ) WITH (fillfactor = 90);
 CREATE UNIQUE INDEX job_requests_inflight ON job_requests(run_id, job_id) WHERE result IS NULL;
 CREATE INDEX job_requests_session ON job_requests(session_id) WHERE result IS NULL;
+-- Latest-attempt lookups (`ORDER BY request_id DESC LIMIT 1` per job) and the
+-- `jobs` -> `job_requests` cascade: the partial inflight index above cannot
+-- serve settled attempts, so both fell back to a seq scan of the table.
+CREATE INDEX job_requests_attempts ON job_requests(run_id, job_id, request_id DESC);
 
 -- Lease (heartbeat target). Narrow row: a renewal is one tiny UPDATE.
 -- Reaper: SELECT .. WHERE expires_at < now() FOR UPDATE SKIP LOCKED LIMIT n.
@@ -519,17 +559,30 @@ CREATE TABLE jobset_gates (
 
 -- ── Events (transactional outbox) ────────────────────────────────────
 -- Written in the command's transaction; insert-only (never updated).
--- Readers track position in consumer_offsets and read only below the
--- safe point: rows with txid < pg_snapshot_xmin(pg_current_snapshot())
--- belong to finished transactions, so nothing new can appear below it.
--- Bookmark and order by (txid, event_id). Dropped by partition once
--- every consumer is past it.
+-- Readers read only below the safe point: rows with
+-- txid < pg_snapshot_xmin(pg_current_snapshot()) belong to finished
+-- transactions, so nothing new can appear below it. Order by
+-- (txid, event_id). That order is not commit order (a txid is assigned at
+-- a transaction's first write), so a consumer that needs "latest state
+-- wins" compares `version` per entity instead of trusting row order.
+--
+-- Retention: no durable consumer exists yet, so rows are kept only for
+-- the live fan-out window (`bootstrap::run_history_archiver` prunes by
+-- `created_at`). A durable consumer must hold a `consumer_offsets`
+-- bookmark and the prune must then stop at the slowest bookmark.
 CREATE TABLE outbox_events (
     event_id                bigint GENERATED ALWAYS AS IDENTITY,
     txid                    xid8 NOT NULL DEFAULT pg_current_xact_id(),
     namespace_id            text NOT NULL,
     run_id                  uuid,
-    run_seq                 bigint,             -- per-run order; consumers drop stale
+    job_id                  text,               -- job the event is about, when it is about one
+    -- `jobs.version` / `runs.version` right after the change the event
+    -- reports. NULL makes no ordering claim (events that are not state:
+    -- annotations, check-run ids, or a status that no longer matches the row).
+    version                 bigint,
+    -- Writer's `preloop.origin` (one id per node process). A node skips its
+    -- own rows: it already broadcast those events directly.
+    origin                  text NOT NULL DEFAULT '',
     topic                   text NOT NULL,      -- versioned, e.g. job.completed.v1
     payload                 jsonb NOT NULL,     -- ids and states only, never secrets
     created_at              timestamptz NOT NULL DEFAULT now(),
@@ -537,6 +590,7 @@ CREATE TABLE outbox_events (
 ) PARTITION BY RANGE (created_at);
 CREATE TABLE outbox_events_default PARTITION OF outbox_events DEFAULT;
 CREATE INDEX outbox_events_read ON outbox_events(txid, event_id);
+CREATE INDEX outbox_events_age ON outbox_events(created_at);
 
 -- One row per registered consumer (or consumer shard): its bookmark.
 -- Advanced once per batch, in the same transaction as the consumer's

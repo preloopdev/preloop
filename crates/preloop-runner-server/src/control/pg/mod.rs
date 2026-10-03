@@ -23,6 +23,7 @@ mod dispatch;
 mod graph;
 mod lifecycle;
 mod lookups;
+mod outbox;
 mod reaper;
 mod runners;
 #[cfg(test)]
@@ -38,7 +39,7 @@ use tokio_postgres::{Client, NoTls};
 
 /// The schema this build creates and accepts. Greenfield v1: there are no
 /// migrations, a database at any other version is refused.
-pub(crate) const SCHEMA_VERSION: &str = "3";
+pub(crate) const SCHEMA_VERSION: &str = "4";
 
 /// The agreed schema plus `schema_meta`.
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -70,20 +71,23 @@ fn pool_size(var: &str) -> usize {
 /// free; a connection whose socket died is replaced on checkout.
 struct Pool {
     url: String,
+    origin: String,
     tx: tokio::sync::mpsc::Sender<Client>,
     rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Client>>,
 }
 
 impl Pool {
-    async fn open(url: &str, size: usize) -> Result<Self, ControlError> {
+    async fn open(url: &str, origin: &str, size: usize) -> Result<Self, ControlError> {
         let (tx, rx) = tokio::sync::mpsc::channel(size);
-        let clients = futures::future::try_join_all((0..size).map(|_| connect_one(url))).await?;
+        let clients =
+            futures::future::try_join_all((0..size).map(|_| connect_one(url, origin))).await?;
         for client in clients {
             tx.try_send(client)
                 .map_err(|_| ControlError::backend(anyhow::anyhow!("pool channel full")))?;
         }
         Ok(Self {
             url: url.to_owned(),
+            origin: origin.to_owned(),
             tx,
             rx: tokio::sync::Mutex::new(rx),
         })
@@ -105,7 +109,7 @@ impl Pool {
         })?
         .ok_or_else(|| ControlError::backend(anyhow::anyhow!("connection pool closed")))?;
         let client = if client.is_closed() {
-            match connect_one(&self.url).await {
+            match connect_one(&self.url, &self.origin).await {
                 Ok(fresh) => fresh,
                 Err(error) => {
                     // Keep the pool at size: hand the dead client back so the
@@ -176,6 +180,11 @@ pub(crate) struct PgBackend {
     /// parity — process-local, reset on restart).
     released_bindings: std::sync::atomic::AtomicU64,
     wakes: tokio::sync::broadcast::Sender<super::wake::Wake>,
+    /// Notifications that another node committed events to the outbox
+    /// (payload: the writer's origin).
+    event_wakes: tokio::sync::broadcast::Sender<String>,
+    /// This node process's id, stamped on every outbox row it writes.
+    origin: String,
 }
 
 impl PgBackend {
@@ -188,11 +197,13 @@ impl PgBackend {
         require_job_assignments: bool,
         runner_liveness_timeout: std::time::Duration,
     ) -> Result<Self, ControlError> {
-        let mut setup = connect_one(url).await?;
+        let origin = uuid::Uuid::new_v4().to_string();
+        let mut setup = connect_one(url, &origin).await?;
         ensure_schema(&mut setup).await?;
         drop(setup);
-        let writers = Pool::open(url, pool_size(WRITERS_ENV)).await?;
-        let readers = Pool::open(url, pool_size(READERS_ENV)).await?;
+        let writers = Pool::open(url, &origin, pool_size(WRITERS_ENV)).await?;
+        let readers = Pool::open(url, &origin, pool_size(READERS_ENV)).await?;
+        let wake_listener = super::wake::spawn_listener(url.to_owned());
         Ok(Self {
             writers,
             readers,
@@ -206,7 +217,9 @@ impl PgBackend {
             )),
             pool_status: parking_lot::RwLock::new(Default::default()),
             released_bindings: std::sync::atomic::AtomicU64::new(0),
-            wakes: super::wake::spawn_listener(url.to_owned()),
+            wakes: wake_listener.wakes,
+            event_wakes: wake_listener.events,
+            origin,
         })
     }
 
@@ -368,9 +381,11 @@ async fn stored_schema_version(client: &Client) -> Result<Option<String>, Contro
     Ok(row.map(|row| String::from_utf8_lossy(row.get::<_, &[u8]>(0)).into_owned()))
 }
 
-/// Open one connection, spawn its driver task and resolve unqualified names
-/// to `control.*`.
-async fn connect_one(url: &str) -> Result<Client, ControlError> {
+/// Open one connection, spawn its driver task, resolve unqualified names to
+/// `control.*` and stamp the node's `preloop.origin` (read by the outbox
+/// writers as the row's `origin`). `origin` is a process-generated uuid, so
+/// it needs no quoting.
+async fn connect_one(url: &str, origin: &str) -> Result<Client, ControlError> {
     let connect_url = crate::store_pg::connect_url(url);
     let client = match crate::store_pg::tls_connector(url).map_err(ControlError::backend)? {
         Some(tls) => {
@@ -397,7 +412,9 @@ async fn connect_one(url: &str) -> Result<Client, ControlError> {
         }
     };
     client
-        .batch_execute("SET search_path TO control")
+        .batch_execute(&format!(
+            "SET search_path TO control; SET preloop.origin = '{origin}'"
+        ))
         .await
         .map_err(db)?;
     Ok(client)

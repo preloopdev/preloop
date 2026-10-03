@@ -88,7 +88,7 @@ CREATE TABLE runs (
     tree_digest             TEXT,
     concurrency_group       TEXT,
     concurrency_cancel_in_progress INTEGER NOT NULL DEFAULT 0,
-    event_seq               INTEGER NOT NULL DEFAULT 0,
+    version                 INTEGER NOT NULL DEFAULT 0,
     -- Fork-PR policy: the run is held at scheduler admission until the
     -- operator approves it; a hold past the window fails closed (reaper).
     -- Real columns so the expiry sweep filters in SQL.
@@ -108,6 +108,13 @@ CREATE UNIQUE INDEX runs_delivery ON runs(webhook_delivery_id, workflow_path)
 CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
+
+-- `version` counts status/conclusion changes of the run (see `jobs_version`).
+CREATE TRIGGER runs_version AFTER UPDATE OF status, conclusion ON runs
+    FOR EACH ROW WHEN OLD.status IS NOT NEW.status OR OLD.conclusion IS NOT NEW.conclusion
+BEGIN
+    UPDATE runs SET version = version + 1 WHERE run_id = NEW.run_id;
+END;
 
 CREATE TABLE workflow_run_numbers (
     namespace_id            TEXT NOT NULL REFERENCES namespaces(namespace_id),
@@ -169,6 +176,7 @@ CREATE TABLE jobs (
     claimed_by_runner_id    INTEGER,
     claimed_at              INTEGER,
     expand_generation       INTEGER NOT NULL DEFAULT 0,
+    version                 INTEGER NOT NULL DEFAULT 0,
     outputs                 TEXT,
     annotations             TEXT,
     check_run_id            INTEGER,
@@ -194,6 +202,16 @@ CREATE INDEX jobs_run_base ON jobs(run_id, base_id);
 CREATE INDEX jobs_namespace_running ON jobs(namespace_id, pool_key) WHERE queue_state = 'claimed';
 CREATE INDEX jobs_namespace_queued ON jobs(namespace_id)
     WHERE queue_state IN ('blocked','held','ready','pending_expansion');
+
+-- `version` counts status changes of the job (see the pg schema's
+-- `jobs_version`). SQLite cannot rewrite NEW in a BEFORE trigger, so an AFTER
+-- trigger bumps the row; recursive triggers are off, so it does not re-fire.
+CREATE TRIGGER jobs_version AFTER UPDATE OF status ON jobs
+    FOR EACH ROW WHEN OLD.status IS NOT NEW.status
+BEGIN
+    UPDATE jobs SET version = version + 1
+    WHERE run_id = NEW.run_id AND job_id = NEW.job_id;
+END;
 
 -- ── Job spec (immutable, written once at submit/expansion) ───────────
 CREATE TABLE job_specs (
@@ -465,16 +483,22 @@ CREATE TABLE jobset_gates (
 
 -- ── Events (transactional outbox) ────────────────────────────────────
 -- Insert-only. One writer: event_id order is commit order, so readers
--- bookmark event_id alone (no txid safe point needed).
+-- bookmark event_id alone (no txid safe point needed). `version` is the
+-- `jobs.version` / `runs.version` the event reports (NULL: no ordering
+-- claim). One process owns the database, so there is no other node to read
+-- events from; rows are kept only for the live window and pruned by
+-- `created_at` (`bootstrap::run_history_archiver`).
 CREATE TABLE outbox_events (
     event_id                INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace_id            TEXT NOT NULL,
     run_id                  TEXT,
-    run_seq                 INTEGER,
+    job_id                  TEXT,
+    version                 INTEGER,
     topic                   TEXT NOT NULL,
     payload                 TEXT NOT NULL,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER))
 );
+CREATE INDEX outbox_events_age ON outbox_events(created_at);
 
 CREATE TABLE consumer_offsets (
     consumer_name           TEXT PRIMARY KEY,

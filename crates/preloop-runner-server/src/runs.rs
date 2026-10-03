@@ -1908,8 +1908,11 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             );
         }
 
-        // Skipped jobs land in `outcome.concluded` (emitted below) — the
-        // backend concluded them inside `submit_run`.
+        // Skipped jobs land in `outcome.concluded` — when the submit
+        // transaction persisted the projected events (`outcome.events`),
+        // broadcasting is enough; `emit` would append the rows a second
+        // time. Early-return outcomes carry no events and emit normally.
+        let persisted = !outcome.events.is_empty();
         for (job_id, status, reason) in &outcome.concluded {
             // The empty-workflow-concurrency-group rejection names no real job:
             // the backend marks it with a synthetic `*` id and the run-level
@@ -1918,48 +1921,56 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
             if job_id.0 == "*" {
                 continue;
             }
-            shared
-                .state
-                .emit(NdjsonEvent::JobStatus {
-                    run_id: outcome.run_id,
-                    job_id: job_id.clone(),
-                    status: *status,
-                    reason: reason.clone(),
-                })
-                .await;
+            let event = NdjsonEvent::JobStatus {
+                run_id: outcome.run_id,
+                job_id: job_id.clone(),
+                status: *status,
+                reason: reason.clone(),
+            };
+            if persisted {
+                shared.state.emit_persisted(event).await;
+            } else {
+                shared.state.emit(event).await;
+            }
         }
 
-        shared
-            .state
-            .emit(NdjsonEvent::RunAccepted {
-                run_id: outcome.run_id,
-                queued_jobs: outcome.queued_jobs,
-            })
-            .await;
+        if persisted {
+            for event in outcome.events.iter().skip(outcome.concluded.len()) {
+                shared.state.emit_persisted(event.clone()).await;
+            }
+        } else {
+            shared
+                .state
+                .emit(NdjsonEvent::RunAccepted {
+                    run_id: outcome.run_id,
+                    queued_jobs: outcome.queued_jobs,
+                })
+                .await;
 
-        if let Some(rejected) = outcome.rejected {
-            let reason = match rejected {
-                ExecutionStatus::Cancelled => crate::concurrency::cancelled_reason(),
-                ExecutionStatus::Pending => crate::concurrency::pending_reason(),
-                _ => Some("concurrency group name must not be empty".to_owned()),
-            };
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id: outcome.run_id,
-                    status: rejected,
-                    reason,
-                })
-                .await;
-        } else if outcome.held {
-            shared
-                .state
-                .emit(NdjsonEvent::RunStatus {
-                    run_id: outcome.run_id,
-                    status: ExecutionStatus::Pending,
-                    reason: crate::concurrency::pending_reason(),
-                })
-                .await;
+            if let Some(rejected) = outcome.rejected {
+                let reason = match rejected {
+                    ExecutionStatus::Cancelled => crate::concurrency::cancelled_reason(),
+                    ExecutionStatus::Pending => crate::concurrency::pending_reason(),
+                    _ => Some("concurrency group name must not be empty".to_owned()),
+                };
+                shared
+                    .state
+                    .emit(NdjsonEvent::RunStatus {
+                        run_id: outcome.run_id,
+                        status: rejected,
+                        reason,
+                    })
+                    .await;
+            } else if outcome.held {
+                shared
+                    .state
+                    .emit(NdjsonEvent::RunStatus {
+                        run_id: outcome.run_id,
+                        status: ExecutionStatus::Pending,
+                        reason: crate::concurrency::pending_reason(),
+                    })
+                    .await;
+            }
         }
 
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1000.0;
@@ -3518,7 +3529,7 @@ pub async fn rerun_run_inner(
     if let Some((job_id, check_run_id)) = reused_check_run.as_ref() {
         let new_run = accepted.run_id;
         // Guarded by the setter itself: a missing `jobs` row writes nothing.
-        shared
+        let mapping_changed = shared
             .state
             .backend
             .set_job_check_run(new_run, job_id, *check_run_id)
@@ -3526,13 +3537,15 @@ pub async fn rerun_run_inner(
             .map_err(ApiError::from)?;
         // Same persistence obligation as `report_check_run_queued`: the
         // reused check id must survive a restart before the job's first
-        // status event.
-        shared
-            .state
-            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
-                run_id: accepted.run_id,
-            })
-            .await;
+        // status event. The setter wrote the event inside its transaction.
+        if mapping_changed {
+            shared
+                .state
+                .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated {
+                    run_id: accepted.run_id,
+                })
+                .await;
+        }
     }
     crate::github::report_check_runs_for_run(shared, accepted.run_id, reused_check_run).await;
     Ok(accepted)

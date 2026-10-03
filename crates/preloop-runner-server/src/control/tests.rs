@@ -1823,6 +1823,53 @@ pub(crate) mod suite {
         assert_eq!(run.fork_approval_note.as_deref(), Some("lgtm"));
     }
 
+    /// A fork-approval hold nobody answered fails its run closed once the
+    /// approval window has passed — and only then. A hold requested inside
+    /// the window is left parked, a second sweep finds nothing new, and the
+    /// expired run no longer holds. A sweep that errors (or skips the run)
+    /// would leave untrusted fork work waiting for an approval forever.
+    pub(crate) async fn expired_fork_hold_fails_closed(backend: &dyn ControlBackend) {
+        let window_nanos: i64 = 24 * 3600 * 1_000_000_000;
+        let now = crate::models::now_unix_nanos();
+        let stale = RunId::new();
+        let fresh = RunId::new();
+        for (run_id, request_id, requested_at) in
+            [(stale, 1, now - 2 * window_nanos), (fresh, 2, now)]
+        {
+            let mut submit = submit_run(run_id, vec![submit_job(run_id, "build", request_id)]);
+            submit.record.fork_approval_pending = true;
+            submit.record.fork_approval_requested_at_unix_nanos = Some(requested_at);
+            backend.submit_run(submit).await.unwrap();
+        }
+
+        let expired = backend
+            .expire_fork_approvals(now - window_nanos)
+            .await
+            .unwrap();
+        assert_eq!(expired, vec![stale], "only the run past its window expires");
+
+        let stale_run = backend.run_record(stale).await.unwrap();
+        assert!(!stale_run.fork_approval_pending, "the expired hold clears");
+        assert!(
+            stale_run.status.is_terminal(),
+            "the expired run fails closed, got {:?}",
+            stale_run.status
+        );
+        let fresh_run = backend.run_record(fresh).await.unwrap();
+        assert!(
+            fresh_run.fork_approval_pending && !fresh_run.status.is_terminal(),
+            "a hold inside its window stays parked"
+        );
+        assert!(
+            backend
+                .expire_fork_approvals(now - window_nanos)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an expired run is not expired twice"
+        );
+    }
+
     /// An armed environment protection gate keeps its job parked until the
     /// gate admits it: an unexpired wait timer holds, the elapsed timer
     /// releases, and a ref outside `deployment_branches` fails the job closed.
@@ -2036,14 +2083,14 @@ pub(crate) mod suite {
         let fill: Vec<_> = (1..=MAX_TIMELINE_RECORDS as u128)
             .map(|id| timeline_record(id, "fill"))
             .collect();
-        let (_, stored) = backend.patch_timeline(&key, fill).await.unwrap();
+        let (_, stored) = backend.patch_timeline(&key, fill, &[]).await.unwrap();
         assert_eq!(stored.len(), MAX_TIMELINE_RECORDS);
 
         // One more record, sorting after every stored one. The write-side
         // bound evicts the lowest stored record, never the fresh patch.
         let late = u128::MAX;
         let (_, stored) = backend
-            .patch_timeline(&key, vec![timeline_record(late, "late")])
+            .patch_timeline(&key, vec![timeline_record(late, "late")], &[])
             .await
             .unwrap();
         let ids: Vec<String> = stored.iter().map(|record| record.id.to_string()).collect();
@@ -3975,6 +4022,60 @@ pub(crate) mod suite {
         );
     }
 
+    /// Lease expiry is driven by the active-request snapshot, not by the
+    /// caller's due-run optimization. A missed due-run mark must not leave an
+    /// otherwise expired attempt in progress forever.
+    pub(crate) async fn expired_active_attempt_is_not_scoped_to_due_runs(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("unscoped-lease"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a claim");
+        };
+        let inputs = backend.reap_inputs().await.unwrap();
+        let request_id = claimed.request.request_id;
+        let outcome = backend
+            .reap_sweep(ReapSweep {
+                now: std::time::SystemTime::now()
+                    + std::time::Duration::from_secs(
+                        crate::distributed_task::DEAD_SESSION_LEASE_SECONDS + 3600,
+                    ),
+                runs: Default::default(),
+                ready: inputs.ready,
+                active: inputs.active,
+                paused: Default::default(),
+                pool_preparing: false,
+                warm_window_open: false,
+                pool_labels: Vec::new(),
+                first_seen: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            outcome
+                .expired
+                .iter()
+                .any(|lease| lease.request_id == request_id),
+            "an expired active attempt must be settled even when due_runs is empty"
+        );
+    }
+
     /// An assigned-but-unowned request still acquires (session-less replay):
     /// the ownership ladder keys on the claiming session row, not on a
     /// recorded runner id.
@@ -5135,6 +5236,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn expired_active_attempt_is_not_scoped_to_due_runs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::expired_active_attempt_is_not_scoped_to_due_runs(&backend).await;
+    }
+
+    #[tokio::test]
     async fn unowned_session_claim_still_acquires() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -5560,6 +5669,11 @@ mod lite {
     #[tokio::test]
     async fn fork_hold_parks_until_released() {
         suite::fork_hold_parks_until_released(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn expired_fork_hold_fails_closed() {
+        suite::expired_fork_hold_fails_closed(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -6087,6 +6201,12 @@ mod lite {
     #[tokio::test]
     async fn closed_session_attempt_stays_reapable() {
         suite::closed_session_attempt_stays_reapable(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn expired_active_attempt_is_not_scoped_to_due_runs() {
+        suite::expired_active_attempt_is_not_scoped_to_due_runs(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

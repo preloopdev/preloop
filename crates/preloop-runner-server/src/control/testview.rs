@@ -164,6 +164,8 @@ pub struct TestState {
     /// Durable outbox rows written in this working set: `(run, topic)`, in
     /// `event_id` order. Test-only read for the transactional event contract.
     pub outbox_topics: Vec<(Option<RunId>, String)>,
+    /// `(topic, job_id, version)` of the same outbox rows, in the same order.
+    pub outbox_stamps: Vec<(String, Option<String>, Option<i64>)>,
     /// Every queued job cancellation with its recorded reason
     /// (`job_cancellations.reason`), in cancellation order.
     pub cancellation_reasons: Vec<(RunId, JobId, Option<String>)>,

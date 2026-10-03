@@ -21,6 +21,7 @@ use crate::control::logic::{
     BuiltExpansion, BuiltJob, ExpansionContext, ExpansionPlan, MatrixExpansionInputs,
     ReusableExpansionInputs,
 };
+use crate::control::txn_stats::RunRowOp;
 use crate::control::types::{
     AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
     ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
@@ -159,6 +160,7 @@ async fn flush_run(tx: &Transaction<'_>, graph: &RunGraph) -> Result<(), Control
     };
     let started_us = record.started_at.map(|at| codec::system_to_us(at.into()));
     let completed_us = record.completed_at.map(|at| codec::system_to_us(at.into()));
+    let started = std::time::Instant::now();
     tx.execute(
         concat!(
             "UPDATE runs SET status=$3, conclusion=$4, started_at=",
@@ -178,6 +180,7 @@ async fn flush_run(tx: &Transaction<'_>, graph: &RunGraph) -> Result<(), Control
     )
     .await
     .map_err(db)?;
+    crate::control::txn_stats::record(RunRowOp::FlushRun, started.elapsed());
     Ok(())
 }
 
@@ -2320,7 +2323,7 @@ async fn cancel_job_tx(
         .query_opt(
             "SELECT status, queue_state, EXISTS (SELECT 1 FROM job_specs s \
              WHERE s.run_id = jobs.run_id AND s.job_id = jobs.job_id \
-             AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null'::jsonb) \
+             AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
                   OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb))) \
              FROM jobs WHERE run_id=$1::text::uuid AND job_id=$2 FOR UPDATE",
             &[&run_id.0.to_string(), &job_id.0],
@@ -3356,38 +3359,50 @@ impl SchedulingOutcome {
 // Outbox + claim requeue
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Append one outbox row and bump the run's `event_seq` (the row's
-/// `run_seq`) in the same statement (contract rule 9). `payload` carries ids
-/// and states only. A `run_id` with no live `runs` row (archived between
-/// events) leaves `run_seq` NULL and the namespace at its default.
+/// Append one outbox row for a state change a command just made. `payload`
+/// carries ids and states only. Rows written here are not `NdjsonEvent`s
+/// (the stream consumer skips them) and carry no version; a `job_id` in the
+/// payload is copied to the row's column. A `run_id` with no live `runs` row
+/// (archived between events) leaves the namespace at its default.
 pub(super) async fn emit_outbox(
     tx: &Transaction<'_>,
     run_id: Option<RunId>,
     topic: &str,
     payload: serde_json::Value,
 ) -> Result<(), ControlError> {
+    let job_id = payload
+        .get("job_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    insert_outbox(tx, run_id, job_id.as_deref(), None, topic, &payload).await
+}
+
+/// The one `INSERT INTO outbox_events`. It touches no run or job row, so
+/// emitting an event takes no row lock; the namespace is resolved inside the
+/// statement and `origin` is this connection's `preloop.origin`.
+async fn insert_outbox(
+    tx: &Transaction<'_>,
+    run_id: Option<RunId>,
+    job_id: Option<&str>,
+    version: Option<i64>,
+    topic: &str,
+    payload: &serde_json::Value,
+) -> Result<(), ControlError> {
     let run_text = run_id.map(|id| id.0.to_string());
-    let stamped = match &run_text {
-        Some(run) => tx
-            .query_opt(
-                "UPDATE runs SET event_seq = event_seq + 1 \
-                 WHERE run_id = $1::text::uuid \
-                 RETURNING namespace_id, event_seq",
-                &[run],
-            )
-            .await
-            .map_err(db)?,
-        None => None,
-    };
-    let (namespace, run_seq) = stamped
-        .as_ref()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, Option<i64>>(1)))
-        .unwrap_or_else(|| (crate::control::types::DEFAULT_NAMESPACE.to_owned(), None));
-    let payload_text = serde_json::to_string(&payload).map_err(ControlError::backend)?;
+    let payload_text = serde_json::to_string(payload).map_err(ControlError::backend)?;
     tx.execute(
-        "INSERT INTO outbox_events (namespace_id, run_id, run_seq, topic, payload) \
-         VALUES ($1,$2::text::uuid,$3,$4,$5::text::jsonb)",
-        &[&namespace, &run_text, &run_seq, &topic, &payload_text],
+        "INSERT INTO outbox_events (namespace_id, run_id, job_id, version, origin, topic, payload) \
+         VALUES (COALESCE((SELECT namespace_id FROM runs WHERE run_id = $1::text::uuid), $2), \
+                 $1::text::uuid, $3, $4, COALESCE(current_setting('preloop.origin', true), ''), \
+                 $5, $6::text::jsonb)",
+        &[
+            &run_text,
+            &crate::control::types::DEFAULT_NAMESPACE,
+            &job_id,
+            &version,
+            &topic,
+            &payload_text,
+        ],
     )
     .await
     .map_err(db)?;
@@ -3412,14 +3427,17 @@ pub(super) async fn notify_wake(
     Ok(())
 }
 
-/// Append one durable event to the transactional outbox (insert-only).
-/// `run_seq` is the run's next sequence; events without a run carry none.
-/// The versioned topic is the event's serde tag (`job_status` ->
-/// `job_status.v1`).
+/// Append one durable event to the transactional outbox (insert-only). The
+/// versioned topic is the event's serde tag (`job_status` ->
+/// `job_status.v1`). A status event is stamped with the version of the row it
+/// reports on, or not published at all when that row has already settled on a
+/// different final state (see [`logic::EventStamp`]). Reads the row with a
+/// plain `SELECT`: no row lock is taken.
 pub(super) async fn append_event_tx(
     tx: &Transaction<'_>,
     event: &preloop_gha_protocol::NdjsonEvent,
 ) -> Result<(), ControlError> {
+    use preloop_gha_protocol::NdjsonEvent;
     let run_id = crate::control::backend::event_run_id(event);
     let payload = serde_json::to_value(event).map_err(ControlError::backend)?;
     let topic = payload
@@ -3427,7 +3445,49 @@ pub(super) async fn append_event_tx(
         .and_then(|t| t.as_str())
         .map(|kind| format!("{kind}.v1"))
         .unwrap_or_else(|| "event.v1".to_owned());
-    emit_outbox(tx, run_id, &topic, payload).await
+    let (job_id, stamp) = match event {
+        NdjsonEvent::JobStatus {
+            run_id,
+            job_id,
+            status,
+            ..
+        } => {
+            let stamp = tx
+                .query_opt(
+                    "SELECT status, version FROM jobs \
+                     WHERE run_id = $1::text::uuid AND job_id = $2",
+                    &[&run_id.0.to_string(), &job_id.0],
+                )
+                .await
+                .map_err(db)?
+                .map(|row| logic::job_event_stamp(*status, row.get(0), row.get(1)))
+                .unwrap_or(logic::EventStamp::Unversioned);
+            (Some(job_id.0.as_str()), stamp)
+        }
+        NdjsonEvent::RunStatus { run_id, status, .. } => {
+            let stamp = tx
+                .query_opt(
+                    "SELECT status, conclusion, version FROM runs \
+                     WHERE run_id = $1::text::uuid",
+                    &[&run_id.0.to_string()],
+                )
+                .await
+                .map_err(db)?
+                .map(|row| logic::run_event_stamp(*status, row.get(0), row.get(1), row.get(2)))
+                .unwrap_or(logic::EventStamp::Unversioned);
+            (None, stamp)
+        }
+        NdjsonEvent::Annotation { job_id, .. } => {
+            (Some(job_id.0.as_str()), logic::EventStamp::Unversioned)
+        }
+        _ => (None, logic::EventStamp::Unversioned),
+    };
+    let version = match stamp {
+        logic::EventStamp::Stale => return Ok(()),
+        logic::EventStamp::Version(version) => Some(version),
+        logic::EventStamp::Unversioned => None,
+    };
+    insert_outbox(tx, run_id, job_id, version, &topic, &payload).await
 }
 
 /// Requeue a claimed job whose runner is gone: drop the claim — its attempt
@@ -3813,6 +3873,7 @@ impl PgBackend {
                 existing: None,
                 queue_depth: self.queue_depth().await?,
                 next_runs_on: Vec::new(),
+                events: Vec::new(),
             });
         }
 
@@ -4089,6 +4150,7 @@ impl PgBackend {
                         existing: None,
                         queue_depth: self.queue_depth().await?,
                         next_runs_on: self.ready_front_labels().await?,
+                        events: Vec::new(),
                     });
                 }
             }
@@ -4339,6 +4401,37 @@ impl PgBackend {
             )
             .await?;
         }
+        // The events the handler used to emit post-commit — `RunAccepted`,
+        // concluded `JobStatus`s, a held `RunStatus` — are written inside this
+        // transaction so they persist atomically with the run and carry the
+        // versions this command just set, not a re-read after other writers.
+        // The handler replays them via `emit_persisted`.
+        let mut events: Vec<preloop_gha_protocol::NdjsonEvent> = concluded
+            .iter()
+            .filter(|(job_id, _, _)| job_id.0 != "*")
+            .map(
+                |(job_id, status, reason)| preloop_gha_protocol::NdjsonEvent::JobStatus {
+                    run_id: record.run_id,
+                    job_id: job_id.clone(),
+                    status: *status,
+                    reason: reason.clone(),
+                },
+            )
+            .collect();
+        events.push(preloop_gha_protocol::NdjsonEvent::RunAccepted {
+            run_id: record.run_id,
+            queued_jobs: accepted,
+        });
+        if held {
+            events.push(preloop_gha_protocol::NdjsonEvent::RunStatus {
+                run_id: record.run_id,
+                status: ExecutionStatus::Pending,
+                reason: crate::concurrency::pending_reason(),
+            });
+        }
+        for event in &events {
+            append_event_tx(&tx, event).await?;
+        }
         tx.commit().await.map_err(db)?;
         drop(client);
         Ok(SubmitOutcome {
@@ -4352,6 +4445,7 @@ impl PgBackend {
             queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
             existing: None,
+            events,
         })
     }
 }
@@ -4441,6 +4535,7 @@ impl PgBackend {
             queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
             existing: Some(Box::new(existing)),
+            events: Vec::new(),
         })
     }
 }

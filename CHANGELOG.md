@@ -18,9 +18,32 @@ Releases before v0.27.0 predate the changelog.
   every in-flight attempt on each tick, and completed-run memory trimming no
   longer runs on the event path. Before, a reaper-driven completion could
   wedge the only reaper task there and leave attempts `in_progress`
-  indefinitely after a node kill. The fork-approval expiry sweep no longer
-  fails on a bigint/timestamptz comparison (the node logs spammed
-  `fork policy: approval sweep failed` and holds never expired).
+  indefinitely after a node kill.
+
+- With several nodes on one Postgres, a client attached to one node now sees
+  events produced through another node as they happen. Before, `preloop run`
+  on node B did not see a run finish through node A until its stream timed out
+  (5 minutes) and it reconnected. Each node reads the transactional outbox
+  when another node signals (one batched `NOTIFY` per ~15 ms, sent outside the
+  command transactions) and at least once a second, skips its own rows, and
+  drops a state older than one it already delivered. Status events carry the
+  version of the job or run they report: `jobs.version` and `runs.version`
+  count status changes and are bumped by a trigger under the row lock the
+  change already holds. `runs.event_seq` (a counter on the run row that every
+  event took a lock to bump, and that nothing read) and `outbox_events.run_seq`
+  are removed. A status event appended after its row settled on a different
+  final state is not published. The outbox is pruned after
+  `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600). **Schema versions are now
+  `4` (Postgres) and `3` (SQLite); an existing control database is refused and
+  must be recreated.**
+
+- Postgres read paths that scanned whole tables on every command now use an
+  index: the latest-attempt lookup and the `jobs` -> `job_requests` cascade
+  (`job_requests_attempts`), the claim and ready-queue reads (`jobs_ready` no
+  longer carries `namespace_id` between the pool key and the priority, which
+  forced a sort of the whole ready queue), and the reaper's per-attempt
+  `timeout-minutes` read (a stored generated column, `job_messages.job_timeout_s`,
+  instead of extracting it from the toasted message template on every tick).
 
 - `PRELOOP_CREDENTIAL_STORE` selects where the engine's own credentials — the
   system token and the GitHub App/PAT — are kept: `os` (the native

@@ -1598,6 +1598,19 @@
     },
     {
       "schema": "control",
+      "table": "job_messages",
+      "name": "job_timeout_s",
+      "type": "bigint",
+      "ordinal_position": 6,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "GENERATED ALWAYS AS (\nCASE\n    WHEN (jsonb_typeof((message_template -> 'jobTimeout'::text)) = 'number'::text) THEN (((message_template ->> 'jobTimeout'::text))::numeric)::bigint\n    ELSE NULL::bigint\nEND) STORED",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
       "table": "job_needs",
       "name": "run_id",
       "type": "uuid",
@@ -2457,20 +2470,20 @@
     {
       "schema": "control",
       "table": "jobs",
-      "name": "outputs",
-      "type": "jsonb",
+      "name": "version",
+      "type": "bigint",
       "ordinal_position": 21,
-      "nullable": true,
+      "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
       "precision": null,
-      "default": "",
+      "default": "0",
       "is_identity": false
     },
     {
       "schema": "control",
       "table": "jobs",
-      "name": "annotations",
+      "name": "outputs",
       "type": "jsonb",
       "ordinal_position": 22,
       "nullable": true,
@@ -2483,9 +2496,35 @@
     {
       "schema": "control",
       "table": "jobs",
+      "name": "annotations",
+      "type": "jsonb",
+      "ordinal_position": 23,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "jobs",
       "name": "check_run_id",
       "type": "bigint",
-      "ordinal_position": 23,
+      "ordinal_position": 24,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "jobs",
+      "name": "environment_gate",
+      "type": "jsonb",
+      "ordinal_position": 25,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -2498,7 +2537,7 @@
       "table": "jobs",
       "name": "created_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 24,
+      "ordinal_position": 26,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -2511,7 +2550,7 @@
       "table": "jobs",
       "name": "deps_ready_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 25,
+      "ordinal_position": 27,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -2524,7 +2563,7 @@
       "table": "jobs",
       "name": "concurrency_wait_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 26,
+      "ordinal_position": 28,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -2537,7 +2576,7 @@
       "table": "jobs",
       "name": "concurrency_acquired_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 27,
+      "ordinal_position": 29,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -2550,7 +2589,7 @@
       "table": "jobs",
       "name": "started_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 28,
+      "ordinal_position": 30,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -2563,7 +2602,7 @@
       "table": "jobs",
       "name": "completed_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 29,
+      "ordinal_position": 31,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -2756,9 +2795,35 @@
     {
       "schema": "control",
       "table": "log_files",
+      "name": "plan_id",
+      "type": "uuid",
+      "ordinal_position": 3,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "log_files",
+      "name": "log_id",
+      "type": "integer",
+      "ordinal_position": 4,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "log_files",
       "name": "byte_count",
       "type": "bigint",
-      "ordinal_position": 3,
+      "ordinal_position": 5,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -2771,7 +2836,7 @@
       "table": "log_files",
       "name": "line_count",
       "type": "bigint",
-      "ordinal_position": 4,
+      "ordinal_position": 6,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -2784,7 +2849,7 @@
       "table": "log_files",
       "name": "updated_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 5,
+      "ordinal_position": 7,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3211,8 +3276,8 @@
     {
       "schema": "control",
       "table": "outbox_events",
-      "name": "run_seq",
-      "type": "bigint",
+      "name": "job_id",
+      "type": "text",
       "ordinal_position": 5,
       "nullable": true,
       "collation": "",
@@ -3224,9 +3289,35 @@
     {
       "schema": "control",
       "table": "outbox_events",
+      "name": "version",
+      "type": "bigint",
+      "ordinal_position": 6,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events",
+      "name": "origin",
+      "type": "text",
+      "ordinal_position": 7,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "''::text",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events",
       "name": "topic",
       "type": "text",
-      "ordinal_position": 6,
+      "ordinal_position": 8,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3239,7 +3330,7 @@
       "table": "outbox_events",
       "name": "payload",
       "type": "jsonb",
-      "ordinal_position": 7,
+      "ordinal_position": 9,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3252,7 +3343,7 @@
       "table": "outbox_events",
       "name": "created_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 8,
+      "ordinal_position": 10,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3562,9 +3653,87 @@
     {
       "schema": "control",
       "table": "run_history",
+      "name": "record_details",
+      "type": "jsonb",
+      "ordinal_position": 16,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "'{}'::jsonb",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_history",
+      "name": "fork_approval_pending",
+      "type": "boolean",
+      "ordinal_position": 17,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "false",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_history",
+      "name": "fork_approval_requested_at",
+      "type": "bigint",
+      "ordinal_position": 18,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_history",
+      "name": "fork_approval_approved_at",
+      "type": "bigint",
+      "ordinal_position": 19,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_history",
+      "name": "fork_approval_note",
+      "type": "text",
+      "ordinal_position": 20,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_history",
+      "name": "reports_check_runs",
+      "type": "boolean",
+      "ordinal_position": 21,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "false",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_history",
       "name": "created_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 16,
+      "ordinal_position": 22,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -3577,7 +3746,7 @@
       "table": "run_history",
       "name": "started_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 17,
+      "ordinal_position": 23,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -3590,7 +3759,7 @@
       "table": "run_history",
       "name": "completed_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 18,
+      "ordinal_position": 24,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -3747,6 +3916,19 @@
       "name": "secret_refs",
       "type": "jsonb",
       "ordinal_position": 6,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "'{}'::jsonb",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "run_submissions",
+      "name": "record_details",
+      "type": "jsonb",
+      "ordinal_position": 7,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -4316,7 +4498,7 @@
     {
       "schema": "control",
       "table": "runs",
-      "name": "event_seq",
+      "name": "version",
       "type": "bigint",
       "ordinal_position": 23,
       "nullable": false,
@@ -4329,9 +4511,74 @@
     {
       "schema": "control",
       "table": "runs",
+      "name": "fork_approval_pending",
+      "type": "boolean",
+      "ordinal_position": 24,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "false",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "runs",
+      "name": "fork_approval_requested_at",
+      "type": "bigint",
+      "ordinal_position": 25,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "runs",
+      "name": "fork_approval_approved_at",
+      "type": "bigint",
+      "ordinal_position": 26,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "runs",
+      "name": "fork_approval_note",
+      "type": "text",
+      "ordinal_position": 27,
+      "nullable": true,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "runs",
+      "name": "reports_check_runs",
+      "type": "boolean",
+      "ordinal_position": 28,
+      "nullable": false,
+      "collation": "",
+      "character_maximum_length": "null",
+      "precision": null,
+      "default": "false",
+      "is_identity": false
+    },
+    {
+      "schema": "control",
+      "table": "runs",
       "name": "created_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 24,
+      "ordinal_position": 29,
       "nullable": false,
       "collation": "",
       "character_maximum_length": "null",
@@ -4344,7 +4591,7 @@
       "table": "runs",
       "name": "started_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 25,
+      "ordinal_position": 30,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -4357,7 +4604,7 @@
       "table": "runs",
       "name": "completed_at",
       "type": "timestamp with time zone",
-      "ordinal_position": 26,
+      "ordinal_position": 31,
       "nullable": true,
       "collation": "",
       "character_maximum_length": "null",
@@ -5084,7 +5331,7 @@
   "fk_info": [
     {
       "schema": "control",
-      "table": "check_run_updates",
+      "table": "control.check_run_updates",
       "column": "run_id",
       "foreign_key_name": "check_run_updates_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5094,7 +5341,7 @@
     },
     {
       "schema": "control",
-      "table": "check_run_updates",
+      "table": "control.check_run_updates",
       "column": "job_id",
       "foreign_key_name": "check_run_updates_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5104,7 +5351,7 @@
     },
     {
       "schema": "control",
-      "table": "concurrency_holds",
+      "table": "control.concurrency_holds",
       "column": "holder_run_id",
       "foreign_key_name": "concurrency_holds_holder_run_id_fkey",
       "reference_schema": "control",
@@ -5114,7 +5361,7 @@
     },
     {
       "schema": "control",
-      "table": "concurrency_waits",
+      "table": "control.concurrency_waits",
       "column": "holder_run_id",
       "foreign_key_name": "concurrency_waits_holder_run_id_fkey",
       "reference_schema": "control",
@@ -5124,7 +5371,7 @@
     },
     {
       "schema": "control",
-      "table": "github_token_requests",
+      "table": "control.github_token_requests",
       "column": "request_id",
       "foreign_key_name": "github_token_requests_request_id_fkey",
       "reference_schema": "control",
@@ -5134,7 +5381,7 @@
     },
     {
       "schema": "control",
-      "table": "job_assignments",
+      "table": "control.job_assignments",
       "column": "run_id",
       "foreign_key_name": "job_assignments_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5144,7 +5391,7 @@
     },
     {
       "schema": "control",
-      "table": "job_assignments",
+      "table": "control.job_assignments",
       "column": "job_id",
       "foreign_key_name": "job_assignments_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5154,7 +5401,7 @@
     },
     {
       "schema": "control",
-      "table": "job_assignments",
+      "table": "control.job_assignments",
       "column": "runner_id",
       "foreign_key_name": "job_assignments_runner_id_fkey",
       "reference_schema": "control",
@@ -5164,7 +5411,7 @@
     },
     {
       "schema": "control",
-      "table": "job_cancellations",
+      "table": "control.job_cancellations",
       "column": "request_id",
       "foreign_key_name": "job_cancellations_request_id_fkey",
       "reference_schema": "control",
@@ -5174,7 +5421,7 @@
     },
     {
       "schema": "control",
-      "table": "job_leases",
+      "table": "control.job_leases",
       "column": "request_id",
       "foreign_key_name": "job_leases_request_id_fkey",
       "reference_schema": "control",
@@ -5184,7 +5431,7 @@
     },
     {
       "schema": "control",
-      "table": "job_messages",
+      "table": "control.job_messages",
       "column": "run_id",
       "foreign_key_name": "job_messages_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5194,7 +5441,7 @@
     },
     {
       "schema": "control",
-      "table": "job_messages",
+      "table": "control.job_messages",
       "column": "job_id",
       "foreign_key_name": "job_messages_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5204,7 +5451,7 @@
     },
     {
       "schema": "control",
-      "table": "job_needs",
+      "table": "control.job_needs",
       "column": "run_id",
       "foreign_key_name": "job_needs_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5214,7 +5461,7 @@
     },
     {
       "schema": "control",
-      "table": "job_needs",
+      "table": "control.job_needs",
       "column": "job_id",
       "foreign_key_name": "job_needs_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5224,7 +5471,7 @@
     },
     {
       "schema": "control",
-      "table": "job_needs",
+      "table": "control.job_needs",
       "column": "run_id",
       "foreign_key_name": "job_needs_run_id_needs_job_id_fkey",
       "reference_schema": "control",
@@ -5234,7 +5481,7 @@
     },
     {
       "schema": "control",
-      "table": "job_needs",
+      "table": "control.job_needs",
       "column": "needs_job_id",
       "foreign_key_name": "job_needs_run_id_needs_job_id_fkey",
       "reference_schema": "control",
@@ -5244,7 +5491,7 @@
     },
     {
       "schema": "control",
-      "table": "job_requests",
+      "table": "control.job_requests",
       "column": "run_id",
       "foreign_key_name": "job_requests_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5254,7 +5501,7 @@
     },
     {
       "schema": "control",
-      "table": "job_requests",
+      "table": "control.job_requests",
       "column": "job_id",
       "foreign_key_name": "job_requests_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5264,7 +5511,7 @@
     },
     {
       "schema": "control",
-      "table": "job_specs",
+      "table": "control.job_specs",
       "column": "run_id",
       "foreign_key_name": "job_specs_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5274,7 +5521,7 @@
     },
     {
       "schema": "control",
-      "table": "job_specs",
+      "table": "control.job_specs",
       "column": "job_id",
       "foreign_key_name": "job_specs_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5284,7 +5531,7 @@
     },
     {
       "schema": "control",
-      "table": "job_steps",
+      "table": "control.job_steps",
       "column": "agent_job_id",
       "foreign_key_name": "job_steps_agent_job_id_fkey",
       "reference_schema": "control",
@@ -5294,7 +5541,7 @@
     },
     {
       "schema": "control",
-      "table": "jobs",
+      "table": "control.jobs",
       "column": "run_id",
       "foreign_key_name": "jobs_run_id_fkey",
       "reference_schema": "control",
@@ -5304,7 +5551,7 @@
     },
     {
       "schema": "control",
-      "table": "jobs",
+      "table": "control.jobs",
       "column": "run_id",
       "foreign_key_name": "jobs_run_id_parent_job_id_fkey",
       "reference_schema": "control",
@@ -5314,7 +5561,7 @@
     },
     {
       "schema": "control",
-      "table": "jobs",
+      "table": "control.jobs",
       "column": "parent_job_id",
       "foreign_key_name": "jobs_run_id_parent_job_id_fkey",
       "reference_schema": "control",
@@ -5324,7 +5571,7 @@
     },
     {
       "schema": "control",
-      "table": "jobset_gates",
+      "table": "control.jobset_gates",
       "column": "jobset_id",
       "foreign_key_name": "jobset_gates_jobset_id_fkey",
       "reference_schema": "control",
@@ -5334,7 +5581,7 @@
     },
     {
       "schema": "control",
-      "table": "jobsets",
+      "table": "control.jobsets",
       "column": "run_id",
       "foreign_key_name": "jobsets_run_id_fkey",
       "reference_schema": "control",
@@ -5344,7 +5591,17 @@
     },
     {
       "schema": "control",
-      "table": "log_files",
+      "table": "control.log_files",
+      "column": "plan_id",
+      "foreign_key_name": "log_files_plan_id_fkey",
+      "reference_schema": "control",
+      "reference_table": "job_requests",
+      "reference_column": "agent_job_id",
+      "fk_def": "FOREIGN KEY (plan_id) REFERENCES control.job_requests(agent_job_id) ON DELETE CASCADE"
+    },
+    {
+      "schema": "control",
+      "table": "control.log_files",
       "column": "run_id",
       "foreign_key_name": "log_files_run_id_fkey",
       "reference_schema": "control",
@@ -5354,7 +5611,7 @@
     },
     {
       "schema": "control",
-      "table": "namespace_limits",
+      "table": "control.namespace_limits",
       "column": "namespace_id",
       "foreign_key_name": "namespace_limits_namespace_id_fkey",
       "reference_schema": "control",
@@ -5364,7 +5621,7 @@
     },
     {
       "schema": "control",
-      "table": "namespace_policies",
+      "table": "control.namespace_policies",
       "column": "namespace_id",
       "foreign_key_name": "namespace_policies_namespace_id_fkey",
       "reference_schema": "control",
@@ -5374,7 +5631,7 @@
     },
     {
       "schema": "control",
-      "table": "namespace_pool_limits",
+      "table": "control.namespace_pool_limits",
       "column": "namespace_id",
       "foreign_key_name": "namespace_pool_limits_namespace_id_fkey",
       "reference_schema": "control",
@@ -5384,7 +5641,7 @@
     },
     {
       "schema": "control",
-      "table": "provision_requests",
+      "table": "control.provision_requests",
       "column": "run_id",
       "foreign_key_name": "provision_requests_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5394,7 +5651,7 @@
     },
     {
       "schema": "control",
-      "table": "provision_requests",
+      "table": "control.provision_requests",
       "column": "job_id",
       "foreign_key_name": "provision_requests_run_id_job_id_fkey",
       "reference_schema": "control",
@@ -5404,7 +5661,7 @@
     },
     {
       "schema": "control",
-      "table": "run_push_states",
+      "table": "control.run_push_states",
       "column": "run_id",
       "foreign_key_name": "run_push_states_run_id_fkey",
       "reference_schema": "control",
@@ -5414,7 +5671,7 @@
     },
     {
       "schema": "control",
-      "table": "run_submissions",
+      "table": "control.run_submissions",
       "column": "run_id",
       "foreign_key_name": "run_submissions_run_id_fkey",
       "reference_schema": "control",
@@ -5424,7 +5681,7 @@
     },
     {
       "schema": "control",
-      "table": "runner_sessions",
+      "table": "control.runner_sessions",
       "column": "runner_id",
       "foreign_key_name": "runner_sessions_runner_id_fkey",
       "reference_schema": "control",
@@ -5434,7 +5691,7 @@
     },
     {
       "schema": "control",
-      "table": "runners",
+      "table": "control.runners",
       "column": "namespace_id",
       "foreign_key_name": "runners_namespace_id_fkey",
       "reference_schema": "control",
@@ -5444,7 +5701,7 @@
     },
     {
       "schema": "control",
-      "table": "runs",
+      "table": "control.runs",
       "column": "namespace_id",
       "foreign_key_name": "runs_namespace_id_fkey",
       "reference_schema": "control",
@@ -5454,7 +5711,7 @@
     },
     {
       "schema": "control",
-      "table": "session_messages",
+      "table": "control.session_messages",
       "column": "request_id",
       "foreign_key_name": "session_messages_request_id_fkey",
       "reference_schema": "control",
@@ -5464,7 +5721,7 @@
     },
     {
       "schema": "control",
-      "table": "session_messages",
+      "table": "control.session_messages",
       "column": "session_id",
       "foreign_key_name": "session_messages_session_id_fkey",
       "reference_schema": "control",
@@ -5474,7 +5731,7 @@
     },
     {
       "schema": "control",
-      "table": "timeline_records",
+      "table": "control.timeline_records",
       "column": "timeline_id",
       "foreign_key_name": "timeline_records_timeline_id_fkey",
       "reference_schema": "control",
@@ -5484,7 +5741,7 @@
     },
     {
       "schema": "control",
-      "table": "timelines",
+      "table": "control.timelines",
       "column": "timeline_id",
       "foreign_key_name": "timelines_timeline_id_fkey",
       "reference_schema": "control",
@@ -5494,7 +5751,7 @@
     },
     {
       "schema": "control",
-      "table": "workflow_run_numbers",
+      "table": "control.workflow_run_numbers",
       "column": "namespace_id",
       "foreign_key_name": "workflow_run_numbers_namespace_id_fkey",
       "reference_schema": "control",
@@ -5506,280 +5763,287 @@
   "pk_info": [
     {
       "schema": "control",
-      "table": "namespaces",
+      "table": "control.schema_meta",
+      "field_count": 1,
+      "column": "key",
+      "pk_def": "PRIMARY KEY (key)"
+    },
+    {
+      "schema": "control",
+      "table": "control.namespaces",
       "field_count": 1,
       "column": "namespace_id",
       "pk_def": "PRIMARY KEY (namespace_id)"
     },
     {
       "schema": "control",
-      "table": "namespace_limits",
+      "table": "control.namespace_limits",
       "field_count": 1,
       "column": "namespace_id",
       "pk_def": "PRIMARY KEY (namespace_id)"
     },
     {
       "schema": "control",
-      "table": "namespace_pool_limits",
+      "table": "control.namespace_pool_limits",
       "field_count": 2,
       "column": "namespace_id,pool_key",
       "pk_def": "PRIMARY KEY (namespace_id, pool_key)"
     },
     {
       "schema": "control",
-      "table": "namespace_policies",
+      "table": "control.namespace_policies",
       "field_count": 1,
       "column": "namespace_id",
       "pk_def": "PRIMARY KEY (namespace_id)"
     },
     {
       "schema": "control",
-      "table": "runs",
+      "table": "control.runs",
       "field_count": 1,
       "column": "run_id",
       "pk_def": "PRIMARY KEY (run_id)"
     },
     {
       "schema": "control",
-      "table": "workflow_run_numbers",
+      "table": "control.workflow_run_numbers",
       "field_count": 3,
       "column": "namespace_id,repository,workflow_path",
       "pk_def": "PRIMARY KEY (namespace_id, repository, workflow_path)"
     },
     {
       "schema": "control",
-      "table": "run_submissions",
+      "table": "control.run_submissions",
       "field_count": 1,
       "column": "run_id",
       "pk_def": "PRIMARY KEY (run_id)"
     },
     {
       "schema": "control",
-      "table": "run_push_states",
+      "table": "control.run_push_states",
       "field_count": 1,
       "column": "run_id",
       "pk_def": "PRIMARY KEY (run_id)"
     },
     {
       "schema": "control",
-      "table": "jobs",
+      "table": "control.jobs",
       "field_count": 2,
       "column": "run_id,job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id)"
     },
     {
       "schema": "control",
-      "table": "job_specs",
+      "table": "control.job_specs",
       "field_count": 2,
       "column": "run_id,job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id)"
     },
     {
       "schema": "control",
-      "table": "job_needs",
+      "table": "control.job_needs",
       "field_count": 3,
       "column": "run_id,job_id,needs_job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id, needs_job_id)"
     },
     {
       "schema": "control",
-      "table": "job_messages",
+      "table": "control.job_messages",
       "field_count": 2,
       "column": "run_id,job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id)"
     },
     {
       "schema": "control",
-      "table": "job_requests",
+      "table": "control.job_requests",
       "field_count": 1,
       "column": "request_id",
       "pk_def": "PRIMARY KEY (request_id)"
     },
     {
       "schema": "control",
-      "table": "job_leases",
+      "table": "control.job_leases",
       "field_count": 1,
       "column": "request_id",
       "pk_def": "PRIMARY KEY (request_id)"
     },
     {
       "schema": "control",
-      "table": "github_token_requests",
+      "table": "control.github_token_requests",
       "field_count": 1,
       "column": "request_id",
       "pk_def": "PRIMARY KEY (request_id)"
     },
     {
       "schema": "control",
-      "table": "webhook_deliveries",
-      "field_count": 1,
-      "column": "delivery_id",
-      "pk_def": "PRIMARY KEY (delivery_id)"
-    },
-    {
-      "schema": "control",
-      "table": "job_steps",
+      "table": "control.job_steps",
       "field_count": 2,
       "column": "agent_job_id,step_id",
       "pk_def": "PRIMARY KEY (agent_job_id, step_id)"
     },
     {
       "schema": "control",
-      "table": "timelines",
+      "table": "control.timelines",
       "field_count": 1,
       "column": "timeline_id",
       "pk_def": "PRIMARY KEY (timeline_id)"
     },
     {
       "schema": "control",
-      "table": "timeline_records",
+      "table": "control.timeline_records",
       "field_count": 2,
       "column": "timeline_id,record_id",
       "pk_def": "PRIMARY KEY (timeline_id, record_id)"
     },
     {
       "schema": "control",
-      "table": "log_files",
+      "table": "control.log_files",
       "field_count": 1,
       "column": "log_key",
       "pk_def": "PRIMARY KEY (log_key)"
     },
     {
       "schema": "control",
-      "table": "runners",
+      "table": "control.runners",
       "field_count": 1,
       "column": "runner_id",
       "pk_def": "PRIMARY KEY (runner_id)"
     },
     {
       "schema": "control",
-      "table": "webhook_watchdog",
-      "field_count": 1,
-      "column": "scope",
-      "pk_def": "PRIMARY KEY (scope)"
-    },
-    {
-      "schema": "control",
-      "table": "runner_sessions",
+      "table": "control.runner_sessions",
       "field_count": 1,
       "column": "session_id",
       "pk_def": "PRIMARY KEY (session_id)"
     },
     {
       "schema": "control",
-      "table": "session_messages",
+      "table": "control.session_messages",
       "field_count": 1,
       "column": "message_id",
       "pk_def": "PRIMARY KEY (message_id)"
     },
     {
       "schema": "control",
-      "table": "job_cancellations",
+      "table": "control.job_cancellations",
       "field_count": 1,
       "column": "cancellation_id",
       "pk_def": "PRIMARY KEY (cancellation_id)"
     },
     {
       "schema": "control",
-      "table": "job_assignments",
+      "table": "control.job_assignments",
       "field_count": 2,
       "column": "run_id,job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id)"
     },
     {
       "schema": "control",
-      "table": "provision_requests",
+      "table": "control.provision_requests",
       "field_count": 2,
       "column": "run_id,job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id)"
     },
     {
       "schema": "control",
-      "table": "run_history",
-      "field_count": 2,
-      "column": "run_id,created_at",
-      "pk_def": "PRIMARY KEY (run_id, created_at)"
-    },
-    {
-      "schema": "control",
-      "table": "concurrency_holds",
+      "table": "control.concurrency_holds",
       "field_count": 3,
       "column": "namespace_id,repository,group_name",
       "pk_def": "PRIMARY KEY (namespace_id, repository, group_name)"
     },
     {
       "schema": "control",
-      "table": "concurrency_waits",
+      "table": "control.concurrency_waits",
       "field_count": 1,
       "column": "wait_id",
       "pk_def": "PRIMARY KEY (wait_id)"
     },
     {
       "schema": "control",
-      "table": "jobsets",
+      "table": "control.jobsets",
       "field_count": 1,
       "column": "jobset_id",
       "pk_def": "PRIMARY KEY (jobset_id)"
     },
     {
       "schema": "control",
-      "table": "jobset_gates",
+      "table": "control.jobset_gates",
       "field_count": 2,
       "column": "jobset_id,gate_index",
       "pk_def": "PRIMARY KEY (jobset_id, gate_index)"
     },
     {
       "schema": "control",
-      "table": "outbox_events",
+      "table": "control.outbox_events",
       "field_count": 2,
       "column": "event_id,created_at",
       "pk_def": "PRIMARY KEY (event_id, created_at)"
     },
     {
       "schema": "control",
-      "table": "consumer_offsets",
+      "table": "control.consumer_offsets",
       "field_count": 1,
       "column": "consumer_name",
       "pk_def": "PRIMARY KEY (consumer_name)"
     },
     {
       "schema": "control",
-      "table": "webhook_redeliveries",
+      "table": "control.webhook_deliveries",
+      "field_count": 1,
+      "column": "delivery_id",
+      "pk_def": "PRIMARY KEY (delivery_id)"
+    },
+    {
+      "schema": "control",
+      "table": "control.webhook_watchdog",
+      "field_count": 1,
+      "column": "scope",
+      "pk_def": "PRIMARY KEY (scope)"
+    },
+    {
+      "schema": "control",
+      "table": "control.webhook_redeliveries",
       "field_count": 1,
       "column": "delivery_guid",
       "pk_def": "PRIMARY KEY (delivery_guid)"
     },
     {
       "schema": "control",
-      "table": "check_run_updates",
+      "table": "control.check_run_updates",
       "field_count": 2,
       "column": "run_id,job_id",
       "pk_def": "PRIMARY KEY (run_id, job_id)"
     },
     {
       "schema": "control",
-      "table": "artifacts",
+      "table": "control.artifacts",
       "field_count": 1,
       "column": "artifact_id",
       "pk_def": "PRIMARY KEY (artifact_id)"
     },
     {
       "schema": "control",
-      "table": "job_history",
+      "table": "control.run_history",
+      "field_count": 2,
+      "column": "run_id,created_at",
+      "pk_def": "PRIMARY KEY (run_id, created_at)"
+    },
+    {
+      "schema": "control",
+      "table": "control.job_history",
       "field_count": 3,
       "column": "run_id,job_id,run_created_at",
       "pk_def": "PRIMARY KEY (run_id, job_id, run_created_at)"
     },
     {
       "schema": "control",
-      "table": "attempt_history",
+      "table": "control.attempt_history",
       "field_count": 2,
       "column": "request_id,run_created_at",
       "pk_def": "PRIMARY KEY (request_id, run_created_at)"
     },
     {
       "schema": "control",
-      "table": "step_history",
+      "table": "control.step_history",
       "field_count": 3,
       "column": "agent_job_id,step_id,run_created_at",
       "pk_def": "PRIMARY KEY (agent_job_id, step_id, run_created_at)"
@@ -5886,6 +6150,42 @@
       "schema": "control",
       "table": "attempt_history",
       "name": "attempt_history_run",
+      "column": "job_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 2
+    },
+    {
+      "schema": "control",
+      "table": "attempt_history_default",
+      "name": "attempt_history_default_agent_job_id_idx",
+      "column": "agent_job_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "attempt_history_default",
+      "name": "attempt_history_default_run_id_job_id_idx",
+      "column": "run_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "attempt_history_default",
+      "name": "attempt_history_default_run_id_job_id_idx",
       "column": "job_id",
       "index_type": "BTREE",
       "cardinality": null,
@@ -6065,6 +6365,42 @@
     {
       "schema": "control",
       "table": "job_requests",
+      "name": "job_requests_attempts",
+      "column": "run_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "job_requests",
+      "name": "job_requests_attempts",
+      "column": "job_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 2
+    },
+    {
+      "schema": "control",
+      "table": "job_requests",
+      "name": "job_requests_attempts",
+      "column": "request_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "desc",
+      "column_position": 3
+    },
+    {
+      "schema": "control",
+      "table": "job_requests",
       "name": "job_requests_inflight",
       "column": "run_id",
       "index_type": "BTREE",
@@ -6174,25 +6510,13 @@
       "schema": "control",
       "table": "jobs",
       "name": "jobs_ready",
-      "column": "namespace_id",
-      "index_type": "BTREE",
-      "cardinality": null,
-      "size": null,
-      "unique": false,
-      "direction": "asc",
-      "column_position": 2
-    },
-    {
-      "schema": "control",
-      "table": "jobs",
-      "name": "jobs_ready",
       "column": "priority",
       "index_type": "BTREE",
       "cardinality": null,
       "size": null,
       "unique": false,
-      "direction": "asc",
-      "column_position": 3
+      "direction": "desc",
+      "column_position": 2
     },
     {
       "schema": "control",
@@ -6204,7 +6528,7 @@
       "size": null,
       "unique": false,
       "direction": "asc",
-      "column_position": 4
+      "column_position": 3
     },
     {
       "schema": "control",
@@ -6216,7 +6540,7 @@
       "size": null,
       "unique": false,
       "direction": "asc",
-      "column_position": 5
+      "column_position": 4
     },
     {
       "schema": "control",
@@ -6293,8 +6617,44 @@
     {
       "schema": "control",
       "table": "log_files",
+      "name": "log_files_plan_id_log_id_key",
+      "column": "plan_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": true,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "log_files",
+      "name": "log_files_plan_id_log_id_key",
+      "column": "log_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": true,
+      "direction": "asc",
+      "column_position": 2
+    },
+    {
+      "schema": "control",
+      "table": "log_files",
       "name": "log_files_run",
       "column": "run_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events",
+      "name": "outbox_events_age",
+      "column": "created_at",
       "index_type": "BTREE",
       "cardinality": null,
       "size": null,
@@ -6318,6 +6678,42 @@
       "schema": "control",
       "table": "outbox_events",
       "name": "outbox_events_read",
+      "column": "event_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 2
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events_default",
+      "name": "outbox_events_default_created_at_idx",
+      "column": "created_at",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events_default",
+      "name": "outbox_events_default_txid_event_id_idx",
+      "column": "txid",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "outbox_events_default",
+      "name": "outbox_events_default_txid_event_id_idx",
       "column": "event_id",
       "index_type": "BTREE",
       "cardinality": null,
@@ -6371,7 +6767,7 @@
       "cardinality": null,
       "size": null,
       "unique": false,
-      "direction": "asc",
+      "direction": "desc",
       "column_position": 2
     },
     {
@@ -6419,7 +6815,79 @@
       "cardinality": null,
       "size": null,
       "unique": false,
+      "direction": "desc",
+      "column_position": 4
+    },
+    {
+      "schema": "control",
+      "table": "run_history_default",
+      "name": "run_history_default_namespace_id_created_at_idx",
+      "column": "namespace_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
       "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "run_history_default",
+      "name": "run_history_default_namespace_id_created_at_idx",
+      "column": "created_at",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "desc",
+      "column_position": 2
+    },
+    {
+      "schema": "control",
+      "table": "run_history_default",
+      "name": "run_history_default_namespace_id_repository_ref_created_at_idx",
+      "column": "namespace_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "run_history_default",
+      "name": "run_history_default_namespace_id_repository_ref_created_at_idx",
+      "column": "repository",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 2
+    },
+    {
+      "schema": "control",
+      "table": "run_history_default",
+      "name": "run_history_default_namespace_id_repository_ref_created_at_idx",
+      "column": "ref",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 3
+    },
+    {
+      "schema": "control",
+      "table": "run_history_default",
+      "name": "run_history_default_namespace_id_repository_ref_created_at_idx",
+      "column": "created_at",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "desc",
       "column_position": 4
     },
     {
@@ -6475,7 +6943,7 @@
       "table": "runners",
       "name": "runners_labels",
       "column": "labels",
-      "index_type": "GIN",
+      "index_type": "BTREE",
       "cardinality": null,
       "size": null,
       "unique": false,
@@ -6539,7 +7007,7 @@
       "cardinality": null,
       "size": null,
       "unique": false,
-      "direction": "asc",
+      "direction": "desc",
       "column_position": 2
     },
     {
@@ -6647,7 +7115,7 @@
       "cardinality": null,
       "size": null,
       "unique": false,
-      "direction": "asc",
+      "direction": "desc",
       "column_position": 4
     },
     {
@@ -6678,6 +7146,18 @@
       "schema": "control",
       "table": "step_history",
       "name": "step_history_run",
+      "column": "run_id",
+      "index_type": "BTREE",
+      "cardinality": null,
+      "size": null,
+      "unique": false,
+      "direction": "asc",
+      "column_position": 1
+    },
+    {
+      "schema": "control",
+      "table": "step_history_default",
+      "name": "step_history_default_run_id_idx",
       "column": "run_id",
       "index_type": "BTREE",
       "cardinality": null,

@@ -166,11 +166,14 @@ pub(super) fn retry_attempt(
 }
 
 /// `append_event_tx` (pg dispatch.rs): append one durable event to the
-/// outbox; run events stamp `run_seq` from the run's bumped `event_seq`.
+/// outbox. A status event is stamped with the version of the row it reports
+/// on, or not published when that row has already settled on a different
+/// final state (`logic::EventStamp`).
 pub(super) fn append_event_tx(
     tx: &Transaction<'_>,
     event: &preloop_gha_protocol::NdjsonEvent,
 ) -> Result<(), ControlError> {
+    use preloop_gha_protocol::NdjsonEvent;
     let run_id = event_run_id(event);
     let payload = serde_json::to_string(event).map_err(ControlError::backend)?;
     // The versioned topic is the event's serde tag (`job_status` ->
@@ -189,32 +192,57 @@ pub(super) fn append_event_tx(
         Some(run_id) => jobs::namespace_of(tx, run_id)?,
         None => DEFAULT_NAMESPACE.to_owned(),
     };
-    let run_seq: Option<i64> = match run_id {
-        Some(run_id) => tx
-            .prepare_cached(
-                "UPDATE runs SET event_seq = event_seq + 1 WHERE run_id = ?1 \
-                 RETURNING event_seq",
-            )
-            .map_err(db)?
-            .query_row([codec::run_key(run_id)], |row| row.get(0))
-            .optional()
-            .map_err(db)?,
-        None => None,
+    let (job_id, stamp) = match event {
+        NdjsonEvent::JobStatus {
+            run_id,
+            job_id,
+            status,
+            ..
+        } => {
+            let stamp = tx
+                .prepare_cached(
+                    "SELECT status, version FROM jobs WHERE run_id = ?1 AND job_id = ?2",
+                )
+                .map_err(db)?
+                .query_row(params![codec::run_key(*run_id), job_id.0], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()
+                .map_err(db)?
+                .map(|(row_status, version)| logic::job_event_stamp(*status, &row_status, version))
+                .unwrap_or(logic::EventStamp::Unversioned);
+            (Some(job_id.0.as_str()), stamp)
+        }
+        NdjsonEvent::RunStatus { run_id, status, .. } => {
+            let stamp = tx
+                .prepare_cached("SELECT status, conclusion, version FROM runs WHERE run_id = ?1")
+                .map_err(db)?
+                .query_row([codec::run_key(*run_id)], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .optional()
+                .map_err(db)?
+                .map(|(row_status, conclusion, version)| {
+                    logic::run_event_stamp(*status, &row_status, conclusion.as_deref(), version)
+                })
+                .unwrap_or(logic::EventStamp::Unversioned);
+            (None, stamp)
+        }
+        NdjsonEvent::Annotation { job_id, .. } => {
+            (Some(job_id.0.as_str()), logic::EventStamp::Unversioned)
+        }
+        _ => (None, logic::EventStamp::Unversioned),
     };
-    tx.prepare_cached(
-        "INSERT INTO outbox_events (namespace_id, run_id, run_seq, topic, payload) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )
-    .map_err(db)?
-    .execute(params![
-        namespace,
-        run_id.map(codec::run_key),
-        run_seq,
-        topic,
-        payload,
-    ])
-    .map_err(db)?;
-    Ok(())
+    let version = match stamp {
+        logic::EventStamp::Stale => return Ok(()),
+        logic::EventStamp::Version(version) => Some(version),
+        logic::EventStamp::Unversioned => None,
+    };
+    jobs::insert_outbox(tx, &namespace, run_id, job_id, version, &topic, &payload)
 }
 
 /// `pair_runner_tx` (pg lifecycle.rs) + the trait doc: release stale or
@@ -1097,12 +1125,33 @@ impl LiteBackend {
     }
 
     /// `append_event` (pg lifecycle.rs → dispatch.rs `append_event_tx`):
-    /// one outbox row; never touches run state beyond `event_seq`.
+    /// one outbox row, stamped with the reported row's version or dropped
+    /// when that row already settled differently.
     pub(crate) async fn append_event(
         &self,
         event: &preloop_gha_protocol::NdjsonEvent,
     ) -> Result<(), ControlError> {
         self.write(|tx| append_event_tx(tx, event))
+    }
+
+    /// `prune_outbox` (pg outbox.rs): delete up to `limit` outbox rows
+    /// older than `older_than`, oldest first. Returns rows removed.
+    pub(crate) async fn prune_outbox(
+        &self,
+        older_than: std::time::Duration,
+        limit: usize,
+    ) -> Result<u64, ControlError> {
+        let cutoff = now_us() - older_than.as_micros() as i64;
+        self.write(|tx| {
+            tx.execute(
+                "DELETE FROM outbox_events WHERE event_id IN ( \
+                     SELECT event_id FROM outbox_events WHERE created_at < ?1 \
+                     ORDER BY created_at LIMIT ?2)",
+                params![cutoff, limit as i64],
+            )
+            .map(|n| n as u64)
+            .map_err(db)
+        })
     }
 
     /// `reconcile_on_boot` (pg lifecycle.rs): drop holds/waits of dead or

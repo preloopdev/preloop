@@ -741,16 +741,24 @@ impl LiteBackend {
                 .push((codec::run_id(&run), codec::job_id(job), reason));
         }
         for row in tx
-            .prepare_cached("SELECT run_id, topic FROM outbox_events ORDER BY event_id")
+            .prepare_cached(
+                "SELECT run_id, topic, job_id, version FROM outbox_events ORDER BY event_id",
+            )
             .map_err(db)?
             .query_map([], |row| {
-                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
             })
             .map_err(db)?
         {
-            let (run, topic) = row.map_err(db)?;
+            let (run, topic, job, version) = row.map_err(db)?;
             t.outbox_topics
-                .push((run.map(|run| codec::run_id(&run)), topic));
+                .push((run.map(|run| codec::run_id(&run)), topic.clone()));
+            t.outbox_stamps.push((topic, job, version));
         }
 
         // ── Counters ─────────────────────────────────────────────────

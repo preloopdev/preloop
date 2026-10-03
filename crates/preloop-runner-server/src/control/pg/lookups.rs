@@ -356,8 +356,9 @@ impl PgBackend {
         job_id: &JobId,
         check_run_id: u64,
     ) -> Result<bool, ControlError> {
-        let client = self.writer().await?;
-        let changed = client
+        let mut client = self.writer().await?;
+        let tx = client.transaction().await.map_err(db)?;
+        let changed = tx
             .execute(
                 "UPDATE jobs SET check_run_id = $3 WHERE run_id = $1::text::uuid AND job_id = $2 \
                  AND check_run_id IS DISTINCT FROM $3",
@@ -365,7 +366,7 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-        let detail_changed = client
+        let detail_changed = tx
             .execute(
                 "UPDATE run_submissions \
                  SET record_details = jsonb_set(record_details, \
@@ -376,7 +377,19 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
-        Ok(changed > 0 || detail_changed > 0)
+        let mapping_changed = changed > 0 || detail_changed > 0;
+        if mapping_changed {
+            // The mapping's `CheckRunCreated` event persists atomically with
+            // it; the caller broadcasts via `emit_persisted` (a restart must
+            // not lose the mapping's event while keeping the mapping).
+            super::dispatch::append_event_tx(
+                &tx,
+                &preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id },
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(mapping_changed)
     }
 
     /// Clear a job's check-run id only while it still equals `expected` —

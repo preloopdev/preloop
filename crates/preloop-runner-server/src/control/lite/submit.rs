@@ -138,6 +138,7 @@ fn submit_run_tx(
                 existing: Some(Box::new(existing)),
                 queue_depth: jobs::ready_count(tx)?,
                 next_runs_on: jobs::next_ready_labels(tx)?,
+                events: Vec::new(),
             });
         }
     }
@@ -159,6 +160,7 @@ fn submit_run_tx(
             existing: None,
             queue_depth: jobs::ready_count(tx)?,
             next_runs_on: jobs::next_ready_labels(tx)?,
+            events: Vec::new(),
         });
     }
 
@@ -365,6 +367,7 @@ fn submit_run_tx(
                     existing: None,
                     queue_depth: jobs::ready_count(tx)?,
                     next_runs_on: jobs::next_ready_labels(tx)?,
+                    events: Vec::new(),
                 });
             }
             cg::AcqOutcome::Failed => {
@@ -719,6 +722,36 @@ fn submit_run_tx(
         )?;
     }
 
+    // The events the handler used to emit post-commit — `RunAccepted`,
+    // concluded `JobStatus`s, a held `RunStatus` — are written inside this
+    // transaction so they persist atomically with the run. The handler
+    // replays them via `emit_persisted`.
+    let mut events: Vec<preloop_gha_protocol::NdjsonEvent> = concluded
+        .iter()
+        .filter(|(job_id, _, _)| job_id.0 != "*")
+        .map(
+            |(job_id, status, reason)| preloop_gha_protocol::NdjsonEvent::JobStatus {
+                run_id,
+                job_id: job_id.clone(),
+                status: *status,
+                reason: reason.clone(),
+            },
+        )
+        .collect();
+    events.push(preloop_gha_protocol::NdjsonEvent::RunAccepted {
+        run_id,
+        queued_jobs: queued,
+    });
+    if held {
+        events.push(preloop_gha_protocol::NdjsonEvent::RunStatus {
+            run_id,
+            status: ExecutionStatus::Pending,
+            reason: crate::concurrency::pending_reason(),
+        });
+    }
+    for event in &events {
+        super::lifecycle::append_event_tx(tx, event)?;
+    }
     Ok(SubmitOutcome {
         run_id,
         run_number: record.run_number,
@@ -730,6 +763,7 @@ fn submit_run_tx(
         existing: None,
         queue_depth: jobs::ready_count(tx)?,
         next_runs_on: jobs::next_ready_labels(tx)?,
+        events,
     })
 }
 

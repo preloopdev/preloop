@@ -211,8 +211,9 @@ impl ControlBackend for LiteBackend {
         &self,
         timeline_key: &str,
         records: Vec<preloop_gha_protocol::azdo::TimelineRecord>,
+        events: &[NdjsonEvent],
     ) -> Result<(i32, Vec<preloop_gha_protocol::azdo::TimelineRecord>), ControlError> {
-        self.patch_timeline(timeline_key, records).await
+        self.patch_timeline(timeline_key, records, events).await
     }
     async fn get_timeline(
         &self,
@@ -224,6 +225,13 @@ impl ControlBackend for LiteBackend {
     }
     async fn prune_timelines(&self, before_us: i64) -> Result<u64, ControlError> {
         self.prune_timelines(before_us).await
+    }
+    async fn prune_outbox(
+        &self,
+        older_than: std::time::Duration,
+        limit: usize,
+    ) -> Result<u64, ControlError> {
+        self.prune_outbox(older_than, limit).await
     }
     async fn reap_inputs(&self) -> Result<ReapInputs, ControlError> {
         self.reap_inputs().await

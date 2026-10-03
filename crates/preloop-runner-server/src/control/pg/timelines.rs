@@ -88,6 +88,7 @@ impl PgBackend {
         &self,
         timeline_key: &str,
         mut records: Vec<TimelineRecord>,
+        events: &[preloop_gha_protocol::NdjsonEvent],
     ) -> Result<(i32, Vec<TimelineRecord>), ControlError> {
         let not_found = || ControlError::NotFound(format!("timeline {timeline_key} not found"));
         let timeline = timeline_uuid(timeline_key).ok_or_else(not_found)?;
@@ -215,6 +216,11 @@ impl PgBackend {
             )
             .await
             .map_err(db)?;
+        // Annotation events projected from this PATCH persist atomically
+        // with the records; the handler broadcasts them via `emit_persisted`.
+        for event in events {
+            super::dispatch::append_event_tx(&tx, event).await?;
+        }
         tx.commit().await.map_err(db)?;
         Ok((change_id, decode_records(&stored)))
     }

@@ -475,10 +475,11 @@ async fn mint_check_run(
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     if mapping_changed {
         // The mapping is meaningful while the run lives, and the next status
-        // event may be hours away. Persist it before returning to the caller.
+        // event may be hours away. `set_job_check_run` persisted the event
+        // inside its own transaction; only the broadcast remains.
         shared
             .state
-            .emit(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
+            .emit_persisted(preloop_gha_protocol::NdjsonEvent::CheckRunCreated { run_id })
             .await;
     }
     Ok(Some(check_run_id))

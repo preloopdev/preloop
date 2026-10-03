@@ -306,14 +306,19 @@ impl PgBackend {
         tx: &Transaction<'_>,
         run_id: RunId,
     ) -> Result<bool, ControlError> {
-        Ok(tx
+        let started = std::time::Instant::now();
+        let row = tx
             .query_opt(
                 "SELECT 1 FROM runs WHERE run_id = $1::text::uuid FOR NO KEY UPDATE",
                 &[&run_id.0.to_string()],
             )
             .await
-            .map_err(db)?
-            .is_some())
+            .map_err(db)?;
+        crate::control::txn_stats::record(
+            crate::control::txn_stats::RunRowOp::LockRun,
+            started.elapsed(),
+        );
+        Ok(row.is_some())
     }
 
     /// Load the run row + submission + every node (jobs ⨝ specs ⨝ needs ⨝

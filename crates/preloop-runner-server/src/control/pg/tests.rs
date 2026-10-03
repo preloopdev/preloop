@@ -644,7 +644,7 @@ async fn timelines_are_shared_and_bounded_across_nodes() {
     let missing = format!("{}/{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     assert!(matches!(
         node_a
-            .patch_timeline(&missing, vec![timeline_record(1, "x")])
+            .patch_timeline(&missing, vec![timeline_record(1, "x")], &[])
             .await,
         Err(ControlError::NotFound(_))
     ));
@@ -653,13 +653,14 @@ async fn timelines_are_shared_and_bounded_across_nodes() {
     assert!(rows.is_empty());
 
     let (first, _) = node_a
-        .patch_timeline(&key, vec![timeline_record(1, "one")])
+        .patch_timeline(&key, vec![timeline_record(1, "one")], &[])
         .await
         .unwrap();
     let (second, stored) = node_b
         .patch_timeline(
             &key,
             vec![timeline_record(2, "two"), timeline_record(1, "uno")],
+            &[],
         )
         .await
         .unwrap();
@@ -677,7 +678,7 @@ async fn timelines_are_shared_and_bounded_across_nodes() {
             let node = if i % 2 == 0 { &node_a } else { &node_b };
             let key = key.clone();
             async move {
-                node.patch_timeline(&key, vec![timeline_record(10 + i as u128, "x")])
+                node.patch_timeline(&key, vec![timeline_record(10 + i as u128, "x")], &[])
                     .await
             }
         })
@@ -700,7 +701,7 @@ async fn prune_timelines_drops_settled_attempts() {
     let (request, runner_id) = submit_and_claim(&node_a, run_id).await;
     let key = format!("{}/{}", request.plan_id, request.timeline_id);
     node_a
-        .patch_timeline(&key, vec![timeline_record(1, "one")])
+        .patch_timeline(&key, vec![timeline_record(1, "one")], &[])
         .await
         .unwrap();
 
@@ -957,7 +958,7 @@ async fn timeline_reply_is_coherent_under_concurrent_patches() {
     let (request, _runner_id) = submit_and_claim(&node_a, run_id).await;
     let key = format!("{}/{}", request.plan_id, request.timeline_id);
     node_a
-        .patch_timeline(&key, vec![timeline_record(1, "seed")])
+        .patch_timeline(&key, vec![timeline_record(1, "seed")], &[])
         .await
         .unwrap();
 
@@ -968,7 +969,7 @@ async fn timeline_reply_is_coherent_under_concurrent_patches() {
         let key = key.clone();
         tokio::spawn(async move {
             for i in 0..PATCHES {
-                node.patch_timeline(&key, vec![timeline_record(100 + i as u128, "x")])
+                node.patch_timeline(&key, vec![timeline_record(100 + i as u128, "x")], &[])
                     .await
                     .unwrap();
             }
@@ -1382,5 +1383,62 @@ async fn gate_displacement_locks_the_cancelled_run_before_the_group() {
     assert_eq!(
         node_a.run_record(holder).await.unwrap().status,
         ExecutionStatus::Cancelled
+    );
+}
+
+/// The outbox reader never skips a row. While a transaction that already
+/// wrote an outbox row is open, rows committed after it stay behind the safe
+/// point; once it commits, both arrive and the older transaction's row comes
+/// first. Each row names the node that wrote it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbox_reader_does_not_pass_an_open_transaction() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    assert_ne!(node_a.origin(), node_b.origin(), "one origin per node");
+    let head = node_b.outbox_head().await.unwrap();
+
+    let mut held = node_a.writer().await.unwrap();
+    let tx = held.transaction().await.unwrap();
+    super::dispatch::emit_outbox(&tx, None, "held.v1", serde_json::json!({"n": 1}))
+        .await
+        .unwrap();
+    // Committed after the open transaction's row was written (and so after it
+    // took its txid).
+    node_b
+        .append_event(&preloop_gha_protocol::NdjsonEvent::RunAccepted {
+            run_id: RunId::new(),
+            queued_jobs: 1,
+        })
+        .await
+        .unwrap();
+    let during = node_b.outbox_read(head, 100).await.unwrap();
+    assert!(
+        during.is_empty(),
+        "rows behind an open transaction are not readable yet: {during:?}"
+    );
+
+    tx.commit().await.unwrap();
+    drop(held);
+    // Another database's long transaction on a shared server can hold the safe
+    // point back for a moment: wait for it rather than assume it is quick.
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        rows = node_b.outbox_read(head, 100).await.unwrap();
+        if rows.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let topics: Vec<&str> = rows.iter().map(|row| row.topic.as_str()).collect();
+    assert_eq!(topics, ["held.v1", "run_accepted.v1"]);
+    assert_eq!(rows[0].origin, node_a.origin());
+    assert_eq!(rows[1].origin, node_b.origin());
+    let key = |row: &crate::control::types::OutboxRow| (row.bookmark.txid, row.bookmark.event_id);
+    assert!(key(&rows[0]) < key(&rows[1]));
+    let after = node_b.outbox_read(rows[1].bookmark, 100).await.unwrap();
+    assert!(
+        after.is_empty(),
+        "nothing past the last bookmark: {after:?}"
     );
 }

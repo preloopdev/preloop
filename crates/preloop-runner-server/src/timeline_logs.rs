@@ -60,7 +60,9 @@ pub async fn patch_timeline_records(
                 "timeline record update"
             );
         }
-        if let (Some(run_id), Some(status)) = (run_id, timeline_status(record)) {
+        if !is_step_record(record)
+            && let (Some(run_id), Some(status)) = (run_id, timeline_status(record))
+        {
             projected.push(NdjsonEvent::JobStatus {
                 run_id,
                 job_id: logical_job_id
@@ -142,7 +144,13 @@ pub async fn patch_timeline_records(
             warn!(?error, "failed to persist timeline steps");
         }
     }
-    for event in projected {
+    // Status events keep the legacy path (persisted by `emit`); annotations
+    // are written by `patch_timeline` inside its own transaction, then
+    // broadcast via `emit_persisted`.
+    let (annotations, statuses): (Vec<NdjsonEvent>, Vec<NdjsonEvent>) = projected
+        .into_iter()
+        .partition(|event| matches!(event, NdjsonEvent::Annotation { .. }));
+    for event in statuses {
         shared.state.emit(event).await;
     }
     // Persist the records (one shared row each; the change id is bumped in
@@ -151,18 +159,31 @@ pub async fn patch_timeline_records(
     match shared
         .state
         .backend
-        .patch_timeline(&timeline_key, records)
+        .patch_timeline(&timeline_key, records, &annotations)
         .await
     {
-        Ok((_change_id, stored)) => Ok(Json(json!({ "count": stored.len(), "value": stored }))),
+        Ok((_change_id, stored)) => {
+            for event in annotations {
+                shared.state.emit_persisted(event).await;
+            }
+            Ok(Json(json!({ "count": stored.len(), "value": stored })))
+        }
         // An unknown timeline (test hooks, standalone uploads) keeps the
-        // permissive empty answer the pre-backend model gave.
+        // permissive empty answer the pre-backend model gave. The
+        // annotations were never persisted; emit them normally so
+        // subscribers still see them.
         Err(crate::control::ControlError::NotFound(_)) => {
+            for event in annotations {
+                shared.state.emit(event).await;
+            }
             Ok(Json(json!({ "count": 0, "value": [] })))
         }
         // Anything else is a real persistence failure: answering 200 with an
         // empty body would tell the runner its records were stored.
         Err(error) => {
+            for event in annotations {
+                shared.state.emit(event).await;
+            }
             warn!(?error, "failed to persist timeline records");
             Err(ApiError::from(error))
         }
@@ -1273,5 +1294,75 @@ mod tests {
             .find(|(_, step_id)| step_id.as_deref() == Some(&child_task_id.to_string()))
             .expect("child task record produces step_id == Some(task_id) annotation");
         assert!(matches!(task_ann.0, AnnotationLevel::Warning));
+    }
+
+    /// A finished step is not a finished job. A successful step record must
+    /// not publish a terminal `JobStatus` for its job: the first terminal
+    /// status per job wins in `state.emit`, so a premature `success` would
+    /// swallow the job's real (here failing) completion.
+    #[tokio::test]
+    async fn successful_step_does_not_mask_the_jobs_real_completion() {
+        let (_temp, shared, run_id, job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
+        let mut events = state.events.subscribe();
+
+        let job_record_id = uuid::Uuid::new_v4();
+        let wrapper: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(serde_json::json!({
+                "count": 1,
+                "value": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "parentId": job_record_id.to_string(),
+                    "name": "Run tests",
+                    "displayName": "Run tests",
+                    "type": "Task",
+                    "state": "completed",
+                    "result": "succeeded"
+                }]
+            }))
+            .expect("valid wire JSON payload");
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+            Json(wrapper),
+        )
+        .await;
+
+        // The job then fails at a later step; settlement reports it.
+        state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id: job_id.clone(),
+                status: ExecutionStatus::Failure,
+                reason: None,
+            })
+            .await;
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let NdjsonEvent::JobStatus {
+                job_id: event_job,
+                status,
+                ..
+            } = event
+                && event_job == job_id
+            {
+                statuses.push(status);
+            }
+        }
+        assert_eq!(
+            statuses.last(),
+            Some(&ExecutionStatus::Failure),
+            "the job's real completion must reach subscribers; saw {statuses:?}"
+        );
+        assert!(
+            !statuses.contains(&ExecutionStatus::Success),
+            "a step result must not be published as the job's status; saw {statuses:?}"
+        );
     }
 }

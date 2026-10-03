@@ -46,6 +46,7 @@ impl LiteBackend {
         &self,
         timeline_key: &str,
         mut records: Vec<TimelineRecord>,
+        events: &[preloop_gha_protocol::NdjsonEvent],
     ) -> Result<(i32, Vec<TimelineRecord>), ControlError> {
         let not_found = || ControlError::NotFound(format!("timeline {timeline_key}"));
         let timeline = timeline_id(timeline_key).ok_or_else(not_found)?;
@@ -179,6 +180,11 @@ impl LiteBackend {
                 )
                 .map_err(db)?;
             let stored = decode_records(&mut stmt, params![timeline, MAX_TIMELINE_RECORDS as i64])?;
+            // Annotation events projected from this PATCH persist atomically
+            // with the records; the handler broadcasts via `emit_persisted`.
+            for event in events {
+                super::lifecycle::append_event_tx(tx, event)?;
+            }
             Ok((change_id as i32, stored))
         })
     }
