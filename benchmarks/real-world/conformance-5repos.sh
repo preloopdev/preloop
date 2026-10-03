@@ -157,28 +157,10 @@ prepare_golden_home() {
   # Reject the small launcher stub or a partial download.  The packed payload
   # used by this campaign is the ~9GB .smolmachine sidecar.
   [ "$bytes" -ge 8589934592 ] || fail "golden is ${bytes} bytes, not the required ~9GB .smolmachine payload"
-  # The server probes the packed artifact at
-  # <vms>/<stem>-<environment-fingerprint>: artifact_payload() appends the
-  # EnvironmentSpec fingerprint (sha256 of the normalized base/toolchains/
-  # curated/bake JSON) so bake-content changes invalidate stale packs. A
-  # stem-only symlink silently falls through to a base-image pull (tens of
-  # GiB) — replicate the fingerprint computation here (the base is custom,
-  # so nothing is curated and there are no toolchains).
-  fingerprint="$(python3 - "$OFFICIAL_GOLDEN_BASE" <<'INNERPY'
-import hashlib, json, sys
-import platform
-rosetta = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
-normalized = {
-    "base": sys.argv[1],
-    "toolchains": [],
-    "curated": False,
-    "bake": "",
-    "rosetta_libs": rosetta,
-}
-print(hashlib.sha256(json.dumps(normalized, separators=(",", ":")).encode()).hexdigest())
-INNERPY
-)"
-  expected="$CAMPAIGN_HOME/vms/$OFFICIAL_GOLDEN_NAME-$fingerprint"
+  # Ask the engine for its own payload path — the fingerprint folds in
+  # base/toolchains/bake AND the node-external pins, so duplicating the hash
+  # here drifts. `preloop golden-path` keeps the harness in lockstep.
+  expected="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$OFFICIAL_GOLDEN_BASE")"
   mkdir -p "$(dirname "$expected")"
   ln -sfn "$OFFICIAL_GOLDEN_ARTIFACT" "$expected"
   [ -f "$expected" ] || fail "failed to expose official golden at $expected"
@@ -433,8 +415,8 @@ main() {
     target_list="$(repo_targets "$repo")" || fail "unknown repository: $repo"
   fi
 
-  prepare_golden_home
   ensure_binaries
+  prepare_golden_home
   mkdir -p "$WORKSPACE_ROOT" "$OUTPUT_ROOT"
   start_server
   for target in $target_list; do
