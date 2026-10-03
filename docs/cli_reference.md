@@ -475,6 +475,7 @@ stock base, or a local bake for a custom one.
 | `PRELOOP_SYSTEM_TOKEN` | Native API bearer token (also `PRELOOP_TOKEN`) |
 | `PRELOOP_GITHUB_TOKEN` | PAT fallback for GitHub API calls (check runs need the App) |
 | `PRELOOP_GITHUB_API_URL` | Override the GitHub API base (tests, GHES) |
+| `PRELOOP_GITHUB_SKIP_WORKFLOWS` | Comma-separated GitHub-owned workflow filenames or `.github/workflows/…` paths (for example `release-runner.yml`). Preloop ignores these workflows on webhook dispatch while GitHub Actions still runs them; set on the engine and restart it |
 | `PRELOOP_WEBHOOK_SECRET` | Webhook signature secret for the default App (Apps in `github.apps` may carry their own) |
 
 ### Engine token storage

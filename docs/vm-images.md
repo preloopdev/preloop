@@ -46,7 +46,13 @@ file, it is also reproducible: the same artifact produces the same runner on any
 
 The stock golden contains:
 
-1. **Base OS**: Ubuntu 24.04, pinned by **digest**. Ubuntu 22.04 is also pinned for workflows that select it. We dont support macos/windows runners yet.
+1. **Base OS**: the published packed golden is Ubuntu 24.04, pinned by digest;
+`ubuntu-latest` currently selects that 24.04 base. `ubuntu-22.04` selects a
+separate digest-pinned plain Ubuntu 22.04 OCI base and builds its environment
+golden on demand; there is no published packed 22.04 golden. `ubuntu-slim` has
+no separate slim image and currently falls back to the configured base.
+Preloop's microVM pool runs Linux guests; the release workflow's macOS builds
+use GitHub-hosted runners.
 2. **The runner**: `preloop-runner` cross-built for `aarch64-unknown-linux-gnu`
 (`cargo-zigbuild`), fidelity-tracked against the official `actions/runner`
 (see `versions.toml`).

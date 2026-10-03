@@ -4,6 +4,10 @@ name: release-runner
 # platform, a CycloneDX SBOM per binary, and a minimal container image at
 # ghcr.io/preloopdev/preloop-runner. Linux bundles are also consumed by
 # install.sh as the in-VM guest runner.
+#
+# GitHub Actions owns this release workflow. A co-hosted Preloop engine must
+# set PRELOOP_GITHUB_SKIP_WORKFLOWS=release-runner.yml so the release webhook
+# does not create duplicate, unhostable jobs and checks there.
 
 on:
   release:
@@ -31,9 +35,6 @@ jobs:
             os: macos-14
           - triple: x86_64-apple-darwin
             os: macos-15-intel
-          - triple: x86_64-pc-windows-msvc
-            os: windows-latest
-            ext: .exe
     permissions:
       contents: write
     steps:
@@ -80,18 +81,6 @@ jobs:
           cp "target/$TRIPLE/release/preloop-runner" "dist/preloop-runner-$TRIPLE"
           shasum -a 256 "dist/preloop-runner-$TRIPLE" | awk '{print $1}' \
             > "dist/preloop-runner-$TRIPLE.sha256"
-
-      - name: Build runner (Windows)
-        if: runner.os == 'Windows'
-        env:
-          TRIPLE: ${{ matrix.triple }}
-        shell: bash
-        run: |
-          cargo build --release --target "$TRIPLE" -p preloop-runner
-          mkdir -p dist
-          cp "target/$TRIPLE/release/preloop-runner.exe" "dist/preloop-runner-$TRIPLE.exe"
-          sha256sum "dist/preloop-runner-$TRIPLE.exe" | awk '{print $1}' \
-            > "dist/preloop-runner-$TRIPLE.exe.sha256"
 
       - name: Generate SBOM (CycloneDX)
         uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2.85.10
