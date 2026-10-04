@@ -3059,6 +3059,52 @@ impl<'a> Sweep<'a> {
         Ok(updated > 0)
     }
 
+    /// Cancel a failed leg's matrix siblings (fail-fast). Returns the IDs of
+    /// jobs actually cancelled. Idempotent: running it twice cancels nothing
+    /// the second time.
+    ///
+    /// The `fail_fast` flag comes from `job_specs` (default true when null,
+    /// matching the old in-memory default). Only non-terminal siblings are
+    /// touched; the failed job itself is excluded.
+    pub(super) async fn cancel_fail_fast_siblings(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        failed: &JobId,
+        base_id: &str,
+    ) -> Result<Vec<JobId>, ControlError> {
+        // Fail-fast defaults to true when the spec row is missing or null.
+        let fail_fast: bool = tx
+            .query_opt(
+                "SELECT fail_fast FROM job_specs \
+                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run_id.0.to_string(), &failed.0],
+            )
+            .await
+            .map_err(db)?
+            .and_then(|row| row.get::<_, Option<bool>>(0))
+            .unwrap_or(true);
+        if !fail_fast {
+            return Ok(Vec::new());
+        }
+        let rows = tx
+            .query(
+                "UPDATE jobs SET status='cancelled', queue_state='none', \
+                        completed_at=COALESCE(completed_at, now()) \
+                 WHERE run_id=$1::text::uuid AND base_id=$2 AND job_id != $3 \
+                 AND kind='matrix_leg' \
+                 AND status NOT IN \
+                   ('success','failure','cancelled','skipped','timed_out') \
+                 RETURNING job_id",
+                &[&run_id.0.to_string(), &base_id, &failed.0],
+            )
+            .await
+            .map_err(db)?;
+        Ok(rows
+            .iter()
+            .map(|row| JobId(row.get::<_, String>(0)))
+            .collect())
+    }
+
     pub(super) async fn settle_node(
         &mut self,
         run_id: RunId,

@@ -1712,3 +1712,86 @@ async fn try_unblock_dependent_needs_all_terminal() {
     assert!(unblocked, "deploy should unblock when test is terminal");
     tx.rollback().await.unwrap();
 }
+
+/// `cancel_fail_fast_siblings` cancels non-terminal legs sharing the base.
+/// Idempotent and respects the `fail_fast=false` opt-out.
+#[tokio::test]
+async fn cancel_fail_fast_siblings_cancels_legs() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let leg0 = submit_job(run_id, "build-0", 2);
+    let leg1 = submit_job(run_id, "build-1", 3);
+    let leg2 = submit_job(run_id, "build-2", 4);
+    node.submit_run(submit_run(run_id, vec![build, leg0, leg1, leg2]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Shape the matrix via SQL.
+    tx.execute(
+        "UPDATE jobs SET kind='matrix_parent', base_id='build', queue_state='none' \
+         WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    for leg in ["build-0", "build-1", "build-2"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build', \
+                    status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // Fail-fast defaults to true (no job_specs row).
+    // Mark leg0 as failed.
+    tx.execute(
+        "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.len(), 2, "two siblings cancelled");
+    assert!(cancelled.contains(&JobId("build-1".to_owned())));
+    assert!(cancelled.contains(&JobId("build-2".to_owned())));
+
+    // Verify DB state.
+    let st: String = tx
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='build-1'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(st, "cancelled");
+
+    // Idempotent: second call cancels nothing.
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(cancelled.is_empty(), "second call is a no-op");
+    tx.rollback().await.unwrap();
+}
