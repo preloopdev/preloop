@@ -3017,6 +3017,48 @@ impl<'a> Sweep<'a> {
             .collect())
     }
 
+    /// Try to unblock a dependent job: set `queue_state='ready'` only if every
+    /// need is satisfied. A need on a job id waits for that job; a need on a
+    /// matrix base id waits for *every* leg (a leg's own id never appears in
+    /// `job_needs`). Expanded matrix parents don't count — their legs do.
+    ///
+    /// Atomic: the check and the write are one statement, so two completions
+    /// racing to unblock the same dependent can't both succeed or lose a
+    /// wakeup. Returns true if this call unblocked the job.
+    pub(super) async fn try_unblock_dependent(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<bool, ControlError> {
+        let updated = tx
+            .execute(
+                "UPDATE jobs SET queue_state='ready', enqueued_at=now() \
+                 WHERE run_id=$1::text::uuid AND job_id=$2 \
+                 AND queue_state='blocked' \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM job_needs n \
+                   WHERE n.run_id=$1::text::uuid AND n.job_id=$2 \
+                   AND EXISTS ( \
+                     SELECT 1 FROM jobs dep \
+                     WHERE dep.run_id=$1::text::uuid \
+                     AND (dep.job_id=n.needs_job_id OR dep.base_id=n.needs_job_id) \
+                     AND dep.status NOT IN \
+                       ('success','failure','cancelled','skipped','timed_out') \
+                     AND NOT ( \
+                       dep.kind='matrix_parent' AND EXISTS ( \
+                         SELECT 1 FROM jobs c \
+                         WHERE c.run_id=dep.run_id AND c.parent_job_id=dep.job_id \
+                       ) \
+                     ) \
+                   ) \
+                 )",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        Ok(updated > 0)
+    }
+
     pub(super) async fn settle_node(
         &mut self,
         run_id: RunId,

@@ -1569,3 +1569,146 @@ async fn dependents_of_finds_direct_dependents() {
     assert!(deps.is_empty());
     tx.rollback().await.unwrap();
 }
+
+/// `try_unblock_dependent` with a matrix: a need on the base waits for every
+/// leg. The expanded parent placeholder does not count.
+#[tokio::test]
+async fn try_unblock_dependent_matrix_waits_for_all_legs() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    // build (parent) with two legs; test needs the base 'build'.
+    let build = submit_job(run_id, "build", 1);
+    let leg1 = submit_job(run_id, "build-0", 2);
+    let leg2 = submit_job(run_id, "build-1", 3);
+    let mut test = submit_job(run_id, "test", 4);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, leg1, leg2, test]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Shape the matrix via SQL: parent + legs with base_id.
+    tx.execute(
+        "UPDATE jobs SET kind='matrix_parent', base_id='build', queue_state='none' \
+         WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    for leg in ["build-0", "build-1"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+
+    // One leg done -> test stays blocked.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let unblocked =
+        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
+            .await
+            .unwrap();
+    assert!(!unblocked, "test waits for all legs");
+
+    // All legs done -> test unblocks (parent placeholder does not block).
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-1'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let unblocked =
+        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
+            .await
+            .unwrap();
+    assert!(unblocked, "test unblocks when every leg is terminal");
+    tx.rollback().await.unwrap();
+}
+
+/// `try_unblock_dependent` flips a blocked job to ready only when every need
+/// is terminal. Atomic: the check and write are one statement.
+#[tokio::test]
+async fn try_unblock_dependent_needs_all_terminal() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    // build <- test <- deploy.
+    let mut build = submit_job(run_id, "build", 1);
+    let mut test = submit_job(run_id, "test", 2);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    let mut deploy = submit_job(run_id, "deploy", 3);
+    deploy.queued.needs = vec![JobId("test".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, test, deploy]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Mark build terminal directly.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    // test's only need (build) is terminal -> unblocks.
+    let unblocked =
+        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
+            .await
+            .unwrap();
+    assert!(unblocked, "test should unblock when build is terminal");
+    let qs: String = tx
+        .query_one(
+            "SELECT queue_state FROM jobs WHERE run_id=$1::text::uuid AND job_id='test'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(qs, "ready");
+
+    // deploy's need (test) is not terminal -> stays blocked.
+    let unblocked =
+        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("deploy".to_owned()))
+            .await
+            .unwrap();
+    assert!(!unblocked, "deploy should stay blocked while test runs");
+
+    // Idempotent: unblocking test again is a no-op (already ready).
+    let unblocked =
+        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("test".to_owned()))
+            .await
+            .unwrap();
+    assert!(!unblocked, "already-ready job is not unblocked twice");
+
+    // Mark test terminal -> deploy unblocks.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='test'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let unblocked =
+        super::dispatch::Sweep::try_unblock_dependent(&tx, run_id, &JobId("deploy".to_owned()))
+            .await
+            .unwrap();
+    assert!(unblocked, "deploy should unblock when test is terminal");
+    tx.rollback().await.unwrap();
+}
