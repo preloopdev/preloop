@@ -572,23 +572,23 @@ impl<'a> StepContext<'a> {
             // ("add Git 2.18 or higher to the PATH") and shell-outs inside
             // git (submodule foreach → git-sh-setup → uname) fail the same
             // way.
+            // A PATH the workflow set (job or step `env:`) is used verbatim,
+            // as on GitHub-hosted runners; the shims below only fill in the
+            // worker-derived default.
+            let explicit_path = env.contains_key("PATH");
             ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
             // Rust toolchains installed by the orchestrator run as the
             // unprivileged runner user. Keep their shims visible to every
             // subsequent step without relying on a profile file
             // (`bash --noprofile --norc` is the official invocation).
-            let cargo_bin = "/home/runner/.cargo/bin";
-            if std::path::Path::new(cargo_bin).is_dir() {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                if !path.split(':').any(|entry| entry == cargo_bin) {
-                    env.insert("PATH".to_owned(), format!("{cargo_bin}:{path}"));
-                }
-            }
-            let go_bin = "/home/runner/go/bin";
-            if std::path::Path::new(go_bin).is_dir() {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                if !path.split(':').any(|entry| entry == go_bin) {
-                    env.insert("PATH".to_owned(), format!("{go_bin}:{path}"));
+            if !explicit_path {
+                for tool_bin in ["/home/runner/.cargo/bin", "/home/runner/go/bin"] {
+                    if std::path::Path::new(tool_bin).is_dir() {
+                        let path = env.get("PATH").cloned().unwrap_or_default();
+                        if !path.split(':').any(|entry| entry == tool_bin) {
+                            env.insert("PATH".to_owned(), format!("{tool_bin}:{path}"));
+                        }
+                    }
                 }
             }
             // GitHub-hosted parity: hosted runners run steps as a dedicated

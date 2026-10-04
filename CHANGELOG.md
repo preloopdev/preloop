@@ -27,6 +27,12 @@ Releases before v0.27.0 predate the changelog.
   `--token <TOKEN> not provided`. The command now runs under
   `sudo --preserve-env`.
 
+- **A workflow-set `PATH` is used verbatim**: when a job or step set
+  `env: PATH`, the runner still prepended `/home/runner/.cargo/bin` and
+  `/home/runner/go/bin` whenever those directories existed (as they do on
+  the official runner image). GitHub-hosted runners leave an explicit `PATH`
+  alone; the toolchain shims now only extend the default.
+
 - **Runner no longer drops the job handed out at job completion**: when a
   job finished, `preloop-runner` aborted its in-flight `status=Busy` broker
   poll, the same pattern as actions/runner#4728. On github.com the service
