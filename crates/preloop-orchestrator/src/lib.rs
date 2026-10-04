@@ -2981,10 +2981,45 @@ for source in "$APT_DIR/sources.list" "$APT_DIR"/sources.list.d/*.list; do
   [ -f "$source" ] || continue
   [ "$source" = "$APT_DIR/sources.list.d/preloop-amd64.list" ] && continue
   sed -i -E '/^deb[[:space:]]/ { /\[arch=/b; s/^deb[[:space:]]+\[/deb [arch=arm64 /; t; s/^deb[[:space:]]+/deb [arch=arm64] /; }' "$source"
-done
-"#,
+done"#,
     );
     script
+}
+
+/// The complete guest script [`prepare_rosetta_multiarch`] runs, wrapped for
+/// root-or-sudo. Separate so the composed text — not just its pieces — is
+/// tested to parse: a stray newline in a spliced fragment once left a line
+/// starting with `;`, every fresh golden bake failed with `sh: 15: Syntax
+/// error`, and the pool silently fell back to plain Ubuntu runners.
+fn rosetta_multiarch_script() -> String {
+    // The strict wrapper is load-bearing: a refused passwordless sudo or a
+    // failed apt step must surface as a nonzero exit. The lenient
+    // `|| true` form would report success and bake a golden whose forks all
+    // fail `test -f /lib64/ld-linux-x86-64.so.2` consumers.
+    run_as_root_or_sudo_strict(&format!(
+        "set -e; \
+         case \"$(uname -m)\" in \
+           aarch64|arm64) ;; \
+           *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
+         esac; \
+         {}; \
+         dpkg --add-architecture amd64; \
+         CODENAME=$(. /etc/os-release 2>/dev/null && echo \"$VERSION_CODENAME\"); \
+         [ -n \"$CODENAME\" ] || CODENAME=noble; \
+         : > /etc/apt/sources.list.d/preloop-amd64.list; \
+         for s in '' '-updates' '-backports' '-security'; do \
+           printf 'deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ %s%s main restricted universe multiverse\\n' \"$CODENAME\" \"$s\" \
+             >> /etc/apt/sources.list.d/preloop-amd64.list; \
+         done; \
+         apt-get update -qq; \
+         DEBIAN_FRONTEND=noninteractive \
+         apt-get install -y -qq --no-install-recommends \
+           libc6:amd64 libgcc-s1:amd64 libstdc++6:amd64 zlib1g:amd64 \
+           libsystemd0:amd64; \
+         sync; \
+         test -f /lib64/ld-linux-x86-64.so.2",
+        scope_rosetta_apt_sources("/etc/apt")
+    ))
 }
 
 /// Install the amd64 loader + libc into an arm64 golden so dynamically
@@ -3015,34 +3050,7 @@ async fn prepare_rosetta_multiarch<P: VmProvider>(
     // image's security-update glibc, whose mutual Breaks pins block
     // installation. One suite per deb line; the one-line format misparses
     // extra suites as components. `sync` flushes before forking the golden.
-    // The strict wrapper is load-bearing: a refused passwordless sudo or a
-    // failed apt step must surface as a nonzero exit. The lenient
-    // `|| true` form would report success and bake a golden whose forks all
-    // fail `test -f /lib64/ld-linux-x86-64.so.2` consumers.
-    let script = run_as_root_or_sudo_strict(&format!(
-        "set -e; \
-         case \"$(uname -m)\" in \
-           aarch64|arm64) ;; \
-           *) echo 'guest is not arm64; rosetta multiarch install is a no-op' >&2; exit 0 ;; \
-         esac; \
-         {}; \
-         dpkg --add-architecture amd64; \
-         CODENAME=$(. /etc/os-release 2>/dev/null && echo \"$VERSION_CODENAME\"); \
-         [ -n \"$CODENAME\" ] || CODENAME=noble; \
-         : > /etc/apt/sources.list.d/preloop-amd64.list; \
-         for s in '' '-updates' '-backports' '-security'; do \
-           printf 'deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ %s%s main restricted universe multiverse\\n' \"$CODENAME\" \"$s\" \
-             >> /etc/apt/sources.list.d/preloop-amd64.list; \
-         done; \
-         apt-get update -qq; \
-         DEBIAN_FRONTEND=noninteractive \
-         apt-get install -y -qq --no-install-recommends \
-           libc6:amd64 libgcc-s1:amd64 libstdc++6:amd64 zlib1g:amd64 \
-           libsystemd0:amd64; \
-         sync; \
-         test -f /lib64/ld-linux-x86-64.so.2",
-        scope_rosetta_apt_sources("/etc/apt")
-    ));
+    let script = rosetta_multiarch_script();
     let output = provider
         .exec(golden, &["sh".to_owned(), "-c".to_owned(), script])
         .await?;
@@ -7578,6 +7586,22 @@ chmod +x "$dest/bin/node"
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn rosetta_multiarch_script_parses_as_posix_sh() {
+        // A spliced fragment ending in a newline once put `;` at the start of
+        // line 15 (`sh: 15: Syntax error: ";" unexpected`): every fresh golden
+        // bake failed, and the pool fell back to plain-Ubuntu runners.
+        let output = std::process::Command::new("sh")
+            .args(["-n", "-c", &rosetta_multiarch_script()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "rosetta multiarch script does not parse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The rootfs selected by `ubuntu-22.04` has one-line sources while

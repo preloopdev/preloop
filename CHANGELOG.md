@@ -11,6 +11,15 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Packed goldens on Apple Silicon bake again**: the Rosetta multiarch step
+  spliced an apt-scoping fragment that ended in a newline, so the composed
+  guest script had a line starting with `;` and every fresh packed-golden
+  bake failed with `sh: 15: Syntax error: ";" unexpected`. The pool then fell
+  back to direct per-runner creation from the plain Ubuntu base, so jobs ran
+  without the official runner image's tools (`cmake`,
+  `/opt/hostedtoolcache`). Regressed in 0.33.8; a test now parses the full
+  composed script.
+
 - **Runner no longer drops the job handed out at job completion**: when a
   job finished, `preloop-runner` aborted its in-flight `status=Busy` broker
   poll, the same pattern as actions/runner#4728. On github.com the service
