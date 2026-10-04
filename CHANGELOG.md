@@ -20,6 +20,13 @@ Releases before v0.27.0 predate the changelog.
   `/opt/hostedtoolcache`). Regressed in 0.33.8; a test now parses the full
   composed script.
 
+- **Runners register on images that run as a non-root user**: the official
+  runner image declares `USER runner`, so the pool runs `preloop-runner
+  configure` through `sudo`, whose `env_reset` dropped the injected
+  `PRELOOP_RUNNER_TOKEN`. Every pooled runner failed provisioning with
+  `--token <TOKEN> not provided`. The command now runs under
+  `sudo --preserve-env`.
+
 - **Runner no longer drops the job handed out at job completion**: when a
   job finished, `preloop-runner` aborted its in-flight `status=Busy` broker
   poll, the same pattern as actions/runner#4728. On github.com the service

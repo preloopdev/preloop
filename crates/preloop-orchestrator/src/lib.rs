@@ -6409,7 +6409,7 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
            printf %s '{inner_b64}' | base64 -d | sh; \
          else \
            printf %s '{b64}' | base64 -d | sudo -n sh 2>/dev/null || true; \
-           printf %s '{inner_b64}' | base64 -d | sudo -n sh; \
+           printf %s '{inner_b64}' | base64 -d | sudo -n --preserve-env sh; \
          fi"
     );
     vec!["sh".to_owned(), "-c".to_owned(), script]
