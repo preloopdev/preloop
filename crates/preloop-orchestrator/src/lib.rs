@@ -6455,6 +6455,12 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // the official golden declares USER runner, so `machine exec` lands on
     // runner and setpriv below self-drops to the same uid (no privilege
     // change needed).
+    // `/tmp` lives on the VM's ext4 data disk, not the overlayfs root: the
+    // small tmpfs the guest boots with fills on real test suites, and the
+    // overlay root it used to fall through to does not support
+    // `name_to_handle_at`, so fanotify FID watchers (TypeScript's fswatch,
+    // 126 tests) failed with "operation not supported". GitHub-hosted
+    // runners keep `/tmp` on ext4; the bind mount matches that.
     let provisioning = format!(
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
@@ -6477,7 +6483,11 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
             [ \"$(stat -f -c %T /tmp 2>/dev/null)\" = tmpfs ]; then \
            umount /tmp 2>/dev/null || mount -o remount,size=75% /tmp 2>/dev/null || true; \
          fi; \
-         mkdir -p /tmp && chmod 1777 /tmp 2>/dev/null || true"
+         mkdir -p /tmp && chmod 1777 /tmp 2>/dev/null || true; \
+         if ! mountpoint -q /tmp 2>/dev/null && mountpoint -q /workspace 2>/dev/null; then \
+           mkdir -p /workspace/.tmp && chmod 1777 /workspace/.tmp && \
+           mount --bind /workspace/.tmp /tmp 2>/dev/null || true; \
+         fi"
     );
     // setpriv requires a groups mode: --init-groups (setgroups) only works
     // as root, so the exec-as-image-user branch (official golden: USER

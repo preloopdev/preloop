@@ -25,6 +25,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
+  provisioning removed the guest's small tmpfs `/tmp`, which left it on the
+  overlayfs root, where `name_to_handle_at` is unsupported: fanotify
+  file-ID watchers failed with "operation not supported" (126 of
+  TypeScript's `internal/fswatch` tests). GitHub-hosted runners keep `/tmp`
+  on ext4.
+
 - With a static PAT and no GitHub App, a job that sat in the queue for more
   than five minutes after the last submit was dispatched with the local
   runtime token instead of the PAT, so its checkout failed with "could not
