@@ -3017,6 +3017,159 @@ impl<'a> Sweep<'a> {
             .collect())
     }
 
+    /// Try to fold a reusable workflow caller when one of its inner jobs
+    /// completes. If all inner jobs are terminal, computes the caller's
+    /// outputs (evaluating output_definitions against inner outputs),
+    /// sets the aggregate status, and marks the caller terminal.
+    ///
+    /// Returns the caller ID if folded, None if the job has no caller parent,
+    /// the parent is not a caller, or inner jobs are still running.
+    /// The caller walks up the chain by calling this repeatedly.
+    pub(super) async fn try_fold_reusable_caller(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        inner_job_id: &JobId,
+    ) -> Result<Option<JobId>, ControlError> {
+        let run = run_id.0.to_string();
+        // Find the parent and verify it's a reusable caller.
+        let parent: Option<(String, String)> = tx
+            .query_opt(
+                "SELECT parent_job_id, kind FROM jobs \
+                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run, &inner_job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .and_then(|row| {
+                let parent: Option<String> = row.get(0);
+                let kind: String = row.get(1);
+                parent.map(|p| (p, kind))
+            });
+        let (caller_id, kind) = match parent {
+            Some((p, k)) if k == "reusable_caller" => (p, k),
+            _ => return Ok(None),
+        };
+        let _ = kind;
+
+        // All inner jobs terminal?
+        let remaining: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM jobs \
+                 WHERE run_id=$1::text::uuid AND parent_job_id=$2 \
+                 AND status NOT IN \
+                   ('success','failure','cancelled','skipped','timed_out')",
+                &[&run, &caller_id],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        if remaining > 0 {
+            return Ok(None);
+        }
+
+        // Load the caller's metadata (output definitions, inputs).
+        let meta_json: Option<String> = tx
+            .query_opt(
+                "SELECT reusable_call::text FROM job_specs \
+                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run, &caller_id],
+            )
+            .await
+            .map_err(db)?
+            .and_then(|row| row.get::<_, Option<String>>(0));
+        let meta: preloop_gha_parser::ReusableCallMetadata = meta_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .ok_or_else(|| {
+                ControlError::backend(anyhow::anyhow!("reusable caller missing metadata"))
+            })?;
+
+        // Load inner jobs' outputs and statuses.
+        let rows = tx
+            .query(
+                "SELECT job_id, outputs::text, status FROM jobs \
+                 WHERE run_id=$1::text::uuid AND parent_job_id=$2",
+                &[&run, &caller_id],
+            )
+            .await
+            .map_err(db)?;
+        let mut jobs_map = serde_json::Map::new();
+        let mut statuses = Vec::new();
+        for row in rows {
+            let jid: String = row.get(0);
+            let outputs: Option<String> = row.get(1);
+            let status: String = row.get(2);
+            // Strip the caller prefix for the context (matches old logic).
+            let prefix = format!("{}/", caller_id);
+            let short = jid.strip_prefix(&prefix).unwrap_or(&jid);
+            let mut job_outputs_map = serde_json::Map::new();
+            if let Some(o) = outputs {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&o) {
+                    if let Some(obj) = v.as_object() {
+                        for (k, v) in obj {
+                            job_outputs_map.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            let mut job_record = serde_json::Map::new();
+            job_record.insert(
+                "outputs".to_owned(),
+                serde_json::Value::Object(job_outputs_map),
+            );
+            jobs_map.insert(short.to_owned(), serde_json::Value::Object(job_record));
+            // Map status string to ExecutionStatus for aggregation.
+            let st = match status.as_str() {
+                "success" => ExecutionStatus::Success,
+                "failure" => ExecutionStatus::Failure,
+                "cancelled" => ExecutionStatus::Cancelled,
+                "skipped" => ExecutionStatus::Skipped,
+                _ => continue,
+            };
+            statuses.push(st);
+        }
+
+        // Build expression context and evaluate output definitions.
+        let mut context = preloop_gha_expressions::Context::default();
+        context.insert("jobs", serde_json::Value::Object(jobs_map));
+        let mut inputs_map = serde_json::Map::new();
+        for (k, v) in &meta.inputs {
+            inputs_map.insert(k.clone(), v.clone());
+        }
+        context.insert("inputs", serde_json::Value::Object(inputs_map));
+        let mut caller_outputs = BTreeMap::new();
+        for (name, expr) in &meta.output_definitions {
+            let resolved = preloop_gha_parser::eval::resolve_string(expr, &context)
+                .unwrap_or_else(|_| expr.clone());
+            // Outputs are strings on GitHub (matches old logic).
+            caller_outputs.insert(name.clone(), serde_json::Value::String(resolved));
+        }
+
+        // Aggregate status: failure > cancelled > skipped > success.
+        let aggregate = crate::runtime_scheduling::aggregate_need_status(&statuses)
+            .unwrap_or(ExecutionStatus::Skipped);
+        let status_str = match aggregate {
+            ExecutionStatus::Success => "success",
+            ExecutionStatus::Failure => "failure",
+            ExecutionStatus::Cancelled => "cancelled",
+            ExecutionStatus::Skipped => "skipped",
+            _ => "failure",
+        };
+        let outputs_json = serde_json::to_string(&caller_outputs).map_err(ControlError::backend)?;
+
+        // Terminalize the caller.
+        tx.execute(
+            "UPDATE jobs SET status=$3, outputs=$4, queue_state='none', \
+                    completed_at=COALESCE(completed_at, now()) \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &caller_id, &status_str, &outputs_json],
+        )
+        .await
+        .map_err(db)?;
+
+        Ok(Some(JobId(caller_id)))
+    }
+
     /// Try to unblock a dependent job: set `queue_state='ready'` only if every
     /// need is satisfied. A need on a job id waits for that job; a need on a
     /// matrix base id waits for *every* leg (a leg's own id never appears in
