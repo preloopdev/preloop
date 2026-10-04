@@ -332,6 +332,42 @@ pub fn cached_pat_scopes(pat: &str) -> Option<Vec<String>> {
         .map(|(_, scopes)| scopes)
 }
 
+/// Drop every cached PAT scope entry, as if the TTL had elapsed (tests that
+/// exercise a job claimed after the cache expired).
+#[cfg(any(test, feature = "test-support"))]
+pub fn expire_pat_scope_cache() {
+    if let Ok(mut cache) = PAT_SCOPE_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+/// The PAT's classic OAuth scopes for a dispatch decision: the cached entry
+/// while it is fresh, otherwise a fresh introspection (which re-caches it).
+///
+/// Acquire paths must use this, not [`cached_pat_scopes`]: a job can wait in
+/// the queue far longer than the cache TTL, and only submits refresh the
+/// entry, so a job claimed more than five minutes after the last submit would
+/// otherwise find it expired, be handed the runtime token instead of the PAT,
+/// and fail every GitHub fetch the submit-time checkout routing assumed it
+/// could make. `None` when the scopes cannot be established (the PAT stays
+/// withheld, as before).
+pub async fn verified_pat_scopes(pat: &str) -> Option<Vec<String>> {
+    if let Some(scopes) = cached_pat_scopes(pat) {
+        return Some(scopes);
+    }
+    match pat_oauth_scopes(pat).await {
+        PatScopeOutcome::Known(scopes) => Some(scopes),
+        PatScopeOutcome::Unverifiable { reason } => {
+            tracing::warn!(%reason, "withholding PAT at dispatch: scopes unverifiable");
+            None
+        }
+        PatScopeOutcome::Invalid(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "withholding PAT at dispatch: rejected");
+            None
+        }
+    }
+}
+
 /// Warm the process-wide PAT scope cache once at startup.
 ///
 /// The job expansion pipeline is synchronous and reads [`cached_pat_scopes`],

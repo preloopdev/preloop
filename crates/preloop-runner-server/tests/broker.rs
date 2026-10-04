@@ -2732,6 +2732,51 @@ async fn static_pat_matching_declared_permissions_keeps_honest_wire_variable() {
     );
 }
 
+/// A job claimed after the PAT scope cache expired must still receive the
+/// PAT. Only submits refresh the cache (TTL 300 s), so a job that queued
+/// longer used to be handed the runtime token instead — and the checkout the
+/// submit-time routing sent straight to github.com then failed with
+/// "could not read Username" (grafana's detect-changes, claimed 8.6 min after
+/// submit). Acquire re-verifies the scopes instead of withholding.
+#[tokio::test]
+async fn static_pat_reaches_a_job_claimed_after_the_scope_cache_expired() {
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let _no_token = crate::state::TestEnvVar::unset("PRELOOP_GITHUB_TOKEN");
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    std::fs::write(&config_path, "[github]\npat = \"queued-pat\"\n").unwrap();
+    let state = AppState::new_with_config(temp.path().to_path_buf(), config_path)
+        .await
+        .unwrap();
+    let _api_url = live_pat_scope_api("").await;
+    let shared = Arc::new(SharedState {
+        state: state.clone(),
+        shutdown: CancellationToken::new(),
+    });
+    let yaml =
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+    crate::submit_run_inner(
+        &shared,
+        preloop_gha_protocol::WorkflowSubmission {
+            workflow_yaml: yaml.to_owned(),
+            event: "push".to_owned(),
+            repository: "owner/repo".to_owned(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a scope-less PAT is accepted");
+
+    crate::runs::expire_pat_scope_cache();
+    let app = app(state.clone(), CancellationToken::new());
+    let acquired = acquire_queued_job(&app, "queued-pat-runner").await;
+    assert_eq!(
+        wire_variable(&acquired, "system.github.token"),
+        Some("queued-pat"),
+        "a job claimed after the cache expired still gets the PAT"
+    );
+}
+
 /// The App-manifest setup flow receives the webhook secret from GitHub and
 /// stores it in the config file. Before that key existed the secret lived
 /// only in `PRELOOP_WEBHOOK_SECRET`, so a configured engine still rejected

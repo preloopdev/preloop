@@ -169,11 +169,12 @@ async fn render_session_message(
         let token = if fork_restricted {
             runtime
         } else {
-            // The PAT is embedded only when its OAuth scopes were verified
-            // (cached by the submit-time introspection); unverifiable
-            // authority stays withheld and the job keeps the runtime token.
+            // The PAT is embedded only when its OAuth scopes are verified
+            // (fresh cache, or re-introspected here: the job may have queued
+            // past the cache TTL); unverifiable authority stays withheld and
+            // the job keeps the runtime token.
             match shared.state.static_github_pat() {
-                Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
+                Some(pat) => match crate::runs::verified_pat_scopes(&pat).await {
                     Some(scopes) => {
                         msg.variables.insert(
                             "system.github.token.pat_scopes".to_owned(),

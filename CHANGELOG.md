@@ -25,6 +25,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- With a static PAT and no GitHub App, a job that sat in the queue for more
+  than five minutes after the last submit was dispatched with the local
+  runtime token instead of the PAT, so its checkout failed with "could not
+  read Username for 'https://github.com'". The PAT's verified scopes were only
+  refreshed by submits; acquire now re-verifies them when the cache entry has
+  expired.
+
 - A job attempt whose runner session is gone (closed, purged, or silent past
   the runner liveness timeout) now fails 10 minutes after its last lease
   renewal instead of 45. A machine that just died still fails at the

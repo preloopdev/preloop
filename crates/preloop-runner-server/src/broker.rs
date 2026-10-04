@@ -1027,11 +1027,12 @@ pub async fn broker_acquire_job(
         let default_token = if fork_restricted {
             runtime
         } else {
-            // A static PAT is embedded only when its OAuth scopes were
-            // verified at submit (scope cache warm); unverifiable authority
-            // stays withheld and the job keeps the runtime token.
+            // A static PAT is embedded only when its OAuth scopes are
+            // verified (fresh cache, or re-introspected here: the job may have
+            // queued past the cache TTL); unverifiable authority stays
+            // withheld and the job keeps the runtime token.
             match shared.state.static_github_pat() {
-                Some(pat) => match crate::runs::cached_pat_scopes(&pat) {
+                Some(pat) => match crate::runs::verified_pat_scopes(&pat).await {
                     Some(scopes) => {
                         message.variables.insert(
                             "system.github.token.pat_scopes".to_owned(),
@@ -1122,8 +1123,10 @@ pub async fn broker_acquire_job(
                 endpoint.data.insert(
                     "GenerateIdTokenUrl".to_owned(),
                     format!(
-                        "{}/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken",
-                        run_service_url, message.plan.plan_id, message.job_id
+                        "{}/runner/server/_apis/distributedtask/hubs/actions/plans/{}/jobs/{}/oidctoken?api-version=2.0",
+                        runner_base_url(),
+                        message.plan.plan_id,
+                        message.job_id
                     ),
                 );
             }
