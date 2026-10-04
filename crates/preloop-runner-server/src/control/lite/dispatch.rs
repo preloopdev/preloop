@@ -343,10 +343,7 @@ impl LiteBackend {
             let mut scheduling = crate::runtime_scheduling::SchedulingOutcome::default();
             promote::promote_run(tx, self, run_id, &mut scheduling)?;
             let (_next_runs_on, queue_nonempty) = queue_gauges(tx)?;
-            let record = jobs::run_record(tx, run_id)?
-                .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
             Ok(CompleteOutcome {
-                record,
                 effective_status: applied.effective_status,
                 newly_terminal_success: applied.newly_terminal_success,
                 cancelled_siblings: applied.cancelled_siblings,

@@ -417,7 +417,6 @@ pub(crate) struct AcquireContext {
 /// handler must fan out (events, check-run effects, live-log close).
 #[derive(Debug)]
 pub(crate) struct CompleteOutcome {
-    pub(crate) record: RunRecord,
     /// The status actually stored (terminal-locked jobs keep their first
     /// verdict).
     pub(crate) effective_status: ExecutionStatus,

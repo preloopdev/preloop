@@ -6158,46 +6158,27 @@ impl PgBackend {
         {
             settle_request_tx(&tx, request_id, completion.status).await?;
         }
-        let mut sweep = Sweep::new(self, &tx).await?;
-        let graph = PgBackend::load_graph(self, &tx, run_id)
-            .await?
-            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
-        sweep.graphs.insert(run_id, graph);
-        let applied = sweep
-            .complete_node(run_id, &job_id, completion.status, &completion.outputs, &[])
+        // Targeted core: no graph load, no sweep, no flush.
+        let outputs: BTreeMap<String, serde_json::Value> = completion
+            .outputs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let outcome = self
+            .settle_job_targeted(&tx, run_id, &job_id, completion.status, &outputs)
             .await?;
-        if !applied.replayed {
-            // The claimed marker is gone once the job is terminal.
-            sweep
-                .tx
-                .execute(
-                    "UPDATE job_assignments SET runner_id = NULL \
-                     WHERE run_id = $1::text::uuid AND job_id = $2",
-                    &[&run_id.0.to_string(), &job_id.0],
-                )
-                .await
-                .map_err(db)?;
-            sweep.sweep().await?;
-        }
-        let scheduling = std::mem::take(&mut sweep.outcome);
         let queue_nonempty = Self::work_pending_on(&tx).await?;
-        let record = sweep
-            .graphs
-            .get(&run_id)
-            .map(|graph| graph.record.clone())
-            .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
-        sweep.flush().await?;
         tx.commit().await.map_err(db)?;
         drop(client);
         Ok(CompleteOutcome {
-            record,
-            effective_status: applied.effective_status,
-            newly_terminal_success: applied.newly_terminal_success,
-            cancelled_siblings: applied.cancelled_siblings,
-            scheduling,
-            live_log_key: applied.live_log_key,
+            effective_status: outcome.effective_status,
+            newly_terminal_success: outcome.run_completed
+                && outcome.effective_status == ExecutionStatus::Success,
+            cancelled_siblings: vec![],
+            scheduling: crate::runtime_scheduling::SchedulingOutcome::default(),
+            live_log_key: String::new(),
             queue_nonempty,
-            replayed: applied.replayed,
+            replayed: false,
         })
     }
 
@@ -6239,32 +6220,18 @@ impl PgBackend {
             }
             attempt = Some(request_id);
         }
-        let mut sweep = Sweep::new(self, &tx).await?;
-        let graph = PgBackend::load_graph(self, &tx, run_id)
-            .await?
-            .ok_or_else(|| ControlError::NotFound("run not found".to_owned()))?;
-        sweep.graphs.insert(run_id, graph);
+        // Targeted core: no graph load, no sweep, no flush.
         // The handler masked `comp.annotations` against the provider.
-        let annotations = comp.annotations.clone();
         let outputs: BTreeMap<String, serde_json::Value> = comp
             .outputs
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let applied = sweep
-            .complete_node(run_id, &job_id, comp.status, &outputs, &annotations)
+        let outcome = self
+            .settle_job_targeted(&tx, run_id, &job_id, comp.status, &outputs)
             .await?;
-        if applied.replayed {
-            let record = sweep
-                .graphs
-                .get(&run_id)
-                .map(|graph| graph.record.clone())
-                .expect("loaded");
-            tx.commit().await.map_err(db)?;
-            return Ok(SettleJobOutcome::Unchanged(Box::new(record)));
-        }
         if let Some(request_id) = attempt {
-            settle_request_tx(&tx, request_id, applied.effective_status).await?;
+            settle_request_tx(&tx, request_id, outcome.effective_status).await?;
             // The attempt's step results land on its manifest.
             for wire in &comp.step_results {
                 let Some(external_id) = wire.external_id.as_deref() else {
@@ -6281,22 +6248,20 @@ impl PgBackend {
                 }
             }
         }
-        sweep.sweep().await?;
-        let scheduling = std::mem::take(&mut sweep.outcome);
         // Cheap existence check: the handler only needs to know whether to
         // wake pollers, not the exact depth (the supervisor reads that from
         // the 5s sampler snapshot).
         let queue_nonempty = Self::work_pending_on(&tx).await?;
         let next_runs_on = Self::ready_front_labels_on(&tx).await?;
-        sweep.flush().await?;
         tx.commit().await.map_err(db)?;
         Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
-            effective_status: applied.effective_status,
-            cancelled_siblings: applied.cancelled_siblings,
-            scheduling,
+            effective_status: outcome.effective_status,
+            cancelled_siblings: vec![],
+            scheduling: crate::runtime_scheduling::SchedulingOutcome::default(),
             queue_nonempty,
-            newly_terminal_success: applied.newly_terminal_success,
-            live_log_key: applied.live_log_key,
+            newly_terminal_success: outcome.run_completed
+                && outcome.effective_status == ExecutionStatus::Success,
+            live_log_key: String::new(),
             next_runs_on,
         })))
     }
@@ -6313,6 +6278,7 @@ impl PgBackend {
         run_id: RunId,
         job_id: &JobId,
         status: ExecutionStatus,
+        outputs: &BTreeMap<String, serde_json::Value>,
     ) -> Result<SettleCoreOutcome, ControlError> {
         let run = run_id.0.to_string();
         let status_str = match status {
@@ -6324,15 +6290,16 @@ impl PgBackend {
         };
 
         // 1. Mark the job terminal (idempotent).
+        let outputs_json = serde_json::to_string(outputs).unwrap_or_else(|_| "{}".to_owned());
         let marked = tx
             .execute(
-                "UPDATE jobs SET status=$3, queue_state='none', \
+                "UPDATE jobs SET status=$3, outputs=$4::jsonb, queue_state='none', \
                         completed_at=COALESCE(completed_at, now()), \
                         claimed_by_runner_id=NULL \
                  WHERE run_id=$1::text::uuid AND job_id=$2 \
                  AND status NOT IN \
                    ('success','failure','cancelled','skipped','timed_out')",
-                &[&run, &job_id.0, &status_str],
+                &[&run, &job_id.0, &status_str, &outputs_json],
             )
             .await
             .map_err(db)?;
