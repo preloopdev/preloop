@@ -3170,6 +3170,213 @@ impl<'a> Sweep<'a> {
         Ok(Some(JobId(caller_id)))
     }
 
+    /// Evaluate a newly-unblocked job's `if:` condition via targeted queries.
+    /// Mirrors `dependency_decision` but builds the context from SQL instead
+    /// of the in-memory graph.
+    ///
+    /// Returns Run (enqueue), Skip (mark skipped), Wait (not ready — should
+    /// not happen after try_unblock_dependent), or Error (mark failure).
+    pub(super) async fn evaluate_if_condition(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<sched_helpers::DependencyDecision, ControlError> {
+        use sched_helpers::DependencyDecision;
+        let run = run_id.0.to_string();
+
+        // Q1: the job's needs, base context, and if condition.
+        let (needs, condition_context_json, if_condition): (
+            Vec<String>,
+            Option<String>,
+            Option<String>,
+        ) = {
+            let rows = tx
+                .query(
+                    "SELECT n.needs_job_id, m.condition_context::text, s.if_condition \
+                     FROM jobs j \
+                     LEFT JOIN job_needs n ON n.run_id=j.run_id AND n.job_id=j.job_id \
+                     LEFT JOIN job_messages m ON m.run_id=j.run_id AND m.job_id=j.job_id \
+                     LEFT JOIN job_specs s ON s.run_id=j.run_id AND s.job_id=j.job_id \
+                     WHERE j.run_id=$1::text::uuid AND j.job_id=$2",
+                    &[&run, &job_id.0],
+                )
+                .await
+                .map_err(db)?;
+            let mut needs = Vec::new();
+            let mut ctx = None;
+            let mut cond = None;
+            for row in &rows {
+                if let Some(n) = row.get::<_, Option<String>>(0) {
+                    if !needs.contains(&n) {
+                        needs.push(n);
+                    }
+                }
+                if ctx.is_none() {
+                    ctx = row.get::<_, Option<String>>(1);
+                }
+                if cond.is_none() {
+                    cond = row.get::<_, Option<String>>(2);
+                }
+            }
+            (needs, ctx, cond)
+        };
+        if needs.is_empty() {
+            return Ok(DependencyDecision::Run);
+        }
+
+        // Q2: statuses + outputs for all jobs matching the direct needs
+        // (matrix-aware: job_id OR base_id).
+        let mut need_statuses: BTreeMap<String, Vec<ExecutionStatus>> = BTreeMap::new();
+        let mut need_outputs: BTreeMap<String, BTreeMap<String, serde_json::Value>> =
+            BTreeMap::new();
+        {
+            let rows = tx
+                .query(
+                    "SELECT n.needs_job_id, j.status, j.outputs::text, j.job_id \
+                     FROM job_needs n \
+                     JOIN jobs j ON j.run_id=n.run_id \
+                       AND (j.job_id=n.needs_job_id OR j.base_id=n.needs_job_id) \
+                     WHERE n.run_id=$1::text::uuid AND n.job_id=$2",
+                    &[&run, &job_id.0],
+                )
+                .await
+                .map_err(db)?;
+            for row in &rows {
+                let need_id: String = row.get(0);
+                let status_str: String = row.get(1);
+                let outputs_str: Option<String> = row.get(2);
+                let status = match status_str.as_str() {
+                    "success" => ExecutionStatus::Success,
+                    "failure" => ExecutionStatus::Failure,
+                    "cancelled" => ExecutionStatus::Cancelled,
+                    "skipped" => ExecutionStatus::Skipped,
+                    "in_progress" => ExecutionStatus::InProgress,
+                    "queued" => ExecutionStatus::Queued,
+                    _ => ExecutionStatus::Pending,
+                };
+                need_statuses
+                    .entry(need_id.clone())
+                    .or_default()
+                    .push(status);
+                if let Some(o) = outputs_str {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&o) {
+                        if let Some(obj) = v.as_object() {
+                            let entry = need_outputs.entry(need_id).or_default();
+                            for (k, v) in obj {
+                                entry.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // All direct needs must be terminal, else Wait.
+        for statuses in need_statuses.values() {
+            if statuses.is_empty()
+                || statuses.iter().any(|s| {
+                    !matches!(
+                        s,
+                        ExecutionStatus::Success
+                            | ExecutionStatus::Failure
+                            | ExecutionStatus::Cancelled
+                            | ExecutionStatus::Skipped
+                    )
+                })
+            {
+                return Ok(DependencyDecision::Wait);
+            }
+        }
+
+        // Q3: transitive ancestor statuses for success()/failure()/cancelled().
+        let ancestor_statuses: Vec<ExecutionStatus> = {
+            let rows = tx
+                .query(
+                    "WITH RECURSIVE ancestors(need_id) AS ( \
+                       SELECT needs_job_id FROM job_needs \
+                       WHERE run_id=$1::text::uuid AND job_id=$2 \
+                       UNION \
+                       SELECT n.needs_job_id FROM job_needs n \
+                       JOIN ancestors a ON n.job_id=a.need_id \
+                       WHERE n.run_id=$1::text::uuid \
+                     ) \
+                     SELECT DISTINCT j.status FROM jobs j \
+                     JOIN ancestors a ON (j.job_id=a.need_id OR j.base_id=a.need_id) \
+                     WHERE j.run_id=$1::text::uuid",
+                    &[&run, &job_id.0],
+                )
+                .await
+                .map_err(db)?;
+            rows.iter()
+                .map(|row| match row.get::<_, String>(0).as_str() {
+                    "success" => ExecutionStatus::Success,
+                    "failure" => ExecutionStatus::Failure,
+                    "cancelled" => ExecutionStatus::Cancelled,
+                    "skipped" => ExecutionStatus::Skipped,
+                    "in_progress" => ExecutionStatus::InProgress,
+                    "queued" => ExecutionStatus::Queued,
+                    _ => ExecutionStatus::Pending,
+                })
+                .collect()
+        };
+        let aggregate = crate::runtime_scheduling::aggregate_need_status(&ancestor_statuses)
+            .unwrap_or(ExecutionStatus::Skipped);
+
+        // Build the needs JSON context.
+        let mut needs_json = serde_json::Map::new();
+        for need_id in &needs {
+            let statuses = need_statuses.get(need_id).cloned().unwrap_or_default();
+            let result = crate::runtime_scheduling::aggregate_need_status(&statuses)
+                .map(|s| match s {
+                    ExecutionStatus::Success => "success",
+                    ExecutionStatus::Failure => "failure",
+                    ExecutionStatus::Cancelled => "cancelled",
+                    ExecutionStatus::Skipped => "skipped",
+                    _ => "success",
+                })
+                .unwrap_or("success");
+            let outputs = need_outputs.get(need_id).cloned().unwrap_or_default();
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "result".to_owned(),
+                serde_json::Value::String(result.to_owned()),
+            );
+            entry.insert(
+                "outputs".to_owned(),
+                serde_json::Value::Object(
+                    outputs.into_iter().collect::<serde_json::Map<String, _>>(),
+                ),
+            );
+            needs_json.insert(need_id.clone(), serde_json::Value::Object(entry));
+        }
+
+        // Build the eval context: base + status flags + needs.
+        let mut context: preloop_gha_expressions::Context = condition_context_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        // with_status flags (mirrors dependency_decision).
+        context.insert(
+            "success",
+            serde_json::Value::Bool(aggregate == ExecutionStatus::Success),
+        );
+        context.insert(
+            "failure",
+            serde_json::Value::Bool(aggregate == ExecutionStatus::Failure),
+        );
+        context.insert(
+            "cancelled",
+            serde_json::Value::Bool(aggregate == ExecutionStatus::Cancelled),
+        );
+        context.insert("needs", serde_json::Value::Object(needs_json));
+
+        let condition = preloop_gha_expressions::effective_condition(if_condition.as_deref());
+        match preloop_gha_expressions::eval_bool(&condition, &context) {
+            Ok(true) => Ok(DependencyDecision::Run),
+            Ok(false) => Ok(DependencyDecision::Skip),
+            Err(_) => Ok(DependencyDecision::Error),
+        }
+    }
+
     /// Try to unblock a dependent job: set `queue_state='ready'` only if every
     /// need is satisfied. A need on a job id waits for that job; a need on a
     /// matrix base id waits for *every* leg (a leg's own id never appears in
