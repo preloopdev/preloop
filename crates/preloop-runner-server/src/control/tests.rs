@@ -3579,6 +3579,430 @@ pub(crate) mod suite {
         }
     }
 
+    /// The job a poll claimed, or `None` when it came back empty.
+    async fn claimed_job(
+        backend: &dyn ControlBackend,
+        session_id: &str,
+        runner_id: i64,
+    ) -> Option<(RunId, JobId, uuid::Uuid)> {
+        match backend
+            .poll_session(poll(session_id, runner_id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => Some((
+                claimed.queued.run_id,
+                claimed.queued.job_id.clone(),
+                claimed.request.agent_job_id,
+            )),
+            PollOutcome::Empty => None,
+            other => panic!("expected a claim or nothing, got {other:?}"),
+        }
+    }
+
+    /// A runner with a live session: `(runner_id, session_id)`.
+    async fn live_runner(backend: &dyn ControlBackend, name: &str) -> (i64, String) {
+        let runner = backend
+            .register_runner(register_runner(name))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        (runner.runner.id, session.session_id)
+    }
+
+    /// `submit_run` under an explicit namespace.
+    fn submit_in(namespace: &str, run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
+        let mut submit = submit_run(run_id, jobs);
+        submit.namespace = namespace.to_owned();
+        submit
+    }
+
+    /// The namespace state gates both admission points. `suspended` starts
+    /// nothing and takes no runs; `draining` finishes queued work but takes
+    /// no runs; `active` does both. Other namespaces are never affected.
+    /// No command writes namespace state (the platform does), so `exec` runs
+    /// the per-backend SQL.
+    pub(crate) async fn namespace_state_gates_submit_and_claim<F, Fut>(
+        backend: &dyn ControlBackend,
+        exec: F,
+    ) where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let tenant = "tenant-state";
+        let (runner, session) = live_runner(backend, "r1").await;
+        let tenant_run = RunId::new();
+        backend
+            .submit_run(submit_in(
+                tenant,
+                tenant_run,
+                vec![submit_job(tenant_run, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let set_state = |state: &str| {
+            exec(format!(
+                "UPDATE namespaces SET state = '{state}' WHERE namespace_id = '{tenant}'"
+            ))
+        };
+
+        set_state("suspended").await;
+        let other_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                other_run,
+                vec![submit_job(other_run, "build", 2)],
+            ))
+            .await
+            .unwrap();
+        let claimed = claimed_job(backend, &session, runner).await;
+        assert_eq!(
+            claimed.map(|(run_id, _, _)| run_id),
+            Some(other_run),
+            "a suspended namespace starts nothing; another namespace's job runs instead"
+        );
+        let (runner_2, session_2) = live_runner(backend, "r2").await;
+        assert!(
+            claimed_job(backend, &session_2, runner_2).await.is_none(),
+            "the suspended namespace's job must stay queued"
+        );
+        let refused = RunId::new();
+        assert!(
+            matches!(
+                backend
+                    .submit_run(submit_in(
+                        tenant,
+                        refused,
+                        vec![submit_job(refused, "b", 3)]
+                    ))
+                    .await,
+                Err(ControlError::Forbidden(_))
+            ),
+            "a suspended namespace takes no new runs"
+        );
+
+        set_state("draining").await;
+        let refused = RunId::new();
+        assert!(
+            matches!(
+                backend
+                    .submit_run(submit_in(
+                        tenant,
+                        refused,
+                        vec![submit_job(refused, "b", 4)]
+                    ))
+                    .await,
+                Err(ControlError::Forbidden(_))
+            ),
+            "a draining namespace takes no new runs"
+        );
+        assert_eq!(
+            claimed_job(backend, &session_2, runner_2)
+                .await
+                .map(|(run_id, _, _)| run_id),
+            Some(tenant_run),
+            "a draining namespace still finishes its queued work"
+        );
+
+        set_state("active").await;
+        let accepted = RunId::new();
+        backend
+            .submit_run(submit_in(
+                tenant,
+                accepted,
+                vec![submit_job(accepted, "b", 5)],
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// `max_running_jobs` and a per-pool cap each hold a namespace's claims
+    /// at its limit; a completion frees the slot; an uncapped namespace's
+    /// jobs keep flowing while the capped one waits.
+    pub(crate) async fn namespace_running_caps_hold_claims_at_limit<F, Fut>(
+        backend: &dyn ControlBackend,
+        exec: F,
+    ) where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let tenant = "tenant-capped";
+        let (runner_1, session_1) = live_runner(backend, "r1").await;
+        let (runner_2, session_2) = live_runner(backend, "r2").await;
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_in(
+                tenant,
+                run_id,
+                vec![
+                    submit_job(run_id, "a", 1),
+                    submit_job(run_id, "b", 2),
+                    submit_job(run_id, "c", 3),
+                ],
+            ))
+            .await
+            .unwrap();
+        exec(format!(
+            "INSERT INTO namespace_limits (namespace_id, max_running_jobs) VALUES ('{tenant}', 1)"
+        ))
+        .await;
+
+        let (_, first_job, first_agent) = claimed_job(backend, &session_1, runner_1)
+            .await
+            .expect("the first job fits under the cap");
+        assert!(
+            claimed_job(backend, &session_2, runner_2).await.is_none(),
+            "a second claim would exceed max_running_jobs = 1"
+        );
+        let other_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                other_run,
+                vec![submit_job(other_run, "build", 4)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed_job(backend, &session_2, runner_2)
+                .await
+                .map(|(run_id, _, _)| run_id),
+            Some(other_run),
+            "another namespace's job is not held back by this namespace's cap"
+        );
+
+        backend
+            .complete_job(crate::control::backend::JobCompletionInput {
+                run_id,
+                job_id: first_job,
+                agent_job_id: Some(first_agent),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_1),
+            })
+            .await
+            .unwrap();
+        let (runner_3, session_3) = live_runner(backend, "r3").await;
+        assert_eq!(
+            claimed_job(backend, &session_3, runner_3)
+                .await
+                .map(|(run_id, _, _)| run_id),
+            Some(run_id),
+            "a completion frees the namespace's slot"
+        );
+
+        // Lift the namespace-wide cap; a per-pool cap of one now holds the
+        // last job while the slot above is still running.
+        let pool_key = crate::control::types::compute_pool_key(&["self-hosted".to_owned()], None);
+        exec(format!(
+            "UPDATE namespace_limits SET max_running_jobs = NULL WHERE namespace_id = '{tenant}'"
+        ))
+        .await;
+        exec(format!(
+            "INSERT INTO namespace_pool_limits (namespace_id, pool_key, max_running_jobs) \
+             VALUES ('{tenant}', '{pool_key}', 1)"
+        ))
+        .await;
+        let (runner_4, session_4) = live_runner(backend, "r4").await;
+        assert!(
+            claimed_job(backend, &session_4, runner_4).await.is_none(),
+            "the pool cap of one is already taken"
+        );
+        exec(format!(
+            "DELETE FROM namespace_pool_limits WHERE namespace_id = '{tenant}'"
+        ))
+        .await;
+        assert_eq!(
+            claimed_job(backend, &session_4, runner_4)
+                .await
+                .map(|(run_id, _, _)| run_id),
+            Some(run_id),
+            "an uncapped namespace claims freely"
+        );
+    }
+
+    /// `max_queued_jobs` admits a run only while the namespace's queued jobs
+    /// plus the run's own fit; other namespaces are unaffected.
+    pub(crate) async fn namespace_queue_cap_refuses_overflowing_submit<F, Fut>(
+        backend: &dyn ControlBackend,
+        exec: F,
+    ) where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let tenant = "tenant-queue";
+        let first = RunId::new();
+        backend
+            .submit_run(submit_in(tenant, first, vec![submit_job(first, "a", 1)]))
+            .await
+            .unwrap();
+        exec(format!(
+            "INSERT INTO namespace_limits (namespace_id, max_queued_jobs) VALUES ('{tenant}', 2)"
+        ))
+        .await;
+        let second = RunId::new();
+        backend
+            .submit_run(submit_in(tenant, second, vec![submit_job(second, "a", 2)]))
+            .await
+            .expect("1 queued + 1 submitted fits max_queued_jobs = 2");
+        let third = RunId::new();
+        assert!(
+            matches!(
+                backend
+                    .submit_run(submit_in(tenant, third, vec![submit_job(third, "a", 3)]))
+                    .await,
+                Err(ControlError::QuotaExceeded(_))
+            ),
+            "2 queued + 1 submitted exceeds max_queued_jobs = 2"
+        );
+        assert!(
+            backend.run_record(third).await.is_err(),
+            "a refused run persists nothing"
+        );
+        let other = RunId::new();
+        backend
+            .submit_run(submit_run(other, vec![submit_job(other, "a", 4)]))
+            .await
+            .expect("another namespace is not limited by this one");
+    }
+
+    /// `max_jobs_per_run` refuses an oversized run outright (it can never
+    /// fit), and `submit_rate_per_minute` refuses runs past the namespace's
+    /// trailing-minute budget; neither persists the refused run.
+    pub(crate) async fn namespace_run_size_and_rate_limits<F, Fut>(
+        backend: &dyn ControlBackend,
+        exec: F,
+    ) where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let tenant = "tenant-submit-limits";
+        let seed = RunId::new();
+        backend
+            .submit_run(submit_in(tenant, seed, vec![submit_job(seed, "a", 1)]))
+            .await
+            .unwrap();
+        exec(format!(
+            "INSERT INTO namespace_limits (namespace_id, max_jobs_per_run, submit_rate_per_minute) \
+             VALUES ('{tenant}', 2, 3)"
+        ))
+        .await;
+
+        let oversized = RunId::new();
+        let jobs = (0..3)
+            .map(|index| submit_job(oversized, &format!("j{index}"), 10 + index))
+            .collect();
+        assert!(
+            matches!(
+                backend.submit_run(submit_in(tenant, oversized, jobs)).await,
+                Err(ControlError::BadRequest(_))
+            ),
+            "3 jobs exceed max_jobs_per_run = 2"
+        );
+        assert!(backend.run_record(oversized).await.is_err());
+
+        // One run already counts toward the minute; two more fit, a third
+        // does not.
+        for request_id in [20, 21] {
+            let run_id = RunId::new();
+            backend
+                .submit_run(submit_in(
+                    tenant,
+                    run_id,
+                    vec![submit_job(run_id, "a", request_id)],
+                ))
+                .await
+                .expect("within submit_rate_per_minute = 3");
+        }
+        let throttled = RunId::new();
+        assert!(
+            matches!(
+                backend
+                    .submit_run(submit_in(
+                        tenant,
+                        throttled,
+                        vec![submit_job(throttled, "a", 22)]
+                    ))
+                    .await,
+                Err(ControlError::QuotaExceeded(_))
+            ),
+            "a fourth run in one minute exceeds submit_rate_per_minute = 3"
+        );
+        assert!(backend.run_record(throttled).await.is_err());
+    }
+
+    /// A webhook-originated run is never refused by a namespace limit or a
+    /// suspension (GitHub does not redeliver, so a refusal loses the push):
+    /// it is recorded and waits at claim. Only a deleted namespace refuses
+    /// it. The same submits through the API are refused.
+    pub(crate) async fn webhook_runs_bypass_submit_quotas<F, Fut>(
+        backend: &dyn ControlBackend,
+        exec: F,
+    ) where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let tenant = "tenant-webhooks";
+        let webhook = |run_id: RunId, request_id: i64| {
+            let mut submit = submit_in(tenant, run_id, vec![submit_job(run_id, "a", request_id)]);
+            submit.record.webhook_delivery_id = Some(format!("delivery-{run_id}"));
+            submit
+        };
+        let seed = RunId::new();
+        backend.submit_run(webhook(seed, 1)).await.unwrap();
+        exec(format!(
+            "INSERT INTO namespace_limits (namespace_id, max_queued_jobs, \
+             submit_rate_per_minute, max_jobs_per_run, max_running_jobs) \
+             VALUES ('{tenant}', 1, 1, 1, 0)"
+        ))
+        .await;
+
+        let api = RunId::new();
+        assert!(
+            backend
+                .submit_run(submit_in(tenant, api, vec![submit_job(api, "a", 2)]))
+                .await
+                .is_err(),
+            "an API submit over the namespace's limits is refused"
+        );
+        let over_quota = RunId::new();
+        backend
+            .submit_run(webhook(over_quota, 3))
+            .await
+            .expect("a webhook run over every submit-time limit is still recorded");
+        assert!(backend.run_record(over_quota).await.is_ok());
+        let (runner, session) = live_runner(backend, "r1").await;
+        assert!(
+            claimed_job(backend, &session, runner).await.is_none(),
+            "it waits at claim under max_running_jobs = 0"
+        );
+
+        exec(format!(
+            "UPDATE namespaces SET state = 'suspended' WHERE namespace_id = '{tenant}'"
+        ))
+        .await;
+        let suspended = RunId::new();
+        backend
+            .submit_run(webhook(suspended, 4))
+            .await
+            .expect("a suspended namespace still records webhook runs");
+
+        exec(format!(
+            "UPDATE namespaces SET state = 'deleted' WHERE namespace_id = '{tenant}'"
+        ))
+        .await;
+        let deleted = RunId::new();
+        assert!(
+            matches!(
+                backend.submit_run(webhook(deleted, 5)).await,
+                Err(ControlError::Forbidden(_))
+            ),
+            "a deleted namespace refuses webhook runs"
+        );
+    }
+
     /// Fixture identity for [`swept_binding_is_reported`]'s per-backend seed.
     pub(crate) struct SweptBinding {
         pub(crate) runner_id: i64,
@@ -5197,6 +5621,114 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn namespace_state_gates_submit_and_claim() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let db = &backend;
+        suite::namespace_state_gates_submit_and_claim(&backend, |sql| async move {
+            db.test_execute(&sql).await.unwrap()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_running_caps_hold_claims_at_limit() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let db = &backend;
+        suite::namespace_running_caps_hold_claims_at_limit(&backend, |sql| async move {
+            db.test_execute(&sql).await.unwrap()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_queue_cap_refuses_overflowing_submit() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let db = &backend;
+        suite::namespace_queue_cap_refuses_overflowing_submit(&backend, |sql| async move {
+            db.test_execute(&sql).await.unwrap()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_run_size_and_rate_limits() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let db = &backend;
+        suite::namespace_run_size_and_rate_limits(&backend, |sql| async move {
+            db.test_execute(&sql).await.unwrap()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_runs_bypass_submit_quotas() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let db = &backend;
+        suite::webhook_runs_bypass_submit_quotas(&backend, |sql| async move {
+            db.test_execute(&sql).await.unwrap()
+        })
+        .await;
+    }
+
+    /// Two nodes polling at once must not both take the last slot under a
+    /// namespace's running cap: the claim serializes on the limit row.
+    #[tokio::test]
+    async fn concurrent_claims_respect_namespace_running_cap() {
+        let Some((_pg, node_a, node_b)) = backend_pair().await else {
+            return skip_no_postgres();
+        };
+        let tenant = "tenant-race";
+        let run_id = RunId::new();
+        let jobs = (0..6)
+            .map(|index| submit_job(run_id, &format!("job-{index}"), index + 1))
+            .collect();
+        let mut submit = submit_run(run_id, jobs);
+        submit.namespace = tenant.to_owned();
+        node_a.submit_run(submit).await.unwrap();
+        node_a
+            .test_execute(&format!(
+                "INSERT INTO namespace_limits (namespace_id, max_running_jobs) \
+                 VALUES ('{tenant}', 2)"
+            ))
+            .await
+            .unwrap();
+        let mut sessions = Vec::new();
+        for index in 0..6 {
+            let node = if index % 2 == 0 { &node_a } else { &node_b };
+            let runner = node
+                .register_runner(register_runner(&format!("race-{index}")))
+                .await
+                .unwrap();
+            let session = node
+                .create_session(create_session(runner.runner.id))
+                .await
+                .unwrap();
+            sessions.push((index, runner.runner.id, session.session_id));
+        }
+        let polls = sessions.iter().map(|(index, runner_id, session_id)| {
+            let node = if index % 2 == 0 { &node_a } else { &node_b };
+            node.poll_session(poll(session_id, *runner_id))
+        });
+        let claimed = futures::future::join_all(polls)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|outcome| matches!(outcome, PollOutcome::Claimed(_)))
+            .count();
+        assert_eq!(claimed, 2, "max_running_jobs = 2 across both nodes");
+    }
+
+    #[tokio::test]
     async fn swept_binding_is_reported() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -6008,6 +6540,58 @@ mod lite {
     #[tokio::test]
     async fn claim_uses_the_pairing_label_matcher() {
         suite::claim_uses_the_pairing_label_matcher(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn namespace_state_gates_submit_and_claim() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::namespace_state_gates_submit_and_claim(&backend, |sql| async move {
+            db.exec_for_test(&sql)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_running_caps_hold_claims_at_limit() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::namespace_running_caps_hold_claims_at_limit(&backend, |sql| async move {
+            db.exec_for_test(&sql)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_queue_cap_refuses_overflowing_submit() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::namespace_queue_cap_refuses_overflowing_submit(&backend, |sql| async move {
+            db.exec_for_test(&sql)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_run_size_and_rate_limits() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::namespace_run_size_and_rate_limits(
+            &backend,
+            |sql| async move { db.exec_for_test(&sql) },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_runs_bypass_submit_quotas() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::webhook_runs_bypass_submit_quotas(
+            &backend,
+            |sql| async move { db.exec_for_test(&sql) },
+        )
+        .await;
     }
 
     #[tokio::test]

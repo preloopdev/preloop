@@ -489,14 +489,19 @@ impl PgBackend {
         self.released_bindings
             .fetch_add(released_count as u64, std::sync::atomic::Ordering::Relaxed);
         // Oldest pool-pending job this runner can serve (pending-mark order,
-        // ties by queue position).
+        // ties by queue position). A job its namespace would not let start
+        // (state or running caps) is not paired: binding it would park this
+        // warm runner on work that cannot run.
         let pending = tx
             .query(
-                "SELECT p.run_id::text, p.job_id, j.runs_on::text, j.runner_group \
-                 FROM provision_requests p JOIN jobs j \
-                 ON j.run_id=p.run_id AND j.job_id=p.job_id \
-                 WHERE j.queue_state='ready' \
-                 ORDER BY p.requested_at, j.priority DESC, j.run_order, j.job_order LIMIT 64",
+                &format!(
+                    "SELECT p.run_id::text, p.job_id, j.runs_on::text, j.runner_group \
+                     FROM provision_requests p JOIN jobs j \
+                     ON j.run_id=p.run_id AND j.job_id=p.job_id \
+                     WHERE j.queue_state='ready' AND ({}) \
+                     ORDER BY p.requested_at, j.priority DESC, j.run_order, j.job_order LIMIT 64",
+                    crate::control::types::NAMESPACE_ADMITS_CLAIM
+                ),
                 &[],
             )
             .await

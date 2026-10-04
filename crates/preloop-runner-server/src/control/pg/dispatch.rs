@@ -2053,11 +2053,22 @@ pub(super) async fn on_job_enqueued(
         .await
         .map_err(db)?;
     let busy: BTreeSet<i64> = busy_rows.iter().map(|r| r.get(0)).collect();
+    // A job its namespace would not let start (state or running caps) must
+    // not reserve an idle runner; it waits pool-pending like any job with no
+    // free runner, and the claim admits it once the namespace does. The gate
+    // is an uncorrelated sub-select over the node's own namespace and pool
+    // key (evaluated once per statement, and valid whether or not the node's
+    // row is flushed yet), so a gated job simply sees no candidates.
     let candidates = tx
         .query(
-            "SELECT DISTINCT s.runner_id FROM runner_sessions s \
-             JOIN runners r ON r.runner_id=s.runner_id WHERE s.runner_id IS NOT NULL",
-            &[],
+            &format!(
+                "SELECT DISTINCT s.runner_id FROM runner_sessions s \
+                 JOIN runners r ON r.runner_id=s.runner_id WHERE s.runner_id IS NOT NULL \
+                 AND (SELECT {} FROM (SELECT $1::text AS namespace_id, \
+                      $2::text AS pool_key) j)",
+                crate::control::types::NAMESPACE_ADMITS_CLAIM
+            ),
+            &[&graph.namespace, &node.pool_key],
         )
         .await
         .map_err(db)?;
@@ -3818,6 +3829,78 @@ async fn delivery_run_in_tx(
     .transpose()
 }
 
+/// Submit admission for `namespace`, inside the submit transaction: the
+/// namespace state must admit the run, and for API/CLI submits each
+/// configured submit-time limit (`max_jobs_per_run`, `submit_rate_per_minute`,
+/// `max_queued_jobs`) must admit it too. Webhook-originated runs (`webhook`)
+/// skip the limits: a refusal would lose the push, so they are recorded and
+/// wait at claim. The limit row is locked before counting so concurrent
+/// submits cannot both take the last slots; namespaces without a limit row
+/// take no lock and run no counts.
+async fn admit_submit(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    submitting: usize,
+    webhook: bool,
+) -> Result<(), ControlError> {
+    use crate::control::types as t;
+    let state: String = tx
+        .query_one(
+            "SELECT state FROM namespaces WHERE namespace_id = $1",
+            &[&namespace],
+        )
+        .await
+        .map_err(db)?
+        .get(0);
+    t::namespace_submit_admission(namespace, &state, webhook)?;
+    if webhook {
+        return Ok(());
+    }
+    let Some(limits) = tx
+        .query_opt(
+            "SELECT max_jobs_per_run, submit_rate_per_minute, max_queued_jobs \
+             FROM namespace_limits WHERE namespace_id = $1 FOR UPDATE",
+            &[&namespace],
+        )
+        .await
+        .map_err(db)?
+    else {
+        return Ok(());
+    };
+    let (per_run, per_minute, max_queued): (Option<i32>, Option<i32>, Option<i32>) =
+        (limits.get(0), limits.get(1), limits.get(2));
+    if let Some(per_run) = per_run {
+        t::namespace_run_size_admission(namespace, i64::from(per_run), submitting)?;
+    }
+    if let Some(per_minute) = per_minute {
+        let recent: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM runs WHERE namespace_id = $1 \
+                 AND created_at > now() - interval '1 minute'",
+                &[&namespace],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        t::namespace_rate_admission(namespace, i64::from(per_minute), recent)?;
+    }
+    if let Some(max_queued) = max_queued {
+        let queued: i64 = tx
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM jobs WHERE namespace_id = $1 AND queue_state IN {}",
+                    t::NAMESPACE_QUEUED_STATES
+                ),
+                &[&namespace],
+            )
+            .await
+            .map_err(db)?
+            .get(0);
+        t::namespace_queue_admission(namespace, i64::from(max_queued), queued, submitting)?;
+    }
+    Ok(())
+}
+
 impl PgBackend {
     /// `submit_run`: one transaction that records the run, its jobs and their
     /// dispatch state, acquires the workflow-level gate, and runs the first
@@ -3885,6 +3968,13 @@ impl PgBackend {
         )
         .await
         .map_err(db)?;
+        admit_submit(
+            &tx,
+            &namespace,
+            jobs.len(),
+            record.webhook_delivery_id.is_some(),
+        )
+        .await?;
         // A caller may replay a run number (tests and push-back retries do);
         // GitHub allocates the next number rather than surfacing a unique-key
         // failure. Keep the counter ahead of both its row and existing runs.
@@ -4727,39 +4817,45 @@ impl PgBackend {
             group_id: caps.runner_group_id,
             group_name: caps.runner_group_name.clone(),
         };
+        // Jobs whose namespace admits no new claim (state or running caps)
+        // never become candidates; `capped` marks the ones whose claim must
+        // first serialize on the namespace's limit rows.
+        let batch_sql = format!(
+            "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, \
+                    a.runner_id, \
+                    COALESCE(a.assigned_at > now() - interval '120 seconds', false), \
+                    COALESCE(a.first_assigned_at > now() - interval '120 seconds', \
+                             false), \
+                    COALESCE(a.runner_id IS NOT NULL AND EXISTS( \
+                        SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id), \
+                        false), \
+                    a.run_id IS NOT NULL, \
+                    (j.enqueued_at IS NOT NULL \
+                     AND j.enqueued_at <= now() - interval '120 seconds'), \
+                    (p.requested_at > now() - interval '120 seconds'), \
+                    j.namespace_id, j.pool_key, {capped} \
+             FROM jobs j \
+             LEFT JOIN job_assignments a ON a.run_id = j.run_id \
+                AND a.job_id = j.job_id \
+             LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+                AND p.job_id = j.job_id \
+             WHERE j.queue_state = 'ready' AND ({admits}) \
+             ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+             LIMIT 64 OFFSET $1",
+            capped = crate::control::types::NAMESPACE_CLAIM_CAPPED,
+            admits = crate::control::types::NAMESPACE_ADMITS_CLAIM,
+        );
         for _attempt in 0..CLAIM_ATTEMPTS {
             let mut offset: i64 = 0;
             loop {
                 // The pool key prunes by label set; the shared eligibility
                 // ladder and matcher still decide.
-                let rows = tx
-                    .query(
-                        "SELECT j.run_id::text, j.job_id, j.runs_on::text, j.runner_group, \
-                                a.runner_id, \
-                                COALESCE(a.assigned_at > now() - interval '120 seconds', false), \
-                                COALESCE(a.first_assigned_at > now() - interval '120 seconds', \
-                                         false), \
-                                COALESCE(a.runner_id IS NOT NULL AND EXISTS( \
-                                    SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id), \
-                                    false), \
-                                a.run_id IS NOT NULL, \
-                                (j.enqueued_at IS NOT NULL \
-                                 AND j.enqueued_at <= now() - interval '120 seconds'), \
-                                (p.requested_at > now() - interval '120 seconds') \
-                         FROM jobs j \
-                         LEFT JOIN job_assignments a ON a.run_id = j.run_id \
-                            AND a.job_id = j.job_id \
-                         LEFT JOIN provision_requests p ON p.run_id = j.run_id \
-                            AND p.job_id = j.job_id \
-                         WHERE j.queue_state = 'ready' \
-                         ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
-                         LIMIT 64 OFFSET $1",
-                        &[&offset],
-                    )
-                    .await
-                    .map_err(db)?;
+                let rows = tx.query(batch_sql.as_str(), &[&offset]).await.map_err(db)?;
                 let exhausted = rows.len() < 64;
                 let mut candidates = Vec::with_capacity(rows.len());
+                // `(namespace, pool_key, capped)` per candidate, kept index-
+                // aligned with `candidates` (both are `swap_remove`d together).
+                let mut namespaces: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
                 for (position, row) in rows.iter().enumerate() {
                     let assigned: Option<i64> = row.get(4);
                     let assignment_fresh: bool = row.get(5);
@@ -4826,6 +4922,7 @@ impl PgBackend {
                         queue_position: position as u64,
                         claimable,
                     });
+                    namespaces.push((row.get(11), row.get(12), row.get(13)));
                 }
                 // Walk the candidates in preference order, claiming the first
                 // whose row lock lands. A skipped (locked) or already-claimed
@@ -4839,6 +4936,17 @@ impl PgBackend {
                     &runner_match,
                 ) {
                     let chosen = candidates.swap_remove(index);
+                    let (namespace, pool_key, capped) = namespaces.swap_remove(index);
+                    if capped
+                        && !self
+                            .capped_claim_admitted(tx, &namespace, &pool_key, &chosen)
+                            .await?
+                    {
+                        // Another claim took the namespace's last slot after
+                        // the batch was read.
+                        raced = true;
+                        continue;
+                    }
                     let claimed = tx
                         .execute(
                             "UPDATE jobs j SET queue_state = 'claimed', status = 'in_progress', \
@@ -4869,6 +4977,48 @@ impl PgBackend {
             }
         }
         Ok(None)
+    }
+
+    /// Re-check a capped namespace's admission under its limit-row locks.
+    ///
+    /// The batch read decided admission from a snapshot; two nodes could both
+    /// see the last free slot. Locking the namespace's `namespace_limits` and
+    /// matching `namespace_pool_limits` rows `FOR UPDATE` (held to commit)
+    /// serializes claims within the capped namespace, and the re-count runs
+    /// as a fresh statement, so it sees every claim committed by the previous
+    /// lock holder. Uncapped namespaces never reach this.
+    async fn capped_claim_admitted(
+        &self,
+        tx: &Transaction<'_>,
+        namespace: &str,
+        pool_key: &str,
+        chosen: &logic::ClaimCandidate,
+    ) -> Result<bool, ControlError> {
+        tx.query(
+            "SELECT 1 FROM namespace_limits WHERE namespace_id = $1 FOR UPDATE",
+            &[&namespace],
+        )
+        .await
+        .map_err(db)?;
+        tx.query(
+            "SELECT 1 FROM namespace_pool_limits WHERE namespace_id = $1 AND pool_key = $2 \
+             FOR UPDATE",
+            &[&namespace, &pool_key],
+        )
+        .await
+        .map_err(db)?;
+        let admitted = tx
+            .query_opt(
+                &format!(
+                    "SELECT {} FROM jobs j WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
+                    crate::control::types::NAMESPACE_ADMITS_CLAIM
+                ),
+                &[&chosen.run_id.0.to_string(), &chosen.job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .is_some_and(|row| row.get::<_, bool>(0));
+        Ok(admitted)
     }
 
     /// Bind the claimed attempt: request owner/session/start stamps, the lease

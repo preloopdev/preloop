@@ -345,6 +345,17 @@ pub(super) fn on_job_enqueued(
         .map_err(db)?
         .execute(params![run, job.job_id.0])
         .map_err(db)?;
+    // A job its namespace would not let start (state or running caps) must
+    // not reserve an idle runner; it waits pool-pending like any job with no
+    // free runner, and the claim admits it once the namespace does.
+    let admitted: bool = tx
+        .prepare_cached(&format!(
+            "SELECT {} FROM (SELECT ?1 AS namespace_id, ?2 AS pool_key) j",
+            crate::control::types::NAMESPACE_ADMITS_CLAIM
+        ))
+        .map_err(db)?
+        .query_row(params![job.namespace_id, job.pool_key], |row| row.get(0))
+        .map_err(db)?;
 
     // Busy runners: claimed assignments plus sessions holding live requests.
     let mut busy: BTreeSet<i64> = BTreeSet::new();
@@ -374,6 +385,9 @@ pub(super) fn on_job_enqueued(
         .map_err(db)?;
     for row in stmt.query_map([], |row| row.get::<_, i64>(0)).map_err(db)? {
         candidates.insert(row.map_err(db)?);
+    }
+    if !admitted {
+        candidates.clear();
     }
     if pool_enabled {
         candidates.retain(|runner_id| {

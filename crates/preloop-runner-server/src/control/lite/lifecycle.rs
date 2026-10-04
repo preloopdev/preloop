@@ -325,17 +325,20 @@ fn pair_runner_tx(
     backend.count_released_bindings(released_count);
 
     // Oldest pool-pending job this runner can serve (pending-mark order,
-    // ties by queue position).
+    // ties by queue position). A job its namespace would not let start
+    // (state or running caps) is not paired: binding it would park this
+    // warm runner on work that cannot run.
     let pending: Vec<(String, String, Vec<String>, Option<String>)> = {
         let mut stmt = tx
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT p.run_id, p.job_id, j.runs_on, j.runner_group \
                  FROM provision_requests p JOIN jobs j \
                  ON j.run_id = p.run_id AND j.job_id = p.job_id \
-                 WHERE j.queue_state = 'ready' \
+                 WHERE j.queue_state = 'ready' AND ({}) \
                  ORDER BY p.requested_at, j.priority DESC, j.run_order, j.job_order \
                  LIMIT 64",
-            )
+                crate::control::types::NAMESPACE_ADMITS_CLAIM
+            ))
             .map_err(db)?;
         let rows = stmt
             .query_map([], |row| {

@@ -43,6 +43,8 @@ CREATE TABLE schema_meta (
 -- the partial indexes, so there is no per-tenant hot counter row.
 CREATE TABLE namespaces (
     namespace_id            text PRIMARY KEY,
+    -- active: submit + claim. draining: claims queued work, refuses submits.
+    -- suspended/deleted: neither (queued jobs stay queued, nothing starts).
     state                   text NOT NULL DEFAULT 'active' CHECK (state IN
                                 ('active','suspended','draining','deleted')),
     cell_generation         bigint NOT NULL DEFAULT 1,   -- bumped on cell move; fences stale writers
@@ -51,8 +53,12 @@ CREATE TABLE namespaces (
     updated_at              timestamptz NOT NULL DEFAULT now()
 );
 
--- Execution quotas (NULL = unlimited). Checked at submit and in the claim
--- predicate; retention drives the archiver's partition drops.
+-- Execution quotas (NULL = unlimited). Enforced today: max_queued_jobs,
+-- submit_rate_per_minute and max_jobs_per_run at API/CLI submit (webhook
+-- runs are never refused; they wait at claim); max_running_jobs in the claim
+-- predicate (a capped claim locks this row first, so nodes cannot
+-- overshoot). Not yet read: max_job_timeout_minutes, priority_tier,
+-- run_history_retention_days.
 CREATE TABLE namespace_limits (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     max_queued_jobs         integer,

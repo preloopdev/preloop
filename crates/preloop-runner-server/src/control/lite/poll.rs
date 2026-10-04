@@ -201,31 +201,33 @@ fn claim_one(
     };
     // Page the ready queue in dispatch order until a candidate matches or the
     // ready set is exhausted: a runner whose own pool sorts past the first
-    // batch must still see the jobs it can serve.
+    // batch must still see the jobs it can serve. Jobs whose namespace admits
+    // no new claim (state or running caps) are never candidates; the single
+    // writer makes the read-then-claim exact without a lock.
+    let batch_sql = format!(
+        "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
+         j.enqueued_at, \
+         a.runner_id, \
+         (a.run_id IS NOT NULL), \
+         (a.assigned_at IS NOT NULL AND a.assigned_at > ?1), \
+         (a.first_assigned_at IS NOT NULL AND a.first_assigned_at > ?1), \
+         (a.runner_id IS NOT NULL AND EXISTS( \
+            SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id)), \
+         p.requested_at \
+         FROM jobs j \
+         LEFT JOIN job_assignments a ON a.run_id = j.run_id \
+            AND a.job_id = j.job_id \
+         LEFT JOIN provision_requests p ON p.run_id = j.run_id \
+            AND p.job_id = j.job_id \
+         WHERE j.queue_state = 'ready' AND ({}) \
+         ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
+         LIMIT 64 OFFSET ?2",
+        crate::control::types::NAMESPACE_ADMITS_CLAIM
+    );
     let mut offset: i64 = 0;
     loop {
         let rows: Vec<ReadyRow> = {
-            let mut stmt = tx
-                .prepare_cached(
-                    "SELECT j.run_id, j.job_id, j.runs_on, j.runner_group, \
-                     j.enqueued_at, \
-                     a.runner_id, \
-                     (a.run_id IS NOT NULL), \
-                     (a.assigned_at IS NOT NULL AND a.assigned_at > ?1), \
-                     (a.first_assigned_at IS NOT NULL AND a.first_assigned_at > ?1), \
-                     (a.runner_id IS NOT NULL AND EXISTS( \
-                        SELECT 1 FROM runners r WHERE r.runner_id = a.runner_id)), \
-                     p.requested_at \
-                     FROM jobs j \
-                     LEFT JOIN job_assignments a ON a.run_id = j.run_id \
-                        AND a.job_id = j.job_id \
-                     LEFT JOIN provision_requests p ON p.run_id = j.run_id \
-                        AND p.job_id = j.job_id \
-                     WHERE j.queue_state = 'ready' \
-                     ORDER BY j.pool_key, j.priority DESC, j.run_order, j.job_order \
-                     LIMIT 64 OFFSET ?2",
-                )
-                .map_err(db)?;
+            let mut stmt = tx.prepare_cached(&batch_sql).map_err(db)?;
             let rows = stmt
                 .query_map(params![fresh_after, offset], |row| {
                     let assigned: Option<i64> = row.get(5)?;

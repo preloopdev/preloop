@@ -17,6 +17,117 @@ use preloop_gha_protocol::{ExecutionStatus, JobId, RegisteredRunner, RunId};
 /// identical.
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// SQL predicate over a `jobs j` row: the job's namespace admits a new claim
+/// right now. The namespace must be `active` or `draining` (draining finishes
+/// queued work; `suspended` and `deleted` start nothing), and neither its
+/// running cap (`namespace_limits.max_running_jobs`) nor its cap for the
+/// job's pool (`namespace_pool_limits`) may be reached. A namespace with no
+/// `namespaces` row is treated as `active`; one with no limit rows is
+/// uncapped, so the unconfigured default namespace pays only two primary-key
+/// probes per row. Shared verbatim by both backends; the claim, the pool
+/// pairing and the enqueue-time binding all apply it, so a gated job neither
+/// starts nor reserves shared warm-pool capacity.
+pub(crate) const NAMESPACE_ADMITS_CLAIM: &str = "\
+COALESCE((SELECT n.state FROM namespaces n WHERE n.namespace_id = j.namespace_id), 'active') \
+    IN ('active', 'draining') \
+AND NOT EXISTS (SELECT 1 FROM namespace_limits l \
+    WHERE l.namespace_id = j.namespace_id AND l.max_running_jobs IS NOT NULL \
+    AND (SELECT count(*) FROM jobs c WHERE c.namespace_id = j.namespace_id \
+         AND c.queue_state = 'claimed') >= l.max_running_jobs) \
+AND NOT EXISTS (SELECT 1 FROM namespace_pool_limits pl \
+    WHERE pl.namespace_id = j.namespace_id AND pl.pool_key = j.pool_key \
+    AND (SELECT count(*) FROM jobs c WHERE c.namespace_id = j.namespace_id \
+         AND c.pool_key = j.pool_key AND c.queue_state = 'claimed') >= pl.max_running_jobs)";
+
+/// SQL predicate over a `jobs j` row: the job's namespace has a running cap
+/// that applies to it. Concurrent claimers on Postgres serialize on the
+/// limit rows before claiming such a job, so two nodes cannot both admit the
+/// last slot under the cap.
+pub(crate) const NAMESPACE_CLAIM_CAPPED: &str = "\
+(EXISTS (SELECT 1 FROM namespace_limits l WHERE l.namespace_id = j.namespace_id \
+    AND l.max_running_jobs IS NOT NULL) \
+ OR EXISTS (SELECT 1 FROM namespace_pool_limits pl WHERE pl.namespace_id = j.namespace_id \
+    AND pl.pool_key = j.pool_key))";
+
+/// Queue states counted against `namespace_limits.max_queued_jobs`
+/// (the `jobs_namespace_queued` partial index).
+pub(crate) const NAMESPACE_QUEUED_STATES: &str = "('blocked','held','ready','pending_expansion')";
+
+/// Submit admission for a namespace in `state`.
+///
+/// API/CLI submits need an `active` namespace: `draining` keeps claiming its
+/// queued work but takes no new runs; `suspended` and `deleted` take neither.
+///
+/// A webhook-originated run (`webhook`) is never refused while the namespace
+/// exists: GitHub does not redeliver, so a refusal loses the push. Such runs
+/// are always recorded and wait at claim instead — a `suspended` namespace's
+/// run starts once it is reactivated. Only a `deleted` namespace refuses them.
+/// Callers skip the submit-time quotas (`namespace_limits`) for these runs for
+/// the same reason; the running caps still apply at claim.
+pub(crate) fn namespace_submit_admission(
+    namespace: &str,
+    state: &str,
+    webhook: bool,
+) -> Result<(), ControlError> {
+    if state == "active" || (webhook && state != "deleted") {
+        return Ok(());
+    }
+    Err(ControlError::Forbidden(format!(
+        "namespace {namespace} is {state}; it does not accept new runs"
+    )))
+}
+
+/// Submit admission against `namespace_limits.max_queued_jobs`: the jobs
+/// already queued in the namespace plus the run's own jobs must fit.
+pub(crate) fn namespace_queue_admission(
+    namespace: &str,
+    max_queued: i64,
+    queued: i64,
+    submitting: usize,
+) -> Result<(), ControlError> {
+    let submitting = submitting as i64;
+    if queued + submitting <= max_queued {
+        return Ok(());
+    }
+    Err(ControlError::QuotaExceeded(format!(
+        "namespace {namespace} has {queued} queued jobs; this run adds {submitting} \
+         and the namespace allows {max_queued}"
+    )))
+}
+
+/// Submit admission against `namespace_limits.max_jobs_per_run`. A run larger
+/// than the limit can never fit, so it is refused as a bad request rather
+/// than as a retryable quota.
+pub(crate) fn namespace_run_size_admission(
+    namespace: &str,
+    max_jobs_per_run: i64,
+    submitting: usize,
+) -> Result<(), ControlError> {
+    let submitting = submitting as i64;
+    if submitting <= max_jobs_per_run {
+        return Ok(());
+    }
+    Err(ControlError::BadRequest(format!(
+        "run has {submitting} jobs; namespace {namespace} allows at most {max_jobs_per_run} per run"
+    )))
+}
+
+/// Submit admission against `namespace_limits.submit_rate_per_minute`: the
+/// runs the namespace created in the trailing minute, plus this one.
+pub(crate) fn namespace_rate_admission(
+    namespace: &str,
+    per_minute: i64,
+    recent_runs: i64,
+) -> Result<(), ControlError> {
+    if recent_runs < per_minute {
+        return Ok(());
+    }
+    Err(ControlError::QuotaExceeded(format!(
+        "namespace {namespace} submitted {recent_runs} runs in the last minute; \
+         it allows {per_minute}"
+    )))
+}
+
 /// Canonical label-set identity for an indexed eligibility lookup. A runner
 /// matches a *subset*, not one identical key; the backend still enforces
 /// capability matching before a policy can use this as a pool filter.
@@ -488,6 +599,9 @@ pub enum ControlError {
     /// The fencing token presented (lease owner/generation) no longer owns
     /// the resource — a stale worker racing a successor.
     Stale(String),
+    /// A namespace limit refused the command (admission control); retrying
+    /// after the namespace's own work drains can succeed.
+    QuotaExceeded(String),
     /// A command ran under a narrow lock scope and found it must touch state
     /// outside it; the transaction rolled back and the caller reruns it
     /// under the wider scope. Never escapes the retrying caller.
@@ -505,6 +619,7 @@ impl std::fmt::Display for ControlError {
             Self::Forbidden(m) => write!(f, "forbidden: {m}"),
             Self::BadRequest(m) => write!(f, "bad request: {m}"),
             Self::Stale(m) => write!(f, "stale fence: {m}"),
+            Self::QuotaExceeded(m) => write!(f, "quota exceeded: {m}"),
             Self::WidenScope => write!(f, "command needs a wider lock scope"),
             Self::Backend(e) => write!(f, "backend: {e}"),
         }
@@ -534,6 +649,7 @@ impl From<ControlError> for ApiError {
             ControlError::Forbidden(message) => ApiError::forbidden(message),
             ControlError::BadRequest(message) => ApiError::bad_request(message),
             ControlError::Stale(message) => ApiError::conflict(message),
+            ControlError::QuotaExceeded(message) => ApiError::too_many_requests(message),
             ControlError::WidenScope => {
                 tracing::error!("scope-widening signal escaped its retry");
                 ApiError::internal("control backend error")

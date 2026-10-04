@@ -96,6 +96,69 @@ pub(super) fn spec_extras<'a>(
     }
 }
 
+/// Submit admission for `namespace` (pg `admit_submit`): the namespace state
+/// must admit the run, and for API/CLI submits each configured submit-time
+/// limit (`max_jobs_per_run`, `submit_rate_per_minute`, `max_queued_jobs`)
+/// must admit it too. Webhook-originated runs (`webhook`) skip the limits so
+/// a push is never lost; they wait at claim. The single writer makes the
+/// counts exact.
+fn admit_submit(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    submitting: usize,
+    webhook: bool,
+) -> Result<(), ControlError> {
+    use crate::control::types as t;
+    let state: String = tx
+        .prepare_cached("SELECT state FROM namespaces WHERE namespace_id = ?1")
+        .map_err(db)?
+        .query_row(params![namespace], |row| row.get(0))
+        .map_err(db)?;
+    t::namespace_submit_admission(namespace, &state, webhook)?;
+    if webhook {
+        return Ok(());
+    }
+    type Limits = (Option<i64>, Option<i64>, Option<i64>);
+    let Some((per_run, per_minute, max_queued)) = tx
+        .prepare_cached(
+            "SELECT max_jobs_per_run, submit_rate_per_minute, max_queued_jobs \
+             FROM namespace_limits WHERE namespace_id = ?1",
+        )
+        .map_err(db)?
+        .query_row(params![namespace], |row| -> rusqlite::Result<Limits> {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()
+        .map_err(db)?
+    else {
+        return Ok(());
+    };
+    if let Some(per_run) = per_run {
+        t::namespace_run_size_admission(namespace, per_run, submitting)?;
+    }
+    if let Some(per_minute) = per_minute {
+        let since = now_us() - 60_000_000;
+        let recent: i64 = tx
+            .prepare_cached("SELECT count(*) FROM runs WHERE namespace_id = ?1 AND created_at > ?2")
+            .map_err(db)?
+            .query_row(params![namespace, since], |row| row.get(0))
+            .map_err(db)?;
+        t::namespace_rate_admission(namespace, per_minute, recent)?;
+    }
+    if let Some(max_queued) = max_queued {
+        let queued: i64 = tx
+            .prepare_cached(&format!(
+                "SELECT count(*) FROM jobs WHERE namespace_id = ?1 AND queue_state IN {}",
+                t::NAMESPACE_QUEUED_STATES
+            ))
+            .map_err(db)?
+            .query_row(params![namespace], |row| row.get(0))
+            .map_err(db)?;
+        t::namespace_queue_admission(namespace, max_queued, queued, submitting)?;
+    }
+    Ok(())
+}
+
 fn submit_run_tx(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
@@ -201,6 +264,12 @@ fn submit_run_tx(
         .map_err(db)?
         .execute(params![namespace])
         .map_err(db)?;
+    admit_submit(
+        tx,
+        &namespace,
+        submit_jobs.len(),
+        record.webhook_delivery_id.is_some(),
+    )?;
     insert_run_row(tx, &record, &namespace, workflow_concurrency.as_ref())?;
 
     // A run's jobs all share one queue sequence number; `created_at` is
