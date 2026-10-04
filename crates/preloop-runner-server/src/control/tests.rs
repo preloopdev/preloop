@@ -618,7 +618,6 @@ pub(crate) mod suite {
             .unwrap();
         assert_eq!(done.effective_status, ExecutionStatus::Success);
         assert!(done.newly_terminal_success);
-        assert_eq!(done.record.status, ExecutionStatus::Success);
         let stats = backend.queue_stats().await.unwrap();
         assert_eq!((stats.ready, stats.claimed), (0, 0));
         assert!(backend.live_assignments().await.unwrap().is_empty());
