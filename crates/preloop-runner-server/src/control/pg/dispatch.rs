@@ -2986,6 +2986,37 @@ impl<'a> Sweep<'a> {
 
     /// Settle a node terminal: status, release gates, retire requests, run
     /// resummary, decrement dependent `remaining_needs` rows.
+    /// Jobs in `run_id` that directly depend on `job_id` or its `base_id`.
+    ///
+    /// Driven by the `job_needs_reverse` index (`job_needs(run_id,
+    /// needs_job_id)`). A declared need matches a job id or its matrix base,
+    /// and an expanded matrix parent is replaced by its legs — so a base need
+    /// must wait for *every* leg, and a leg's id never appears in the
+    /// dependent's `job_needs` row. Both the job id and the base id are
+    /// probed. This is the targeted replacement for scanning the whole run
+    /// graph when a job settles (Phase 1 item 8); callers apply their own
+    /// status/queue-state filters to the returned ids.
+    pub(super) async fn dependents_of(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        job_id: &JobId,
+        base_id: &str,
+    ) -> Result<Vec<JobId>, ControlError> {
+        let rows = tx
+            .query(
+                "SELECT DISTINCT job_id FROM job_needs \
+                 WHERE run_id = $1::text::uuid \
+                 AND (needs_job_id = $2 OR needs_job_id = $3)",
+                &[&run_id.0.to_string(), &job_id.0, &base_id],
+            )
+            .await
+            .map_err(db)?;
+        Ok(rows
+            .iter()
+            .map(|row| JobId(row.get::<_, String>(0)))
+            .collect())
+    }
+
     pub(super) async fn settle_node(
         &mut self,
         run_id: RunId,

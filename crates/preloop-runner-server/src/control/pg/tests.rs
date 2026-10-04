@@ -1528,3 +1528,44 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
         "nothing past the last bookmark: {after:?}"
     );
 }
+
+/// `dependents_of` finds direct dependents via the reverse index, probing
+/// both the job id and the matrix base id (Phase 1 item 8).
+#[tokio::test]
+async fn dependents_of_finds_direct_dependents() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    // build <- test <- deploy: test needs build, deploy needs test.
+    let mut build = submit_job(run_id, "build", 1);
+    let mut test = submit_job(run_id, "test", 2);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    let mut deploy = submit_job(run_id, "deploy", 3);
+    deploy.queued.needs = vec![JobId("test".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, test, deploy]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    // Dependents of "build" is just "test" — not the transitive "deploy".
+    let deps =
+        super::dispatch::Sweep::dependents_of(&tx, run_id, &JobId("build".to_owned()), "build")
+            .await
+            .unwrap();
+    assert_eq!(deps, vec![JobId("test".to_owned())]);
+    // Dependents of "test" is "deploy".
+    let deps =
+        super::dispatch::Sweep::dependents_of(&tx, run_id, &JobId("test".to_owned()), "test")
+            .await
+            .unwrap();
+    assert_eq!(deps, vec![JobId("deploy".to_owned())]);
+    // Nothing depends on "deploy".
+    let deps =
+        super::dispatch::Sweep::dependents_of(&tx, run_id, &JobId("deploy".to_owned()), "deploy")
+            .await
+            .unwrap();
+    assert!(deps.is_empty());
+    tx.rollback().await.unwrap();
+}
