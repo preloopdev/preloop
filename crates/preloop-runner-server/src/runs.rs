@@ -800,23 +800,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let remote_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
-        if submission.dispatch_inputs.is_empty() {
-            submission.dispatch_inputs = submission
-                .payload
-                .get("inputs")
-                .and_then(serde_json::Value::as_object)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-        }
-        if submission.dispatch_inputs_stringified.is_empty() {
-            submission.dispatch_inputs_stringified = submission
-                .dispatch_inputs
-                .iter()
-                .map(|(name, value)| (name.clone(), value_to_input_string(value)))
-                .collect();
-        }
+        // GitHub's webhook payload stringifies every workflow_dispatch input,
+        // including booleans (`"false"`). Rebuild the typed context from the
+        // validated payload unconditionally: preserving the raw non-empty map
+        // would make `"false"` truthy in job conditions.
+        submission.dispatch_inputs = submission
+            .payload
+            .get("inputs")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        submission.dispatch_inputs_stringified = submission
+            .dispatch_inputs
+            .iter()
+            .map(|(name, value)| (name.clone(), value_to_input_string(value)))
+            .collect();
         if let Some(object) = submission.payload.as_object_mut() {
             let inputs_value = if submission.dispatch_inputs_stringified.is_empty() {
                 serde_json::Value::Null

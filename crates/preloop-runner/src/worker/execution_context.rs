@@ -80,11 +80,11 @@ fn format_stdout_line(timestamp: &str, line: &str, prefix: bool) -> String {
     }
 }
 
-/// Maximum bytes retained for a newline-free partial output line.
+/// R1-12: maximum bytes retained for a newline-free partial output line.
 /// A step printing 64 MiB without a `\n` (progress bars, binary dumps)
 /// would otherwise be retained 1:1 in memory for the whole step.
 const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
-/// Maximum bytes of a single completed output line passed through
+/// R1-12: maximum bytes of a single completed output line passed through
 /// masking/logging. Longer lines are truncated with a marker instead of
 /// being copied whole several times over.
 const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
@@ -93,7 +93,7 @@ const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
 /// so scans never need more than the head.
 pub(crate) const LOG_HEAD_SCAN_BYTES: u64 = 1024 * 1024;
 
-/// Truncate an overlong completed log line, keeping the head so the
+/// R1-12: truncate an overlong completed log line, keeping the head so the
 /// start of the output stays visible.
 fn truncate_log_line(line: &str) -> std::borrow::Cow<'_, str> {
     if line.len() <= MAX_LOG_LINE_BYTES {
@@ -144,7 +144,7 @@ pub struct StepContext<'a> {
     pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
     /// Line buffer for accumulating partial lines from process output chunks.
     line_buffer: Arc<Mutex<Vec<u8>>>,
-    /// Set when the partial-line buffer overflowed its cap and the
+    /// R1-12: set when the partial-line buffer overflowed its cap and the
     /// head was dropped; surfaced as a truncation warning on the next flush.
     line_buffer_truncated: bool,
     /// Whether to also accumulate log lines in memory (for tests).
@@ -255,12 +255,12 @@ impl<'a> StepContext<'a> {
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
             let masked = self.job.mask_secrets(&line);
-            // Cap absurd single lines after the masking pass, so the
+            // R1-12: cap absurd single lines after the masking pass, so the
             // copies masking makes stay bounded too.
             complete_lines.push(truncate_log_line(&masked).into_owned());
         }
 
-        // Bound only the unterminated tail. Newline-free output (a
+        // R1-12: bound only the unterminated tail. Newline-free output (a
         // step dumping megabytes without `\n`) would otherwise be retained
         // 1:1 in memory for the whole step. Keep the tail so a later newline
         // still terminates the line; the dropped head is reported below.
@@ -281,7 +281,7 @@ impl<'a> StepContext<'a> {
         }
         drop(buf);
 
-        // Surface a swallowed head instead of silently dropping output.
+        // R1-12: surface a swallowed head instead of silently dropping output.
         if self.line_buffer_truncated {
             self.line_buffer_truncated = false;
             self.log(
@@ -308,7 +308,7 @@ impl<'a> StepContext<'a> {
     pub fn flush_line_buffer(&mut self) {
         let mut buf = self.line_buffer.lock();
         if buf.is_empty() {
-            // The buffer may have overflowed and been capped while no
+            // R1-12: the buffer may have overflowed and been capped while no
             // newline ever arrived; still surface the truncation warning.
             let truncated = self.line_buffer_truncated;
             self.line_buffer_truncated = false;
@@ -441,7 +441,7 @@ impl<'a> StepContext<'a> {
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
 
-        // Feed through job-level problem matchers to produce annotations
+        // P1.6: Feed through job-level problem matchers to produce annotations
         let matched_annotations = self.job.matchers.match_line(
             &masked,
             &workspace,
@@ -552,11 +552,6 @@ impl<'a> StepContext<'a> {
         for (k, v) in &self.env {
             env.insert(k.clone(), v.clone());
         }
-        // A non-empty job/step PATH is explicit user intent: it replaces the
-        // machine PATH, and hosted runners do not add toolchain shims to it.
-        // An empty PATH is treated as missing by `ensure_path`, so it still
-        // gets the machine fallback and the shims below.
-        let explicit_path = env.get("PATH").is_some_and(|path| !path.trim().is_empty());
         // Container-bound environments (docker actions, and every step of a
         // job container) must NOT receive the host PATH fallback: it is
         // passed to docker run/exec as `-e PATH=<host path>`, overriding the
@@ -577,15 +572,25 @@ impl<'a> StepContext<'a> {
             // ("add Git 2.18 or higher to the PATH") and shell-outs inside
             // git (submodule foreach → git-sh-setup → uname) fail the same
             // way.
+            // A PATH the workflow set (job or step `env:`) is used verbatim,
+            // as on GitHub-hosted runners; the shims below only fill in the
+            // worker-derived default.
+            let explicit_path = env.contains_key("PATH");
             ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
             // Rust toolchains installed by the orchestrator run as the
             // unprivileged runner user. Keep their shims visible to every
-            // subsequent step that relies on the machine PATH, without
-            // relying on a profile file (`bash --noprofile --norc` is the
-            // official invocation). An explicit job/step PATH is left alone:
-            // hosted runners replace the image PATH wholesale there, and a
-            // runner must not smuggle toolchain entries back into it.
-            apply_toolchain_shims(&mut env, explicit_path, TOOLCHAIN_SHIM_DIRS);
+            // subsequent step without relying on a profile file
+            // (`bash --noprofile --norc` is the official invocation).
+            if !explicit_path {
+                for tool_bin in ["/home/runner/.cargo/bin", "/home/runner/go/bin"] {
+                    if std::path::Path::new(tool_bin).is_dir() {
+                        let path = env.get("PATH").cloned().unwrap_or_default();
+                        if !path.split(':').any(|entry| entry == tool_bin) {
+                            env.insert("PATH".to_owned(), format!("{tool_bin}:{path}"));
+                        }
+                    }
+                }
+            }
             // GitHub-hosted parity: hosted runners run steps as a dedicated
             // user in a systemd session, so USER/LOGNAME (the runner account)
             // and XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present
@@ -778,35 +783,6 @@ pub(crate) fn ensure_path(env: &mut HashMap<String, String>, worker_path: Option
         .filter(|path| !path.trim().is_empty())
         .unwrap_or(DEFAULT_PATH);
     env.insert("PATH".to_string(), path.to_string());
-}
-
-/// Toolchain bin dirs the orchestrator installs for the unprivileged runner
-/// user; the guest layout mirrors hosted runners.
-const TOOLCHAIN_SHIM_DIRS: &[&str] = &["/home/runner/.cargo/bin", "/home/runner/go/bin"];
-
-/// Prepend every existing toolchain shim dir that `PATH` is missing.
-///
-/// Skipped when the job/step set an explicit (non-empty) PATH: that value
-/// replaces the machine PATH, and hosted runners do not re-add image entries
-/// to it. Tests pass a temp dir so the gate is covered on hosts without the
-/// guest layout.
-fn apply_toolchain_shims(
-    env: &mut HashMap<String, String>,
-    explicit_path: bool,
-    shim_dirs: &[&str],
-) {
-    if explicit_path {
-        return;
-    }
-    for shim in shim_dirs {
-        if !std::path::Path::new(shim).is_dir() {
-            continue;
-        }
-        let path = env.get("PATH").cloned().unwrap_or_default();
-        if !path.split(':').any(|entry| entry == *shim) {
-            env.insert("PATH".to_owned(), format!("{shim}:{path}"));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1068,28 +1044,6 @@ mod tests {
         assert_eq!(env["PATH"], "/custom");
     }
 
-    /// Toolchain shims repair only the machine-PATH fallback: a
-    /// workflow-provided PATH must come through verbatim (`build_env` gates
-    /// the injection on `explicit_path`). A temp dir stands in for the guest
-    /// shim dirs so the assertion holds on hosts without `/home/runner`.
-    #[test]
-    fn toolchain_shims_respect_explicit_path() {
-        let shim = tempfile::tempdir().unwrap();
-        let shim_dir = shim.path().to_str().unwrap();
-
-        let mut explicit = HashMap::from([("PATH".to_string(), "/custom/bin".to_string())]);
-        apply_toolchain_shims(&mut explicit, true, &[shim_dir]);
-        assert_eq!(explicit["PATH"], "/custom/bin");
-
-        let mut inherited = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
-        apply_toolchain_shims(&mut inherited, false, &[shim_dir]);
-        assert_eq!(inherited["PATH"], format!("{shim_dir}:/usr/bin"));
-
-        // An entry already present is not duplicated.
-        apply_toolchain_shims(&mut inherited, false, &[shim_dir]);
-        assert_eq!(inherited["PATH"], format!("{shim_dir}:/usr/bin"));
-    }
-
     #[test]
     fn log_masks_secrets() {
         let mut job = make_job();
@@ -1097,7 +1051,7 @@ mod tests {
         ctx.log("token is secret-value here");
         assert!(ctx.log_lines[0].ends_with("token is *** here"));
     }
-    /// A secret straddling the line-truncation cut must still be masked.
+    /// P1: a secret straddling the line-truncation cut must still be masked.
     /// Masking runs on the complete line before truncation; truncating first
     /// would match against the survivor and log an unredacted fragment.
     #[test]
@@ -1261,7 +1215,7 @@ mod tests {
 
     #[test]
     fn multiline_secret_retroactive_masking_preserves_line_checkpoints() {
-        // A cross-line secret value printed before
+        // Codex review on #298: a cross-line secret value printed before
         // `::add-mask::` registers it occupies two physical records.
         // Retroactive masking must redact it without collapsing those
         // records, or a debug-retry checkpoint captured at the attempt
@@ -1368,17 +1322,17 @@ mod tests {
 
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
 
-        // Unsafe repository telemetry check
+        // 1. Unsafe repository telemetry check
         ctx.log("fatal: unsafe repository ('/github/workspace' is owned by someone else)");
         assert_eq!(ctx.telemetry_errors.len(), 1);
         assert!(ctx.telemetry_errors[0].contains("fatal: unsafe repository"));
 
-        // Composite action marker stripping check
+        // 2. Composite action marker stripping check
         ctx.log("Some text ##[start-action display=fake;id=fake] more text");
         let last_log = ctx.log_lines.last().unwrap();
         assert!(last_log.contains("##[\\start-action"));
 
-        // Problem matcher check
+        // 3. Problem matcher check
         ctx.log("ERROR: compilation failed");
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "compilation failed");
