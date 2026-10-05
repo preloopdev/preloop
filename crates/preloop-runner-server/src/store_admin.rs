@@ -421,7 +421,7 @@ async fn postgres_client(url: &str) -> anyhow::Result<tokio_postgres::Client> {
 }
 
 async fn postgres_preflight(
-    client: &tokio_postgres::Client,
+    client: &mut tokio_postgres::Client,
     options: &MigrateOptions,
 ) -> anyhow::Result<Preflight> {
     let ledger = migrations::postgres_ledger(client).await?;

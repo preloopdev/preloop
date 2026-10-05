@@ -203,16 +203,7 @@ CREATE TABLE jobs (
     concurrency_wait_at     INTEGER,
     concurrency_acquired_at INTEGER,
     started_at              INTEGER,
-    completed_at            INTEGER,
-    -- GitHub deployment id for jobs with `environment:` (created when the
-    -- run reports checks; deployment statuses update on gate decisions and
-    -- job completion). `NULL` for unreported or environment-less jobs.
-    deployment_id           INTEGER,
-    -- The job's `environment.url`, evaluated by the runner after its steps
-    -- and reported in the completion (`completejob` `environmentUrl`). The
-    -- server posts it as the deployment status's `environment_url`; `NULL`
-    -- until a completion reports one (or for environment-less jobs).
-    environment_url         TEXT,
+    completed_at            INTEGER, deployment_id INTEGER, environment_url TEXT,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
@@ -641,7 +632,7 @@ CREATE INDEX artifacts_expiry ON artifacts(expires_at) WHERE expires_at IS NOT N
 CREATE INDEX artifacts_pending ON artifacts(created_at) WHERE state = 'pending';
 
 -- ── History (terminal runs) ──────────────────────────────────────────
-CREATE TABLE run_history (
+CREATE TABLE "run_history" (
     run_id                  TEXT NOT NULL,
     namespace_id            TEXT NOT NULL,
     repository              TEXT NOT NULL,
@@ -671,7 +662,7 @@ CREATE TABLE run_history (
 CREATE INDEX run_history_namespace ON run_history(namespace_id, created_at DESC);
 CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, created_at DESC);
 
-CREATE TABLE job_history (
+CREATE TABLE "job_history" (
     run_id                  TEXT NOT NULL,
     run_created_at          INTEGER NOT NULL,
     run_attempt             INTEGER NOT NULL,

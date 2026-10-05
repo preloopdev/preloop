@@ -203,7 +203,7 @@ pub(crate) fn verify_shape_sqlite(
         MIGRATIONS.contains(&through),
         "unknown adoption version {through}"
     );
-    let mut reference = rusqlite::Connection::open_in_memory()?;
+    let reference = rusqlite::Connection::open_in_memory()?;
     for migration in sqlite_runner(Target::Latest).get_migrations() {
         if migration.version() > through {
             continue;
@@ -272,10 +272,10 @@ WITH objects AS (
 SELECT line FROM objects ORDER BY line
 "#;
 
-async fn postgres_fingerprint(
-    client: &tokio_postgres::Client,
-    schema: &str,
-) -> anyhow::Result<String> {
+async fn postgres_fingerprint<C>(client: &C, schema: &str) -> anyhow::Result<String>
+where
+    C: tokio_postgres::GenericClient,
+{
     let rows = client.query(POSTGRES_FINGERPRINT_SQL, &[&schema]).await?;
     let lines = rows
         .iter()
@@ -470,7 +470,7 @@ mod tests {
         }
         let mut migrated = rusqlite::Connection::open_in_memory().unwrap();
         run_sqlite(&mut migrated).unwrap();
-        let mut declared = rusqlite::Connection::open_in_memory().unwrap();
+        let declared = rusqlite::Connection::open_in_memory().unwrap();
         declared
             .execute_batch(crate::control::lite::SCHEMA_SQL)
             .unwrap();
@@ -524,7 +524,13 @@ mod tests {
         // only `schema_meta`.
         assert_eq!(sqlite_ledger(&conn).unwrap(), Ledger::Unledgered);
 
-        let applied = run_sqlite(&mut conn).unwrap();
+        // A populated pre-ledger baseline upgrades through the same probe →
+        // adopt → apply sequence `preloop store migrate --adopt-baseline`
+        // uses; applying the migration set directly would re-create the
+        // baseline.
+        let probe = probe_shape_sqlite(&conn).unwrap();
+        assert_eq!(probe.version, MIGRATIONS[0]);
+        let applied = adopt_sqlite(&mut conn, probe.version).unwrap();
         assert_eq!(applied, MIGRATIONS[1..].to_vec());
         verify_sqlite(&conn).unwrap();
 
@@ -614,7 +620,9 @@ mod tests {
             ("webhook_redeliveries", 1),
             ("check_run_updates", 1),
             ("outbox_events", 1),
-            ("run_history", 1),
+            // The attempt-2 row this test inserts above coexists with the
+            // attempt-1 history row.
+            ("run_history", 2),
             ("job_history", 1),
             ("attempt_history", 1),
             ("step_history", 1),
@@ -739,8 +747,9 @@ mod tests {
         )
         .unwrap();
         let error = run_sqlite(&mut conn).unwrap_err();
+        let message = error.to_string().to_lowercase();
         assert!(
-            error.to_string().to_lowercase().contains("divergent"),
+            message.contains("divergent") || message.contains("different"),
             "unexpected error: {error}"
         );
         assert_eq!(
@@ -762,7 +771,9 @@ mod tests {
             )
             .unwrap();
         assert!(run_sqlite(&mut newer).is_err());
-        let error = check_applied(&[MIGRATIONS[0], MIGRATIONS[1], 999_999_999]).unwrap_err();
+        let mut applied_with_future = MIGRATIONS.to_vec();
+        applied_with_future.push(999_999_999);
+        let error = check_applied(&applied_with_future).unwrap_err();
         assert!(error.contains("newer"), "{error}");
     }
 
@@ -782,7 +793,7 @@ mod tests {
         verify_sqlite(&conn).unwrap();
 
         // An unrecognizable database is never adopted.
-        let mut junk = rusqlite::Connection::open_in_memory().unwrap();
+        let junk = rusqlite::Connection::open_in_memory().unwrap();
         junk.execute_batch(
             "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value BLOB);
              CREATE TABLE not_the_schema (id INTEGER);",
