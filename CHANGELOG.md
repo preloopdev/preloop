@@ -612,6 +612,19 @@ Releases before v0.27.0 predate the changelog.
   that have a failed/cancelled/timed-out job in the live control tables so
   they stay re-runnable in place; everything else still archives within a
   minute of completion, and retention (`PRELOOP_RETENTION_DAYS`) still wins.
+  The volume cost is one live run row plus its jobs and attempts per failed
+  run for up to the window — small next to the run's own artifacts and logs,
+  and the knob trades it for keeping "Re-run failed jobs" working long after
+  the 60-second archive grace.
+
+### Changed
+
+- **Breaking (control database):** `run_history` and `job_history` now carry
+  `run_attempt` in their primary keys, so a re-run's per-attempt snapshots
+  coexist in history. The control schema version is now SQLite `4` and
+  PostgreSQL `5`; a database stamped with an older version is refused at
+  startup and must be recreated (the schema is applied fresh, there is no
+  in-place migration).
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and

@@ -46,6 +46,19 @@ struct RerunRow {
     needs: Vec<JobId>,
 }
 
+/// The `runs` row fields `rerun_run_tx` reads before resetting the attempt.
+struct RunHead {
+    prev_attempt: i64,
+    run_number: i64,
+    namespace: String,
+    repository: String,
+    git_ref: String,
+    run_status: String,
+    prev_group: String,
+    prev_cancel_in_progress: i64,
+    created_at_us: i64,
+}
+
 impl LiteBackend {
     /// `rerun_run` (pg dispatch.rs): snapshot the completed attempt into the
     /// history tables, reset the selected jobs, and re-admit them through
@@ -163,7 +176,7 @@ fn rerun_run_tx(
     let run = codec::run_key(run_id);
 
     // ── The run row: identity, clocks, guards ──────────────────────────
-    let head: Option<(i64, i64, String, String, String, String, String, i64, i64)> = tx
+    let head: Option<RunHead> = tx
         .prepare_cached(
             "SELECT run_attempt, run_number, namespace_id, repository, ref, \
                     status, concurrency_group, \
@@ -172,21 +185,23 @@ fn rerun_run_tx(
         )
         .map_err(db)?
         .query_row([&run], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                row.get(7)?,
-                row.get(8)?,
-            ))
+            Ok(RunHead {
+                prev_attempt: row.get(0)?,
+                run_number: row.get(1)?,
+                namespace: row.get(2)?,
+                repository: row.get(3)?,
+                git_ref: row.get(4)?,
+                run_status: row.get(5)?,
+                prev_group: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                // `concurrency_cancel_in_progress` is informational here:
+                // the re-acquired gate below rewrites the columns.
+                prev_cancel_in_progress: row.get(7)?,
+                created_at_us: row.get(8)?,
+            })
         })
         .optional()
         .map_err(db)?;
-    let Some((
+    let Some(RunHead {
         prev_attempt,
         run_number,
         namespace,
@@ -194,9 +209,9 @@ fn rerun_run_tx(
         git_ref,
         run_status,
         prev_group,
-        _prev_cancel_in_progress,
+        prev_cancel_in_progress: _,
         created_at_us,
-    )) = head
+    }) = head
     else {
         return Err(ControlError::NotFound(format!("run {run_id}")));
     };
@@ -260,6 +275,12 @@ fn rerun_run_tx(
     // the books (e.g. a waiter the completion path left) is cleaned here
     // rather than trusted absent.
     clear_stale_concurrency(tx, &run, &set)?;
+
+    // Close stale in-flight requests (a dependency-skipped or
+    // arrival-cancelled job can leave a NULL-result row) before the new
+    // attempt mints its own: `job_requests_inflight` refuses a second live
+    // request for the same job.
+    settle_stale_requests(tx, &run, &rows, &set)?;
 
     // The new attempt claims its own dispatch intents: pooled provisioning
     // and runner assignments mint again at enqueue.
@@ -791,6 +812,43 @@ fn clear_stale_concurrency(
         .map_err(db)?
         .execute([run])
         .map_err(db)?;
+    Ok(())
+}
+
+/// Close stale in-flight request rows for the selected jobs: a completed
+/// run's requests should already carry a result, but a dependency-skipped or
+/// arrival-cancelled job can leave a NULL-result row whose job row the rerun
+/// is about to reset. The partial unique index `job_requests_inflight`
+/// refuses the next attempt's request otherwise. The closed row keeps the
+/// old attempt's outcome (the raw status; anything non-terminal reads
+/// `cancelled`, mirroring the PG path).
+fn settle_stale_requests(
+    tx: &Transaction<'_>,
+    run: &str,
+    rows: &[RerunRow],
+    set: &BTreeSet<JobId>,
+) -> Result<(), ControlError> {
+    let now = now_us();
+    let mut stmt = tx
+        .prepare_cached(
+            "UPDATE job_requests SET result = ?3, \
+                 finished_at = COALESCE(finished_at, ?4) \
+             WHERE run_id = ?1 AND job_id = ?2 AND result IS NULL",
+        )
+        .map_err(db)?;
+    for member in rows {
+        if !set.contains(&member.row.job_id) {
+            continue;
+        }
+        let result = match member.status_raw.as_str() {
+            "success" | "failure" | "cancelled" | "skipped" | "timed_out" => {
+                member.status_raw.as_str()
+            }
+            _ => "cancelled",
+        };
+        stmt.execute(params![run, member.row.job_id.0, result, now])
+            .map_err(db)?;
+    }
     Ok(())
 }
 

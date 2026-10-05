@@ -3518,7 +3518,7 @@ pub(crate) async fn cancel_run_inner(
     // each behind a busy engine. Awaiting it here let a client that timed out
     // drop the handler midway: the run stayed cancelled while the remaining
     // check runs were never updated and sat `queued` on GitHub forever.
-    let reporter = Arc::clone(&shared);
+    let reporter = Arc::clone(shared);
     tokio::spawn(async move {
         for job_id in cancelled_jobs {
             crate::github::report_check_run_completed(

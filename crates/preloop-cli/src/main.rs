@@ -6273,6 +6273,9 @@ mod tests {
             panic!("expected Rerun");
         };
         assert_eq!(args.job.as_deref(), Some("build"));
+
+        // `--failed` and `--job` select different modes; clap refuses both.
+        assert!(parse(&["rerun", "run-42", "--failed", "--job", "build"]).is_err());
     }
 
     #[test]

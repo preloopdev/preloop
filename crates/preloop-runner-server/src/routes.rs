@@ -1117,6 +1117,7 @@ pub fn build_app(
             crate::http_metrics::http_metrics_middleware,
         ))
         .layer(middleware::from_fn(errors::protocol_error_envelope))
+        .layer(middleware::from_fn(errors::github_error_envelope))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_flows_middleware,

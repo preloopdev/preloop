@@ -693,7 +693,7 @@ jobs:
 }
 
 #[tokio::test]
-async fn github_check_run_rerequest_resubmits_the_owning_run() {
+async fn github_check_run_rerequest_reruns_the_owning_run_in_place() {
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -777,12 +777,16 @@ async fn github_check_run_rerequest_resubmits_the_owning_run() {
     crate::github::drain_webhook_queue(&shared).await.unwrap();
 
     let inner = state.test_tx().await;
-    assert_eq!(inner.runs.len(), 2);
+    assert_eq!(
+        inner.runs.len(),
+        1,
+        "a rerequest re-runs the owning run in place"
+    );
     let rerun = inner
         .runs
-        .values()
-        .find(|run| run.run_id != original_run_id)
-        .expect("rerequest should create a new run");
+        .get(&original_run_id)
+        .expect("the owning run must survive the rerequest");
+    assert_eq!(rerun.run_attempt, 2, "the rerequest starts attempt 2");
     assert_eq!(rerun.status, ExecutionStatus::Queued);
     assert_eq!(
         rerun.job_check_run_ids.get(&JobId("build".to_owned())),
@@ -2315,6 +2319,86 @@ async fn archived_run_keeps_run_tier_secrets_for_rerun() {
         .expect("re-run acquires the submission secret");
     assert_eq!(var["value"].as_str(), Some("s3cr3t-value"));
     assert_eq!(var["isSecret"].as_bool(), Some(true));
+}
+
+/// A partial re-run of a fully archived run is refused with `409`: the live
+/// scheduler rows (`job_specs`/`job_messages`/`job_needs`) are gone, so only a
+/// full re-run — resubmit as a new run — is possible. `all` keeps that
+/// fallback; the refusal names the archive.
+#[tokio::test]
+async fn archived_run_partial_rerun_is_409_and_all_resubmits() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        json!({
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "event": "push",
+            "repository": "owner/repo"
+        }),
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    complete_via_api(&app, accepted["run_id"].as_str().unwrap(), "build").await;
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(run_id, old).unwrap();
+        })
+        .await;
+    assert!(
+        state.test_archive_finished_runs_once().await >= 1,
+        "the settled run must archive"
+    );
+
+    for body in [
+        json!({"mode": "failed"}),
+        json!({"mode": "job", "job_id": "build"}),
+    ] {
+        let (status, response) = try_req(
+            &app,
+            Method::POST,
+            &format!("/api/v1/runs/{run_id}/rerun"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "partial mode {body} must 409: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("archived"),
+            "the 409 must name the archive: {response}"
+        );
+    }
+
+    // `all` keeps the pre-rerun fallback: the recorded submission resubmits
+    // as a fresh run (new id, attempt 1).
+    let accepted = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/runs/{run_id}/rerun"),
+        json!({"mode": "all"}),
+    )
+    .await;
+    let new_run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+    assert_ne!(new_run_id, run_id, "an archived full re-run is a new run");
+    let record = state
+        .test_tx()
+        .await
+        .runs
+        .get(&new_run_id)
+        .cloned()
+        .expect("the resubmitted run exists");
+    assert_eq!(record.run_attempt, 1);
 }
 
 /// A reusable-workflow callee that declares no `secrets:` receives none of

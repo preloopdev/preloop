@@ -22,8 +22,8 @@ use std::sync::Arc;
 use preloop_gha_protocol::JobId;
 use tracing::warn;
 
-use crate::control::backend::ControlBackend;
 use crate::SharedState;
+use crate::control::backend::ControlBackend;
 
 /// Publish queued/completed checks for a rerun attempt. `selected` is the
 /// set of jobs the rerun reset; `None` means every job (a full rerun) and
@@ -90,9 +90,14 @@ pub async fn report_rerun_check_runs(
                 }
             }
             _ => {
-                if let Err(error) =
-                    crate::github::report_check_run_queued(shared, &repository, &sha, &job_id, run_id)
-                        .await
+                if let Err(error) = crate::github::report_check_run_queued(
+                    shared,
+                    &repository,
+                    &sha,
+                    &job_id,
+                    run_id,
+                )
+                .await
                 {
                     warn!(%run_id, %job_id, ?error, "failed to report queued GitHub check run");
                 }

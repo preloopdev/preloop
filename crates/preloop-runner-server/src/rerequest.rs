@@ -13,8 +13,8 @@ use axum::response::IntoResponse;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::control::backend::ControlBackend;
 use crate::SharedState;
+use crate::control::backend::ControlBackend;
 
 /// Handle a `check_suite` delivery whose action is `rerequested`: map the
 /// suite back to its run by `(repository, head_sha)` — the newest completed

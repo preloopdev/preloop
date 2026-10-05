@@ -183,6 +183,17 @@ pub(crate) trait ControlBackend: Send + Sync {
     /// before building templates.
     async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError>;
 
+    /// Test hook: overwrite a run's `completed_at` (µs since the epoch) so
+    /// the archiver's 60-second grace and the `PRELOOP_RERUN_WINDOW_DAYS`
+    /// hold can be exercised without sleeping. The shared suite uses it;
+    /// production never sees it.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError>;
+
     /// Allocate the next run number for a workflow path from the durable
     /// counter. Called before the job messages are built (the number is
     /// embedded in `github.run_number`), so it is its own transaction — a
@@ -1872,6 +1883,17 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.rerun_plan(run_id, mode).await,
             Self::Postgres(b) => b.rerun_plan(run_id, mode).await,
+        }
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        match self {
+            Self::Sqlite(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
+            Self::Postgres(b) => b.test_backdate_run_completed(run_id, completed_at_us).await,
         }
     }
     async fn allocate_run_number(

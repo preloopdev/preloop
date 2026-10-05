@@ -359,6 +359,34 @@ async fn resolve_run_ref(
         })
 }
 
+/// Validate the optional re-run body GitHub accepts
+/// (`enable_debug_logging`/`enable_debugger` booleans). preloop has no
+/// per-re-run debug toggle, so the flags are accepted and ignored — but a
+/// wrong-typed field is `422`, matching github.com's request validation.
+fn validate_rerun_body(body: Option<Json<Value>>) -> Result<(), ApiError> {
+    let Some(Json(body)) = body else {
+        return Ok(());
+    };
+    if body.is_null() {
+        return Ok(());
+    }
+    let Some(object) = body.as_object() else {
+        return Err(ApiError::unprocessable(
+            "Invalid request: the re-run body must be a JSON object",
+        ));
+    };
+    for key in ["enable_debug_logging", "enable_debugger"] {
+        if let Some(value) = object.get(key)
+            && !value.is_boolean()
+        {
+            return Err(ApiError::unprocessable(format!(
+                "Invalid request: `{key}` must be a boolean"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun — GitHub's
 /// "Re-run all jobs" compat surface: a new attempt on the same run.
 /// Success is `201 Created` (github.com returns an empty 201).
@@ -366,8 +394,10 @@ pub async fn rerun_actions_run(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
+    body: Option<Json<Value>>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
+    validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
     crate::runs::rerun_run_inner(&shared, run_id, crate::control::types::RerunMode::All, None)
@@ -383,8 +413,10 @@ pub async fn rerun_actions_run_failed(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, run_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
+    body: Option<Json<Value>>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
+    validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let run_id = resolve_run_ref(&shared, &repository, &run_ref).await?;
     crate::runs::rerun_run_inner(
@@ -456,8 +488,10 @@ pub async fn rerun_actions_job(
     State(shared): State<Arc<SharedState>>,
     Path((owner, repo, job_ref)): Path<(String, String, String)>,
     Extension(identity): Extension<DispatchIdentity>,
+    body: Option<Json<Value>>,
 ) -> Result<StatusCode, ApiError> {
     authorize_workflow_dispatch(&identity, &owner, &repo)?;
+    validate_rerun_body(body)?;
     let repository = format!("{owner}/{repo}");
     let (run_id, job_id) = resolve_job_ref(&shared, &repository, &job_ref).await?;
     crate::runs::rerun_run_inner(

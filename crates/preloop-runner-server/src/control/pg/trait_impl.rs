@@ -26,6 +26,21 @@ impl ControlBackend for PgBackend {
     async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
         self.rerun_plan(run_id, mode).await
     }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        // Microsecond-epoch arithmetic keeps the timestamptz conversion
+        // exact for any value `now_unix_nanos` can produce.
+        self.test_execute(&format!(
+            "UPDATE runs SET completed_at = to_timestamp(0) \
+                 + ({completed_at_us}::bigint * interval '1 microsecond') \
+             WHERE run_id = '{run_id}'::uuid"
+        ))
+        .await
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,

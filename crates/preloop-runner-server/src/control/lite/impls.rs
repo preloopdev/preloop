@@ -22,6 +22,22 @@ impl ControlBackend for LiteBackend {
     async fn rerun_plan(&self, run_id: RunId, mode: &RerunMode) -> Result<RerunPlan, ControlError> {
         self.rerun_plan(run_id, mode).await
     }
+    #[cfg(any(test, feature = "test-support"))]
+    async fn test_backdate_run_completed(
+        &self,
+        run_id: RunId,
+        completed_at_us: i64,
+    ) -> Result<(), ControlError> {
+        use super::{codec, db};
+        let run = codec::run_key(run_id);
+        self.write(move |tx| {
+            tx.prepare_cached("UPDATE runs SET completed_at = ?2 WHERE run_id = ?1")
+                .map_err(db)?
+                .execute(rusqlite::params![run, completed_at_us])
+                .map_err(db)?;
+            Ok(())
+        })
+    }
     async fn allocate_run_number(
         &self,
         namespace_id: &str,
