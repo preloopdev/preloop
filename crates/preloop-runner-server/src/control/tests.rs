@@ -7388,36 +7388,54 @@ mod lite {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Greenfield schema_meta: a database holding foreign tables with no
-    /// `schema_meta` is refused; a stamped wrong version is refused.
+    /// The migration ledger is the boot contract: a foreign database, a
+    /// legacy store and an uninitialized file each refuse with their own
+    /// guidance; a test-support fresh file initializes through the real
+    /// migration runner (embedded refinery) and verifies.
     #[test]
     fn opening_a_foreign_database_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("control.db");
-        rusqlite::Connection::open(&path)
+
+        // Foreign tables, no control schema.
+        let foreign = dir.path().join("foreign.db");
+        rusqlite::Connection::open(&foreign)
             .unwrap()
             .execute_batch("CREATE TABLE foreign_table (id INTEGER)")
             .unwrap();
-        let error = LiteBackend::open(&path, false, false, std::time::Duration::from_secs(300))
+        let error = LiteBackend::open(&foreign, false, false, std::time::Duration::from_secs(300))
             .err()
             .expect("a foreign database must be refused");
-        assert!(error.to_string().contains("predates"), "{error}");
+        assert!(error.to_string().contains("no control schema"), "{error}");
 
-        // A fresh file opens and is stamped with the agreed version.
-        let fresh = dir.path().join("fresh.db");
-        LiteBackend::open(&fresh, false, false, std::time::Duration::from_secs(300)).unwrap();
-        let version: Vec<u8> = rusqlite::Connection::open(&fresh)
+        // The released legacy store (v11, `schema_migrations`).
+        let legacy = dir.path().join("legacy.db");
+        rusqlite::Connection::open(&legacy)
             .unwrap()
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
+            .execute_batch(
+                "PRAGMA user_version = 11;
+                 CREATE TABLE schema_migrations (version INTEGER, name TEXT);
+                 CREATE TABLE runs (run_id TEXT PRIMARY KEY);",
             )
             .unwrap();
-        assert_eq!(
-            String::from_utf8(version).unwrap(),
-            crate::control::lite::SCHEMA_VERSION
-        );
+        let error = LiteBackend::open(&legacy, false, false, std::time::Duration::from_secs(300))
+            .err()
+            .expect("a legacy store must be refused");
+        assert!(error.to_string().contains("legacy"), "{error}");
+        assert!(error.to_string().contains("preloop store import-legacy"), "{error}");
+
+        // A fresh file initializes (test-support) through the migration
+        // runner and carries the build's ledger.
+        let fresh = dir.path().join("fresh.db");
+        LiteBackend::open(&fresh, false, false, std::time::Duration::from_secs(300)).unwrap();
+        let versions: Vec<i32> = rusqlite::Connection::open(&fresh)
+            .unwrap()
+            .prepare("SELECT version FROM refinery_schema_history ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(versions, crate::control::migrations::MIGRATIONS);
     }
 
     #[tokio::test]

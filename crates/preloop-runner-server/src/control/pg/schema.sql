@@ -147,6 +147,8 @@ CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 -- archiver scan: terminal runs not yet moved to history
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
+-- fork-approval expiry sweep: runs held for approval whose hold window passed
+CREATE INDEX runs_fork_approval_sweep ON runs(fork_approval_requested_at) WHERE fork_approval_pending;
 
 -- `version` counts status/conclusion changes of the run (see `jobs_version`).
 CREATE FUNCTION bump_run_version() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -235,6 +237,15 @@ CREATE TABLE jobs (
     outputs                 jsonb,
     annotations             jsonb,
     check_run_id            bigint,
+    -- GitHub deployment id for jobs with `environment:` (created when the
+    -- run reports checks; deployment statuses update on gate decisions and
+    -- job completion). `NULL` for unreported or environment-less jobs.
+    deployment_id           bigint,
+    -- The job's `environment.url`, evaluated by the runner after its steps
+    -- and reported in the completion (`completejob` `environmentUrl`). The
+    -- server posts it as the deployment status's `environment_url`; `NULL`
+    -- until a completion reports one (or for environment-less jobs).
+    environment_url         text,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
@@ -668,6 +679,33 @@ CREATE TABLE check_run_updates (
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 
+-- ── Environment approvals (durable audit) ────────────────────────────
+-- One row per recorded environment review decision (approval or
+-- rejection), written in the same transaction that flips the gate, so a
+-- crash cannot separate the decision from its record. Deliberately NOT
+-- archived with the run and never deleted by retention: GitHub keeps an
+-- environment's review history after the run is gone, and this table is
+-- the only durable record of who released a gate. `run_id`/`job_id` carry
+-- no foreign key for exactly that reason — the run row they name may be
+-- deleted while the audit row must survive.
+CREATE TABLE environment_approvals (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    namespace_id    text NOT NULL,
+    run_id          uuid NOT NULL,
+    job_id          text NOT NULL,
+    repository      text NOT NULL,
+    environment     text NOT NULL,
+    decision        text NOT NULL CHECK (decision IN ('approved','rejected')),
+    -- GitHub login of the reviewing user; NULL for the operator's
+    -- system-token (admin) override, which carries no user identity.
+    actor           text,
+    admin_override  boolean NOT NULL DEFAULT false,
+    -- Reviewer comment, when one was supplied (native approve endpoint).
+    comment         text,
+    decided_at      timestamptz NOT NULL
+);
+CREATE INDEX environment_approvals_gate ON environment_approvals(run_id, job_id);
+
 -- ── Artifacts (replaces the artifact part of the `meta` blob) ────────
 -- Blobs live in object storage; these rows are the shared index. Upload
 -- tokens are stored as hashes, never raw.
@@ -731,6 +769,7 @@ CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, 
 CREATE TABLE job_history (
     run_id                  uuid NOT NULL,
     run_created_at          timestamptz NOT NULL,
+    run_attempt             integer NOT NULL,
     job_id                  text NOT NULL,
     namespace_id            text NOT NULL,
     kind                    text NOT NULL,

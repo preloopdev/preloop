@@ -1,3 +1,21 @@
+-- Control schema v1 baseline (SQLite).
+--
+-- Frozen copy of `crates/preloop-runner-server/src/control/lite/schema.sql`
+-- as of base commit 05126635 (the schema the pre-migration runtime created).
+-- Migration files are immutable: refinery stores a checksum per version and
+-- refuses a changed file (abort_divergent), so never edit an applied
+-- migration — add a new V<version>__<name>.sql instead. An executable parity
+-- test in control/migrations.rs keeps apply(all migrations) equal to the
+-- current schema.sql.
+--
+-- Up-only by design: refinery has no down/rollback. A lossy change is undone
+-- by restoring the pre-migration SQLite backup (created by
+-- `preloop store migrate`) or by a forward corrective migration; Postgres
+-- restores from the operator's pg_dump/backup. Never a down script.
+--
+-- The `schema_meta` table stays for `key_fingerprint`; a stale
+-- `schema_version` row from a pre-ledger build is ignored (the migration
+-- ledger is the sole version authority) and retired by `--adopt-baseline`.
 -- Preloop control plane — SQLite translation of docs/control-schema.sql (v1).
 --
 -- Mechanical translation of the agreed Postgres schema; the design rules in
@@ -108,7 +126,6 @@ CREATE UNIQUE INDEX runs_delivery ON runs(webhook_delivery_id, workflow_path)
 CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
-CREATE INDEX runs_fork_approval_sweep ON runs(fork_approval_requested_at) WHERE fork_approval_pending = 1;
 
 -- `version` counts status/conclusion changes of the run (see `jobs_version`).
 CREATE TRIGGER runs_version AFTER UPDATE OF status, conclusion ON runs
@@ -191,15 +208,6 @@ CREATE TABLE jobs (
     concurrency_acquired_at INTEGER,
     started_at              INTEGER,
     completed_at            INTEGER,
-    -- GitHub deployment id for jobs with `environment:` (created when the
-    -- run reports checks; deployment statuses update on gate decisions and
-    -- job completion). `NULL` for unreported or environment-less jobs.
-    deployment_id           INTEGER,
-    -- The job's `environment.url`, evaluated by the runner after its steps
-    -- and reported in the completion (`completejob` `environmentUrl`). The
-    -- server posts it as the deployment status's `environment_url`; `NULL`
-    -- until a completion reports one (or for environment-less jobs).
-    environment_url         TEXT,
     PRIMARY KEY (run_id, job_id),
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
@@ -564,39 +572,14 @@ CREATE TABLE check_run_updates (
     job_id                  TEXT NOT NULL,
     installation_id         INTEGER NOT NULL,
     check_run_id            INTEGER,
-    version                 INTEGER NOT NULL DEFAULT 0,
     payload                 TEXT NOT NULL,
     not_before              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     attempts                INTEGER NOT NULL DEFAULT 0,
     leased_until            INTEGER,
-    lease_owner             TEXT,
-    PRIMARY KEY (run_id, job_id)
+    PRIMARY KEY (run_id, job_id),
+    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
-
--- ── Environment approvals (durable audit) ────────────────────────────
--- One row per recorded environment review decision (approval or
--- rejection), written in the same transaction that flips the gate, so a
--- crash cannot separate the decision from its record. Deliberately NOT
--- archived with the run and never deleted by retention: GitHub keeps an
--- environment's review history after the run is gone, and this table is
--- the only durable record of who released a gate. `run_id`/`job_id` carry
--- no foreign key for exactly that reason — the run row they name may be
--- deleted while the audit row must survive.
-CREATE TABLE environment_approvals (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    namespace_id    TEXT NOT NULL,
-    run_id          TEXT NOT NULL,
-    job_id          TEXT NOT NULL,
-    repository      TEXT NOT NULL,
-    environment     TEXT NOT NULL,
-    decision        TEXT NOT NULL CHECK (decision IN ('approved','rejected')),
-    actor           TEXT,
-    admin_override  INTEGER NOT NULL DEFAULT 0,
-    comment         TEXT,
-    decided_at      INTEGER NOT NULL
-);
-CREATE INDEX environment_approvals_gate ON environment_approvals(run_id, job_id);
 
 -- ── Artifacts ────────────────────────────────────────────────────────
 CREATE TABLE artifacts (
@@ -645,7 +628,7 @@ CREATE TABLE run_history (
     created_at              INTEGER NOT NULL,
     started_at              INTEGER,
     completed_at            INTEGER,
-    PRIMARY KEY (run_id, created_at, run_attempt)
+    PRIMARY KEY (run_id, created_at)
 );
 CREATE INDEX run_history_namespace ON run_history(namespace_id, created_at DESC);
 CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, created_at DESC);
@@ -653,9 +636,8 @@ CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, 
 CREATE TABLE job_history (
     run_id                  TEXT NOT NULL,
     run_created_at          INTEGER NOT NULL,
-    run_attempt             INTEGER NOT NULL,
-    namespace_id            TEXT NOT NULL,
     job_id                  TEXT NOT NULL,
+    namespace_id            TEXT NOT NULL,
     kind                    TEXT NOT NULL,
     parent_job_id           TEXT,
     base_id                 TEXT NOT NULL,
@@ -669,7 +651,7 @@ CREATE TABLE job_history (
     deps_ready_at           INTEGER,
     started_at              INTEGER,
     completed_at            INTEGER,
-    PRIMARY KEY (run_id, job_id, run_created_at, run_attempt)
+    PRIMARY KEY (run_id, job_id, run_created_at)
 );
 
 CREATE TABLE attempt_history (
@@ -717,3 +699,8 @@ CREATE TABLE schema_meta (
 
 -- Until the platform pushes namespaces, everything lives in 'default'.
 INSERT INTO namespaces (namespace_id) VALUES ('default');
+
+-- ── Data invariants from the pre-migration create path ───────────────
+-- Session-message ids start above the broker request-id range (see
+-- `session_messages` above); the pre-migration runtime seeded this at open.
+INSERT INTO sqlite_sequence (name, seq) VALUES ('session_messages', 1000000);

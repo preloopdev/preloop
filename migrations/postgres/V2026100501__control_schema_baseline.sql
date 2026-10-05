@@ -1,6 +1,20 @@
--- Preloop control plane 
+-- Control schema v1 baseline (PostgreSQL).
 --
-
+-- Frozen copy of `crates/preloop-runner-server/src/control/pg/schema.sql`
+-- as of base commit 05126635 (the schema the pre-migration runtime created).
+-- Migration files are immutable: refinery stores a checksum per version and
+-- refuses a changed file (abort_divergent), so never edit an applied
+-- migration — add a new V<version>__<name>.sql instead. An executable parity
+-- test covers the SQLite translation; docs/control-schema.sql must stay
+-- identical to this baseline plus the migrations after it.
+--
+-- Up-only by design: refinery has no down/rollback. A lossy change is undone
+-- by restoring the operator's pre-migration pg_dump/backup or by a forward
+-- corrective migration. Never a down script.
+-- Preloop control plane — target production schema (greenfield, v1).
+--
+-- Source of truth for docs/control-schema-chartdb.json and
+-- docs/control-schema.{dot,png}. Postgres is the production backend; the
 -- SQLite backend mirrors every table with the obvious type mapping
 -- (uuid/text -> TEXT, timestamptz -> INTEGER µs, jsonb -> TEXT, bytea -> BLOB,
 -- identity -> INTEGER PRIMARY KEY) and skips partitioning.
@@ -146,8 +160,6 @@ CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 -- archiver scan: terminal runs not yet moved to history
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
--- fork-approval expiry sweep: runs held for approval whose hold window passed
-CREATE INDEX runs_fork_approval_sweep ON runs(fork_approval_requested_at) WHERE fork_approval_pending;
 
 -- `version` counts status/conclusion changes of the run (see `jobs_version`).
 CREATE FUNCTION bump_run_version() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -236,15 +248,6 @@ CREATE TABLE jobs (
     outputs                 jsonb,
     annotations             jsonb,
     check_run_id            bigint,
-    -- GitHub deployment id for jobs with `environment:` (created when the
-    -- run reports checks; deployment statuses update on gate decisions and
-    -- job completion). `NULL` for unreported or environment-less jobs.
-    deployment_id           bigint,
-    -- The job's `environment.url`, evaluated by the runner after its steps
-    -- and reported in the completion (`completejob` `environmentUrl`). The
-    -- server posts it as the deployment status's `environment_url`; `NULL`
-    -- until a completion reports one (or for environment-less jobs).
-    environment_url         text,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
@@ -668,42 +671,14 @@ CREATE TABLE check_run_updates (
     job_id                  text NOT NULL,
     installation_id         bigint NOT NULL,
     check_run_id            bigint,
-    version                 bigint NOT NULL DEFAULT 0,
     payload                 jsonb NOT NULL,
     not_before              timestamptz NOT NULL DEFAULT now(),
     attempts                integer NOT NULL DEFAULT 0,
     leased_until            timestamptz,
-    lease_owner             text,
-    PRIMARY KEY (run_id, job_id)
+    PRIMARY KEY (run_id, job_id),
+    FOREIGN KEY (run_id, job_id) REFERENCES jobs(run_id, job_id) ON DELETE CASCADE
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
-
--- ── Environment approvals (durable audit) ────────────────────────────
--- One row per recorded environment review decision (approval or
--- rejection), written in the same transaction that flips the gate, so a
--- crash cannot separate the decision from its record. Deliberately NOT
--- archived with the run and never deleted by retention: GitHub keeps an
--- environment's review history after the run is gone, and this table is
--- the only durable record of who released a gate. `run_id`/`job_id` carry
--- no foreign key for exactly that reason — the run row they name may be
--- deleted while the audit row must survive.
-CREATE TABLE environment_approvals (
-    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    namespace_id    text NOT NULL,
-    run_id          uuid NOT NULL,
-    job_id          text NOT NULL,
-    repository      text NOT NULL,
-    environment     text NOT NULL,
-    decision        text NOT NULL CHECK (decision IN ('approved','rejected')),
-    -- GitHub login of the reviewing user; NULL for the operator's
-    -- system-token (admin) override, which carries no user identity.
-    actor           text,
-    admin_override  boolean NOT NULL DEFAULT false,
-    -- Reviewer comment, when one was supplied (native approve endpoint).
-    comment         text,
-    decided_at      timestamptz NOT NULL
-);
-CREATE INDEX environment_approvals_gate ON environment_approvals(run_id, job_id);
 
 -- ── Artifacts (replaces the artifact part of the `meta` blob) ────────
 -- Blobs live in object storage; these rows are the shared index. Upload
@@ -768,7 +743,6 @@ CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, 
 CREATE TABLE job_history (
     run_id                  uuid NOT NULL,
     run_created_at          timestamptz NOT NULL,
-    run_attempt             integer NOT NULL,
     job_id                  text NOT NULL,
     namespace_id            text NOT NULL,
     kind                    text NOT NULL,
@@ -826,3 +800,8 @@ CREATE TABLE step_history (
 ) PARTITION BY RANGE (run_created_at);
 CREATE TABLE step_history_default PARTITION OF step_history DEFAULT;
 CREATE INDEX step_history_run ON step_history(run_id);
+
+-- ── Data invariants from the pre-migration create path ───────────────
+-- `default` is the namespace every submission lands in until the platform
+-- pushes more; the pre-migration runtime seeded it at create.
+INSERT INTO namespaces (namespace_id) VALUES ('default');

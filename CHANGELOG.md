@@ -168,6 +168,18 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
+- Control-database schema is now versioned and migratable: refinery 0.10 runs
+  the forward-only migration sets in `migrations/{sqlite,postgres}` (rerun
+  history attempt keys, environment deployments/review audit, fork-approval
+  sweep index), the ledger `refinery_schema_history` is the sole version
+  authority, and `preloop store migrate|status` is the explicit
+  initialize/upgrade path. `preloop serve` never migrates: a missing, older,
+  newer or divergent schema refuses with the recovery command, and a legacy
+  store refuses with `preloop store import-legacy`. SQLite migrations take a
+  consistent pre-migration backup (`VACUUM INTO`) as the rollback path;
+  populated baseline fixtures and an executable parity test against
+  `schema.sql` keep upgrades lossless. Brand-new local installs still
+  initialize on first `preloop run`/`init`/`server install`.
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and

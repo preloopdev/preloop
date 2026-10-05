@@ -367,7 +367,14 @@ fn install_systemd(
         bootstrap_system_smolvm(dry)?;
         bootstrap_smolvm_data(home, dry)?;
         migrate_legacy_env_file(home, dry)?;
+        // Brand-new installs: initialize the control database so the
+        // service's first start works with no extra step. Ownership is fixed
+        // by the recursive chown below; an existing database is never
+        // upgraded here (`preloop store migrate` is the explicit path).
+        prepare_control_store(home, dry)?;
         chown_state_dir(home, dry)?;
+    } else {
+        prepare_control_store(home, dry)?;
     }
     // Written after chown_state_dir, and deliberately outside it for a system
     // install: the env file lives in the root-owned config dir, so the
@@ -1692,6 +1699,25 @@ fn prepare_home(home: &Path, dry_run: bool) -> Result<()> {
     }
     std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
     set_private_directory_permissions(home)?;
+    Ok(())
+}
+
+/// Initialize a brand-new control database at install time so the service's
+/// first start works with no extra step (zero-config first use). An existing
+/// database is never touched: upgrading is `preloop store migrate`, never
+/// implicit, and a Postgres store is the operator's explicit migrate call.
+fn prepare_control_store(home: &Path, dry_run: bool) -> Result<()> {
+    if dry_run {
+        eprintln!("[preloop] would initialize a brand-new control database");
+        return Ok(());
+    }
+    let state_dir = home.join("state");
+    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
+        eprintln!(
+            "[preloop] initialized the control database at {}",
+            state_dir.join("preloop.db").display()
+        );
+    }
     Ok(())
 }
 
