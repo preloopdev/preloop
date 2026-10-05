@@ -1047,6 +1047,18 @@ criteria = "safe-to-deploy"
 version = "0.5.18"
 criteria = "safe-to-deploy"
 
+[[exemptions.refinery]]
+version = "0.10.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.refinery-core]]
+version = "0.10.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.refinery-macros]]
+version = "0.10.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.regex]]
 version = "1.12.4"
 criteria = "safe-to-deploy"
