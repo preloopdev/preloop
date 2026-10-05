@@ -6384,12 +6384,33 @@ impl PgBackend {
                 match Sweep::evaluate_if_condition(tx, run_id, &dependent).await? {
                     sched_helpers::DependencyDecision::Run => {
                         // Promote: mark ready and enqueue.
-                        // Simplified: UPDATE + outbox + wake.
-                        // Full gate logic (concurrency, etc.) is TODO.
                         tx.execute(
                             "UPDATE jobs SET queue_state='ready', status='queued' \
                              WHERE run_id=$1::text::uuid AND job_id=$2",
                             &[&run, &dependent.0],
+                        )
+                        .await
+                        .map_err(db)?;
+                        // Create the job_requests row so runners can claim it.
+                        // Without this, the claim path INSERTs with wrong
+                        // defaults and violates job_requests_result_check.
+                        let namespace: String = tx
+                            .query_one(
+                                "SELECT namespace_id FROM jobs \
+                                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                                &[&run, &dependent.0],
+                            )
+                            .await
+                            .map_err(db)?
+                            .get(0);
+                        let agent_job_id = uuid::Uuid::new_v4().to_string();
+                        let timeline_id = uuid::Uuid::new_v4().to_string();
+                        tx.execute(
+                            "INSERT INTO job_requests (run_id, job_id, namespace_id, \
+                             agent_job_id, timeline_id) \
+                             VALUES ($1::text::uuid,$2,$3,$4::text::uuid,$5::text::uuid) \
+                             ON CONFLICT DO NOTHING",
+                            &[&run, &dependent.0, &namespace, &agent_job_id, &timeline_id],
                         )
                         .await
                         .map_err(db)?;
