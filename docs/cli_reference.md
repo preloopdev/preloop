@@ -22,6 +22,7 @@ Usage: preloop <COMMAND>
 | `setup` | Configure GitHub credentials (App or fine-grained PAT) |
 | `doctor` | Verify the GitHub credential configuration |
 | `server` | Install/remove the control plane as a supervised service |
+| `store` | Control-database operations: import a legacy `preloop.db` |
 | `shell` | Open a shell in a preserved VM |
 | `debug` | Attach to a job paused at a failed step |
 | `dap` | Attach an interactive DAP client to a debugger-enabled run |
@@ -376,6 +377,26 @@ and per-App webhook configuration drift.
 | Flag | Description |
 |---|---|
 | `--json` | Print the raw JSON document |
+
+## `preloop store <COMMAND>`
+
+Control-database operations. They are offline and explicit — they never
+bootstrap the engine.
+
+### `preloop store import-legacy [OPTIONS]`
+
+One-time import of a released v11 `preloop.db` (the durable-state store the
+control backend replaced) into a fresh control database. See
+[Importing a legacy `preloop.db`](./setup.md#importing-a-legacy-preloopdb).
+
+| Flag | Description |
+|---|---|
+| `--source <LEGACY_DB>` | Legacy `preloop.db` to read (opened read-only, never modified) |
+| `--target <CONTROL_DB>` | Control database to create; must not exist |
+| `--state-dir <DIR>` | Server state dir the target will live in (secret tiers, log segments). Defaults to the target's directory |
+| `--key <FILE>` | Cluster key file (32 bytes). Defaults to `PRELOOP_HMAC_KEY`, then `<state-dir>/hmac-key.bin` |
+| `--active <POLICY>` | In-flight work: `refuse` (default), `requeue`, or `cancel` |
+| `--json` | Print the machine-readable report |
 
 ## `preloop update [OPTIONS]`
 

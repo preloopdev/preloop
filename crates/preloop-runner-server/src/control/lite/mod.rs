@@ -21,6 +21,7 @@ mod expansion;
 mod fork_gate;
 mod impls;
 mod jobs;
+pub mod legacy_import;
 mod lifecycle;
 mod poll;
 mod promote;

@@ -335,6 +335,28 @@ Releases before v0.27.0 predate the changelog.
   populated baseline fixtures and an executable parity test against
   `schema.sql` keep upgrades lossless. Brand-new local installs still
   initialize on first `preloop run`/`init`/`server install`.
+- **`preloop store import-legacy` imports a released v11 `preloop.db` into a
+  fresh control SQLite database.** The source is opened read-only at `PRAGMA
+  user_version = 11` and hashed before and after; runs, queued jobs (secrets
+  move to the SecretProvider run tier and are stripped from the stored message
+  templates), attempts, steps, log bytes, counters, runners, sessions,
+  webhooks, check ids, and the durable metadata snapshot are written in one
+  transaction into `<target>.importing`, verified (`PRAGMA
+  foreign_key_check`, row counts, schema version), then published atomically
+  (never overwriting an existing target) — a failure leaves no target and a
+  retry is safe. Claimed-but-unfinished attempts, session bindings, and live
+  concurrency gates refuse by default; `--active=requeue|cancel` drains them
+  explicitly. The legacy event log is carried into the outbox (ids and order
+  preserved), per-attempt message frames are verified against the imported
+  templates (reconstructing them for terminal jobs), the finalized artifact
+  registry — legacy v1 `artifact_records` and `artifact_v2_registry.json` —
+  moves into `artifacts`, and buffered timeline events move into the outbox.
+  Anything not carried into a table is written to
+  `<state-dir>/legacy-import-archive.json`; only node-local state that
+  cannot be carried (queued broker frames, in-flight artifact/cache uploads,
+  pool provisioning marks) refuses the import, and only provably unreachable
+  tombstones/ephemeral tokens are reported as skipped. `preloop serve` still
+  never migrates a database on its own.
 - The control plane now enforces per-namespace state and quotas on both store
   backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
   one finishes its queued jobs. `namespace_limits.max_running_jobs` and
