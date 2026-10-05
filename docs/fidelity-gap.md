@@ -928,6 +928,25 @@ Tradeoffs: breaks cross-trust serialization for deliberately shared groups
 still flood the pool with runs — that needs queue/run limits, separate from
 concurrency). Not implemented; documented here for parity tracking.
 
+**Job-secret injection — deliberate divergence (implemented 2026-10).**
+github.com delivers every in-scope stored secret to a job as `isSecret`
+variables, so `${{ secrets.X }}` and `toJSON(secrets)` see names the job
+never declares. preloop now injects only the names the job's expanded plan
+actually references (`preloop_gha_parser::collect_job_secret_reads` walks
+`env`, `if`, steps, container/services, `environment`, `outputs`, step
+names and reusable `secrets:` maps; `secrets[expr]` indexing, `*` object
+filters, and bare `secrets` arguments are unprovable, so those jobs keep
+the full scope). Effects: `${{ secrets.UNDECLARED }}` still evaluates to
+`""` like an unset secret, but `toJSON(secrets)` / `secrets.*` enumerate
+fewer keys than on GitHub — observable, and accepted: the unreferenced set
+was the dump surface. Server-side masking still covers the whole scope
+(submit-time masker seed plus `FillOutcome.masked`), so an unreferenced
+value that reaches a log through a literal is still redacted. Reusable
+callees are unchanged: `secrets: inherit` keeps the caller's whole scope,
+`secrets: {…}` maps resolve as before. Engine tokens
+(`secrets.GITHUB_TOKEN`, OIDC/runtime tokens) are minted per claim and
+never went through the stored set anyway.
+
 ---
 
 ## 4. Pluggable backends &amp; deployment modes

@@ -2440,12 +2440,44 @@ pub(crate) fn build_job_artifacts(
         BTreeSet::new()
     };
 
+    // Inject only the secrets the job actually references: every `isSecret`
+    // variable lands in the runner's `secrets` context (and its `toJSON`
+    // output) for the duration of the job, so shipping the whole scope
+    // exposes names nothing reads. Dynamic or unparseable access
+    // (`secrets[matrix.x]`, object filters) cannot be enumerated — those
+    // jobs keep the full scope rather than failing open on a missed name.
+    // Engine-provided tokens (`secrets.GITHUB_TOKEN`) are minted per claim,
+    // never through `spec.names`.
+    //
+    // Context properties match case-insensitively (`secrets.foo` reads the
+    // `FOO` secret), so the filter compares uppercased names.
+    let reads = preloop_gha_parser::collect_job_secret_reads(job);
+    let spec_names: BTreeSet<String> = if reads.dynamic {
+        merged_names.clone()
+    } else {
+        let referenced: std::collections::HashSet<String> = reads
+            .names
+            .iter()
+            .map(|name| name.to_ascii_uppercase())
+            .collect();
+        merged_names
+            .iter()
+            .filter(|name| referenced.contains(&name.to_ascii_uppercase()))
+            .cloned()
+            .collect()
+    };
+
     // The builder needs secret *names* (for `secrets.*` contexts and
     // `secrets: inherit` key sets) but never values — the stored message is
     // a template: `build_context` masks values, and the only fields that
     // would carry a real value (`variables`, `mask_hints`) are stripped
     // below. Keys-only input makes a value leak structurally impossible.
-    let secret_names: BTreeMap<String, String> = merged_names
+    let builder_names = if job.workflow_file.is_some() && job.secrets_inherit {
+        &merged_names
+    } else {
+        &spec_names
+    };
+    let secret_names: BTreeMap<String, String> = builder_names
         .iter()
         .map(|name| (name.clone(), String::new()))
         .collect();
@@ -2723,7 +2755,7 @@ pub(crate) fn build_job_artifacts(
     agent_msg.preloop_secret_spec = if policy.allows_secrets {
         Some(crate::message_template::secret_spec_for(
             job,
-            &merged_names,
+            &spec_names,
             &submission.run_secret_names,
         ))
     } else {

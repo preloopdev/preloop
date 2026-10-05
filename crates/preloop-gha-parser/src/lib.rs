@@ -26,7 +26,10 @@ pub use expand::{
     expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
 };
 pub use models::*;
-pub use secrets::{ENGINE_PROVIDED_SECRETS, SecretRequirements, collect_secret_requirements};
+pub use secrets::{
+    ENGINE_PROVIDED_SECRETS, SecretRequirements, collect_job_secret_reads,
+    collect_secret_requirements,
+};
 pub use trigger::{TriggerMismatch, glob_match};
 pub use yaml::{parse_action_metadata, parse_workflow};
 

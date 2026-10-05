@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
 use super::{
-    ContextFunctionCall, ExpressionError, ExpressionReferences,
+    ContextFunctionCall, ExpressionError, ExpressionReferences, SecretReads,
     ast::{BinaryOp, Expr},
     conditions::is_truthy,
     context::Context,
@@ -143,6 +143,75 @@ pub(super) fn collect_context_properties_from_expr(
         Expr::Call { args, .. } => {
             for arg in args {
                 collect_context_properties_from_expr(arg, properties);
+            }
+        }
+    }
+}
+
+/// Collect `secrets.*` reads from an expression tree, separating literal
+/// names from accesses whose coverage cannot be proven statically.
+///
+/// [`collect_context_properties_from_expr`] reports literal `secrets.NAME`
+/// paths only; this walker additionally recognizes
+///
+/// - `secrets['NAME']` / `secrets["NAME"]` — a literal [`Expr::Index`] key
+///   contributes the name,
+/// - `secrets[<expr>]`, a bare `secrets` path argument (`format('{0}',
+///   secrets)`), and the `secrets.*` object filter — any of these may read
+///   every stored name, so `dynamic` is set and the caller must not narrow
+///   the injected set.
+///
+/// `MemberAccess` on a computed base (`fromJSON(x).name`) can never reach the
+/// `secrets` context — the base is an evaluated value, not a context path —
+/// so only the base expression is recursed into.
+pub(super) fn collect_secret_reads_from_expr(expr: &Expr, reads: &mut SecretReads) {
+    match expr {
+        Expr::Path(path) => {
+            let Some(first) = path.first() else { return };
+            if !first.eq_ignore_ascii_case("secrets") {
+                return;
+            }
+            match path.get(1) {
+                // `toJSON(secrets)`, `secrets || …`: whole object, unknowable.
+                None => reads.dynamic = true,
+                // `secrets.*` / `secrets.*.x`: object filter, unknowable.
+                Some(segment) if segment == "*" => reads.dynamic = true,
+                Some(name) => {
+                    reads.names.insert(name.clone());
+                }
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::UnaryNot(inner) => collect_secret_reads_from_expr(inner, reads),
+        Expr::MemberAccess { expr: inner, .. } => collect_secret_reads_from_expr(inner, reads),
+        Expr::Index { base, key } => {
+            match (base.as_ref(), key.as_ref()) {
+                (Expr::Path(path), Expr::Literal(Value::String(name)))
+                    if path.len() == 1 && path[0].eq_ignore_ascii_case("secrets") =>
+                {
+                    reads.names.insert(name.clone());
+                }
+                (Expr::Path(path), _)
+                    if path.len() == 1 && path[0].eq_ignore_ascii_case("secrets") =>
+                {
+                    // `secrets[matrix.pick]` / `secrets[format(...)]`: the key
+                    // is computed at run time — assume every name.
+                    reads.dynamic = true;
+                    collect_secret_reads_from_expr(key, reads);
+                }
+                _ => {
+                    collect_secret_reads_from_expr(base, reads);
+                    collect_secret_reads_from_expr(key, reads);
+                }
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_secret_reads_from_expr(left, reads);
+            collect_secret_reads_from_expr(right, reads);
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_secret_reads_from_expr(arg, reads);
             }
         }
     }
