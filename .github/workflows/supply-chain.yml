@@ -50,16 +50,31 @@ jobs:
           policy_files="$(echo "$diff_files" | grep -E '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' || true)"
           non_policy_files="$(echo "$diff_files" | grep -vE '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' | grep -v '^$' || true)"
 
-          if [[ -n "$policy_files" && -n "$non_policy_files" ]]; then
+          # Adding a Rust dependency necessarily changes Cargo.lock *and* the
+          # manifests that declare it. Permit that dedicated PR shape, but no
+          # source changes or other policy files alongside the lockfile.
+          dependency_only=false
+          if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" ]]; then
+            dependency_only=true
+            while IFS= read -r file; do
+              if [[ "$file" != "Cargo.toml" && ! "$file" =~ ^crates/[^/]+/Cargo\.toml$ ]]; then
+                dependency_only=false
+                break
+              fi
+            done <<< "$non_policy_files"
+          fi
+          if [[ -n "$policy_files" && -n "$non_policy_files" && "$dependency_only" != true ]]; then
             echo "ERROR: PR touches both supply-chain policy files and non-policy files." >&2
-            echo "Policy updates (Cargo.lock, deny.toml, .cargo/audit.toml, supply-chain/*) must be isolated in a dedicated PR." >&2
+            echo "Only Cargo.lock plus Cargo.toml manifests may share a dedicated dependency PR." >&2
             echo "Modified policy files:" >&2
             echo "$policy_files" >&2
             echo "Modified non-policy files:" >&2
             echo "$non_policy_files" >&2
             exit 1
           fi
-          if [[ -n "$policy_files" ]]; then
+          if [[ "$dependency_only" == true ]]; then
+            echo "Dedicated dependency manifest + lockfile PR detected: OK"
+          elif [[ -n "$policy_files" ]]; then
             echo "Dedicated supply-chain policy PR detected: OK"
           else
             echo "Policy file guard: OK (no policy files modified)"
