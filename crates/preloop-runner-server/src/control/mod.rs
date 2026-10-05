@@ -34,6 +34,8 @@ pub(crate) mod logic;
 pub mod logic;
 pub(crate) mod pg;
 #[cfg(test)]
+mod schema_drift;
+#[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testview;

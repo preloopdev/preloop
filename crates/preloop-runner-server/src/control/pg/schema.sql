@@ -48,6 +48,9 @@ CREATE TABLE namespaces (
     -- suspended/deleted: neither (queued jobs stay queued, nothing starts).
     state                   text NOT NULL DEFAULT 'active' CHECK (state IN
                                 ('active','suspended','draining','deleted')),
+    -- UNUSED: `cell_generation` and `config_version` have no reader or
+    -- writer in any code; drop only with a migration (`UNUSED` in
+    -- control/schema_drift.rs).
     cell_generation         bigint NOT NULL DEFAULT 1,   -- bumped on cell move; fences stale writers
     config_version          bigint NOT NULL DEFAULT 0,   -- last platform push applied
     created_at              timestamptz NOT NULL DEFAULT now(),
@@ -60,6 +63,9 @@ CREATE TABLE namespaces (
 -- predicate (a capped claim locks this row first, so nodes cannot
 -- overshoot). Not yet read: max_job_timeout_minutes, priority_tier,
 -- run_history_retention_days.
+-- RESERVED: not read by any code yet (planned: per-tenant job timeout cap,
+-- ordering input, history retention window); see `RESERVED_UNUSED` in
+-- control/schema_drift.rs.
 CREATE TABLE namespace_limits (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     max_queued_jobs         integer,
@@ -80,6 +86,8 @@ CREATE TABLE namespace_pool_limits (
 );
 
 -- Admission and job-build restrictions.
+-- RESERVED: not read by any code yet (planned: hosted-tenant admission
+-- policy); see `RESERVED_UNUSED` in control/schema_drift.rs.
 CREATE TABLE namespace_policies (
     namespace_id            text PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     fork_pr_policy          text NOT NULL DEFAULT 'untrusted' CHECK (fork_pr_policy IN
@@ -169,16 +177,17 @@ CREATE TABLE workflow_run_numbers (
     PRIMARY KEY (namespace_id, repository, workflow_path)
 );
 
--- The request a run was created from. No secret values: `secret_refs`
--- names which secrets (and scopes) the run may use; values are resolved
--- from the SecretProvider when a job is acquired, never stored here.
+-- The request a run was created from. No secret values are ever stored:
+-- secrets are resolved from the SecretProvider when a job is acquired.
 CREATE TABLE run_submissions (
     run_id                  uuid PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
     submission              jsonb NOT NULL,     -- WorkflowSubmission minus secrets
     github_context          jsonb NOT NULL,
     workspace_snapshot      jsonb,
     snapshot_timing         jsonb,              -- duration_ms, object_count, pack_bytes
-    secret_refs             jsonb NOT NULL DEFAULT '{}', -- name -> {scope, version}
+    -- UNUSED: no reader or writer in any code; drop only with a migration
+    -- (`UNUSED` in control/schema_drift.rs).
+    secret_refs             jsonb NOT NULL DEFAULT '{}',
     -- Record-level per-job maps the table layout has no column for (jobs
     -- with no `jobs` row yet — a check run minted before its matrix leg
     -- materializes). Mirrors lite's `run_submissions.record_details`.
@@ -225,6 +234,8 @@ CREATE TABLE jobs (
     priority                integer NOT NULL DEFAULT 0,
     run_order               bigint NOT NULL DEFAULT 0,
     job_order               integer NOT NULL DEFAULT 0,
+    -- UNUSED: retry-backoff / delayed-start leftover; drop only with a
+    -- migration (`UNUSED` in control/schema_drift.rs).
     not_before              timestamptz,
     enqueued_at             timestamptz,
     claimed_by_runner_id    bigint,
@@ -414,12 +425,14 @@ CREATE TABLE timeline_records (
 
 -- Per-plan log ids fit the official runner's 32-bit TaskLog.Id and remain
 -- stable across nodes. The unique pair arbitrates concurrent allocations.
--- Content lives in file segments; this row tracks result-service counters.
+-- Content and sizes live in file segments; this row only allocates ids.
 CREATE TABLE log_files (
     log_key                 text PRIMARY KEY,
     run_id                  uuid NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     plan_id                 uuid NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     log_id                  integer NOT NULL CHECK (log_id > 0),
+    -- UNUSED: log sizes live in the log-segment store, not here; drop only
+    -- with a migration (`UNUSED` in control/schema_drift.rs).
     byte_count              bigint NOT NULL DEFAULT 0,
     line_count              bigint NOT NULL DEFAULT 0,
     updated_at              timestamptz NOT NULL DEFAULT now(),
@@ -451,7 +464,9 @@ CREATE TABLE runner_sessions (
     protocol                text NOT NULL CHECK (protocol IN ('broker','azdo')),
     client_id               text,
     verified                boolean NOT NULL DEFAULT false,
-    engine_node_id          text,               -- node holding the long-poll (wake routing)
+    -- UNUSED: wake routing is in-process (`control/wake.rs`); drop only with
+    -- a migration (`UNUSED` in control/schema_drift.rs).
+    engine_node_id          text,
     created_at              timestamptz NOT NULL DEFAULT now(),
     last_seen_at            timestamptz NOT NULL DEFAULT now()
 );
@@ -505,6 +520,8 @@ CREATE TABLE provision_requests (
     pool_key                text NOT NULL,
     labels                  jsonb NOT NULL,
     requested_at            timestamptz NOT NULL DEFAULT now(),
+    -- UNUSED: the provisioner queue has no lease protocol; drop only with a
+    -- migration (`UNUSED` in control/schema_drift.rs).
     leased_until            timestamptz,
     lease_owner             text,
     PRIMARY KEY (run_id, job_id),
@@ -669,8 +686,10 @@ CREATE TABLE check_run_updates (
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 
 -- ── Artifacts (replaces the artifact part of the `meta` blob) ────────
--- Blobs live in object storage; these rows are the shared index. Upload
--- tokens are stored as hashes, never raw.
+-- Blobs live in object storage; upload state lives in the file-backed
+-- ArtifactStore. These rows are RESERVED (planned as the shared artifact
+-- index): the only production statement is the run-archive DELETE. See
+-- `RESERVED_UNUSED` in control/schema_drift.rs.
 --
 -- The Actions cache is deliberately NOT here: it is a bounded cache
 -- colocated with the runner hosts (preloop-cache CAS: key index ->
@@ -686,6 +705,9 @@ CREATE TABLE artifacts (
     size_bytes              bigint,
     digest                  text,
     storage_key             text NOT NULL,
+    -- UNUSED: `upload_token_hash` and `finalized_at` have no reader or
+    -- writer in any code; drop only with a migration (`UNUSED` in
+    -- control/schema_drift.rs).
     upload_token_hash       bytea,
     created_at              timestamptz NOT NULL DEFAULT now(),
     finalized_at            timestamptz,
