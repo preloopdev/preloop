@@ -298,6 +298,15 @@ pub(crate) trait ControlBackend: Send + Sync {
         resolver: std::sync::Arc<crate::environment_resolver::EnvironmentResolver>,
     );
 
+    /// The durable review-decision audit rows for one job, oldest first
+    /// (`environment_approvals`). These outlive the gate and the run: the
+    /// table is deliberately never archived or pruned with the run row.
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError>;
+
     /// The jobs still parked on an armed required-reviewer gate (the gate's
     /// `approval_requested_at` is set and no approval satisfies it yet),
     /// with the GitHub side-channel ids the announce/approve paths PATCH.
@@ -1921,6 +1930,16 @@ impl ControlBackend for Backend {
         match self {
             Self::Sqlite(b) => b.set_environment_resolver(resolver),
             Self::Postgres(b) => b.set_environment_resolver(resolver),
+        }
+    }
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        match self {
+            Self::Sqlite(b) => b.environment_approvals(run_id, job_id).await,
+            Self::Postgres(b) => b.environment_approvals(run_id, job_id).await,
         }
     }
     async fn pending_environment_approvals(

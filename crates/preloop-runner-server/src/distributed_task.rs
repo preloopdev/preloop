@@ -337,6 +337,7 @@ pub async fn complete_job_compat(
             outputs: Default::default(),
             annotations: Vec::new(),
             step_results: Vec::new(),
+            environment_url: None,
         },
     )
     .await
@@ -524,6 +525,7 @@ pub async fn agent_request_patch(
                 outputs: Default::default(),
                 annotations: Vec::new(),
                 step_results: Vec::new(),
+                environment_url: None,
             }
         });
         if let Some(c) = completion {

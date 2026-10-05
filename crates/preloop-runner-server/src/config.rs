@@ -768,16 +768,17 @@ pub struct ConfigFile {
     /// global secret of the same name for jobs in that environment.
     #[serde(default)]
     pub env_secrets: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
-    /// Registered environments (`[environments]` mapping `owner/repo` to a
-    /// list of environment names), mirroring GitHub's environment registry.
-    /// A job's `environment:` name must be registered for its repository, or
-    /// the job fails closed: no environment secrets are injected and no
-    /// environment OIDC subject is minted. Required reviewers, wait timers,
-    /// and deployment-branch policies are not enforced yet; the registry
-    /// currently gates existence. Protection rules (required reviewers, wait
-    /// timers, deployment-branch policies) live in the separate
-    /// `[environment_rules]` table, enforced at scheduler admission before
-    /// environment secrets are injected.
+    /// Removed environment registry (`[environments]` mapping `owner/repo` to
+    /// a list of environment names).
+    ///
+    /// GitHub accepts any `environment:` name, auto-creates it on first
+    /// reference, and applies whatever protection rules the repository
+    /// configured for it — preloop now behaves the same way (rules come from
+    /// `[environment_rules]` in local mode and from the repository's
+    /// environments API when a GitHub credential exists). A registry that
+    /// *rejects* unregistered names would diverge from GitHub, so it no
+    /// longer gates submissions; a non-empty table is rejected at config load
+    /// with a pointer to this change rather than silently ignored.
     #[serde(default)]
     pub environments: BTreeMap<String, BTreeSet<String>>,
     /// Token permissions ceiling (`[token_permissions_ceiling]`), mirroring
@@ -1591,6 +1592,14 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
 fn validate_environment_rules(config: &ConfigFile) -> anyhow::Result<()> {
     /// Largest whole minutes representable as i64 nanoseconds.
     const MAX_WAIT_TIMER_MINUTES: u64 = (i64::MAX as u64) / 60_000_000_000;
+    anyhow::ensure!(
+        config.environments.is_empty(),
+        "the `[environments]` registry is no longer supported: GitHub accepts any \
+         `environment:` name and auto-creates it unprotected, so preloop no longer \
+         rejects unregistered names. Delete the table; environment secrets stay keyed \
+         by name under `[env_secrets]`, and protection rules come from the repository's \
+         environment configuration (or `[environment_rules]` in local mode)"
+    );
     for (repo, envs) in &config.environment_rules {
         for (env, rules) in envs {
             anyhow::ensure!(
@@ -1767,7 +1776,7 @@ mod tests {
                     BTreeMap::from([("DEPLOY_KEY".into(), "env-secret".into())]),
                 )]),
             )]),
-            environments: BTreeMap::from([("owner/repo".into(), BTreeSet::from(["prod".into()]))]),
+            environments: BTreeMap::new(),
             token_permissions_ceiling: None,
             environment_rules: BTreeMap::new(),
             fork_policy: ForkPolicyConfig::default(),

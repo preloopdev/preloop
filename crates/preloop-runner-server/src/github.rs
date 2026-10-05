@@ -3876,8 +3876,10 @@ pub async fn github_register(headers: HeaderMap) -> impl IntoResponse {
         "redirect_url": format!("{}/api/v1/github/callback", base_url),
         "public": false,
         "default_permissions": {
+            "actions": "read",
             "checks": "write",
             "contents": "read",
+            "deployments": "write",
             "metadata": "read",
             "pull_requests": "read"
         }

@@ -7,9 +7,10 @@ use super::{PgBackend, db, lookups};
 use crate::control::backend::RegisterRunner;
 use crate::control::logic;
 use crate::control::types::{
-    AcquireContext, ControlError, EnvironmentApproval, EnvironmentApprovalOutcome,
-    EnvironmentApprovalResult, EnvironmentDecision, OpenRunnerSession, PendingEnvironmentApproval,
-    PurgeGuard, RunQueueClaimability, RunnerListing, RunnerRow, SessionProtocol, SessionRow,
+    AcquireContext, ControlError, EnvironmentApproval, EnvironmentApprovalAudit,
+    EnvironmentApprovalOutcome, EnvironmentApprovalResult, EnvironmentDecision, OpenRunnerSession,
+    PendingEnvironmentApproval, PurgeGuard, RunQueueClaimability, RunnerListing, RunnerRow,
+    SessionProtocol, SessionRow,
 };
 use crate::models::{RunRecord, RunnerCapabilities};
 use crate::runtime_scheduling;
@@ -1644,8 +1645,8 @@ impl PgBackend {
             let run_key = run_id.0.to_string();
             let row = tx
                 .query_opt(
-                    "SELECT j.status, j.environment_gate::text \
-                     FROM jobs j \
+                    "SELECT j.status, j.environment_gate::text, r.namespace_id, r.repository \
+                     FROM jobs j JOIN runs r ON r.run_id = j.run_id \
                      WHERE j.run_id = $1::text::uuid AND j.job_id = $2",
                     &[&run_key, &job_id.0],
                 )
@@ -1653,6 +1654,8 @@ impl PgBackend {
                 .map_err(db)?
                 .ok_or_else(|| ControlError::NotFound("job not found".to_owned()))?;
             let status = crate::control::types::status_parse(row.get::<_, String>(0).as_str());
+            let namespace_id: String = row.get(2);
+            let repository: String = row.get(3);
             let result = if status.is_terminal() {
                 EnvironmentApprovalResult::AlreadyTerminal
             } else {
@@ -1695,6 +1698,20 @@ impl PgBackend {
                                         )
                                         .await
                                         .map_err(db)?;
+                                        insert_environment_approval_audit(
+                                            &tx,
+                                            run_id,
+                                            &job_id,
+                                            &repository,
+                                            &namespace_id,
+                                            &env_name,
+                                            "approved",
+                                            actor.as_deref(),
+                                            admin_override,
+                                            note.as_deref(),
+                                            now,
+                                        )
+                                        .await?;
                                         if admin_override {
                                             tracing::warn!(
                                                 run_id = %run_id.0,
@@ -1733,6 +1750,20 @@ impl PgBackend {
                                         )
                                         .await
                                         .map_err(db)?;
+                                        insert_environment_approval_audit(
+                                            &tx,
+                                            run_id,
+                                            &job_id,
+                                            &repository,
+                                            &namespace_id,
+                                            &env_name,
+                                            "rejected",
+                                            actor.as_deref(),
+                                            admin_override,
+                                            note.as_deref(),
+                                            now,
+                                        )
+                                        .await?;
                                         tracing::warn!(
                                             run_id = %run_id.0,
                                             job_id = %job_id.0,
@@ -1851,21 +1882,18 @@ impl PgBackend {
                     crate::runtime_scheduling::environment_gate_name_of(spec_env.as_ref())
                         .map(str::to_owned)
                 });
-            // The hydrated message URL wins: `environment.url` expressions
-            // resolve into it before dispatch, while the spec literal may
-            // still hold `${{}}`.
+            // Only a statically known literal is reported before the job
+            // runs: the runner reports the evaluated `environment.url` with
+            // its completion (`jobs.environment_url`), which the deployment
+            // read prefers. A raw `${{ }}` template is never posted.
             let environment_url = template_env
                 .as_ref()
-                .and_then(|env| env.get("url"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|url| !url.is_empty())
+                .and_then(runtime_scheduling::environment_url_literal)
                 .map(str::to_owned)
                 .or_else(|| {
                     spec_env
                         .as_ref()
-                        .and_then(|value| value.get("url"))
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|url| !url.is_empty())
+                        .and_then(runtime_scheduling::environment_url_literal)
                         .map(str::to_owned)
                 });
             let Some(environment_name) = environment_name else {
@@ -1956,4 +1984,94 @@ impl PgBackend {
             .map_err(db)?;
         Ok(())
     }
+}
+
+impl PgBackend {
+    /// `environment_approvals`: the durable review-decision audit rows for
+    /// one job, oldest first. Read straight from the audit table — it is not
+    /// archived with the run, so archived runs answer here too.
+    pub(crate) async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        let client = self.reader().await?;
+        let rows = client
+            .query(
+                "SELECT repository, environment, decision, actor, admin_override, comment, \
+                        (extract(epoch from decided_at) * 1000000)::int8 \
+                 FROM environment_approvals \
+                 WHERE run_id = $1::text::uuid AND job_id = $2 \
+                 ORDER BY id",
+                &[&run_id.0.to_string(), &job_id.0],
+            )
+            .await
+            .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EnvironmentApprovalAudit {
+                run_id,
+                job_id: job_id.clone(),
+                repository: row.get(0),
+                environment: row.get(1),
+                decision: row.get(2),
+                actor: row.get(3),
+                admin_override: row.get(4),
+                comment: row.get(5),
+                decided_at_unix_nanos: row.get::<_, i64>(6) * 1000,
+            })
+            .collect())
+    }
+}
+
+/// Append one durable environment-review audit row
+/// (`environment_approvals`): who decided what on which environment, when,
+/// and with which comment. Called inside the decision's own transaction so
+/// the gate flip and its audit record commit together — a decision can never
+/// exist without its record, and vice versa.
+///
+/// The repository and namespace are read from the run row here rather than
+/// carried by the caller: the audit row is what survives the run, so it
+/// denormalizes the facts retention will delete. Run archival never touches
+/// this table (see the schema comment).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn insert_environment_approval_audit(
+    tx: &tokio_postgres::Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    repository: &str,
+    namespace_id: &str,
+    environment: &str,
+    decision: &str,
+    actor: Option<&str>,
+    admin_override: bool,
+    comment: Option<&str>,
+    decided_at_unix_nanos: i64,
+) -> Result<(), ControlError> {
+    let run_key = run_id.0.to_string();
+    let decided_at_us = decided_at_unix_nanos / 1000;
+    tx.execute(
+        &format!(
+            "INSERT INTO environment_approvals \
+             (namespace_id, run_id, job_id, repository, environment, decision, actor, \
+              admin_override, comment, decided_at) \
+             VALUES ($1, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9, {})",
+            ts!("$10")
+        ),
+        &[
+            &namespace_id,
+            &run_key,
+            &job_id.0,
+            &repository,
+            &environment,
+            &decision,
+            &actor,
+            &admin_override,
+            &comment,
+            &decided_at_us,
+        ],
+    )
+    .await
+    .map_err(db)?;
+    Ok(())
 }

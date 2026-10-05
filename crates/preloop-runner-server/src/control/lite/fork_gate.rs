@@ -156,7 +156,7 @@ impl LiteBackend {
             let row = tx
                 .prepare_cached(
                     "SELECT r.repository, r.head_sha, j.environment_gate, \
-                            j.check_run_id, j.deployment_id, \
+                            j.check_run_id, j.deployment_id, j.environment_url, \
                             s.environment, m.message_template \
                      FROM jobs j \
                      JOIN runs r ON r.run_id = j.run_id \
@@ -174,6 +174,7 @@ impl LiteBackend {
                         row.get::<_, Option<i64>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 })
                 .optional()
@@ -184,6 +185,7 @@ impl LiteBackend {
                 gate_json,
                 check_run_id,
                 deployment_id,
+                resolved_url,
                 spec_env,
                 template,
             )) = row
@@ -191,6 +193,7 @@ impl LiteBackend {
                 return Ok(None);
             };
             let Some((environment, environment_url)) = resolve_environment_parts(
+                resolved_url.as_deref(),
                 gate_json.as_deref(),
                 template.as_deref(),
                 spec_env.as_deref(),
@@ -211,10 +214,17 @@ impl LiteBackend {
 
 /// Resolve `(environment_name, environment_url)` for one job from its three
 /// sources: the armed gate blob (post-hydration stamp), the stored runner
-/// message (`environment` / `actionsEnvironment` — deferred names and
-/// expression URLs resolve into it), and the spec literal. `None` when no
-/// source yields a name — the job isn't an environment job.
+/// message (`environment` / `actionsEnvironment` — deferred names resolve
+/// into it), and the spec literal. `None` when no source yields a name — the
+/// job isn't an environment job.
+///
+/// The URL precedence is: the runner-evaluated value reported with the job's
+/// completion (the only source that can resolve `steps.<id>.outputs`, and what
+/// GitHub's own service receives at job completion), then a statically known
+/// literal from the message or the spec. An unevaluated `${{ }}` template is
+/// never returned — see [`crate::runtime_scheduling::environment_url_literal`].
 fn resolve_environment_parts(
+    resolved_url: Option<&str>,
     gate_json: Option<&str>,
     template: Option<&str>,
     spec_env: Option<&str>,
@@ -246,19 +256,18 @@ fn resolve_environment_parts(
                 crate::runtime_scheduling::environment_gate_name_of(Some(value)).map(str::to_owned)
             })
         })?;
-    // The hydrated message URL wins: `environment.url` expressions resolve
-    // into it before dispatch, while the spec literal may still hold `${{}}`.
-    let environment_url = message_environment
-        .as_ref()
-        .and_then(|env| env.get("url"))
-        .and_then(serde_json::Value::as_str)
+    let environment_url = resolved_url
         .filter(|url| !url.is_empty())
         .map(str::to_owned)
         .or_else(|| {
+            message_environment
+                .as_ref()
+                .and_then(crate::runtime_scheduling::environment_url_literal)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
             spec.as_ref()
-                .and_then(|value| value.get("url"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|url| !url.is_empty())
+                .and_then(crate::runtime_scheduling::environment_url_literal)
                 .map(str::to_owned)
         });
     Some((environment, environment_url))
@@ -317,9 +326,12 @@ fn pending_environment_approvals_tx(
         {
             continue;
         }
-        let Some((environment_name, environment_url)) =
-            resolve_environment_parts(Some(&gate_json), template.as_deref(), spec_env.as_deref())
-        else {
+        let Some((environment_name, environment_url)) = resolve_environment_parts(
+            None,
+            Some(&gate_json),
+            template.as_deref(),
+            spec_env.as_deref(),
+        ) else {
             continue;
         };
         out.push(PendingEnvironmentApproval {

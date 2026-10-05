@@ -5523,6 +5523,7 @@ impl<'a> Sweep<'a> {
         reported: ExecutionStatus,
         outputs: &BTreeMap<String, serde_json::Value>,
         annotations: &[serde_json::Value],
+        environment_url: Option<&str>,
     ) -> Result<CompletionApplied, ControlError> {
         let was_terminal_success = self
             .graphs
@@ -5588,6 +5589,20 @@ impl<'a> Sweep<'a> {
             if let Some(node) = self.node_mut(run_id, job_id) {
                 node.annotations = Some(value);
             }
+        }
+        // The runner evaluated `environment.url` after its steps ran; the
+        // value rides the completion and is what the deployment status
+        // reports. Written straight to the row: no in-memory node field
+        // mirrors it, and no later node flush touches the column.
+        if let Some(url) = environment_url.filter(|url| !url.is_empty()) {
+            self.tx
+                .execute(
+                    "UPDATE jobs SET environment_url = $3 \
+                     WHERE run_id = $1::text::uuid AND job_id = $2",
+                    &[&run_id.0.to_string(), &job_id.0, &url],
+                )
+                .await
+                .map_err(db)?;
         }
         self.mark(run_id, job_id);
         // Retire the node's attempts (settled rows stay readable).
@@ -5777,7 +5792,16 @@ impl PgBackend {
             .ok_or_else(|| ControlError::NotFound(format!("run {run_id}")))?;
         sweep.graphs.insert(run_id, graph);
         let applied = sweep
-            .complete_node(run_id, &job_id, completion.status, &completion.outputs, &[])
+            .complete_node(
+                run_id,
+                &job_id,
+                completion.status,
+                &completion.outputs,
+                &[],
+                // The legacy `complete_job` shape carries no runner-reported
+                // environment URL; the broker settle path does.
+                None,
+            )
             .await?;
         if !applied.replayed {
             // The claimed marker is gone once the job is terminal.
@@ -5865,7 +5889,14 @@ impl PgBackend {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         let applied = sweep
-            .complete_node(run_id, &job_id, comp.status, &outputs, &annotations)
+            .complete_node(
+                run_id,
+                &job_id,
+                comp.status,
+                &outputs,
+                &annotations,
+                comp.environment_url.as_deref(),
+            )
             .await?;
         if applied.replayed {
             let record = sweep
@@ -6715,7 +6746,7 @@ impl PgBackend {
         let row = client
             .query_opt(
                 "SELECT r.repository, r.head_sha, j.environment_gate::text, \
-                        j.check_run_id, j.deployment_id, \
+                        j.check_run_id, j.deployment_id, j.environment_url, \
                         s.environment::text, m.message_template \
                  FROM jobs j \
                  JOIN runs r ON r.run_id = j.run_id \
@@ -6760,21 +6791,25 @@ impl PgBackend {
         let Some(environment) = environment else {
             return Ok(None);
         };
-        // The hydrated message URL wins: `environment.url` expressions
-        // resolve into it before dispatch, while the spec literal may still
-        // hold `${{}}`.
-        let environment_url = template_env
-            .as_ref()
-            .and_then(|env| env.get("url"))
-            .and_then(serde_json::Value::as_str)
+        // The runner-evaluated URL — reported with the job's completion and
+        // stamped on the job row — wins: it is the only source that can
+        // resolve `steps.<id>.outputs`, and what GitHub's own service
+        // receives at job completion. Until it lands, only a literal from
+        // the message or the spec is known; an unevaluated `${{ }}` template
+        // is never posted.
+        let environment_url = row
+            .get::<_, Option<String>>(7)
             .filter(|url| !url.is_empty())
-            .map(str::to_owned)
+            .or_else(|| {
+                template_env
+                    .as_ref()
+                    .and_then(sched_helpers::environment_url_literal)
+                    .map(str::to_owned)
+            })
             .or_else(|| {
                 spec_env
                     .as_ref()
-                    .and_then(|value| value.get("url"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|url| !url.is_empty())
+                    .and_then(sched_helpers::environment_url_literal)
                     .map(str::to_owned)
             });
         Ok(Some(EnvironmentDeploymentRow {

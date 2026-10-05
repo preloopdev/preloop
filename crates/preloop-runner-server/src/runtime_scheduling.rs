@@ -30,6 +30,31 @@ pub(crate) fn environment_gate_name_of(environment: Option<&serde_json::Value>) 
     }
 }
 
+/// The statically known `environment.url` of a stored `environment:` value —
+/// a literal, never an unevaluated `${{ }}` template.
+///
+/// `environment.url` may reference `steps.<id>.outputs`, which exist only once
+/// the job ran, so the official runner evaluates the token at job completion
+/// and reports the value over the completion protocol
+/// (`CompleteJobRequest.environmentUrl`); that evaluated value is what a
+/// deployment status carries on GitHub. Until the report lands, only a
+/// literal is known — posting the raw template would put `${{ … }}` on the
+/// deployment. Accepts both shapes the server stores: the job-spec literal
+/// and the runner message's TemplateToken (`{type: 0, lit}`).
+pub(crate) fn environment_url_literal(environment: &serde_json::Value) -> Option<&str> {
+    let url = environment.get("url")?;
+    if let Some(raw) = url.as_str() {
+        return (!raw.trim().is_empty() && !raw.contains("${{")).then_some(raw);
+    }
+    match url.get("type").and_then(serde_json::Value::as_u64) {
+        Some(0) => url
+            .get("lit")
+            .and_then(serde_json::Value::as_str)
+            .filter(|literal| !literal.is_empty()),
+        _ => None,
+    }
+}
+
 /// Does `git_ref` satisfy the environment's deployment branch policy?
 ///
 /// GitHub semantics: a configured `deployment_branch_policy` restricts

@@ -104,6 +104,13 @@ impl ControlBackend for PgBackend {
     ) {
         PgBackend::set_environment_resolver(self, resolver);
     }
+    async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        self.environment_approvals(run_id, job_id).await
+    }
     async fn pending_environment_approvals(
         &self,
         run_id: Option<RunId>,

@@ -2404,32 +2404,19 @@ pub(crate) fn build_job_artifacts(
         job.oidc_id_token_granted,
     );
 
-    // The environment registry. `environment:` names an
-    // operator-registered deployment tier; a workflow claiming an
-    // unregistered name gets nothing — no environment secrets, no
-    // environment OIDC subject — and the job fails closed rather than
-    // minting a token for a never-created, never-approved environment.
-    // This check runs ahead of `policy.allows_secrets` because the OIDC
-    // subject is minted for jobs even when secret injection is disabled.
-    // Note: expression-based names (`${{ needs.* }}`, `${{ vars.* }}`, …)
-    // arrive here as `None` — the parser only resolves `matrix.*` at build
-    // time — so they are not rejected here, but they also receive no
-    // environment secrets and no environment OIDC subject (both are keyed
-    // off this same field). The name later resolved by
-    // `hydrate_needs_context` is not re-validated against the registry;
-    // it only reaches the runner's deployment record.
-    if let Some(env_name) = job.oidc_environment.as_deref()
-        && !shared
-            .state
-            .secrets
-            .read()
-            .is_environment_registered(&submission.repository, env_name)
-    {
-        return Err(ApiError::forbidden(format!(
-            "environment '{env_name}' is not registered for repository '{}'; register it under [environments]",
-            submission.repository
-        )));
-    }
+    // Environment names are GitHub's to validate, not preloop's: GitHub
+    // accepts any `environment:` name, auto-creates it on first reference,
+    // and applies whatever protection rules the repository configured for it
+    // (none = no gate). preloop therefore rejects *no* name here — the
+    // protection rules come from the repository (`environment_resolver`), and
+    // a name nothing knows about behaves exactly like GitHub's: the job runs
+    // with the environment tier's stored secrets (by name) and no gate. The
+    // only fail-closed path left is a repo whose rules could not be fetched:
+    // the resolver answers `Pending` and the gate holds the job until GitHub
+    // answers. Note: expression-based names (`${{ needs.* }}`, `${{ vars.* }}`,
+    // …) arrive here as `None` — the parser only resolves `matrix.*` at build
+    // time — and are resolved by `hydrate_needs_context` before the gate is
+    // armed.
 
     // Environment secrets are per-job: a job's `environment:` selects the
     // tier. Precedence per name is run > environment > repo > global
@@ -4614,12 +4601,14 @@ mod tests {
 
     const ENV_WORKFLOW: &str = "on: push\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo hi\n";
 
-    /// `environment:` is an unvalidated string. A workflow claiming an
-    /// environment the operator never registered must fail closed — even
-    /// when that environment has secrets configured (the pentest shape: env
-    /// secret injected + OIDC `sub` asserting the unregistered environment).
+    /// `environment:` names are GitHub's to validate: GitHub accepts any
+    /// name, auto-creates it on first reference, and applies whatever
+    /// protection rules the repository configured for it. A name nothing
+    /// knows about must therefore submit like any other job — its secrets (by
+    /// name) still apply, and the gate is decided by the environment's rules
+    /// (none = runs immediately), never by a preloop-side registry.
     #[tokio::test]
-    async fn unregistered_environment_rejects_run_submission() {
+    async fn unknown_environment_submits_without_registry() {
         use axum::http::StatusCode;
         let (status, body) = submit_push_run(
             "[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
@@ -4628,29 +4617,52 @@ mod tests {
         .await;
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
-            "a job claiming an unregistered environment must fail closed, got: {body}"
-        );
-        assert!(
-            body.contains("not registered"),
-            "the rejection must name the missing registration, got: {body}"
+            StatusCode::OK,
+            "GitHub auto-creates an unknown environment; the submission must be accepted, got: {body}"
         );
     }
 
-    /// An environment the operator registered in `[environments]` keeps
-    /// working — the registry gates existence, not legitimate use.
+    /// A job claiming an environment whose rules are configured keeps the
+    /// rules: the submission is accepted (the gate is armed at admission, not
+    /// at submit) and the environment's secrets are selected by name.
     #[tokio::test]
-    async fn registered_environment_accepts_run_submission() {
+    async fn environment_with_rules_submits_and_arms_gate() {
         use axum::http::StatusCode;
         let (status, body) = submit_push_run(
-            "[environments]\n\"owner/repo\" = [\"production\"]\n[env_secrets.\"owner/repo\".production]\nDEPLOY_KEY = \"env-secret\"\n",
+            "[environment_rules.\"owner/repo\".production]\nwait_timer_minutes = 5\n",
             ENV_WORKFLOW,
         )
         .await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "a job claiming a registered environment must be accepted, got: {body}"
+            "a job claiming an environment with rules must be accepted, got: {body}"
+        );
+    }
+
+    /// The removed registry key fails the config load loudly instead of
+    /// silently changing what the operator thinks is enforced.
+    #[tokio::test]
+    async fn environments_registry_key_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[environments]\n\"owner/repo\" = [\"production\"]\n",
+        )
+        .unwrap();
+        let result = AppState::new_with_config(temp.path().to_path_buf(), config_path).await;
+        assert!(
+            result.is_err(),
+            "a non-empty [environments] table must fail the config load"
+        );
+        let message = match result {
+            Ok(_) => unreachable!("asserted above"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            message.contains("[environments]"),
+            "the error must name the removed table, got: {message}"
         );
     }
 

@@ -408,16 +408,18 @@ fn url_path_segment(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-/// Mint a repository-scoped token able to read environments. `contents:read`
-/// is the read floor every installation holds; GitHub's own GET endpoints
-/// for environments, branch policies and protection rules need only repo
-/// read access (docs list no finer-grained requirement for the GETs).
+/// Mint a repository-scoped token able to read environments. GitHub's REST
+/// docs list the environments, branch-policy and protection-rule GETs under
+/// the App's `Actions: read` permission
+/// (docs.github.com/en/rest/authentication/permissions-required-for-github-apps),
+/// so the mint requests it alongside `contents: read`.
 async fn environment_token(
     creds: &crate::github_app::GitHubAppCredentials,
     repository: &str,
 ) -> anyhow::Result<String> {
     let mut permissions = std::collections::BTreeMap::new();
     permissions.insert("contents".to_owned(), "read".to_owned());
+    permissions.insert("actions".to_owned(), "read".to_owned());
     crate::github_app::get_or_mint_token(creds, repository, &permissions).await
 }
 

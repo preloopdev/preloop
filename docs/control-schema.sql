@@ -1,6 +1,7 @@
--- Preloop control plane 
+-- Preloop control plane — target production schema (greenfield, v1).
 --
-
+-- Source of truth for docs/control-schema-chartdb.json and
+-- docs/control-schema.{dot,png}. Postgres is the production backend; the
 -- SQLite backend mirrors every table with the obvious type mapping
 -- (uuid/text -> TEXT, timestamptz -> INTEGER µs, jsonb -> TEXT, bytea -> BLOB,
 -- identity -> INTEGER PRIMARY KEY) and skips partitioning.
@@ -238,6 +239,11 @@ CREATE TABLE jobs (
     -- run reports checks; deployment statuses update on gate decisions and
     -- job completion). `NULL` for unreported or environment-less jobs.
     deployment_id           bigint,
+    -- The job's `environment.url`, evaluated by the runner after its steps
+    -- and reported in the completion (`completejob` `environmentUrl`). The
+    -- server posts it as the deployment status's `environment_url`; `NULL`
+    -- until a completion reports one (or for environment-less jobs).
+    environment_url         text,
     -- Environment protection gate state (`EnvironmentGateState` JSON): armed
     -- at scheduler admission, updated on approval, cleared when satisfied.
     -- Fail-closed reload: a lost stamp re-arms the gate, never the reverse.
@@ -670,6 +676,33 @@ CREATE TABLE check_run_updates (
     PRIMARY KEY (run_id, job_id)
 );
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
+
+-- ── Environment approvals (durable audit) ────────────────────────────
+-- One row per recorded environment review decision (approval or
+-- rejection), written in the same transaction that flips the gate, so a
+-- crash cannot separate the decision from its record. Deliberately NOT
+-- archived with the run and never deleted by retention: GitHub keeps an
+-- environment's review history after the run is gone, and this table is
+-- the only durable record of who released a gate. `run_id`/`job_id` carry
+-- no foreign key for exactly that reason — the run row they name may be
+-- deleted while the audit row must survive.
+CREATE TABLE environment_approvals (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    namespace_id    text NOT NULL,
+    run_id          uuid NOT NULL,
+    job_id          text NOT NULL,
+    repository      text NOT NULL,
+    environment     text NOT NULL,
+    decision        text NOT NULL CHECK (decision IN ('approved','rejected')),
+    -- GitHub login of the reviewing user; NULL for the operator's
+    -- system-token (admin) override, which carries no user identity.
+    actor           text,
+    admin_override  boolean NOT NULL DEFAULT false,
+    -- Reviewer comment, when one was supplied (native approve endpoint).
+    comment         text,
+    decided_at      timestamptz NOT NULL
+);
+CREATE INDEX environment_approvals_gate ON environment_approvals(run_id, job_id);
 
 -- ── Artifacts (replaces the artifact part of the `meta` blob) ────────
 -- Blobs live in object storage; these rows are the shared index. Upload

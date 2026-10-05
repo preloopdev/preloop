@@ -1482,6 +1482,17 @@ impl LiteBackend {
                     .map_err(db)?
                     .execute(params![codec::run_key(run_id), job_id.0, gate_json])
                     .map_err(db)?;
+                    insert_environment_approval_audit(
+                        tx,
+                        run_id,
+                        &job_id,
+                        &env_name,
+                        "approved",
+                        actor.as_deref(),
+                        admin_override,
+                        note.as_deref(),
+                        now,
+                    )?;
                     if admin_override {
                         tracing::warn!(
                             run_id = %run_id.0,
@@ -1521,6 +1532,17 @@ impl LiteBackend {
                     .map_err(db)?
                     .execute(params![codec::run_key(run_id), job_id.0, gate_json])
                     .map_err(db)?;
+                    insert_environment_approval_audit(
+                        tx,
+                        run_id,
+                        &job_id,
+                        &env_name,
+                        "rejected",
+                        actor.as_deref(),
+                        admin_override,
+                        note.as_deref(),
+                        now,
+                    )?;
                     tracing::warn!(
                         run_id = %run_id.0,
                         job_id = %job_id.0,
@@ -1559,4 +1581,110 @@ impl LiteBackend {
             Ok(())
         })
     }
+}
+
+impl LiteBackend {
+    /// `environment_approvals`: the durable review-decision audit rows for
+    /// one job, oldest first. Read straight from the audit table — it is not
+    /// archived with the run, so archived runs answer here too.
+    pub(crate) async fn environment_approvals(
+        &self,
+        run_id: RunId,
+        job_id: &JobId,
+    ) -> Result<Vec<EnvironmentApprovalAudit>, ControlError> {
+        let job_id = job_id.clone();
+        self.read(move |tx| {
+            let mut stmt = tx
+                .prepare_cached(
+                    "SELECT repository, environment, decision, actor, admin_override, \
+                            comment, decided_at \
+                     FROM environment_approvals \
+                     WHERE run_id = ?1 AND job_id = ?2 \
+                     ORDER BY id",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![codec::run_key(run_id), job_id.0], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(db)?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (repository, environment, decision, actor, admin_override, comment, decided) =
+                    row.map_err(db)?;
+                out.push(EnvironmentApprovalAudit {
+                    run_id,
+                    job_id: job_id.clone(),
+                    repository,
+                    environment,
+                    decision,
+                    actor,
+                    admin_override: admin_override != 0,
+                    comment,
+                    decided_at_unix_nanos: decided,
+                });
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Append one durable environment-review audit row
+/// (`environment_approvals`): who decided what on which environment, when,
+/// and with which comment. Called inside the decision's own transaction so
+/// the gate flip and its audit record commit together — a decision can never
+/// exist without its record, and vice versa.
+///
+/// The repository and namespace are read from the run row here rather than
+/// carried by the caller: the audit row is what survives the run, so it
+/// denormalizes the facts retention will delete. Run archival never touches
+/// this table (see the schema comment).
+#[allow(clippy::too_many_arguments)]
+fn insert_environment_approval_audit(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    job_id: &JobId,
+    environment: &str,
+    decision: &str,
+    actor: Option<&str>,
+    admin_override: bool,
+    comment: Option<&str>,
+    decided_at_unix_nanos: i64,
+) -> Result<(), ControlError> {
+    let (namespace_id, repository): (String, String) = tx
+        .prepare_cached("SELECT namespace_id, repository FROM runs WHERE run_id = ?1")
+        .map_err(db)?
+        .query_row([codec::run_key(run_id)], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(db)?;
+    tx.prepare_cached(
+        "INSERT INTO environment_approvals \
+         (namespace_id, run_id, job_id, repository, environment, decision, actor, \
+          admin_override, comment, decided_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )
+    .map_err(db)?
+    .execute(params![
+        namespace_id,
+        codec::run_key(run_id),
+        job_id.0,
+        repository,
+        environment,
+        decision,
+        actor,
+        admin_override as i64,
+        comment,
+        decided_at_unix_nanos,
+    ])
+    .map_err(db)?;
+    Ok(())
 }

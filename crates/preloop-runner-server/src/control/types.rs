@@ -1129,6 +1129,32 @@ pub(crate) struct EnvironmentDeploymentRow {
     pub(crate) deployment_id: Option<u64>,
 }
 
+/// One durable environment-review audit row (`environment_approvals`): who
+/// decided what on which environment, when, and with which comment. The row
+/// outlives the gate and the run — run archival never deletes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnvironmentApprovalAudit {
+    /// The run the decision belonged to (a plain key: the run row may be
+    /// archived while this audit row stays readable).
+    pub(crate) run_id: RunId,
+    pub(crate) job_id: JobId,
+    /// The run's repository (`owner/repo`).
+    pub(crate) repository: String,
+    /// The post-hydration environment name the gate was armed against.
+    pub(crate) environment: String,
+    /// `"approved"` or `"rejected"`.
+    pub(crate) decision: String,
+    /// GitHub login of the reviewing user; `None` for the operator's
+    /// system-token (admin) override, which carries no user identity.
+    pub(crate) actor: Option<String>,
+    /// The decision bypassed the reviewer list (native admin endpoint).
+    pub(crate) admin_override: bool,
+    /// Reviewer comment, when one was supplied.
+    pub(crate) comment: Option<String>,
+    /// When the decision was recorded (unix nanos).
+    pub(crate) decided_at_unix_nanos: i64,
+}
+
 /// `record_environment_approval` outcome plus the queue gauges the handler
 /// mirrors into the node-local store.
 #[derive(Debug)]

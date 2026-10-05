@@ -3641,6 +3641,7 @@ pub(crate) mod suite {
                     outputs: preloop_gha_protocol::OutputMap::new(),
                     annotations: Vec::new(),
                     step_results: Vec::new(),
+                    environment_url: None,
                 },
                 settle: Some(AttemptSettle {
                     agent_job_id: agent,
@@ -3698,6 +3699,7 @@ pub(crate) mod suite {
                         status: Some(serde_json::json!("completed")),
                         conclusion: Some(serde_json::json!("succeeded")),
                     }],
+                    environment_url: None,
                 },
                 settle: Some(AttemptSettle {
                     agent_job_id: agent,
