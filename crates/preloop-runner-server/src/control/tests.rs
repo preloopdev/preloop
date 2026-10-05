@@ -1954,6 +1954,449 @@ pub(crate) mod suite {
         );
     }
 
+    /// The TOML rules map for `owner/repo` carrying one environment's rule.
+    fn rules_for(environment: &str, rule: crate::config::EnvironmentRules) -> EnvironmentRulesMap {
+        let mut rules = EnvironmentRulesMap::new();
+        rules
+            .entry("owner/repo".to_owned())
+            .or_default()
+            .insert(environment.to_owned(), rule);
+        rules
+    }
+
+    /// A job claiming an environment no rule set knows runs like any other
+    /// job: the gate proceeds, no hold is armed, and no gate row survives.
+    /// GitHub auto-creates a referenced environment unprotected, so preloop
+    /// must not reject or park an unknown name (the registry is gone).
+    pub(crate) async fn unknown_environment_runs_without_a_gate(backend: &dyn ControlBackend) {
+        // Rules exist for a *different* environment: the unknown name must
+        // still resolve to "no protection", not to the sibling's rule. The
+        // submit path pre-evaluates the gate, so a parked (armed) job is the
+        // realistic shape — as is the release below.
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules_for(
+                "other",
+                crate::config::EnvironmentRules {
+                    required_reviewers: 1,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("staging"));
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        backend.submit_run(submit).await.unwrap();
+
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        assert_eq!(
+            outcome.promoted, 1,
+            "an environment with no rules must not gate"
+        );
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned())),
+            "the unknown environment's job reaches the ready queue"
+        );
+        let gate = backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate;
+        assert!(
+            gate.is_none(),
+            "an unprotected environment must not leave gate state behind"
+        );
+        assert!(
+            backend
+                .pending_environment_approvals(Some(run_id))
+                .await
+                .unwrap()
+                .is_empty(),
+            "no review surface is announced for an unprotected environment"
+        );
+    }
+
+    /// A required-reviewer rule parks the job on an armed approval gate
+    /// (stamped `approval_requested_at`), and `record_environment_approval`
+    /// decides it: approving releases the job to the ready queue, rejecting
+    /// concludes it `failure` — GitHub's reviewer-rejection semantics. Every
+    /// decision leaves its durable audit row.
+    pub(crate) async fn reviewer_gate_holds_until_decision(backend: &dyn ControlBackend) {
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules_for(
+                "prod",
+                crate::config::EnvironmentRules {
+                    required_reviewers: 1,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        // The submit path pre-evaluates the gate and parks the job when the
+        // rules gate it; the sweep below arms the approval request.
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        backend.submit_run(submit).await.unwrap();
+
+        // Admission arms the gate and parks the job.
+        let armed = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        assert_eq!(armed.promoted, 0, "the reviewer gate must hold the job");
+        assert_eq!(armed.failed, 0, "an armed reviewer gate never denies");
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned()))
+        );
+        let gate = backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("the reviewer gate is armed");
+        assert!(
+            gate.approval_requested_at_unix_nanos.is_some(),
+            "the gate stamps when the approval was requested"
+        );
+        assert_eq!(gate.environment_name.as_deref(), Some("prod"));
+        let pending = backend
+            .pending_environment_approvals(Some(run_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the held job is the GitHub announce loop's input"
+        );
+
+        // An approval satisfies the gate and the same command's promotion
+        // pass releases the job.
+        let outcome = backend
+            .record_environment_approval(EnvironmentApproval {
+                run_id,
+                job_id: job_id.clone(),
+                decision: EnvironmentDecision::Approve,
+                actor: Some("octocat".to_owned()),
+                admin_override: false,
+                note: Some("ship it".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                outcome.result,
+                EnvironmentApprovalResult::Recorded {
+                    approvals: 1,
+                    satisfied: true,
+                    ..
+                }
+            ),
+            "one approval satisfies the one-reviewer gate, got {:?}",
+            outcome.result
+        );
+        assert_eq!(outcome.promoted, 1, "the release promotes the job");
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("ready".to_owned(), "queued".to_owned())),
+            "the approved job reaches the ready queue"
+        );
+        let gate = backend
+            .environment_gate(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("job exists")
+            .gate
+            .expect("the satisfied gate keeps its record");
+        assert_eq!(gate.approvals.len(), 1);
+        assert_eq!(gate.approvals[0].actor.as_deref(), Some("octocat"));
+        assert!(!gate.approvals[0].admin_override);
+        let audit = backend
+            .environment_approvals(run_id, &job_id)
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1, "the approval writes one audit row");
+        assert_eq!(audit[0].decision, "approved");
+        assert_eq!(audit[0].actor.as_deref(), Some("octocat"));
+        assert_eq!(audit[0].environment, "prod");
+        assert_eq!(audit[0].repository, "owner/repo");
+        assert_eq!(audit[0].comment.as_deref(), Some("ship it"));
+        assert!(!audit[0].admin_override);
+
+        // A second job on the same rules: rejecting it fails the job closed.
+        let rejected_run = RunId::new();
+        let rejected_job = JobId("deploy".to_owned());
+        let mut submit = submit_run(rejected_run, vec![submit_job(rejected_run, "deploy", 2)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        backend.submit_run(submit).await.unwrap();
+        backend
+            .promote_ready_jobs(Some(rejected_run))
+            .await
+            .unwrap();
+        let outcome = backend
+            .record_environment_approval(EnvironmentApproval {
+                run_id: rejected_run,
+                job_id: rejected_job.clone(),
+                decision: EnvironmentDecision::Reject,
+                actor: Some("octocat".to_owned()),
+                admin_override: false,
+                note: Some("not today".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome.result, EnvironmentApprovalResult::Rejected),
+            "the rejection is recorded, got {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            backend
+                .job_queue_state(rejected_run, &rejected_job)
+                .await
+                .unwrap(),
+            Some(("none".to_owned(), "failure".to_owned())),
+            "a rejected deployment never dispatches"
+        );
+        assert!(
+            backend
+                .run_record(rejected_run)
+                .await
+                .unwrap()
+                .status
+                .is_terminal(),
+            "the rejection concludes the run"
+        );
+        let audit = backend
+            .environment_approvals(rejected_run, &rejected_job)
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].decision, "rejected");
+        assert_eq!(audit[0].comment.as_deref(), Some("not today"));
+    }
+
+    /// Rules that could not be fetched hold the job fail-closed — never
+    /// "no rules": a GitHub-covered repository whose environment has never
+    /// resolved answers `Pending`, admission parks the job `held`/`pending`,
+    /// and the key queues for the reaper's fetch pass.
+    pub(crate) async fn unresolved_environment_rules_hold_the_job(backend: &dyn ControlBackend) {
+        let resolver = Arc::new(crate::environment_resolver::EnvironmentResolver::new(
+            EnvironmentRulesMap::new(),
+        ));
+        resolver.set_github_configured();
+        backend.set_environment_resolver(resolver.clone());
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        // Parked at submit, the way the submit path parks a gated job.
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        backend.submit_run(submit).await.unwrap();
+
+        let outcome = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        assert_eq!(
+            outcome.promoted, 0,
+            "an unresolved rule set must not admit the job"
+        );
+        assert_eq!(outcome.failed, 0, "a fetch failure holds, it never denies");
+        assert_eq!(
+            backend.job_queue_state(run_id, &job_id).await.unwrap(),
+            Some(("blocked".to_owned(), "pending".to_owned())),
+            "the job stays held until the rules resolve"
+        );
+        assert_eq!(
+            resolver.pending_keys(),
+            vec![("owner/repo".to_owned(), "prod".to_owned())],
+            "the held lookup queues its key for the reaper's fetch"
+        );
+        // A second sweep with the rules still unresolved must not change the
+        // verdict: the hold is stable, not a one-shot pass.
+        let again = backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        assert_eq!((again.promoted, again.failed), (0, 0));
+    }
+
+    /// The runner evaluates `environment.url` after the job's steps ran and
+    /// reports it with the completion (`environmentUrl` — the official
+    /// runner's `JobRunner.CompleteJobAsync` reads it off
+    /// `ActionsEnvironment.Url`). The settled job carries that evaluated
+    /// value into its deployment row, overriding the pre-completion literal;
+    /// before the report, a `${{ … }}` template is never surfaced as a URL.
+    pub(crate) async fn reported_environment_url_lands_on_the_deployment_row(
+        backend: &dyn ControlBackend,
+    ) {
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            EnvironmentRulesMap::new(),
+        ));
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!({
+            "name": "staging",
+            "url": "https://${{ steps.s.outputs.host }}.example.com",
+        }));
+        backend.submit_run(submit).await.unwrap();
+        // Pre-completion the row carries no URL: the template is unevaluated.
+        // (The deployment row itself only materializes once the job's
+        // environment is stored — assert the URL shape when it is there.)
+        if let Some(row) = backend
+            .environment_deployment(run_id, &job_id)
+            .await
+            .unwrap()
+        {
+            assert_eq!(row.environment, "staging");
+            assert_eq!(
+                row.environment_url, None,
+                "an unevaluated `${{ }}` template is never surfaced as a URL"
+            );
+        }
+
+        let (runner, session) = live_runner(backend, "env-url-runner").await;
+        let claimed = match backend.poll_session(poll(&session, runner)).await.unwrap() {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id,
+                    job_id: job_id.clone(),
+                    agent_job_id: Some(claimed.request.agent_job_id),
+                    status: ExecutionStatus::Success,
+                    outputs: preloop_gha_protocol::OutputMap::new(),
+                    annotations: Vec::new(),
+                    step_results: Vec::new(),
+                    environment_url: Some("https://vm-42.example.com".to_owned()),
+                },
+                settle: Some(AttemptSettle {
+                    agent_job_id: claimed.request.agent_job_id,
+                    runner_id: runner,
+                }),
+            })
+            .await
+            .unwrap();
+        let row = backend
+            .environment_deployment(run_id, &job_id)
+            .await
+            .unwrap()
+            .expect("the deployment row survives the completion");
+        assert_eq!(
+            row.environment_url.as_deref(),
+            Some("https://vm-42.example.com"),
+            "the runner-evaluated URL wins over the unevaluated template"
+        );
+    }
+
+    /// The `environment_approvals` audit row outlives the decision, the job
+    /// and the run: it is written in the decision's own transaction and
+    /// archival never deletes it. `backdate` moves the completed run past the
+    /// archival grace so `archive_finished_runs` really claims it (no
+    /// `ControlBackend` command expresses a `completed_at` edit, so each
+    /// backend supplies its own SQL escape hatch).
+    pub(crate) async fn environment_approval_audit_survives_archival<F, Fut>(
+        backend: &dyn ControlBackend,
+        backdate: F,
+    ) where
+        F: Fn(RunId) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        backend.set_environment_resolver(crate::environment_resolver::EnvironmentResolver::local(
+            rules_for(
+                "prod",
+                crate::config::EnvironmentRules {
+                    required_reviewers: 1,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let run_id = RunId::new();
+        let job_id = JobId("deploy".to_owned());
+        let mut submit = submit_run(run_id, vec![submit_job(run_id, "deploy", 1)]);
+        submit.jobs[0].queued.environment = Some(serde_json::json!("prod"));
+        // Parked at submit (the submit path parks a gated job), so the
+        // approval below has an armed gate to decide.
+        submit.jobs[0].queued.environment_gate =
+            Some(crate::models::EnvironmentGateState::default());
+        backend.submit_run(submit).await.unwrap();
+        backend.promote_ready_jobs(Some(run_id)).await.unwrap();
+        backend
+            .record_environment_approval(EnvironmentApproval {
+                run_id,
+                job_id: job_id.clone(),
+                decision: EnvironmentDecision::Approve,
+                actor: Some("octocat".to_owned()),
+                admin_override: false,
+                note: Some("ship it".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        // Run the approved job to completion through a real claim.
+        let (runner, session) = live_runner(backend, "audit-runner").await;
+        let claimed = match backend.poll_session(poll(&session, runner)).await.unwrap() {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: job_id.clone(),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner),
+            })
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .run_record(run_id)
+                .await
+                .unwrap()
+                .status
+                .is_terminal(),
+            "the completed job settles its run"
+        );
+        assert_eq!(
+            backend
+                .environment_approvals(run_id, &job_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the audit row survives the job's completion"
+        );
+
+        backdate(run_id).await;
+        assert!(
+            backend
+                .archive_finished_runs(32)
+                .await
+                .unwrap()
+                .contains(&run_id),
+            "the completed run must archive"
+        );
+        let audit = backend
+            .environment_approvals(run_id, &job_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            audit.len(),
+            1,
+            "archival must never delete the environment-review audit"
+        );
+        assert_eq!(audit[0].decision, "approved");
+        assert_eq!(audit[0].actor.as_deref(), Some("octocat"));
+    }
+
     pub(crate) async fn concurrency_gate_serializes_group(backend: &dyn ControlBackend) {
         let run_a = RunId::new();
         let mut submit_a = submit_run(run_a, vec![submit_job(run_a, "deploy", 1)]);
@@ -5800,6 +6243,55 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn unknown_environment_runs_without_a_gate() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unknown_environment_runs_without_a_gate(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_gate_holds_until_decision() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reviewer_gate_holds_until_decision(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn unresolved_environment_rules_hold_the_job() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::unresolved_environment_rules_hold_the_job(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reported_environment_url_lands_on_the_deployment_row() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::reported_environment_url_lands_on_the_deployment_row(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn environment_approval_audit_survives_archival() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        let db = &backend;
+        suite::environment_approval_audit_survives_archival(&backend, |run_id| async move {
+            db.test_execute(&format!(
+                "UPDATE runs SET completed_at = now() - interval '10 minutes' \
+                 WHERE run_id = '{run_id}'::uuid"
+            ))
+            .await
+            .unwrap()
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn list_runs_filters_on_the_projected_status() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -6853,6 +7345,47 @@ mod lite {
     #[tokio::test]
     async fn environment_gate_parks_until_satisfied() {
         suite::environment_gate_parks_until_satisfied(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_environment_runs_without_a_gate() {
+        suite::unknown_environment_runs_without_a_gate(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reviewer_gate_holds_until_decision() {
+        suite::reviewer_gate_holds_until_decision(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn unresolved_environment_rules_hold_the_job() {
+        suite::unresolved_environment_rules_hold_the_job(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn reported_environment_url_lands_on_the_deployment_row() {
+        suite::reported_environment_url_lands_on_the_deployment_row(
+            &LiteBackend::in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn environment_approval_audit_survives_archival() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let db = &backend;
+        suite::environment_approval_audit_survives_archival(&backend, move |run_id| async move {
+            let completed = crate::models::now_unix_nanos() / 1000 - 120 * 1_000_000;
+            db.test_db_mutate(move |tx| {
+                tx.execute(
+                    "UPDATE runs SET completed_at = ?1 WHERE run_id = ?2",
+                    (completed, run_id.0.to_string()),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        })
+        .await;
     }
 
     #[tokio::test]

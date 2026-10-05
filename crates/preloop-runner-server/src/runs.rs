@@ -4508,8 +4508,10 @@ mod tests {
         let api_base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
         // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+        // The guard restores the previous value when the test ends, so a
+        // leaked stub base cannot poison later tests.
         let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
-        unsafe { std::env::set_var("PRELOOP_GITHUB_API_URL", api_base) };
+        let _api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
 
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");

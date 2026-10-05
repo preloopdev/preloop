@@ -18,6 +18,10 @@
 //! rules — GitHub auto-creates an environment the first time a workflow
 //! references it, with zero protection
 //! (https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments).
+//! Because GitHub also answers 404 for resources a credential cannot see, a
+//! missing environment is only accepted as "unprotected" when the same
+//! credential can read the repository's Actions surface; otherwise the
+//! fetch fails and the gate holds.
 //!
 //! Transactions cannot await, so the synchronous lookup
 //! ([`EnvironmentResolver::lookup_sync`]) reads only cached state: a key that
@@ -76,6 +80,13 @@ struct ResolvedEntry {
     fetched_at: Instant,
 }
 
+/// `(repository, environment)` — the resolver's cache key.
+type ResolverKey = (String, String);
+/// One in-flight fetch per key, so concurrent lookups collapse.
+type InflightMap = tokio::sync::Mutex<HashMap<ResolverKey, Arc<tokio::sync::Mutex<()>>>>;
+/// `(org, team_slug)` → `(fetched_at, member logins)`.
+type TeamMembers = parking_lot::RwLock<HashMap<ResolverKey, (Instant, Vec<String>)>>;
+
 /// Rule resolution with a TTL cache over GitHub's environments API.
 ///
 /// `Default` yields the pure-local resolver: no GitHub credential is ever
@@ -99,9 +110,9 @@ pub struct EnvironmentResolver {
     pending: parking_lot::Mutex<BTreeSet<(String, String)>>,
     /// In-flight fetches, one per key, so concurrent submissions for the
     /// same environment collapse onto one API round-trip.
-    inflight: tokio::sync::Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    inflight: InflightMap,
     /// `(org, team_slug)` → member logins, for reviewer authorization.
-    team_members: parking_lot::RwLock<HashMap<(String, String), (Instant, Vec<String>)>>,
+    team_members: TeamMembers,
 }
 
 impl EnvironmentResolver {
@@ -191,8 +202,10 @@ impl EnvironmentResolver {
     ///
     /// Fetch failures are retried by the caller (`refresh_stale`) — the key
     /// stays in `pending` so a held gate re-evaluates once GitHub answers.
-    /// A `404` on the environment resolves to *no rules*: GitHub auto-creates
-    /// referenced environments unprotected.
+    /// A `404` on the environment resolves to *no rules* (GitHub auto-creates
+    /// referenced environments unprotected) only when the credential can
+    /// demonstrably read the repository's Actions surface; an unreadable
+    /// repository 404s the same way, and that case errors (fail closed).
     pub async fn resolve(
         &self,
         shared: &crate::state::SharedState,
@@ -341,14 +354,13 @@ impl EnvironmentResolver {
                 EnvironmentReviewer::User(login) if login.eq_ignore_ascii_case(sender) => {
                     return Ok(true);
                 }
-                EnvironmentReviewer::Team { org, slug } => {
+                EnvironmentReviewer::Team { org, slug }
                     if self
                         .team_member(shared, repository, org, slug, sender)
                         .await
-                        .unwrap_or(false)
-                    {
-                        return Ok(true);
-                    }
+                        .unwrap_or(false) =>
+                {
+                    return Ok(true);
                 }
                 _ => {}
             }
@@ -444,6 +456,35 @@ async fn github_get(api_base: &str, token: &str, path: &str) -> anyhow::Result<O
     Ok(Some(res.json().await?))
 }
 
+/// Whether the credential can read this repository's Actions surface —
+/// `GET /repos/{o}/{r}/actions/runs` needs the same `actions: read` grant the
+/// environment GETs do.
+///
+/// This is the disambiguator for an environment 404: GitHub answers 404 both
+/// for an environment that does not exist *and* for a resource the token
+/// cannot see (a minted App token is clamped to the installation's grants, so
+/// an App without `actions: read` 404s a protected environment). Treating
+/// that second 404 as "auto-created unprotected" would fail open, so the
+/// caller only accepts the 404 as "no protection" when this probe succeeds.
+async fn actions_readable(api_base: &str, token: &str, repository: &str) -> bool {
+    let path = format!("/repos/{repository}/actions/runs?per_page=1");
+    match crate::shared_http::CLIENT
+        .get(format!("{api_base}{path}"))
+        .header("User-Agent", "preloop")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2026-03-10")
+        .send()
+        .await
+    {
+        Ok(res) => res.status().is_success(),
+        Err(error) => {
+            tracing::warn!(repository, %error, "Actions-surface probe failed; keeping the gate closed");
+            false
+        }
+    }
+}
+
 /// Fetch and map an environment's full protection rule set.
 ///
 /// Three reads: the environment record (protection rules + branch-policy
@@ -461,7 +502,18 @@ async fn fetch_environment_rules(
     let env_path = format!("/repos/{repository}/environments/{encoded_env}");
     let Some(env_json) = github_get(api_base, token, &env_path).await? else {
         // GitHub auto-creates an environment the first time a workflow
-        // references it, with no protection — so a 404 resolves to no rules.
+        // references it, with no protection — but the same 404 is also what a
+        // credential that cannot read the repository's environment
+        // configuration sees, and that must not read as "unprotected". Only
+        // accept the 404 when the credential demonstrably has the
+        // `actions: read` grant; otherwise fail closed (the key stays pending
+        // and the gate holds).
+        anyhow::ensure!(
+            actions_readable(api_base, token, repository).await,
+            "GET {env_path} returned 404 and the credential cannot read \
+             {repository}'s Actions surface: the 404 may be an authorization \
+             failure, so the environment rules stay unresolved (fail closed)"
+        );
         return Ok(EnvironmentRules::default());
     };
 
@@ -689,6 +741,22 @@ mod tests {
 
     impl StubApi {
         async fn serve(env_json: Value, branch_policies: Value, protection_rules: Value) -> Self {
+            Self::serve_with(env_json, branch_policies, protection_rules, true).await
+        }
+
+        /// A stub whose Actions surface answers 404 — the shape a credential
+        /// without `actions: read` sees, which makes an environment 404
+        /// ambiguous.
+        async fn serve_with_unreadable_actions(env_json: Value) -> Self {
+            Self::serve_with(env_json, json!({}), json!({}), false).await
+        }
+
+        async fn serve_with(
+            env_json: Value,
+            branch_policies: Value,
+            protection_rules: Value,
+            actions_readable: bool,
+        ) -> Self {
             let stub = Router::new()
                 .route(
                     "/repos/owner/repo/environments/prod/deployment-branch-policies",
@@ -723,6 +791,16 @@ mod tests {
                 .route(
                     "/orgs/acme/teams/deployers/members",
                     get(|| async { Json(json!([{"login": "teammate"}, {"login": "octocat"}])) }),
+                )
+                .route(
+                    "/repos/owner/repo/actions/runs",
+                    get(move || async move {
+                        if actions_readable {
+                            Ok(Json(json!({"total_count": 0, "workflow_runs": []})))
+                        } else {
+                            Err(axum::http::StatusCode::NOT_FOUND)
+                        }
+                    }),
                 );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -744,14 +822,20 @@ mod tests {
 
     /// PAT-mode resolve (no App configured): `PRELOOP_GITHUB_TOKEN` +
     /// `PRELOOP_GITHUB_API_URL` point the fetch at the stub. Held for the
-    /// test — the vars are process-global.
-    async fn pat_env(api_base: &str) -> tokio::sync::MutexGuard<'static, ()> {
+    /// test — the vars are process-global — and restored when the guards
+    /// drop (including on panic): a leaked stub base or token poisons every
+    /// later test in the binary that resolves refs or reads the config PAT.
+    async fn pat_env(
+        api_base: &str,
+    ) -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        crate::state::TestEnvVar,
+        crate::state::TestEnvVar,
+    ) {
         let lock = crate::state::GITHUB_ENV_LOCK.lock().await;
-        unsafe {
-            std::env::set_var("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
-            std::env::set_var("PRELOOP_GITHUB_API_URL", api_base);
-        }
-        lock
+        let token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "ghp_test_token");
+        let api = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+        (lock, token, api)
     }
 
     #[tokio::test]
@@ -826,6 +910,63 @@ mod tests {
             *rules,
             EnvironmentRules::default(),
             "GitHub auto-creates environments unprotected: a 404 is no rules"
+        );
+    }
+
+    /// A 404 whose credential cannot read the repository's Actions surface is
+    /// ambiguous — it may be a protected environment the token cannot see —
+    /// and must fail closed: the resolve errors, the key stays pending, and
+    /// the gate holds instead of promoting the job unprotected.
+    #[tokio::test]
+    async fn unreadable_actions_surface_keeps_a_404_fail_closed() {
+        let stub = StubApi::serve_with_unreadable_actions(Value::Null).await;
+        let _env = pat_env(&stub.base).await;
+        let shared = shared().await;
+        let resolver = EnvironmentResolver::local(EnvironmentRulesMap::new());
+        resolver.set_github_configured();
+
+        let error = resolver
+            .resolve_at(&stub.base, &shared, "owner/repo", "prod")
+            .await
+            .expect_err("an unreadable 404 must not resolve to \"no rules\"");
+        assert!(
+            format!("{error:#}").contains("fail closed"),
+            "the error must explain the fail-closed verdict, got: {error:#}"
+        );
+        assert!(
+            matches!(
+                resolver.lookup_sync("owner/repo", "prod"),
+                EnvironmentLookup::Pending
+            ),
+            "the unresolved key must keep the gate held"
+        );
+        assert_eq!(
+            resolver.pending_keys(),
+            vec![("owner/repo".to_owned(), "prod".to_owned())],
+            "the reaper must retry the key"
+        );
+
+        // End to end: the admission gate reads that same lookup, so the
+        // job's own gate check holds it (fail closed) instead of promoting
+        // the deployment unprotected.
+        let mut gate = None;
+        let outcome = crate::runtime_scheduling::evaluate_environment_gate(
+            &resolver.lookup_sync("owner/repo", "prod"),
+            "refs/heads/main",
+            preloop_gha_protocol::RunId::new(),
+            &preloop_gha_protocol::JobId("deploy".to_owned()),
+            "prod",
+            &mut gate,
+            1_700_000_000_000_000_000,
+        );
+        assert_eq!(
+            outcome,
+            crate::runtime_scheduling::EnvironmentGateOutcome::Wait,
+            "an ambiguous 404 must hold the job, never promote it unprotected"
+        );
+        assert!(
+            gate.is_some(),
+            "the held job keeps its armed gate for the reaper's retry"
         );
     }
 

@@ -695,13 +695,32 @@ webhooks for them to arrive. Required App permissions: `Actions: read` and
 the environments GETs), and `Members: read` at the org level when
 environment reviewers include teams. A missing grant degrades that one
 surface — an unauthorized review is simply ignored — and the job holds
-until the rules resolve.
+until the rules resolve. GitHub answers 404 for resources a credential cannot
+see, so a missing environment is only accepted as "no protection" when the
+same credential can read the repository's Actions surface; otherwise the
+fetch fails and the job holds (it is retried once the grant exists).
 
 The GitHub deployment for an `environment:` job is created lazily on the
 first announce and carries the resolved name; `environment.url` (or
 `environment_url`) rides on each deployment status, and the statuses
 track the job: `pending` while reviewers deliberate, `queued` once
 approved, `in_progress` at job start, `success`/`failure` at conclusion.
+
+`environment.url` may reference `steps.<id>.outputs`, which exist only once
+the job has run: the runner evaluates the expression at job completion and
+reports the result over the completion protocol, and that evaluated value is
+what the terminal deployment status carries. Until the report lands only a
+literal URL is known — an unevaluated `${{ … }}` template is never posted
+to GitHub.
+
+The `[environments]` registry is gone. GitHub accepts any `environment:`
+name, auto-creates the environment unprotected on first reference, and
+applies whatever protection rules the repository configured for it — so
+preloop no longer rejects unknown names, and no longer sources gating from a
+local registry. A config file still carrying a non-empty `[environments]`
+table fails the load with an error naming the removed table: silently
+ignoring it would change what the operator believes is enforced.
+Environment secrets stay keyed by name under `[env_secrets]`.
 
 With no GitHub credential configured (local mode), `[environment_rules]`
 TOML remains the whole story, unchanged:

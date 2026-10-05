@@ -233,14 +233,14 @@ pub fn evaluate_environment_gate(
             "environment gate: wait timer armed"
         );
     }
-    if let Some(deadline) = gate.wait_until_unix_nanos {
-        if now_unix_nanos < deadline {
-            return EnvironmentGateOutcome::Wait;
-        }
-        // Keep the elapsed stamp: released jobs re-enter this evaluator on
-        // the promotion sweep, and clearing it would re-arm a fresh timer
-        // against a rule that still declares `wait_timer_minutes`.
+    if let Some(deadline) = gate.wait_until_unix_nanos
+        && now_unix_nanos < deadline
+    {
+        return EnvironmentGateOutcome::Wait;
     }
+    // Keep the elapsed stamp: released jobs re-enter this evaluator on
+    // the promotion sweep, and clearing it would re-arm a fresh timer
+    // against a rule that still declares `wait_timer_minutes`.
 
     // 4. Required reviewers: hold until enough approvals are recorded, fail
     // closed when the window expires. The required count is stamped on the
@@ -1311,12 +1311,31 @@ mod environment_gate_tests {
             deadline + 1,
         );
         assert_eq!(outcome, EnvironmentGateOutcome::Proceed);
-        assert!(
+        // The elapsed deadline stays stamped: released jobs re-enter this
+        // evaluator on the promotion sweep, and clearing it would re-arm a
+        // fresh timer against a rule that still declares `wait_timer_minutes`.
+        assert_eq!(
             job.environment_gate
                 .as_ref()
-                .and_then(|gate| gate.wait_until_unix_nanos)
-                .is_none(),
-            "satisfied timer must be cleared"
+                .and_then(|gate| gate.wait_until_unix_nanos),
+            Some(deadline),
+            "the elapsed deadline stays stamped so re-evaluation cannot re-arm it"
+        );
+        // A later pass still proceeds and never re-arms a fresh deadline.
+        let outcome = check_environment_gates(
+            &rules,
+            "owner/repo",
+            "refs/heads/main",
+            &mut job,
+            deadline + 60 * MIN,
+        );
+        assert_eq!(outcome, EnvironmentGateOutcome::Proceed);
+        assert_eq!(
+            job.environment_gate
+                .as_ref()
+                .and_then(|gate| gate.wait_until_unix_nanos),
+            Some(deadline),
+            "a satisfied timer must not restart"
         );
     }
 

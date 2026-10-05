@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Added
+
+- Environment protection rules now come from GitHub. When a GitHub App (or
+  `PRELOOP_GITHUB_TOKEN`) covers a repository, the rules for a job's
+  `environment:` are read from the repository's environments API —
+  deployment branch policies (including `protected_branches` expansion via
+  the protected-branch list), `wait_timer`, `required_reviewers` with
+  `prevent_self_review` (teams expanded via the org members API), and
+  custom deployment protection rules (which fail the job closed: their
+  callback contract cannot be impersonated). Rules are cached for 60
+  seconds and refreshed by the reaper. `[environment_rules]` TOML remains
+  the source for repositories no credential covers, and for local mode.
+- Reviewer approvals arrive as `check_run.requested_action` webhooks: the
+  held job's check run is PATCHed to `action_required` with Approve/Reject
+  actions, the deployment status is `pending`, and an authorized click
+  releases the job (`queued`) or rejects it (the job fails, matching
+  GitHub). Approvals, rejections, and the native admin override are
+  recorded in a new durable `environment_approvals` table that outlives the
+  run and its archival.
+- Every `environment:` job now gets a GitHub Deployment whose statuses
+  track the job: `pending` while reviewers deliberate, `queued` on
+  approval, `in_progress` at job start, `success`/`failure` at conclusion.
+  `environment.url` is evaluated by the runner at job completion (so
+  `steps.<id>.outputs` works) and reported over the completion protocol;
+  the evaluated value rides on the deployment statuses.
+- The App manifest requests `actions: read` and `deployments: write` (check
+  runs already needed `checks: write`) so the environment surfaces work
+  without a second install.
+
+### Changed
+
+- **Breaking:** the `[environments]` config table is removed. GitHub
+  accepts any `environment:` name and auto-creates it unprotected, so an
+  unknown name is no longer rejected (no more 403 at submit) and gating is
+  decided by the environment's rules. A config file with a non-empty
+  `[environments]` table now fails to load with an error naming the removed
+  table. Environment secrets stay keyed by name under `[env_secrets]`.
+- **Breaking:** the control-store schema version bumped (SQLite 3 → 4,
+  Postgres 4 → 5) for the `environment_approvals` table and the job's
+  environment-gate columns. There are no migrations: existing dev databases
+  are refused at boot and must be recreated.
+- Environment rules that cannot be fetched hold the job fail-closed
+  (a resolver `Pending` state) instead of proceeding unprotected; a job
+  not approved within 24 hours fails closed.
 
 ### Security
 

@@ -6747,7 +6747,7 @@ impl PgBackend {
             .query_opt(
                 "SELECT r.repository, r.head_sha, j.environment_gate::text, \
                         j.check_run_id, j.deployment_id, j.environment_url, \
-                        s.environment::text, m.message_template \
+                        s.environment::text, m.message_template::text \
                  FROM jobs j \
                  JOIN runs r ON r.run_id = j.run_id \
                  LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \
@@ -6763,8 +6763,10 @@ impl PgBackend {
         let gate: Option<crate::models::EnvironmentGateState> = row
             .get::<_, Option<String>>(2)
             .and_then(|json| from_json(&json).ok());
+        // Column order: 5 `jobs.environment_url`, 6 `job_specs.environment`,
+        // 7 `job_messages.message_template`.
         let template_env: Option<serde_json::Value> = row
-            .get::<_, Option<String>>(6)
+            .get::<_, Option<String>>(7)
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
             .and_then(|message| {
                 message
@@ -6773,7 +6775,7 @@ impl PgBackend {
                     .cloned()
             });
         let spec_env: Option<serde_json::Value> = row
-            .get::<_, Option<String>>(5)
+            .get::<_, Option<String>>(6)
             .and_then(|json| from_json(&json).ok());
         let environment = gate
             .and_then(|gate| gate.environment_name)
@@ -6798,7 +6800,7 @@ impl PgBackend {
         // the message or the spec is known; an unevaluated `${{ }}` template
         // is never posted.
         let environment_url = row
-            .get::<_, Option<String>>(7)
+            .get::<_, Option<String>>(5)
             .filter(|url| !url.is_empty())
             .or_else(|| {
                 template_env
@@ -6920,6 +6922,14 @@ async fn release_parked_nodes(
                     .map(str::to_owned)
             });
         let Some(env_name) = env_name else {
+            // No environment on the node: the (now lifted) fork hold is the
+            // only thing that parked it, so hand it back to the ordinary
+            // promotion path — same as a gate that resolved to "no rules".
+            if let Some(node) = sweep.node_mut(run_id, &job_id) {
+                node.queue_state = logic::QueueState::Blocked;
+                node.status = ExecutionStatus::Queued;
+            }
+            sweep.mark(run_id, &job_id);
             continue;
         };
         let lookup = resolver.lookup_sync(&repository, &env_name);

@@ -447,6 +447,16 @@ fn release_parked_jobs(
                 .map(str::to_owned)
             });
         let Some(env_name) = env_name else {
+            // No environment on the job: the (now lifted) fork hold is the
+            // only thing that parked it, so hand it back to the ordinary
+            // promotion path — same as a gate that resolved to "no rules".
+            tx.prepare_cached(
+                "UPDATE jobs SET queue_state = 'blocked', status = 'queued' \
+                 WHERE run_id = ?1 AND job_id = ?2 AND queue_state = 'held'",
+            )
+            .map_err(db)?
+            .execute(params![run, job.job_id.0])
+            .map_err(db)?;
             continue;
         };
         let lookup = resolver.lookup_sync(&repository, &env_name);
