@@ -21,6 +21,9 @@ CREATE TABLE namespaces (
     namespace_id            TEXT PRIMARY KEY,
     state                   TEXT NOT NULL DEFAULT 'active' CHECK (state IN
                                 ('active','suspended','draining','deleted')),
+    -- UNUSED: `cell_generation` and `config_version` have no reader or
+    -- writer in any code; drop only with a migration (`UNUSED` in
+    -- control/schema_drift.rs).
     cell_generation         INTEGER NOT NULL DEFAULT 1,
     config_version          INTEGER NOT NULL DEFAULT 0,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
@@ -33,6 +36,9 @@ CREATE TABLE namespace_limits (
     max_running_jobs        INTEGER,
     submit_rate_per_minute  INTEGER,
     max_jobs_per_run        INTEGER,
+    -- RESERVED: not read by any code yet (planned: per-tenant job timeout
+    -- cap, ordering input, history retention window); see `RESERVED_UNUSED`
+    -- in control/schema_drift.rs.
     max_job_timeout_minutes INTEGER,
     priority_tier           INTEGER NOT NULL DEFAULT 0,
     run_history_retention_days INTEGER
@@ -45,6 +51,8 @@ CREATE TABLE namespace_pool_limits (
     PRIMARY KEY (namespace_id, pool_key)
 );
 
+-- RESERVED: not read by any code yet (planned: hosted-tenant admission
+-- policy); see `RESERVED_UNUSED` in control/schema_drift.rs.
 CREATE TABLE namespace_policies (
     namespace_id            TEXT PRIMARY KEY REFERENCES namespaces(namespace_id) ON DELETE CASCADE,
     fork_pr_policy          TEXT NOT NULL DEFAULT 'untrusted' CHECK (fork_pr_policy IN
@@ -130,6 +138,9 @@ CREATE TABLE run_submissions (
     github_context          TEXT NOT NULL,
     workspace_snapshot      TEXT,
     snapshot_timing         TEXT,
+    -- UNUSED: no reader or writer in any code (secret values are resolved at
+    -- acquire and never stored); drop only with a migration (`UNUSED` in
+    -- control/schema_drift.rs).
     secret_refs             TEXT NOT NULL DEFAULT '{}',
     -- Record-level per-job maps the agreed schema has no table for
     -- (old backend's run_jobs): job_base_ids, job_names, job_needs,
@@ -171,6 +182,8 @@ CREATE TABLE jobs (
     priority                INTEGER NOT NULL DEFAULT 0,
     run_order               INTEGER NOT NULL DEFAULT 0,
     job_order               INTEGER NOT NULL DEFAULT 0,
+    -- UNUSED: retry-backoff / delayed-start leftover; drop only with a
+    -- migration (`UNUSED` in control/schema_drift.rs).
     not_before              INTEGER,
     enqueued_at             INTEGER,
     claimed_by_runner_id    INTEGER,
@@ -194,7 +207,11 @@ CREATE TABLE jobs (
     FOREIGN KEY (run_id, parent_job_id) REFERENCES jobs(run_id, job_id)
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 );
-CREATE INDEX jobs_ready ON jobs(pool_key, namespace_id, priority DESC, run_order, job_order)
+-- Claim order: `SELECT .. WHERE queue_state = 'ready' ORDER BY pool_key,
+-- priority DESC, run_order, job_order`. The key columns are exactly the
+-- ORDER BY (pg's index carries the same key), so the ready front is read in
+-- order instead of sorting the whole ready set on every poll.
+CREATE INDEX jobs_ready ON jobs(pool_key, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
 CREATE INDEX jobs_pending_expansion ON jobs(enqueued_at) WHERE queue_state = 'pending_expansion';
 CREATE INDEX jobs_run_active ON jobs(run_id, queue_state) WHERE queue_state <> 'none';
@@ -281,6 +298,11 @@ CREATE TABLE job_requests (
 );
 CREATE UNIQUE INDEX job_requests_inflight ON job_requests(run_id, job_id) WHERE result IS NULL;
 CREATE INDEX job_requests_session ON job_requests(session_id) WHERE result IS NULL;
+-- Latest-attempt lookups (`WHERE run_id = ? AND job_id = ? ORDER BY
+-- request_id DESC LIMIT 1`) and the jobs -> job_requests cascade: the partial
+-- inflight index cannot serve settled attempts. `request_id` is the rowid;
+-- naming it keeps the key identical to pg's index.
+CREATE INDEX job_requests_attempts ON job_requests(run_id, job_id, request_id DESC);
 
 CREATE TABLE job_leases (
     request_id              INTEGER PRIMARY KEY REFERENCES job_requests(request_id) ON DELETE CASCADE,
@@ -345,6 +367,9 @@ CREATE TABLE log_files (
     run_id                  TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     plan_id                 TEXT NOT NULL REFERENCES job_requests(agent_job_id) ON DELETE CASCADE,
     log_id                  INTEGER NOT NULL CHECK (log_id > 0),
+    -- UNUSED: log sizes live in the log-segment store, not here; the table
+    -- only allocates (plan_id, log_id). Drop only with a migration
+    -- (`UNUSED` in control/schema_drift.rs).
     byte_count              INTEGER NOT NULL DEFAULT 0,
     line_count              INTEGER NOT NULL DEFAULT 0,
     updated_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
@@ -378,6 +403,8 @@ CREATE TABLE runner_sessions (
     protocol                TEXT NOT NULL CHECK (protocol IN ('broker','azdo')),
     client_id               TEXT,
     verified                INTEGER NOT NULL DEFAULT 0,
+    -- UNUSED: wake routing is in-process (`control/wake.rs`); drop only with
+    -- a migration (`UNUSED` in control/schema_drift.rs).
     engine_node_id          TEXT,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     last_seen_at            INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER))
@@ -426,6 +453,8 @@ CREATE TABLE provision_requests (
     pool_key                TEXT NOT NULL,
     labels                  TEXT NOT NULL,
     requested_at            INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
+    -- UNUSED: the provisioner queue has no lease protocol; drop only with a
+    -- migration (`UNUSED` in control/schema_drift.rs).
     leased_until            INTEGER,
     lease_owner             TEXT,
     PRIMARY KEY (run_id, job_id),
@@ -565,6 +594,10 @@ CREATE TABLE check_run_updates (
 CREATE INDEX check_run_updates_queue ON check_run_updates(installation_id, not_before);
 
 -- ── Artifacts ────────────────────────────────────────────────────────
+-- RESERVED: not read by any code yet (planned: shared artifact index; bytes
+-- live in the file-backed ArtifactStore). The only production statement is
+-- the run-archive `DELETE FROM artifacts`; see `RESERVED_UNUSED` in
+-- control/schema_drift.rs.
 CREATE TABLE artifacts (
     artifact_id             INTEGER PRIMARY KEY AUTOINCREMENT,
     namespace_id            TEXT NOT NULL,
@@ -575,6 +608,9 @@ CREATE TABLE artifacts (
     size_bytes              INTEGER,
     digest                  TEXT,
     storage_key             TEXT NOT NULL,
+    -- UNUSED: `upload_token_hash` and `finalized_at` have no reader or
+    -- writer in any code; drop only with a migration (`UNUSED` in
+    -- control/schema_drift.rs).
     upload_token_hash       BLOB,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     finalized_at            INTEGER,
