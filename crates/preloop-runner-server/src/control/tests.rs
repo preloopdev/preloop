@@ -5277,6 +5277,36 @@ pub(crate) mod suite {
             outcome_b.run_number
         );
     }
+
+    /// The command-outcome gauges report the global ready depth and the
+    /// `runs-on` labels of the front job in the shared global dispatch order
+    /// (`priority DESC, run_order, job_order`) — no pool filter.
+    pub(crate) async fn queue_gauges_report_the_global_front(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let alpha = submit_job_on(run_id, "alpha", 1, &["self-hosted", "alpha"]);
+        let beta = submit_job_on(run_id, "beta", 2, &["self-hosted", "beta"]);
+        let outcome = backend
+            .submit_run(submit_run(run_id, vec![alpha, beta]))
+            .await
+            .unwrap();
+        assert_eq!(outcome.queue_depth, 2);
+
+        // Cancelling the second job leaves the first as the queue front.
+        let cancel = backend
+            .cancel_job(run_id, &JobId("beta".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(cancel.queue_depth, 1);
+        assert_eq!(
+            cancel.next_runs_on,
+            vec!["self-hosted".to_owned(), "alpha".to_owned()],
+            "the gauge reports the global front job's labels"
+        );
+
+        let drained = backend.cancel_run(run_id, None).await.unwrap();
+        assert_eq!(drained.queue_depth, 0);
+        assert!(drained.next_runs_on.is_empty());
+    }
 }
 
 // ── SQLite ──────────────────────────────────────────────────────────────
@@ -6454,6 +6484,14 @@ mod pg {
         };
         suite::duplicate_run_number_is_reallocated(&backend).await;
     }
+
+    #[tokio::test]
+    async fn queue_gauges_report_the_global_front() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::queue_gauges_report_the_global_front(&backend).await;
+    }
 }
 // ── New SQLite backend (`control::lite`) ────────────────────────────────
 //
@@ -6461,7 +6499,10 @@ mod pg {
 // `&dyn ControlBackend`.
 mod lite {
     use super::suite;
-    use super::{built_matrix_leg, create_session, poll, register_runner, submit_job, submit_run};
+    use super::{
+        built_matrix_leg, create_session, poll, register_runner, submit_job, submit_job_on,
+        submit_run,
+    };
     use crate::control::backend::{ControlBackend, ExpansionApply, JobCompletionInput};
     use crate::control::lite::LiteBackend;
     use crate::control::types::PollOutcome;
@@ -7545,6 +7586,152 @@ mod lite {
     #[tokio::test]
     async fn duplicate_run_number_is_reallocated() {
         suite::duplicate_run_number_is_reallocated(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn queue_gauges_report_the_global_front() {
+        suite::queue_gauges_report_the_global_front(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    /// The global gauge reads (`next_ready_labels`, `queue_stats`) must read
+    /// the ready queue in order through `jobs_ready_global` — never through a
+    /// temp b-tree — on a populated queue with non-ready rows around it.
+    #[tokio::test]
+    async fn queue_gauge_queries_are_index_fed() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let ready = RunId::new();
+        let jobs = (0..64)
+            .map(|i| submit_job_on(ready, &format!("job-{i:03}"), i, &["self-hosted"]))
+            .collect();
+        backend
+            .submit_run(submit_run(ready, jobs))
+            .await
+            .unwrap();
+        // A realistic mix: a cancelled run's jobs stay in `jobs`, not ready.
+        let cancelled = RunId::new();
+        let jobs = (0..16)
+            .map(|i| submit_job_on(cancelled, &format!("gone-{i:03}"), 100 + i, &["self-hosted"]))
+            .collect();
+        backend
+            .submit_run(submit_run(cancelled, jobs))
+            .await
+            .unwrap();
+        backend.cancel_run(cancelled, None).await.unwrap();
+
+        let plans = backend
+            .test_db_mutate(|db| {
+                [
+                    "SELECT runs_on FROM jobs WHERE queue_state = 'ready' \
+                     ORDER BY priority DESC, run_order, job_order LIMIT 1",
+                    "SELECT runs_on FROM jobs WHERE queue_state = 'ready' \
+                     ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
+                ]
+                .iter()
+                .map(|sql| {
+                    let mut statement = db
+                        .0
+                        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                        .unwrap();
+                    statement
+                        .query_map([], |row| row.get::<_, String>(3))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                        .join("\n")
+                })
+                .collect::<Vec<_>>()
+            })
+            .unwrap();
+        for plan in plans {
+            assert!(
+                plan.contains("jobs_ready_global"),
+                "the gauge plan must use the global index: {plan}"
+            );
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "the gauge plan must not sort: {plan}"
+            );
+        }
+    }
+
+    /// The `jobs_ready_global` migration applies in place to a database
+    /// created before it and converges on the fresh schema's index.
+    #[test]
+    fn global_index_migration_applies_in_place() {
+        let backend = LiteBackend::in_memory().unwrap();
+        // Simulate a pre-migration database: the fresh schema minus the index.
+        backend
+            .test_db_mutate(|db| db.0.execute_batch("DROP INDEX jobs_ready_global").unwrap())
+            .unwrap();
+        backend
+            .test_db_mutate(|db| {
+                db.0.execute_batch(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../migrations/sqlite/V2026100506__jobs_ready_global_index.sql"
+                )))
+                .unwrap()
+            })
+            .unwrap();
+
+        let index_sql = |backend: &LiteBackend| -> String {
+            backend
+                .test_db_mutate(|db| {
+                    db.0.query_row(
+                        "SELECT sql FROM sqlite_master WHERE type = 'index' \
+                         AND name = 'jobs_ready_global'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap()
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            index_sql(&backend)
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            index_sql(&LiteBackend::in_memory().unwrap())
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            "the migration must converge on the fresh schema's index"
+        );
+    }
+
+    /// A malformed `runs_on` (lite stores it as free-form TEXT) must not
+    /// abort the gauges: the command still reports the depth, with no front
+    /// labels.
+    #[tokio::test]
+    async fn malformed_runs_on_does_not_abort_gauges() {
+        let backend = LiteBackend::in_memory().unwrap();
+        let run_id = RunId::new();
+        let alpha = submit_job_on(run_id, "alpha", 1, &["self-hosted", "alpha"]);
+        let beta = submit_job_on(run_id, "beta", 2, &["self-hosted", "beta"]);
+        backend
+            .submit_run(submit_run(run_id, vec![alpha, beta]))
+            .await
+            .unwrap();
+        // Corrupt the front job's labels, as a foreign writer could have.
+        backend
+            .test_db_mutate(|db| {
+                db.0.execute(
+                    "UPDATE jobs SET runs_on = 'not json' \
+                     WHERE run_id = ?1 AND job_id = 'alpha'",
+                    [run_id.0.to_string()],
+                )
+                .unwrap()
+            })
+            .unwrap();
+
+        let cancel = backend
+            .cancel_job(run_id, &JobId("beta".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(cancel.queue_depth, 1);
+        assert!(
+            cancel.next_runs_on.is_empty(),
+            "a malformed runs_on yields no labels, not an error: {:?}",
+            cancel.next_runs_on
+        );
     }
 }
 

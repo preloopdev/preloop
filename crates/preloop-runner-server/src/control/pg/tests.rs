@@ -1528,3 +1528,106 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
         "nothing past the last bookmark: {after:?}"
     );
 }
+
+// ── queue gauge plans ───────────────────────────────────────────────────
+
+/// The global gauge reads (`queue_stats`, the cancel path's front gauge,
+/// `rebuild_dispatch_intent`, the reaper's ready scans) must be index-fed by
+/// `jobs_ready_global` — no Sort node — on a populated ready queue; the
+/// claim-order reads keep using `jobs_ready`.
+#[tokio::test]
+async fn queue_gauge_plans_are_index_fed() {
+    let Some((_pg, url)) = fresh_database_opt().await else {
+        return skip_no_postgres();
+    };
+    let node = connect(&url).await;
+    // A populated ready queue: four runs of 64 jobs.
+    for batch in 0..4u64 {
+        let run_id = RunId::new();
+        let jobs = (0..64)
+            .map(|i| submit_job(run_id, &format!("job-{batch}-{i:03}"), (batch * 64 + i) as i64))
+            .collect();
+        let mut submit = submit_run(run_id, jobs);
+        submit.record.run_number = batch + 1;
+        node.submit_run(submit).await.unwrap();
+    }
+
+    let client = node.reader().await.unwrap();
+    client.batch_execute("ANALYZE jobs").await.unwrap();
+    for sql in [
+        "SELECT runs_on::text FROM jobs WHERE queue_state='ready' \
+         ORDER BY priority DESC, run_order, job_order LIMIT 1",
+        "SELECT runs_on::text FROM jobs WHERE queue_state='ready' \
+         ORDER BY priority DESC, run_order, job_order, run_id, job_id LIMIT 1",
+    ] {
+        let plan: String = client
+            .query(&format!("EXPLAIN {sql}"), &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("Index Scan using jobs_ready_global"),
+            "the gauge plan must use the global index:\n{plan}"
+        );
+        assert!(!plan.contains("Sort"), "the gauge plan must not sort:\n{plan}");
+    }
+    let plan: String = client
+        .query(
+            "EXPLAIN SELECT job_id FROM jobs WHERE queue_state='ready' \
+             ORDER BY pool_key, priority DESC, run_order, job_order LIMIT 64",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Index Scan using jobs_ready on jobs"),
+        "the claim order must keep using jobs_ready:\n{plan}"
+    );
+}
+
+/// A `runs_on` that is valid JSONB but not a string list must not abort the
+/// gauges: the cancel still reports the depth, with no front labels. (The
+/// JSONB column rejects malformed JSON, so only the shape can surprise.)
+#[tokio::test]
+async fn non_list_runs_on_does_not_abort_gauges() {
+    let Some((_pg, url)) = fresh_database_opt().await else {
+        return skip_no_postgres();
+    };
+    let node = connect(&url).await;
+    let run_id = RunId::new();
+    node.submit_run(submit_run(
+        run_id,
+        vec![submit_job(run_id, "alpha", 1), submit_job(run_id, "beta", 2)],
+    ))
+    .await
+    .unwrap();
+    // The front job's labels become a JSON object — valid JSONB, not a list.
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET runs_on = '{\"label\":1}'::jsonb \
+             WHERE run_id=$1::text::uuid AND job_id='alpha'",
+            &[&run_id.0.to_string()],
+        )
+        .await
+        .unwrap();
+
+    let cancel = node
+        .cancel_job(run_id, &JobId("beta".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(cancel.queue_depth, 1);
+    assert!(
+        cancel.next_runs_on.is_empty(),
+        "a non-list runs_on yields no labels, not an error: {:?}",
+        cancel.next_runs_on
+    );
+}

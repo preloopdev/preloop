@@ -1368,7 +1368,8 @@ impl PgBackend {
     ///
     /// Statements: one grouped count over `jobs` joined to the run's
     /// workflow-level wait; `SELECT runs_on FROM jobs WHERE queue_state =
-    /// 'ready' ORDER BY priority DESC, run_order, job_order LIMIT 1`.
+    /// 'ready' ORDER BY priority DESC, run_order, job_order, run_id, job_id
+    /// LIMIT 1` (the `jobs_ready_global` partial index feeds the order).
     pub(super) async fn queue_stats(&self) -> Result<QueueStats, ControlError> {
         let client = self.reader().await?;
         let mut stats = QueueStats::default();
@@ -1404,7 +1405,9 @@ impl PgBackend {
             .await
             .map_err(db)?
         {
-            Some(row) => codec::from_json(row.get(0))?,
+            // A stored `runs_on` that is not a JSON string list yields no
+            // labels: the gauge must not fail on data.
+            Some(row) => codec::from_json::<Vec<String>>(row.get(0)).unwrap_or_default(),
             None => Vec::new(),
         };
         Ok(stats)

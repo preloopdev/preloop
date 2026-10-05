@@ -2517,8 +2517,9 @@ async fn cancel_outcome_gauges(
         )
         .await
         .map_err(db)?
-        .map(|row| from_json(row.get(0)))
-        .transpose()?
+        // A stored `runs_on` that is not a JSON string list yields no
+        // labels: the gauge must not fail on data.
+        .map(|row| from_json::<Vec<String>>(row.get(0)).unwrap_or_default())
         .unwrap_or_default();
     let pending_cancels: bool = tx
         .query_one(
@@ -4604,7 +4605,9 @@ impl PgBackend {
             .await
             .map_err(db)?;
         match row {
-            Some(row) => codec::from_json(row.get::<_, String>(0).as_str()),
+            // A stored `runs_on` that is not a JSON string list yields no
+            // labels: the gauge must not fail on data.
+            Some(row) => Ok(codec::from_json(row.get::<_, String>(0).as_str()).unwrap_or_default()),
             None => Ok(Vec::new()),
         }
     }

@@ -229,6 +229,14 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- Queue-gauge reads (`queue_depth`/`next_runs_on`) no longer sort the whole
+  ready queue: a `jobs_ready_global` partial index now feeds the global
+  dispatch order on both backends, and the front read takes only its first
+  row (`LIMIT 1`) instead of a 64-row batch. A stored `runs-on` that is not a
+  label list no longer fails the gauge command; the depth is still reported
+  with no front labels. The per-pool `jobs_ready` index is unchanged, so the
+  claim path reads the same order as before.
+
 - A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
   provisioning removed the guest's small tmpfs `/tmp`, which left it on the
   overlayfs root, where `name_to_handle_at` is unsupported: fanotify

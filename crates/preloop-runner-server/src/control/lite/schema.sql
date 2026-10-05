@@ -197,6 +197,13 @@ CREATE TABLE jobs (
 );
 CREATE INDEX jobs_ready ON jobs(pool_key, namespace_id, priority DESC, run_order, job_order)
     WHERE queue_state = 'ready';
+-- global ready order: the reads that carry no pool filter (`next_ready_labels`,
+-- `queue_stats`, the reaper's ready scans; the LIMIT-less ones append the
+-- run_id, job_id tie-breakers) sort by priority DESC, run_order, job_order.
+-- The pool_key leading column above cannot serve them, so without this index
+-- every call sorts the whole ready set.
+CREATE INDEX jobs_ready_global ON jobs(priority DESC, run_order, job_order, run_id, job_id)
+    WHERE queue_state = 'ready';
 CREATE INDEX jobs_pending_expansion ON jobs(enqueued_at) WHERE queue_state = 'pending_expansion';
 CREATE INDEX jobs_run_active ON jobs(run_id, queue_state) WHERE queue_state <> 'none';
 CREATE INDEX jobs_run_base ON jobs(run_id, base_id);
