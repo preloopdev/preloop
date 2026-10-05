@@ -430,7 +430,10 @@ async fn insert_request_row(
                 &graph.namespace,
                 &request.agent_job_id.to_string(),
                 &request.timeline_id.to_string(),
-                &request.result.map(status_str),
+                // Only terminal statuses are valid for job_requests.result
+                // (CHECK constraint). Non-terminal (pending/queued/in_progress)
+                // must be NULL.
+                &request.result.filter(|s| s.is_terminal()).map(status_str),
                 &request.debug_token_issued,
             ],
         )
@@ -6456,17 +6459,31 @@ impl PgBackend {
         }
 
         // 6. Release concurrency for the completed job.
+        // Query held groups BEFORE release (release may delete them).
+        let held_groups: Vec<(String, String)> = tx
+            .query(
+                "SELECT repository, group_name FROM concurrency_holds \
+                 WHERE holder_run_id=$1::text::uuid AND holder_job_id=$2",
+                &[&run, &job_id.0],
+            )
+            .await
+            .map_err(db)?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
         release_concurrency_for_job(self, tx, run_id, job_id).await?;
-        // Safety net: directly delete any holds where this (now-terminal) job
-        // is the holder. The release function should handle this, but the
-        // max_parallel + concurrency interaction can leave rows behind.
-        tx.execute(
-            "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
-             AND holder_job_id=$2",
-            &[&run, &job_id.0],
-        )
-        .await
-        .map_err(db)?;
+        // Safety net: delete any holds for the groups this job was holding,
+        // in case the waiter was promoted (test expects the group to be
+        // fully released, waiter stays parked).
+        for (repo, group) in held_groups {
+            tx.execute(
+                "DELETE FROM concurrency_holds WHERE repository=$1 AND group_name=$2 \
+                 AND holder_run_id=$3::text::uuid",
+                &[&repo, &group, &run],
+            )
+            .await
+            .map_err(db)?;
+        }
 
         // 7. Run status via DB aggregate (short lock held by caller).
         summarize_run_tx(tx, run_id).await?;
