@@ -25,12 +25,13 @@ smolvm_min_version = "1.18.1"
 # goldens track the last *verified* release, the runtime floor rarely moves.
 smolvm_golden_version = "1.19.3"
 
- # Freshness policy for apt package indices baked into golden images.
- # Provisioning stamps each bake with its date (see prepare_artifact) and
- # warns when a pack serving curated jobs is older than this. The weekly
- # apt-indices-refresh workflow rebuilds the goldens past this age.
- # Quoted: build.rs only picks up quoted values (and Renovate's regex
- # manager expects flat `key = "value"` lines).
+# Freshness policy for apt package indices baked into golden images.
+# Provisioning stamps each bake with its date (see prepare_artifact) and warns
+# when a pack serving curated jobs is older than this. The weekly
+# apt-indices-refresh workflow opens a draft reminder PR past this age; the
+# golden is rebuilt manually on a host with enough disk.
+# Quoted: build.rs only picks up quoted values (and Renovate's regex manager
+# expects flat `key = "value"` lines).
 apt_indices_max_age_days = "7"
 
 # Image inputs for the runner golden. The OCI bases are immutable filesystem

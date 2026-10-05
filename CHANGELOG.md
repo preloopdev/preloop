@@ -11,6 +11,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Scheduled golden refreshes no longer launch an impossible hosted bake**:
+  the apt-index freshness workflow now opens one idempotent draft PR asking for
+  a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are
+  coerced before job conditions, so GitHub's string `"false"` no longer runs a
+  truthy-gated job; the reuse path also resolves the target release without
+  requiring a checkout.
+
 - **Packed goldens on Apple Silicon bake again**: the Rosetta multiarch step
   spliced an apt-scoping fragment that ended in a newline, so the composed
   guest script had a line starting with `;` and every fresh packed-golden

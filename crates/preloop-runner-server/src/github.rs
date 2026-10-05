@@ -2748,26 +2748,6 @@ async fn process_delivery_payload_with_lease(
             } else {
                 None
             };
-            let dispatch_inputs = effective
-                .payload
-                .get("inputs")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            let dispatch_inputs_stringified = dispatch_inputs
-                .iter()
-                .map(|(name, value)| {
-                    let rendered = match value {
-                        Value::String(value) => value.clone(),
-                        Value::Bool(value) => value.to_string(),
-                        Value::Number(value) => value.to_string(),
-                        _ => value.to_string(),
-                    };
-                    (name.clone(), rendered)
-                })
-                .collect::<BTreeMap<_, _>>();
 
             let submission = WorkflowSubmission {
                 workflow_yaml: content,
@@ -2809,8 +2789,8 @@ async fn process_delivery_payload_with_lease(
                     .clone()
                     .or_else(|| Some(resolved_sha.clone())),
                 filter_branch,
-                dispatch_inputs,
-                dispatch_inputs_stringified,
+                dispatch_inputs: BTreeMap::new(),
+                dispatch_inputs_stringified: BTreeMap::new(),
                 selected_jobs: vec![],
                 base_ref: None,
                 preserve_on_failure: false,
@@ -3667,6 +3647,75 @@ mod tests {
         assert_eq!(
             inner.runs.values().next().unwrap().workflow_path_str,
             ".github/workflows/selected.yml"
+        );
+    }
+
+    /// GitHub stringifies workflow_dispatch inputs in the webhook payload.
+    /// The typed `inputs` context must still expose a boolean so `"false"`
+    /// does not run a truthy-gated job.
+    #[tokio::test]
+    async fn workflow_dispatch_webhook_coerces_boolean_inputs_before_job_gates() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_dir = temp.path().join("ws");
+        std::fs::create_dir_all(ws_dir.join(".github/workflows")).unwrap();
+        std::fs::write(
+            ws_dir.join(".github/workflows/dispatch.yml"),
+            r#"
+on:
+  workflow_dispatch:
+    inputs:
+      reuse:
+        type: boolean
+        default: false
+jobs:
+  reuse:
+    if: inputs.reuse
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo reuse
+  build:
+    if: ${{ !inputs.reuse }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo build
+"#,
+        )
+        .unwrap();
+        let fixture = WebhookFixture::with_workspace(&temp, ws_dir).await;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "ref": "main",
+            "workflow": ".github/workflows/dispatch.yml",
+            "inputs": {"reuse": "false"},
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "sender": {"login": "octocat"},
+        }))
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .post_body(
+                    "delivery-stringified-boolean",
+                    Some("workflow_dispatch"),
+                    &payload,
+                )
+                .await,
+            StatusCode::ACCEPTED
+        );
+        fixture.drain().await;
+
+        let inner = fixture.state.inner.lock().await;
+        let run = inner.runs.values().next().unwrap();
+        assert_eq!(
+            run.submission.dispatch_inputs.get("reuse"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            run.jobs.get(&JobId("reuse".to_owned())),
+            Some(&ExecutionStatus::Skipped)
+        );
+        assert_eq!(
+            run.jobs.get(&JobId("build".to_owned())),
+            Some(&ExecutionStatus::Queued)
         );
     }
 
