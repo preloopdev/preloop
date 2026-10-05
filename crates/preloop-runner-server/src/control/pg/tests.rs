@@ -1331,7 +1331,7 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     // Completing `a` releases `g1` and re-parks `aw`.
     complete("a").await;
 
-    let hold: Option<i64> = node
+    let hold: Option<i32> = node
         .writer()
         .await
         .unwrap()

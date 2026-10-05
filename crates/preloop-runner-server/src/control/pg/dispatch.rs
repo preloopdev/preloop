@@ -3159,7 +3159,7 @@ impl<'a> Sweep<'a> {
 
         // Terminalize the caller.
         tx.execute(
-            "UPDATE jobs SET status=$3, outputs=$4, queue_state='none', \
+            "UPDATE jobs SET status=$3, outputs=$4::text::jsonb, queue_state='none', \
                     completed_at=COALESCE(completed_at, now()) \
              WHERE run_id=$1::text::uuid AND job_id=$2",
             &[&run, &caller_id, &status_str, &outputs_json],
@@ -6293,7 +6293,7 @@ impl PgBackend {
         let outputs_json = serde_json::to_string(outputs).unwrap_or_else(|_| "{}".to_owned());
         let marked = tx
             .execute(
-                "UPDATE jobs SET status=$3, outputs=$4::jsonb, queue_state='none', \
+                "UPDATE jobs SET status=$3, outputs=$4::text::jsonb, queue_state='none', \
                         completed_at=COALESCE(completed_at, now()), \
                         claimed_by_runner_id=NULL \
                  WHERE run_id=$1::text::uuid AND job_id=$2 \
