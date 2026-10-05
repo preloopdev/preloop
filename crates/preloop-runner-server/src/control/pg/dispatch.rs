@@ -6436,6 +6436,16 @@ impl PgBackend {
 
         // 6. Release concurrency for the completed job.
         release_concurrency_for_job(self, tx, run_id, job_id).await?;
+        // Safety net: directly delete any holds where this (now-terminal) job
+        // is the holder. The release function should handle this, but the
+        // max_parallel + concurrency interaction can leave rows behind.
+        tx.execute(
+            "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
+             AND holder_job_id=$2",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?;
 
         // 7. Run status via DB aggregate (short lock held by caller).
         summarize_run_tx(tx, run_id).await?;
