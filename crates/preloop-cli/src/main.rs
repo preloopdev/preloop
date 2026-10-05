@@ -27,6 +27,7 @@ mod init;
 
 mod push;
 mod server_install;
+mod store;
 mod update;
 mod webhooks;
 
@@ -750,6 +751,10 @@ enum Command {
     /// them without touching PRELOOP_HOME data unless asked.
     Server(server_install::ServerArgs),
 
+    /// Control-database operations: one-time legacy import (and, in the
+    /// migrations build, `migrate` / `status` / `rollback`).
+    Store(store::StoreArgs),
+
     /// Open a shell in a preserved VM.
     Shell(ShellArgs),
 
@@ -1089,6 +1094,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor(args) => github_setup::cmd_doctor(args).await,
         Command::Secret(args) => github_setup::cmd_secret(args).await,
         Command::Server(args) => server_install::run(args),
+        // Database operations are explicit and offline; never bootstrap the
+        // engine for them.
+        Command::Store(args) => store::run(args),
         // Planning parses local workflow files only; do not bootstrap the
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
@@ -1120,7 +1128,8 @@ async fn main() -> anyhow::Result<()> {
                     | Command::Init(_)
                     | Command::Doctor(_)
                     | Command::Secret(_)
-                    | Command::Server(_) => {
+                    | Command::Server(_)
+                    | Command::Store(_) => {
                         unreachable!("daemon commands handled before client startup")
                     }
                 },

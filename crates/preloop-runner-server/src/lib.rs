@@ -47,6 +47,10 @@ use runs::*;
 pub mod runtime_scheduling;
 use runtime_scheduling::*;
 pub mod control;
+// One-time legacy-store importer (`preloop store import-legacy`). The
+// implementation lives under the SQLite backend because it writes with the
+// backend's own row vocabulary; this re-export is its public surface.
+pub use control::lite::legacy_import;
 pub mod timeline_logs;
 use timeline_logs::*;
 mod live_log_segments;

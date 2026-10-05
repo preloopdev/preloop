@@ -871,7 +871,7 @@ pub(super) fn insert_classified_job(
 }
 
 /// Insert the `runs` + `run_submissions` rows for a new run.
-fn insert_run_row(
+pub(super) fn insert_run_row(
     tx: &Transaction<'_>,
     record: &crate::models::RunRecord,
     namespace: &str,
