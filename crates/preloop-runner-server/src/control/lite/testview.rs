@@ -15,6 +15,7 @@ use preloop_gha_protocol::crypto::AgentRsaPublicKey;
 use preloop_gha_protocol::{
     ExecutionStatus, JobId, RegisteredRunner, RunId, RunnerSession, SessionId, azdo,
 };
+use rusqlite::OptionalExtension;
 use std::collections::{BTreeMap, BTreeSet};
 use steps::{STEP_COLUMNS, step_row};
 

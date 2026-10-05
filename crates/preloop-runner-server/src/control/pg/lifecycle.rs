@@ -1240,11 +1240,11 @@ impl PgBackend {
             .await
             .map_err(db)?;
             tx.execute(
-                "INSERT INTO job_history (run_id, run_created_at, job_id, \
+                "INSERT INTO job_history (run_id, run_created_at, run_attempt, job_id, \
                  namespace_id, kind, parent_job_id, base_id, display_name, \
                  status, pool_key, outputs, annotations, check_run_id, created_at, \
                  deps_ready_at, started_at, completed_at) \
-                 SELECT j.run_id, r.created_at, j.job_id, j.namespace_id, j.kind, \
+                 SELECT j.run_id, r.created_at, r.run_attempt, j.job_id, j.namespace_id, j.kind, \
                  j.parent_job_id, j.base_id, \
                  COALESCE(s.display_name, j.job_id), j.status, j.pool_key, \
                  j.outputs, j.annotations, j.check_run_id, j.created_at, \
