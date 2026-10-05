@@ -150,6 +150,18 @@ Releases before v0.27.0 predate the changelog.
   wait at claim; only a `deleted` namespace refuses them. Namespaces with no
   limit rows behave as before.
 
+### Changed
+
+- **Job messages now carry only the secrets the job references.**
+  `build_job_artifacts` used to stamp every name `SecretProvider::resolve()`
+  returned for the job's scope into `spec.names`, so each job's `secrets`
+  context (and `toJSON(secrets)`) contained the whole stored set. The spec
+  now carries the referenced subset, collected statically from the expanded
+  plan (`preloop_gha_parser::collect_job_secret_reads`); reads that cannot
+  be enumerated — `secrets[expr]` indexing, `*` object filters, a bare
+  `secrets` argument, an expression that fails to parse — keep the full
+  scope. Secret masking still covers the entire scope server-side.
+
 ### Fixed
 
 - A job's `/tmp` is now backed by the VM's ext4 data disk. Runner

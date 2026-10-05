@@ -17,7 +17,7 @@ pub use context::Context;
 
 use evaluator::{
     EvalBudget, collect_context_properties_from_expr, collect_expression_references_from_expr,
-    eval, validate_function_calls,
+    collect_secret_reads_from_expr, eval, validate_function_calls,
 };
 use expr_parser::Parser;
 use lexer::Lexer;
@@ -184,10 +184,10 @@ pub fn collect_contexts(input: &str) -> Result<std::collections::HashSet<String>
 /// Literal `context.property` reads in an expression, keyed by lowercase
 /// context: `${{ secrets.DEPLOY_KEY }}` yields `{"secrets": {"DEPLOY_KEY"}}`.
 ///
-/// Only literal paths are reported. GitHub has no dynamic context access
-/// (`secrets[name]` is invalid) and computed member access
-/// (`fromJSON(...).name`) has no statically knowable property, so neither can
-/// contribute a name.
+/// Only literal paths are reported. Index access (`secrets['NAME']` or
+/// `secrets[expr]`) and computed member access (`fromJSON(...).name`) have
+/// no statically knowable property here — [`collect_secret_reads`] is the
+/// variant that classifies them.
 pub fn collect_context_properties(
     input: &str,
 ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, ExpressionError>
@@ -197,6 +197,37 @@ pub fn collect_context_properties(
     let mut properties = std::collections::BTreeMap::new();
     collect_context_properties_from_expr(&expr, &mut properties);
     Ok(properties)
+}
+
+/// `secrets.*` access found in one expression.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretReads {
+    /// Literally referenced names (`secrets.FOO`, `secrets['FOO']`),
+    /// spelled as written — the expression evaluator matches context
+    /// properties case-insensitively, so consumers must compare
+    /// case-insensitively too.
+    pub names: std::collections::BTreeSet<String>,
+    /// The expression may read names beyond `names`: dynamic indexing
+    /// (`secrets[matrix.pick]`), the `*` object filter, a bare `secrets`
+    /// path, or an expression this crate cannot parse. Consumers that gate
+    /// secret delivery must treat `dynamic` as "every name in scope".
+    pub dynamic: bool,
+}
+
+/// Collect the `secrets` names one expression reads.
+///
+/// Unlike [`collect_context_properties`], dynamic `secrets` access is
+/// surfaced through [`SecretReads::dynamic`] instead of vanishing, so a
+/// caller narrowing secret delivery cannot under-provision: it must fall
+/// back to the full in-scope set when `dynamic` is set. An unparsable
+/// expression returns `Err` — gating callers should treat that the same as
+/// `dynamic`.
+pub fn collect_secret_reads(input: &str) -> Result<SecretReads, ExpressionError> {
+    let trimmed = trim_expression_markers(input);
+    let expr = parse_cached(trimmed)?;
+    let mut reads = SecretReads::default();
+    collect_secret_reads_from_expr(&expr, &mut reads);
+    Ok(reads)
 }
 
 /// Parse and evaluate a GitHub Actions expression.

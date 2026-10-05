@@ -861,9 +861,10 @@ pub async fn broker_acquire_job(
             "filled secret variables into job message at acquire"
         );
     }
-    // Merge freshly resolved values (env-tier secrets included) into the
-    // node masker entry seeded at submit.
-    if !filled.values.is_empty() {
+    // Merge every resolved scope value (env-tier secrets included) into the
+    // node masker entry seeded at submit: masking stays wider than the
+    // injected variable set so unreferenced values are still redacted.
+    if !filled.masked.is_empty() {
         let plan_id = message.plan.plan_id.clone();
         let mut inner = shared.state.inner.lock().await;
         let mut merged: Vec<String> = inner
@@ -871,7 +872,7 @@ pub async fn broker_acquire_job(
             .get(&plan_id)
             .map(|v| (**v).clone())
             .unwrap_or_default();
-        merged.extend(filled.values.values().cloned());
+        merged.extend(filled.masked.iter().cloned());
         merged.sort();
         merged.dedup();
         inner.plan_secret_masker.insert(plan_id, Arc::new(merged));
