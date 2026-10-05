@@ -1829,7 +1829,7 @@ impl PgBackend {
                 &format!(
                     "SELECT j.run_id::text, j.job_id, r.repository, j.environment_gate::text, \
                             j.check_run_id, j.deployment_id, \
-                            s.environment::text, m.message_template \
+                            s.environment::text, m.message_template::text \
                      FROM jobs j \
                      JOIN runs r ON r.run_id = j.run_id \
                      LEFT JOIN job_specs s ON s.run_id = j.run_id AND s.job_id = j.job_id \

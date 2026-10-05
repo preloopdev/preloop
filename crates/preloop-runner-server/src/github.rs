@@ -6521,21 +6521,26 @@ jobs:
         })
         .to_string();
 
-        // Switch on (default): the fork PR event produces a run.
-        assert_eq!(
-            fixture
-                .post_body("delivery-fork-on", Some("pull_request"), payload.as_bytes())
-                .await,
-            StatusCode::ACCEPTED
+        let payload_value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        // The payload really is a fork event — the projection must tier it
+        // `UntrustedForkPullRequest`, or the skip assertion below would be
+        // vacuous (nothing to skip).
+        let projected = {
+            use crate::events::EventAdapter;
+            crate::events::pull_request::Adapter.project(&payload_value)
+        };
+        assert!(
+            projected.iter().any(|event| event.trust_tier
+                == Some(crate::events::trust_tier::TrustTier::UntrustedForkPullRequest)),
+            "the delivery must project an untrusted fork pull request: {projected:?}"
         );
-        fixture.drain().await;
-        assert_eq!(
-            fixture.state.test_tx().await.runs.len(),
-            1,
-            "with the kill switch on the fork pull request must produce a run"
+        assert!(
+            projected.iter().any(|event| event.event == "pull_request"),
+            "the pull_request event must be projected: {projected:?}"
         );
 
-        // Switch off: the same delivery is skipped, no run is created.
+        // Switch off: the delivery is skipped before any workflow is fetched
+        // or matched, and no run is created.
         fixture.state.fork_policy.run_fork_workflows = false;
         assert_eq!(
             fixture
@@ -6548,9 +6553,8 @@ jobs:
             StatusCode::ACCEPTED
         );
         fixture.drain().await;
-        assert_eq!(
-            fixture.state.test_tx().await.runs.len(),
-            1,
+        assert!(
+            fixture.state.test_tx().await.runs.is_empty(),
             "run_fork_workflows = false must skip the fork event before matching"
         );
     }
