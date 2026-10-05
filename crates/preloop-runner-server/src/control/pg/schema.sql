@@ -153,6 +153,8 @@ CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);
 -- archiver scan: terminal runs not yet moved to history
 CREATE INDEX runs_archivable ON runs(completed_at) WHERE status = 'completed';
+-- fork-approval expiry sweep: runs held for approval whose hold window passed
+CREATE INDEX runs_fork_approval_sweep ON runs(fork_approval_requested_at) WHERE fork_approval_pending;
 
 -- `version` counts status/conclusion changes of the run (see `jobs_version`).
 CREATE FUNCTION bump_run_version() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -764,6 +766,7 @@ CREATE INDEX run_history_repo_ref ON run_history(namespace_id, repository, ref, 
 CREATE TABLE job_history (
     run_id                  uuid NOT NULL,
     run_created_at          timestamptz NOT NULL,
+    run_attempt             integer NOT NULL,
     job_id                  text NOT NULL,
     namespace_id            text NOT NULL,
     kind                    text NOT NULL,

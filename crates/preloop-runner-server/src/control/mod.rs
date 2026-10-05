@@ -32,6 +32,8 @@ pub(crate) mod logic;
 // Integration test crates address `control::logic::session_uuid` directly.
 #[cfg(feature = "test-support")]
 pub mod logic;
+pub(crate) mod migrate_runner;
+pub(crate) mod migrations;
 pub(crate) mod pg;
 #[cfg(test)]
 mod schema_drift;

@@ -98,6 +98,7 @@ pub mod models;
 use models::*;
 pub mod bootstrap;
 pub mod store;
+pub mod store_admin;
 pub mod store_pg;
 #[cfg(test)]
 #[allow(unused_imports)]

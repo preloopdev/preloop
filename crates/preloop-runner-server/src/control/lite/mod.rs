@@ -42,18 +42,18 @@ mod webhooks;
 
 use super::types::*;
 use parking_lot::{Condvar, Mutex};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-/// The schema this build reads and writes. Greenfield: any other stamped
-/// version is refused at open (no migrations).
-pub(crate) const SCHEMA_VERSION: &str = "5";
-
-/// The translated schema (see the file header for the type mapping).
-const SCHEMA_SQL: &str = include_str!("schema.sql");
+/// The translated schema (see the file header for the type mapping). The
+/// runtime only verifies the migration ledger at open; this definition is
+/// the test-side parity reference for `migrations/sqlite`, never applied by
+/// a serving process. `migrations.rs` compiles against it.
+#[cfg(test)]
+pub(crate) const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Readers in the pool. Enough for the read-heavy paths (acquire context,
 /// status, queue stats) without fd pressure.
@@ -116,92 +116,75 @@ fn configure(conn: &mut Connection) -> Result<(), ControlError> {
     Ok(())
 }
 
-/// Apply the schema to a fresh database, or verify an existing one is
-/// exactly [`SCHEMA_VERSION`]. Runs in one `BEGIN IMMEDIATE` transaction
-/// so two processes opening the same new file cannot both create it.
-fn ensure_schema(conn: &mut Connection) -> Result<(), ControlError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(db)?;
-    let has_meta: bool = tx
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master \
-             WHERE type = 'table' AND name = 'schema_meta')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db)?;
-    if has_meta {
-        let version: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(db)?;
-        let version = version.map(|v| String::from_utf8_lossy(&v).into_owned());
-        if version.as_deref() != Some(SCHEMA_VERSION) {
-            return Err(ControlError::backend(anyhow::anyhow!(
-                "control database has schema version {}; this build supports only \
-                 {SCHEMA_VERSION}. Recreate the database.",
-                version.as_deref().unwrap_or("<none>")
-            )));
+/// Verify the database is exactly this build's control schema, or — only for
+/// test-support — initialize a brand-new file.
+///
+/// A serving process never creates, migrates, recreates or adopts: the
+/// ledger is the sole version authority, and anything else (a legacy store,
+/// a foreign file, a pre-ledger control schema, an older/newer/divergent
+/// migration set) refuses with the recovery command. `preloop store migrate`
+/// (refinery over `migrations/sqlite`, see `docs/control-migrations.md`) is
+/// the only writer of schema state.
+fn ensure_usable(conn: &mut Connection) -> Result<(), ControlError> {
+    let ledger = super::migrations::sqlite_ledger(conn).map_err(db)?;
+    if let super::migrations::Ledger::Empty = ledger {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            super::migrate_runner::initialize_empty_sqlite(conn)
+                .map_err(ControlError::backend)?;
+            return Ok(());
         }
-        return tx.commit().map_err(db);
-    }
-    let foreign: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(db)?;
-    if foreign != 0 {
-        return Err(ControlError::backend(anyhow::anyhow!(
-            "control database holds {foreign} tables but no schema_meta: it predates \
-             schema version {SCHEMA_VERSION}. Recreate the database."
+        #[cfg(not(any(test, feature = "test-support")))]
+        return Err(super::migrations::backend_error(super::migrations::refusal(
+            super::migrations::Ledger::Empty,
         )));
     }
-    tx.execute_batch(SCHEMA_SQL).map_err(db)?;
-    // Session-message ids occupy the >=1_000_001 space so a JobCancellation
-    // messageId can never collide with a broker job ref's request_id
-    // (broker_job_ref_root carries request_id as messageId; the runner's
-    // in-memory dedup would drop a same-id cancel).
-    tx.execute(
-        "INSERT INTO sqlite_sequence (name, seq)          VALUES ('session_messages', 1000000)",
-        [],
-    )
-    .map_err(db)?;
-    tx.execute(
-        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)",
-        [SCHEMA_VERSION.as_bytes()],
-    )
-    .map_err(db)?;
-    tx.commit().map_err(db)
+    super::migrations::check_ledger(ledger).map_err(super::migrations::backend_error)
 }
 
 impl LiteBackend {
-    /// Open (or create) the control database at `path`.
+    /// Open the control database at `path` and verify its migration ledger.
+    ///
+    /// A serving process never creates the database: an absent (or empty)
+    /// file refuses with the migration command, and an existing file's
+    /// ledger must match this build exactly. Only test-support builds
+    /// initialize a brand-new file (via the same migration SQL the runner
+    /// applies).
     pub(crate) fn open(
         path: &Path,
         pool_assignments_enabled: bool,
         require_job_assignments: bool,
         runner_liveness_timeout: Duration,
     ) -> Result<Self, ControlError> {
-        // Create the file owner-only before SQLite materializes it, matching
-        // the 0600 convention every other state artifact follows.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path)
-                .map_err(ControlError::backend)?;
+        let absent = std::fs::metadata(path)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(true);
+        #[cfg(not(any(test, feature = "test-support")))]
+        if absent {
+            return Err(super::migrations::backend_error(format!(
+                "control database {} is not initialized (no migration ledger). Run \
+                 `preloop store migrate` before starting the server; the server never \
+                 creates, migrates or recreates the control schema itself \
+                 (docs/control-migrations.md).",
+                path.display()
+            )));
+        }
+        // Test-support only: create the file owner-only before SQLite
+        // materializes it, matching the 0600 convention every other state
+        // artifact follows.
+        #[cfg(any(test, feature = "test-support"))]
+        if absent {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(ControlError::backend)?;
+            }
         }
         let mut writer = Connection::open(path).map_err(db)?;
         configure(&mut writer)?;
@@ -211,7 +194,7 @@ impl LiteBackend {
         writer
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(db)?;
-        ensure_schema(&mut writer)?;
+        ensure_usable(&mut writer)?;
         let mut readers = Vec::with_capacity(READERS);
         for _ in 0..READERS {
             let mut reader = Connection::open(path).map_err(db)?;
@@ -238,12 +221,14 @@ impl LiteBackend {
     }
 
     /// An in-memory backend for tests. The reader pool is empty, so reads
-    /// run on the writer.
+    /// run on the writer. Initialized by replaying the same migration SQL the
+    /// runner applies (`migrations/sqlite`), never by a second schema source.
     #[cfg(test)]
     pub(crate) fn in_memory() -> Result<Self, ControlError> {
         let mut writer = Connection::open_in_memory().map_err(db)?;
         configure(&mut writer)?;
-        ensure_schema(&mut writer)?;
+        super::migrate_runner::initialize_empty_sqlite(&mut writer)
+            .map_err(ControlError::backend)?;
         Ok(Self::from_parts(
             writer,
             Vec::new(),
