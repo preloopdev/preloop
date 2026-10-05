@@ -728,7 +728,7 @@ CREATE TABLE artifacts (
     created_at              timestamptz NOT NULL DEFAULT now(),
     finalized_at            timestamptz,
     expires_at              timestamptz,
-    public_id               text,               -- v1 endpoint identity; see V2026100506
+    public_id               text,
     UNIQUE (run_id, job_backend_id, name)
 );
 CREATE INDEX artifacts_run ON artifacts(run_id);

@@ -5,8 +5,10 @@
 
 use super::fixture::{LegacyFixtureSpec, write_legacy_fixture};
 use super::{ActivePolicy, ImportOptions, run_import};
-use crate::control::backend::RequestKey;
+use crate::control::backend::{CreateSession, PollRequest, RequestKey};
 use crate::control::lite::LiteBackend;
+use crate::control::types::{PollOutcome, SessionProtocol};
+use crate::models::RunnerCapabilities;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::time::Duration;
 
@@ -102,22 +104,52 @@ async fn imported_database_serves_runs_attempts_steps_and_queued_claims() {
         imported.fixture.log_bytes
     );
 
-    // Queued work: the ready job's placeholder claim acquires through the
-    // normal path (template + prompt-scoped metadata).
+    // Queued work: the ready job is claimed through the normal broker
+    // sequence — create a session, poll (which binds the placeholder request
+    // to the session), then acquire. A bare acquire without a session is
+    // refused by design.
     let stats = backend.queue_stats().await.unwrap();
     assert!(stats.ready >= 1, "{stats:?}");
+    let session = backend
+        .create_session(CreateSession {
+            runner_id: 7,
+            protocol: SessionProtocol::Broker,
+            client_id: None,
+        })
+        .await
+        .unwrap();
+    let outcome = backend
+        .poll_session(PollRequest {
+            session_id: session.session_id.clone(),
+            verified_runner_id: Some(7),
+            runner: RunnerCapabilities {
+                known: true,
+                labels: vec!["self-hosted".to_owned()],
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+            busy: false,
+            wait_ms: 0,
+        })
+        .await
+        .unwrap();
+    let PollOutcome::Claimed(claimed) = outcome else {
+        panic!("expected a claimed job, got {outcome:?}");
+    };
     let context = backend
-        .acquire_for_runner(3, 7)
+        .acquire_for_runner(claimed.request.request_id, 7)
         .await
         .expect("queued lint job acquires");
     assert_eq!(context.message.job_name, "lint");
     assert_eq!(context.repository, imported.fixture.repository);
-    let (status, queue_state) = backend
+    // `job_queue_state` returns `(queue kind, status)`. The claim moved the
+    // job to `in_progress` and marked its queue entry claimed.
+    let (queue_state, status) = backend
         .job_queue_state(run_queued, &JobId("lint".to_owned()))
         .await
         .unwrap()
         .expect("job row exists");
-    assert_eq!(status, "queued");
+    assert_eq!(status, "in_progress");
     assert_eq!(queue_state, "claimed");
 }
 
