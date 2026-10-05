@@ -6411,15 +6411,29 @@ impl PgBackend {
                             .get(0);
                         let agent_job_id = uuid::Uuid::new_v4().to_string();
                         let timeline_id = uuid::Uuid::new_v4().to_string();
-                        tx.execute(
-                            "INSERT INTO job_requests (run_id, job_id, namespace_id, \
-                             agent_job_id, timeline_id) \
-                             VALUES ($1::text::uuid,$2,$3,$4::text::uuid,$5::text::uuid) \
-                             ON CONFLICT DO NOTHING",
-                            &[&run, &dependent.0, &namespace, &agent_job_id, &timeline_id],
-                        )
-                        .await
-                        .map_err(db)?;
+                        // Only INSERT if the job doesn't already have an in-flight
+                        // request. Otherwise we'd create duplicate rows and the
+                        // runner could claim the job twice.
+                        let existing: i64 = tx
+                            .query_one(
+                                "SELECT count(*) FROM job_requests \
+                                 WHERE run_id=$1::text::uuid AND job_id=$2 AND result IS NULL",
+                                &[&run, &dependent.0],
+                            )
+                            .await
+                            .map_err(db)?
+                            .get(0);
+                        if existing == 0 {
+                            tx.execute(
+                                "INSERT INTO job_requests (run_id, job_id, namespace_id, \
+                                 agent_job_id, timeline_id) \
+                                 VALUES ($1::text::uuid,$2,$3,$4::text::uuid,$5::text::uuid) \
+                                 ON CONFLICT DO NOTHING",
+                                &[&run, &dependent.0, &namespace, &agent_job_id, &timeline_id],
+                            )
+                            .await
+                            .map_err(db)?;
+                        }
                         emit_outbox(
                             tx,
                             Some(run_id),
