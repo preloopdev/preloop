@@ -871,18 +871,6 @@ impl LegacyDb {
         }
     }
 
-    /// Decode one legacy message payload: either a plain JSON value (the
-    /// pre-marker encoding) or a base64 string carrying a sealed payload
-    /// (the v12 encoding written by `seal_message_payload`).
-    pub(crate) fn decode_message_payload(
-        &self,
-        cipher: &Envelope,
-        raw: &str,
-        label: &str,
-    ) -> anyhow::Result<serde_json::Value> {
-        decode_message_payload(cipher, raw, label)
-    }
-
     /// `(request_id, payload_json)` rows of the per-attempt job-message table.
     pub(crate) fn job_request_messages(&self) -> anyhow::Result<Vec<(i64, String)>> {
         let mut stmt = self
@@ -895,11 +883,47 @@ impl LegacyDb {
     }
 }
 
+/// Canonical associated data for a bound message payload. The released v12
+/// store seals `job_request_messages` rows with the row identity in the AAD
+/// (see `message_payload_aad` in the pre-cutover runtime); the domain and
+/// tuple layout must match byte for byte or the payload cannot authenticate.
+const MESSAGE_PAYLOAD_AAD_DOMAIN: &str = "preloop-message-payload-aad-v1";
+
+fn message_payload_aad(
+    table: &str,
+    payload_type: &str,
+    session_id: Option<&str>,
+    message_id: Option<i64>,
+    request_id: Option<i64>,
+) -> Vec<u8> {
+    serde_json::to_vec(&(
+        MESSAGE_PAYLOAD_AAD_DOMAIN,
+        table,
+        payload_type,
+        session_id,
+        message_id,
+        request_id,
+    ))
+    .expect("message payload AAD tuple is serializable")
+}
+
+/// AAD for a `job_request_messages(request_id)` row.
+pub(crate) fn job_request_message_payload_aad(request_id: i64) -> Vec<u8> {
+    message_payload_aad(
+        "job_request_messages",
+        "AgentJobRequestMessage",
+        None,
+        None,
+        Some(request_id),
+    )
+}
+
 /// Decode a legacy message payload (see [`LegacyDb::decode_message_payload`]).
 pub(crate) fn decode_message_payload(
     cipher: &Envelope,
     raw: &str,
     label: &str,
+    associated_data: &[u8],
 ) -> anyhow::Result<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(raw)
         .with_context(|| format!("parse legacy {label} payload JSON"))?;
@@ -909,9 +933,19 @@ pub(crate) fn decode_message_payload(
             let sealed = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .with_context(|| format!("decode base64 legacy {label} payload"))?;
-            let plaintext = cipher
-                .unseal(&sealed)
-                .with_context(|| format!("unseal legacy {label} payload"))?;
+            // v12 rows are bound to their row identity; rows from the first
+            // sealing implementation are authenticated but unbound. Try the
+            // bound form first, then fall back exactly like the released
+            // `decode_message_payload` migration did.
+            let plaintext = match cipher.unseal_with_associated_data(&sealed, associated_data) {
+                Ok(plaintext) => plaintext,
+                Err(bound_error) => cipher.unseal(&sealed).with_context(|| {
+                    format!(
+                        "unseal legacy {label} payload (neither bound nor \
+                         legacy-authenticated: {bound_error})"
+                    )
+                })?,
+            };
             serde_json::from_slice(&plaintext)
                 .with_context(|| format!("parse unsealed legacy {label} payload"))
         }

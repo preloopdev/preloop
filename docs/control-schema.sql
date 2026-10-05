@@ -728,11 +728,13 @@ CREATE TABLE artifacts (
     created_at              timestamptz NOT NULL DEFAULT now(),
     finalized_at            timestamptz,
     expires_at              timestamptz,
+    public_id               text,               -- v1 endpoint identity; see V2026100506
     UNIQUE (run_id, job_backend_id, name)
 );
 CREATE INDEX artifacts_run ON artifacts(run_id);
 CREATE INDEX artifacts_expiry ON artifacts(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX artifacts_pending ON artifacts(created_at) WHERE state = 'pending';
+CREATE UNIQUE INDEX artifacts_public_id ON artifacts(public_id) WHERE public_id IS NOT NULL;
 
 -- ── History (terminal runs, partitioned by run creation, dropped by partition) ──
 CREATE TABLE run_history (

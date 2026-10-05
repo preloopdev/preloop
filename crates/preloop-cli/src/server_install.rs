@@ -1717,6 +1717,9 @@ fn prepare_home(home: &Path, dry_run: bool) -> Result<()> {
 /// therefore drops the child to the service account, which can only write
 /// where the service itself can — the identity that owns the store from the
 /// first start on.
+///
+/// Called from the systemd (Linux) install path; macOS installs initialize
+/// the store on first `preloop run` instead.
 #[cfg(target_os = "linux")]
 fn prepare_control_store(home: &Path, exe: &Path, user: bool, dry_run: bool) -> Result<()> {
     if dry_run {

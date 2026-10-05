@@ -55,7 +55,7 @@ async fn imported_database_serves_runs_attempts_steps_and_queued_claims() {
     let run_queued = RunId(imported.fixture.run_queued.parse().unwrap());
 
     // Run projection: status/conclusion, per-job statuses, check ids, outputs.
-    let record = backend.run_record(run_ok).await.unwrap();
+    let record = backend.run_record(run_ok).await.unwrap().unwrap();
     assert_eq!(record.status, ExecutionStatus::Success);
     assert_eq!(record.conclusion.as_deref(), Some("success"));
     assert_eq!(

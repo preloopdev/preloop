@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 const KEY: &[u8] = b"legacy-import-test-key-32-bytes!";
 
+#[derive(Debug)]
 struct Imported {
     _dir: tempfile::TempDir,
     source: PathBuf,

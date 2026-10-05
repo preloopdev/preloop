@@ -3864,10 +3864,34 @@ pub async fn run_events(
         })?);
     }
     {
+        // Durable history first: the outbox carries the run's persisted
+        // events (including events imported from a legacy store), so the
+        // snapshot survives a restart. Node-local timeline events follow,
+        // de-duplicated by serialized form so a replayed status does not
+        // repeat a line the durable set already carried.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for value in shared
+            .state
+            .backend
+            .run_event_snapshot(run_id)
+            .await
+            .map_err(ApiError::from)?
+        {
+            let Ok(event) = serde_json::from_value::<NdjsonEvent>(value) else {
+                continue;
+            };
+            let line = event_to_ndjson(&event)?;
+            if seen.insert(line.clone()) {
+                snapshot.push_str(&line);
+            }
+        }
         let inner = shared.state.inner.lock().await;
         if let Some(events) = inner.timeline_events.get(&run_id) {
             for event in events {
-                snapshot.push_str(&event_to_ndjson(event)?);
+                let line = event_to_ndjson(event)?;
+                if seen.insert(line.clone()) {
+                    snapshot.push_str(&line);
+                }
             }
         }
     }

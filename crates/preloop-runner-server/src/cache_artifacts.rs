@@ -486,6 +486,22 @@ pub async fn put_artifact(
     let mut inner = shared.state.inner.lock().await;
     inner.artifacts.insert(record.id.clone(), record.clone());
     drop(inner);
+    // Durable catalog row: a restart must not lose an uploaded artifact
+    // (the GET/list paths read the catalog before the in-memory map).
+    if let Err(error) = shared
+        .state
+        .backend
+        .put_artifact_catalog(crate::control::types::NewArtifactRow {
+            public_id: record.id.clone(),
+            run_id,
+            name: record.name.clone(),
+            storage_key: record.path.clone(),
+            size_bytes: record.size.min(i64::MAX as u64) as i64,
+        })
+        .await
+    {
+        tracing::warn!(?error, "failed to persist artifact catalog row");
+    }
     Ok(Json(record))
 }
 
@@ -507,15 +523,29 @@ pub async fn read_artifact(
     shared: Arc<SharedState>,
     artifact_id: String,
 ) -> Result<Response, ApiError> {
-    let record = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .artifacts
-            .get(&artifact_id)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found("artifact not found"))?
+    // The control catalog is the durable home: imported artifacts and
+    // uploads from a previous process live there. The in-memory map serves
+    // only rows this process has not catalogued (test hooks, a backend
+    // hiccup).
+    let catalog = shared
+        .state
+        .backend
+        .artifact_catalog(None)
+        .await
+        .unwrap_or_default();
+    let bytes = if let Some(row) = catalog.into_iter().find(|row| row.public_id == artifact_id) {
+        tokio::fs::read(&row.storage_key).await?
+    } else {
+        let record = {
+            let inner = shared.state.inner.lock().await;
+            inner
+                .artifacts
+                .get(&artifact_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("artifact not found"))?
+        };
+        tokio::fs::read(&record.path).await?
     };
-    let bytes = tokio::fs::read(&record.path).await?;
     Ok(Response::builder()
         .header("content-type", "application/octet-stream")
         .body(Body::from(bytes))
@@ -526,12 +556,38 @@ pub async fn artifact_list(
     State(shared): State<Arc<SharedState>>,
     Path(run_id): Path<RunId>,
 ) -> Json<serde_json::Value> {
-    let inner = shared.state.inner.lock().await;
-    let value = inner
-        .artifacts
-        .values()
-        .filter(|artifact| artifact.run_id == run_id)
-        .collect::<Vec<_>>();
+    // Catalog first (durable, includes imported artifacts), then in-memory
+    // records this process has not catalogued; ids de-duplicate.
+    let mut seen = std::collections::HashSet::new();
+    let mut value = Vec::new();
+    if let Ok(catalog) = shared.state.backend.artifact_catalog(Some(run_id)).await {
+        for row in catalog {
+            seen.insert(row.public_id.clone());
+            value.push(json!({
+                "id": row.public_id,
+                "run_id": row.run_id,
+                "name": row.name,
+                "path": row.storage_key,
+                "size": row.size_bytes,
+            }));
+        }
+    }
+    {
+        let inner = shared.state.inner.lock().await;
+        for artifact in inner.artifacts.values().filter(|a| a.run_id == run_id) {
+            if !seen.insert(artifact.id.clone()) {
+                continue;
+            }
+            value.push(json!({
+                "id": artifact.id,
+                "run_id": artifact.run_id,
+                "name": artifact.name,
+                "file_name": artifact.file_name,
+                "path": artifact.path,
+                "size": artifact.size,
+            }));
+        }
+    }
     Json(json!({
         "count": value.len(),
         "value": value,

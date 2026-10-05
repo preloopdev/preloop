@@ -14,8 +14,8 @@
 //! scanned for the run's secret values before it is stored.
 
 use super::legacy::{
-    LegacyAttempt, LegacyLogFile, LegacyQueuedJob, LegacyRequestSnapshot, LegacyRun, LegacyRunner,
-    LegacySession, LegacyStep, LegacyWebhookDelivery, LegacyWebhookRedelivery,
+    LegacyAttempt, LegacyHeader, LegacyLogFile, LegacyQueuedJob, LegacyRequestSnapshot, LegacyRun,
+    LegacyRunner, LegacySession, LegacyStep, LegacyWebhookDelivery, LegacyWebhookRedelivery,
     LegacyWebhookWatchdog,
 };
 use super::report::{ActivePolicy, ImportedRows, SkippedFamily};
@@ -418,7 +418,30 @@ impl Sidecars {
     /// existing destination). On any failure the files already published in
     /// this call are removed again.
     pub(crate) fn publish(&mut self, cipher: &Envelope) -> anyhow::Result<()> {
-        for file in &self.files {
+        // Take the staged list so the linking loop can borrow `self`
+        // mutably (`published`/`rollback`) without aliasing `self.files`.
+        let files = std::mem::take(&mut self.files);
+        let result = self.link_staged(&files, cipher);
+        // Restore the list before propagating: `rollback`/`cleanup` walk it,
+        // and a retried import re-publishes (or adopts) the same sidecars.
+        self.files = files;
+        result?;
+        for dir in self
+            .files
+            .iter()
+            .filter_map(|file| file.final_path.parent().map(Path::to_path_buf))
+            .collect::<BTreeSet<_>>()
+        {
+            if let Ok(handle) = std::fs::File::open(&dir) {
+                let _ = handle.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Link each staged sidecar into place (see [`Sidecars::publish`]).
+    fn link_staged(&mut self, files: &[StagedFile], cipher: &Envelope) -> anyhow::Result<()> {
+        for file in files {
             if let Some(parent) = file.final_path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create sidecar dir {}", parent.display()))?;
@@ -448,16 +471,6 @@ impl Sidecars {
                         )
                     });
                 }
-            }
-        }
-        for dir in self
-            .files
-            .iter()
-            .filter_map(|file| file.final_path.parent().map(Path::to_path_buf))
-            .collect::<BTreeSet<_>>()
-        {
-            if let Ok(handle) = std::fs::File::open(&dir) {
-                let _ = handle.sync_all();
             }
         }
         Ok(())
@@ -575,8 +588,11 @@ pub(crate) fn write_import(
             reason: "steps of attempts the legacy store no longer holds (evicted runs)".to_owned(),
         });
     }
-    let session_of_request: BTreeMap<i64, String> =
-        source.session_active.iter().cloned().collect();
+    let session_of_request: BTreeMap<i64, String> = source
+        .session_active
+        .iter()
+        .map(|(session, request)| (*request, session.clone()))
+        .collect();
     let mut extra_needs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for (run_id, job_id, depends_on) in dependencies {
         extra_needs
@@ -676,7 +692,7 @@ pub(crate) fn write_import(
             .remove(&run.run_id)
             .unwrap_or_default()
             .into_iter()
-            .map(|job| (job.job_id.0.clone(), job))
+            .map(|job| (job.job.job_id.0.clone(), job))
             .collect();
         let mut job_ids: Vec<String> = record.jobs.keys().map(|id| id.0.clone()).collect();
         for (id, payload) in &payloads {
@@ -1437,7 +1453,6 @@ pub(crate) fn write_import(
         imported.outbox_events += 1;
     }
     seed_sequence(tx, "outbox_events", max_event_id)?;
-    drop(max_event_id);
 
     // ── Per-attempt job messages: verify or reconstruct ────────────────
     // The legacy store persists the runner-facing message per attempt. The
@@ -1447,7 +1462,13 @@ pub(crate) fn write_import(
     // the frame itself reconstructs a sanitized template.
     let mut verified_frames = 0_u64;
     for (request_id, raw) in &source.job_request_messages {
-        let value = super::legacy::decode_message_payload(cipher, raw, "job_request_message")?;
+        let associated_data = super::legacy::job_request_message_payload_aad(*request_id);
+        let value = super::legacy::decode_message_payload(
+            cipher,
+            raw,
+            "job_request_message",
+            &associated_data,
+        )?;
         let mut message: AgentJobRequestMessage = serde_json::from_value(value)
             .with_context(|| format!("decode legacy per-attempt message {request_id}"))?;
         let Some((run_id, job_id, agent_job_id)) = attempt_index.get(request_id) else {
@@ -1520,22 +1541,45 @@ pub(crate) fn write_import(
                 .get("path")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
+            // The public id is what the v1 endpoints address the artifact
+            // by (the map key is the same id; prefer the record field).
+            let public_id = entry
+                .get("id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+                .or_else(|| pair[0].as_str())
+                .unwrap_or_default();
             let size = entry.get("size").and_then(|value| value.as_i64());
+            let file_name = entry
+                .get("file_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or(name);
+            // The bytes are copied beside the target under this stable
+            // relative path; the legacy `path` names a retired state
+            // directory, so it cannot be the storage key.
+            let relative = format!("legacy-artifacts/{run_id}/{file_name}");
+            let storage_key = state_dir.join(&relative).to_string_lossy().into_owned();
             let inserted = tx.execute(
                 "INSERT INTO artifacts (namespace_id, run_id, job_backend_id, name, state, \
-                     size_bytes, storage_key, created_at, finalized_at) \
-                 VALUES (?1, ?2, '', ?3, 'finalized', ?4, ?5, ?6, ?6) \
+                     size_bytes, storage_key, public_id, created_at, finalized_at) \
+                 VALUES (?1, ?2, '', ?3, 'finalized', ?4, ?5, ?6, ?7, ?7) \
                  ON CONFLICT (run_id, job_backend_id, name) DO NOTHING",
-                params![namespace, run_id, name, size, path, crate::store::now_us()],
+                params![
+                    namespace,
+                    run_id,
+                    name,
+                    size,
+                    storage_key,
+                    public_id,
+                    crate::store::now_us()
+                ],
             )?;
             if inserted > 0 {
                 imported.artifacts += 1;
                 max_artifact_id = max_artifact_id.max(1);
             }
-            // Preserve the bytes too: the legacy v1 endpoint reads its
-            // in-memory catalog, so the file is copied under a documented
-            // target directory (validated against the recorded size) rather
-            // than left behind in the retired state directory.
+            // Preserve the bytes too (validated against the recorded size):
+            // the legacy store's own directory is retired with it.
             let source_file = legacy_state_dir.join(path);
             match std::fs::read(&source_file) {
                 Ok(bytes) => {
@@ -1547,11 +1591,6 @@ pub(crate) fn write_import(
                             bytes.len()
                         );
                     }
-                    let file_name = entry
-                        .get("file_name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(name);
-                    let relative = format!("legacy-artifacts/{run_id}/{file_name}");
                     sidecars.stage(
                         state_dir,
                         &relative,
@@ -1683,6 +1722,13 @@ pub(crate) fn write_import(
             }
         }
         let mut max_artifact_id = 0_i64;
+        // The v2 artifact service reads its registry from
+        // `<state-dir>/artifact_v2_registry.json` and the bytes from
+        // `<state-dir>/blobs/artifact/<token>/data`; carry both so migrated
+        // artifacts stay downloadable after the switch.
+        let mut serving_registry = serde_json::Map::new();
+        let mut copied_blobs = 0_u64;
+        let mut missing_blobs = 0_u64;
         for (key, entry) in registry {
             let run_id = entry
                 .get("workflow_run_backend_id")
@@ -1730,8 +1776,78 @@ pub(crate) fn write_import(
                 imported.artifacts += 1;
                 max_artifact_id = max_artifact_id.max(artifact_id);
             }
+            // Copy the finalized blob and expose the entry through the
+            // runtime registry (keyed `{run_id}/{name}`).
+            let Some(token) = uuid::Uuid::parse_str(storage_key).ok() else {
+                missing_blobs += 1;
+                notes.push(format!(
+                    "artifact registry entry {key} has a non-UUID blob token {storage_key:?}; \
+                     the row was imported but its blob is not served"
+                ));
+                continue;
+            };
+            let source_blob = legacy_state_dir
+                .join("blobs")
+                .join("artifact")
+                .join(token.to_string())
+                .join("data");
+            match std::fs::read(&source_blob) {
+                Ok(bytes) => {
+                    if let Some(expected) = size
+                        && bytes.len() as i64 != expected
+                    {
+                        notes.push(format!(
+                            "legacy artifact {name} blob is {} bytes but the registry records \
+                             {expected}",
+                            bytes.len()
+                        ));
+                    }
+                    let relative = format!("blobs/artifact/{token}/data");
+                    sidecars.stage(
+                        state_dir,
+                        &relative,
+                        &bytes,
+                        SidecarKind::ExactBytes,
+                        cipher,
+                    )?;
+                    copied_blobs += 1;
+                    // The key is the registry's own identity (the canonical
+                    // run id, which can differ from the entry's
+                    // `workflow_run_backend_id`); copy it verbatim — the boot
+                    // loader migrates pre-existing key shapes itself.
+                    serving_registry.insert(key.clone(), entry.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing_blobs += 1;
+                    notes.push(format!(
+                        "legacy artifact {name} blob {token} is missing from the legacy state \
+                         dir; the row was imported but its download is not served"
+                    ));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("read legacy artifact blob {}", source_blob.display())
+                    });
+                }
+            }
         }
         seed_sequence(tx, "artifacts", max_artifact_id)?;
+        if !serving_registry.is_empty() {
+            let bytes = serde_json::to_vec(&serde_json::Value::Object(serving_registry))?;
+            sidecars.stage(
+                state_dir,
+                "artifact_v2_registry.json",
+                &bytes,
+                SidecarKind::ExactBytes,
+                cipher,
+            )?;
+        }
+        if copied_blobs > 0 || missing_blobs > 0 {
+            notes.push(format!(
+                "{copied_blobs} finalized artifact blob(s) copied for serving; \
+                 {missing_blobs} registry entr(ies) had no usable blob"
+            ));
+        }
     }
 
     // ── Logs ────────────────────────────────────────────────────────────
@@ -1741,6 +1857,7 @@ pub(crate) fn write_import(
         &source.meta,
         sidecars,
         state_dir,
+        cipher,
         &mut imported,
         &mut skipped,
         &mut notes,
@@ -2076,6 +2193,7 @@ fn import_logs(
     meta: &serde_json::Map<String, serde_json::Value>,
     sidecars: &mut Sidecars,
     state_dir: &Path,
+    cipher: &Envelope,
     imported: &mut ImportedRows,
     skipped: &mut Vec<SkippedFamily>,
     notes: &mut Vec<String>,
@@ -2126,7 +2244,7 @@ fn import_logs(
     let mut next_log_id: BTreeMap<String, i64> = BTreeMap::new();
     let mut unmapped = 0_u64;
     let mut pruned = 0_u64;
-    for (key, (byte_count, line_count, updated_at_us, chunks)) in merged {
+    for (key, (byte_count, _line_count, updated_at_us, chunks)) in merged {
         let Some(plan) = legacy_log_plan(&key) else {
             unmapped += 1;
             continue;

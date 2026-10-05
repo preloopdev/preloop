@@ -173,7 +173,7 @@ pub fn write_legacy_fixture(
     insert_runs(&tx, &cipher, spec, &fixture)?;
     insert_jobs(&tx, &cipher, spec)?;
     insert_attempts(&tx, &cipher, spec)?;
-    insert_steps(&tx, &cipher)?;
+    insert_steps(&tx, &cipher, spec)?;
     insert_logs(&tx, &fixture)?;
     insert_runners(&tx)?;
     insert_webhooks(&tx, &cipher)?;
@@ -206,6 +206,17 @@ pub fn write_legacy_fixture(
 }
 
 fn apply_legacy_schema(conn: &mut Connection, user_version: i64) -> anyhow::Result<()> {
+    // The released runtime created its migration bookkeeping table outside
+    // the migration bodies themselves (see the old `SqliteStore::migrate`);
+    // the fixture must reproduce that or the ledger inserts below fail.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+           version INTEGER PRIMARY KEY,
+           name TEXT NOT NULL UNIQUE,
+           applied_at_us INTEGER NOT NULL
+         ) STRICT;",
+    )
+    .context("create legacy schema_migrations bookkeeping table")?;
     let migrations = legacy_migrations();
     for (version, name, ddl) in &migrations {
         conn.execute_batch(ddl)
@@ -750,7 +761,11 @@ fn insert_step(
     Ok(())
 }
 
-fn insert_steps(tx: &rusqlite::Transaction<'_>, cipher: &Envelope) -> anyhow::Result<()> {
+fn insert_steps(
+    tx: &rusqlite::Transaction<'_>,
+    cipher: &Envelope,
+    spec: &LegacyFixtureSpec,
+) -> anyhow::Result<()> {
     insert_step(
         tx,
         cipher,
@@ -793,20 +808,25 @@ fn insert_steps(tx: &rusqlite::Transaction<'_>, cipher: &Envelope) -> anyhow::Re
         Some(BASE_US + 31_000_000),
         Some(BASE_US + 40_000_000),
     )?;
-    insert_step(
-        tx,
-        cipher,
-        RUN_ACTIVE,
-        AGENT_RELEASE,
-        "eeeeeeee-0000-0000-0000-000000000001",
-        "workflow",
-        Some(0),
-        Some(2),
-        "Deploy",
-        "pending",
-        Some(BASE_US + 131_000_000),
-        None,
-    )?;
+    // The active run (and its attempt) only exists when the spec asks for
+    // it; a step for a run the fixture never inserted would violate the
+    // `job_steps.run_id` foreign key (and be an orphan for the importer).
+    if spec.include_active_claim {
+        insert_step(
+            tx,
+            cipher,
+            RUN_ACTIVE,
+            AGENT_RELEASE,
+            "eeeeeeee-0000-0000-0000-000000000001",
+            "workflow",
+            Some(0),
+            Some(2),
+            "Deploy",
+            "pending",
+            Some(BASE_US + 131_000_000),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -939,8 +959,12 @@ fn insert_control_events(
     tx: &rusqlite::Transaction<'_>,
     spec: &LegacyFixtureSpec,
 ) -> anyhow::Result<()> {
+    // Explicit non-trivial id: the import must carry it into the outbox
+    // unchanged (ids are the event feed's ordering contract), so the
+    // fixture must not let AUTOINCREMENT pick 1.
     tx.execute(
-        "INSERT INTO control_events(run_id, job_id, event_type, payload_json, created_at_us)          VALUES (?1, 'build', 'job_status', ?2, ?3)",
+        "INSERT INTO control_events(event_id, run_id, job_id, event_type, payload_json, created_at_us) \
+         VALUES (7, ?1, 'build', 'job_status', ?2, ?3)",
         params![
             RUN_OK,
             serde_json::json!({"run_id": RUN_OK, "job_id": "build", "status": "success"})

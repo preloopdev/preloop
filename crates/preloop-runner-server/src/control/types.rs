@@ -1371,3 +1371,25 @@ pub(crate) struct OidcGrant {
     pub(crate) granted: bool,
     pub(crate) context: crate::state::OidcJobContext,
 }
+
+/// One finalized v1 artifact from the control catalog. `public_id` is the
+/// UUID the v1 API addresses artifacts by; `storage_key` is the file path
+/// holding the bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactCatalogRow {
+    pub(crate) public_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) name: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
+}
+
+/// A finalized v1 artifact row to persist when an upload completes.
+#[derive(Debug, Clone)]
+pub(crate) struct NewArtifactRow {
+    pub(crate) public_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) name: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
+}

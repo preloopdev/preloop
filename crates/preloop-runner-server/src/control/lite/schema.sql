@@ -624,12 +624,13 @@ CREATE TABLE artifacts (
     storage_key             TEXT NOT NULL,
     created_at              INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000 AS INTEGER)),
     finalized_at            INTEGER,
-    expires_at              INTEGER,
+    expires_at              INTEGER, public_id TEXT,
     UNIQUE (run_id, job_backend_id, name)
 );
 CREATE INDEX artifacts_run ON artifacts(run_id);
 CREATE INDEX artifacts_expiry ON artifacts(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX artifacts_pending ON artifacts(created_at) WHERE state = 'pending';
+CREATE UNIQUE INDEX artifacts_public_id ON artifacts(public_id) WHERE public_id IS NOT NULL;
 
 -- ── History (terminal runs) ──────────────────────────────────────────
 CREATE TABLE "run_history" (
