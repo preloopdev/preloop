@@ -526,7 +526,10 @@ async fn settle_request_tx(
     tx.execute(
         "UPDATE job_requests SET result=$2, finished_at=now(), session_id=NULL \
          WHERE request_id=$1 AND result IS NULL",
-        &[&request_id, &status_str(status)],
+        &[
+            &request_id,
+            &status.is_terminal().then(|| status_str(status)),
+        ],
     )
     .await
     .map_err(db)?;
