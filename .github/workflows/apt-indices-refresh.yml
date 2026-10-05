@@ -99,7 +99,7 @@ jobs:
           ' versions.toml > versions.toml.tmp
           mv versions.toml.tmp versions.toml
           git add versions.toml
-          git commit -m "chore(golden): request apt index refresh"
+          git commit -m "chore(golden): request apt index refresh [skip ci]"
           gh auth setup-git
           git fetch origin "$BRANCH" || true
           git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
@@ -127,7 +127,7 @@ jobs:
             --draft \
             --base main \
             --head "$BRANCH" \
-            --title "chore(golden): rebuild stale apt indices" \
+            --title "chore(golden): rebuild stale apt indices [skip preloop]" \
             --body-file "$BODY"; then
             EXISTING_URL="$(gh pr list \
               --repo "$GITHUB_REPOSITORY" \

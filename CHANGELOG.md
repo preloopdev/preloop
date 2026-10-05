@@ -18,6 +18,13 @@ Releases before v0.27.0 predate the changelog.
   truthy-gated job; the reuse path also resolves the target release without
   requiring a checkout.
 
+- **Skipped checks now settle instead of remaining queued**: GitHub may return
+  `404 Not Found` when an immediate completion PATCH races replication of a
+  newly created check run. Preloop retries that narrow case, allowing
+  submit-time `if:` skips to report `completed/skipped`. Automated golden
+  reminder PRs now carry `[skip ci]` and `[skip preloop]` markers so the draft
+  notification does not consume GitHub or Preloop runners.
+
 - **Packed goldens on Apple Silicon bake again**: the Rosetta multiarch step
   spliced an apt-scoping fragment that ended in a newline, so the composed
   guest script had a line starting with `;` and every fresh packed-golden

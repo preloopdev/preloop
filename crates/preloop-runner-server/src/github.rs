@@ -211,7 +211,7 @@ async fn send_github_check_request(
     repo: &str,
     method: reqwest::Method,
     path: &str,
-    body: Value,
+    body: &Value,
 ) -> anyhow::Result<Value> {
     let client = crate::shared_http::CLIENT.clone();
     let url = format!("{}/repos/{}/{}", github_api_base(), repo, path);
@@ -222,7 +222,7 @@ async fn send_github_check_request(
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {}", token))
             .header("Accept", "application/vnd.github+json")
-            .json(&body),
+            .json(body),
     )
     .await?;
 
@@ -240,6 +240,56 @@ async fn send_github_check_request(
     record_check_reporting(shared, true);
     let val = res.json().await.unwrap_or(Value::Null);
     Ok(val)
+}
+
+/// GitHub can briefly return 404 when a PATCH races replication of a newly
+/// created check run. Retry only that response; every other error is final.
+async fn send_github_check_completion(
+    shared: &Arc<SharedState>,
+    token: &str,
+    repo: &str,
+    path: &str,
+    body: &Value,
+) -> anyhow::Result<Value> {
+    const RETRY_DELAYS: [Duration; 3] = [
+        Duration::from_millis(250),
+        Duration::from_millis(750),
+        Duration::from_millis(1_500),
+    ];
+    for (attempt, delay) in RETRY_DELAYS.into_iter().enumerate() {
+        match send_github_check_request(
+            shared,
+            &shared.state.github_lifecycle_breaker,
+            token,
+            repo,
+            reqwest::Method::PATCH,
+            path,
+            body,
+        )
+        .await
+        {
+            Err(error) if is_check_run_not_found(&error) => {
+                warn!(
+                    attempt = attempt + 1,
+                    delay_ms = delay.as_millis(),
+                    %error,
+                    "new GitHub check run is not visible to PATCH yet; retrying"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            result => return result,
+        }
+    }
+    send_github_check_request(
+        shared,
+        &shared.state.github_lifecycle_breaker,
+        token,
+        repo,
+        reqwest::Method::PATCH,
+        path,
+        body,
+    )
+    .await
 }
 
 pub fn run_details_url(run_id: RunId) -> Option<String> {
@@ -425,7 +475,7 @@ async fn mint_check_run(
             repo,
             reqwest::Method::POST,
             "check-runs",
-            body,
+            &body,
         )
         .await
         {
@@ -509,7 +559,7 @@ pub async fn report_existing_check_run_queued(
             repo,
             reqwest::Method::PATCH,
             &path,
-            body,
+            &body,
         )
         .await
         {
@@ -546,7 +596,7 @@ async fn find_existing_check_run(
         repo,
         reqwest::Method::GET,
         &format!("commits/{sha}/check-runs"),
-        Value::Null,
+        &Value::Null,
     )
     .await
     {
@@ -604,7 +654,7 @@ pub async fn report_check_run_permanent_failure(
             repo,
             method,
             &path,
-            body,
+            &body,
         )
         .await?;
     } else {
@@ -735,7 +785,7 @@ pub async fn report_check_run_in_progress(
             &repo,
             reqwest::Method::PATCH,
             &path,
-            body,
+            &body,
         )
         .await
         {
@@ -950,16 +1000,8 @@ pub async fn report_check_run_completed(
                     body["details_url"] = serde_json::json!(url);
                 }
             }
-            if let Err(error) = send_github_check_request(
-                shared,
-                &shared.state.github_lifecycle_breaker,
-                token,
-                &repo,
-                reqwest::Method::PATCH,
-                &path,
-                body,
-            )
-            .await
+            if let Err(error) =
+                send_github_check_completion(shared, token, &repo, &path, &body).await
             {
                 warn!(
                     %run_id,
@@ -4631,6 +4673,61 @@ jobs:
                 .contains_key(&leg),
             "a terminal report must mint the check it reports to"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_check_retries_not_found_after_creation() {
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock_app = axum::Router::new().route(
+            "/repos/owner/repo/check-runs/:id",
+            axum::routing::patch({
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if attempt == 0 {
+                            (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({"message": "Not Found"})),
+                            )
+                                .into_response()
+                        } else {
+                            Json(serde_json::json!({"id": 7})).into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+
+        let (_temp, shared, run_id) = mint_fixture(true, None).await;
+        let job_id = JobId("build".to_owned());
+        {
+            let mut inner = shared.state.inner.lock().await;
+            let run = inner.runs.get_mut(&run_id).unwrap();
+            run.jobs.insert(job_id.clone(), ExecutionStatus::Skipped);
+            run.job_check_run_ids.insert(job_id.clone(), 7);
+        }
+        let _api_url = crate::state::TestEnvVar::set(
+            "PRELOOP_GITHUB_API_URL",
+            format!("http://127.0.0.1:{port}"),
+        );
+        let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "check-retry-token");
+
+        report_check_run_completed(&shared, run_id, &job_id, ExecutionStatus::Skipped).await;
+
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an immediate 404 must be retried instead of stranding the check"
+        );
+        server.abort();
     }
 
     #[test]
