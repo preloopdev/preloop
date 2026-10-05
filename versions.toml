@@ -32,6 +32,7 @@ smolvm_golden_version = "1.21.1"
 # golden is rebuilt manually on a host with enough disk.
 # Quoted: build.rs only picks up quoted values (and Renovate's regex manager
 # expects flat `key = "value"` lines).
+# Golden rebuild requested 2026-10-05: published provenance is missing.
 apt_indices_max_age_days = "7"
 
 # Image inputs for the runner golden. The OCI bases are immutable filesystem
