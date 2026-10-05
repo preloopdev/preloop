@@ -11,6 +11,19 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Linux packed-golden runners survive engine restarts again** (#371): the
+  orphaned-data-dir sweep treated every unregistered directory under SmolVM's
+  `vms/` as a leaked machine, including SmolVM's own shared pack store
+  (`_shared/`) that every packed machine's lease points into. After a restart
+  each fork failed with `copy shared pack lease: No such file or directory`,
+  and the direct-create fallback re-extracted the whole golden (~90 GB) per
+  runner. The sweep now only removes 16-hex machine data dirs.
+
+- **The official golden unpacks without `SMOLVM_PACK_MAX_EXTRACT_BYTES`**
+  (#371): SmolVM caps extraction at 128 GiB of declared size, which the
+  golden's sparse disks exceed. Preloop now passes a 512 GiB ceiling to SmolVM
+  unless the operator sets one.
+
 - **Scheduled golden refreshes no longer launch an impossible hosted bake**:
   the apt-index freshness workflow now opens one idempotent draft PR asking for
   a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are

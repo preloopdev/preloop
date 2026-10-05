@@ -1613,9 +1613,28 @@ impl VmProvider for SmolVmProvider {
 /// provably orphaned.
 const ORPHAN_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Delete children of `roots` that are not in `known_dirs` and are older than
-/// `grace`. Synchronous: the sweep runs inside `spawn_blocking` because a
-/// leaked VM dir can be gigabytes of metadata.
+/// Whether `name` is a SmolVM machine data dir: the first 16 lowercase hex
+/// chars of the SHA-256 of the machine name (`vm_dir_hash`). SmolVM keeps its
+/// own node-wide state beside them under `_`-prefixed names — the shared
+/// content-addressed pack store (`_shared/`) every packed machine's
+/// `.pack-shared` lease points into, the restore base (`_restore-base/`) —
+/// precisely so they can never collide with a machine dir (#371).
+fn is_machine_data_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.len() == 16
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Delete machine data dirs under `roots` that are not in `known_dirs` and
+/// are older than `grace`. Only machine data dirs are candidates: anything
+/// else is SmolVM's own state, and deleting the shared pack store left every
+/// packed machine's lease dangling, so forks failed and the direct-create
+/// fallback re-extracted the whole pack per runner (#371). Synchronous: the
+/// sweep runs inside `spawn_blocking` because a leaked VM dir can be
+/// gigabytes of metadata.
 fn sweep_orphaned_dirs(
     roots: &[PathBuf],
     known_dirs: &std::collections::BTreeSet<PathBuf>,
@@ -1628,7 +1647,10 @@ fn sweep_orphaned_dirs(
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if known_dirs.contains(&path) || !path.is_dir() {
+            if !is_machine_data_dir_name(&entry.file_name())
+                || known_dirs.contains(&path)
+                || !path.is_dir()
+            {
                 continue;
             }
             let old_enough = std::fs::metadata(&path)
@@ -2126,6 +2148,10 @@ pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
     Ok(killed)
 }
 
+/// Declared-size ceiling for SmolVM pack extraction (512 GiB): above the
+/// official golden's sparse disk sizes, still finite.
+const PACK_MAX_EXTRACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+
 fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
     let host_home = std::env::var_os("HOME").map(PathBuf::from);
     let mut env = Vec::new();
@@ -2161,6 +2187,19 @@ fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)
             .find(|path| path.is_dir())
     {
         env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
+    }
+
+    // smolvm caps a pack extraction at 128 GiB of *header-declared* size, so
+    // the official golden's sparse disks (declared far beyond what they
+    // allocate) fail every unpack with "tar archive exceeds max total size"
+    // (#371). The packs Preloop extracts are digest- or checksum-verified
+    // before use, so the bomb guard only needs to stay finite. An operator
+    // value wins.
+    if std::env::var_os("SMOLVM_PACK_MAX_EXTRACT_BYTES").is_none() {
+        env.push((
+            "SMOLVM_PACK_MAX_EXTRACT_BYTES".to_owned(),
+            PACK_MAX_EXTRACT_BYTES.to_string().into(),
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -2731,17 +2770,21 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).ok();
     }
 
-    /// A data dir with no registry entry is unreachable garbage once the
-    /// create-before-register grace window passes; the sweep must take it
-    /// while sparing registered dirs and anything too young to be proven
-    /// orphaned.
+    /// A machine data dir with no registry entry is unreachable garbage once
+    /// the create-before-register grace window passes; the sweep must take it
+    /// while sparing registered dirs and SmolVM's own node-wide state, whose
+    /// loss dangles every packed machine's lease (#371).
     #[test]
-    fn sweep_orphaned_dirs_removes_unregistered_only() {
+    fn sweep_orphaned_dirs_removes_unregistered_machine_dirs_only() {
         let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
-        let known = root.join("registered");
-        let orphan = root.join("orphaned");
-        std::fs::create_dir_all(&known).unwrap();
-        std::fs::create_dir_all(&orphan).unwrap();
+        let known = root.join("0123456789abcdef");
+        let orphan = root.join("59cc3c416f4b6d5e");
+        let shared_store = root.join("_shared").join("a1b2c3d4");
+        let restore_base = root.join("_restore-base");
+        let not_a_hash = root.join("ABCDEF0123456789");
+        for dir in [&known, &orphan, &shared_store, &restore_base, &not_a_hash] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         let known_dirs = std::collections::BTreeSet::from([known.clone()]);
 
         // Zero grace: every unregistered dir is provably old enough.
@@ -2754,7 +2797,10 @@ mod tests {
 
         assert_eq!(swept, 1);
         assert!(known.is_dir(), "registered dir survives");
-        assert!(!orphan.exists(), "orphaned dir is removed");
+        assert!(!orphan.exists(), "orphaned machine dir is removed");
+        assert!(shared_store.is_dir(), "shared pack store survives");
+        assert!(restore_base.is_dir(), "restore base survives");
+        assert!(not_a_hash.is_dir(), "non-machine names are never swept");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2798,7 +2844,7 @@ mod tests {
     #[test]
     fn sweep_orphaned_dirs_spares_young_dirs() {
         let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
-        let young = root.join("young");
+        let young = root.join("fedcba9876543210");
         std::fs::create_dir_all(&young).unwrap();
 
         let swept = super::sweep_orphaned_dirs(

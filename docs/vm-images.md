@@ -642,6 +642,11 @@ one produced so a regression is recognizable.
   pack export streams multi-GiB flattened layers, but the general 4 GiB
   file-transfer cap applies unless raised. preloop sets
   `SMOLVM_FILE_TRANSFER_MAX_BYTES=64GiB` on the pack command.
+- **`tar archive exceeds max total size (137438953472 bytes)` unpacking a
+  golden**: SmolVM caps extraction at 128 GiB of header-declared size, and a
+  golden's sparse disks declare far more than they allocate. preloop passes
+  `SMOLVM_PACK_MAX_EXTRACT_BYTES=549755813888` (512 GiB) to every SmolVM
+  command unless the variable is already set.
 - **`mkdir: cannot create directory '/var/lib/preloop-runner': Permission
   denied` during the bake**: the official image declares `USER=runner`, and
   `machine exec` runs as the image's declared user. The exec path now
