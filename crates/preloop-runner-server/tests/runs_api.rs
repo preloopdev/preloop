@@ -2238,7 +2238,7 @@ async fn environment_secrets_override_repo_and_global_per_job() {
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\njobs:\n  prod:\n    runs-on: ubuntu-latest\n    environment: prod\n    steps:\n      - run: echo hi\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_yaml": "on: push\njobs:\n  prod:\n    runs-on: ubuntu-latest\n    environment: prod\n    env:\n      SHARED: ${{ secrets.SHARED }}\n      ENV_ONLY: ${{ secrets.ENV_ONLY }}\n      TIERED: ${{ secrets.TIERED }}\n      REPO_GLOBAL: ${{ secrets.REPO_GLOBAL }}\n    steps:\n      - run: echo hi\n  plain:\n    runs-on: ubuntu-latest\n    env:\n      SHARED: ${{ secrets.SHARED }}\n      REPO_GLOBAL: ${{ secrets.REPO_GLOBAL }}\n      TIERED: ${{ secrets.TIERED }}\n    steps:\n      - run: echo hi\n",
             "event": "push",
             "payload": {"ref": "refs/heads/main", "commits": []},
             "repository": "owner/repo",

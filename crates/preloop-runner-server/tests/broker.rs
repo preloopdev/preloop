@@ -2178,6 +2178,82 @@ async fn stored_secrets_are_injected_into_native_submissions() {
     assert_eq!(var["isSecret"].as_bool(), Some(true));
 }
 
+/// The acquire fill injects only the stored secrets the job's own expressions
+/// reference. Every `isSecret` variable lands in the runner's `secrets`
+/// context — an unreferenced name would ride the wire for nothing, so
+/// `spec.names` carries the referenced subset and nothing else.
+#[tokio::test]
+async fn unreferenced_stored_secrets_stay_out_of_the_job_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let mut secrets = state.secrets.write();
+        secrets
+            .global
+            .insert("USED_SECRET".to_owned(), "used-value".to_owned());
+        secrets
+            .global
+            .insert("UNUSED_SECRET".to_owned(), "must-not-ship".to_owned());
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    env:\n      USED: ${{ secrets.USED_SECRET }}\n    steps:\n      - run: echo $USED\n",
+        "owner/repo",
+    )
+    .await;
+
+    let acquired = acquire_queued_job(&app, "referenced-only-runner").await;
+    let variables = acquired["variables"].as_object().unwrap();
+    assert_eq!(
+        variables
+            .get("USED_SECRET")
+            .and_then(|v| v["value"].as_str()),
+        Some("used-value"),
+        "the referenced secret is injected: {variables:?}"
+    );
+    assert!(
+        !variables.contains_key("UNUSED_SECRET"),
+        "unreferenced stored secrets must not reach the job: {variables:?}"
+    );
+}
+
+/// A job whose `secrets` reads cannot be enumerated — `secrets[matrix.pick]`,
+/// an object filter, a bare `secrets` argument — keeps the whole in-scope
+/// set: dropping it would silently turn a real read into an empty string.
+#[tokio::test]
+async fn dynamic_secret_reads_keep_the_full_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    {
+        let mut secrets = state.secrets.write();
+        secrets
+            .global
+            .insert("PIVOTED".to_owned(), "pivot-value".to_owned());
+        secrets
+            .global
+            .insert("ALSO_STORED".to_owned(), "also-value".to_owned());
+    }
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ toJSON(secrets) }}\n",
+        "owner/repo",
+    )
+    .await;
+
+    let acquired = acquire_queued_job(&app, "dynamic-secrets-runner").await;
+    let variables = acquired["variables"].as_object().unwrap();
+    for name in ["PIVOTED", "ALSO_STORED"] {
+        assert!(
+            variables.contains_key(name),
+            "a bare secrets-context read must keep every scoped name: {variables:?}"
+        );
+    }
+}
+
 /// A submission's run-tier secrets must outlive the run finishing and being
 /// archived: a re-run of an archived run re-resolves them. Dropping the tier
 /// at archive silently ran the re-run without secrets.
@@ -2192,7 +2268,7 @@ async fn archived_run_keeps_run_tier_secrets_for_rerun() {
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $TOKEN\n        env:\n          TOKEN: ${{ secrets.MY_TOKEN }}\n",
             "event": "push",
             "repository": "owner/repo",
             "secrets": {"MY_TOKEN": "s3cr3t-value"}
@@ -2900,7 +2976,7 @@ async fn repo_scoped_secrets_override_global_and_stay_scoped() {
         );
     }
     let app = app(state.clone(), CancellationToken::new());
-    let workflow = "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo $SECRET\n";
+    let workflow = "on: push\njobs:\n  probe:\n    runs-on: ubuntu-latest\n    env:\n      GLOBAL_TOKEN: ${{ secrets.GLOBAL_TOKEN }}\n      REPO_TOKEN: ${{ secrets.REPO_TOKEN }}\n    steps:\n      - run: echo $SECRET\n";
 
     // Secrets resolve at acquire through the SecretProvider; the stored
     // template only names them. Acquire each queued job in submit order.

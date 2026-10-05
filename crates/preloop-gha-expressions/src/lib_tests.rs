@@ -1337,3 +1337,69 @@ fn collect_context_properties_walks_functions_and_operators() {
         Some(&std::collections::BTreeSet::from(["REGION".to_owned()]))
     );
 }
+
+#[test]
+fn collect_secret_reads_reports_literal_names_without_dynamic() {
+    let reads = collect_secret_reads("${{ secrets.DEPLOY_KEY }}").unwrap();
+    assert_eq!(
+        reads.names,
+        std::collections::BTreeSet::from(["DEPLOY_KEY".to_owned()])
+    );
+    assert!(!reads.dynamic);
+
+    // Bracket form with a literal key is still a literal read.
+    let indexed = collect_secret_reads("${{ secrets['ALT_KEY'] }}").unwrap();
+    assert_eq!(
+        indexed.names,
+        std::collections::BTreeSet::from(["ALT_KEY".to_owned()])
+    );
+    assert!(!indexed.dynamic);
+
+    // Walks the same shapes the property collector does.
+    let mixed =
+        collect_secret_reads("${{ secrets.A == 'x' && format('{0}', secrets.B) || !secrets.C }}")
+            .unwrap();
+    assert_eq!(
+        mixed.names,
+        std::collections::BTreeSet::from(["A".to_owned(), "B".to_owned(), "C".to_owned()])
+    );
+    assert!(!mixed.dynamic);
+}
+
+#[test]
+fn collect_secret_reads_flags_unprovable_access_as_dynamic() {
+    // Dynamic index: the key is computed at run time.
+    let dynamic = collect_secret_reads("${{ secrets[matrix.pick] }}").unwrap();
+    assert!(dynamic.dynamic);
+    assert!(dynamic.names.is_empty());
+
+    // A bare secrets path hands the whole object to a function.
+    let bare = collect_secret_reads("${{ toJSON(secrets) }}").unwrap();
+    assert!(bare.dynamic);
+
+    // The `*` object filter reads every value.
+    let star = collect_secret_reads("${{ join(secrets.*) }}").unwrap();
+    assert!(star.dynamic);
+
+    // A dynamic index still reports names read elsewhere in the expression.
+    let both = collect_secret_reads("${{ secrets[matrix.pick] || secrets.FALLBACK }}").unwrap();
+    assert!(both.dynamic);
+    assert_eq!(
+        both.names,
+        std::collections::BTreeSet::from(["FALLBACK".to_owned()])
+    );
+}
+
+#[test]
+fn collect_secret_reads_ignores_non_secret_contexts() {
+    // `vars`, `env`, computed member access: none of it touches `secrets`.
+    for input in [
+        "${{ vars.REGION }}",
+        "${{ env[matrix.key] }}",
+        "${{ fromJSON('{\"a\":1}').a }}",
+    ] {
+        let reads = collect_secret_reads(input).unwrap();
+        assert!(reads.names.is_empty(), "{input}");
+        assert!(!reads.dynamic, "{input}");
+    }
+}

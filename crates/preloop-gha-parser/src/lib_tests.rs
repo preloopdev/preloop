@@ -3940,3 +3940,89 @@ fn secret_requirements_missing_from_diffs_against_stored_names() {
     );
     assert!(requirements.missing_from(["STORED", "MISSING"]).is_empty());
 }
+
+#[test]
+fn job_secret_reads_cover_fields_the_requirements_walk_missed() {
+    // `outputs` (runner-evaluated), step `name`, and `environment.url` can
+    // all carry `${{ secrets.* }}` — the injection filter needs them even
+    // though the submit preflight never reported them.
+    let jobs = expand_secret_workflow(
+        r#"
+name: reads
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://${{ secrets.ENV_HOST }}/deploy
+    outputs:
+      token: ${{ secrets.OUTPUT_TOKEN }}
+    steps:
+      - name: Deploy ${{ secrets.STEP_NAME_SUFFIX }}
+        run: echo done
+"#,
+    );
+    let reads = collect_job_secret_reads(&jobs[0]);
+    assert_eq!(
+        reads.names,
+        std::collections::BTreeSet::from([
+            "ENV_HOST".to_owned(),
+            "OUTPUT_TOKEN".to_owned(),
+            "STEP_NAME_SUFFIX".to_owned(),
+        ])
+    );
+    assert!(!reads.dynamic);
+}
+
+#[test]
+fn job_secret_reads_flag_dynamic_access_for_fail_closed_scoping() {
+    let jobs = expand_secret_workflow(
+        r#"
+name: dynamic
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pick: [A]
+    steps:
+      - run: echo "${{ secrets[matrix.pick] }}"
+"#,
+    );
+    let reads = collect_job_secret_reads(&jobs[0]);
+    assert!(reads.dynamic, "secrets[matrix.pick] is not enumerable");
+
+    // An expression that fails to parse is dynamic too: the injection
+    // filter must not drop a reference it could not read. `if:` is a bare
+    // expression (no `${{ }}` needed), so an invalid one still reaches the
+    // collector as source text.
+    let mut job = jobs[0].clone();
+    job.steps.clear();
+    job.if_condition = Some("secrets.TOKEN &&".to_owned());
+    assert!(collect_job_secret_reads(&job).dynamic);
+}
+
+#[test]
+fn job_secret_reads_match_requirement_names_on_literal_workflows() {
+    // Same literal-name set the preflight reports, per job — including the
+    // engine-provided token exclusion.
+    let jobs = expand_secret_workflow(
+        r#"
+name: parity
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ secrets.REAL }} ${{ secrets.GITHUB_TOKEN }}"
+"#,
+    );
+    let reads = collect_job_secret_reads(&jobs[0]);
+    assert_eq!(
+        reads.names,
+        std::collections::BTreeSet::from(["REAL".to_owned()])
+    );
+    assert!(!reads.dynamic);
+}
