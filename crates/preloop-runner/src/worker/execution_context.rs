@@ -552,6 +552,11 @@ impl<'a> StepContext<'a> {
         for (k, v) in &self.env {
             env.insert(k.clone(), v.clone());
         }
+        // A non-empty job/step PATH is explicit user intent: it replaces the
+        // machine PATH, and hosted runners do not add toolchain shims to it.
+        // An empty PATH is treated as missing by `ensure_path`, so it still
+        // gets the machine fallback and the shims below.
+        let explicit_path = env.get("PATH").is_some_and(|path| !path.trim().is_empty());
         // Container-bound environments (docker actions, and every step of a
         // job container) must NOT receive the host PATH fallback: it is
         // passed to docker run/exec as `-e PATH=<host path>`, overriding the
@@ -575,22 +580,12 @@ impl<'a> StepContext<'a> {
             ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
             // Rust toolchains installed by the orchestrator run as the
             // unprivileged runner user. Keep their shims visible to every
-            // subsequent step without relying on a profile file
-            // (`bash --noprofile --norc` is the official invocation).
-            let cargo_bin = "/home/runner/.cargo/bin";
-            if std::path::Path::new(cargo_bin).is_dir() {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                if !path.split(':').any(|entry| entry == cargo_bin) {
-                    env.insert("PATH".to_owned(), format!("{cargo_bin}:{path}"));
-                }
-            }
-            let go_bin = "/home/runner/go/bin";
-            if std::path::Path::new(go_bin).is_dir() {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                if !path.split(':').any(|entry| entry == go_bin) {
-                    env.insert("PATH".to_owned(), format!("{go_bin}:{path}"));
-                }
-            }
+            // subsequent step that relies on the machine PATH, without
+            // relying on a profile file (`bash --noprofile --norc` is the
+            // official invocation). An explicit job/step PATH is left alone:
+            // hosted runners replace the image PATH wholesale there, and a
+            // runner must not smuggle toolchain entries back into it.
+            apply_toolchain_shims(&mut env, explicit_path, TOOLCHAIN_SHIM_DIRS);
             // GitHub-hosted parity: hosted runners run steps as a dedicated
             // user in a systemd session, so USER/LOGNAME (the runner account)
             // and XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present
@@ -783,6 +778,35 @@ pub(crate) fn ensure_path(env: &mut HashMap<String, String>, worker_path: Option
         .filter(|path| !path.trim().is_empty())
         .unwrap_or(DEFAULT_PATH);
     env.insert("PATH".to_string(), path.to_string());
+}
+
+/// Toolchain bin dirs the orchestrator installs for the unprivileged runner
+/// user; the guest layout mirrors hosted runners.
+const TOOLCHAIN_SHIM_DIRS: &[&str] = &["/home/runner/.cargo/bin", "/home/runner/go/bin"];
+
+/// Prepend every existing toolchain shim dir that `PATH` is missing.
+///
+/// Skipped when the job/step set an explicit (non-empty) PATH: that value
+/// replaces the machine PATH, and hosted runners do not re-add image entries
+/// to it. Tests pass a temp dir so the gate is covered on hosts without the
+/// guest layout.
+fn apply_toolchain_shims(
+    env: &mut HashMap<String, String>,
+    explicit_path: bool,
+    shim_dirs: &[&str],
+) {
+    if explicit_path {
+        return;
+    }
+    for shim in shim_dirs {
+        if !std::path::Path::new(shim).is_dir() {
+            continue;
+        }
+        let path = env.get("PATH").cloned().unwrap_or_default();
+        if !path.split(':').any(|entry| entry == *shim) {
+            env.insert("PATH".to_owned(), format!("{shim}:{path}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1042,6 +1066,28 @@ mod tests {
         let mut env = HashMap::from([("PATH".to_string(), "/custom".to_string())]);
         ensure_path(&mut env, Some("/worker"));
         assert_eq!(env["PATH"], "/custom");
+    }
+
+    /// Toolchain shims repair only the machine-PATH fallback: a
+    /// workflow-provided PATH must come through verbatim (`build_env` gates
+    /// the injection on `explicit_path`). A temp dir stands in for the guest
+    /// shim dirs so the assertion holds on hosts without `/home/runner`.
+    #[test]
+    fn toolchain_shims_respect_explicit_path() {
+        let shim = tempfile::tempdir().unwrap();
+        let shim_dir = shim.path().to_str().unwrap();
+
+        let mut explicit = HashMap::from([("PATH".to_string(), "/custom/bin".to_string())]);
+        apply_toolchain_shims(&mut explicit, true, &[shim_dir]);
+        assert_eq!(explicit["PATH"], "/custom/bin");
+
+        let mut inherited = HashMap::from([("PATH".to_string(), "/usr/bin".to_string())]);
+        apply_toolchain_shims(&mut inherited, false, &[shim_dir]);
+        assert_eq!(inherited["PATH"], format!("{shim_dir}:/usr/bin"));
+
+        // An entry already present is not duplicated.
+        apply_toolchain_shims(&mut inherited, false, &[shim_dir]);
+        assert_eq!(inherited["PATH"], format!("{shim_dir}:/usr/bin"));
     }
 
     #[test]
