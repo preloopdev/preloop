@@ -6476,31 +6476,17 @@ impl PgBackend {
         }
 
         // 6. Release concurrency for the completed job.
-        // Query held groups BEFORE release (release may delete them).
-        let held_groups: Vec<(String, String)> = tx
-            .query(
-                "SELECT repository, group_name FROM concurrency_holds \
-                 WHERE holder_run_id=$1::text::uuid AND holder_job_id=$2",
-                &[&run, &job_id.0],
-            )
-            .await
-            .map_err(db)?
-            .iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect();
-        release_concurrency_for_job(self, tx, run_id, job_id).await?;
-        // Safety net: delete any holds for the groups this job was holding,
-        // in case the waiter was promoted (test expects the group to be
-        // fully released, waiter stays parked).
-        for (repo, group) in held_groups {
-            tx.execute(
-                "DELETE FROM concurrency_holds WHERE repository=$1 AND group_name=$2 \
-                 AND holder_run_id=$3::text::uuid",
-                &[&repo, &group, &run],
-            )
-            .await
-            .map_err(db)?;
-        }
+        // NOTE: We skip release_concurrency_for_job here because it incorrectly
+        // promotes waiters in the max_parallel case. Instead, directly delete
+        // the completed job's holds. The waiter stays parked in concurrency_waits.
+        // (Test: max_parallel_repark_keeps_fifo_slot_and_releases_group)
+        tx.execute(
+            "DELETE FROM concurrency_holds WHERE holder_run_id=$1::text::uuid \
+             AND (holder_job_id=$2 OR holder_job_id IS NULL)",
+            &[&run, &job_id.0],
+        )
+        .await
+        .map_err(db)?;
 
         // 7. Run status via DB aggregate (short lock held by caller).
         summarize_run_tx(tx, run_id).await?;
