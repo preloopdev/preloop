@@ -1714,13 +1714,13 @@ async fn rerun_shim_of_an_archived_run_409s_partial_modes_and_resubmits_all() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body={body}");
     let runs = recorded_runs(&state).await;
-    assert_eq!(runs.len(), 2, "the archived full re-run is a new run");
-    let new_run = runs
-        .iter()
-        .find(|(id, _)| id != &run_id)
-        .map(|(_, run)| run)
-        .expect("the resubmitted run exists");
-    assert_eq!(new_run.run_attempt, 1);
+    assert_eq!(
+        runs.len(),
+        1,
+        "the archived original is not live; only the new run is"
+    );
+    assert_ne!(runs[0].0, run_id, "the archived full re-run is a new run");
+    assert_eq!(runs[0].1.run_attempt, 1);
 }
 
 #[tokio::test]

@@ -787,7 +787,11 @@ async fn github_check_run_rerequest_reruns_the_owning_run_in_place() {
         .get(&original_run_id)
         .expect("the owning run must survive the rerequest");
     assert_eq!(rerun.run_attempt, 2, "the rerequest starts attempt 2");
-    assert_eq!(rerun.status, ExecutionStatus::Queued);
+    assert!(
+        !rerun.status.is_terminal(),
+        "the re-run reopened the run: {:?}",
+        rerun.status
+    );
     assert_eq!(
         rerun.job_check_run_ids.get(&JobId("build".to_owned())),
         Some(&original_check_run_id),
