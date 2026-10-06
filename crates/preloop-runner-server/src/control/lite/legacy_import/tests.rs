@@ -5,8 +5,10 @@
 
 use super::fixture::{LegacyFixtureSpec, write_legacy_fixture};
 use super::{ActivePolicy, ImportOptions, run_import};
-use crate::control::backend::RequestKey;
+use crate::control::backend::{CreateSession, PollRequest, RequestKey};
 use crate::control::lite::LiteBackend;
+use crate::control::types::{PollOutcome, SessionProtocol};
+use crate::models::RunnerCapabilities;
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
 use std::time::Duration;
 
@@ -55,7 +57,7 @@ async fn imported_database_serves_runs_attempts_steps_and_queued_claims() {
     let run_queued = RunId(imported.fixture.run_queued.parse().unwrap());
 
     // Run projection: status/conclusion, per-job statuses, check ids, outputs.
-    let record = backend.run_record(run_ok).await.unwrap();
+    let record = backend.run_record(run_ok).await.unwrap().unwrap();
     assert_eq!(record.status, ExecutionStatus::Success);
     assert_eq!(record.conclusion.as_deref(), Some("success"));
     assert_eq!(
@@ -102,23 +104,50 @@ async fn imported_database_serves_runs_attempts_steps_and_queued_claims() {
         imported.fixture.log_bytes
     );
 
-    // Queued work: the ready job's placeholder claim acquires through the
-    // normal path (template + prompt-scoped metadata).
+    // Queued work: the ready job is claimed by a live session on the
+    // imported runner and acquires through the normal path.
     let stats = backend.queue_stats().await.unwrap();
-    assert!(stats.ready >= 1, "{stats:?}");
-    let context = backend
-        .acquire_for_runner(3, 7)
+    assert_eq!((stats.ready, stats.pending), (1, 1), "{stats:?}");
+    let session = backend
+        .create_session(CreateSession {
+            runner_id: 7,
+            protocol: SessionProtocol::Broker,
+            client_id: None,
+        })
         .await
-        .expect("queued lint job acquires");
+        .unwrap();
+    let poll = backend
+        .poll_session(PollRequest {
+            session_id: session.session_id.clone(),
+            verified_runner_id: Some(7),
+            runner: RunnerCapabilities {
+                known: true,
+                labels: vec!["self-hosted".to_owned()],
+                runner_group_id: None,
+                runner_group_name: None,
+            },
+            busy: false,
+            wait_ms: 0,
+        })
+        .await
+        .unwrap();
+    let PollOutcome::Claimed(claimed) = poll else {
+        panic!("expected the imported lint job to be claimed, got {poll:?}");
+    };
+    assert_eq!(claimed.queued.job_id, JobId("lint".to_owned()));
+    let context = backend
+        .acquire_for_runner(claimed.request.request_id, 7)
+        .await
+        .expect("claimed lint job acquires");
     assert_eq!(context.message.job_name, "lint");
     assert_eq!(context.repository, imported.fixture.repository);
-    let (status, queue_state) = backend
+    let (queue_state, status) = backend
         .job_queue_state(run_queued, &JobId("lint".to_owned()))
         .await
         .unwrap()
         .expect("job row exists");
-    assert_eq!(status, "queued");
     assert_eq!(queue_state, "claimed");
+    assert_eq!(status, "in_progress");
 }
 
 #[test]
@@ -128,8 +157,8 @@ fn publication_never_replaces_an_existing_target() {
     let target = dir.path().join("preloop.db");
     std::fs::write(&staging, b"imported").unwrap();
     std::fs::write(&target, b"someone-else").unwrap();
-    let error = crate::control::lite::legacy_import::publish_no_replace(&staging, &target)
-        .unwrap_err();
+    let error =
+        crate::control::lite::legacy_import::publish_no_replace(&staging, &target).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&target).unwrap(), b"someone-else");
     std::fs::remove_file(&target).unwrap();

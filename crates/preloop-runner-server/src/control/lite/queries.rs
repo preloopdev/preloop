@@ -632,7 +632,7 @@ impl LiteBackend {
             let mut stmt = tx
                 .prepare_cached(&format!(
                     "SELECT {QUEUE_KIND} AS kind, COUNT(*) FROM jobs j \
-                     WHERE j.queue_state NOT IN ('none', 'expanding') GROUP BY kind"
+                     WHERE j.queue_state NOT IN ('none', 'expanding') GROUP BY 1"
                 ))
                 .map_err(db)?;
             let rows = stmt

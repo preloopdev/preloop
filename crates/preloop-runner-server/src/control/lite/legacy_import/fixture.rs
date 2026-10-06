@@ -27,17 +27,61 @@ pub(crate) const LEGACY_MIGRATIONS_SQL: &str = include_str!("legacy_v11_migratio
 
 /// sha256 of every migration body in [`LEGACY_MIGRATIONS_SQL`].
 pub(crate) const LEGACY_MIGRATION_SHA256: &[(i64, &str, &str)] = &[
-    (1, "initial-control-plane-schema", "b3ef13699b558193741e6202a92752b12a3272bbadb1a9d74bfca5f1b729fde3"),
-    (2, "drop-redundant-run-secrets", "bbd381e8f5b15cdbb01a2c20fb65f133ee04a1cb5e0997a3c4c904aa4f626730"),
-    (3, "job-request-messages-table", "12f1e391ba7fc09d529b291b2ba309068b75ec08fbbb0c303ddd12b77e39c5b7"),
-    (4, "job-steps-table", "ebafb32a0fd83899ecd1f7a37c9411f932b5be5f64ec6d3639c497e10f59b124"),
-    (5, "runtime-snapshot-revision", "61c785b8b807bd81a421b2a0ec9c36245fd408cb3bcf5949a6158620c42cfadf"),
-    (6, "webhook-deliveries-table", "1cf220db65a715a6d2d4105a6e4299579ceb6490672e405df11562560e410a93"),
-    (7, "webhook-delivery-lease-fencing", "e6d50ffdfd6f400b9b8ba8ffc7e0d3601d9d4602614b5e39dfc11172b1dc3b80"),
-    (8, "webhook-run-reservation", "e81ffb463b8cfaec41f0206e4fe02c33a9a6737de0e009c0aa1d54210c9eea80"),
-    (9, "webhook-delivery-repair-state", "bcddb9cf61dbc5fa9693dd7e1c8206b853e377e1d2b9ac461703ccccf6e2bce6"),
-    (10, "drop-source-state-reconciler", "a39cfc979f434c5937774e94c877b04b36fc47d6cb7668808e788c857df557bb"),
-    (11, "webhook-watchdog-safe-pagination", "1350508f628fef52026a2e3f977d9b779321daf16d591b3c7894c6c9f910f63c"),
+    (
+        1,
+        "initial-control-plane-schema",
+        "b3ef13699b558193741e6202a92752b12a3272bbadb1a9d74bfca5f1b729fde3",
+    ),
+    (
+        2,
+        "drop-redundant-run-secrets",
+        "bbd381e8f5b15cdbb01a2c20fb65f133ee04a1cb5e0997a3c4c904aa4f626730",
+    ),
+    (
+        3,
+        "job-request-messages-table",
+        "12f1e391ba7fc09d529b291b2ba309068b75ec08fbbb0c303ddd12b77e39c5b7",
+    ),
+    (
+        4,
+        "job-steps-table",
+        "ebafb32a0fd83899ecd1f7a37c9411f932b5be5f64ec6d3639c497e10f59b124",
+    ),
+    (
+        5,
+        "runtime-snapshot-revision",
+        "61c785b8b807bd81a421b2a0ec9c36245fd408cb3bcf5949a6158620c42cfadf",
+    ),
+    (
+        6,
+        "webhook-deliveries-table",
+        "1cf220db65a715a6d2d4105a6e4299579ceb6490672e405df11562560e410a93",
+    ),
+    (
+        7,
+        "webhook-delivery-lease-fencing",
+        "e6d50ffdfd6f400b9b8ba8ffc7e0d3601d9d4602614b5e39dfc11172b1dc3b80",
+    ),
+    (
+        8,
+        "webhook-run-reservation",
+        "e81ffb463b8cfaec41f0206e4fe02c33a9a6737de0e009c0aa1d54210c9eea80",
+    ),
+    (
+        9,
+        "webhook-delivery-repair-state",
+        "bcddb9cf61dbc5fa9693dd7e1c8206b853e377e1d2b9ac461703ccccf6e2bce6",
+    ),
+    (
+        10,
+        "drop-source-state-reconciler",
+        "a39cfc979f434c5937774e94c877b04b36fc47d6cb7668808e788c857df557bb",
+    ),
+    (
+        11,
+        "webhook-watchdog-safe-pagination",
+        "1350508f628fef52026a2e3f977d9b779321daf16d591b3c7894c6c9f910f63c",
+    ),
 ];
 
 /// Parse the marker-delimited migration file into `(version, name, body)`.
@@ -64,7 +108,6 @@ pub(crate) fn legacy_migrations() -> Vec<(i64, String, String)> {
     }
     out
 }
-
 
 /// Knobs the tests flip to exercise refusal paths.
 #[derive(Debug, Clone)]
@@ -173,7 +216,7 @@ pub fn write_legacy_fixture(
     insert_runs(&tx, &cipher, spec, &fixture)?;
     insert_jobs(&tx, &cipher, spec)?;
     insert_attempts(&tx, &cipher, spec)?;
-    insert_steps(&tx, &cipher)?;
+    insert_steps(&tx, &cipher, spec)?;
     insert_logs(&tx, &fixture)?;
     insert_runners(&tx)?;
     insert_webhooks(&tx, &cipher)?;
@@ -211,6 +254,13 @@ fn apply_legacy_schema(conn: &mut Connection, user_version: i64) -> anyhow::Resu
         conn.execute_batch(ddl)
             .with_context(|| format!("apply legacy migration {version} ({name})"))?;
     }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          applied_at_us INTEGER NOT NULL
+        ) STRICT;",
+    )?;
     let tx = conn.transaction()?;
     for (version, name, _) in &migrations {
         tx.execute(
@@ -230,8 +280,9 @@ fn submission(spec: &LegacyFixtureSpec) -> WorkflowSubmission {
         SecretString::new(spec.secret_value.clone()),
     );
     WorkflowSubmission {
-        workflow_yaml: "name: ci\non: workflow_dispatch\njobs:\n  build:\n    runs-on: self-hosted\n"
-            .to_owned(),
+        workflow_yaml:
+            "name: ci\non: workflow_dispatch\njobs:\n  build:\n    runs-on: self-hosted\n"
+                .to_owned(),
         event: "workflow_dispatch".to_owned(),
         payload: serde_json::json!({"ref": "refs/heads/main"}),
         repository: REPOSITORY.to_owned(),
@@ -244,7 +295,7 @@ fn submission(spec: &LegacyFixtureSpec) -> WorkflowSubmission {
     }
 }
 
-fn base_record(run_id: &str, run_number: u64, status: ExecutionStatus) -> RunRecord {
+pub(crate) fn base_record(run_id: &str, run_number: u64, status: ExecutionStatus) -> RunRecord {
     RunRecord {
         run_id: RunId(run_id.parse().unwrap()),
         webhook_delivery_id: None,
@@ -386,10 +437,7 @@ fn insert_runs(
     ]);
     queued.job_needs = BTreeMap::from([
         (JobId("lint".to_owned()), Vec::new()),
-        (
-            JobId("deploy".to_owned()),
-            vec![JobId("lint".to_owned())],
-        ),
+        (JobId("deploy".to_owned()), vec![JobId("lint".to_owned())]),
     ]);
     queued.jobs_list = vec![
         JobDetail {
@@ -414,8 +462,7 @@ fn insert_runs(
         let mut active = base_record(RUN_ACTIVE, 3, ExecutionStatus::InProgress);
         active.jobs = BTreeMap::from([(JobId("release".to_owned()), ExecutionStatus::InProgress)]);
         active.job_names = BTreeMap::from([(JobId("release".to_owned()), "release".to_owned())]);
-        active.job_base_ids =
-            BTreeMap::from([(JobId("release".to_owned()), "release".to_owned())]);
+        active.job_base_ids = BTreeMap::from([(JobId("release".to_owned()), "release".to_owned())]);
         active.job_needs = BTreeMap::from([(JobId("release".to_owned()), Vec::new())]);
         active.jobs_list = vec![JobDetail {
             job_id: "release".to_owned(),
@@ -441,7 +488,12 @@ fn agent_for(job: &str) -> &'static str {
     }
 }
 
-fn message_json(job: &str, agent: &str, request_id: i64, secret_value: &str) -> AgentJobRequestMessage {
+fn message_json(
+    job: &str,
+    agent: &str,
+    request_id: i64,
+    secret_value: &str,
+) -> AgentJobRequestMessage {
     serde_json::from_value(serde_json::json!({
         "jobId": agent,
         "requestId": request_id,
@@ -666,15 +718,7 @@ fn insert_attempts(
     insert_attempt(
         tx,
         cipher,
-        &request_snapshot(
-            RUN_QUEUED,
-            "lint",
-            AGENT_LINT,
-            REQUEST_LINT,
-            None,
-            None,
-            "",
-        ),
+        &request_snapshot(RUN_QUEUED, "lint", AGENT_LINT, REQUEST_LINT, None, None, ""),
         "active",
     )?;
     insert_attempt(
@@ -750,7 +794,11 @@ fn insert_step(
     Ok(())
 }
 
-fn insert_steps(tx: &rusqlite::Transaction<'_>, cipher: &Envelope) -> anyhow::Result<()> {
+fn insert_steps(
+    tx: &rusqlite::Transaction<'_>,
+    cipher: &Envelope,
+    spec: &LegacyFixtureSpec,
+) -> anyhow::Result<()> {
     insert_step(
         tx,
         cipher,
@@ -793,20 +841,24 @@ fn insert_steps(tx: &rusqlite::Transaction<'_>, cipher: &Envelope) -> anyhow::Re
         Some(BASE_US + 31_000_000),
         Some(BASE_US + 40_000_000),
     )?;
-    insert_step(
-        tx,
-        cipher,
-        RUN_ACTIVE,
-        AGENT_RELEASE,
-        "eeeeeeee-0000-0000-0000-000000000001",
-        "workflow",
-        Some(0),
-        Some(2),
-        "Deploy",
-        "pending",
-        Some(BASE_US + 131_000_000),
-        None,
-    )?;
+    // `RUN_ACTIVE` exists only when the fixture claims it; its step must be
+    // gated on the same flag or `job_steps.run_id` dangles.
+    if spec.include_active_claim {
+        insert_step(
+            tx,
+            cipher,
+            RUN_ACTIVE,
+            AGENT_RELEASE,
+            "eeeeeeee-0000-0000-0000-000000000001",
+            "workflow",
+            Some(0),
+            Some(2),
+            "Deploy",
+            "pending",
+            Some(BASE_US + 131_000_000),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -815,12 +867,7 @@ fn insert_logs(tx: &rusqlite::Transaction<'_>, fixture: &LegacyFixture) -> anyho
     tx.execute(
         "INSERT INTO log_files(log_key, byte_count, line_count, updated_at_us) \
          VALUES (?1, ?2, ?3, ?4)",
-        params![
-            fixture.log_key,
-            bytes.len() as i64,
-            2,
-            BASE_US + 21_000_000
-        ],
+        params![fixture.log_key, bytes.len() as i64, 2, BASE_US + 21_000_000],
     )?;
     for (index, chunk) in bytes.chunks(10).enumerate() {
         tx.execute(
@@ -1002,10 +1049,10 @@ fn insert_meta(
         "job_assignments": [[RUN_QUEUED, "lint", RUNNER_OPEN, (BASE_US + 1) * 1000, (BASE_US + 1) * 1000]],
         "pool_pending": []
     });
-    if spec.unknown_meta_key {
-        if let Some(object) = meta.as_object_mut() {
-            object.insert("mystery_state".to_owned(), serde_json::json!([1, 2, 3]));
-        }
+    if spec.unknown_meta_key
+        && let Some(object) = meta.as_object_mut()
+    {
+        object.insert("mystery_state".to_owned(), serde_json::json!([1, 2, 3]));
     }
     let blob = cipher.seal(&serde_json::to_vec(&meta)?)?;
     tx.execute(
@@ -1054,7 +1101,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preloop.db");
         let spec = LegacyFixtureSpec::default();
-        let fixture = write_legacy_fixture(&path, b"fixture-provenance-key-32-bytes!!", &spec).unwrap();
+        let fixture =
+            write_legacy_fixture(&path, b"fixture-provenance-key-32-bytes!!", &spec).unwrap();
         assert_eq!(fixture.run_ok, RUN_OK);
         let conn = Connection::open(&path).unwrap();
         let version: i64 = conn

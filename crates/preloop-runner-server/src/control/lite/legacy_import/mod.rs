@@ -20,14 +20,14 @@
 //! replaces with the embedded-migration initializer (`preloop store migrate`)
 //! once the two land together.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixture;
 pub(crate) mod legacy;
 mod report;
 mod target;
-mod writer;
-#[cfg(any(test, feature = "test-support"))]
-pub mod fixture;
 #[cfg(test)]
 mod tests;
+mod writer;
 
 pub use report::{ActivePolicy, ImportReport, ImportedRows, SkippedFamily};
 
@@ -60,8 +60,8 @@ pub struct ImportOptions {
 /// `<state_dir>/hmac-key.bin`.
 pub fn load_import_key(state_dir: &Path, explicit: Option<&Path>) -> anyhow::Result<Vec<u8>> {
     if let Some(path) = explicit {
-        let key = std::fs::read(path)
-            .with_context(|| format!("read cluster key {}", path.display()))?;
+        let key =
+            std::fs::read(path).with_context(|| format!("read cluster key {}", path.display()))?;
         check_key_size(&key, &path.display().to_string())?;
         return Ok(key);
     }
@@ -78,8 +78,8 @@ pub fn load_import_key(state_dir: &Path, explicit: Option<&Path>) -> anyhow::Res
             path.display()
         );
     }
-    let key = std::fs::read(&path)
-        .with_context(|| format!("read cluster key {}", path.display()))?;
+    let key =
+        std::fs::read(&path).with_context(|| format!("read cluster key {}", path.display()))?;
     check_key_size(&key, &path.display().to_string())?;
     Ok(key)
 }
@@ -188,9 +188,8 @@ pub fn run_import(options: &ImportOptions) -> anyhow::Result<ImportReport> {
     // target-owned directory and publish only after the database commit and
     // the source re-check; nothing is written into the live state directory
     // before that.
-    std::fs::create_dir_all(&options.state_dir).with_context(|| {
-        format!("create state directory {}", options.state_dir.display())
-    })?;
+    std::fs::create_dir_all(&options.state_dir)
+        .with_context(|| format!("create state directory {}", options.state_dir.display()))?;
     let mut sidecars = writer::Sidecars::new(
         options
             .state_dir
@@ -330,8 +329,9 @@ fn read_artifact_registry_sidecar(
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("read artifact registry sidecar {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("read artifact registry sidecar {}", path.display()))
+        }
     }
 }
 
@@ -364,11 +364,10 @@ fn verify_invariants(
             bail!("target {table} row count {actual} != imported {expected}");
         }
     }
-    let foreign_violations: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM pragma_foreign_key_check",
-        [],
-        |row| row.get(0),
-    )?;
+    let foreign_violations: i64 =
+        tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
     if foreign_violations != 0 {
         bail!("target has {foreign_violations} foreign-key violations; refusing to publish");
     }

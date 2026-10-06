@@ -300,7 +300,9 @@ impl LegacyDb {
     /// Verify the source really is a v11/v12 legacy store. Fails closed with
     /// an explicit reason; the importer never guesses at a foreign format.
     pub(crate) fn header(&self) -> anyhow::Result<LegacyHeader> {
-        let user_version: i64 = self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let user_version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
         if user_version != LEGACY_VERSION && user_version != LEGACY_VERSION_PAYLOAD_MARKER {
             bail!(
                 "legacy database has PRAGMA user_version={user_version}; this importer \
@@ -335,9 +337,7 @@ impl LegacyDb {
         // The audit table must match the table chain for the claimed version;
         // a hand-renamed or half-migrated copy is refused.
         for (version, name) in LEGACY_MIGRATIONS {
-            let found = migrations
-                .iter()
-                .any(|(v, n)| v == version && n == name);
+            let found = migrations.iter().any(|(v, n)| v == version && n == name);
             if !found {
                 bail!(
                     "legacy schema_migrations is missing v{version} ({name:?}); \
@@ -593,8 +593,9 @@ impl LegacyDb {
                      refusing an unrecognized source"
                 ),
             };
-            let name = String::from_utf8(cipher.unseal(&name_blob)?)
-                .with_context(|| format!("legacy step name {agent_job_id}/{step_id} is not UTF-8"))?;
+            let name = String::from_utf8(cipher.unseal(&name_blob)?).with_context(|| {
+                format!("legacy step name {agent_job_id}/{step_id} is not UTF-8")
+            })?;
             steps.push(LegacyStep {
                 run_id,
                 agent_job_id,
@@ -621,9 +622,9 @@ impl LegacyDb {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<_, _>>()?;
-        let mut chunk_stmt = self.conn.prepare(
-            "SELECT payload FROM log_chunks WHERE log_key = ?1 ORDER BY chunk_index",
-        )?;
+        let mut chunk_stmt = self
+            .conn
+            .prepare("SELECT payload FROM log_chunks WHERE log_key = ?1 ORDER BY chunk_index")?;
         let mut out = Vec::with_capacity(files.len());
         for (log_key, byte_count, line_count, updated_at_us) in files {
             // Legacy log chunks are stored raw (masked by the HTTP layer
@@ -871,23 +872,22 @@ impl LegacyDb {
         }
     }
 
-    /// Decode one legacy message payload: either a plain JSON value (the
-    /// pre-marker encoding) or a base64 string carrying a sealed payload
-    /// (the v12 encoding written by `seal_message_payload`).
+    /// Decode one legacy job-request message payload: a plain JSON value (the
+    /// pre-marker encoding) or a base64 string carrying a sealed payload.
     pub(crate) fn decode_message_payload(
         &self,
         cipher: &Envelope,
         raw: &str,
-        label: &str,
+        request_id: i64,
     ) -> anyhow::Result<serde_json::Value> {
-        decode_message_payload(cipher, raw, label)
+        decode_message_payload(cipher, raw, request_id)
     }
 
     /// `(request_id, payload_json)` rows of the per-attempt job-message table.
     pub(crate) fn job_request_messages(&self) -> anyhow::Result<Vec<(i64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id",
+        )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
@@ -895,25 +895,57 @@ impl LegacyDb {
     }
 }
 
-/// Decode a legacy message payload (see [`LegacyDb::decode_message_payload`]).
+/// Domain tag the released store bound into every message-payload AAD.
+const MESSAGE_PAYLOAD_AAD_DOMAIN: &str = "preloop-message-payload-aad-v1";
+
+/// The released store's associated data for a `job_request_messages` row:
+/// the serialized `(domain, table, type, session_id, message_id, request_id)`
+/// tuple from `store.rs::message_payload_aad` at the last old-store commit.
+fn job_request_message_aad(request_id: i64) -> Vec<u8> {
+    serde_json::to_vec(&(
+        MESSAGE_PAYLOAD_AAD_DOMAIN,
+        "job_request_messages",
+        "AgentJobRequestMessage",
+        None::<&str>,
+        None::<i64>,
+        Some(request_id),
+    ))
+    .expect("message payload AAD tuple is serializable")
+}
+
+/// Decode a legacy job-request message payload (see
+/// [`LegacyDb::decode_message_payload`]). The v12 store seals rows bound to
+/// their identity; rows from the first sealing implementation are unbound;
+/// older rows are plaintext JSON. All three are accepted, bound first.
 pub(crate) fn decode_message_payload(
     cipher: &Envelope,
     raw: &str,
-    label: &str,
+    request_id: i64,
 ) -> anyhow::Result<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(raw)
-        .with_context(|| format!("parse legacy {label} payload JSON"))?;
+        .with_context(|| format!("parse legacy job_request_message {request_id} payload JSON"))?;
     match parsed {
         serde_json::Value::String(encoded) => {
             use base64::Engine as _;
             let sealed = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
-                .with_context(|| format!("decode base64 legacy {label} payload"))?;
-            let plaintext = cipher
-                .unseal(&sealed)
-                .with_context(|| format!("unseal legacy {label} payload"))?;
-            serde_json::from_slice(&plaintext)
-                .with_context(|| format!("parse unsealed legacy {label} payload"))
+                .with_context(|| {
+                    format!("decode base64 legacy job_request_message {request_id} payload")
+                })?;
+            let plaintext = match cipher
+                .unseal_with_associated_data(&sealed, &job_request_message_aad(request_id))
+            {
+                Ok(plaintext) => plaintext,
+                Err(bound_error) => cipher.unseal(&sealed).with_context(|| {
+                    format!(
+                        "unseal legacy job_request_message {request_id} payload \
+                         (neither row-bound nor unbound): {bound_error}"
+                    )
+                })?,
+            };
+            serde_json::from_slice(&plaintext).with_context(|| {
+                format!("parse unsealed legacy job_request_message {request_id} payload")
+            })
         }
         value => Ok(value),
     }
@@ -944,7 +976,6 @@ pub(crate) struct LegacyRequestSnapshot {
     pub(crate) timeout_triggered: bool,
     pub(crate) debug_token_issued: bool,
 }
-
 
 /// Unseal and parse a legacy run blob.
 pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
@@ -996,11 +1027,11 @@ pub(crate) fn run_record_from_value(value: serde_json::Value) -> anyhow::Result<
         // understands is a hard import failure, not a silent drop: the
         // importer never claims a run it could not restore.
         run.workspace_snapshot = match object.get("workspace_snapshot") {
-            Some(value) if !value.is_null() => Some(
-                serde_json::from_value(value.clone()).with_context(|| {
+            Some(value) if !value.is_null() => {
+                Some(serde_json::from_value(value.clone()).with_context(|| {
                     format!("decode workspace snapshot of run {}", run.run_id.0)
-                })?,
-            ),
+                })?)
+            }
             _ => None,
         };
     }
@@ -1010,8 +1041,8 @@ pub(crate) fn run_record_from_value(value: serde_json::Value) -> anyhow::Result<
 /// Hex SHA-256 of a file, used to prove the source did not change.
 pub(crate) fn file_digest(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("hash source database {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("hash source database {}", path.display()))?;
     let digest = Sha256::digest(&bytes);
     Ok(hex::encode(digest))
 }
@@ -1025,5 +1056,24 @@ mod tests {
         let versions: Vec<i64> = LEGACY_MIGRATIONS.iter().map(|(v, _)| *v).collect();
         assert_eq!(versions, (1..=11).collect::<Vec<_>>());
         assert_eq!(LEGACY_PAYLOAD_MARKER.0, 12);
+    }
+
+    /// The released v12 store binds each `job_request_messages` payload to
+    /// its row identity; a real store refused to import until this decoded.
+    #[test]
+    fn v12_row_bound_payload_decodes_and_rejects_another_row() {
+        use base64::Engine as _;
+        let cipher = Envelope::new(b"legacy-import-unit-test-key-32!!");
+        let value = serde_json::json!({"requestId": 42, "jobName": "build"});
+        let sealed = cipher
+            .seal_with_associated_data(
+                &serde_json::to_vec(&value).unwrap(),
+                &job_request_message_aad(42),
+            )
+            .unwrap();
+        let raw = serde_json::to_string(&base64::engine::general_purpose::STANDARD.encode(&sealed))
+            .unwrap();
+        assert_eq!(decode_message_payload(&cipher, &raw, 42).unwrap(), value);
+        assert!(decode_message_payload(&cipher, &raw, 43).is_err());
     }
 }

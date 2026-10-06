@@ -93,16 +93,23 @@ fn conclusion_of(status: ExecutionStatus) -> &'static str {
 /// status field reads `pending` (a crash between the two writes must not
 /// resurrect a finished run as scheduled).
 fn run_state(record: &crate::models::RunRecord) -> (&'static str, Option<String>) {
-    // A recorded conclusion wins when it is one the schema accepts; anything
-    // else is derived from the status and reported by the caller's notes.
+    // A terminal status is authoritative: the legacy store could leave an
+    // earlier `conclusion` behind when the run was later cancelled (seen on
+    // real stores: `status=cancelled`, `conclusion="success"`). The recorded
+    // conclusion only refines a failure into `timed_out`.
     const CONCLUSIONS: &[&str] = &["success", "failure", "cancelled", "skipped", "timed_out"];
+    if terminal(record.status) {
+        let derived = conclusion_of(record.status);
+        let conclusion = match record.conclusion.as_deref() {
+            Some("timed_out") if derived == "failure" => "timed_out",
+            _ => derived,
+        };
+        return ("completed", Some(conclusion.to_owned()));
+    }
     if let Some(conclusion) = record.conclusion.as_deref()
         && CONCLUSIONS.contains(&conclusion)
     {
         return ("completed", Some(conclusion.to_owned()));
-    }
-    if terminal(record.status) {
-        return ("completed", Some(conclusion_of(record.status).to_owned()));
     }
     if record.completed_at.is_some() {
         return ("completed", Some(conclusion_of(record.status).to_owned()));
@@ -239,7 +246,10 @@ pub(crate) fn audit_unmappable(source: &SourceData) -> anyhow::Result<()> {
     for (family, rows) in [
         ("broker_messages", source.counts.broker_messages),
         ("runner_commands", source.counts.runner_commands),
-        ("meta.pool_pending", meta_count(&source.meta, "pool_pending")),
+        (
+            "meta.pool_pending",
+            meta_count(&source.meta, "pool_pending"),
+        ),
         (
             "meta.cache_v2_pending",
             meta_count(&source.meta, "cache_v2_pending"),
@@ -499,7 +509,8 @@ fn sidecar_equal(
             let Ok(existing_plain) = cipher.unseal(&existing) else {
                 return Ok(false);
             };
-            let Ok(existing_map) = serde_json::from_slice::<BTreeMap<String, String>>(&existing_plain)
+            let Ok(existing_map) =
+                serde_json::from_slice::<BTreeMap<String, String>>(&existing_plain)
             else {
                 return Ok(false);
             };
@@ -934,9 +945,8 @@ pub(crate) fn write_import(
                 } else {
                     attempt.snapshot.result
                 };
-                let claimed = !unclaimed(&attempt.snapshot)
-                    && !cancelled
-                    && policy != ActivePolicy::Requeue;
+                let claimed =
+                    !unclaimed(&attempt.snapshot) && !cancelled && policy != ActivePolicy::Requeue;
                 let session = session_of_request.get(&attempt.request_id);
                 let claimed_at_us = attempt
                     .snapshot
@@ -978,7 +988,9 @@ pub(crate) fn write_import(
                 )
                 .with_context(|| format!("insert attempt {}", attempt.request_id))?;
                 imported.job_requests += 1;
-                if claimed {
+                // A settled attempt never holds a lease: the live server drops
+                // the lease row when it records a result.
+                if claimed && result.is_none() {
                     let expires_at = if attempt.snapshot.locked_until.is_empty() {
                         crate::store::now_us()
                     } else {
@@ -1030,10 +1042,7 @@ pub(crate) fn write_import(
                 params![
                     run.run_id,
                     job_id,
-                    record
-                        .job_check_run_ids
-                        .get(&job_key)
-                        .map(|id| *id as i64),
+                    record.job_check_run_ids.get(&job_key).map(|id| *id as i64),
                     record
                         .job_outputs
                         .get(&job_key)
@@ -1257,7 +1266,10 @@ pub(crate) fn write_import(
     let mut recovered = 0_u64;
     for delivery in &source.webhook_deliveries {
         let payload = std::str::from_utf8(&delivery.payload).with_context(|| {
-            format!("webhook delivery {} payload is not UTF-8", delivery.delivery_id)
+            format!(
+                "webhook delivery {} payload is not UTF-8",
+                delivery.delivery_id
+            )
         })?;
         let installation_id = serde_json::from_str::<serde_json::Value>(payload)
             .ok()
@@ -1338,7 +1350,10 @@ pub(crate) fn write_import(
     }
 
     // ── Meta-derived durable state ──────────────────────────────────────
-    for (position, row) in meta_array(&source.meta, "job_assignments")?.iter().enumerate() {
+    for (position, row) in meta_array(&source.meta, "job_assignments")?
+        .iter()
+        .enumerate()
+    {
         let fields = row
             .as_array()
             .filter(|fields| fields.len() == 5)
@@ -1355,7 +1370,10 @@ pub(crate) fn write_import(
         )?;
         imported.job_assignments += 1;
     }
-    for (position, row) in meta_array(&source.meta, "cancellation_queue")?.iter().enumerate() {
+    for (position, row) in meta_array(&source.meta, "cancellation_queue")?
+        .iter()
+        .enumerate()
+    {
         let run_id = row
             .get("run_id")
             .and_then(|v| v.as_str())
@@ -1446,7 +1464,6 @@ pub(crate) fn write_import(
         imported.outbox_events += 1;
     }
     seed_sequence(tx, "outbox_events", max_event_id)?;
-    drop(max_event_id);
 
     // ── Per-attempt job messages: verify or reconstruct ────────────────
     // The legacy store persists the runner-facing message per attempt. The
@@ -1456,7 +1473,7 @@ pub(crate) fn write_import(
     // the frame itself reconstructs a sanitized template.
     let mut verified_frames = 0_u64;
     for (request_id, raw) in &source.job_request_messages {
-        let value = super::legacy::decode_message_payload(cipher, raw, "job_request_message")?;
+        let value = super::legacy::decode_message_payload(cipher, raw, *request_id)?;
         let mut message: AgentJobRequestMessage = serde_json::from_value(value)
             .with_context(|| format!("decode legacy per-attempt message {request_id}"))?;
         let Some((run_id, job_id, agent_job_id)) = attempt_index.get(request_id) else {
@@ -1465,9 +1482,7 @@ pub(crate) fn write_import(
             );
         };
         if message.request_id != *request_id || message.job_id.to_string() != *agent_job_id {
-            bail!(
-                "legacy per-attempt message {request_id} does not match attempt {agent_job_id}"
-            );
+            bail!("legacy per-attempt message {request_id} does not match attempt {agent_job_id}");
         }
         let stored: Option<String> = tx
             .prepare_cached(
@@ -1477,11 +1492,9 @@ pub(crate) fn write_import(
             .optional()?;
         match stored {
             Some(template) => {
-                let decoded: Option<AgentJobRequestMessage> =
-                    serde_json::from_str(&template).ok();
+                let decoded: Option<AgentJobRequestMessage> = serde_json::from_str(&template).ok();
                 let matches = decoded.is_some_and(|stored| {
-                    stored.job_id.to_string() == *agent_job_id
-                        && stored.request_id == *request_id
+                    stored.job_id.to_string() == *agent_job_id && stored.request_id == *request_id
                 });
                 if !matches {
                     bail!(
@@ -1720,7 +1733,10 @@ pub(crate) fn write_import(
                 .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
                 .map(|at| at.timestamp_micros())
                 .unwrap_or_else(crate::store::now_us);
-            let artifact_id = entry.get("id").and_then(|value| value.as_i64()).unwrap_or(0);
+            let artifact_id = entry
+                .get("id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
             let inserted = tx.execute(
                 "INSERT INTO artifacts (artifact_id, namespace_id, run_id, job_backend_id,                      name, state, size_bytes, digest, storage_key, created_at, finalized_at)                  VALUES (?1, ?2, ?3, ?4, ?5, 'finalized', ?6, ?7, ?8, ?9, ?9)                  ON CONFLICT (run_id, job_backend_id, name) DO NOTHING",
                 params![
@@ -1878,10 +1894,18 @@ fn insert_synthesized_job(
         params![
             run_id,
             job_id,
-            if base_id == job_id { "job" } else { "matrix_leg" },
+            if base_id == job_id {
+                "job"
+            } else {
+                "matrix_leg"
+            },
             base_id,
             crate::control::types::status_str(status),
-            if status.is_terminal() { "none" } else { "blocked" },
+            if status.is_terminal() {
+                "none"
+            } else {
+                "blocked"
+            },
             remaining,
             run_order,
             order,
@@ -1894,13 +1918,11 @@ fn insert_synthesized_job(
          VALUES (?1,?2,?3,?4,'{}')",
         params![run_id, job_id, display_name, order],
     )?;
-    let mut position = 0_i64;
-    for need in &needs {
+    for (position, need) in needs.iter().enumerate() {
         tx.execute(
             "INSERT INTO job_needs (run_id, job_id, needs_job_id, position) VALUES (?1,?2,?3,?4)",
-            params![run_id, job_id, need.0, position],
+            params![run_id, job_id, need.0, position as i64],
         )?;
-        position += 1;
     }
     Ok(())
 }
@@ -1953,10 +1975,12 @@ fn job_times(
                 attempts
                     .iter()
                     .filter_map(|attempt| {
-                        attempt
-                            .snapshot
-                            .result
-                            .map(|_| attempt.snapshot.last_renewed_at_us.or(attempt.snapshot.started_at_us))
+                        attempt.snapshot.result.map(|_| {
+                            attempt
+                                .snapshot
+                                .last_renewed_at_us
+                                .or(attempt.snapshot.started_at_us)
+                        })
                     })
                     .flatten()
                     .max()
@@ -1967,11 +1991,14 @@ fn job_times(
     (started, completed)
 }
 
+/// `(environment, job_workflow_ref, job_workflow_sha, id_token_granted)`.
+type OidcContext = (Option<String>, Option<String>, Option<String>, bool);
+
 fn oidc_for(
     meta: &serde_json::Map<String, serde_json::Value>,
     run_id: &str,
     job_id: &str,
-) -> anyhow::Result<(Option<String>, Option<String>, Option<String>, bool)> {
+) -> anyhow::Result<OidcContext> {
     let mut environment = None;
     let mut job_workflow_ref = None;
     let mut job_workflow_sha = None;
@@ -2093,7 +2120,9 @@ fn import_logs(
 ) -> anyhow::Result<()> {
     // Merge the table rows with the runtime snapshot's metadata map: an entry
     // can exist in either (chunk pruning vs. row rewrite timing).
-    let mut merged: BTreeMap<String, (i64, i64, i64, Vec<Vec<u8>>)> = BTreeMap::new();
+    // key -> (byte_count, line_count, updated_at_us, chunks)
+    type LogEntry = (i64, i64, i64, Vec<Vec<u8>>);
+    let mut merged: BTreeMap<String, LogEntry> = BTreeMap::new();
     for log in logs {
         merged.insert(
             log.log_key.clone(),
@@ -2136,10 +2165,18 @@ fn import_logs(
     }
     let mut next_log_id: BTreeMap<String, i64> = BTreeMap::new();
     let mut unmapped = 0_u64;
+    let mut unscoped_metadata = 0_u64;
     let mut pruned = 0_u64;
-    for (key, (byte_count, line_count, updated_at_us, chunks)) in merged {
+    for (key, (byte_count, _line_count, updated_at_us, chunks)) in merged {
         let Some(plan) = legacy_log_plan(&key) else {
-            unmapped += 1;
+            // Results metadata recorded without plan/job identity
+            // (`step:<id>`, `job:<id>`): a byte count with no content and no
+            // attempt to own it. Nothing to import.
+            if chunks.is_empty() {
+                unscoped_metadata += 1;
+            } else {
+                unmapped += 1;
+            }
             continue;
         };
         let Some(run_id) = plan_by_agent.get(&plan) else {
@@ -2188,6 +2225,12 @@ fn import_logs(
             rows: unmapped,
             reason: "legacy log keys name no imported attempt".to_owned(),
         });
+    }
+    if unscoped_metadata > 0 {
+        notes.push(format!(
+            "{unscoped_metadata} results-metadata entries had no plan/job identity \
+             (`step:`/`job:` keys) and no stored content; size-only records were not imported"
+        ));
     }
     if pruned > 0 {
         notes.push(format!(
@@ -2302,4 +2345,35 @@ fn skipped_families(
         families.push(("meta.concurrency_gates", gate_count, reason));
     }
     families
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_state;
+    use crate::control::lite::legacy_import::fixture::base_record;
+    use preloop_gha_protocol::ExecutionStatus;
+
+    const RUN: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Real stores held `status=cancelled` with a stale `conclusion="success"`
+    /// left from before the cancel; the terminal status must win.
+    #[test]
+    fn terminal_status_overrides_stale_recorded_conclusion() {
+        let mut record = base_record(RUN, 1, ExecutionStatus::Cancelled);
+        record.conclusion = Some("success".to_owned());
+        assert_eq!(
+            run_state(&record),
+            ("completed", Some("cancelled".to_owned()))
+        );
+    }
+
+    #[test]
+    fn recorded_timed_out_refines_a_failure() {
+        let mut record = base_record(RUN, 1, ExecutionStatus::Failure);
+        record.conclusion = Some("timed_out".to_owned());
+        assert_eq!(
+            run_state(&record),
+            ("completed", Some("timed_out".to_owned()))
+        );
+    }
 }
