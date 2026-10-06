@@ -394,8 +394,8 @@ fn publication_never_replaces_an_existing_target() {
     let target = dir.path().join("preloop.db");
     std::fs::write(&staging, b"imported").unwrap();
     std::fs::write(&target, b"someone-else").unwrap();
-    let error = crate::control::lite::legacy_import::publish_no_replace(&staging, &target)
-        .unwrap_err();
+    let error =
+        crate::control::lite::legacy_import::publish_no_replace(&staging, &target).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(std::fs::read(&target).unwrap(), b"someone-else");
     std::fs::remove_file(&target).unwrap();

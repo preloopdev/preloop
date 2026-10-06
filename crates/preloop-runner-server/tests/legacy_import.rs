@@ -7,9 +7,7 @@
 #![cfg(feature = "test-support")]
 
 use preloop_runner_server::legacy_import::fixture::{LegacyFixtureSpec, write_legacy_fixture};
-use preloop_runner_server::legacy_import::{
-    ActivePolicy, ImportOptions, ImportReport, run_import,
-};
+use preloop_runner_server::legacy_import::{ActivePolicy, ImportOptions, ImportReport, run_import};
 use preloop_runner_server::store::Envelope;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -25,11 +23,7 @@ struct Imported {
     report: ImportReport,
 }
 
-fn import(
-    spec: &LegacyFixtureSpec,
-    policy: ActivePolicy,
-    key: &[u8],
-) -> anyhow::Result<Imported> {
+fn import(spec: &LegacyFixtureSpec, policy: ActivePolicy, key: &[u8]) -> anyhow::Result<Imported> {
     let dir = tempfile::tempdir()?;
     let source = dir.path().join("preloop.db");
     let fixture = write_legacy_fixture(&source, KEY, spec)?;
@@ -98,10 +92,7 @@ fn populated_store_imports_runs_jobs_steps_logs_and_secrets() {
         ),
         "queued"
     );
-    assert_eq!(
-        scalar_i64(&conn, "SELECT COUNT(*) FROM run_submissions"),
-        2
-    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM run_submissions"), 2);
 
     // Jobs: terminal rows are synthesized from the record (the legacy store
     // deletes queue rows for finished jobs), queued rows come from payloads.
@@ -183,9 +174,7 @@ fn populated_store_imports_runs_jobs_steps_logs_and_secrets() {
         )
         .unwrap();
     assert_eq!(bytes, 18);
-    let hex = |id: &str| -> String {
-        id.bytes().map(|byte| format!("{byte:02x}")).collect()
-    };
+    let hex = |id: &str| -> String { id.bytes().map(|byte| format!("{byte:02x}")).collect() };
     let segment = imported
         .state_dir
         .join("live-logs")
@@ -207,7 +196,10 @@ fn populated_store_imports_runs_jobs_steps_logs_and_secrets() {
     let plain = Envelope::new(KEY).unseal(&sealed).unwrap();
     let values: std::collections::BTreeMap<String, String> =
         serde_json::from_slice(&plain).unwrap();
-    assert_eq!(values.get("CANARY").map(String::as_str), Some("hunter2-canary-value"));
+    assert_eq!(
+        values.get("CANARY").map(String::as_str),
+        Some("hunter2-canary-value")
+    );
     let submission_json: Option<String> = conn
         .query_row(
             "SELECT submission FROM run_submissions \
@@ -230,7 +222,10 @@ fn populated_store_imports_runs_jobs_steps_logs_and_secrets() {
         ),
         3
     );
-    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM timeline_records"), 1);
+    assert_eq!(
+        scalar_i64(&conn, "SELECT COUNT(*) FROM timeline_records"),
+        1
+    );
     assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM runners"), 2);
     assert_eq!(
         scalar_i64(
@@ -251,10 +246,7 @@ fn populated_store_imports_runs_jobs_steps_logs_and_secrets() {
         scalar_text(&conn, "SELECT topic FROM outbox_events"),
         "job_status"
     );
-    assert_eq!(
-        scalar_i64(&conn, "SELECT event_id FROM outbox_events"),
-        7
-    );
+    assert_eq!(scalar_i64(&conn, "SELECT event_id FROM outbox_events"), 7);
     // The per-attempt message frame is verified, and the finalized artifact
     // registry (sidecar + snapshot) is carried into `artifacts`.
     assert_eq!(imported.report.imported.job_request_messages, 1);
@@ -270,15 +262,9 @@ fn populated_store_imports_runs_jobs_steps_logs_and_secrets() {
     let leftovers: Vec<_> = std::fs::read_dir(&imported.state_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".import-")
-        })
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".import-"))
         .collect();
     assert!(leftovers.is_empty(), "staging dirs left: {leftovers:?}");
-
 }
 
 #[test]
@@ -367,7 +353,10 @@ fn claimed_attempt_refuses_until_an_explicit_drain_policy() {
         "cancelled/none"
     );
     assert_eq!(
-        scalar_text(&conn, "SELECT result FROM job_requests WHERE request_id = 5"),
+        scalar_text(
+            &conn,
+            "SELECT result FROM job_requests WHERE request_id = 5"
+        ),
         "cancelled"
     );
 }
@@ -527,8 +516,5 @@ fn retry_after_failure_and_existing_target_refusal() {
     run_import(&options(KEY)).unwrap();
     // A second import refuses to overwrite the target it produced.
     let again = run_import(&options(KEY)).unwrap_err();
-    assert!(
-        format!("{again:#}").contains("already exists"),
-        "{again:#}"
-    );
+    assert!(format!("{again:#}").contains("already exists"), "{again:#}");
 }

@@ -300,7 +300,9 @@ impl LegacyDb {
     /// Verify the source really is a v11/v12 legacy store. Fails closed with
     /// an explicit reason; the importer never guesses at a foreign format.
     pub(crate) fn header(&self) -> anyhow::Result<LegacyHeader> {
-        let user_version: i64 = self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let user_version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
         if user_version != LEGACY_VERSION && user_version != LEGACY_VERSION_PAYLOAD_MARKER {
             bail!(
                 "legacy database has PRAGMA user_version={user_version}; this importer \
@@ -335,9 +337,7 @@ impl LegacyDb {
         // The audit table must match the table chain for the claimed version;
         // a hand-renamed or half-migrated copy is refused.
         for (version, name) in LEGACY_MIGRATIONS {
-            let found = migrations
-                .iter()
-                .any(|(v, n)| v == version && n == name);
+            let found = migrations.iter().any(|(v, n)| v == version && n == name);
             if !found {
                 bail!(
                     "legacy schema_migrations is missing v{version} ({name:?}); \
@@ -593,8 +593,9 @@ impl LegacyDb {
                      refusing an unrecognized source"
                 ),
             };
-            let name = String::from_utf8(cipher.unseal(&name_blob)?)
-                .with_context(|| format!("legacy step name {agent_job_id}/{step_id} is not UTF-8"))?;
+            let name = String::from_utf8(cipher.unseal(&name_blob)?).with_context(|| {
+                format!("legacy step name {agent_job_id}/{step_id} is not UTF-8")
+            })?;
             steps.push(LegacyStep {
                 run_id,
                 agent_job_id,
@@ -621,9 +622,9 @@ impl LegacyDb {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<_, _>>()?;
-        let mut chunk_stmt = self.conn.prepare(
-            "SELECT payload FROM log_chunks WHERE log_key = ?1 ORDER BY chunk_index",
-        )?;
+        let mut chunk_stmt = self
+            .conn
+            .prepare("SELECT payload FROM log_chunks WHERE log_key = ?1 ORDER BY chunk_index")?;
         let mut out = Vec::with_capacity(files.len());
         for (log_key, byte_count, line_count, updated_at_us) in files {
             // Legacy log chunks are stored raw (masked by the HTTP layer
@@ -873,9 +874,9 @@ impl LegacyDb {
 
     /// `(request_id, payload_json)` rows of the per-attempt job-message table.
     pub(crate) fn job_request_messages(&self) -> anyhow::Result<Vec<(i64, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id, payload_json FROM job_request_messages ORDER BY request_id",
+        )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
@@ -925,8 +926,8 @@ pub(crate) fn decode_message_payload(
     label: &str,
     associated_data: &[u8],
 ) -> anyhow::Result<serde_json::Value> {
-    let parsed: serde_json::Value = serde_json::from_str(raw)
-        .with_context(|| format!("parse legacy {label} payload JSON"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).with_context(|| format!("parse legacy {label} payload JSON"))?;
     match parsed {
         serde_json::Value::String(encoded) => {
             use base64::Engine as _;
@@ -979,7 +980,6 @@ pub(crate) struct LegacyRequestSnapshot {
     pub(crate) debug_token_issued: bool,
 }
 
-
 /// Unseal and parse a legacy run blob.
 pub(crate) fn restore_run_record(cipher: &Envelope, blob: &[u8]) -> anyhow::Result<RunRecord> {
     let value: serde_json::Value = serde_json::from_slice(&cipher.unseal(blob)?)?;
@@ -1030,11 +1030,11 @@ pub(crate) fn run_record_from_value(value: serde_json::Value) -> anyhow::Result<
         // understands is a hard import failure, not a silent drop: the
         // importer never claims a run it could not restore.
         run.workspace_snapshot = match object.get("workspace_snapshot") {
-            Some(value) if !value.is_null() => Some(
-                serde_json::from_value(value.clone()).with_context(|| {
+            Some(value) if !value.is_null() => {
+                Some(serde_json::from_value(value.clone()).with_context(|| {
                     format!("decode workspace snapshot of run {}", run.run_id.0)
-                })?,
-            ),
+                })?)
+            }
             _ => None,
         };
     }
@@ -1044,8 +1044,8 @@ pub(crate) fn run_record_from_value(value: serde_json::Value) -> anyhow::Result<
 /// Hex SHA-256 of a file, used to prove the source did not change.
 pub(crate) fn file_digest(path: &Path) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("hash source database {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("hash source database {}", path.display()))?;
     let digest = Sha256::digest(&bytes);
     Ok(hex::encode(digest))
 }
