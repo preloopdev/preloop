@@ -372,6 +372,7 @@ pub async fn delete_session(
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id
@@ -434,6 +435,7 @@ pub async fn purge_runner_identity_guarded(
         }
     }
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
     Ok(())
 }
 
@@ -488,6 +490,7 @@ async fn purge_runner_identity_with_phantom_check(
         }
     }
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
     true
 }
 
@@ -523,6 +526,7 @@ pub async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
         "purged restored ephemeral runner identities"
     );
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
 }
 
 /// DELETE /runner/server/_apis/distributedtask/pools/:pool_id/sessions (no session_id)

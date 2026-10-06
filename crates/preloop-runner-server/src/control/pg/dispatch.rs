@@ -5231,7 +5231,12 @@ impl PgBackend {
         &self,
         poll: PollRequest,
     ) -> Result<PollOutcome, ControlError> {
-        // Fast path first: idle polls never take a writer.
+        // Fast path first: idle polls never take a writer. The probe reads
+        // from this node's own pool — the claim-enabling probe (and every
+        // state read that can promote to a write) must NEVER route to a
+        // read replica: a replica's snapshot lags the writer's commits, so
+        // it could answer "empty" for a claim the writer just made, or
+        // claimable for one another node already took. Read your writes.
         let reader = self.reader().await?;
         if let Some(outcome) = self.probe_poll(&*reader, &poll).await? {
             return Ok(outcome);

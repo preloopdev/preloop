@@ -16,11 +16,21 @@ pub async fn next_message(
     let wait_seconds = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(50);
+        .unwrap_or(50)
+        // A client-chosen window longer than the liveness floor parks a
+        // healthy runner past its own reaping.
+        .min(crate::state::max_poll_window_secs());
     // One window per request (see `broker::next_message_broker_ref`).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
 
     loop {
+        // Register the waiter *before* probing: a `notify_waiters` landing
+        // between the probe and a later `notified()` registration is lost
+        // forever (it stores no permit), stalling this poll until the
+        // window ends even though work was queued.
+        let notified = shared.state.message_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let outcome = shared
             .state
             .backend
@@ -77,10 +87,7 @@ pub async fn next_message(
                 if wait_seconds == 0 {
                     return Ok((StatusCode::OK, Json(None)));
                 }
-                if tokio::time::timeout_at(deadline, shared.state.message_notify.notified())
-                    .await
-                    .is_err()
-                {
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
                     return Ok((StatusCode::OK, Json(None)));
                 }
                 continue;
@@ -852,6 +859,7 @@ pub(crate) async fn complete_job_settling(
     if scheduling.promoted > 0 || !cancelled_siblings.is_empty() || queue_nonempty {
         crate::state::wake_waiters(
             &shared.state.message_notify,
+            &shared.state.sampler_notify,
             scheduling.promoted.max(usize::from(queue_nonempty)),
             !cancelled_siblings.is_empty(),
         );

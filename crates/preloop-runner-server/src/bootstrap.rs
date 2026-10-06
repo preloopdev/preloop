@@ -484,6 +484,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // Notify if cancellations or starvation failures occurred
     if cancellation_count > 0 || !starved.is_empty() || !expired_fork_approvals.is_empty() {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
 
     // Surface fork-PR runs failed closed by the expired approval window.
@@ -603,6 +604,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             }
             if outcome.promoted > 0 || outcome.failed > 0 {
                 shared.state.message_notify.notify_waiters();
+                shared.state.sampler_notify.notify_waiters();
             }
         }
         Err(error) => warn!(?error, "environment gate promotion sweep failed"),
@@ -1259,6 +1261,9 @@ async fn run_state_sampler(
     );
     heartbeat.beat("state_sampler");
     let mut interval = tokio::time::interval(Duration::from_secs(5));
+    // A tick missed during a coalescing nap delays rather than bursting:
+    // publishing twice back-to-back reports the same counters twice.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Immediate sample then every 5s.
     interval.tick().await;
     // When the last tick ran: the burst-reactive early tick below must not
@@ -1270,10 +1275,11 @@ async fn run_state_sampler(
         tokio::select! {
             _ = interval.tick() => {}
             // A submit/claim/complete/cancel wakes the sampler early so the
-            // pool sees a burst in ~ms instead of at the next 5s tick. The
-            // Notify coalesces a flurry into one wakeup, and the 1s floor
-            // below caps a sustained storm at one extra count per second.
-            _ = shared.state.message_notify.notified() => { early = true; }
+            // pool sees a burst in ~ms instead of at the next 5s tick. This
+            // is the sampler's own channel: runner waiters on
+            // `message_notify` are woken with per-job `notify_one` permits
+            // that a parked sampler here would otherwise steal.
+            _ = shared.state.sampler_notify.notified() => { early = true; }
             _ = shared.shutdown.cancelled() => { shutdown = true; }
         }
         if shutdown {
@@ -1286,51 +1292,71 @@ async fn run_state_sampler(
             publish_snapshot(&shared, &store_backend, true).await;
             break;
         }
-        if early && last_tick.elapsed() < Duration::from_secs(1) {
-            continue;
-        }
-        last_tick = std::time::Instant::now();
+        if early
+            && let Some(nap) = Duration::from_secs(1).checked_sub(last_tick.elapsed())
+            && !nap.is_zero()
         {
-            heartbeat.beat("state_sampler");
-            publish_snapshot(&shared, &store_backend, false).await;
-            // Record pool/queue gauges into OTel instruments so `/metrics`
-            // has a single exposition source (the SDK renderer).
-            {
-                let s = shared.state.status_snapshot.read();
-                // The co-hosted runner pool scales off this atomic; it
-                // used to be refreshed by every submit/claim/complete
-                // (a full count(*) each). The sampler's grouped count
-                // is the same number at a fixed cadence, plus a
-                // burst-reactive early tick above.
-                shared
-                    .state
-                    .queue_depth
-                    .store(s.jobs.ready as usize, std::sync::atomic::Ordering::Release);
-                shared.state.pool_status.set_queue_depth(s.jobs.ready);
-                shared.state.observability.metrics().pool.record(
-                    s.service.uptime_seconds,
-                    s.pool.desired as u64,
-                    s.pool.preparing,
-                    s.pool.idle as u64,
-                    s.pool.busy as u64,
-                    s.jobs.ready as u64,
-                    s.jobs.claimable as u64,
-                    s.jobs.unclaimable as u64,
-                    s.jobs.dependency_blocked as u64,
-                );
-                // Host memory reality on the same cadence: a /proc scan
-                // is microseconds next to everything else on this tick.
-                // Recorded even when nothing else changed so OOM
-                // proximity is a continuous signal, not a sampled one.
-                shared
-                    .state
-                    .observability
-                    .metrics()
-                    .host
-                    .record(&preloop_observability::vm_telemetry::sample_host());
+            // Inside the 1s floor: don't drop the event — nap off the rest
+            // of the floor, then sample below. A `continue` here meant a
+            // change during the floor was invisible until the next 5s tick.
+            // Wakes during the nap need no flag: the sample that follows
+            // counts everything already.
+            tokio::select! {
+                _ = tokio::time::sleep(nap) => {}
+                _ = shared.shutdown.cancelled() => {
+                    heartbeat.beat("state_sampler");
+                    publish_snapshot(&shared, &store_backend, true).await;
+                    break;
+                }
             }
         }
+        last_tick = std::time::Instant::now();
+        heartbeat.beat("state_sampler");
+        sample_state_once(&shared, &store_backend).await;
     }
+}
+
+/// One sampler tick: publish the snapshot, then refresh the pool/queue
+/// gauges and host-memory metrics from it. The loop calls this on every
+/// tick/early-wake; tests call it directly (`test_sample_state_once`) since
+/// no sampler task runs under `app()`.
+pub(crate) async fn sample_state_once(
+    shared: &Arc<SharedState>,
+    store_backend: &preloop_observability::status::StoreBackend,
+) {
+    publish_snapshot(shared, store_backend, false).await;
+    // Record pool/queue gauges into OTel instruments so `/metrics` has a
+    // single exposition source (the SDK renderer).
+    let s = shared.state.status_snapshot.read();
+    // The co-hosted runner pool scales off this atomic; it used to be
+    // refreshed by every submit/claim/complete (a full count(*) each). The
+    // sampler's grouped count is the same number at a fixed cadence, plus a
+    // burst-reactive early tick in the loop above.
+    shared
+        .state
+        .queue_depth
+        .store(s.jobs.ready as usize, std::sync::atomic::Ordering::Release);
+    shared.state.pool_status.set_queue_depth(s.jobs.ready);
+    shared.state.observability.metrics().pool.record(
+        s.service.uptime_seconds,
+        s.pool.desired as u64,
+        s.pool.preparing,
+        s.pool.idle as u64,
+        s.pool.busy as u64,
+        s.jobs.ready as u64,
+        s.jobs.claimable as u64,
+        s.jobs.unclaimable as u64,
+        s.jobs.dependency_blocked as u64,
+    );
+    // Host memory reality on the same cadence: a /proc scan is microseconds
+    // next to everything else on this tick. Recorded even when nothing else
+    // changed so OOM proximity is a continuous signal, not a sampled one.
+    shared
+        .state
+        .observability
+        .metrics()
+        .host
+        .record(&preloop_observability::vm_telemetry::sample_host());
 }
 
 fn is_routine_unix_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {

@@ -288,7 +288,10 @@ pub async fn next_message_broker_ref(
     let wait_seconds = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(50);
+        .unwrap_or(50)
+        // A client-chosen window longer than the liveness floor parks a
+        // healthy runner past its own reaping.
+        .min(crate::state::max_poll_window_secs());
     let runner_busy = params
         .get("status")
         .is_some_and(|status| status.eq_ignore_ascii_case("busy"));
@@ -322,6 +325,13 @@ pub async fn next_message_broker_ref(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
 
     loop {
+        // Register the waiter *before* probing: a `notify_waiters` landing
+        // between the probe and a later `notified()` registration is lost
+        // forever (it stores no permit), stalling this poll until the
+        // window ends even though work was queued.
+        let notified = shared.state.message_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let outcome = shared
             .state
             .backend
@@ -388,10 +398,7 @@ pub async fn next_message_broker_ref(
             };
             return Ok((status, Json(body)).into_response());
         }
-        if tokio::time::timeout_at(deadline, shared.state.message_notify.notified())
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
             let status = if runner_busy {
                 StatusCode::ACCEPTED
             } else {
@@ -699,7 +706,10 @@ pub async fn next_message_broker_ref_root(
     let wait = params
         .get("waitSeconds")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(50);
+        .unwrap_or(50)
+        // A client-chosen window longer than the liveness floor parks a
+        // healthy runner past its own reaping.
+        .min(crate::state::max_poll_window_secs());
     // The runner may report completion before its worker process has fully
     // exited. GitHub keeps polling with status=Busy during that drain window;
     // never dispatch a successor until the runner reports Online again.
@@ -710,6 +720,13 @@ pub async fn next_message_broker_ref_root(
     let mut deadline = std::time::Instant::now() + Duration::from_secs(wait);
 
     loop {
+        // Register the waiter *before* probing: a `notify_waiters` landing
+        // between the probe and a later `notified()` registration is lost
+        // forever (it stores no permit), stalling this poll until the
+        // window ends even though work was queued.
+        let notified = shared.state.message_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         // `drained`: Busy poll but nothing is still running — the session's
         // job has finished and the status=Busy report is stale.
         let mut drained = false;
@@ -770,9 +787,9 @@ pub async fn next_message_broker_ref_root(
         // One wait per window, like `next_message_broker_ref` and the azdo
         // path: the poll above is a cheap reader probe now, and
         // `message_notify` fires on every enqueue, cancellation and
-        // promotion. A lost wake only delays until the window ends.
-        let _ =
-            tokio::time::timeout_at(deadline.into(), shared.state.message_notify.notified()).await;
+        // promotion. The waiter was registered before the probe, so a wake
+        // that landed mid-poll is still seen.
+        let _ = tokio::time::timeout_at(deadline.into(), notified).await;
     }
 }
 
@@ -1306,6 +1323,7 @@ async fn fail_unclaimable_request(shared: &Arc<SharedState>, request_id: i64) {
     // Let a long-polling runner pick up a successor immediately rather than
     // waiting out its poll window behind a job that will never run.
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
 }
 
 /// Reconcile job claims whose runner session did not survive a restart.
@@ -1687,6 +1705,7 @@ pub async fn broker_complete_job(
     // Wake long-polling runners so a queued successor job is delivered promptly
     // after cancel/complete (concurrency release path).
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
     Ok(StatusCode::NO_CONTENT)
 }
 

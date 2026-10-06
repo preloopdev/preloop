@@ -764,6 +764,7 @@ async fn release_webhook_run_reservation(shared: &Arc<SharedState>, key: (String
     inner.webhook_run_reservations.remove(&key);
     drop(inner);
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
 }
 
 /// The host (and optional port) of the configured forge, for `git://`-schemed
@@ -1951,6 +1952,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         if outcome.queued_jobs > 0 || expansion.promoted > 0 {
             crate::state::wake_waiters(
                 &shared.state.message_notify,
+                &shared.state.sampler_notify,
                 outcome.queued_jobs + expansion.promoted,
                 false,
             );
@@ -3428,6 +3430,7 @@ pub async fn cancel_run(
     *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
     shared
         .state
@@ -3503,6 +3506,7 @@ pub async fn approve_job(
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
     match outcome.result {
         crate::control::types::EnvironmentApprovalResult::AlreadyTerminal => {
@@ -3513,6 +3517,7 @@ pub async fn approve_job(
         )),
         crate::control::types::EnvironmentApprovalResult::Expired => {
             shared.state.message_notify.notify_waiters();
+            shared.state.sampler_notify.notify_waiters();
             Err(ApiError::conflict(
                 "approval window expired; the job was failed closed",
             ))
@@ -3662,6 +3667,7 @@ pub async fn approve_fork(
             crate::fork_policy::sweep_expired_fork_approvals(&shared, now_unix_nanos).await;
         if !expired.is_empty() {
             shared.state.message_notify.notify_waiters();
+            shared.state.sampler_notify.notify_waiters();
         }
         return Err(ApiError::conflict(
             "approval window expired; the run was failed closed",
@@ -3694,6 +3700,7 @@ pub async fn approve_fork(
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
     // The expiry sweep may have won the run's terminal transition between the
     // guard read and the write (it clears the hold in its own transaction).
