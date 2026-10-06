@@ -274,7 +274,10 @@ pub fn normalize_github_context(github: &Value) -> Value {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(&server_url)
-        .trim_end_matches('/');
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or(server_url.as_str());
     object.insert(
         "repositoryUrl".to_owned(),
         json!(format!("git://{forge_host}/{repository}.git")),
@@ -1975,5 +1978,14 @@ jobs:
             "server_url": "http://127.0.0.1:9090/"
         }));
         assert_eq!(configured["repositoryUrl"], "git://127.0.0.1:9090/o/r.git");
+
+        // A path-bearing server_url (e.g. an enterprises/ prefix) must not
+        // leak into the git host — the forge host is authority-only, matching
+        // `forge_git_host` in runs.rs which feeds the same context.
+        let pathed = normalize_github_context(&serde_json::json!({
+            "repository": "o/r",
+            "server_url": "https://github.com/enterprises/acme"
+        }));
+        assert_eq!(pathed["repositoryUrl"], "git://github.com/o/r.git");
     }
 }

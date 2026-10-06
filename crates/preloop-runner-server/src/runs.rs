@@ -2458,9 +2458,17 @@ pub(crate) fn build_job_artifacts(
         if let (Some(repository), crate::snapshots::SnapshotSource::LocalWorkspace) =
             (repository, snapshot.source)
         {
-            use base64::Engine as _;
             let credentials = base64::engine::general_purpose::STANDARD
                 .encode(format!("x-access-token:{runtime_token}"));
+            // The `git://` URL the job advertises as `github.repositoryUrl`:
+            // a step cloning it bypasses the snapshot unless its own
+            // insteadOf prefix is registered — the `https://` rewrite below
+            // does not match the git scheme.
+            let git_forge_url = normalized_github
+                .get("repositoryUrl")
+                .and_then(|value| value.as_str())
+                .and_then(|url| url.strip_suffix(".git"))
+                .map(str::to_owned);
             agent_msg.preloop_snapshot_origin_rewrite =
                 Some(preloop_gha_protocol::azdo::SnapshotOriginRewrite {
                     snapshot_url: format!("{base_url}/{}", snapshot.repository),
@@ -2468,6 +2476,7 @@ pub(crate) fn build_job_artifacts(
                         "{}/{repository}",
                         shared.state.github_urls.server_url.trim_end_matches('/')
                     ),
+                    git_forge_url,
                     auth_header: format!("AUTHORIZATION: basic {credentials}"),
                 });
         }
