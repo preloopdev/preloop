@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::Regex;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,6 +65,8 @@ enum Commands {
     Init(InitArgs),
     /// Report golden coverage of implemented runner-facing routes (finding #2).
     Coverage(CoverageArgs),
+    /// Compare any two flows.jsonl captures (service-agnostic contract gate).
+    FlowsDiff(FlowsDiffArgs),
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +197,33 @@ struct CoverageArgs {
     /// `.runner-watch/coverage-allow.txt` allowlist).
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Debug, Args)]
+struct FlowsDiffArgs {
+    /// Reference capture directory (contains flows.jsonl), e.g. real GitHub.
+    #[arg(long)]
+    left: PathBuf,
+    /// Candidate capture directory, e.g. an emulator replay.
+    #[arg(long)]
+    right: PathBuf,
+    #[arg(long, default_value = "reference")]
+    left_label: String,
+    #[arg(long, default_value = "candidate")]
+    right_label: String,
+    /// Endpoint substrings whose status mismatches are ignored (repeatable).
+    #[arg(long = "status-ignore")]
+    status_ignore: Vec<String>,
+    /// Endpoint substrings whose response-schema removals fail the gate
+    /// (repeatable). `*` gates every endpoint.
+    #[arg(long = "schema-gate")]
+    schema_gate: Vec<String>,
+    /// Also gate normalized response values, except for these substrings.
+    #[arg(long = "value-gate-except")]
+    value_gate_except: Option<Vec<String>>,
+    /// Print the machine-readable result instead of a summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -427,6 +457,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run(args) => run_all(&config, &args).await,
         Commands::Init(args) => init_files(&config, &args).await,
         Commands::Coverage(args) => coverage_cmd(&config, &args).await,
+        Commands::FlowsDiff(args) => flows_diff(&args),
     }
 }
 
@@ -2209,7 +2240,7 @@ async fn replay_flows_to_preloop_inner(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // The server requires exp/iat/aud on client assertions (R1-9): exp
+        // The server requires exp/iat/aud on client assertions: exp
         // bounds the replay window, aud must name the token endpoint or the
         // server base URL.
         let token_endpoint = format!(
@@ -2297,6 +2328,8 @@ async fn replay_flows_to_preloop_inner(
     let mut official_broker_job_ids = Vec::new();
     let mut preloop_broker_job_ids = Vec::new();
     let mut blob_upload_urls: VecDeque<String> = VecDeque::new();
+    // Agent id the golden flow's own `POST .../agents` registered.
+    let mut official_agent_id: Option<String> = None;
     for line in flows.lines().filter(|l| !l.trim().is_empty()) {
         let flow: Value = serde_json::from_str(line)?;
         let method = flow.get("method").and_then(Value::as_str).unwrap_or("GET");
@@ -2312,6 +2345,9 @@ async fn replay_flows_to_preloop_inner(
         {
             path = format!("/broker/{}{}", replay_runner_id, &rest[slash_pos..]);
         }
+        // Rewrite the disttask agent id of the golden's own registered agent
+        // to the replay runner: the golden PUTs target the official pool's id.
+        path = rewrite_replay_agent_id(&path, official_agent_id.as_deref(), replay_runner_id);
         // Rewrite OIDC plan/job IDs to match local replay state
         if path.contains("/oidctoken")
             && let Some(rest) =
@@ -2411,6 +2447,19 @@ async fn replay_flows_to_preloop_inner(
                     saw_auth = true;
                 }
                 let header_value = rewritten_header_value(name, value, &path, auth_token);
+                // The broker session header carries the session id verbatim;
+                // rewrite the official id to the local one so DELETE /session
+                // (and any session-scoped call) targets the live session.
+                let header_value = if name.eq_ignore_ascii_case("x-actions-session") {
+                    std::borrow::Cow::Owned(
+                        session_ids
+                            .get(header_value.as_ref())
+                            .cloned()
+                            .unwrap_or_else(|| header_value.into_owned()),
+                    )
+                } else {
+                    header_value
+                };
                 req = req.header(name, header_value.as_ref());
             }
         }
@@ -2445,9 +2494,9 @@ async fn replay_flows_to_preloop_inner(
                 let text = String::from_utf8_lossy(&bytes).to_string();
                 captured["status"] = json!(status);
                 captured["response_headers"] = json!(headers);
+                let mut runtime_token = None;
                 if let Ok(body_json) = serde_json::from_str::<Value>(&text) {
-                    let mut runtime_token = None;
-                    if path.ends_with("/sessions")
+                    if (path.ends_with("/sessions") || path.ends_with("/runner/session"))
                         && let (Some(official_id), Some(local_id)) = (
                             flow.pointer("/response_body_json/sessionId")
                                 .and_then(Value::as_str),
@@ -2513,7 +2562,8 @@ async fn replay_flows_to_preloop_inner(
                     // comparison tool sees null instead of substituting {}.
                     captured["response_body_json"] = Value::Null;
                 } else {
-                    captured["response_body"] = json!(redact_replay_text(&text, None));
+                    captured["response_body"] =
+                        json!(redact_replay_text(&text, runtime_token.as_deref()));
                 }
             }
             Err(error) => {
@@ -2525,6 +2575,19 @@ async fn replay_flows_to_preloop_inner(
             .await?;
         out.write_all(b"\n").await?;
         count += 1;
+        // The golden's own agent registration names the official agent id
+        // every later disttask `/agents/{id}` call targets.
+        if method.eq_ignore_ascii_case("POST")
+            && flow
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|golden| golden.split('?').next().unwrap_or("").ends_with("/agents"))
+            && let Some(id) = flow
+                .pointer("/response_body_json/id")
+                .and_then(Value::as_i64)
+        {
+            official_agent_id = Some(id.to_string());
+        }
     }
     let summary = serde_json::to_string_pretty(&json!({"status":"captured", "flows": count}))?;
     fs::write(out_dir.join("summary.json"), &summary)?;
@@ -2780,10 +2843,20 @@ fn looks_like_jwt(value: &str) -> bool {
 }
 
 fn redact_replay_text(value: &str, exact_token: Option<&str>) -> String {
-    exact_token.map_or_else(
-        || value.to_owned(),
-        |token| value.replace(token, "***REDACTED***"),
-    )
+    // The official capture pipeline scrubs raw bytes with these credential
+    // shapes (`experiments/mitm/addons/redact.py`). The replay side has to
+    // apply the same rules to non-JSON bodies, otherwise a token-shaped string
+    // stays verbatim on one side of the comparison and reads as a value
+    // divergence.
+    let github_token_re = Regex::new(r"gh[sopur]_[A-Za-z0-9_.-]{8,}|github_pat_[A-Za-z0-9_]{15,}")
+        .expect("static regex");
+    let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,})+").expect("static regex");
+    let value = github_token_re.replace_all(value, "***REDACTED***");
+    let value = jwt_re.replace_all(&value, "***REDACTED***");
+    match exact_token {
+        Some(token) => value.replace(token, "***REDACTED***"),
+        None => value.into_owned(),
+    }
 }
 
 fn extract_replay_job_key(body: &Value) -> Option<(String, String)> {
@@ -3234,7 +3307,12 @@ fn normalize_request_path(_method: &str, path: &str) -> String {
         return normalize_replay_wait(format!("/runner/server{}", &path[pos..]));
     }
     if path.starts_with("/session") {
-        return "/runner/server/_apis/distributedtask/pools/1/sessions".to_string();
+        // The official runner speaks the broker session protocol: POST
+        // /session always mints a fresh session and DELETE /session drops the
+        // caller's (via X-Actions-Session). Map to the broker endpoints, not
+        // the disttask /sessions route — that one 409s on an already-live
+        // session, which breaks the runner's delete-then-recreate cycle.
+        return "/runner/session".to_string();
     }
     if path.starts_with("/message") {
         return normalize_replay_wait(path.replacen(
@@ -3293,6 +3371,39 @@ fn rewrite_replay_plan_ids(path: &str, plan_ids: &HashMap<String, String>) -> St
         .fold(path.to_owned(), |rewritten, (official, local)| {
             rewritten.replace(official, local)
         })
+}
+
+/// Rewrite the pool agent id in a disttask `/agents/{n}` path to the runner the
+/// replay registered. Only the agent the golden flow itself registered maps:
+/// the golden PUTs against the official pool's agent id (e.g. `agents/51`),
+/// which does not exist in the replay's state. Any other id — the stale agent a
+/// `config.sh` run deletes before registering — passes through untouched, or the
+/// replay would delete its own runner.
+fn rewrite_replay_agent_id(
+    path: &str,
+    official_agent_id: Option<&str>,
+    replay_runner_id: i64,
+) -> String {
+    let Some(official_agent_id) = official_agent_id else {
+        return path.to_owned();
+    };
+    let Some(position) = path.find("/agents/") else {
+        return path.to_owned();
+    };
+    let tail = &path[position + "/agents/".len()..];
+    let (id, suffix) = match tail.find(['?', '#']) {
+        Some(index) => (&tail[..index], &tail[index..]),
+        None => (tail, ""),
+    };
+    if id != official_agent_id {
+        return path.to_owned();
+    }
+    format!(
+        "{}/agents/{}{}",
+        &path[..position],
+        replay_runner_id,
+        suffix
+    )
 }
 
 fn replay_auth_token<'a>(
@@ -3369,7 +3480,12 @@ fn is_oidc_path(path: &str) -> bool {
 
 fn is_listener_path(method: &str, path: &str) -> bool {
     let endpoint = path.split('?').next().unwrap_or(path);
+    // The broker session endpoint (`/runner/session`) is listen-token scoped:
+    // POST mints a session, DELETE drops it. The disttask `/sessions` POST is
+    // the legacy equivalent.
     (endpoint.ends_with("/sessions") && method.eq_ignore_ascii_case("POST"))
+        || endpoint == "/runner/session"
+        || endpoint.starts_with("/runner/session/")
         || endpoint.contains("/sessions/")
         || endpoint.contains("/messages")
         || endpoint.contains("/v1/AgentRequest/")
@@ -3429,6 +3545,96 @@ fn should_skip_replay_flow(host: &str, path: &str, flow: &Value) -> bool {
     // (requests in-flight when the runner was killed) and cannot be replayed meaningfully.
     let has_captured_response = flow.get("status").is_some_and(|status| !status.is_null());
     !has_captured_response
+}
+
+/// `runner-watch flows-diff`: gate a candidate capture against a reference by
+/// endpoint coverage, status sets, request shape, and (gated) response shape.
+/// Service-agnostic: used for the runner protocol and for GitHub API captures.
+fn flows_diff(args: &FlowsDiffArgs) -> anyhow::Result<()> {
+    let scenario = args
+        .left
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // A gate on a missing capture is meaningless: `load_flows` yields an
+    // empty vector for a nonexistent flows.jsonl, and an empty pair compares
+    // clean — a wrong path or lost capture would pass. Require both files,
+    // and reject an empty reference so missing evidence cannot gate green.
+    for dir in [&args.left, &args.right] {
+        let flows = dir.join("flows.jsonl");
+        if !flows.exists() {
+            anyhow::bail!("flows-diff requires a capture: missing {}", flows.display());
+        }
+    }
+    let reference_count = std::fs::read_to_string(args.left.join("flows.jsonl"))?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if reference_count == 0 {
+        anyhow::bail!(
+            "flows-diff reference {} contains no flows; refusing to gate on empty evidence",
+            args.left.display()
+        );
+    }
+    let report = compare::analyze(&compare::Args {
+        scenario: &scenario,
+        left_dir: &args.left,
+        right_dir: &args.right,
+        output: Path::new(""),
+        left_label: &args.left_label,
+        right_label: &args.right_label,
+    })?;
+    // `*` gates every endpoint: the gate matches by substring, and every key
+    // contains the empty string.
+    let gate = |entries: &[String]| -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| {
+                if entry == "*" {
+                    String::new()
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect()
+    };
+    let policy = compare::GatePolicy {
+        status_ignore: args.status_ignore.clone(),
+        response_schema_gate: gate(&args.schema_gate),
+        value_gate: match &args.value_gate_except {
+            Some(except) => compare::ValueGate::AllExcept(except.clone()),
+            None => compare::ValueGate::Off,
+        },
+    };
+    let failures = report.failures(&policy);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json(&policy))?
+        );
+    } else {
+        println!(
+            "{} flows ({}) vs {} flows ({}); {} shared endpoints",
+            report.left_flow_count,
+            args.left_label,
+            report.right_flow_count,
+            args.right_label,
+            report.endpoints.iter().filter(|e| e.is_shared()).count()
+        );
+        for failure in &failures {
+            println!(
+                "FAIL {} {}: {}",
+                failure.kind.as_str(),
+                failure.endpoint,
+                failure.detail
+            );
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{} contract failure(s)", failures.len())
+    }
 }
 
 async fn run_compare(
@@ -4497,6 +4703,54 @@ mod tests {
                 &session_ids,
             ),
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId=local-session&status=Online"
+        );
+    }
+
+    #[test]
+    fn replay_rewrites_only_the_golden_agent_id_to_the_registered_runner() {
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents/51", Some("51"), 7),
+            "/_apis/distributedtask/pools/1/agents/7"
+        );
+        // The stale agent `config.sh` deletes before registering is not ours:
+        // rewriting it would delete the replay's own runner.
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/0/agents/1", Some("51"), 7),
+            "/_apis/distributedtask/pools/0/agents/1"
+        );
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/0/agents/1", None, 7),
+            "/_apis/distributedtask/pools/0/agents/1"
+        );
+        // A query string keeps its position; a collection path is left alone.
+        assert_eq!(
+            rewrite_replay_agent_id(
+                "/_apis/distributedtask/pools/1/agents/51?x=1",
+                Some("51"),
+                7
+            ),
+            "/_apis/distributedtask/pools/1/agents/7?x=1"
+        );
+        assert_eq!(
+            rewrite_replay_agent_id("/_apis/distributedtask/pools/1/agents", Some("51"), 7),
+            "/_apis/distributedtask/pools/1/agents"
+        );
+    }
+
+    #[test]
+    fn non_json_replay_bodies_are_redacted_like_the_capture_pipeline() {
+        // Credential shapes the official capture pipeline scrubs from raw bytes.
+        assert_eq!(
+            redact_replay_text(
+                "denied token ghs_15368_eyJhbGciOiJFUzI1NiJ9.eyJhaWQiOjE1MzY4fQ.Duv_FPs3lVT",
+                None
+            ),
+            "denied token ***REDACTED***"
+        );
+        // The acquired runtime token is redacted even when it has no JWT shape.
+        assert_eq!(
+            redact_replay_text("runtime-token here", Some("runtime-token")),
+            "***REDACTED*** here"
         );
     }
 

@@ -28,8 +28,25 @@ pub async fn register_runner(
     Json(request): Json<RunnerRegistrationRequest>,
 ) -> Result<Json<RegisteredRunner>, ApiError> {
     let runner = register_runner_inner(&shared, request).await?;
+    {
+        // Native-bearer registration is engine-authorized: pair the fresh
+        // runner with a pending pool-assigned job immediately, same as
+        // `register_runner_native`.
+        shared
+            .state
+            .backend
+            .pair_runner(runner.id)
+            .await
+            .map_err(ApiError::from)?;
+    }
     if let Err(error) = persist_full_state(&shared).await {
-        purge_runner_identity(&shared, runner.id).await;
+        if let Err(purge_error) = purge_runner_identity(&shared, runner.id).await {
+            tracing::error!(
+                ?purge_error,
+                runner_id = runner.id,
+                "runner rollback purge failed — listen token remains valid"
+            );
+        }
         return Err(error);
     }
     Ok(Json(runner))
@@ -49,51 +66,41 @@ async fn register_runner_inner(
         .map(AgentRsaPublicKey::parse)
         .transpose()
         .map_err(ApiError::from)?;
-    let mut inner = shared.state.inner.lock().await;
-    inner.next_runner_id += 1;
-    let runner_id = inner.next_runner_id;
-    let public_key = request.public_key.clone();
-    let runner = RegisteredRunner {
-        id: runner_id,
-        name: request.name,
-        labels: dedupe_labels_ci(&request.labels),
-        ephemeral: request.ephemeral,
-        public_key,
-        runner_group_id: request.runner_group_id,
-        runner_group_name: request.runner_group_name,
-    };
-    if let Some(public_key) = &runner.public_key {
+    let row = shared
+        .state
+        .backend
+        .register_runner(crate::control::backend::RegisterRunner {
+            name: request.name,
+            labels: dedupe_labels_ci(&request.labels),
+            ephemeral: request.ephemeral,
+            public_key: request.public_key.clone(),
+            rsa_public_key: parsed_public_key,
+            client_id: None,
+            runner_group_id: request.runner_group_id,
+            runner_group_name: request.runner_group_name,
+            pool_proven: false,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    // `runner_public_keys` (the PEM/string form) is node-local — it is not part
+    // of the scheduling working set the backend owns.
+    if let Some(public_key) = &row.runner.public_key {
+        let mut inner = shared.state.inner.lock().await;
         inner
             .runner_public_keys
-            .insert(runner_id, public_key.clone());
+            .insert(row.runner.id, public_key.clone());
     }
-    if let Some(public_key) = parsed_public_key {
-        inner.runner_rsa_public_keys.insert(runner_id, public_key);
-    }
-    inner.runners.insert(runner.id, runner.clone());
-    inner
-        .runner_registered_at
-        .insert(runner.id, std::time::Instant::now());
-    Ok(runner)
+    Ok(row.runner)
 }
 
-/// Capture and write a full in-memory snapshot under a process-wide write
-/// gate. The gate is acquired before `inner`, so concurrent callers cannot
-/// write an older snapshot after a newer mutation has already been persisted.
-async fn persist_full_state(shared: &Arc<SharedState>) -> Result<(), ApiError> {
-    let _store_guard = shared.state.store_mutation.lock().await;
-    let snapshot = {
-        let inner = shared.state.inner.lock().await;
-        crate::store::StoreSnapshot::from_inner(&inner)
-    };
-    shared
-        .state
-        .store
-        .store_inner(&snapshot)
-        .await
-        .map_err(|error| ApiError::internal(format!("failed to persist runner state: {error}")))
+/// Retired: the control backend commits every mutation durably inside its own
+/// transaction, so the legacy `StoreSnapshot`/`store_inner` dual-write is no
+/// longer needed to survive a restart. Kept as a no-op so the registration /
+/// session call sites read unchanged; the whole helper is deleted once the
+/// snapshot store is removed.
+async fn persist_full_state(_shared: &Arc<SharedState>) -> Result<(), ApiError> {
+    Ok(())
 }
-
 /// Wrapper for the native registration route: native-bearer gated, so the
 /// registration is engine-authorized and the fresh runner may be paired
 /// with a pending pool-assigned job immediately.
@@ -103,11 +110,21 @@ pub async fn register_runner_native(
 ) -> Result<Json<RegisteredRunner>, ApiError> {
     let runner = register_runner_inner(&shared, request).await?;
     {
-        let mut inner = shared.state.inner.lock().await;
-        crate::runtime_scheduling::pair_registered_runner(&mut inner, runner.id);
+        shared
+            .state
+            .backend
+            .pair_runner(runner.id)
+            .await
+            .map_err(ApiError::from)?;
     }
     if let Err(error) = persist_full_state(&shared).await {
-        purge_runner_identity(&shared, runner.id).await;
+        if let Err(purge_error) = purge_runner_identity(&shared, runner.id).await {
+            tracing::error!(
+                ?purge_error,
+                runner_id = runner.id,
+                "runner rollback purge failed — listen token remains valid"
+            );
+        }
         return Err(error);
     }
     Ok(Json(runner))
@@ -134,10 +151,15 @@ pub async fn list_runners_native(
     State(shared): State<Arc<SharedState>>,
     Query(query): Query<RunnerListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let inner = shared.state.inner.lock().await;
-    let runners: Vec<serde_json::Value> = inner
+    let listing = shared
+        .state
+        .backend
+        .list_runners(query.run_id)
+        .await
+        .map_err(ApiError::from)?;
+    let runners: Vec<serde_json::Value> = listing
         .runners
-        .values()
+        .iter()
         .map(|runner| {
             json!({
                 "id": runner.id,
@@ -150,27 +172,9 @@ pub async fn list_runners_native(
         "count": runners.len(),
         "runners": runners,
     });
-    if let Some(run_id) = query.run_id {
-        let queued = inner
-            .queue
-            .iter()
-            .filter(|job| job.run_id == run_id)
-            .count();
-        // A runner is claimable when it matches at least one of the run's
-        // queued jobs under the same predicate the scheduler dispatches with.
-        let claimable = inner
-            .runners
-            .values()
-            .filter(|runner| {
-                let caps = crate::runtime_scheduling::capabilities_of(runner);
-                inner.queue.iter().any(|job| {
-                    job.run_id == run_id
-                        && crate::runtime_scheduling::job_matches_runner_capabilities(job, &caps)
-                })
-            })
-            .count();
-        response["queued"] = json!(queued);
-        response["claimable"] = json!(claimable);
+    if let Some(run_queue) = listing.run_queue {
+        response["queued"] = json!(run_queue.queued);
+        response["claimable"] = json!(run_queue.claimable);
     }
     Ok(Json(response))
 }
@@ -181,16 +185,17 @@ pub async fn create_session(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = uuid::Uuid::new_v4();
 
-    // Generate AES session key
-    let session_enc = SessionEncryption::generate();
+    // The AES session key is derived from the cluster key and the session id
+    // (never stored): any node re-derives it to encrypt this session's
+    // messages.
+    let session_enc = shared.state.session_encryption(&session_id.to_string());
 
-    let runner_public_key = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runner_rsa_public_keys
-            .get(&request.runner_id)
-            .cloned()
-    };
+    let runner_public_key = shared
+        .state
+        .backend
+        .runner_rsa_public_key(request.runner_id)
+        .await
+        .map_err(ApiError::from)?;
     let (key_bytes, encrypted) = if let Some(public_key) = runner_public_key {
         (public_key.wrap_key(&session_enc.key)?, true)
     } else {
@@ -198,25 +203,20 @@ pub async fn create_session(
     };
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
 
-    // Store the session key for later message decryption
-    {
-        let mut inner = shared.state.inner.lock().await;
-        inner
-            .session_keys
-            .insert(session_id.to_string(), session_enc);
-        inner.sessions.insert(
-            session_id.to_string(),
-            RunnerSession {
-                session_id: SessionId(session_id),
-                runner_id: request.runner_id,
-            },
-        );
-        inner.mark_session_seen(&session_id.to_string());
-        inner
-            .broker_session_runners
-            .insert(session_id.to_string(), request.runner_id);
-    }
-    persist_full_state(&shared).await?;
+    shared
+        .state
+        .backend
+        .open_runner_session(crate::control::OpenRunnerSession {
+            session_id: session_id.to_string(),
+            runner_id: Some(request.runner_id),
+            protocol: crate::control::SessionProtocol::Broker,
+            verified: false,
+            // The legacy AzDO/AgentSession create may name an agent id whose
+            // registration arrives later.
+            require_live_runner: false,
+        })
+        .await
+        .map_err(ApiError::from)?;
 
     info!(%session_id, runner_id = request.runner_id, encrypted, "session created with AES key");
 
@@ -241,7 +241,7 @@ pub async fn create_session_disttask(
     // RSA-wrapped keys are only needed for real internet-facing GHES; for local
     // use the runner's from_rsaparams may not reconstruct the keypair correctly.
     let session_id = uuid::Uuid::new_v4();
-    let session_enc = SessionEncryption::generate();
+    let session_enc = shared.state.session_encryption(&session_id.to_string());
 
     let requested_runner_id = body
         .pointer("/agent/id")
@@ -267,9 +267,14 @@ pub async fn create_session_disttask(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let runner_public_key = {
-        let inner = shared.state.inner.lock().await;
-        runner_id.and_then(|id| inner.runner_rsa_public_keys.get(&id).cloned())
+    let runner_public_key = match runner_id {
+        Some(id) => shared
+            .state
+            .backend
+            .runner_rsa_public_key(id)
+            .await
+            .map_err(ApiError::from)?,
+        None => None,
     };
     let (key_bytes, _encrypted) = if use_fips_encryption {
         let Some(public_key) = runner_public_key else {
@@ -285,35 +290,31 @@ pub async fn create_session_disttask(
         (session_enc.key.clone(), false)
     };
     let key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
-    {
-        let mut inner = shared.state.inner.lock().await;
-        inner
-            .session_keys
-            .insert(session_id.to_string(), session_enc);
-        if let Some(runner_id) = runner_id {
-            inner
-                .broker_session_runners
-                .insert(session_id.to_string(), runner_id);
-            inner.sessions.insert(
-                session_id.to_string(),
-                RunnerSession {
-                    session_id: SessionId(session_id),
-                    runner_id,
-                },
-            );
-            inner.mark_session_seen(&session_id.to_string());
-        }
-        // Only mark as AzDO if the client explicitly opts in.
-        // This preserves backward compat: test and broker-hybrid sessions do NOT
-        // include `preloopAzdo: true` and continue to receive broker-ref messages.
-        if body
-            .get("preloopAzdo")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            inner.azdo_sessions.insert(session_id.to_string());
-        }
-    }
+    let azdo_opt_in = body
+        .get("preloopAzdo")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // The official control plane answers 409 when the runner already holds a
+    // live session. Only *verified* sessions count: an unverified compat
+    // session (no listen token) must not squat a runner id.
+    shared
+        .state
+        .backend
+        .open_runner_session(crate::control::OpenRunnerSession {
+            session_id: session_id.to_string(),
+            runner_id,
+            protocol: if azdo_opt_in {
+                crate::control::SessionProtocol::Azdo
+            } else {
+                crate::control::SessionProtocol::Broker
+            },
+            verified: runner_id.is_some() && verified == runner_id,
+            // The distributedtask session create serves legacy clients that
+            // may name an agent id before its registration lands.
+            require_live_runner: false,
+        })
+        .await
+        .map_err(ApiError::from)?;
     persist_full_state(&shared).await?;
 
     let owner_name = body
@@ -357,23 +358,16 @@ pub async fn delete_session(
             "registration tokens cannot delete sessions",
         ));
     }
-    {
-        let mut inner = shared.state.inner.lock().await;
-        if let crate::auth::AdminCaller::Runner(runner_id) = caller {
-            match inner.runner_id_for_session(&session_id) {
-                Some(owner) if owner == runner_id => {}
-                // Ending another runner's session strands its in-flight job
-                // until the lease reaper notices.
-                Some(_) => {
-                    return Err(ApiError::forbidden("session belongs to another runner"));
-                }
-                // Unknown session: nothing to strand, stay idempotent.
-                None => return Ok(StatusCode::NO_CONTENT),
-            }
-        }
-        inner.sessions.remove(&session_id);
-        inner.broker_session_runners.remove(&session_id);
-    }
+    let caller_runner_id = match caller {
+        crate::auth::AdminCaller::Runner(runner_id) => Some(runner_id),
+        _ => None,
+    };
+    shared
+        .state
+        .backend
+        .close_runner_session(&session_id, caller_runner_id)
+        .await
+        .map_err(ApiError::from)?;
     if let Err(error) = persist_full_state(&shared).await {
         tracing::warn!(?error, "failed to persist deleted runner session");
     }
@@ -412,54 +406,32 @@ pub async fn purge_runner_identity_guarded(
     caller: crate::auth::AdminCaller,
     agent_id: i64,
 ) -> Result<(), ApiError> {
-    let (purged, abandoned_completions) = {
-        let mut inner = shared.state.inner.lock().await;
-        match caller {
-            crate::auth::AdminCaller::System => {}
-            crate::auth::AdminCaller::Runner(runner_id) => {
-                if runner_id != agent_id {
-                    return Err(ApiError::forbidden("a runner may only deregister itself"));
-                }
-            }
-            crate::auth::AdminCaller::RunnerManager => {
-                let has_active_session = inner
-                    .sessions
-                    .values()
-                    .any(|session| session.runner_id == agent_id)
-                    || inner
-                        .broker_session_runners
-                        .values()
-                        .any(|runner_id| *runner_id == agent_id);
-                if has_active_session {
-                    return Err(ApiError::forbidden(
-                        "cannot delete an active runner using a registration token",
-                    ));
-                }
-            }
+    // Caller-guard + active-session check + purge run in ONE writer
+    // transaction: a session created between a separate read and the purge
+    // would let a RunnerManager token delete an active runner (TOCTOU).
+    let guard = match caller {
+        crate::auth::AdminCaller::System => crate::control::PurgeGuard::System,
+        crate::auth::AdminCaller::Runner(runner_id) => {
+            crate::control::PurgeGuard::Runner(runner_id)
         }
-        purge_runner_identity_locked(&mut inner, &shared.state, agent_id)
+        crate::auth::AdminCaller::RunnerManager => crate::control::PurgeGuard::RegistrationToken,
     };
-    if !purged {
-        return Ok(());
-    }
-    for completion in abandoned_completions {
-        if let Err(error) =
-            crate::distributed_task::complete_job_inner(shared.clone(), completion).await
-        {
-            tracing::warn!(
-                runner_id = agent_id,
-                ?error,
-                "failed to complete job abandoned by purged runner"
-            );
+    let retired = shared
+        .state
+        .backend
+        .purge_runner_guarded(agent_id, guard)
+        .await
+        .map_err(ApiError::from)?
+        .unwrap_or_default();
+    // `runner_public_keys` and the live-log feeds are node-local — outside
+    // the scheduling tx. An abandoned attempt's feed closes so its
+    // `logs -f` followers exit; the retry streams under its own identity.
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.runner_public_keys.remove(&agent_id);
+        for agent_job_id in &retired {
+            crate::live_logs::close_live_log(&mut inner, &agent_job_id.to_string());
         }
-    }
-    // Persist before waking pollers: a restart between notify and persist
-    // would let the old snapshot restore the deleted runner. The shared
-    // snapshot gate captures the latest state after this mutation, so a
-    // concurrent registration cannot be overwritten by this delete.
-    // Notify is still unconditional when the store write fails.
-    if let Err(error) = persist_full_state(shared).await {
-        tracing::warn!(?error, "failed to persist deleted runner identity");
     }
     shared.state.message_notify.notify_waiters();
     Ok(())
@@ -467,145 +439,15 @@ pub async fn purge_runner_identity_guarded(
 
 /// Remove every trace of a runner identity: keys, client ids, sessions and
 /// assignments. Shared by agent deregistration and pool machine teardown.
-pub async fn purge_runner_identity(shared: &Arc<SharedState>, runner_id: i64) {
-    let _ =
-        purge_runner_identity_guarded(shared, crate::auth::AdminCaller::System, runner_id).await;
-}
-
-/// Remove every trace of a runner identity from in-memory state.
 ///
-/// The returned completions must be applied after releasing the state lock:
-/// normal completion owns dependency promotion, concurrency release, event
-/// publication, and request settlement.
-fn purge_runner_identity_locked(
-    inner: &mut crate::state::InnerState,
-    state: &AppState,
+/// This *is* the revocation mechanism for listen tokens (`auth.rs`: a JWT
+/// that outlives its registration must stop authenticating), so a failure
+/// here leaves a live credential — it must surface, not be dropped.
+pub async fn purge_runner_identity(
+    shared: &Arc<SharedState>,
     runner_id: i64,
-) -> (bool, Vec<preloop_gha_protocol::JobCompletion>) {
-    if inner.runners.remove(&runner_id).is_none()
-        && inner.runner_client_ids.values().all(|id| *id != runner_id)
-    {
-        return (false, Vec::new());
-    }
-    inner.runner_client_ids.retain(|_, id| *id != runner_id);
-    inner.runner_public_keys.remove(&runner_id);
-    inner.runner_rsa_public_keys.remove(&runner_id);
-    let mut abandoned_completions = Vec::new();
-    inner.pool_proven_runners.remove(&runner_id);
-    inner.runner_registered_at.remove(&runner_id);
-    // Sessions claiming this runner: drop them so subsequent polls stop.
-    let doomed_sessions: Vec<String> = inner
-        .broker_session_runners
-        .iter()
-        .filter(|(_, id)| **id == runner_id)
-        .map(|(session, _)| session.clone())
-        .chain(
-            inner
-                .sessions
-                .iter()
-                .filter(|(_, session)| session.runner_id == runner_id)
-                .map(|(id, _)| id.clone()),
-        )
-        .collect();
-    for session_id in doomed_sessions {
-        let active_request = inner.session_active_requests.remove(&session_id);
-        inner.sessions.remove(&session_id);
-        inner.broker_session_runners.remove(&session_id);
-        inner.session_keys.remove(&session_id);
-        inner.azdo_sessions.remove(&session_id);
-        inner.inflight_messages.remove(&session_id);
-        // A job this session claimed but never finished goes back on the
-        // queue for another runner right away, instead of sitting for the
-        // lease reaper to fail tens of minutes later.
-        if let Some(request_id) = active_request {
-            let pending = inner
-                .job_requests
-                .get(&request_id)
-                .filter(|request| request.result.is_none())
-                .map(|request| (request.run_id, request.job_id.clone(), request.agent_job_id));
-            if let Some((run_id, job_id, agent_job_id)) = pending {
-                let key = (run_id, job_id.clone());
-                let queued_copy_exists = inner
-                    .queue
-                    .iter()
-                    .any(|job| job.run_id == run_id && job.job_id == job_id);
-                if inner.claimed_jobs.contains_key(&key) || queued_copy_exists {
-                    // Release the dead owner even when only the durable queued
-                    // copy survived a restart. The retry rotates its runtime
-                    // identity before a replacement can acquire it.
-                    runtime_scheduling::release_request_for_retry(inner, request_id);
-                    if let Some(run) = inner.runs.get_mut(&run_id) {
-                        run.jobs.insert(job_id.clone(), ExecutionStatus::Queued);
-                        run.status = runtime_scheduling::summarize_run(run.jobs.values().copied());
-                    }
-                    if let Some(job) = inner.claimed_jobs.remove(&key) {
-                        if !queued_copy_exists {
-                            info!(
-                                runner_id,
-                                %run_id,
-                                job_id = %job_id.0,
-                                "requeuing job of purged runner"
-                            );
-                            runtime_scheduling::on_job_enqueued(inner, &job);
-                            inner.queue.push_back(job);
-                        } else {
-                            info!(
-                                runner_id,
-                                %run_id,
-                                job_id = %job_id.0,
-                                "preserving restored queued job of purged runner"
-                            );
-                        }
-                    }
-                } else {
-                    // A restarted process may restore the durable request
-                    // without restoring either in-memory copy. Treat the lost
-                    // worker as a failure through the normal completion path;
-                    // it owns dependency promotion, concurrency release,
-                    // timestamps, events, and request settlement.
-                    abandoned_completions.push(preloop_gha_protocol::JobCompletion {
-                        run_id,
-                        job_id: job_id.clone(),
-                        agent_job_id: Some(agent_job_id),
-                        status: ExecutionStatus::Failure,
-                        outputs: Default::default(),
-                        annotations: Vec::new(),
-                        step_results: Vec::new(),
-                    });
-                    warn!(
-                        runner_id,
-                        %run_id,
-                        job_id = %job_id.0,
-                        "failing purged request with no recoverable job copy"
-                    );
-                }
-            }
-        }
-    }
-
-    // Assignments it never claimed: release the jobs back to pool-pending so
-    // a replacement machine can be provisioned for them.
-    let orphaned: Vec<(RunId, JobId)> = inner
-        .job_assignments
-        .iter()
-        .filter(|(_, record)| record.runner_id == Some(runner_id))
-        .map(|(key, _)| key.clone())
-        .collect();
-    for key in orphaned {
-        if crate::runtime_scheduling::clear_assignment(inner, key.0, &key.1)
-            && inner.pool_assignments_enabled
-        {
-            inner
-                .pool_pending
-                .entry(key)
-                .or_insert_with(std::time::SystemTime::now);
-        }
-    }
-    state
-        .queue_depth
-        .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
-    runtime_scheduling::sync_next_job_labels(inner, &state.next_job_runs_on);
-    (true, abandoned_completions)
+) -> Result<(), ApiError> {
+    purge_runner_identity_guarded(shared, crate::auth::AdminCaller::System, runner_id).await
 }
 
 /// Remove a runner identity, optionally requiring it to remain sessionless.
@@ -614,47 +456,36 @@ async fn purge_runner_identity_with_phantom_check(
     runner_id: i64,
     only_if_phantom: bool,
 ) -> bool {
-    let (purged, abandoned_completions) = {
-        let mut inner = shared.state.inner.lock().await;
-        if only_if_phantom {
-            let has_session = inner
-                .sessions
-                .values()
-                .any(|session| session.runner_id == runner_id)
-                || inner
-                    .broker_session_runners
-                    .values()
-                    .any(|id| *id == runner_id);
-            if has_session {
-                tracing::info!(
-                    runner_id,
-                    "runner established session before phantom purge; skipping cleanup"
-                );
-                return false;
-            }
-        }
-        purge_runner_identity_locked(&mut inner, &shared.state, runner_id)
+    // Phantom-check + purge in ONE writer transaction: a session created
+    // between a separate read and the purge would let us delete a runner that
+    // just went active (TOCTOU).
+    let guard = if only_if_phantom {
+        crate::control::PurgeGuard::IfPhantom
+    } else {
+        crate::control::PurgeGuard::System
     };
-    if !purged {
-        return false;
-    }
-    for completion in abandoned_completions {
-        if let Err(error) =
-            crate::distributed_task::complete_job_inner(shared.clone(), completion).await
-        {
-            tracing::warn!(
+    let Some(retired) = shared
+        .state
+        .backend
+        .purge_runner_guarded(runner_id, guard)
+        .await
+        .ok()
+        .flatten()
+    else {
+        if only_if_phantom {
+            tracing::info!(
                 runner_id,
-                ?error,
-                "failed to complete job abandoned by phantom runner"
+                "runner established session before phantom purge; skipping cleanup"
             );
         }
-    }
-    if let Err(error) = persist_full_state(shared).await {
-        tracing::warn!(
-            runner_id,
-            ?error,
-            "failed to persist purged runner identity"
-        );
+        return false;
+    };
+    {
+        let mut inner = shared.state.inner.lock().await;
+        inner.runner_public_keys.remove(&runner_id);
+        for agent_job_id in &retired {
+            crate::live_logs::close_live_log(&mut inner, &agent_job_id.to_string());
+        }
     }
     shared.state.message_notify.notify_waiters();
     true
@@ -668,50 +499,27 @@ pub async fn purge_phantom_runner(shared: &Arc<SharedState>, runner_id: i64) -> 
 /// runner registrations and sessions cannot reconnect, so purge them as one
 /// transaction before serving or they masquerade as idle capacity forever.
 pub async fn purge_restored_ephemeral_runners(shared: &Arc<SharedState>) {
-    let runner_ids: Vec<i64> = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runners
-            .values()
-            .filter(|runner| runner.ephemeral)
-            .map(|runner| runner.id)
-            .collect()
-    };
+    let runner_ids: Vec<i64> = shared
+        .state
+        .backend
+        .ephemeral_runner_ids()
+        .await
+        .unwrap_or_default();
     if runner_ids.is_empty() {
         return;
     }
 
-    let (purged_count, abandoned_completions) = {
-        let mut inner = shared.state.inner.lock().await;
-        let mut abandoned_completions = Vec::new();
-        let mut purged_count = 0;
-        for runner_id in &runner_ids {
-            let (purged, mut completions) =
-                purge_runner_identity_locked(&mut inner, &shared.state, *runner_id);
-            purged_count += usize::from(purged);
-            abandoned_completions.append(&mut completions);
-        }
-        (purged_count, abandoned_completions)
-    };
-    for completion in abandoned_completions {
-        if let Err(error) =
-            crate::distributed_task::complete_job_inner(shared.clone(), completion).await
-        {
-            tracing::warn!(
-                ?error,
-                "failed to complete job abandoned by restored ephemeral runner"
-            );
-        }
+    for runner_id in &runner_ids {
+        let _ = shared.state.backend.purge_runner(*runner_id).await;
     }
-    if let Err(error) = persist_full_state(shared).await {
-        tracing::warn!(
-            count = purged_count,
-            ?error,
-            "failed to persist purged restored ephemeral runners"
-        );
+    {
+        let mut inner = shared.state.inner.lock().await;
+        for runner_id in &runner_ids {
+            inner.runner_public_keys.remove(runner_id);
+        }
     }
     info!(
-        count = purged_count,
+        count = runner_ids.len(),
         "purged restored ephemeral runner identities"
     );
     shared.state.message_notify.notify_waiters();
@@ -761,20 +569,13 @@ pub async fn agent_lookup(
     let Some(agent_name) = params.get("agentName") else {
         return Json(json!({"count": 0, "value": []}));
     };
-    let mut inner = shared.state.inner.lock().await;
-    let found = inner
-        .runners
-        .values()
-        .find(|r| &r.name == agent_name)
-        .cloned();
-    if let Some(runner) = found {
-        let client_id = inner
-            .runner_client_ids
-            .iter()
-            .find(|(_, id)| **id == runner.id)
-            .map(|(k, _)| k.clone())
-            .unwrap_or_else(|| format!("{:08x}-0000-4000-8000-000000000000", runner.id as u32));
-        inner.runner_client_ids.insert(client_id.clone(), runner.id);
+    let found = shared
+        .state
+        .backend
+        .lookup_agent(agent_name)
+        .await
+        .unwrap_or(None);
+    if let Some((runner, client_id)) = found {
         return Json(json!({"count": 1, "value": [{
             "id": runner.id,
             "name": runner.name,
@@ -937,20 +738,24 @@ pub async fn register_runner_compat(
     };
     let client_id = uuid::Uuid::new_v4().to_string();
     {
-        let mut inner = shared.state.inner.lock().await;
-        // The OAuth client id must be in the store before it is persisted:
-        // the runner's next token request is rejected as an unknown client
-        // if a restart happens between registration and persist.
-        inner.runner_client_ids.insert(client_id.clone(), result.id);
-        // Pair the fresh runner with the job its machine was provisioned
-        // for. Pairing is gated on the one-time provision token the pool
-        // generated host-side for exactly this machine — a rogue process on
-        // another machine cannot mint it, so it cannot steal pairings.
-        if provision_authorized && let Some(token) = provision_token.as_deref() {
-            // Mirror into the consolidated pool handle so the sampler's
-            // pending-registration count drops with the consume.
+        let runner_id = result.id;
+        let pair = provision_authorized
+            .then(|| provision_token.clone())
+            .flatten();
+        // The OAuth client id must be durable before the runner's next token
+        // request. Pairing is gated on the one-time provision token the pool
+        // generated host-side — a rogue process on another machine cannot
+        // mint it, so it cannot steal pairings.
+        shared
+            .state
+            .backend
+            .bind_runner_client(runner_id, &client_id, pair.is_some())
+            .await
+            .map_err(ApiError::from)?;
+        // Mirror into the consolidated pool handle so the sampler's
+        // pending-registration count drops with the consume (node-local).
+        if let Some(token) = pair.as_deref() {
             shared.state.pool_status.remove_pending(token);
-            crate::runtime_scheduling::pair_registered_runner(&mut inner, result.id);
         }
     }
     // One persist after every identity-bearing mutation, so client_id and any
@@ -963,7 +768,13 @@ pub async fn register_runner_compat(
                 .pool_status
                 .insert_pending(token.to_owned(), issued_at);
         }
-        purge_runner_identity(&shared, result.id).await;
+        if let Err(purge_error) = purge_runner_identity(&shared, result.id).await {
+            tracing::error!(
+                ?purge_error,
+                runner_id = result.id,
+                "provision rollback purge failed — listen token remains valid"
+            );
+        }
         return Err(error);
     }
     Ok(Json(json!({
@@ -1014,15 +825,14 @@ pub async fn replace_runner_compat(
         .map_err(|_| ApiError::bad_request("agent id must be numeric"))?;
     let exists = shared
         .state
-        .inner
-        .lock()
+        .backend
+        .runner_exists(old_id)
         .await
-        .runners
-        .contains_key(&old_id);
+        .unwrap_or(false);
     if !exists {
         return Err(ApiError::not_found("runner to replace not found"));
     }
-    purge_runner_identity(&shared, old_id).await;
+    purge_runner_identity(&shared, old_id).await?;
     register_runner_compat(
         State(shared),
         Path((pool_id, "0".to_owned())),
@@ -1030,6 +840,80 @@ pub async fn replace_runner_compat(
         Json(request),
     )
     .await
+}
+
+/// Compat handler for the official runner's in-place agent update:
+/// `PUT /_apis/distributedtask/pools/{pool}/agents/{id}`. The runner PUTs its
+/// current label/name set against the id it already holds and expects the
+/// same id back — unlike `replace_runner_compat`, which purges and
+/// re-registers under a fresh id for the `/_apis/v1/Agent` flow.
+pub(crate) async fn update_agent(
+    State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    identity: Option<axum::Extension<RunnerIdentity>>,
+    Path((_pool_id, agent_id)): Path<(i64, String)>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let runner_id = agent_id
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("agent id must be numeric"))?;
+    // A runner may refresh its own name/labels and nothing else; labels are
+    // the dispatch predicate, so rewriting a peer's row starves it or makes
+    // it claim jobs it was never provisioned for. The system token (and the
+    // registration credential behind the management flows) stays unrestricted.
+    let caller = crate::auth::admin_caller(
+        &shared.state,
+        &headers,
+        identity.as_ref().map(|axum::Extension(id)| id),
+    )?;
+    if let crate::auth::AdminCaller::Runner(caller_runner_id) = caller
+        && caller_runner_id != runner_id
+    {
+        return Err(ApiError::forbidden(
+            "a runner may only update its own agent",
+        ));
+    }
+    let name = request
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let labels: Option<Vec<String>> = request.get("labels").and_then(|v| v.as_array()).map(|arr| {
+        let raw: Vec<String> = arr
+            .iter()
+            .filter_map(|v| {
+                v.as_str()
+                    .or_else(|| v.get("name").and_then(|name| name.as_str()))
+                    .map(str::to_owned)
+            })
+            .collect();
+        dedupe_labels_ci(&raw)
+    });
+    let row = shared
+        .state
+        .backend
+        .update_runner(runner_id, name, labels)
+        .await
+        .map_err(ApiError::from)?;
+    let runner = row.runner;
+    Ok(Json(json!({
+        "id": runner.id,
+        "name": runner.name,
+        "enabled": true,
+        "status": "online",
+        "ephemeral": runner.ephemeral,
+        "maxParallelism": 1,
+        "currentParallelism": 0,
+        "disableUpdate": false,
+        "provisioningState": "Provisioned",
+        "runnerGroupId": runner.runner_group_id.unwrap_or(1),
+        "runnerGroupName": runner.runner_group_name,
+        "labels": runner.labels.iter().enumerate().map(|(i, l)| json!({"id": i + 1, "name": l, "type": "user"})).collect::<Vec<_>>(),
+        "properties": {
+            "ServerUrl": {"$type": "System.String", "$value": runner_server_url()},
+            "ServerUrlV2": {"$type": "System.String", "$value": runner_server_url()},
+            "UseV2Flow": {"$type": "System.Boolean", "$value": true}
+        }
+    })))
 }
 
 /// Compat handler: register runner via `/_apis/v1/Agent/:pool_id` (no agent_id in path).
@@ -1097,7 +981,7 @@ pub async fn next_message_compat(
     Path(_pool_id): Path<i64>,
     identity: Option<axum::Extension<RunnerIdentity>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> (StatusCode, Json<Option<azdo::TaskAgentMessage>>) {
+) -> Result<(StatusCode, Json<Option<azdo::TaskAgentMessage>>), ApiError> {
     next_message(State(shared), identity, Query(params)).await
 }
 /// POST /api/v1/runners/purge — orchestrator-facing runner deregistration:
@@ -1117,20 +1001,33 @@ pub async fn purge_runners_by_name(
             Json(json!({ "error": "name is required" })),
         );
     }
-    let id_or_ids: Vec<i64> = {
-        let inner = shared.state.inner.lock().await;
-        inner
-            .runners
-            .iter()
-            .filter(|(_, runner)| runner.name == name)
-            .map(|(id, _)| *id)
-            .collect()
-    };
+    let id_or_ids: Vec<i64> = shared
+        .state
+        .backend
+        .runner_ids_named(name)
+        .await
+        .unwrap_or_default();
+    let mut purge_failures = 0usize;
     for id in &id_or_ids {
-        purge_runner_identity(&shared, *id).await;
+        if let Err(error) = purge_runner_identity(&shared, *id).await {
+            purge_failures += 1;
+            tracing::error!(
+                ?error,
+                runner_id = *id,
+                "runner teardown purge failed — listen token remains valid"
+            );
+        }
     }
+    let purged = id_or_ids.len() - purge_failures;
+    let status = if purge_failures == 0 {
+        StatusCode::OK
+    } else {
+        // Partial failure: some listen tokens are still valid. 207-style —
+        // report what actually happened so the caller can retry the rest.
+        StatusCode::MULTI_STATUS
+    };
     (
-        StatusCode::OK,
-        Json(json!({ "purged": id_or_ids.len(), "ids": id_or_ids })),
+        status,
+        Json(json!({ "purged": purged, "failed": purge_failures, "ids": id_or_ids })),
     )
 }

@@ -228,6 +228,60 @@ async fn run_steps_marks_condition_error_as_failure() {
 }
 
 #[tokio::test]
+async fn retry_applies_fresh_snapshot_auth_header_before_replay() {
+    let dir = TempDir::new().unwrap();
+    let mut job = JobContext::new(
+        "job".into(),
+        "Job".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    job.env
+        .insert("GIT_CONFIG_COUNT".to_owned(), "1".to_owned());
+    job.env.insert(
+        "GIT_CONFIG_KEY_0".to_owned(),
+        "http.http://snap.invalid/owner/repo.extraheader".to_owned(),
+    );
+    job.env.insert(
+        "GIT_CONFIG_VALUE_0".to_owned(),
+        "AUTHORIZATION: basic stale".to_owned(),
+    );
+    let mut step = test_step("retry", None);
+    step.step_type = StepType::Script {
+        script: "[ \"$GIT_CONFIG_VALUE_0\" = 'AUTHORIZATION: basic fresh' ]".to_owned(),
+        shell: Some("bash".to_owned()),
+        working_directory: None,
+    };
+    let queue = Arc::new(Mutex::new(ServerQueue::new("job".into(), "plan".into())));
+    let (_tx, cancel_rx) = watch::channel(false);
+    let debug = crate::worker::debug_pause_tests::retry_client_with_snapshot_header(
+        "AUTHORIZATION: basic fresh",
+    )
+    .await;
+
+    let result = run_steps(
+        &[step],
+        &mut job,
+        dir.path().to_str().unwrap(),
+        cancel_rx,
+        queue,
+        None,
+        None,
+        &[],
+        Some(&debug),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, "Succeeded");
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+        Some("AUTHORIZATION: basic fresh")
+    );
+}
+
+#[tokio::test]
 async fn run_steps_continue_on_error_sets_failure_outcome_success_conclusion() {
     let dir = TempDir::new().unwrap();
     let mut job = JobContext::new(
@@ -1126,7 +1180,7 @@ async fn run_steps_outcome_visible_in_later_step_condition() {
     assert_eq!(job.steps.get("should_skip").unwrap().conclusion, "Skipped");
 }
 
-// --- P1 expressions/templates gap coverage ---
+// --- expressions/templates gap coverage ---
 
 #[tokio::test]
 async fn run_steps_step_env_evaluates_expressions() {

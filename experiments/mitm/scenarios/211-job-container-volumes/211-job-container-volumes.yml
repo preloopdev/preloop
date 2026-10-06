@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   default-container-env:
     runs-on: self-hosted
-    container:
+    container: "node:22-alpine"
     steps:
 
 

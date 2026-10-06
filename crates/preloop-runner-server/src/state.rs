@@ -32,7 +32,7 @@ impl AppState {
         claims.insert("iat".to_owned(), json!(now));
         claims.insert("nbf".to_owned(), json!(now));
         claims.insert("exp".to_owned(), json!(expires_at));
-        // R1-10: every minted token gets a unique id so identical claims
+        // Every minted token gets a unique id so identical claims
         // minted in the same second do not produce byte-identical tokens.
         // Callers that already set `jti` (e.g. the OAuth flow) keep theirs.
         if !claims.contains_key("jti") {
@@ -235,6 +235,14 @@ impl AppState {
         .expect("fixed local JWT claims must serialize")
     }
 
+    /// The AES session key for `session_id`, derived rather than stored:
+    /// `HKDF-SHA256(ikm = cluster HMAC key, info = "preloop-session-key-v1"
+    /// || session_id)`. Every node sharing the cluster key derives the same
+    /// key, so no session key is ever written to the database.
+    pub(crate) fn session_encryption(&self, session_id: &str) -> SessionEncryption {
+        derive_session_encryption(&self.local_jwt_key, session_id)
+    }
+
     /// Mint the token the runner process uses to speak for a job's debug
     /// session, kept separate from the runtime token that workflow code sees.
     ///
@@ -272,6 +280,262 @@ impl AppState {
             state: self.clone(),
             shutdown: CancellationToken::new(),
         })
+    }
+
+    /// Read a consistent snapshot of the authoritative scheduling state for
+    /// assertions, as a [`TestState`] populated by
+    /// `Backend::test_working_set`.
+    pub async fn test_tx(&self) -> crate::control::testview::TestState {
+        self.backend
+            .test_working_set()
+            .await
+            .expect("test_working_set failed")
+    }
+
+    /// Test hook: adjust runner liveness timing without a restart (SQLite
+    /// backend only).
+    pub fn test_set_runner_liveness(&self, d: std::time::Duration) {
+        match &*self.backend {
+            crate::control::Backend::Sqlite(b) => {
+                let (pool, require, _) = b.config();
+                b.set_config(pool, require, d);
+            }
+            crate::control::Backend::Postgres(_) => {
+                panic!("test_set_runner_liveness is SQLite-only")
+            }
+        }
+    }
+
+    /// Mutate the control database directly. Escape hatch for seeds that no
+    /// `ControlBackend` command expresses (forced-terminal runs, planted
+    /// timestamps). SQLite only: production servers never see it, and the
+    /// shared suite must not use it (Postgres parity).
+    ///
+    /// The closure receives the backend's writer connection inside a `BEGIN
+    /// IMMEDIATE` transaction so seeds interleave correctly with commands.
+    pub async fn test_db_mutate<R>(
+        &self,
+        f: impl FnOnce(&crate::control::lite::TestDb<'_>) -> R + Send,
+    ) -> R {
+        match &*self.backend {
+            crate::control::Backend::Sqlite(b) => {
+                b.test_db_mutate(f).expect("test_db_mutate failed")
+            }
+            crate::control::Backend::Postgres(_) => {
+                panic!(
+                    "test_db_mutate is SQLite-only; drive Postgres state through ControlBackend commands"
+                )
+            }
+        }
+    }
+
+    /// Test hook: switch pool assignments on or off, keeping the other
+    /// backend settings.
+    pub fn test_set_pool_assignments(&self, enabled: bool) {
+        let (_, require, timeout) = self.backend.config();
+        self.backend.set_config(enabled, require, timeout);
+    }
+
+    /// Test hook: resolve the secret scope a job of `run_id` in `repository`
+    /// sees (run > repository > global tiers), exactly as acquire does.
+    pub fn test_resolve_run_secrets(
+        &self,
+        repository: &str,
+        run_id: RunId,
+    ) -> std::collections::BTreeMap<String, preloop_gha_protocol::SecretString> {
+        self.secret_provider
+            .resolve(crate::secret_provider::SecretScope {
+                repository,
+                environment: None,
+                run_id: Some(run_id),
+            })
+            .expect("secret provider resolves")
+    }
+
+    /// Test hook: switch the pool-assignment and require-assignment knobs
+    /// together, keeping the configured lease timeout.
+    pub fn test_set_backend_config(&self, pool_assignments: bool, require_assignments: bool) {
+        let (_, _, timeout) = self.backend.config();
+        self.backend
+            .set_config(pool_assignments, require_assignments, timeout);
+    }
+
+    /// Test hook: claim up to `limit` webhook deliveries under a
+    /// `lease_secs` lease, returning how many the backend handed out.
+    pub async fn test_claim_webhook_deliveries(&self, limit: usize, lease_secs: u64) -> usize {
+        self.backend
+            .claim_webhook_deliveries(limit, lease_secs)
+            .await
+            .expect("claim_webhook_deliveries failed")
+            .len()
+    }
+
+    /// Test hook: release delivery leases left behind by a crashed node,
+    /// returning how many deliveries the backend recovered.
+    pub async fn test_recover_webhook_deliveries(&self) -> u64 {
+        self.backend
+            .recover_webhook_deliveries()
+            .await
+            .expect("recover_webhook_deliveries failed")
+    }
+
+    /// Test hook: broker-path renew of `agent_job_id` by `runner_id`;
+    /// `false` when the backend refuses (unknown, foreign or settled).
+    pub async fn test_renew_broker_request(
+        &self,
+        agent_job_id: uuid::Uuid,
+        runner_id: i64,
+        locked_until: &str,
+    ) -> bool {
+        self.backend
+            .renew_broker_request(agent_job_id, runner_id, locked_until)
+            .await
+            .is_ok()
+    }
+
+    /// Test hook: cancel one job through the control backend.
+    pub async fn test_cancel_job(&self, run_id: RunId, job_id: &JobId) {
+        self.backend
+            .cancel_job(run_id, job_id)
+            .await
+            .expect("cancel_job failed");
+    }
+
+    /// Test hook: the live-log key a logical job key resolves to (the latest
+    /// attempt), and whether the run or that job is terminal.
+    pub async fn test_live_log_key(&self, run_id: RunId, job_id: &str) -> Option<(String, bool)> {
+        self.backend
+            .live_log_key(run_id, job_id)
+            .await
+            .expect("live_log_key failed")
+    }
+
+    /// Test hook: append raw bytes to a live-log segment.
+    pub async fn test_log_append(&self, plan: &str, log: &str, bytes: &[u8]) {
+        self.log_segments
+            .append(plan, log, bytes)
+            .await
+            .expect("live-log append failed");
+    }
+
+    /// Test hook: flush every buffered live-log segment to disk.
+    pub async fn test_log_flush(&self) {
+        self.log_segments
+            .flush_all()
+            .await
+            .expect("live-log flush failed");
+    }
+
+    /// Test hook: read a live-log segment back from its node-local file.
+    pub async fn test_log_read_all(&self, plan: &str, log: &str) -> Vec<u8> {
+        self.log_segments
+            .read_all(plan, log)
+            .await
+            .expect("live-log read failed")
+    }
+
+    /// Test hook: interpose a secret provider that forwards normally and
+    /// fails every call while the returned flag is set. Lets a test arm a
+    /// provider outage after the submission that seeded the state.
+    pub fn test_install_toggled_secret_provider(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.secret_provider = std::sync::Arc::new(ToggledSecretProvider {
+            inner: self.secret_provider.clone(),
+            failing: failing.clone(),
+        });
+        failing
+    }
+
+    /// Test hook: drive exactly one run-history archive pass instead of
+    /// racing the interval, returning how many settled runs moved.
+    pub async fn test_archive_finished_runs_once(&self) -> usize {
+        crate::bootstrap::archive_finished_runs_once(&self.shared()).await
+    }
+}
+
+/// Test hook: open a control backend exactly as boot does (`store_url`
+/// explicit, else `PRELOOP_STORE_URL`, else `<state_dir>/preloop.db`) and
+/// report which variant it selected (`"sqlite"` or `"postgres"`). `Err`
+/// carries the open error's message. The backend is dropped on return: the
+/// callers assert URL grammar, env precedence and migration race safety, not
+/// a live connection. The knob defaults are the boot defaults.
+///
+/// A free function rather than a hook method: it needs no [`AppState`], and
+/// its whole point is the selection [`AppState::new`] would have done.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn test_open_backend(
+    store_url: Option<&str>,
+    state_dir: &std::path::Path,
+) -> Result<&'static str, String> {
+    let backend =
+        crate::control::Backend::open(store_url, state_dir, false, false, Duration::from_secs(300))
+            .await
+            .map_err(|error| error.to_string())?;
+    Ok(match backend {
+        crate::control::Backend::Sqlite(_) => "sqlite",
+        crate::control::Backend::Postgres(_) => "postgres",
+    })
+}
+
+/// Test-only secret provider wrapper: forwards every call to the real
+/// provider until the shared flag is set, then fails them all. Lets a test
+/// arm a provider outage *after* the submission that seeded the state.
+#[cfg(any(test, feature = "test-support"))]
+struct ToggledSecretProvider {
+    inner: std::sync::Arc<dyn crate::secret_provider::SecretProvider>,
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ToggledSecretProvider {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("secret backend unavailable");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::secret_provider::SecretProvider for ToggledSecretProvider {
+    fn resolve(
+        &self,
+        scope: crate::secret_provider::SecretScope<'_>,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, preloop_gha_protocol::SecretString>>
+    {
+        self.check()?;
+        self.inner.resolve(scope)
+    }
+
+    fn resolve_all(&self) -> anyhow::Result<Vec<String>> {
+        self.check()?;
+        self.inner.resolve_all()
+    }
+
+    fn put_run(
+        &self,
+        run_id: RunId,
+        secrets: &std::collections::BTreeMap<String, preloop_gha_protocol::SecretString>,
+    ) -> anyhow::Result<()> {
+        self.inner.put_run(run_id, secrets)
+    }
+
+    fn run_tier(
+        &self,
+        run_id: RunId,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, preloop_gha_protocol::SecretString>>
+    {
+        self.inner.run_tier(run_id)
+    }
+
+    fn delete_run(&self, run_id: RunId) -> anyhow::Result<()> {
+        self.inner.delete_run(run_id)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
     }
 }
 
@@ -428,8 +692,15 @@ impl Drop for TestEnvVar {
 #[derive(Clone)]
 pub struct AppState {
     pub inner: Arc<Mutex<InnerState>>,
-    pub store: Arc<dyn Store>,
+    /// The database-authoritative control plane: scheduling state lives
+    /// here, not in `inner`. `Arc<Backend>` (concrete enum) so
+    /// `Backend::transact` stays generic.
+    pub(crate) backend: Arc<crate::control::Backend>,
     pub events: broadcast::Sender<NdjsonEvent>,
+    /// Marked after events were committed to the outbox; the notifier turns
+    /// it into one `NOTIFY` per ~15 ms for the other nodes
+    /// ([`crate::event_feed`]).
+    pub(crate) events_dirty: Arc<Notify>,
     pub message_notify: Arc<Notify>,
     pub webhook_queue_notify: Arc<Notify>,
     /// Circuit breaker for durable webhook delivery work. Lifecycle check-run
@@ -445,10 +716,6 @@ pub struct AppState {
     /// constant so tests can drive the retry path without sleeping through the
     /// real tiers.
     pub webhook_retry_backoff: Vec<std::time::Duration>,
-    /// Atomic counter for pre-allocating request IDs outside the dispatch
-    /// lock.  Monotonically increases; the inner counter is no longer the
-    /// source of truth once this is in use.
-    pub next_request_id: Arc<std::sync::atomic::AtomicI64>,
     /// Observability handle (cloneable, holds heartbeat & limit registries).
     pub observability: preloop_observability::Observability,
     /// Cached operational snapshot, updated every 5s by the sampler without holding `inner`.
@@ -460,6 +727,9 @@ pub struct AppState {
     /// `JobStatus` (repeated timeline PATCH after completion) is recorded
     /// exactly once per job.
     pub terminal_jobs_recorded: Arc<std::sync::Mutex<BTreeSet<(RunId, JobId)>>>,
+    /// Single-flight guard for asynchronous completed-run runtime trimming.
+    /// Terminal events must not spawn one expensive planner per job.
+    pub completed_trim_in_progress: Arc<std::sync::atomic::AtomicBool>,
     /// Consolidated pool handle replacing the four ad-hoc Option<Arc<…>> fields.
     pub pool_status: Arc<preloop_observability::status::PoolStatus>,
     /// When this AppState was created (for uptime).
@@ -515,6 +785,8 @@ pub struct AppState {
     pub environment_rules: crate::config::EnvironmentRulesMap,
     /// State directory for replay/log storage.
     pub state_dir: PathBuf,
+    /// File-backed live log segments for real-time console tail persistence.
+    pub(crate) log_segments: LiveLogSegments,
     /// Native API administrator credential for this server instance.
     pub system_token: String,
     /// Registration policy for new runners; see [`RegistrationPolicy`].
@@ -531,11 +803,11 @@ pub struct AppState {
     /// `None` when no App is configured, in which case job tokens fall back to
     /// `PRELOOP_GITHUB_TOKEN` and then to the local HMAC JWT.
     pub github_app: Option<crate::github_app::GitHubAppCredentials>,
-    /// The full registered GitHub App registry (D6). The legacy env-var App
+    /// The full registered GitHub App registry. The legacy env-var App
     /// is always the first entry and mirrors `github_app`.
     pub github_apps: Option<crate::github_app::GitHubApps>,
     /// Short-TTL cache of installation tokens validated against github.com
-    /// for the GitHub-compatible dispatch API (D2.4).
+    /// for the GitHub-compatible dispatch API.
     pub dispatch_token_cache: Arc<crate::dispatch_auth::InstallationTokenCache>,
     /// Short-TTL cache of actor logins resolved for dispatch authentication
     /// (PAT `GET /user`, App `GET /app`).
@@ -579,6 +851,9 @@ pub struct AppState {
     /// take precedence per name. Writable at runtime by the live secrets
     /// API, which also persists the config file.
     pub secrets: Arc<parking_lot::RwLock<SecretStore>>,
+    /// Resolves workflow secrets for a job's scope. The built-in provider
+    /// reads `secrets`; hosted/bring-your-own providers plug in here.
+    pub(crate) secret_provider: Arc<dyn crate::secret_provider::SecretProvider>,
     /// Serializes the live secrets API's load → mutate → persist → publish
     /// sequence. `set_secret`/`delete_secret` read the whole config file,
     /// change one entry and write the file back; without mutual exclusion
@@ -652,13 +927,13 @@ pub struct SecretStore {
     /// Registered environments, keyed by `owner/repo` then environment name.
     /// A job's `environment:` must be registered for its repository; a job
     /// claiming any other name fails closed before secrets are injected or
-    /// an OIDC environment subject is minted (M4).
+    /// an OIDC environment subject is minted.
     pub environments: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl SecretStore {
     /// Whether `environment:` `env` names a registered environment of
-    /// `repo` (M4). Jobs claiming an unregistered environment fail closed.
+    /// `repo`. Jobs claiming an unregistered environment fail closed.
     pub fn is_environment_registered(&self, repo: &str, env: &str) -> bool {
         self.environments
             .get(repo)
@@ -721,7 +996,7 @@ impl JobSetId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSetGate {
     pub key: (String, String),
     pub display_name: String,
@@ -729,7 +1004,7 @@ pub struct JobSetGate {
     pub queue: preloop_gha_parser::ConcurrencyQueue,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSetAdmission {
     pub gates: Vec<JobSetGate>,
     pub acquired_keys: BTreeSet<(String, String)>,
@@ -783,10 +1058,10 @@ fn bounded_termination_reason(value: &str) -> &'static str {
     // Two distinct never-claimable conditions, and conflating them would hide
     // the difference between "wait or add capacity" and "this will never work
     // until you register that platform":
-    //   - the starvation sweep, which fires after a grace window;
-    //   - the external-host check, where the server has no runner of that
-    //     platform class at all (`no {platform} runner is registered with
-    //     this server, so `runs-on: …` cannot be scheduled`).
+    // - the starvation sweep, which fires after a grace window;
+    // - the external-host check, where the server has no runner of that
+    // platform class at all (`no {platform} runner is registered with
+    // this server, so `runs-on: …` cannot be scheduled`).
     // The starvation prose interpolates workflow-controlled `runs-on`
     // labels, so the anchored prefix MUST be checked before the substring:
     // a crafted label containing the platform phrase must not flip a
@@ -891,8 +1166,14 @@ impl AppState {
             )?
         };
         #[cfg(not(any(test, feature = "test-support")))]
-        let system_token =
-            crate::credential_store::resolve_engine_token(&token_dir, configured_token)?;
+        let system_token = {
+            let store = crate::credential_store::store_from_env(&state_dir);
+            crate::credential_store::resolve_engine_token_with_store(
+                &token_dir,
+                configured_token,
+                store.as_ref(),
+            )?
+        };
         #[cfg(any(test, feature = "test-support"))]
         let local_jwt_key = TEST_LOCAL_JWT_KEY.to_vec();
         #[cfg(not(any(test, feature = "test-support")))]
@@ -937,80 +1218,7 @@ impl AppState {
             ),
             ..Default::default()
         };
-        let store = crate::store::open_store(store_url, &state_dir, &local_jwt_key).await?;
-        let mut recovered = inner;
-        store
-            .load_into(&mut recovered, &config.environment_rules)
-            .await?;
-        // An attempt dispatched but not yet reported has no persisted step
-        // rows: seeding happens in memory, and only a runner report writes
-        // them. The request message it was built from *is* persisted, so
-        // rebuild from that rather than leaving the run with no declared steps
-        // and `--step` answering 409 for logs that are on disk.
-        //
-        // Two homes, depending on how far the job got: `broker_messages` once
-        // a runner claimed it, and the queue row's own copy before that.
-        let rebuilt: Vec<(uuid::Uuid, Vec<crate::models::StepRecord>)> = recovered
-            .job_requests
-            .values()
-            .filter(|record| !recovered.job_steps.contains_key(&record.agent_job_id))
-            .filter_map(|record| {
-                let steps = recovered
-                    .broker_messages
-                    .get(&record.request_id)
-                    .map(|message| message.steps.as_slice())
-                    .or_else(|| {
-                        recovered
-                            .queue
-                            .iter()
-                            .chain(recovered.pending_jobs.iter())
-                            .chain(recovered.concurrency_blocked.iter())
-                            // Keyed by request id, not by (run, job): a
-                            // re-dispatch leaves several requests for one
-                            // logical job, and matching the pair attaches the
-                            // newest queued message to an older attempt —
-                            // rebuilding it with the wrong `TaskStep` ids, so
-                            // its `step-<id>.txt` blobs stop resolving.
-                            .find(|job| job.message.request_id == record.request_id)
-                            .map(|job| job.message.steps.as_slice())
-                    })?;
-                let manifest = crate::models::StepRecord::manifest(steps);
-                (!manifest.is_empty()).then_some((record.agent_job_id, manifest))
-            })
-            .collect();
-        if !rebuilt.is_empty() {
-            tracing::info!(
-                attempts = rebuilt.len(),
-                "rebuilt step manifests from persisted job request messages"
-            );
-        }
-        recovered.job_steps.extend(rebuilt);
-        let next_request_id = recovered
-            .job_requests
-            .keys()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let inner = recovered;
-        // Seed the terminal-transition marker from the restored run record so
-        // a replayed terminal `JobStatus` after a restart cannot double-record
-        // `preloop.job.completed` for a job that already completed.
-        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
-            inner
-                .runs
-                .iter()
-                .flat_map(|(run_id, run)| {
-                    run.jobs
-                        .iter()
-                        .filter(|(_, status)| status.is_terminal())
-                        .map(move |(job_id, _)| (*run_id, job_id.clone()))
-                })
-                .collect::<BTreeSet<(RunId, JobId)>>(),
-        ));
-        // Capture queue length before moving `inner` into the Mutex so the
-        // `queue_depth` atomic is set to the recovered ready-queue size.
-        let recovered_queue_len = inner.queue.len();
+
         let local_workspace = std::env::var("PRELOOP_LOCAL_WORKSPACE")
             .ok()
             .map(PathBuf::from);
@@ -1105,6 +1313,12 @@ impl AppState {
             env: config.env_secrets,
             environments: config.environments,
         }));
+        let secret_provider: Arc<dyn crate::secret_provider::SecretProvider> =
+            Arc::new(crate::secret_provider::BuiltinSecretProvider::new(
+                secrets.clone(),
+                state_dir.join("run-secrets"),
+                crate::store::Envelope::new(&local_jwt_key),
+            ));
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let mut pr_config = config.github.pr.clone();
@@ -1151,23 +1365,92 @@ impl AppState {
                 .map(str::to_owned)
                 .collect();
         }
+        // The sole database authority. SQLite uses `<state_dir>/preloop.db`;
+        // PostgreSQL uses the configured database's `control` schema.
+        let backend = Arc::new(
+            crate::control::Backend::open(
+                store_url,
+                &state_dir,
+                false,
+                false,
+                inner.runner_liveness_timeout,
+            )
+            .await?,
+        );
+        // Every node on one database must seal and sign with the same key; a
+        // mismatched node would write rows the rest of the cluster cannot
+        // read. Refuse to start instead.
+        crate::control::backend::ControlBackend::ensure_key_fingerprint(
+            &*backend,
+            &key_fingerprint(&local_jwt_key),
+        )
+        .await?;
+        // A shared control database with a node-local secret provider means a
+        // runner on another node cannot resolve this node's run tiers: it
+        // would either fail the acquire (loudly, since the names are recorded)
+        // or, for config tiers, miss values entirely. Multi-node deployments
+        // must plug in a shared provider.
+        if matches!(&*backend, crate::control::Backend::Postgres(_))
+            && secret_provider.name() == "builtin"
+        {
+            tracing::warn!(
+                provider = secret_provider.name(),
+                "Postgres control backend with the node-local builtin secret provider: \
+                 secret values live on this node only; configure a shared SecretProvider \
+                 before running more than one node"
+            );
+        }
+        let message_notify = Arc::new(Notify::new());
+        // One pool status handle, shared with the backend: the pool's
+        // advertised labels gate `runs-on` inside submit/promotion.
+        let pool_status = Arc::new(preloop_observability::status::PoolStatus::default());
+        backend.set_pool_status((*pool_status).clone());
+        // Cross-node wake-ups (Postgres LISTEN): a job committed through any
+        // node wakes runners long-polling this one.
+        if let Some(mut wakes) = backend.subscribe_wakes() {
+            let notify = message_notify.clone();
+            tokio::spawn(async move {
+                loop {
+                    match wakes.recv().await {
+                        Ok(wake) => wake_waiters(&notify, wake.ready, wake.broadcast),
+                        // Missed signals: wake everyone once; they re-check.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            notify.notify_waiters()
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
+        // Cross-node live events: the notifier and the outbox consumer.
+        let events_dirty = Arc::new(Notify::new());
+        crate::event_feed::spawn(&backend, events.clone(), events_dirty.clone());
+        crate::control::backend::ControlBackend::reconcile_on_boot(&*backend).await?;
+        let log_segments = LiveLogSegments::new(state_dir.join("live-logs"));
+        let terminal_jobs_recorded = Arc::new(std::sync::Mutex::new(
+            crate::control::backend::ControlBackend::terminal_jobs(&*backend).await?,
+        ));
+        let recovered_queue_len = crate::control::backend::ControlBackend::queue_stats(&*backend)
+            .await?
+            .ready;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
-            store,
+            backend,
             events,
-            message_notify: Arc::new(Notify::new()),
+            events_dirty,
+            message_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
             github_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             github_lifecycle_breaker: Arc::new(crate::github_breaker::GithubBreaker::default()),
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
-            next_request_id: Arc::new(std::sync::atomic::AtomicI64::new(next_request_id)),
             observability: preloop_observability::Observability::noop(),
             status_snapshot: Arc::new(parking_lot::RwLock::new(
                 preloop_observability::status::OperationalSnapshot::default(),
             )),
             terminal_jobs_recorded,
-            pool_status: Arc::new(preloop_observability::status::PoolStatus::default()),
+            completed_trim_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pool_status,
             started_at: std::time::Instant::now(),
             // Mirror the recovered ready-queue size so an on-demand runner
             // pool spawns against the right workload after restart.
@@ -1188,12 +1471,14 @@ impl AppState {
             retention_days,
             environment_rules: config.environment_rules.clone(),
             state_dir,
+            log_segments,
             system_token,
             registration_policy: RegistrationPolicy::from_env(),
             local_jwt_key,
             runner_version_deprecated,
             scheduler: None,
             secrets,
+            secret_provider,
             secret_mutation: Arc::new(Mutex::new(())),
             policy_mutation: Arc::new(Mutex::new(())),
             store_mutation: Arc::new(Mutex::new(())),
@@ -1217,17 +1502,36 @@ impl AppState {
         })
     }
 
+    /// Emit an event the backend never persisted — write it to the event
+    /// stream and broadcast it.
     pub async fn emit(&self, event: NdjsonEvent) {
-        let run_id = match &event {
-            NdjsonEvent::RunAccepted { run_id, .. }
-            | NdjsonEvent::JobStatus { run_id, .. }
-            | NdjsonEvent::RunStatus { run_id, .. }
-            | NdjsonEvent::JobCompleted { run_id, .. }
-            | NdjsonEvent::CheckRunCreated { run_id } => Some(*run_id),
-            _ => None,
-        };
-        let has_run_projection = run_id.is_some();
-        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = &event {
+        // authoritative backend. Persist exactly the event; never reload or
+        // rewrite run state as an observer side effect.
+        if !self.dedupe_and_record(&event) {
+            return;
+        }
+        if let Err(error) = self.backend.append_event(&event).await {
+            error!(?error, "failed to persist control-plane event");
+        } else {
+            self.events_dirty.notify_one();
+        }
+        self.broadcast(event).await;
+    }
+
+    /// Emit an event the producing command already wrote to the outbox
+    /// inside its own transaction — side effects and broadcast only.
+    pub async fn emit_persisted(&self, event: NdjsonEvent) {
+        if !self.dedupe_and_record(&event) {
+            return;
+        }
+        self.events_dirty.notify_one();
+        self.broadcast(event).await;
+    }
+
+    /// Per-event observability and terminal dedup. Returns false when the
+    /// event must be dropped entirely (a repeated terminal `JobStatus`).
+    fn dedupe_and_record(&self, event: &NdjsonEvent) -> bool {
+        if let NdjsonEvent::RunAccepted { queued_jobs, .. } = event {
             self.observability.export_log(
                 "INFO",
                 "run.accepted",
@@ -1249,7 +1553,7 @@ impl AppState {
         // emits. A duplicate event is still a duplicate — drop it entirely
         // (side effects, persistence and broadcast) rather than re-append the
         // same terminal record to the timeline.
-        match &event {
+        match event {
             NdjsonEvent::JobStatus {
                 run_id,
                 job_id,
@@ -1263,7 +1567,7 @@ impl AppState {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert((*run_id, job_id.clone()));
                 if !first_terminal {
-                    return;
+                    return false;
                 }
                 let conclusion = execution_conclusion(*status);
                 // `reason: None` is the common case (most terminal transitions
@@ -1314,33 +1618,59 @@ impl AppState {
             // call here would make the record look double-sourced.
             _ => {}
         }
-        // Capture the projection under the lock, then persist after releasing
-        // it: a slow or unavailable backend must not stall the control plane
-        // (runner polling, heartbeats, other state mutations).
-        if let Some(run_id) = run_id {
-            let projection = {
-                let mut inner = self.inner.lock().await;
-                // A terminal RunStatus means this run just completed — bound
-                // retained completed-run records before projecting so the
-                // heap cannot grow one RunRecord (~1 MiB) per run forever.
-                if event.terminal_run_status().is_some() {
-                    crate::memory_caps::trim_completed_runs(&mut inner);
+        true
+    }
+
+    /// Broadcast a live event to SSE/UI subscribers. The broadcast is
+    /// advisory, not authoritative — a store hiccup must never freeze the
+    /// stream for a healthy run. Terminal run statuses first bound the
+    /// node-local runtime state retained for completed runs, so the heap
+    /// cannot grow one run's live-log buffers and projections per completed
+    /// run forever.
+    async fn broadcast(&self, event: NdjsonEvent) {
+        if event.terminal_run_status().is_some()
+            && self
+                .completed_trim_in_progress
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            let state = self.clone();
+            tokio::spawn(async move {
+                state.trim_completed_run_state().await;
+                state
+                    .completed_trim_in_progress
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
+        let _ = self.events.send(event);
+    }
+
+    /// Drop the node-local runtime state (live-log buffers, timeline
+    /// projections, artifact registries) of every terminal run outside the
+    /// newest [`crate::memory_caps::MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE`].
+    /// The resident set is read under the lock, resolved against the backend
+    /// without it, and applied under it again.
+    async fn trim_completed_run_state(&self) {
+        let traces = {
+            let inner = self.inner.lock().await;
+            crate::memory_caps::ResidentRunTraces::of(&inner)
+        };
+        match crate::memory_caps::plan_completed_run_trim(&self.backend, &traces).await {
+            Ok(trim) => {
+                if !trim.drops.is_empty() {
+                    let mut inner = self.inner.lock().await;
+                    crate::memory_caps::trim_completed_runs(&mut inner, &trim);
                 }
-                crate::store::RunProjection::from_inner(&inner, run_id, event.clone())
-            };
-            if let Some(projection) = projection
-                && let Err(error) = self.store.store_run_event(projection).await
-            {
-                error!(?error, %run_id, "failed to persist control-plane run event");
+            }
+            Err(error) => {
+                tracing::warn!(?error, "completed-run runtime-state trim failed");
             }
         }
-        if !has_run_projection && let Err(error) = self.store.append_event(&event).await {
-            error!(?error, "failed to append durable control-plane event");
-        }
-        // Always broadcast: in-memory state is the source of truth and
-        // subscribers see live events. A store hiccup must never
-        // freeze the SSE/UI stream for a healthy run.
-        let _ = self.events.send(event);
     }
 
     /// Plaintext static PAT for job tokens, when one is configured.
@@ -1369,6 +1699,17 @@ impl AppState {
 fn action_ticket_payload(owner: &str, repo: &str, git_ref: &str, expires_at: u64) -> String {
     serde_json::to_string(&("action-archive", owner, repo, git_ref, expires_at))
         .expect("a tuple of strings and an integer always serializes")
+}
+
+/// HKDF-SHA256 session-key derivation (see [`AppState::session_encryption`]).
+pub fn derive_session_encryption(cluster_key: &[u8], session_id: &str) -> SessionEncryption {
+    let mut info = b"preloop-session-key-v1".to_vec();
+    info.extend_from_slice(session_id.as_bytes());
+    let mut key = vec![0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(None, cluster_key)
+        .expand(&info, &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    SessionEncryption::from_key(key)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1478,11 +1819,45 @@ fn set_private_file_permissions(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Non-secret identifier of the cluster key, stored in the control database
+/// so a node started with a different key is refused.
+pub fn key_fingerprint(key: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"preloop-cluster-key-fingerprint\0");
+    hasher.update(key);
+    hex::encode(&hasher.finalize()[..16])
+}
+
+/// Environment variable carrying the cluster-wide 32-byte key (hex). Every
+/// engine node sharing one control database must use the same key: it signs
+/// runner tokens and derives the envelope that seals database rows.
+pub const HMAC_KEY_ENV: &str = "PRELOOP_HMAC_KEY";
+
+/// Parse a hex-encoded 32-byte key.
+pub fn parse_hmac_key(value: &str) -> anyhow::Result<Vec<u8>> {
+    let key = hex::decode(value.trim())
+        .map_err(|error| anyhow::anyhow!("{HMAC_KEY_ENV} is not hex: {error}"))?;
+    anyhow::ensure!(
+        key.len() == 32,
+        "{HMAC_KEY_ENV} must be 32 bytes (64 hex characters), got {}",
+        key.len()
+    );
+    Ok(key)
+}
+
 #[cfg(not(any(test, feature = "test-support")))]
 /// Load or generate a 32-byte HMAC key for local JWT signing.
 ///
-/// Persisted to `<state_dir>/hmac-key.bin` so runtime tokens survive restarts.
+/// `PRELOOP_HMAC_KEY` (the shared cluster key) wins; otherwise the key is
+/// persisted to `<state_dir>/hmac-key.bin`, which is correct only for a
+/// single node.
 pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    if let Ok(value) = std::env::var(HMAC_KEY_ENV)
+        && !value.trim().is_empty()
+    {
+        return parse_hmac_key(&value);
+    }
     let key_path = state_dir.join("hmac-key.bin");
     if key_path.exists() {
         let key = std::fs::read(&key_path).map_err(|error| {
@@ -1516,87 +1891,14 @@ pub fn load_or_generate_hmac_key(state_dir: &std::path::Path) -> anyhow::Result<
     Ok(key)
 }
 
-impl InnerState {
-    /// Return the runner that owns a listener session.
-    pub fn runner_id_for_session(&self, session_id: &str) -> Option<i64> {
-        self.broker_session_runners
-            .get(session_id)
-            .copied()
-            .or_else(|| {
-                self.sessions
-                    .get(session_id)
-                    .map(|session| session.runner_id)
-            })
-    }
-
-    /// Look up dispatch metadata for the runner that owns a given session.
-    pub fn runner_capabilities_for_session(&self, session_id: &str) -> RunnerCapabilities {
-        self.runner_id_for_session(session_id)
-            .and_then(|runner_id| self.runners.get(&runner_id))
-            .map(|runner| RunnerCapabilities {
-                known: true,
-                labels: runner.labels.clone(),
-                runner_group_id: runner.runner_group_id,
-                runner_group_name: runner.runner_group_name.clone(),
-            })
-            .unwrap_or_default()
-    }
-
-    /// Record that a runner session just polled the control plane.
-    ///
-    /// The liveness sweep purges runners whose sessions have not polled
-    /// within [`InnerState::runner_liveness_timeout`]: a session that goes
-    /// silent is a deaf runner (its in-guest control bridge died), and its
-    /// unfinished job must be requeued to a fresh machine instead of sitting
-    /// in_progress until the job-lease reaper fails it 45 minutes later.
-    pub fn mark_session_seen(&mut self, session_id: &str) {
-        self.session_last_seen
-            .insert(session_id.to_owned(), std::time::Instant::now());
-    }
-}
-
 #[derive(Default)]
 pub struct InnerState {
     /// Snapshot sequence allocated while the state mutex is held; restored from metadata.
     pub metadata_revision: std::sync::atomic::AtomicU64,
-    pub runs: BTreeMap<RunId, RunRecord>,
-    pub workflow_run_counters: BTreeMap<String, u64>,
     /// Webhook run submissions currently building outside the state lock.
     /// Entries prevent a replay from doing the same expensive work twice.
     pub webhook_run_reservations: BTreeSet<(String, String)>,
-    pub queue: VecDeque<QueuedJob>,
-    /// When each ready-queue job was first seen by the reaper, used to fail
-    /// jobs no runner can ever claim. Maintained by the reaper itself, so it
-    /// needs no enqueue-site coordination: entries are inserted on first
-    /// observation and dropped when the job leaves the queue.
-    pub queued_at: BTreeMap<(RunId, JobId), std::time::SystemTime>,
-    pub pending_jobs: VecDeque<QueuedJob>,
-    /// Reusable-caller and dynamic-matrix nodes whose gates are already held
-    /// and whose callee subtree still has to be built.
-    ///
-    /// Building a subtree parses workflow YAML, constructs one runner message
-    /// per inner job and mints a runtime token for each, so it scales with the
-    /// width of the callee matrix. Doing that while holding the global state
-    /// mutex stalls every other request, so promotion only records the intent
-    /// here; `drain_expansions` performs the work with the lock released and
-    /// applies the result under a fresh one.
-    pub pending_expansions: VecDeque<QueuedJob>,
-    /// Nodes currently being expanded with the lock released.
-    ///
-    /// The entry is the reservation: it stops a second sweep from expanding
-    /// the same node, and cancellation drops it so a build that finishes after
-    /// the run was cancelled is discarded instead of resurrecting jobs.
-    pub expanding: BTreeSet<(RunId, JobId)>,
-    /// Serializes GitHub check-run creation per run. Creation races — an
-    /// expansion mint, a claim-time in-progress report, and a completion
-    /// report for the same job can all decide to mint at once — and GitHub
-    /// allows duplicate check runs for the same name+SHA, which would leave
-    /// one stale `queued` check forever. Only minting takes this lock;
-    /// status PATCHes never do.
     pub check_run_mint_locks: BTreeMap<RunId, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    pub runner_registered_at: BTreeMap<i64, std::time::Instant>,
-    pub runners: BTreeMap<i64, RegisteredRunner>,
-    pub sessions: BTreeMap<String, RunnerSession>,
     /// When each runner session last polled. In-memory only: sessions are
     /// ephemeral and re-created by runners, so nothing is persisted here.
     /// Restored sessions from a restart have no entry and are left to the
@@ -1606,50 +1908,10 @@ pub struct InnerState {
     /// purges its runner. Env: `PRELOOP_RUNNER_LIVENESS_TIMEOUT_SECS`
     /// (default 1800).
     pub runner_liveness_timeout: std::time::Duration,
-    pub session_keys: BTreeMap<String, SessionEncryption>,
     // test-only: retained for session encryption integration coverage.
     #[allow(dead_code)]
     pub agent_keypair: Option<AgentRsaKeypair>,
     pub runner_public_keys: BTreeMap<i64, String>,
-    pub runner_rsa_public_keys: BTreeMap<i64, AgentRsaPublicKey>,
-    pub inflight_messages: BTreeMap<String, BTreeMap<i64, azdo::TaskAgentMessage>>,
-    pub broker_messages: BTreeMap<i64, azdo::AgentJobRequestMessage>,
-    /// Short-lived GitHub App credentials still to mint at broker acquisition.
-    pub github_token_requests: BTreeMap<i64, GitHubTokenRequest>,
-    pub runner_client_ids: BTreeMap<String, i64>,
-    pub cancellation_queue: VecDeque<QueuedCancellation>,
-    /// Job → runner pairings. While an entry is fresh, the job may only be
-    /// claimed by sessions presenting a verified listen-token identity for
-    /// that runner. Entries are consumed on successful claim and dropped on
-    /// runner deregistration, requeue, or run teardown.
-    pub job_assignments: BTreeMap<(RunId, JobId), AssignmentRecord>,
-    /// Pool-managed jobs that are queued but not yet paired with a registered
-    /// runner (a machine is being provisioned for them). While fresh, these
-    /// cannot be claimed at all — the wait protects against a rogue session
-    /// claiming the job before its machine registers.
-    pub pool_pending: BTreeMap<(RunId, JobId), std::time::SystemTime>,
-    /// Runners that proved themselves with a provision token at registration,
-    /// keyed by runner id. Pool-managed jobs must pair with one of these
-    /// (or a machine the pool itself provisioned) rather than an external
-    /// runner that registered before the job was queued.
-    pub pool_proven_runners: BTreeSet<i64>,
-    /// Set when the embedded runner pool provisions machines for queued jobs
-    /// (the `preloop serve` flow). Enables assignment enforcement for newly
-    /// queued jobs.
-    pub pool_assignments_enabled: bool,
-    /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: when true, jobs may only be claimed
-    /// through an assignment; unassigned jobs are never delivered, even to
-    /// external runners. Default false keeps bring-your-own-runner installs
-    /// working unchanged.
-    pub require_job_assignments: bool,
-    /// Observable counter of stale job bindings released back to waitlist or expired.
-    pub released_bindings_count: u64,
-    /// Jobs popped from the queue by a dispatch claim, keyed for requeueing:
-    /// if the runner that claimed a job dies mid-execution (machine torn down,
-    /// identity purged), the stashed copy is what gets the same job back into
-    /// the queue intact instead of waiting for the lease reaper to fail it.
-    /// Entries drop on normal completion.
-    pub claimed_jobs: BTreeMap<(RunId, JobId), QueuedJob>,
     pub pending_caches: BTreeMap<i64, PendingCache>,
     pub artifacts: BTreeMap<String, ArtifactRecord>,
     pub logs: BTreeMap<String, Vec<u8>>,
@@ -1671,41 +1933,23 @@ pub struct InnerState {
     /// ends, instead of subscribing to a channel that will never speak again.
     /// Cleared if the same key ingests fresh lines (a retry reusing the job).
     pub live_log_closed: std::collections::BTreeSet<String>,
-    pub inflight_requests: BTreeMap<i64, (RunId, JobId)>,
-    pub job_requests: BTreeMap<i64, TaskAgentJobRequestRecord>,
-    /// Step records per job attempt, keyed by `agent_job_id`.
-    ///
-    /// Authoritative for both the run record's step projection and `--step`
-    /// log selection. Keyed by attempt, not by job: a re-dispatch mints fresh
-    /// `TaskStep` ids, so a job-scoped map would overwrite the mapping the
-    /// previous attempt's `step-<id>.txt` blobs are still named after.
-    ///
-    /// Seeded from the job request message at dispatch (every declared step,
-    /// in workflow order); runner reports only reconcile into it.
-    pub job_steps: BTreeMap<uuid::Uuid, Vec<crate::models::StepRecord>>,
-    /// Monotonic revision per attempt, bumped whenever `job_steps` changes.
-    ///
-    /// Reconciliation snapshots a manifest under this lock and writes it after
-    /// releasing it, so two reports for one attempt can commit out of order.
-    /// The revision travels with the write and the upsert refuses to move a
-    /// row backwards, so an older snapshot cannot overwrite newer conclusions.
-    /// In memory only: the persisted column is what it guards.
-    pub job_steps_revision: BTreeMap<uuid::Uuid, u64>,
-    pub plan_requests: BTreeMap<String, i64>,
-    pub agent_job_requests: BTreeMap<uuid::Uuid, i64>,
-    pub timeline_requests: BTreeMap<uuid::Uuid, i64>,
-    pub session_active_requests: BTreeMap<String, i64>,
-    /// Modern broker session owner, derived from the runner-listen JWT.
-    pub broker_session_runners: BTreeMap<String, i64>,
-    pub next_runner_id: i64,
+    /// Resolved plan→run secret masker cache (node-local). `plan_secret_masker`
+    /// is the permanent entry once a plan maps to a concrete run;
+    /// `plan_secret_masker_pending` is the negative-cache union fallback with a
+    /// re-probe deadline so an unresolved plan doesn't re-scan every run's
+    /// secrets on each log chunk.
+    pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
+    pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Reaper starvation marks (node-local): when this node
+    /// first saw each ready job that no registered runner matches. Cleared
+    /// once a runner matches, while a pool is preparing, or when the job
+    /// leaves the ready queue; a restart resets them, which only delays a
+    /// starvation failure.
+    pub reaper_first_seen: BTreeMap<(RunId, JobId), std::time::SystemTime>,
     pub next_cache_id: i64,
-    pub next_message_id: i64,
     pub next_log_id: usize,
     pub flows_file: Option<std::fs::File>,
     pub next_flow_index: usize,
-    /// Sessions created via the AzDO distributedtask path (full encrypted message format).
-    /// Sessions NOT in this set use the broker-ref (RunnerJobRequest) format.
-    pub azdo_sessions: std::collections::HashSet<String>,
     /// Cache v2 Twirp pending uploads: upload_token → (key, version).
     pub cache_v2_pending: BTreeMap<String, CacheV2Pending>,
     /// Cache v2 download tokens: dl_token → (key, version).
@@ -1738,30 +1982,11 @@ pub struct InnerState {
     pub artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
     /// Monotonic artifact v2 ID counter.
     pub next_artifact_v2_id: u64,
-    /// Per-job resolved OIDC execution context.
-    pub oidc_job_contexts: BTreeMap<(RunId, JobId), OidcJobContext>,
     /// OIDC issuer URL used in the `iss` claim and discovery document.
     pub oidc_issuer: String,
     pub dap_ports: BTreeMap<RunId, DapPortRegistration>,
     /// OIDC signing keypair (RS256) for id-token minting.
     pub oidc_keypair: Option<oidc::OidcKeypair>,
-    /// Per-job `id-token: write` grant, keyed by (run_id, job_id).
-    pub id_token_grants: BTreeMap<(RunId, JobId), bool>,
-    /// Concurrency groups keyed by (lowercased repo, lowercased group name).
-    pub concurrency_groups: BTreeMap<(String, String), concurrency::ConcurrencyGroup>,
-    /// Workflow-level pending runs: run_id → jobs held out of the ready queue.
-    pub held_runs: BTreeMap<RunId, Vec<QueuedJob>>,
-    /// Job-level concurrency-blocked jobs (FIFO).
-    pub concurrency_blocked: VecDeque<QueuedJob>,
-    /// Multi-key admission state for reusable workflow invocations.
-    pub jobset_admissions: BTreeMap<JobSetId, JobSetAdmission>,
-    /// JobSets whose gates were acquired and whose caller placeholder nodes
-    /// still await callee-subtree expansion by the scheduler.
-    pub jobset_ready: BTreeSet<JobSetId>,
-    /// Evaluated workflow-level concurrency raw config per run (for release/debug).
-    pub run_concurrency: BTreeMap<RunId, preloop_gha_parser::Concurrency>,
-    /// Which concurrency key a holder currently occupies (for release).
-    pub holder_keys: BTreeMap<RunId, Vec<(String, String)>>,
     /// Live debug sessions holding paused jobs open.
     pub debug_sessions: crate::debug_sessions::DebugSessionRegistry,
 }
@@ -1938,5 +2163,66 @@ mod termination_reason_tests {
             seen.insert(bounded_termination_reason(&format!("novel reason {i}")));
         }
         assert_eq!(seen.len(), 2, "expected exactly no_runner + unrecognized");
+    }
+}
+
+#[cfg(test)]
+mod cluster_key_tests {
+    #[test]
+    fn cluster_key_must_be_32_hex_bytes() {
+        let key = super::parse_hmac_key(&"ab".repeat(32)).unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(super::parse_hmac_key("abcd").is_err());
+        assert!(super::parse_hmac_key(&"zz".repeat(32)).is_err());
+        // Same key → same fingerprint; different key → different.
+        let a = super::key_fingerprint(&key);
+        assert_eq!(a, super::key_fingerprint(&key));
+        assert_ne!(a, super::key_fingerprint(&[0u8; 32]));
+    }
+}
+
+/// Wake long-polling runners: at most `ready` of them for newly claimable
+/// jobs (waking every waiter for one job is a thundering herd: all of them
+/// race one claim), or all of them for broadcasts such as cancellations.
+pub(crate) fn wake_waiters(notify: &Notify, ready: usize, broadcast: bool) {
+    if broadcast {
+        notify.notify_waiters();
+        return;
+    }
+    for _ in 0..ready {
+        notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    /// Five runners wait; two jobs become ready: exactly two wake. Waking
+    /// all of them made every waiter race one claim transaction.
+    #[tokio::test]
+    async fn ready_jobs_wake_only_that_many_waiters() {
+        let notify = Arc::new(Notify::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::new();
+        for _ in 0..5 {
+            let (notify, woken) = (notify.clone(), woken.clone());
+            waiters.push(tokio::spawn(async move {
+                if tokio::time::timeout(std::time::Duration::from_millis(300), notify.notified())
+                    .await
+                    .is_ok()
+                {
+                    woken.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        super::wake_waiters(&notify, 2, false);
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
     }
 }

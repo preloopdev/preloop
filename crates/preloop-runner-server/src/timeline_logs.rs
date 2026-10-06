@@ -30,18 +30,25 @@ pub async fn patch_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
-) -> Json<serde_json::Value> {
-    let mut records = wrapper.value;
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let records = wrapper.value;
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
-    let callback_job = {
-        let inner = shared.state.inner.lock().await;
-        resolve_callback_job(&inner, &plan_id, timeline_id.parse().ok(), None)
-    };
-    let run_id = callback_job
+    // Resolve the callback (plan/timeline → attempt → run/job + current job
+    // status) with one indexed query; node-local `timeline_*` state is read
+    // under `inner` below.
+    let callback = shared
+        .state
+        .backend
+        .callback_job(&plan_id, timeline_id.parse().ok(), None)
+        .await
+        .unwrap_or(None);
+    let run_id = callback
         .as_ref()
-        .map(|(_, run_id, _)| *run_id)
+        .map(|cb| cb.run_id)
         .or_else(|| plan_id.parse::<RunId>().ok());
-    let logical_job_id = callback_job.as_ref().map(|(_, _, job_id)| job_id.clone());
+    let logical_job_id = callback.as_ref().map(|cb| cb.job_id.clone());
+    let agent_job_id = callback.as_ref().map(|cb| cb.agent_job_id);
+    let job_status_for_run = callback.as_ref().and_then(|cb| cb.job_status);
     let mut projected = Vec::new();
     for record in &records {
         if let Some(state) = &record.state {
@@ -53,7 +60,9 @@ pub async fn patch_timeline_records(
                 "timeline record update"
             );
         }
-        if let (Some(run_id), Some(status)) = (run_id, timeline_status(record)) {
+        if !is_step_record(record)
+            && let (Some(run_id), Some(status)) = (run_id, timeline_status(record))
+        {
             projected.push(NdjsonEvent::JobStatus {
                 run_id,
                 job_id: logical_job_id
@@ -97,18 +106,9 @@ pub async fn patch_timeline_records(
         }
     }
 
-    // Set when this PATCH reconciled an attempt's step records, so they can be
-    // persisted once the state lock is released.
-    let mut touched_attempt: Option<(RunId, uuid::Uuid, Vec<StepRecord>, u64)> = None;
-    let new_change_id = {
+    // Node-local: merge the projected events into the per-run feed.
+    {
         let mut inner = shared.state.inner.lock().await;
-        let current = inner
-            .timeline_change_ids
-            .entry(timeline_key.clone())
-            .or_insert(0);
-        *current += 1;
-        let new_id = *current;
-
         let events = inner
             .timeline_events
             .entry(run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())))
@@ -122,182 +122,72 @@ pub async fn patch_timeline_records(
             &mut inner,
             run_id.unwrap_or_else(|| RunId(uuid::Uuid::nil())),
         );
-
-        if let (Some(run_id), Some(job_id)) = (run_id, &logical_job_id) {
-            // The manifest is attempt-scoped, so reconciliation needs the
-            // agent job id — the workflow job key alone cannot distinguish
-            // one dispatch of a job from a later re-dispatch.
-            let agent_job_id = callback_job
-                .as_ref()
-                .and_then(|(request_id, _, _)| inner.job_requests.get(request_id))
-                .map(|request| request.agent_job_id);
-            let job_status = inner
-                .runs
-                .get(&run_id)
-                .and_then(|run| run.jobs.get(job_id).copied());
-
-            if let Some(run) = inner.runs.get_mut(&run_id) {
-                let detail = match JobDetail::find(&mut run.jobs_list, &job_id.0) {
-                    Some(detail) => detail,
-                    None => {
-                        run.jobs_list.push(JobDetail {
-                            job_id: job_id.0.clone(),
-                            name: job_id.0.clone(),
-                            // A timeline update means the job started; the run
-                            // record's final conclusion comes from the job
-                            // status map (projected in the runs GET). Default
-                            // to the truthful in-flight state, never "success".
-                            conclusion: "in_progress".to_owned(),
-                            steps: Vec::new(),
-                            annotations: Vec::new(),
-                        });
-                        run.jobs_list.last_mut().expect("just pushed")
-                    }
-                };
-                // The status map is authoritative for terminal states only.
-                // Its in-flight projection ("inprogress" from the raw Debug
-                // spelling, or "success" from the run-level status_string)
-                // lies about a job that is still running — keep the truthful
-                // "in_progress" default set above.
-                if let Some(status) = job_status
-                    && status != ExecutionStatus::InProgress
-                {
-                    detail.conclusion = format!("{:?}", status).to_lowercase();
-                }
-            }
-
-            if let Some(agent_job_id) = agent_job_id {
-                let observed = chrono::Utc::now();
-                let manifest = inner.job_steps.entry(agent_job_id).or_default();
-                for record in &records {
-                    let Some(name) = &record.display_name else {
-                        continue;
-                    };
-                    if !is_step_record(record) {
-                        continue;
-                    }
-
-                    let conclusion_str = match record.result {
-                        Some(
-                            azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues,
-                        ) => "success",
-                        Some(azdo::TaskResult::Failed) => {
-                            if job_status == Some(ExecutionStatus::Cancelled) {
-                                "cancelled"
-                            } else {
-                                "failure"
-                            }
-                        }
-                        Some(azdo::TaskResult::Cancelled) => "cancelled",
-                        Some(azdo::TaskResult::Skipped) => "skipped",
-                        Some(azdo::TaskResult::Abandoned) => "failed",
-                        None if record.state == Some(azdo::TimelineRecordState::InProgress) => {
-                            "in_progress"
-                        }
-                        _ => "success",
-                    };
-                    let started_at = record
-                        .start_time
-                        .as_deref()
-                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc));
-                    let finished_at = record
-                        .finish_time
-                        .as_deref()
-                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t.with_timezone(&chrono::Utc));
-                    let record_id = record.id.to_string();
-
-                    match StepRecord::find_by_id(manifest, &record_id) {
-                        Some(pos) => {
-                            manifest[pos].conclusion = conclusion_str.to_owned();
-                            if let Some(started_at) = started_at {
-                                manifest[pos].started_at = Some(started_at);
-                            }
-                            if let Some(finished_at) = finished_at {
-                                manifest[pos].finished_at = Some(finished_at);
-                            }
-                            manifest[pos].name = name.clone();
-                        }
-                        // A timeline record with no manifest entry is runner
-                        // bookkeeping, not a workflow step. `TimelineRecord`
-                        // carries no ordinal, so `runner_number` stays unset
-                        // on this path.
-                        None => manifest.push(StepRecord {
-                            id: record_id,
-                            kind: StepKind::Synthetic,
-                            workflow_index: None,
-                            runner_number: None,
-                            context_name: None,
-                            name: name.clone(),
-                            conclusion: conclusion_str.to_owned(),
-                            started_at: started_at.or(Some(observed)),
-                            finished_at,
-                        }),
-                    }
-                }
-                // Captured so the attempt can be persisted after the lock is
-                // released. A PATCH that projects no job-status event emits
-                // nothing, so without this the reconciliation stays
-                // memory-only and a restart loses it.
-                let records = manifest.clone();
-                let revision = {
-                    let counter = inner.job_steps_revision.entry(agent_job_id).or_insert(0);
-                    *counter += 1;
-                    *counter
-                };
-                touched_attempt = Some((run_id, agent_job_id, records, revision));
-            }
-        }
-        new_id
-    };
-    if let Some((run_id, agent_job_id, records, revision)) = touched_attempt
-        && let Err(error) = shared
-            .state
-            .store
-            .store_job_steps(run_id, agent_job_id, &records, revision)
-            .await
-    {
-        warn!(?error, %run_id, "failed to persist timeline step records");
     }
-    for event in projected {
+
+    // Backend: reconcile the attempt's step rows. Job detail is derived
+    // (the `jobs` row is the projection), so only the step patches persist;
+    // timeline records never move `jobs.status` — settlement owns that.
+    if let (Some(_run_id), Some(_job_id)) = (run_id, logical_job_id.clone()) {
+        let job_status = job_status_for_run;
+        let observed_us = chrono::Utc::now().timestamp_micros();
+        let patches: Vec<crate::control::types::StepPatch> = records
+            .iter()
+            .filter_map(|record| step_patch(record, job_status, observed_us))
+            .collect();
+        if let Some(agent_job_id) = agent_job_id
+            && let Err(error) = shared
+                .state
+                .backend
+                .patch_steps(agent_job_id, patches)
+                .await
+        {
+            warn!(?error, "failed to persist timeline steps");
+        }
+    }
+    // Status events keep the legacy path (persisted by `emit`); annotations
+    // are written by `patch_timeline` inside its own transaction, then
+    // broadcast via `emit_persisted`.
+    let (annotations, statuses): (Vec<NdjsonEvent>, Vec<NdjsonEvent>) = projected
+        .into_iter()
+        .partition(|event| matches!(event, NdjsonEvent::Annotation { .. }));
+    for event in statuses {
         shared.state.emit(event).await;
     }
-    // Stamp each record with server-computed fields.
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    for record in &mut records {
-        record.change_id = Some(new_change_id);
-        record.last_modified = Some(now.clone());
-    }
-
-    // Persist records (upsert by record ID) and return the full stored set.
-    let (response_records, meta) = {
-        let mut inner = shared.state.inner.lock().await;
-        let stored = inner
-            .timeline_records
-            .entry(timeline_key.clone())
-            .or_default();
-        // Ids just upserted by this PATCH — protect them from eviction so a
-        // low-sorting UUID isn't dropped out of the response/timeline.
-        let patched_ids: Vec<uuid::Uuid> = records.iter().map(|r| r.id).collect();
-        for record in records {
-            stored.insert(record.id, record);
+    // Persist the records (one shared row each; the change id is bumped in
+    // the same transaction) and return the full stored set. No node-local
+    // copy: a PATCH on one node and a GET on another must agree.
+    match shared
+        .state
+        .backend
+        .patch_timeline(&timeline_key, records, &annotations)
+        .await
+    {
+        Ok((_change_id, stored)) => {
+            for event in annotations {
+                shared.state.emit_persisted(event).await;
+            }
+            Ok(Json(json!({ "count": stored.len(), "value": stored })))
         }
-        trim_timeline_after_patch(&mut inner, &timeline_key, &patched_ids);
-        let vals: Vec<_> = inner
-            .timeline_records
-            .get(&timeline_key)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
-        (vals, crate::store::build_meta_snapshot(&inner))
-    };
-    // Persist after the lock is released so a slow backend does not serialize
-    // the control plane behind the snapshot write.
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        warn!(?error, "failed to persist timeline records");
+        // An unknown timeline (test hooks, standalone uploads) keeps the
+        // permissive empty answer the pre-backend model gave. The
+        // annotations were never persisted; emit them normally so
+        // subscribers still see them.
+        Err(crate::control::ControlError::NotFound(_)) => {
+            for event in annotations {
+                shared.state.emit(event).await;
+            }
+            Ok(Json(json!({ "count": 0, "value": [] })))
+        }
+        // Anything else is a real persistence failure: answering 200 with an
+        // empty body would tell the runner its records were stored.
+        Err(error) => {
+            for event in annotations {
+                shared.state.emit(event).await;
+            }
+            warn!(?error, "failed to persist timeline records");
+            Err(ApiError::from(error))
+        }
     }
-
-    Json(json!({ "count": response_records.len(), "value": response_records }))
 }
 pub fn timeline_status(record: &azdo::TimelineRecord) -> Option<ExecutionStatus> {
     match record.result {
@@ -328,32 +218,37 @@ pub async fn create_log(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id)): Path<(String, String, String)>,
     Json(mut log): Json<azdo::TaskLog>,
-) -> Json<serde_json::Value> {
-    let (meta, evicted) = {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // A plan_id that is not a job's agent_job_id (test hooks, standalone
+    // uploads) has no log_files row to allocate against: its bytes live only
+    // in the node-local buffer, so fall back to the in-memory counter like
+    // the pre-backend model did. Real plans keep the per-plan log_files ids.
+    let next_id = match shared.state.backend.create_log(&plan_id).await {
+        Ok(id) => id,
+        Err(crate::control::ControlError::NotFound(_)) => {
+            let mut inner = shared.state.inner.lock().await;
+            inner.next_log_id += 1;
+            inner.next_log_id as i64
+        }
+        Err(other) => return Err(ApiError::from(other)),
+    };
+    log.id = next_id;
+    let key = format!("{plan_id}/{next_id}");
+    let evicted = {
         let mut inner = shared.state.inner.lock().await;
-        let next_id = inner.next_log_id;
-        inner.next_log_id = next_id.wrapping_add(1);
-        log.id = next_id as i64;
-        let key = format!("{}/{}", plan_id, next_id);
         inner.logs.entry(key.clone()).or_default();
         inner.log_metadata.entry(key.clone()).or_default();
-        if !inner.log_order.iter().any(|k| k == &key) {
-            inner.log_order.push_back(key.clone());
+        if !inner.log_order.iter().any(|existing| existing == &key) {
+            inner.log_order.push_back(key);
         }
-        let evicted = trim_plan_logs(&mut inner, &plan_id);
-        (crate::store::build_meta_snapshot(&inner), evicted)
+        trim_plan_logs(&mut inner, &plan_id)
     };
-    // Delete durably any logs the caps just evicted from memory, so the
-    // on-disk store never outgrows the in-memory retention (D2).
-    for key in &evicted {
-        if let Err(error) = shared.state.store.delete_log(key).await {
-            warn!(?error, key, "failed to delete evicted log from store");
-        }
-    }
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        warn!(?error, "failed to persist created log");
-    }
-    Json(serde_json::to_value(&log).unwrap_or(json!({ "ok": true })))
+    // Eviction bounds the node-local preview only. Published segments remain
+    // available until retained-plan cleanup or final-log publication.
+    let _ = evicted;
+    Ok(Json(
+        serde_json::to_value(&log).unwrap_or(json!({ "ok": true })),
+    ))
 }
 
 /// POST append log — runner appends lines to a log file.
@@ -365,10 +260,30 @@ pub async fn append_log(
     let key = log_key(&plan_id, &log_id);
     // Hot path: mutate and capture the chunk under the lock, then persist
     // after releasing it.
-    let (masked, chunk_index, byte_count, line_count, evicted) = {
+    // Mask the body against the run's secrets. Run secrets are immutable, so
+    // the resolved masker is cached node-locally per plan_id — the hot append
+    // path does not touch the backend after the first chunk. On a backend
+    // error we MUST NOT store the raw body — drop the append rather than
+    // persist unmasked secrets.
+    let masked = match mask_log_bytes_cached(&shared, &plan_id, &body).await {
+        Ok(masked) => masked,
+        Err(error) => {
+            warn!(?error, key = %key, "failed to mask log body; dropping append");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    if let Err(error) = shared
+        .state
+        .log_segments
+        .append(&plan_id, &log_id, &masked)
+        .await
+    {
+        warn!(?error, key = %key, "failed to buffer/publish live log");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    let evicted = {
         let mut inner = shared.state.inner.lock().await;
         let is_new = !inner.logs.contains_key(&key);
-        let masked = mask_log_bytes(&inner, &plan_id, &body);
         let byte_count = masked.len();
         let line_count = masked.iter().filter(|&&b| b == b'\n').count();
         inner
@@ -380,11 +295,8 @@ pub async fn append_log(
         if is_new && !inner.log_order.iter().any(|k| k == &key) {
             inner.log_order.push_back(key.clone());
         }
-        // F1: keep only the newest bytes in memory. `log_chunks` is the live
-        // console recovery buffer (read only by restart to refill this map),
-        // bounded to the SAME per-key budget in `store_log_chunk` — see D2.
-        // The complete, permanent logs are the step/job-log blobs the runner
-        // uploads separately, so trimming this tail never drops real log data.
+        // Keep only the newest bytes in the node-local preview. Published
+        // segments and the runner's complete uploaded logs are independent.
         if let Some(retained) = inner.logs.get_mut(&key) {
             // Only trim once the buffer grows a full slack window past the cap,
             // then drop back down to the cap — amortizes the O(n) front-shift
@@ -402,36 +314,11 @@ pub async fn append_log(
             meta.byte_count += byte_count;
             meta.line_count += line_count;
         }
-        let evicted = trim_plan_logs(&mut inner, &plan_id);
-        // Hot path: write the chunk to `log_chunks` and UPSERT the per-log
-        // counter, instead of rewriting the entire meta snapshot for every
-        // append. The counter is small and idempotent; the chunk is the
-        // append-only event stream. We use the new byte count as the chunk
-        // index so each append maps to a unique `(log_key, chunk_index)` row.
-        let meta = inner.log_metadata.get(&key).cloned().unwrap_or_default();
-        (
-            masked,
-            meta.byte_count as i64,
-            meta.byte_count as i64,
-            meta.line_count as i64,
-            evicted,
-        )
+        trim_plan_logs(&mut inner, &plan_id)
     };
-    // Delete durably any logs the caps just evicted from memory (D2). The just
-    // appended key is never in this list — it is the newest.
-    for key in &evicted {
-        if let Err(error) = shared.state.store.delete_log(key).await {
-            warn!(?error, key, "failed to delete evicted log from store");
-        }
-    }
-    if let Err(error) = shared
-        .state
-        .store
-        .store_log_chunk(&key, chunk_index, &masked, byte_count, line_count)
-        .await
-    {
-        warn!(?error, "failed to persist appended log chunk");
-    }
+    // Evict only the in-memory preview; the file-backed segments are
+    // independent and remain readable after a restart.
+    let _ = evicted;
     StatusCode::ACCEPTED
 }
 
@@ -439,25 +326,162 @@ pub fn log_key(plan_id: &str, log_id: &str) -> String {
     format!("{plan_id}/{log_id}")
 }
 
-pub fn mask_log_bytes(inner: &InnerState, plan_id: &str, body: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(body);
-    let resolved_run_id = resolve_callback_job(inner, plan_id, None, None)
-        .map(|(_, run_id, _)| run_id)
-        .or_else(|| plan_id.parse::<RunId>().ok());
-    let run_secrets: Vec<String> = resolved_run_id
-        .and_then(|run_id| inner.runs.get(&run_id))
-        .map(|run| preloop_gha_protocol::masking::expose_values(run.submission.secrets.values()))
-        .unwrap_or_else(|| {
-            preloop_gha_protocol::masking::expose_values(
-                inner
-                    .runs
-                    .values()
-                    .flat_map(|run| run.submission.secrets.values()),
-            )
-        });
+/// Mask `body` against the run's secrets, resolving and caching the masker
+/// node-locally per `plan_id`. Run secrets are immutable for the life of the
+/// run, so after the first append for a plan the hot path never touches the
+/// backend.
+///
+/// A cache miss does one scoped read (`job_requests` to resolve the run,
+/// `runs` for its repository and, via the stored template, the job's
+/// `environment:` — no queues, sessions, or concurrency families). The
+/// resolved masker is cached permanently. An *unresolved* plan (log chunk
+/// arrived before the run row exists) masks against every run's secrets but
+/// is NOT cached — caching the fallback would permanently mask against a set
+/// that lacks this run's secrets and leak them into the log. Instead a short
+/// negative-cache TTL bounds how often the unresolved plan re-probes the
+/// backend.
+///
+/// A SecretProvider failure is propagated, never cached and never masked
+/// over: the caller drops the append instead of persisting (and streaming)
+/// an unmasked body, and the retry is free to resolve a real masker.
+pub(crate) async fn mask_log_bytes_cached(
+    shared: &Arc<SharedState>,
+    plan_id: &str,
+    body: &[u8],
+) -> Result<Vec<u8>, crate::control::ControlError> {
+    /// How long an unresolved plan_id waits before re-probing the backend for
+    /// its run's secrets. Short enough that a run registered mid-stream picks
+    /// up its real masker quickly; long enough to keep a chunk-per-append
+    /// storm from hammering the reader pool.
+    const MASKER_NEG_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(250);
 
-    preloop_gha_protocol::masking::mask_secrets(&text, run_secrets.iter().map(String::as_str), &[])
-        .into_bytes()
+    // Fast path: masker already resolved for this plan, or a cached union
+    // fallback still within its re-probe window.
+    {
+        let inner = shared.state.inner.lock().await;
+        let cached: Option<Arc<Vec<String>>> =
+            inner.plan_secret_masker.get(plan_id).cloned().or_else(|| {
+                inner
+                    .plan_secret_masker_pending
+                    .get(plan_id)
+                    .and_then(|(secrets, deadline)| {
+                        (std::time::Instant::now() < *deadline).then(|| secrets.clone())
+                    })
+            });
+        if let Some(secrets) = cached {
+            drop(inner);
+            let text = String::from_utf8_lossy(body);
+            return Ok(preloop_gha_protocol::masking::mask_secrets(
+                &text,
+                secrets.iter().map(String::as_str),
+                &[],
+            )
+            .into_bytes());
+        }
+    }
+
+    // Slow path: resolve plan_id → run_id → secrets. `resolved` is true
+    // only when the plan mapped to a concrete run row, so the fallback
+    // union is never cached as if it were the run's real masker. Values come
+    // from the SecretProvider (run > environment > repo > global). The
+    // environment tier is per job and only joins a node's cache when that
+    // node served the acquire, so the cold path reads it back from the
+    // stored template's secret spec — the same input the acquire fill uses.
+    // A resolution failure propagates: an empty masker would persist the raw
+    // body, and caching it would disable masking for the plan's whole life.
+    let callback = shared
+        .state
+        .backend
+        .callback_job(plan_id, None, None)
+        .await
+        .ok()
+        .flatten();
+    let resolved_run_id = callback
+        .as_ref()
+        .map(|callback| callback.run_id)
+        .or_else(|| plan_id.parse::<RunId>().ok());
+    let provider = shared.state.secret_provider.as_ref();
+    let (secrets, resolved) = match resolved_run_id {
+        Some(run_id) => {
+            let repository = shared
+                .state
+                .backend
+                .run_record(run_id)
+                .await
+                .map(|record| record.submission.repository.clone())
+                .unwrap_or_default();
+            let environment = match &callback {
+                Some(callback) => shared
+                    .state
+                    .backend
+                    .acquire_context(callback.request_id)
+                    .await
+                    .ok()
+                    .and_then(|context| context.message.preloop_secret_spec)
+                    .and_then(|spec| spec.environment),
+                None => None,
+            };
+            let resolved_secrets = provider
+                .resolve(crate::secret_provider::SecretScope {
+                    repository: &repository,
+                    environment: environment.as_deref(),
+                    run_id: Some(run_id),
+                })
+                .map_err(crate::control::ControlError::backend)?;
+            let mut values: Vec<String> =
+                preloop_gha_protocol::masking::expose_all(&resolved_secrets)
+                    .into_values()
+                    .collect();
+            values.sort();
+            values.dedup();
+            (values, true)
+        }
+        None => {
+            // Unresolvable plan: union of stored provider secrets plus every
+            // provided value the node already cached at submit/acquire.
+            let mut values = provider
+                .resolve_all()
+                .map_err(crate::control::ControlError::backend)?;
+            {
+                let inner = shared.state.inner.lock().await;
+                for cached in inner.plan_secret_masker.values() {
+                    values.extend(cached.iter().cloned());
+                }
+            }
+            values.sort();
+            values.dedup();
+            (values, false)
+        }
+    };
+
+    {
+        let mut inner = shared.state.inner.lock().await;
+        let secrets = Arc::new(secrets);
+        if resolved {
+            // Permanent cache: run secrets are immutable for the run's life.
+            inner
+                .plan_secret_masker
+                .insert(plan_id.to_owned(), secrets.clone());
+            inner.plan_secret_masker_pending.remove(plan_id);
+        } else {
+            // Negative cache: mask against this union and re-probe after the
+            // TTL, not on every chunk.
+            inner.plan_secret_masker_pending.insert(
+                plan_id.to_owned(),
+                (
+                    secrets.clone(),
+                    std::time::Instant::now() + MASKER_NEG_CACHE_TTL,
+                ),
+            );
+        }
+        let text = String::from_utf8_lossy(body);
+        Ok(preloop_gha_protocol::masking::mask_secrets(
+            &text,
+            secrets.iter().map(String::as_str),
+            &[],
+        )
+        .into_bytes())
+    }
 }
 
 /// POST console log — runner streams live console output.
@@ -472,15 +496,17 @@ pub async fn console_log(
     )>,
     body: Bytes,
 ) -> StatusCode {
-    // Resolve the callback to the run-scoped agent-job key. Falling back to
-    // the plan id preserves compatibility for callbacks that arrive before a
-    // request record exists.
+    // Resolve the callback to the run-scoped agent-job key with one indexed
+    // query. Falling back to the plan id preserves compatibility for
+    // callbacks that arrive before a request record exists.
     if let Ok(wrapper) = serde_json::from_slice::<LiveLogFeedLinesWrapper>(&body) {
-        let resolved = {
-            let inner = shared.state.inner.lock().await;
-            resolve_callback_job(&inner, &plan_id, None, None)
-                .map(|(_, run_id, job_id)| (run_id, job_id.0))
-        };
+        let resolved = shared
+            .state
+            .backend
+            .callback_job(&plan_id, None, None)
+            .await
+            .unwrap_or(None)
+            .map(|callback| (callback.run_id, callback.job_id.0));
         match resolved {
             Some((run_id, job_id)) => {
                 crate::live_logs::record_live_log_wrapper_for_run(
@@ -506,43 +532,60 @@ pub async fn finish_job(
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect();
-    let completion = {
-        let mut inner = shared.state.inner.lock().await;
-        let callback_resolved = resolve_callback_job(
-            &inner,
-            &plan_id,
-            Some(event.timeline_id),
-            Some(event.job_id),
-        );
-        let active_resolved =
-            sole_active_unfinished_request(&inner).and_then(|id| job_request_tuple(&inner, id));
-        let resolved = callback_resolved.or(active_resolved).or_else(|| {
-            plan_id
-                .parse::<RunId>()
-                .ok()
-                .map(|run_id| (0, run_id, JobId(event.job_id.to_string())))
-        });
-        if let Some((request_id, run_id, job_id)) = resolved {
-            if let Some(request) = inner.job_requests.get_mut(&request_id) {
-                request.result = Some(status);
-                request.locked_until = agent_request_locked_until();
-            }
-            Some(JobCompletion {
-                run_id,
-                job_id,
-                // Resolved from the callback's own request record.
-                agent_job_id: inner
-                    .job_requests
-                    .get(&request_id)
-                    .map(|record| record.agent_job_id),
-                status,
-                outputs,
-                annotations: Vec::new(),
-                step_results: Vec::new(),
+    let callback = shared
+        .state
+        .backend
+        .callback_job(&plan_id, Some(event.timeline_id), Some(event.job_id))
+        .await
+        .unwrap_or(None);
+    // Compatibility: when no request carries this callback's identifiers,
+    // fall back to the single in-flight request (old runners); failing
+    // that, a plan id that *is* a run id still completes the job record.
+    let resolved = match callback {
+        Some(callback) => Some((
+            callback.request_id,
+            callback.run_id,
+            callback.job_id,
+            Some(callback.agent_job_id),
+        )),
+        None => shared
+            .state
+            .backend
+            .sole_inflight_request()
+            .await
+            .unwrap_or(None)
+            .map(|(request_id, run_id, job_id, agent_job_id)| {
+                (request_id, run_id, job_id, Some(agent_job_id))
             })
-        } else {
-            None
+            .or_else(|| {
+                plan_id
+                    .parse::<RunId>()
+                    .ok()
+                    .map(|run_id| (0, run_id, JobId(event.job_id.to_string()), None))
+            }),
+    };
+    let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
+        if request_id != 0 {
+            // Settle is a guarded UPDATE — an already-settled row keeps its
+            // first result, but the completion still fans out below.
+            let _ = shared
+                .state
+                .backend
+                .settle_agent_request(request_id, status, &agent_request_locked_until())
+                .await;
         }
+        Some(JobCompletion {
+            run_id,
+            job_id,
+            // Resolved from the callback's own request record.
+            agent_job_id,
+            status,
+            outputs,
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        })
+    } else {
+        None
     };
 
     info!(
@@ -566,7 +609,7 @@ pub async fn finish_job(
     Json(serde_json::Value::Null)
 }
 
-// ── F030: standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
+// ── standard AzDO `/_apis/v1/plans/` route handlers ────────────────────
 // These use the URL pattern our AzDO client sends (`plans/{planId}/...`) rather
 // than the scoped pattern (`Timeline/{scope}/{hub}/{planId}/{timelineId}`).
 // The logic is identical to the existing handlers above.
@@ -576,7 +619,7 @@ pub async fn patch_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     Json(wrapper): Json<azdo::VssJsonCollectionWrapper<azdo::TimelineRecord>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     patch_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
@@ -585,7 +628,7 @@ pub async fn patch_timeline_records_plan(
     .await
 }
 
-/// F6 — pagination controls for timeline GET. `top` is clamped to
+/// pagination controls for timeline GET. `top` is clamped to
 /// [`MAX_TOP_RECORDS`] server-side; `skip` pages further.
 #[derive(Debug, Deserialize)]
 pub struct TimelineQuery {
@@ -600,34 +643,34 @@ pub async fn get_timeline_records(
     State(shared): State<Arc<SharedState>>,
     Path((_scope, _hub, plan_id, timeline_id)): Path<(String, String, String, String)>,
     Query(query): Query<TimelineQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_key = format!("{}/{}", plan_id, timeline_id);
-    let inner = shared.state.inner.lock().await;
-    let change_id = inner
-        .timeline_change_ids
-        .get(&timeline_key)
-        .copied()
-        .unwrap_or(0);
     // When `top` is absent the official runner expects the full timeline
-    // (it does not paginate). Storage itself is already capped at
-    // MAX_TIMELINE_RECORDS=1024, so returning all is bounded. When `top`
-    // is present we clamp to MAX_TOP_RECORDS.
+    // (it does not paginate); storage is capped at MAX_TIMELINE_RECORDS, so
+    // returning all is bounded. When `top` is present we clamp it.
     let (top, skip) = match query.top {
         Some(t) => (t.min(MAX_TOP_RECORDS), query.skip.unwrap_or(0)),
         None => (usize::MAX, query.skip.unwrap_or(0)),
     };
-    let records: Vec<_> = inner
-        .timeline_records
-        .get(&timeline_key)
-        .map(|m| m.values().skip(skip).take(top).cloned().collect())
-        .unwrap_or_default();
-    Json(json!({
+    let (change_id, records) = shared
+        .state
+        .backend
+        .get_timeline(&timeline_key, skip, top)
+        .await
+        // An empty timeline is a legitimate answer, so a failed read must
+        // not be reported as one: the runner would conclude the timeline is
+        // empty instead of retrying.
+        .map_err(|error| {
+            warn!(?error, "failed to read timeline records");
+            ApiError::from(error)
+        })?;
+    Ok(Json(json!({
         "id": timeline_id,
         "changeId": change_id,
         "lastChangedBy": uuid::Uuid::nil(),
         "lastChangedOn": "0001-01-01T00:00:00",
         "records": records
-    }))
+    })))
 }
 
 /// GET `/_apis/v1/plans/:plan_id/timelines/:timeline_id/records`
@@ -635,7 +678,7 @@ pub async fn get_timeline_records_plan(
     State(shared): State<Arc<SharedState>>,
     Path((plan_id, timeline_id)): Path<(String, String)>,
     Query(query): Query<TimelineQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     get_timeline_records(
         State(shared),
         Path((String::new(), String::new(), plan_id, timeline_id)),
@@ -649,7 +692,7 @@ pub async fn create_log_plan(
     State(shared): State<Arc<SharedState>>,
     Path(plan_id): Path<String>,
     Json(log): Json<azdo::TaskLog>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     create_log(
         State(shared),
         Path((String::new(), String::new(), plan_id)),
@@ -710,33 +753,52 @@ pub async fn finish_job_plan(
         "finish_job_plan"
     );
 
-    let completion = {
-        let mut inner = shared.state.inner.lock().await;
-        let resolved = resolve_callback_job(&inner, &plan_id, None, None).or_else(|| {
-            sole_active_unfinished_request(&inner).and_then(|id| job_request_tuple(&inner, id))
-        });
-        if let Some((request_id, run_id, job_id)) = resolved {
-            if let Some(request) = inner.job_requests.get_mut(&request_id) {
-                request.result = Some(status);
-                request.locked_until = agent_request_locked_until();
-            }
-            Some(JobCompletion {
-                run_id,
-                job_id,
-                // Resolved from the callback's own request record.
-                agent_job_id: inner
-                    .job_requests
-                    .get(&request_id)
-                    .map(|record| record.agent_job_id),
-                status,
-                outputs,
-                annotations: Vec::new(),
-                step_results: Vec::new(),
-            })
-        } else {
-            warn!(plan_id, "finish_job_plan: could not resolve run/job");
-            None
-        }
+    let callback = shared
+        .state
+        .backend
+        .callback_job(&plan_id, None, None)
+        .await
+        .unwrap_or(None);
+    // Compatibility fallback: the single in-flight request, when exactly
+    // one exists (older runners correlate only by plan).
+    let resolved = match callback {
+        Some(callback) => Some((
+            callback.request_id,
+            callback.run_id,
+            callback.job_id,
+            Some(callback.agent_job_id),
+        )),
+        None => shared
+            .state
+            .backend
+            .sole_inflight_request()
+            .await
+            .unwrap_or(None)
+            .map(|(request_id, run_id, job_id, agent_job_id)| {
+                (request_id, run_id, job_id, Some(agent_job_id))
+            }),
+    };
+    let completion = if let Some((request_id, run_id, job_id, agent_job_id)) = resolved {
+        // Settle is a guarded UPDATE — an already-settled row keeps its
+        // first result, but the completion still fans out below.
+        let _ = shared
+            .state
+            .backend
+            .settle_agent_request(request_id, status, &agent_request_locked_until())
+            .await;
+        Some(JobCompletion {
+            run_id,
+            job_id,
+            // Resolved from the callback's own request record.
+            agent_job_id,
+            status,
+            outputs,
+            annotations: Vec::new(),
+            step_results: Vec::new(),
+        })
+    } else {
+        warn!(plan_id, "finish_job_plan: could not resolve run/job");
+        None
     };
     if let Some(c) = completion {
         let _ = complete_job_inner(shared, c).await;
@@ -751,16 +813,24 @@ pub async fn authorize_reporting_callback(
     timeline_id: Option<uuid::Uuid>,
     agent_job_id: Option<uuid::Uuid>,
 ) -> Result<(), ApiError> {
-    let request = {
-        let inner = shared.state.inner.lock().await;
-        let request_id = agent_job_id
-            .and_then(|id| inner.agent_job_requests.get(&id).copied())
-            .or_else(|| timeline_id.and_then(|id| inner.timeline_requests.get(&id).copied()))
-            .or_else(|| inner.plan_requests.get(plan_id).copied());
-        request_id
-            .and_then(|id| inner.job_requests.get(&id).cloned())
-            .filter(|request| request.plan_id == plan_id)
-    };
+    use crate::control::backend::RequestKey;
+    let keys = [
+        agent_job_id.map(RequestKey::AgentJobId),
+        timeline_id.map(RequestKey::TimelineId),
+        Some(RequestKey::PlanId(plan_id.to_owned())),
+    ];
+    let mut request = None;
+    for key in keys.into_iter().flatten() {
+        match shared.state.backend.request(key).await {
+            Ok(found) => {
+                request = Some(found);
+                break;
+            }
+            Err(crate::control::ControlError::NotFound(_)) => {}
+            Err(error) => return Err(ApiError::from(error)),
+        }
+    }
+    let request = request.filter(|request| request.plan_id == plan_id);
     crate::auth::authorize_reporting_request(&shared.state, headers, request.as_ref())
 }
 
@@ -772,7 +842,7 @@ pub async fn patch_timeline_records_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
     authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
-    Ok(patch_timeline_records(State(shared), Path(path), Json(wrapper)).await)
+    patch_timeline_records(State(shared), Path(path), Json(wrapper)).await
 }
 
 pub async fn get_timeline_records_authenticated(
@@ -783,7 +853,7 @@ pub async fn get_timeline_records_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_id = path.3.parse().ok();
     authorize_reporting_callback(&shared, &headers, &path.2, timeline_id, None).await?;
-    Ok(get_timeline_records(State(shared), Path(path), Query(query)).await)
+    get_timeline_records(State(shared), Path(path), Query(query)).await
 }
 
 pub async fn create_log_authenticated(
@@ -793,7 +863,7 @@ pub async fn create_log_authenticated(
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_reporting_callback(&shared, &headers, &path.2, None, None).await?;
-    Ok(create_log(State(shared), Path(path), Json(log)).await)
+    create_log(State(shared), Path(path), Json(log)).await
 }
 
 pub async fn append_log_authenticated(
@@ -849,10 +919,7 @@ pub async fn patch_timeline_records_plan_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
     authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
-    Ok(
-        patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper))
-            .await,
-    )
+    patch_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Json(wrapper)).await
 }
 
 pub async fn get_timeline_records_plan_authenticated(
@@ -863,7 +930,7 @@ pub async fn get_timeline_records_plan_authenticated(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let timeline_uuid = timeline_id.parse().ok();
     authorize_reporting_callback(&shared, &headers, &plan_id, timeline_uuid, None).await?;
-    Ok(get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await)
+    get_timeline_records_plan(State(shared), Path((plan_id, timeline_id)), Query(query)).await
 }
 
 pub async fn create_log_plan_authenticated(
@@ -873,7 +940,7 @@ pub async fn create_log_plan_authenticated(
     Json(log): Json<azdo::TaskLog>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_reporting_callback(&shared, &headers, &plan_id, None, None).await?;
-    Ok(create_log_plan(State(shared), Path(plan_id), Json(log)).await)
+    create_log_plan(State(shared), Path(plan_id), Json(log)).await
 }
 
 pub async fn append_log_plan_authenticated(
@@ -886,12 +953,50 @@ pub async fn append_log_plan_authenticated(
     Ok(append_log_plan(State(shared), Path((plan_id, log_id)), body).await)
 }
 
+/// The step update a timeline record carries, or `None` for records that are
+/// not steps (runner bookkeeping, unnamed records).
+fn step_patch(
+    record: &azdo::TimelineRecord,
+    job_status: Option<ExecutionStatus>,
+    observed_us: i64,
+) -> Option<crate::control::types::StepPatch> {
+    let name = record.display_name.clone()?;
+    if !is_step_record(record) {
+        return None;
+    }
+    let conclusion = match record.result {
+        Some(azdo::TaskResult::Succeeded | azdo::TaskResult::SucceededWithIssues) => "success",
+        Some(azdo::TaskResult::Failed) => {
+            if job_status == Some(ExecutionStatus::Cancelled) {
+                "cancelled"
+            } else {
+                "failure"
+            }
+        }
+        Some(azdo::TaskResult::Cancelled) => "cancelled",
+        Some(azdo::TaskResult::Skipped) => "skipped",
+        Some(azdo::TaskResult::Abandoned) => "failed",
+        None if record.state == Some(azdo::TimelineRecordState::InProgress) => "in_progress",
+        _ => "success",
+    };
+    let micros = |time: Option<&str>| {
+        time.and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.timestamp_micros())
+    };
+    Some(crate::control::types::StepPatch {
+        id: record.id.to_string(),
+        name,
+        conclusion: conclusion.to_owned(),
+        started_at_us: micros(record.start_time.as_deref()),
+        finished_at_us: micros(record.finish_time.as_deref()),
+        observed_us,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{RunRecord, TaskAgentJobRequestRecord};
-    use preloop_gha_protocol::{ExecutionStatus, WorkflowSubmission};
-    use std::collections::BTreeMap;
+    use crate::store::now_us;
     use std::sync::Arc;
 
     /// Seed a single in-flight run with one job, its plan→request mapping, and
@@ -918,76 +1023,52 @@ mod tests {
         let plan_id = run_id.to_string();
         let timeline_id = uuid::Uuid::new_v4();
         let request_id = 7_i64;
-        {
-            let mut inner = state.inner.lock().await;
-            inner.runs.insert(
-                run_id,
-                RunRecord {
-                    run_id,
-                    webhook_delivery_id: None,
-                    run_name: Some("timeline-conclusion-test".to_owned()),
-                    submission: Arc::new(WorkflowSubmission {
-                        workflow_yaml: "on: push\njobs: {}\n".to_owned(),
-                        event: "push".to_owned(),
-                        repository: "test/repo".to_owned(),
-                        git_ref: "refs/heads/main".to_owned(),
-                        ..Default::default()
-                    }),
-                    jobs: BTreeMap::from([(job_id.clone(), ExecutionStatus::InProgress)]),
-                    status: ExecutionStatus::InProgress,
-                    job_outputs: BTreeMap::new(),
-                    job_base_ids: BTreeMap::new(),
-                    job_needs: BTreeMap::new(),
-                    caller_plans: BTreeMap::new(),
-                    job_names: BTreeMap::from([(job_id.clone(), "build".to_owned())]),
-                    github: serde_json::json!({}),
-                    head_sha: String::new(),
-                    workflow_ref: String::new(),
-                    workspace_snapshot: None,
-                    job_fail_fast: BTreeMap::new(),
-                    job_continue_on_error: BTreeMap::new(),
-                    job_check_run_ids: BTreeMap::new(),
-                    reports_check_runs: false,
-                    reusable_calls: BTreeMap::new(),
-                    jobs_list: Vec::new(),
-                    created_at: chrono::Utc::now(),
-                    started_at: None,
-                    completed_at: None,
-                    run_number: 1,
-                    run_attempt: 1,
-                    workflow_path_str: ".github/workflows/ci.yml".to_owned(),
-                    event: "push".to_owned(),
-                    conclusion: None,
-                    push_state: None,
-                    snapshot_timing: None,
-                    fork_approval_pending: false,
-                    fork_approval_requested_at_unix_nanos: None,
-                    fork_approved_at_unix_nanos: None,
-                    fork_approval_note: None,
-                },
-            );
-            inner.plan_requests.insert(plan_id.clone(), request_id);
-            inner.job_requests.insert(
-                request_id,
-                TaskAgentJobRequestRecord {
-                    request_id,
-                    run_id,
-                    job_id: job_id.clone(),
-                    agent_job_id: uuid::Uuid::new_v4(),
-                    plan_id: plan_id.clone(),
-                    plan_type: "Build".to_owned(),
-                    timeline_id,
-                    result: None,
-                    locked_until: String::new(),
-                    claimed_at: None,
-                    owner_runner_id: None,
-                    started_at: None,
-                    last_renewed_at: None,
-                    timeout_triggered: false,
-                    debug_token_issued: false,
-                },
-            );
-        }
+        // Seed the authoritative backend (runs/job_requests are backend rows,
+        // not node-local InnerState) so the handler's lookups see them.
+        let plan_id_captured = plan_id.clone();
+        state
+            .test_db_mutate(move |tx| {
+                let now = now_us();
+                // Minimal run + job + request rows: the PATCH path resolves
+                // timeline_id -> job_requests, so only the columns it reads
+                // need real values; the rest satisfy NOT NULLs.
+                tx.execute(
+                    "INSERT INTO runs (run_id, namespace_id, repository, \
+                     workflow_path, run_number, run_attempt, run_name, event, \
+                     ref, ref_type, head_ref, base_ref, head_sha, workflow_ref, \
+                     status, conclusion, webhook_delivery_id, origin, actor, \
+                     tree_digest, concurrency_group, \
+                     concurrency_cancel_in_progress, created_at, started_at, \
+                     completed_at) VALUES (?1,'default','test/repo',\
+                     'ci.yml',1,1,'timeline-conclusion-test','push',\
+                     'refs/heads/main','branch',NULL,NULL,'abc123',\
+                     'test/repo/ci.yml@refs/heads/main','in_progress',NULL,NULL,\
+                     'api','tester',NULL,NULL,0,?2,NULL,NULL)",
+                    rusqlite::params![run_id.to_string(), now],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO jobs (run_id, job_id, namespace_id, kind, \
+                     base_id, status, queue_state) \
+                     VALUES (?1,'build','default','job','build','in_progress','claimed')",
+                    rusqlite::params![run_id.to_string()],
+                )
+                .unwrap();
+                let agent_job_id = uuid::Uuid::parse_str(&plan_id_captured).unwrap();
+                tx.execute(
+                    "INSERT INTO job_requests (request_id, run_id, job_id, \
+                     namespace_id, agent_job_id, timeline_id) \
+                     VALUES (?1,?2,'build','default',?3,?4)",
+                    rusqlite::params![
+                        request_id,
+                        run_id.to_string(),
+                        agent_job_id.to_string(),
+                        timeline_id.to_string()
+                    ],
+                )
+                .unwrap();
+            })
+            .await;
         (temp, shared, run_id, job_id, plan_id, timeline_id)
     }
 
@@ -1015,15 +1096,20 @@ mod tests {
         )
         .await;
 
-        let inner = state.inner.lock().await;
-        let run = inner.runs.get(&run_id).expect("run still present");
-        let detail = run
-            .jobs_list
-            .iter()
-            .find(|detail| detail.name == "build")
-            .expect("timeline PATCH created the job detail");
+        // `runs` is authoritative backend state — read it via the backend,
+        // not node-local `inner`.
+        let detail = {
+            let tx = state.test_tx().await;
+            tx.runs.get(&run_id).and_then(|run| {
+                run.jobs_list
+                    .iter()
+                    .find(|detail| detail.name == "build")
+                    .map(|d| d.conclusion.clone())
+            })
+        }
+        .expect("timeline PATCH created the job detail");
         assert_eq!(
-            detail.conclusion, "in_progress",
+            detail, "in_progress",
             "an in-flight job must not read as 'success' or 'inprogress'"
         );
     }
@@ -1124,6 +1210,7 @@ mod tests {
             }),
         )
         .await;
+        let response = response.expect("timeline read");
         let records = response
             .0
             .get("records")
@@ -1207,5 +1294,75 @@ mod tests {
             .find(|(_, step_id)| step_id.as_deref() == Some(&child_task_id.to_string()))
             .expect("child task record produces step_id == Some(task_id) annotation");
         assert!(matches!(task_ann.0, AnnotationLevel::Warning));
+    }
+
+    /// A finished step is not a finished job. A successful step record must
+    /// not publish a terminal `JobStatus` for its job: the first terminal
+    /// status per job wins in `state.emit`, so a premature `success` would
+    /// swallow the job's real (here failing) completion.
+    #[tokio::test]
+    async fn successful_step_does_not_mask_the_jobs_real_completion() {
+        let (_temp, shared, run_id, job_id, plan_id, timeline_id) = seed_inflight_run().await;
+        let state = shared.state.clone();
+        let mut events = state.events.subscribe();
+
+        let job_record_id = uuid::Uuid::new_v4();
+        let wrapper: azdo::VssJsonCollectionWrapper<azdo::TimelineRecord> =
+            serde_json::from_value(serde_json::json!({
+                "count": 1,
+                "value": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "parentId": job_record_id.to_string(),
+                    "name": "Run tests",
+                    "displayName": "Run tests",
+                    "type": "Task",
+                    "state": "completed",
+                    "result": "succeeded"
+                }]
+            }))
+            .expect("valid wire JSON payload");
+        let _ = patch_timeline_records(
+            State(shared.clone()),
+            Path((
+                "scope".to_owned(),
+                "hub".to_owned(),
+                plan_id,
+                timeline_id.to_string(),
+            )),
+            Json(wrapper),
+        )
+        .await;
+
+        // The job then fails at a later step; settlement reports it.
+        state
+            .emit(NdjsonEvent::JobStatus {
+                run_id,
+                job_id: job_id.clone(),
+                status: ExecutionStatus::Failure,
+                reason: None,
+            })
+            .await;
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let NdjsonEvent::JobStatus {
+                job_id: event_job,
+                status,
+                ..
+            } = event
+                && event_job == job_id
+            {
+                statuses.push(status);
+            }
+        }
+        assert_eq!(
+            statuses.last(),
+            Some(&ExecutionStatus::Failure),
+            "the job's real completion must reach subscribers; saw {statuses:?}"
+        );
+        assert!(
+            !statuses.contains(&ExecutionStatus::Success),
+            "a step result must not be published as the job's status; saw {statuses:?}"
+        );
     }
 }

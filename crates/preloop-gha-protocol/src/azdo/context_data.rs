@@ -83,6 +83,20 @@ impl Serialize for PipelineContextData {
             PipelineContextData::Null => serializer.serialize_none(),
             PipelineContextData::String(value) => serializer.serialize_str(value),
             PipelineContextData::Bool(value) => serializer.serialize_bool(*value),
+            // Integral values serialize as JSON integers, matching the
+            // official runner's wire shape (`check_run_id`, `run_number`,
+            // `retention_days`, … are integers, not `0.0`/`90.0`). A bare
+            // `serialize_f64` emits `0.0`, which the conformance schema gate
+            // flags as a changed field type. Non-integral and out-of-i64-range
+            // values keep the float form.
+            PipelineContextData::Number(value)
+                if value.is_finite()
+                    && value.fract() == 0.0
+                    && *value >= i64::MIN as f64
+                    && *value <= i64::MAX as f64 =>
+            {
+                serializer.serialize_i64(*value as i64)
+            }
             PipelineContextData::Number(value) => serializer.serialize_f64(*value),
             PipelineContextData::Array(values) => {
                 struct ArrayValues<'a>(&'a [PipelineContextData]);

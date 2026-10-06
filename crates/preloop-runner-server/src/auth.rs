@@ -96,7 +96,7 @@ pub async fn require_results_bearer(
         return Ok(next.run(request).await);
     }
     if path.starts_with("/twirp-blob/") {
-        // R1-2: this route used to fall through the `!/twirp/` check below
+        // This route used to fall through the `!/twirp/` check below
         // with zero authentication, and blob_put/blob_get joined the raw
         // segments into the filesystem. The gate now owns both problems.
         let path = path.to_owned();
@@ -117,7 +117,7 @@ pub async fn require_results_bearer(
     Ok(next.run(request).await)
 }
 
-/// Authorize `/twirp-blob/{kind}/{token}` requests (R1-2).
+/// Authorize `/twirp-blob/{kind}/{token}` requests.
 ///
 /// The blob endpoints are bearerless by protocol design — the Azure SDK in
 /// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
@@ -189,7 +189,7 @@ async fn authorize_blob_request(
     }
 }
 
-/// R1-10: require the calling job to be live before a Results write.
+/// Require the calling job to be live before a Results write.
 ///
 /// Resolves the job's request record and rejects when the job is unknown
 /// (purged) or has settled/projected to a terminal status — the stale
@@ -207,33 +207,34 @@ pub async fn require_live_results_job(
     require_live_job(state, job_uuid).await
 }
 
-/// Liveness predicate on the already-locked inner state — the in-lock
-/// re-check for handlers that mutate `inner`. Checking under a released
-/// lock leaves a check-then-mutate window where the job settles between
-/// the gate and the write; callers that hold `inner` should re-verify with
-/// this before committing the mutation.
-pub fn job_is_live_locked(inner: &InnerState, job_uuid: uuid::Uuid) -> bool {
-    inner
-        .agent_job_requests
-        .get(&job_uuid)
-        .copied()
-        .and_then(|request_id| inner.job_requests.get(&request_id))
-        .is_some_and(|record| !matches!(record.result, Some(status) if status.is_terminal()))
+/// Liveness predicate on a job, resolved from the control backend: a job is
+/// live while its request record still exists and has not settled to a
+/// terminal status. A purged or unknown job is not live.
+///
+/// Liveness follows the request record, not the projected run status:
+/// cancellation projects `run.jobs` to Cancelled immediately while the
+/// request stays unsettled until the runner finishes reporting — the window
+/// where its final step updates, logs, and uploads must still land. Only a
+/// settled (or purged) request is stale.
+pub async fn job_is_live(state: &AppState, job_uuid: uuid::Uuid) -> Result<bool, ApiError> {
+    match state
+        .backend
+        .request(crate::control::backend::RequestKey::AgentJobId(job_uuid))
+        .await
+    {
+        Ok(record) => Ok(!matches!(record.result, Some(status) if status.is_terminal())),
+        Err(crate::control::ControlError::NotFound(_)) => Ok(false),
+        Err(error) => Err(ApiError::from(error)),
+    }
 }
 
-/// R1-10: require a job UUID to be live before a write, for handlers that
+/// Require a job UUID to be live before a write, for handlers that
 /// authenticate from headers rather than a typed [`ResultsIdentity`]
 /// (the legacy `/_apis/artifactcache` cache write path). Same rule as
 /// [`require_live_results_job`]: the system identity bypasses, so callers
 /// must skip this helper for the system bearer themselves.
 pub async fn require_live_job(state: &AppState, job_uuid: uuid::Uuid) -> Result<(), ApiError> {
-    let inner = state.inner.lock().await;
-    // Liveness follows the request record, not the projected run status:
-    // cancellation projects `run.jobs` to Cancelled immediately while the
-    // request stays unsettled until the runner finishes reporting — the
-    // window where its final step updates, logs, and uploads must still
-    // land. Only a settled (or purged) request is stale.
-    if job_is_live_locked(&inner, job_uuid) {
+    if job_is_live(state, job_uuid).await? {
         Ok(())
     } else {
         Err(ApiError::forbidden(
@@ -547,12 +548,11 @@ pub async fn registered_runner_id(shared: &Arc<SharedState>, token: &str) -> Opt
         let client_id = client_id?;
         shared
             .state
-            .inner
-            .lock()
+            .backend
+            .runner_for_client(&client_id)
             .await
-            .runner_client_ids
-            .get(&client_id)
-            .copied()
+            .ok()
+            .flatten()
     };
     let runner_id = runner_id?;
     runner_registered(shared, runner_id)
@@ -580,11 +580,10 @@ pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
 async fn runner_registered(shared: &Arc<SharedState>, runner_id: i64) -> bool {
     shared
         .state
-        .inner
-        .lock()
+        .backend
+        .runner_exists(runner_id)
         .await
-        .runners
-        .contains_key(&runner_id)
+        .unwrap_or(false)
 }
 
 /// Signed replay blob upload tickets expire after one hour.
@@ -976,20 +975,18 @@ pub async fn job_repository_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let inner = state.inner.lock().await;
-    let repository = inner
-        .agent_job_requests
-        .get(&job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-        .and_then(|record| inner.runs.get(&record.run_id))
-        .map(|run| run.submission.repository.clone())
+    let repository = state
+        .backend
+        .attempt_repository(job_id)
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::forbidden("job runtime token is not bound to a live workflow run")
         })?;
     Ok(Some(repository))
 }
 
-/// R1-5: resolve the git ref of the job behind a job runtime bearer, from
+/// Resolve the git ref of the job behind a job runtime bearer, from
 /// the job → run → submission chain. Mirrors `job_repository_from_headers`.
 /// Returns `None` for the system token (the engine itself has no job).
 pub async fn job_git_ref_from_headers(
@@ -1005,16 +1002,22 @@ pub async fn job_git_ref_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let inner = state.inner.lock().await;
-    let git_ref = inner
-        .agent_job_requests
-        .get(&job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-        .and_then(|record| inner.runs.get(&record.run_id))
-        .map(|run| run.submission.git_ref.clone())
+    let run_id = state
+        .backend
+        .run_for_attempt(job_id)
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::forbidden("job runtime token is not bound to a live workflow run")
         })?;
+    let git_ref = state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?
+        .submission
+        .git_ref
+        .clone();
     Ok(Some(git_ref))
 }
 
@@ -1055,15 +1058,19 @@ pub async fn job_cache_context_from_headers(
     let job_id = state
         .job_uuid_from_token(token)
         .ok_or_else(|| ApiError::unauthorized("job runtime token required"))?;
-    let inner = state.inner.lock().await;
-    let run = inner
-        .agent_job_requests
-        .get(&job_id)
-        .and_then(|request_id| inner.job_requests.get(request_id))
-        .and_then(|record| inner.runs.get(&record.run_id))
+    let run_id = state
+        .backend
+        .run_for_attempt(job_id)
+        .await
+        .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::forbidden("job runtime token is not bound to a live workflow run")
         })?;
+    let run = state
+        .backend
+        .run_record(run_id)
+        .await
+        .map_err(ApiError::from)?;
     let submission = &run.submission;
     let default_branch = submission
         .payload

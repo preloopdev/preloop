@@ -152,7 +152,7 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
                 pending.created_unix = now_u;
             }
         }
-        // F7: drop pending cache/artifact uploads and download tokens older than
+        // drop pending cache/artifact uploads and download tokens older than
         // PENDING_UPLOAD_TTL. Entries restored from a persisted meta have no age
         // and are left alone, so a restart never sweeps a legitimate upload.
         let expired_cache: Vec<String> = inner
@@ -195,76 +195,35 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .join(token);
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
-    let mut inner = shared.state.inner.lock().await;
-    let now = SystemTime::now();
-    let mut cancellations = Vec::new();
-    let mut disconnected_completions = Vec::new();
     // Fork-PR workflow policy: fail closed runs whose 24h approval window
-    // expired while waiting for operator approval. Emitted below, after the
-    // lock is released.
-    let expired_fork_approvals = crate::fork_policy::sweep_expired_fork_approvals(
-        &mut inner,
-        crate::models::now_unix_nanos(),
-    );
-    // Jobs failed by the starvation sweep, emitted after the lock is
-    // released so the event fan-out never runs under the state lock.
-    let mut starved: Vec<(RunId, JobId, String)> = Vec::new();
-
-    let mut active_reqs = Vec::new();
-    for (request_id, request) in &inner.job_requests {
-        if request.result.is_none() {
-            active_reqs.push((
-                *request_id,
-                request.run_id,
-                request.job_id.clone(),
-                request.started_at,
-                request.last_renewed_at,
-                request.timeout_triggered,
-            ));
+    // expired while waiting for operator approval. The fail-closed mutation
+    // is one backend transaction; the per-job events are emitted below, once
+    // the run rows are final.
+    let expired_fork_approvals =
+        crate::fork_policy::sweep_expired_fork_approvals(shared, crate::models::now_unix_nanos())
+            .await;
+    // Everything this tick decides from, read directly: no working-set
+    // load and no lock. Transactions below run only when something is due,
+    // and only over the runs involved.
+    let inputs = match shared.state.backend.reap_inputs().await {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            warn!(?error, "reaper input read failed");
+            return;
+        }
+    };
+    // Stale-binding sweep: the claim/pair path writes
+    // `job_assignments`/`pool_pending`; with none present there is nothing
+    // to reap (the "leaked job bindings" failure mode needs a binding).
+    if inputs.has_bindings {
+        match shared.state.backend.sweep_stale_bindings().await {
+            Ok(0) => {}
+            Ok(swept) => debug!(swept, "swept stale job bindings"),
+            Err(error) => warn!(?error, "stale-binding sweep failed"),
         }
     }
-
-    // Drop sessions whose worker stopped polling before reading pause credit,
-    // and sessions whose job has since ended. Either way a crashed or finished
-    // job must not go on suspending a timeout.
-    let active_request_ids: std::collections::BTreeSet<i64> =
-        active_reqs.iter().map(|(id, ..)| *id).collect();
-    // Pause credit outlives the sessions that earned it: the registry retires
-    // it with the job request, not with the session. The sweep below therefore
-    // cannot retroactively bill a job for time it spent legitimately paused —
-    // which is what used to cancel a job one tick after it resumed.
-    let paused_credits: std::collections::BTreeMap<i64, Duration> = active_reqs
-        .iter()
-        .map(|(id, ..)| (*id, inner.debug_sessions.paused_for_request(*id, now)))
-        .collect();
-    crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
-    crate::runtime_scheduling::sweep_stale_bindings(&mut inner, now);
-
-    // Starvation sweep: a ready-queue job that no runner can ever claim must
-    // not sit queued forever with no explanation. The pool is provisioned on
-    // demand and external runners may register at any moment, so a job is
-    // only failed after a grace window during which nothing matched its
-    // labels. The `queued_at` map is maintained here, from the queue itself:
-    // its first observation uses the persisted ready-enqueue time when
-    // available, and entries are dropped when jobs leave the queue. This
-    // avoids enqueue-site coordination and preserves queue age across
-    // restarts. While a co-hosted pool is still preparing its machine image
-    // (artifact download or build, golden prep) or booting a runner it cannot
-    // register a runner no matter how long the job waits, so keep the job
-    // protected during that warm and do not count the warm against the short
-    // grace: each protected tick re-stamps the observation clock, so the
-    // grace window measures only time waited with no provision in flight.
-    // The protection is bounded by
-    // MAX_QUEUED_GRACE (see below), measured from ready-enqueue, so continuous
-    // provisioning cannot protect an unschedulable job forever.
-    const QUEUED_JOB_GRACE: Duration = Duration::from_secs(120);
-    // Absolute backstop, measured from ready-enqueue, on how long a job whose
-    // labels the pool *can* satisfy may wait for a matching runner. It only
-    // fires when provisioning is genuinely stuck (e.g. every fork/exec fails
-    // and retries forever) — a job that merely outlives a slow warm is not
-    // unschedulable. One hour covers a full golden rebuild plus several
-    // failed provision rounds with headroom.
-    const MAX_QUEUED_GRACE: Duration = Duration::from_secs(3600);
+    // ── Node-local inputs: pool flags + start time ──────────────────────
+    let now = SystemTime::now();
     let pool_status = shared.state.pool_status.snapshot();
     let pool_preparing = shared
         .state
@@ -277,367 +236,241 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
         // raise `provisioning`, not `preparing`, so treat an in-flight
         // provision as preparing or those boots would go unprotected here.
         || pool_status.provisioning > 0;
-    let queued_jobs: Vec<_> = inner.queue.iter().cloned().collect();
-    let in_queue: std::collections::BTreeSet<(RunId, JobId)> = queued_jobs
-        .iter()
-        .map(|job| (job.run_id, job.job_id.clone()))
-        .collect();
-    inner.queued_at.retain(|key, _| in_queue.contains(key));
-    let mut starved_keys: Vec<(RunId, JobId, String)> = Vec::new();
-    for job in &queued_jobs {
-        let key = (job.run_id, job.job_id.clone());
-        let matching = inner.runners.values().any(|runner| {
-            crate::runtime_scheduling::job_matches_runner(&job.runs_on, &runner.labels)
-        });
-        if matching {
-            inner.queued_at.remove(&key);
-            continue;
-        }
-        // Unlike the Linux microVM pool, non-Linux jobs can only run on a
-        // registered host. Keep them queued until that host appears rather
-        // than converting a temporarily empty host pool into a failed job.
-        let needs_external_host = job.runs_on.iter().any(|label| {
-            let label = label.to_ascii_lowercase();
-            label.starts_with("macos") || label.starts_with("windows")
-        });
-        if needs_external_host {
-            inner.queued_at.remove(&key);
-            continue;
-        }
-        let enqueued_at =
-            SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64);
-        let enqueue_age_expired = now
-            .duration_since(enqueued_at)
-            .map(|age| age >= MAX_QUEUED_GRACE)
-            .unwrap_or(true);
-        // Early label validation: when the co-hosted pool has published its
-        // advertised labels, a job whose `runs-on` the pool can never satisfy
-        // fails fast instead of starving. A job that *does* match is exempt
-        // from the short grace path entirely — its runner is guaranteed to
-        // appear once the pool warms, so only the absolute backstop applies.
-        if !pool_status.labels.is_empty() {
-            if crate::runtime_scheduling::job_matches_runner(&job.runs_on, &pool_status.labels) {
-                if !enqueue_age_expired {
-                    inner.queued_at.remove(&key);
-                    continue;
-                }
-            } else {
-                let reason = format!(
-                    "no runner is registered for `runs-on: {}` and the runner \
-                     pool's advertised labels ({}) can never satisfy it, so \
-                     the job cannot be scheduled",
-                    job.runs_on.join(", "),
-                    pool_status.labels.join(", ")
-                );
-                tracing::warn!(
-                    run_id = %job.run_id,
-                    job_id = %job.job_id.0,
-                    labels = ?job.runs_on,
-                    pool_labels = ?pool_status.labels,
-                    "queued job failed fast: runs-on unsatisfiable by runner pool"
-                );
-                starved_keys.push((job.run_id, job.job_id.clone(), reason));
-                continue;
-            }
-        }
-        let grace = if pool_preparing {
-            // A restart restores the queue's original enqueue timestamps but
-            // destroys every pool VM. Give the replacement pool one process-
-            // local warm window before applying the durable queue-age ceiling;
-            // otherwise the first reaper tick fails every old queued job while
-            // the golden and its runners are demonstrably still starting.
-            let enqueued = if job.enqueued_at_unix_nanos > 0 {
-                SystemTime::UNIX_EPOCH + Duration::from_nanos(job.enqueued_at_unix_nanos as u64)
-            } else {
-                now
-            };
-            // Provisioning time does not count against the short grace: stamp
-            // the observation clock at the latest tick the pool was still
-            // working, so the 120s window measures only time the job waited
-            // with no provision in flight. A failed provision followed by a
-            // retry gap must not fail the job for the earlier attempt's
-            // minutes.
-            if shared.state.started_at.elapsed() < MAX_QUEUED_GRACE
-                && now.duration_since(enqueued).unwrap_or_default() < MAX_QUEUED_GRACE
-            {
-                inner.queued_at.insert(key.clone(), now);
-                continue;
-            }
-            // The pool is warming or booting a runner that may serve this
-            // job, so hold the grace window rather than failing a job whose
-            // runner is genuinely on the way. Bound the hold by
-            // MAX_QUEUED_GRACE measured from ready-enqueue: once a job has
-            // waited that long it starves even while the pool is still
-            // preparing, so sustained provisioning cannot mask it forever.
-            if !enqueue_age_expired {
-                inner.queued_at.insert(key.clone(), now);
-                continue;
-            }
-            MAX_QUEUED_GRACE
-        } else {
-            // Seed the observation clock from the persisted ready-enqueue
-            // timestamp so restart does not grant a fresh grace window.
-            let first_seen = *inner.queued_at.entry(key.clone()).or_insert(enqueued_at);
-            if now
-                .duration_since(first_seen)
-                .map(|age| age < QUEUED_JOB_GRACE)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            QUEUED_JOB_GRACE
-        };
-        let reason = format!(
-            "no runner is registered for `runs-on: {}` and none appeared \
-             within {}s, so the job cannot be scheduled",
-            job.runs_on.join(", "),
-            grace.as_secs()
-        );
-        tracing::warn!(
-            run_id = %job.run_id,
-            job_id = %job.job_id.0,
-            labels = ?job.runs_on,
-            "starving queued job failed after {}s without a matching runner",
-            grace.as_secs()
-        );
-        starved_keys.push((job.run_id, job.job_id.clone(), reason));
-    }
-    for (run_id, job_id, reason) in starved_keys {
-        inner.queued_at.remove(&(run_id, job_id.clone()));
-        starved.push((run_id, job_id, reason));
-    }
+    let started_at = shared.state.started_at;
 
-    for (request_id, run_id, job_id, started_at, last_renewed_at, timeout_triggered) in active_reqs
-    {
-        // 1. Check Timeout Enforcement
-        if let Some(started_at) = started_at
-            && !timeout_triggered
-        {
-            // Time spent paused at a failed step is debugging, not
-            // execution. Without this subtraction a `timeout-minutes: 10`
-            // job is cancelled ten minutes into a debug session, through a
-            // path no client can see.
-            let paused = paused_credits.get(&request_id).copied().unwrap_or_default();
-            let elapsed = now
-                .duration_since(started_at)
+    // ── Active attempts + the ready queue (from `inputs`) ────────────────
+    let queued_jobs = inputs.ready.clone();
+    // Runs with something due: a timeout or lease past its limit (a
+    // superset: paused debug time only shortens the elapsed time), or a
+    // ready job no runner can take (or one whose first-seen mark must clear).
+    let mut due_runs: std::collections::BTreeSet<RunId> = std::collections::BTreeSet::new();
+    for request in &inputs.active {
+        let elapsed = |at: Option<SystemTime>| {
+            at.and_then(|at| now.duration_since(at).ok())
                 .unwrap_or_default()
-                .saturating_sub(paused);
-            let job_timeout = inner
-                .broker_messages
-                .get(&request_id)
-                .and_then(|msg| msg.job_timeout)
-                .unwrap_or(21600); // 360 minutes in seconds
-
-            if elapsed >= Duration::from_secs(job_timeout as u64) {
-                info!(
-                    %run_id,
-                    %job_id,
-                    request_id,
-                    "Job timed out after {}s",
-                    job_timeout
-                );
-                if let Some(req) = inner.job_requests.get_mut(&request_id) {
-                    req.timeout_triggered = true;
+        };
+        let timed_out = request.started_at.is_some()
+            && !request.timeout_triggered
+            && elapsed(request.started_at)
+                >= Duration::from_secs(request.job_timeout_s.unwrap_or(21600).max(0) as u64);
+        let lease_expired = request.last_renewed_at.is_some()
+            && elapsed(request.last_renewed_at)
+                >= Duration::from_secs(if request.session_live {
+                    crate::distributed_task::HUNG_WORKER_LEASE_SECONDS
+                } else {
+                    crate::distributed_task::DEAD_SESSION_LEASE_SECONDS
+                });
+        if timed_out || lease_expired {
+            due_runs.insert(request.run_id);
+        }
+    }
+    // Node-local starvation marks. The verdict here decides
+    // only the mark; the backend re-evaluates the same verdict inside its
+    // transaction, where the conditional ready→failure UPDATE is the
+    // one-writer-wins guard across nodes.
+    let first_seen = {
+        let mut inner = shared.state.inner.lock().await;
+        let marks = &mut inner.reaper_first_seen;
+        let in_queue: std::collections::BTreeSet<(RunId, JobId)> = inputs
+            .ready
+            .iter()
+            .map(|job| (job.run_id, job.job_id.clone()))
+            .collect();
+        marks.retain(|key, _| in_queue.contains(key));
+        for job in &inputs.ready {
+            let key = (job.run_id, job.job_id.clone());
+            let any_runner_matches = inputs
+                .runner_labels
+                .iter()
+                .any(|labels| crate::runtime_scheduling::job_matches_runner(&job.runs_on, labels));
+            // An unmarked job measures from its enqueue instant (an unknown
+            // age — `enqueued_at` 0 after a restore — is not granted a fresh
+            // window); the verdict's `Mark` carries the instant to keep.
+            let candidate = crate::control::logic::StarvationCandidate {
+                runs_on: &job.runs_on,
+                enqueued_at: std::time::UNIX_EPOCH
+                    + Duration::from_nanos(job.enqueued_at_unix_nanos as u64),
+                first_seen: marks.get(&key).copied(),
+                any_runner_matches,
+            };
+            match crate::control::logic::starvation_verdict(
+                &candidate,
+                now,
+                pool_preparing,
+                started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+                &pool_status.labels,
+            ) {
+                crate::control::logic::StarvationVerdict::ClearMark => {
+                    marks.remove(&key);
                 }
-                if let Some(agent_job_id) = agent_job_id_for(&inner, run_id, &job_id) {
-                    cancellations.push(QueuedCancellation {
-                        run_id,
-                        job_id: job_id.clone(),
-                        agent_job_id,
-                    });
+                // Provisioning protection re-stamps the observation clock;
+                // ordinary unmatched jobs keep the first observation.
+                crate::control::logic::StarvationVerdict::Mark { first_seen } => {
+                    if pool_preparing {
+                        marks.insert(key, first_seen);
+                    } else {
+                        marks.entry(key).or_insert(first_seen);
+                    }
+                }
+                // The mark stays until the job leaves the ready queue
+                // (`retain` above): the backend re-evaluates this verdict
+                // with the same mark, and a lost race re-decides identically.
+                crate::control::logic::StarvationVerdict::Starve { .. }
+                | crate::control::logic::StarvationVerdict::Unschedulable { .. } => {
+                    due_runs.insert(job.run_id);
                 }
             }
         }
+        marks.clone()
+    };
+    // ── Node-local: debug-session sweep + pause credits ─────────────────
+    // Drop sessions whose worker stopped polling before reading pause credit,
+    // and sessions whose job has since ended. Either way a crashed or finished
+    // job must not go on suspending a timeout.
+    let active_request_ids: std::collections::BTreeSet<i64> = inputs
+        .active
+        .iter()
+        .map(|request| request.request_id)
+        .collect();
+    // Pause credit outlives the sessions that earned it: the registry retires
+    // it with the job request, not with the session. The sweep below therefore
+    // cannot retroactively bill a job for time it spent legitimately paused —
+    // which is what used to cancel a job one tick after it resumed.
+    let paused_credits: std::collections::BTreeMap<i64, Duration> = {
+        let mut inner = shared.state.inner.lock().await;
+        let credits = active_request_ids
+            .iter()
+            .map(|id| (*id, inner.debug_sessions.paused_for_request(*id, now)))
+            .collect();
+        crate::debug_sessions::sweep(&mut inner.debug_sessions, now, &active_request_ids);
+        credits
+    };
 
-        // 2. Check Lease Expiration / Disconnect Reaper
-        //
-        // Two distinct clocks guard a claimed job. The job lease
-        // (`last_renewed_at`) is the *worker* heartbeat — the runner renews it
-        // every ~60s from a dedicated task. The session poll
-        // (`session_last_seen`) is the *listener* heartbeat — the runner polls
-        // the broker on a separate thread. A hung worker stops renewing while
-        // its listener keeps polling, so the session looks alive and the slot
-        // is held until the full lease elapses. Detect that divergence —
-        // fresh session, stale lease — and reap on the worker's own cadence
-        // instead of waiting out the disconnect timeout. Requiring the session
-        // to be live is what separates a wedged worker from a guest network
-        // partition, which would silence both clocks at once.
-        if let Some(last_renewed_at) = last_renewed_at {
-            let elapsed = now.duration_since(last_renewed_at).unwrap_or_default();
-            let session_live = inner
-                .session_active_requests
-                .iter()
-                .find(|(_, active)| **active == request_id)
-                .and_then(|(session_id, _)| inner.session_last_seen.get(session_id))
-                .is_some_and(|seen| {
-                    std::time::Instant::now().duration_since(*seen) < inner.runner_liveness_timeout
-                });
-            // A healthy worker renews every ~60s; three missed renewals while
-            // the session still polls means the renew task is dead, not slow.
-            let hung_worker =
-                session_live && elapsed >= Duration::from_secs(HUNG_WORKER_LEASE_SECONDS);
-            let lease_expired = elapsed >= Duration::from_secs(JOB_LEASE_SECONDS);
-            if hung_worker || lease_expired {
-                let cause = if hung_worker {
-                    format!(
-                        "worker stopped renewing {}s ago but its session is still polling; treating as hung",
-                        elapsed.as_secs()
-                    )
-                } else {
-                    format!(
-                        "Runner lease expired (last renewed {}s ago)",
-                        elapsed.as_secs()
-                    )
-                };
-                info!(
-                    %run_id,
-                    %job_id,
-                    request_id,
-                    "{cause}. Marking job as failed."
-                );
-                if let Some(req) = inner.job_requests.get_mut(&request_id) {
-                    req.result = Some(ExecutionStatus::Failure);
-                }
-                disconnected_completions.push((
-                    request_id,
-                    JobCompletion {
-                        run_id,
-                        job_id: job_id.clone(),
-                        // The lease that expired names the attempt exactly.
-                        agent_job_id: inner
-                            .job_requests
-                            .get(&request_id)
-                            .map(|record| record.agent_job_id),
+    // ── Authoritative sweep: starvation, timeout, lease-expiry ──────────
+    // Starvation sweep: a ready-queue job that no runner can ever claim must
+    // not sit queued forever with no explanation. The pool is provisioned on
+    // demand and external runners may register at any moment, so a job is
+    // only failed after a grace window during which nothing matched its
+    // labels (`logic::starvation_verdict`). While a co-hosted pool is still
+    // preparing its machine image or booting a runner the job stays
+    // protected, bounded by the verdict's absolute ceiling measured from
+    // ready-enqueue, so continuous provisioning cannot protect an
+    // unschedulable job forever. Time paused at a failed debug step is not
+    // execution time, so it is credited against `timeout-minutes`.
+    let (cancellation_count, disconnected_completions, starved) = if due_runs.is_empty() {
+        (0, Vec::new(), Vec::new())
+    } else {
+        let sweep = crate::control::types::ReapSweep {
+            now,
+            runs: due_runs,
+            ready: queued_jobs,
+            active: inputs.active.clone(),
+            paused: paused_credits,
+            pool_preparing,
+            warm_window_open: started_at.elapsed() < crate::control::logic::MAX_QUEUED_GRACE,
+            pool_labels: pool_status.labels.clone(),
+            first_seen,
+        };
+        match shared.state.backend.reap_sweep(sweep).await {
+            Ok(outcome) => {
+                let completions: Vec<JobCompletion> = outcome
+                    .expired
+                    .into_iter()
+                    .map(|lease| JobCompletion {
+                        run_id: lease.run_id,
+                        job_id: lease.job_id,
+                        agent_job_id: lease.agent_job_id,
                         status: ExecutionStatus::Failure,
                         outputs: Default::default(),
                         annotations: Vec::new(),
                         step_results: Vec::new(),
-                    },
-                ));
+                    })
+                    .collect();
+                (outcome.cancellations, completions, outcome.starved)
+            }
+            Err(error) => {
+                warn!(?error, "reaper sweep failed");
+                (0, Vec::new(), Vec::new())
             }
         }
-    }
+    };
 
-    // Cleanup session and inflight maps for disconnected runners
-    for (request_id, _) in &disconnected_completions {
-        inner.inflight_requests.remove(request_id);
-        inner
-            .session_active_requests
-            .retain(|_, &mut v| v != *request_id);
-    }
-
-    // Apply cancellations
-    let cancellation_count = cancellations.len();
-    if cancellation_count > 0 {
-        inner.cancellation_queue.extend(cancellations);
-    }
-
-    // Apply starvation failures: remove each job from the ready queue and
-    // mark it terminal in its run, so dependents unblock and a run with no
-    // surviving jobs concludes. The reason is emitted after the lock, along
-    // with a per-run status update (see below): without a `RunStatus` on the
-    // event stream the run looks unfinished to stream watchers forever even
-    // though the record already concluded.
-    //
-    // The per-run status is snapshotted after every starved job is applied:
-    // several starved jobs can belong to one run, and the status computed
-    // after the first failure is not the run's conclusion. Publishing that
-    // intermediate status would keep stream watchers waiting on a run the
-    // engine has already failed.
-    let mut starved_run_ids: Vec<RunId> = Vec::new();
-    for (run_id, job_id, _reason) in &starved {
-        inner
-            .queue
-            .retain(|job| job.run_id != *run_id || job.job_id != *job_id);
-        if let Some(run) = inner.runs.get_mut(run_id) {
-            run.jobs.insert(job_id.clone(), ExecutionStatus::Failure);
-            run.status = crate::runtime_scheduling::summarize_run(run.jobs.values().copied());
-            crate::runtime_scheduling::finalize_run_if_complete(run);
-        }
-        if !starved_run_ids.contains(run_id) {
-            starved_run_ids.push(*run_id);
-        }
-    }
-    let starved_runs: Vec<(RunId, ExecutionStatus)> = starved_run_ids
-        .iter()
-        .filter_map(|run_id| inner.runs.get(run_id).map(|run| (*run_id, run.status)))
-        .collect();
-
-    // Record queue-wait for every starved job so the histogram covers all
-    // terminal outcomes, not just `claimed`. `unschedulable` = the pool's
-    // advertised labels can never match; `starved` = a matching runner
-    // never appeared inside the backstop.
-    for (run_id, job_id, reason) in &starved {
-        let outcome = if reason.contains("can never satisfy") {
-            "unschedulable"
-        } else {
-            "starved"
-        };
-        if let Some(job) = queued_jobs
+    // Queue-wait for every starved job, so the histogram covers every
+    // terminal queue outcome, not just `claimed`: `unschedulable` = the
+    // pool's advertised labels can never match; `starved` = a matching
+    // runner never appeared inside the grace window.
+    for job in &starved {
+        if let Some(ready) = inputs
+            .ready
             .iter()
-            .find(|job| job.run_id == *run_id && job.job_id == *job_id)
+            .find(|ready| ready.run_id == job.run_id && ready.job_id == job.job_id)
         {
-            let elapsed_nanos = (std::time::SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i128)
-                .saturating_sub(job.enqueued_at_unix_nanos as i128);
-            if elapsed_nanos > 0 {
+            let enqueued_at =
+                std::time::UNIX_EPOCH + Duration::from_nanos(ready.enqueued_at_unix_nanos as u64);
+            if let Ok(wait) = now.duration_since(enqueued_at) {
                 shared
                     .state
                     .observability
                     .metrics()
                     .lifecycle
                     .record_queue_wait(
-                        outcome,
-                        std::time::Duration::from_nanos(elapsed_nanos as u64),
+                        if job.unschedulable {
+                            "unschedulable"
+                        } else {
+                            "starved"
+                        },
+                        wait,
                     );
             }
         }
     }
 
-    drop(inner);
+    // Run statuses for the jobs the sweep just failed, read back from the
+    // authoritative rows: `reap_sweep` applied the starvation failures and
+    // recomputed each affected run inside its transaction, so the post-sweep
+    // status is the run's conclusion. Several starved jobs can share a run,
+    // and the status after the first failure is not that conclusion — the
+    // reads happen after every failure was applied, not per job.
+    let mut starved_run_ids: Vec<RunId> = Vec::new();
+    for job in &starved {
+        if !starved_run_ids.contains(&job.run_id) {
+            starved_run_ids.push(job.run_id);
+        }
+    }
+    let mut starved_runs: Vec<(RunId, ExecutionStatus)> = Vec::new();
+    for run_id in starved_run_ids {
+        match shared.state.backend.run_record(run_id).await {
+            Ok(record) => starved_runs.push((run_id, record.status)),
+            Err(error) => debug!(?error, %run_id, "starved run status read failed"),
+        }
+    }
 
     // Liveness sweep: a session that stops polling is a deaf runner — its
     // in-guest control bridge died (e.g. the guest network was not up at
     // fork and the bridge gave up). Purge it so the unfinished job goes
     // back on the queue for a fresh machine instead of sitting in_progress
-    // until the 45-minute job lease fails it, and so the pool stops handing
-    // the dead machine new jobs. Restored sessions from a restart have no
+    // until the lease reaper fails it, and so the pool stops handing the
+    // dead machine new jobs. Restored sessions from a restart have no
     // last-seen entry and are deliberately skipped here (the runner
     // re-registers and polls, or the lease reaper bounds them).
-    let (stale_runners, phantom_runners) = {
-        let inner = shared.state.inner.lock().await;
-        let now = std::time::Instant::now();
-        let stale: std::collections::BTreeSet<i64> = inner
-            .session_last_seen
-            .iter()
-            .filter(|(_, seen)| now.duration_since(**seen) > inner.runner_liveness_timeout)
-            .filter_map(|(session_id, _)| inner.runner_id_for_session(session_id))
-            .collect();
-        // Reap registrations with no active AzDO or broker session and no
-        // successful poll within the liveness timeout.
-        let phantom: std::collections::BTreeSet<i64> = inner
-            .runner_registered_at
-            .iter()
-            .filter(|(runner_id, registered_at)| {
-                now.duration_since(**registered_at) > inner.runner_liveness_timeout
-                    && !inner.sessions.values().any(|s| s.runner_id == **runner_id)
-                    && !inner
-                        .broker_session_runners
-                        .values()
-                        .any(|session_runner_id| *session_runner_id == **runner_id)
-            })
-            .map(|(runner_id, _)| *runner_id)
-            .collect();
-        (stale, phantom)
-    };
+    // Liveness sweep on the authoritative backend: `sessions`,
+    // `broker_session_runners`, `runner_registered_at`, `session_last_seen`
+    // and `runner_liveness_timeout` are all backend rows. Reading the dead
+    // node-local maps here would mark every restored runner "phantom" (both
+    // session negations unconditionally true) and purge live identities.
+    let (stale_runners, phantom_runners) = (inputs.stale_runners, inputs.phantom_runners);
     for runner_id in stale_runners {
         warn!(
             runner_id,
             "liveness sweep: reaping deaf runner (no poll within timeout)"
         );
-        purge_runner_identity(shared, runner_id).await;
+        if let Err(error) = purge_runner_identity(shared, runner_id).await {
+            tracing::error!(
+                ?error,
+                runner_id,
+                "liveness purge failed — deaf runner's listen token remains valid"
+            );
+        }
     }
     for runner_id in phantom_runners {
         warn!(
@@ -657,13 +490,14 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     // GitHub check runs: without this a check run created at webhook intake
     // stays `queued` on GitHub indefinitely for a terminal run.
     for run_id in &expired_fork_approvals {
-        let failed_jobs: Vec<JobId> = {
-            let inner = shared.state.inner.lock().await;
-            inner
-                .runs
-                .get(run_id)
-                .map(|run| run.jobs.keys().cloned().collect())
-                .unwrap_or_default()
+        // The run's jobs, from the authoritative rows: the sweep above
+        // already failed every non-terminal job in the database.
+        let failed_jobs: Vec<JobId> = match shared.state.backend.run_job_ids(*run_id).await {
+            Ok(job_ids) => job_ids.into_iter().map(JobId).collect(),
+            Err(error) => {
+                warn!(?error, %run_id, "fork-approval job list read failed");
+                Vec::new()
+            }
         };
         for job_id in failed_jobs {
             shared
@@ -695,20 +529,20 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
 
     // Surface why a queued job was failed. Without this the only record is a
     // server-side log line the workflow author never sees.
-    for (run_id, job_id, reason) in &starved {
+    for job in &starved {
         shared
             .state
             .emit(NdjsonEvent::JobStatus {
-                run_id: *run_id,
-                job_id: job_id.clone(),
+                run_id: job.run_id,
+                job_id: job.job_id.clone(),
                 status: ExecutionStatus::Failure,
-                reason: Some(reason.clone()),
+                reason: Some(job.reason.clone()),
             })
             .await;
         crate::github::report_check_run_completed(
             shared,
-            *run_id,
-            job_id,
+            job.run_id,
+            &job.job_id,
             ExecutionStatus::Failure,
         )
         .await;
@@ -732,32 +566,48 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
             .await;
     }
 
-    // Process completions for disconnected runners
-    for (_, completion) in disconnected_completions {
-        let _ = complete_job_inner(shared.clone(), completion).await;
+    // A completion is post-sweep housekeeping. Never let one stuck
+    // completion wedge the only reaper task and prevent later lease expiry
+    // attempts from being processed.
+    for completion in disconnected_completions {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            complete_job_inner(shared.clone(), completion),
+        )
+        .await
+        {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => warn!("reaper completion exceeded 30s; will retry on the next tick"),
+        }
     }
 
     // Environment protection gates: wait timers expire and approval windows
-    // close on wall-clock time, not on scheduling events. Re-run promotion
-    // so newly-satisfied gates release their jobs and expired approval
-    // windows fail closed. Skipped entirely when no job carries gate state.
+    // close on wall-clock time, not on scheduling events, so re-run admission
+    // for every run parking a gate-armed job — newly-satisfied gates release
+    // their jobs and expired approval windows fail closed. The command is a
+    // no-op for runs with no parked gate, so the tick can always ask.
+    match shared
+        .state
+        .backend
+        .promote_ready_jobs(None, &shared.state.environment_rules)
+        .await
     {
-        let mut inner = shared.state.inner.lock().await;
-        if inner
-            .pending_jobs
-            .iter()
-            .any(|job| job.environment_gate.is_some())
-        {
-            crate::runtime_scheduling::promote_ready_jobs(
-                &mut inner,
-                &shared.state.environment_rules,
-                &shared.state.pool_status.snapshot().labels,
-            );
+        Ok(outcome) => {
+            // Post-commit: refresh the node-local mirrors the runner
+            // supervisor and the pool read, then wake them if the sweep
+            // changed what is schedulable.
             shared
                 .state
                 .queue_depth
-                .store(inner.queue.len(), std::sync::atomic::Ordering::Release);
+                .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+            if let Ok(mut guard) = shared.state.next_job_runs_on.write() {
+                *guard = outcome.next_runs_on;
+            }
+            if outcome.promoted > 0 || outcome.failed > 0 {
+                shared.state.message_notify.notify_waiters();
+            }
         }
+        Err(error) => warn!(?error, "environment gate promotion sweep failed"),
     }
 }
 
@@ -773,8 +623,10 @@ async fn run_background_reaper(shared: Arc<SharedState>) {
     while !shared.shutdown.is_cancelled() {
         tokio::select! {
             _ = interval.tick() => {
-                heartbeat.beat("reaper");
                 reap_once(&shared).await;
+                // Beat after the sweep: a wedged or missing sweep must
+                // surface as a stale critical task, not a live heartbeat.
+                heartbeat.beat("reaper");
             }
             _ = shared.shutdown.cancelled() => {
                 break;
@@ -806,232 +658,116 @@ async fn run_checkout_cache_pruner(shared: Arc<SharedState>) {
     }
 }
 
-/// Everything the operational snapshot reads from `inner`, collected under a
-/// single lock acquisition. The 5s sampler and the startup seed after a store
-/// restore both build their snapshots from this, so the two cannot drift.
-#[derive(Default)]
-struct SnapshotInputs {
-    queue_len: usize,
-    pending_jobs_len: usize,
-    pending_expansions_len: usize,
-    expanding_len: usize,
-    runs_queued: u32,
-    runs_in_progress: u32,
-    runs_completed: u32,
-    active_runs: Vec<preloop_observability::status::ActiveRunSnapshot>,
-    /// `in_progress` runs with no queued, claimed, or pending job and no
-    /// assigned runner — nothing is executing them.
-    orphaned_run_ids: Vec<String>,
-    registered: u32,
-    /// Distinct session ids across the modern broker map and the legacy map
-    /// (every session creation path inserts into both, so the sum would
-    /// double count).
-    sessions: u32,
-    runner_idle: u32,
-    runner_busy: u32,
-    runner_stale: u32,
-    /// Pool-managed runners currently executing a job. The pool section's
-    /// `busy` counter has no other source: the orchestrator only tracks warm
-    /// idle slots, so without this it always read zero while the pool ran
-    /// jobs. Restricted to `pool_proven_runners` so external runners do not
-    /// inflate the pool's own view.
-    pool_busy: u32,
-    runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
-    oldest_ready_seconds: Option<f64>,
-    oldest_ready_run_id: Option<String>,
-    oldest_ready_job_id: Option<String>,
-    /// Per queued job, in queue order: the `runs-on` labels and any explicit
-    /// runner group. Only this label surface is needed for claimability —
-    /// never the full message payload.
-    queue_runner_reqs: Vec<(Vec<String>, Option<String>)>,
-    /// Capabilities (labels + group identity) of every registered runner.
-    runner_caps: Vec<RunnerCapabilities>,
-    debug_active_sessions: u32,
-    debug_oldest_session_seconds: Option<f64>,
-    /// Jobs parked behind job-level concurrency gates (FIFO).
-    concurrency_blocked: u32,
-    /// Concurrency-group admission state, derived from
-    /// `inner.concurrency_groups`. Queue-mode limits and overflow counts are
-    /// not tracked in group state and stay zero.
-    concurrency_groups_active: u32,
-    concurrency_groups_contended: u32,
-    concurrency_pending_holders: u32,
-    concurrency_deepest_group_pending: u32,
-    released_bindings: u64,
+/// Move settled run rows out of the hot scheduler tables. A missed wakeup or
+/// process crash is repaired by the next scan; each batch commits atomically.
+async fn run_history_archiver(shared: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                archive_finished_runs_once(&shared).await;
+                // Timelines replay a running job to its runner; one idle for a
+                // week belongs to a job long finished.
+                let week_ago = (chrono::Utc::now() - chrono::Duration::days(7)).timestamp_micros();
+                if let Err(error) = shared.state.backend.prune_timelines(week_ago).await {
+                    tracing::warn!(?error, "timeline prune failed; will retry");
+                }
+                prune_outbox_once(&shared, outbox_retention()).await;
+            }
+            _ = shared.shutdown.cancelled() => break,
+        }
+    }
 }
 
-fn count_run_statuses(statuses: impl IntoIterator<Item = ExecutionStatus>) -> (u32, u32, u32) {
-    let mut queued = 0;
-    let mut in_progress = 0;
-    let mut completed = 0;
-    for status in statuses {
-        match status {
-            ExecutionStatus::Queued => queued += 1,
-            ExecutionStatus::Pending | ExecutionStatus::InProgress => in_progress += 1,
-            ExecutionStatus::Success
-            | ExecutionStatus::Failure
-            | ExecutionStatus::Skipped
-            | ExecutionStatus::Cancelled => completed += 1,
-        }
-    }
-    (queued, in_progress, completed)
+/// Outbox rows are only needed for the live fan-out window (no durable
+/// consumer reads them yet): older rows are deleted. Env:
+/// `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600).
+fn outbox_retention() -> Duration {
+    Duration::from_secs(
+        std::env::var("PRELOOP_OUTBOX_RETENTION_SECONDS")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+            .unwrap_or(3600),
+    )
 }
 
-/// Collect [`SnapshotInputs`] from `inner` while the state lock is held.
-fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
-    let (runs_queued, runs_in_progress, runs_completed) =
-        count_run_statuses(inner.runs.values().map(|run| run.status));
-    let mut runner_ids_by_run: std::collections::BTreeMap<RunId, std::collections::BTreeSet<i64>> =
-        std::collections::BTreeMap::new();
-    for (key, assignment) in &inner.job_assignments {
-        if let Some(runner_id) = assignment.runner_id {
-            runner_ids_by_run
-                .entry(key.0)
-                .or_default()
-                .insert(runner_id);
-        }
-    }
-    for request in inner.job_requests.values() {
-        if request.result.is_none()
-            && let Some(runner_id) = request.owner_runner_id
-        {
-            runner_ids_by_run
-                .entry(request.run_id)
-                .or_default()
-                .insert(runner_id);
-        }
-    }
-    let mut active_runs: Vec<_> = inner
-        .runs
-        .values()
-        .filter(|run| !run.status.is_terminal())
-        .map(|run| {
-            let assigned_runners = runner_ids_by_run
-                .get(&run.run_id)
-                .into_iter()
-                .flatten()
-                .filter_map(|runner_id| inner.runners.get(runner_id))
-                .map(|runner| runner.name.clone())
-                .collect();
-            preloop_observability::status::ActiveRunSnapshot {
-                run_id: run.run_id.to_string(),
-                workflow: run.workflow_path_str.clone(),
-                status: serde_json::to_value(run.status)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                event: run.event.clone(),
-                started_at: run.started_at,
-                assigned_runners,
+/// Delete expired outbox rows in batches until a short batch or an error.
+/// Returns rows removed. Split out so a test can drive a pass.
+pub(crate) async fn prune_outbox_once(shared: &SharedState, older_than: Duration) -> u64 {
+    const BATCH: usize = 5_000;
+    let mut removed_total = 0;
+    loop {
+        match shared.state.backend.prune_outbox(older_than, BATCH).await {
+            Ok(removed) => {
+                removed_total += removed;
+                if removed < BATCH as u64 {
+                    break;
+                }
             }
-        })
-        .collect();
-    active_runs.sort_by(|left, right| {
-        right
-            .started_at
-            .cmp(&left.started_at)
-            .then_with(|| right.run_id.cmp(&left.run_id))
-    });
-    // A run can sit `in_progress` while nothing is executing it: its claim
-    // leaked, its machine died, or a restart dropped the pairing. Those runs
-    // are exactly what an operator hunts for during a stall, so name them
-    // instead of leaving the aggregate counts to imply progress.
-    let live_run_ids: std::collections::BTreeSet<RunId> = inner
-        .queue
-        .iter()
-        .map(|job| job.run_id)
-        .chain(inner.claimed_jobs.keys().map(|(run_id, _)| *run_id))
-        .chain(inner.pending_jobs.iter().map(|job| job.run_id))
-        .collect();
-    let orphaned_run_ids: Vec<String> = active_runs
-        .iter()
-        .filter(|run| run.status == "in_progress" && run.assigned_runners.is_empty())
-        .filter(|run| {
-            run.run_id
-                .parse::<uuid::Uuid>()
-                .map(RunId)
-                .is_ok_and(|run_id| !live_run_ids.contains(&run_id))
-        })
-        .map(|run| run.run_id.clone())
-        .collect();
-    let now_unix_nanos = crate::models::now_unix_nanos();
-    let oldest_ready = inner
-        .queue
-        .iter()
-        .filter(|job| job.enqueued_at_unix_nanos != 0)
-        .min_by_key(|job| job.enqueued_at_unix_nanos);
-    let oldest_ready_seconds = oldest_ready.map(|job| {
-        now_unix_nanos.saturating_sub(job.enqueued_at_unix_nanos) as f64 / 1_000_000_000.0
-    });
-    let session_ids: std::collections::BTreeSet<&String> = inner
-        .broker_session_runners
-        .keys()
-        .chain(inner.sessions.keys())
-        .collect();
-
-    // Runner state: busy = an owned session holds an active job assignment;
-    // stale = every owned session stopped polling; idle = at least one live
-    // session and neither busy nor stale. A registered runner with no session
-    // is only a pre-provisioned successor: it cannot poll until its slot starts.
-    // Busy and stale remain independent — a runner that stopped polling
-    // mid-job is both.
-    let now = std::time::Instant::now();
-    let mut runner_idle = 0u32;
-    let mut runner_busy = 0u32;
-    let mut runner_stale = 0u32;
-    let mut pool_busy = 0u32;
-    for runner_id in inner.runners.keys() {
-        let mut owned: std::collections::BTreeSet<&String> = inner
-            .broker_session_runners
-            .iter()
-            .filter(|(_, owner)| **owner == *runner_id)
-            .map(|(session_id, _)| session_id)
-            .collect();
-        owned.extend(
-            inner
-                .sessions
-                .iter()
-                .filter(|(_, session)| session.runner_id == *runner_id)
-                .map(|(session_id, _)| session_id),
-        );
-        let busy = owned
-            .iter()
-            .any(|session_id| inner.session_active_requests.contains_key(*session_id));
-        // Sessions restored from a restart have no last-seen entry; like the
-        // liveness sweep, treat an unknown poll time as not-yet-stale rather
-        // than asserting staleness we cannot observe.
-        let stale = !owned.is_empty()
-            && owned.iter().all(|session_id| {
-                inner
-                    .session_last_seen
-                    .get(*session_id)
-                    .is_some_and(|seen| now.duration_since(*seen) > STALENESS_THRESHOLD)
-            });
-        if busy {
-            runner_busy += 1;
-            if inner.pool_proven_runners.contains(runner_id) {
-                pool_busy += 1;
+            Err(error) => {
+                tracing::warn!(?error, "outbox prune failed; will retry");
+                break;
             }
         }
-        if stale {
-            runner_stale += 1;
-        }
-        if !owned.is_empty() && !busy && !stale {
-            runner_idle += 1;
+    }
+    removed_total
+}
+
+/// Drain one archive pass: move settled runs to history in batches until a
+/// short batch or an error, and return how many runs moved. Split out so a
+/// test can drive a pass deterministically instead of racing the interval.
+pub(crate) async fn archive_finished_runs_once(shared: &SharedState) -> usize {
+    let mut archived_total = 0;
+    loop {
+        match shared.state.backend.archive_finished_runs(32).await {
+            Ok(archived) => {
+                archived_total += archived.len();
+                // Run-tier secrets are NOT dropped here. Archiving only moves
+                // settled rows into history, and a run in history can still be
+                // re-run — `rerun` reads the original run tier. There is no
+                // run-history retention/pruning yet, so the run tier lives as
+                // long as the run's history; when retention lands, drop the
+                // tier where the history row is removed.
+                if archived.len() < 32 {
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(?error, "run history archive failed; will retry");
+                break;
+            }
         }
     }
-    // Live runner -> job pairings, sourced from claimed job requests (each
-    // carries its claiming runner). NOT from the assignment table, which
-    // holds only pre-claim reservations removed at claim time.
-    let assignments = crate::runtime_scheduling::live_runner_assignments(
-        &inner.job_requests,
-        &inner.session_active_requests,
-        std::time::SystemTime::now(),
-    );
+    archived_total
+}
 
-    // Live debug sessions: count open sessions and the age of the oldest.
-    let debug_sessions = inner.debug_sessions.list();
-    let debug_oldest_session_seconds = debug_sessions
+/// Everything the operational snapshot reads from durable control state
+/// (`ControlBackend::status_inputs`). The 5s sampler and the startup seed
+/// after a store restore both build their snapshots from this, so the two
+/// cannot drift.
+type SnapshotInputs = crate::control::types::StatusInputs;
+
+/// Read the durable status inputs; a failed read degrades to an empty
+/// snapshot rather than blocking the status publisher.
+async fn read_snapshot_inputs(state: &AppState) -> SnapshotInputs {
+    match state
+        .backend
+        .status_inputs(crate::runs::STALENESS_THRESHOLD)
+        .await
+    {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            warn!(?error, "status input read failed");
+            SnapshotInputs::default()
+        }
+    }
+}
+
+/// `(open_session_count, oldest_session_age_seconds)` from the node-local
+/// debug-session registry.
+fn debug_session_scalars(inner: &InnerState) -> (u32, Option<f64>) {
+    let sessions = inner.debug_sessions.list();
+    let oldest_seconds = sessions
         .iter()
         .map(|session| session.created_at_ms)
         .min()
@@ -1042,64 +778,7 @@ fn collect_snapshot_inputs(inner: &InnerState) -> SnapshotInputs {
                 .unwrap_or(0);
             now_ms.saturating_sub(created_at_ms) as f64 / 1000.0
         });
-
-    // Concurrency-group admission state: one group per (repo, group) key,
-    // holding at most one running holder plus a FIFO pending queue.
-    let mut concurrency_groups_active = 0u32;
-    let mut concurrency_groups_contended = 0u32;
-    let mut concurrency_pending_holders = 0u32;
-    let mut concurrency_deepest_group_pending = 0u32;
-    for group in inner.concurrency_groups.values() {
-        if group.running.is_some() {
-            concurrency_groups_active += 1;
-        }
-        if !group.pending.is_empty() {
-            concurrency_groups_contended += 1;
-        }
-        concurrency_pending_holders += group.pending.len() as u32;
-        concurrency_deepest_group_pending =
-            concurrency_deepest_group_pending.max(group.pending.len() as u32);
-    }
-
-    SnapshotInputs {
-        queue_len: inner.queue.len(),
-        pending_jobs_len: inner.pending_jobs.len(),
-        pending_expansions_len: inner.pending_expansions.len(),
-        expanding_len: inner.expanding.len(),
-        runs_queued,
-        active_runs,
-        orphaned_run_ids,
-        runs_in_progress,
-        runs_completed,
-        registered: inner.runners.len() as u32,
-        sessions: session_ids.len() as u32,
-        runner_idle,
-        runner_busy,
-        runner_stale,
-        pool_busy,
-        runner_assignments: assignments,
-        oldest_ready_seconds,
-        oldest_ready_run_id: oldest_ready.map(|job| job.run_id.to_string()),
-        oldest_ready_job_id: oldest_ready.map(|job| job.job_id.0.clone()),
-        queue_runner_reqs: inner
-            .queue
-            .iter()
-            .map(|job| (job.runs_on.clone(), job.runner_group.clone()))
-            .collect(),
-        runner_caps: inner
-            .runners
-            .values()
-            .map(crate::runtime_scheduling::capabilities_of)
-            .collect(),
-        debug_active_sessions: debug_sessions.len() as u32,
-        debug_oldest_session_seconds,
-        concurrency_blocked: inner.concurrency_blocked.len() as u32,
-        concurrency_groups_active,
-        concurrency_groups_contended,
-        concurrency_pending_holders,
-        concurrency_deepest_group_pending,
-        released_bindings: inner.released_bindings_count,
-    }
+    (sessions.len() as u32, oldest_seconds)
 }
 
 /// Webhook-repair inputs for the operational snapshot.
@@ -1257,6 +936,7 @@ fn webhook_conditions(
 
 fn build_operational_snapshot_sync(
     inputs: SnapshotInputs,
+    (debug_active_sessions, debug_oldest_session_seconds): (u32, Option<f64>),
     mut pool_snapshot: preloop_observability::status::PoolSnapshot,
     observability: &preloop_observability::Observability,
     started_at: std::time::Instant,
@@ -1447,8 +1127,8 @@ fn build_operational_snapshot_sync(
         tasks: Vec::new(),
         github: github_snapshot,
         debug: DebugSnapshot {
-            active_sessions: inputs.debug_active_sessions,
-            oldest_session_seconds: inputs.debug_oldest_session_seconds,
+            active_sessions: debug_active_sessions,
+            oldest_session_seconds: debug_oldest_session_seconds,
         },
         telemetry: TelemetrySnapshot {
             otlp_enabled: observability.otlp_enabled(),
@@ -1521,11 +1201,11 @@ async fn publish_snapshot(
     store_backend: &preloop_observability::status::StoreBackend,
     shutdown_requested: bool,
 ) {
-    // Clone needed state under lock, release, then build.
-    let inputs = {
+    let debug = {
         let inner = shared.state.inner.lock().await;
-        collect_snapshot_inputs(&inner)
+        debug_session_scalars(&inner)
     };
+    let inputs = read_snapshot_inputs(&shared.state).await;
     let pool_snapshot = shared.state.pool_status.snapshot();
     let github_snapshot = shared.state.status_snapshot.read().github.clone();
     // The storage bytes are a synchronous filesystem read; run it on the
@@ -1540,6 +1220,7 @@ async fn publish_snapshot(
     let webhook = collect_webhook_condition_inputs(&shared.state);
     let snap = build_operational_snapshot_sync(
         inputs,
+        debug,
         pool_snapshot,
         &shared.state.observability,
         shared.state.started_at,
@@ -1655,7 +1336,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if let Some(obs) = config.observability.clone() {
         state.observability = obs;
     }
-    // H3: warm the static-PAT OAuth scope cache once at startup. Job expansion
+    // Warm the static-PAT OAuth scope cache once at startup. Job expansion
     // is synchronous and cannot introspect the PAT itself, so without this the
     // first expansions after a restart would find a cold cache and withhold the
     // credential. The PAT is read from config/env during state construction and
@@ -1680,16 +1361,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             .or_else(|| std::env::var(crate::store::STORE_URL_ENV).ok())
             .unwrap_or_default();
         let store_url = crate::store::parse_store_url(&effective_url);
-        // One decorator around the private `Store` trait — never per-backend
-        // duplication. The backend label is bounded to sqlite|postgres.
-        state.store = crate::store::InstrumentedStore::wrap(
-            state.store.clone(),
-            state.observability.clone(),
-            match &store_url {
-                Ok(crate::store::StoreUrl::Postgres(_)) => "postgres",
-                _ => "sqlite",
-            },
-        );
         match &store_url {
             Ok(crate::store::StoreUrl::Postgres(_)) => {
                 preloop_observability::status::StoreBackend::Postgres
@@ -1699,6 +1370,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     };
     if let Some(ps) = config.pool_status.clone() {
         state.pool_status = ps;
+        state.backend.set_pool_status((*state.pool_status).clone());
     }
     // Ensure uptime base is now (AppState::new set it, but re-arm after store load).
     state.started_at = std::time::Instant::now();
@@ -1726,6 +1398,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             crate::retention::sweep_once(&shared).await;
         });
     }
+    let queue = state.backend.queue_stats().await.unwrap_or_default();
     if let Some(queue_depth) = config.queue_depth.clone() {
         state.queue_depth = queue_depth;
         // The pool shares this same atomic and only forks a runner while it
@@ -1733,10 +1406,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         // nothing will refresh it from a broker poll. Re-arm it with the
         // ready-queue size recovered from the store, or every job queued
         // before the restart sits forever with the pool asleep.
-        state.queue_depth.store(
-            state.inner.lock().await.queue.len(),
-            std::sync::atomic::Ordering::Release,
-        );
+        let queue_len = queue.ready;
+        state
+            .queue_depth
+            .store(queue_len, std::sync::atomic::Ordering::Release);
         state
             .pool_status
             .set_queue_depth(state.queue_depth.load(std::sync::atomic::Ordering::Acquire) as u32);
@@ -1748,8 +1421,10 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         }
     }
     {
-        let inner = state.inner.lock().await;
-        crate::runtime_scheduling::sync_next_job_labels(&inner, &state.next_job_runs_on);
+        let labels = queue.next_runs_on;
+        if let Ok(mut guard) = state.next_job_runs_on.write() {
+            *guard = labels;
+        }
         if state.pool_status.snapshot().next_job_runs_on.is_empty()
             && let Ok(v) = state.next_job_runs_on.read()
         {
@@ -1767,9 +1442,36 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
                 }
             }
         }
-        let mut inner = state.inner.lock().await;
-        inner.pool_assignments_enabled = pool_managed;
-        inner.require_job_assignments = config.require_job_assignments;
+        // Read the node-local liveness timeout under the lock, then release it:
+        // `rebuild_dispatch_intent` runs a transaction per ready job and must
+        // not hold the global `inner` mutex while awaiting the backend.
+        let runner_liveness_timeout = state.inner.lock().await.runner_liveness_timeout;
+        // `pool_assignments_enabled`/`require_job_assignments`: the
+        // authoritative backend reads these flags from its own config on
+        // every transaction (`with_config`); mirror the effective values into
+        // it now that the real server config is known. `runner_liveness_timeout`
+        // is not part of the bootstrap config — keep the value `open` seeded.
+        state.backend.set_config(
+            pool_managed,
+            config.require_job_assignments,
+            runner_liveness_timeout,
+        );
+        // Environment protection rules are pure config the backend evaluates
+        // inside its promotion and reaper transactions (where the job rows
+        // live). Hand the effective rules over now that the real server
+        // config is known; empty rules keep every gate open.
+        state
+            .backend
+            .set_environment_rules(std::sync::Arc::new(state.environment_rules.clone()));
+        // Imported/persisted ready jobs were enqueued under the recovered
+        // (default) config, so `on_job_enqueued` may not have run for them.
+        // Now that the effective config is live, rebuild dispatch intent for
+        // every ready job — `on_job_enqueued` is idempotent and config-gated,
+        // so this only fills assignments/pool_pending the startup config
+        // actually requires.
+        if let Err(error) = state.backend.rebuild_dispatch_intent().await {
+            warn!(?error, "rebuilding dispatch intent at boot failed");
+        }
     }
     if let Some(pool_preparing) = config.pool_preparing.clone() {
         state.pool_preparing = Some(pool_preparing.clone());
@@ -1789,12 +1491,14 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         // snapshot reports real webhook depth and the queue worker only has to
         // keep the cache fresh from then on.
         crate::github::refresh_webhook_queue_stats(&state).await;
-        let inputs = {
+        let debug = {
             let inner = state.inner.lock().await;
-            collect_snapshot_inputs(&inner)
+            debug_session_scalars(&inner)
         };
+        let inputs = read_snapshot_inputs(&state).await;
         let init = build_operational_snapshot_sync(
             inputs,
+            debug,
             state.pool_status.snapshot(),
             &state.observability,
             state.started_at,
@@ -1869,7 +1573,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
             });
         }
     }
-    // Read back the App's webhook event subscription at startup (D7). A new
+    // Read back the App's webhook event subscription at startup. A new
     // App created from the manifest gets the expanded default events, but an
     // App created earlier — or narrowed by hand — may miss trigger events,
     // and GitHub cannot change a subscription through the API. Warn loudly
@@ -1948,7 +1652,6 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
-    crate::runner_lifecycle::purge_restored_ephemeral_runners(&shared).await;
 
     // 5s sampler — clone needed state under lock, release, then publish.
     let sampler_shared = shared.clone();
@@ -1976,6 +1679,28 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     let snapshot_sweep_shared = shared.clone();
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
+    });
+    let archive_shared = shared.clone();
+    tokio::spawn(async move { run_history_archiver(archive_shared).await });
+    let flusher_shared = shared.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.tick().await;
+        while !flusher_shared.shutdown.is_cancelled() {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if let Err(error) = flusher_shared.state.log_segments.flush_stale().await {
+                        tracing::warn!(%error, "failed to flush live-log segments");
+                    }
+                }
+                _ = flusher_shared.shutdown.cancelled() => {
+                    break;
+                }
+            }
+        }
+        if let Err(error) = flusher_shared.state.log_segments.flush_all().await {
+            tracing::error!(%error, "failed to flush live-log segments on shutdown");
+        }
     });
 
     let webhook_worker_heartbeat = state.observability.heartbeat().clone();
@@ -2186,55 +1911,6 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt as _;
 
-    #[test]
-    fn pool_busy_counts_only_pool_proven_busy_runners() {
-        // Regression: `PoolSnapshot.busy` had no writer, so `preloop status`
-        // always showed `pool busy: 0` even while pool machines ran jobs. The
-        // server now derives it from pool-proven runners holding an active
-        // session request; external busy runners must not inflate it.
-        use preloop_gha_protocol::{RunnerSession, SessionId};
-
-        let mut inner = InnerState {
-            pool_assignments_enabled: true,
-            ..Default::default()
-        };
-        let add_busy_runner = |inner: &mut InnerState, id: i64, pool_proven: bool| {
-            inner.runners.insert(
-                id,
-                RegisteredRunner {
-                    id,
-                    name: format!("runner-{id}"),
-                    labels: vec!["self-hosted".to_owned()],
-                    ephemeral: true,
-                    public_key: None,
-                    runner_group_id: None,
-                    runner_group_name: None,
-                },
-            );
-            let session_id = format!("sess-{id}");
-            inner.sessions.insert(
-                session_id.clone(),
-                RunnerSession {
-                    session_id: SessionId::new(),
-                    runner_id: id,
-                },
-            );
-            inner.session_active_requests.insert(session_id, id);
-            if pool_proven {
-                inner.pool_proven_runners.insert(id);
-            }
-        };
-        add_busy_runner(&mut inner, 7, true);
-        add_busy_runner(&mut inner, 8, false);
-
-        let inputs = collect_snapshot_inputs(&inner);
-        assert_eq!(inputs.runner_busy, 2, "both runners hold an active request");
-        assert_eq!(
-            inputs.pool_busy, 1,
-            "only the pool-proven runner counts toward pool busy"
-        );
-    }
-
     #[tokio::test]
     async fn incomplete_unix_http_message_is_a_routine_disconnect() {
         use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -2263,53 +1939,6 @@ mod tests {
         assert!(is_routine_unix_disconnect(error.as_ref()));
     }
     #[test]
-    fn pending_runs_count_as_in_progress() {
-        let counts = count_run_statuses([
-            ExecutionStatus::Queued,
-            ExecutionStatus::Pending,
-            ExecutionStatus::InProgress,
-            ExecutionStatus::Success,
-            ExecutionStatus::Failure,
-            ExecutionStatus::Skipped,
-            ExecutionStatus::Cancelled,
-        ]);
-        assert_eq!(counts, (1, 2, 4));
-    }
-
-    #[test]
-    fn registered_successor_without_a_session_is_not_idle_capacity() {
-        let mut inner = InnerState::default();
-        let runner_id = 7;
-        inner.runners.insert(
-            runner_id,
-            RegisteredRunner {
-                id: runner_id,
-                name: "prebuilt-successor".to_owned(),
-                labels: vec!["self-hosted".to_owned()],
-                ephemeral: true,
-                public_key: None,
-                runner_group_id: None,
-                runner_group_name: None,
-            },
-        );
-
-        assert_eq!(
-            collect_snapshot_inputs(&inner).runner_idle,
-            0,
-            "a configured successor cannot poll until its slot starts it"
-        );
-
-        inner
-            .broker_session_runners
-            .insert("live-session".to_owned(), runner_id);
-        assert_eq!(
-            collect_snapshot_inputs(&inner).runner_idle,
-            1,
-            "a session-backed runner with no active request is idle"
-        );
-    }
-
-    #[test]
     fn status_degrades_when_claimable_work_waits_behind_idle_runner() {
         let temp = tempfile::tempdir().unwrap();
         let inputs = SnapshotInputs {
@@ -2328,6 +1957,7 @@ mod tests {
         };
         let snapshot = build_operational_snapshot_sync(
             inputs,
+            (0, None),
             Default::default(),
             &preloop_observability::Observability::noop(),
             std::time::Instant::now(),
@@ -2360,6 +1990,7 @@ mod tests {
         };
         let snapshot = build_operational_snapshot_sync(
             inputs,
+            (0, None),
             Default::default(),
             &preloop_observability::Observability::noop(),
             std::time::Instant::now(),
@@ -2394,6 +2025,7 @@ mod tests {
         };
         let snapshot = build_operational_snapshot_sync(
             Default::default(),
+            (0, None),
             Default::default(),
             &preloop_observability::Observability::noop(),
             std::time::Instant::now(),

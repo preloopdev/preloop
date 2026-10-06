@@ -67,8 +67,78 @@ impl Holder {
     }
 }
 
+/// Row encoding of a [`Holder`] for the `concurrency_holds`/`concurrency_waits`
+/// tables: `(kind, run_id, job_id, job_ids_json)`. `job_ids_json` is the
+/// sorted id list for `JobSet` holders, `'[]'` otherwise.
+pub fn holder_row(holder: &Holder) -> (&'static str, String, Option<String>, String) {
+    match holder {
+        Holder::Run(run_id) => ("run", run_id.to_string(), None, "[]".to_owned()),
+        Holder::Job { run_id, job_id } => (
+            "job",
+            run_id.to_string(),
+            Some(job_id.0.clone()),
+            "[]".to_owned(),
+        ),
+        Holder::JobSet { run_id, job_ids } => {
+            let ids: Vec<String> = job_ids.iter().map(|j| j.0.clone()).collect();
+            (
+                "jobset",
+                run_id.to_string(),
+                None,
+                serde_json::to_string(&ids).unwrap_or_default(),
+            )
+        }
+    }
+}
+
+/// Decode a holder row. Unknown kinds and unparseable ids fail closed.
+pub fn holder_from_row(
+    kind: &str,
+    run_id: &str,
+    job_id: Option<&str>,
+    job_ids_json: &str,
+) -> Option<Holder> {
+    let run_id = run_id.parse::<RunId>().ok()?;
+    match kind {
+        "run" => Some(Holder::Run(run_id)),
+        "job" => Some(Holder::Job {
+            run_id,
+            job_id: JobId(job_id?.to_owned()),
+        }),
+        "jobset" => {
+            let ids: BTreeSet<JobId> = serde_json::from_str::<Vec<String>>(job_ids_json)
+                .ok()?
+                .into_iter()
+                .map(JobId)
+                .collect();
+            Some(Holder::JobSet {
+                run_id,
+                job_ids: ids,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Row encoding of a [`ConcurrencyQueue`] mode.
+pub fn queue_mode_row(queue: &ConcurrencyQueue) -> &'static str {
+    match queue {
+        ConcurrencyQueue::Single => "single",
+        ConcurrencyQueue::Max => "max",
+    }
+}
+
+/// Decode a queue mode; unknown values fail closed to `Single` (at most one
+/// pending holder), matching the parser default.
+pub fn queue_mode_from_row(mode: &str) -> ConcurrencyQueue {
+    match mode {
+        "max" => ConcurrencyQueue::Max,
+        _ => ConcurrencyQueue::Single,
+    }
+}
+
 /// One concurrency group (repo + group name, case-insensitive key).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConcurrencyGroup {
     /// Display-case group name as first evaluated.
     pub display_name: String,
@@ -269,6 +339,174 @@ pub fn pending_reason() -> Option<String> {
 /// Build the terminal reason for a holder cancelled by concurrency.
 pub fn cancelled_reason() -> Option<String> {
     Some("concurrency_cancelled".to_owned())
+}
+
+/// `try_acquire_concurrency` error: the arriving holder is cancelled on
+/// arrival (queue overflow, or a stale event a newer holder supersedes).
+pub(crate) const ARRIVAL_CANCELLED: &str = "concurrency_arrival_cancelled";
+
+/// GitHub's own ordering for the event that triggered a run.
+///
+/// Webhooks arrive out of order, and retries and watchdog redeliveries land
+/// late by design, so arrival order cannot decide which of two runs is newer.
+/// Two orders are comparable only within the same `scope`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventOrder {
+    scope: String,
+    /// Unix seconds, from GitHub's payload.
+    at: i64,
+}
+
+impl EventOrder {
+    /// Whether `self` is strictly older than `other` for the same subject.
+    /// Same-second ties are not ordered: GitHub's timestamps cannot tell them
+    /// apart, so arrival order stands.
+    pub(crate) fn is_older_than(&self, other: &Self) -> bool {
+        self.scope == other.scope && self.at < other.at
+    }
+}
+
+/// The ordering GitHub recorded for `event`'s payload, when it carries one.
+///
+/// Each event maps to a subject (what "newer" is about) and the timestamp
+/// GitHub stamped on it. Events about the same pull request — the PR itself,
+/// its reviews, review comments, and conversation comments — share one
+/// subject so any of them can supersede another. Events without GitHub
+/// ordering data (dispatches, schedules, create/delete, …) return `None` and
+/// keep arrival order.
+pub(crate) fn event_order(event: &str, repository: &str, payload: &Value) -> Option<EventOrder> {
+    fn unix_seconds(value: &Value) -> Option<i64> {
+        value.as_i64().or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(value.as_str()?)
+                .ok()
+                .map(|at| at.timestamp())
+        })
+    }
+    /// First timestamp present among `fields` of `object`.
+    fn first_at(object: &Value, fields: &[&str]) -> Option<i64> {
+        fields
+            .iter()
+            .find_map(|field| object.get(*field).and_then(unix_seconds))
+    }
+    fn number(object: &Value) -> Option<u64> {
+        object.get("number")?.as_u64()
+    }
+    let pull_request_scope = |number: u64| format!("pull_request:{repository}#{number}");
+    let order = |scope: String, at: i64| Some(EventOrder { scope, at });
+
+    match event {
+        "push" => order(
+            format!("push:{repository}"),
+            unix_seconds(payload.get("repository")?.get("pushed_at")?)?,
+        ),
+        "pull_request" | "pull_request_target" => {
+            let pull_request = payload.get("pull_request")?;
+            order(
+                pull_request_scope(number(payload).or_else(|| number(pull_request))?),
+                first_at(pull_request, &["updated_at"])?,
+            )
+        }
+        // The review or comment's own time, falling back to the PR's.
+        "pull_request_review" | "pull_request_review_comment" => {
+            let pull_request = payload.get("pull_request")?;
+            let own = payload
+                .get("review")
+                .and_then(|review| first_at(review, &["submitted_at", "updated_at"]))
+                .or_else(|| {
+                    payload
+                        .get("comment")
+                        .and_then(|comment| first_at(comment, &["updated_at", "created_at"]))
+                });
+            order(
+                pull_request_scope(number(pull_request)?),
+                own.or_else(|| first_at(pull_request, &["updated_at"]))?,
+            )
+        }
+        // A comment on a pull request is about that pull request.
+        "issue_comment" => {
+            let issue = payload.get("issue")?;
+            let n = number(issue)?;
+            let scope = if issue.get("pull_request").is_some() {
+                pull_request_scope(n)
+            } else {
+                format!("issue:{repository}#{n}")
+            };
+            order(
+                scope,
+                first_at(payload.get("comment")?, &["updated_at", "created_at"])?,
+            )
+        }
+        "issues" => {
+            let issue = payload.get("issue")?;
+            order(
+                format!("issue:{repository}#{}", number(issue)?),
+                first_at(issue, &["updated_at", "created_at"])?,
+            )
+        }
+        "discussion" | "discussion_comment" => {
+            let discussion = payload.get("discussion")?;
+            let own = payload
+                .get("comment")
+                .and_then(|comment| first_at(comment, &["updated_at", "created_at"]));
+            order(
+                format!("discussion:{repository}#{}", number(discussion)?),
+                own.or_else(|| first_at(discussion, &["updated_at", "created_at"]))?,
+            )
+        }
+        "milestone" => {
+            let milestone = payload.get("milestone")?;
+            order(
+                format!("milestone:{repository}#{}", number(milestone)?),
+                first_at(milestone, &["updated_at", "created_at"])?,
+            )
+        }
+        // Deploy groups are per environment: the latest deployment event for
+        // an environment wins, across deployments.
+        "deployment" | "deployment_status" => {
+            let deployment = payload.get("deployment")?;
+            let environment = payload
+                .get("deployment_status")
+                .and_then(|status| status.get("environment"))
+                .or_else(|| deployment.get("environment"))?
+                .as_str()?;
+            let at = match payload.get("deployment_status") {
+                Some(status) => first_at(status, &["updated_at", "created_at"])?,
+                None => first_at(deployment, &["updated_at", "created_at"])?,
+            };
+            order(format!("deployment:{repository}:{environment}"), at)
+        }
+        // Downstream pipelines group per branch.
+        "workflow_run" => {
+            let run = payload.get("workflow_run")?;
+            order(
+                format!("branch:{repository}:{}", run.get("head_branch")?.as_str()?),
+                first_at(run, &["updated_at", "created_at"])?,
+            )
+        }
+        "check_suite" => {
+            let suite = payload.get("check_suite")?;
+            order(
+                format!(
+                    "branch:{repository}:{}",
+                    suite.get("head_branch")?.as_str()?
+                ),
+                first_at(suite, &["updated_at", "created_at"])?,
+            )
+        }
+        "check_run" => {
+            let run = payload.get("check_run")?;
+            let branch = run.get("check_suite")?.get("head_branch")?.as_str()?;
+            order(
+                format!("branch:{repository}:{branch}"),
+                first_at(run, &["completed_at", "started_at"])?,
+            )
+        }
+        "release" => order(
+            format!("release:{repository}"),
+            first_at(payload.get("release")?, &["published_at", "created_at"])?,
+        ),
+        _ => None,
+    }
 }
 
 /// Whether a job status is still awaiting assignment (queued or concurrency-pending).
@@ -492,11 +730,11 @@ mod properties {
     // ---- property tests ----
 
     proptest! {
-        /// GH-GROUP-01: Case variants produce equal keys.
+        /// Case variants produce equal keys.
         /// concurrency_key lowercases both repo and group, so any casing of the
         /// same ASCII string must map to the same key.
         #[test]
-        fn gh_group_01_case_insensitive(
+        fn group_key_case_insensitive(
             repo in arb_name(),
             group in arb_name(),
         ) {
@@ -510,28 +748,28 @@ mod properties {
                 &group,
             );
             prop_assert_eq!(&key_lower, &key_upper,
-                "GH-GROUP-01: upper/lower must produce equal keys");
+                "upper/lower must produce equal keys");
             prop_assert_eq!(&key_lower, &key_mixed,
-                "GH-GROUP-01: mixed case must produce equal key");
+                "mixed case must produce equal key");
         }
 
-        /// GH-GROUP-01: Normalization is idempotent — applying concurrency_key
+        /// Normalization is idempotent — applying concurrency_key
         /// to already-lowered output returns the same pair.
         #[test]
-        fn gh_group_01_idempotent(
+        fn group_key_normalization_is_idempotent(
             repo in arb_name(),
             group in arb_name(),
         ) {
             let (r1, g1) = concurrency_key(&repo, &group);
             let (r2, g2) = concurrency_key(&r1, &g1);
             prop_assert_eq!((&r1, &g1), (&r2, &g2),
-                "GH-GROUP-01: normalization must be idempotent");
+                "normalization must be idempotent");
         }
 
-        /// GH-GROUP-01: Different repositories keep keys distinct even when
+        /// Different repositories keep keys distinct even when
         /// group names match (case-insensitively).
         #[test]
-        fn gh_group_01_repo_isolation(
+        fn group_key_repo_isolation(
             repo_a in arb_name(),
             repo_b in arb_name(),
             group in arb_name(),
@@ -541,38 +779,38 @@ mod properties {
             // Keys equal iff repos are equal after lowering.
             let repos_equal = repo_a.eq_ignore_ascii_case(&repo_b);
             prop_assert_eq!(key_a == key_b, repos_equal,
-                "GH-GROUP-01: keys must differ iff repos differ (case-insensitive)");
+                "keys must differ iff repos differ (case-insensitive)");
         }
 
-        /// GH-SINGLE-01: Single mode cancels every existing pending holder,
+        /// Single mode cancels every existing pending holder,
         /// never cancels the arrival, and parks the arrival.
         #[test]
-        fn gh_single_01_cancel_all_pending_park_arrival(
+        fn single_mode_cancel_all_pending_park_arrival(
             pending in arb_pending(10),
         ) {
             let result = apply_queue_mode(ConcurrencyQueue::Single, &pending);
 
             // Never cancels arrival
             prop_assert!(!result.cancel_arrival,
-                "GH-SINGLE-01: arrival must never be cancelled in single mode");
+                "arrival must never be cancelled in single mode");
 
             // Always parks arrival
             prop_assert!(result.park_arrival,
-                "GH-SINGLE-01: arrival must always be parked in single mode");
+                "arrival must always be parked in single mode");
 
             // Cancels exactly all existing pending holders
             prop_assert_eq!(result.cancel_pending.len(), pending.len(),
-                "GH-SINGLE-01: must cancel all {} existing pending holders", pending.len());
+                "must cancel all {} existing pending holders", pending.len());
 
             // Cancel set matches pending contents and order
             let expected: Vec<Holder> = pending.iter().cloned().collect();
             prop_assert_eq!(&result.cancel_pending, &expected,
-                "GH-SINGLE-01: cancelled holders must match existing pending in order");
+                "cancelled holders must match existing pending in order");
         }
 
-        /// GH-MAX-01: Lengths 0..99 park the arrival without cancellation.
+        /// Lengths 0..99 park the arrival without cancellation.
         #[test]
-        fn gh_max_01_under_limit_parks(
+        fn max_concurrency_under_limit_parks(
             len in 0..100usize,
         ) {
             let pending: VecDeque<Holder> = (0..len as u32)
@@ -581,16 +819,16 @@ mod properties {
             let result = apply_queue_mode(ConcurrencyQueue::Max, &pending);
 
             prop_assert!(!result.cancel_arrival,
-                "GH-MAX-01: arrival must not be cancelled at len={len}");
+                "arrival must not be cancelled at len={len}");
             prop_assert!(result.park_arrival,
-                "GH-MAX-01: arrival must be parked at len={len}");
+                "arrival must be parked at len={len}");
             prop_assert!(result.cancel_pending.is_empty(),
-                "GH-MAX-01: no existing pending should be cancelled at len={len}");
+                "no existing pending should be cancelled at len={len}");
         }
 
-        /// GH-MAX-01: At exactly 100 pending, arrival is cancelled (overflow).
+        /// At exactly 100 pending, arrival is cancelled (overflow).
         #[test]
-        fn gh_max_01_at_limit_cancels_arrival(
+        fn max_concurrency_at_limit_cancels_arrival(
             extra in 0..6usize,
         ) {
             let len = QUEUE_MAX_PENDING + extra; // 100, 101, 102, 103, 104, 105
@@ -600,17 +838,17 @@ mod properties {
             let result = apply_queue_mode(ConcurrencyQueue::Max, &pending);
 
             prop_assert!(result.cancel_arrival,
-                "GH-MAX-01: arrival must be cancelled at len={len}");
+                "arrival must be cancelled at len={len}");
             prop_assert!(!result.park_arrival,
-                "GH-MAX-01: arrival must not be parked at len={len}");
+                "arrival must not be parked at len={len}");
             prop_assert!(result.cancel_pending.is_empty(),
-                "GH-MAX-01: existing queue must not be mutated at len={len}");
+                "existing queue must not be mutated at len={len}");
         }
 
-        /// GH-MAX-01: Boundary test at exactly 99/100/101 — the three critical
+        /// Boundary test at exactly 99/100/101 — the three critical
         /// values around QUEUE_MAX_PENDING.
         #[test]
-        fn gh_max_01_boundary_99_100_101(
+        fn max_concurrency_boundary_99_100_101(
             boundary in prop_oneof![Just(99usize), Just(100usize), Just(101usize)],
         ) {
             let pending: VecDeque<Holder> = (0..boundary as u32)
@@ -621,12 +859,12 @@ mod properties {
             match boundary {
                 99 => {
                     prop_assert!(!result.cancel_arrival,
-                        "GH-MAX-01: 99 pending must park arrival");
+                        "99 pending must park arrival");
                     prop_assert!(result.park_arrival);
                 }
                 100 | 101 => {
                     prop_assert!(result.cancel_arrival,
-                        "GH-MAX-01: {boundary} pending must cancel arrival");
+                        "{boundary} pending must cancel arrival");
                     prop_assert!(!result.park_arrival);
                 }
                 _ => unreachable!(),
@@ -813,5 +1051,337 @@ mod properties {
                 }
             }
         }
+    }
+
+    // ---- `evaluate_concurrency`: group and scope semantics ----
+
+    /// Evaluate a `concurrency:` block whose group comes from the documented
+    /// workflow `inputs` context.
+    fn evaluate_group(group: &str) -> Result<(String, bool, ConcurrencyQueue), String> {
+        let github = json!({});
+        let inputs = BTreeMap::from([("group".to_owned(), Value::String(group.to_owned()))]);
+        let vars = BTreeMap::new();
+        let ctx = ConcurrencyContext {
+            scope: ConcurrencyScope::Workflow,
+            github: &github,
+            inputs: &inputs,
+            vars: &vars,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let raw = Concurrency {
+            group: "${{ inputs.group }}".to_owned(),
+            cancel_in_progress: None,
+            queue: ConcurrencyQueue::Single,
+        };
+        evaluate_concurrency(&raw, &ctx)
+    }
+
+    /// The evaluated group limit counts UTF-16 code units
+    /// (C# `string.Length`), so 400 ASCII characters fit exactly and 401 are
+    /// rejected with the evaluated length in the message.
+    #[test]
+    fn evaluated_ascii_group_length_400_utf16_units_is_accepted() {
+        let group = "a".repeat(400);
+        let (evaluated, cancel, queue) =
+            evaluate_group(&group).expect("400 ASCII characters must be accepted");
+        assert_eq!(
+            (evaluated.as_str(), cancel, queue),
+            (group.as_str(), false, ConcurrencyQueue::Single)
+        );
+
+        let error =
+            evaluate_group(&"a".repeat(401)).expect_err("401 ASCII characters must be rejected");
+        assert_eq!(
+            error,
+            "concurrency group name is too long (401 UTF-16 code units, maximum 400)"
+        );
+    }
+
+    /// An astral character counts as two UTF-16 code
+    /// units, so 200 astral characters (400 units) fit and 201 (402 units)
+    /// are rejected using that evaluated length.
+    #[test]
+    fn evaluated_astral_group_length_boundary_is_400_utf16_units() {
+        assert!(
+            evaluate_group(&"😀".repeat(200)).is_ok(),
+            "200 astral characters (400 UTF-16 code units) must be accepted"
+        );
+        let error = evaluate_group(&"😀".repeat(201))
+            .expect_err("201 astral characters (402 UTF-16 code units) must be rejected");
+        assert_eq!(
+            error,
+            "concurrency group name is too long (402 UTF-16 code units, maximum 400)"
+        );
+    }
+
+    /// BMP characters occupy one UTF-16 code unit each even
+    /// when they occupy two or more bytes in UTF-8.
+    #[test]
+    fn evaluated_bmp_group_length_400_utf16_units_is_accepted() {
+        assert!(
+            evaluate_group(&"é".repeat(400)).is_ok(),
+            "400 BMP characters (400 UTF-16 code units) must be accepted"
+        );
+    }
+
+    /// `queue: max` with `cancel-in-progress: true` is
+    /// rejected before admission, never resolved as independent options.
+    #[test]
+    fn validate_max_plus_cancel_is_error() {
+        let github = json!({});
+        let inputs = BTreeMap::new();
+        let vars = BTreeMap::new();
+        let ctx = ConcurrencyContext {
+            scope: ConcurrencyScope::Workflow,
+            github: &github,
+            inputs: &inputs,
+            vars: &vars,
+            matrix: None,
+            strategy: None,
+            needs: None,
+        };
+        let incompatible = Concurrency {
+            group: "build".to_owned(),
+            cancel_in_progress: Some("true".to_owned()),
+            queue: ConcurrencyQueue::Max,
+        };
+        let result = evaluate_concurrency(&incompatible, &ctx);
+        assert!(
+            result.is_err(),
+            "queue: max + cancel-in-progress: true must be rejected, got {result:?}"
+        );
+
+        // Each option alone stays valid.
+        let without_cancel = Concurrency {
+            cancel_in_progress: None,
+            ..incompatible.clone()
+        };
+        assert!(evaluate_concurrency(&without_cancel, &ctx).is_ok());
+        let without_max = Concurrency {
+            queue: ConcurrencyQueue::Single,
+            ..incompatible
+        };
+        assert!(evaluate_concurrency(&without_max, &ctx).is_ok());
+    }
+
+    proptest! {
+        /// Workflow-scope concurrency receives `github`,
+        /// `inputs` and `vars`, but never the job-only `matrix`, `strategy`
+        /// or `needs` contexts.
+        #[test]
+        fn workflow_context_enforces_allowlist(
+            github_value in "[a-z]{1,8}",
+            input_value in "[a-z]{1,8}",
+            var_value in "[a-z]{1,8}",
+            forbidden_index in 0..3usize,
+        ) {
+            const FORBIDDEN: [&str; 3] =
+                ["matrix.os", "strategy.job-index", "needs.setup.result"];
+
+            let github = json!({"ref_name": github_value});
+            let inputs = BTreeMap::from([(
+                "target".to_owned(),
+                Value::String(input_value.clone()),
+            )]);
+            let vars = BTreeMap::from([("suffix".to_owned(), var_value.clone())]);
+            let matrix = BTreeMap::from([("os".to_owned(), Value::String("linux".to_owned()))]);
+            let strategy = json!({"job-index": 0});
+            let needs = json!({"setup": {"result": "success"}});
+            let ctx = ConcurrencyContext {
+                scope: ConcurrencyScope::Workflow,
+                github: &github,
+                inputs: &inputs,
+                vars: &vars,
+                matrix: Some(&matrix),
+                strategy: Some(&strategy),
+                needs: Some(&needs),
+            };
+            let allowed = Concurrency {
+                group: "${{ github.ref_name }}-${{ inputs.target }}-${{ vars.suffix }}"
+                    .to_owned(),
+                cancel_in_progress: None,
+                queue: ConcurrencyQueue::Single,
+            };
+            let (group, cancel, queue) = evaluate_concurrency(&allowed, &ctx)
+                .expect("documented workflow contexts must evaluate");
+            prop_assert_eq!(group, format!("{github_value}-{input_value}-{var_value}"));
+            prop_assert!(!cancel);
+            prop_assert_eq!(queue, ConcurrencyQueue::Single);
+
+            // The same expression evaluated against different job-only
+            // contexts must produce the same result: matrix/strategy/needs
+            // are invisible at workflow scope.
+            let alternate_matrix =
+                BTreeMap::from([("os".to_owned(), Value::String("windows".to_owned()))]);
+            let alternate_strategy = json!({"job-index": 99});
+            let alternate_needs = json!({"setup": {"result": "failure"}});
+            let alternate = ConcurrencyContext {
+                scope: ConcurrencyScope::Workflow,
+                github: &github,
+                inputs: &inputs,
+                vars: &vars,
+                matrix: Some(&alternate_matrix),
+                strategy: Some(&alternate_strategy),
+                needs: Some(&alternate_needs),
+            };
+            let raw = Concurrency {
+                group: format!("${{{{ {} }}}}", FORBIDDEN[forbidden_index]),
+                cancel_in_progress: None,
+                queue: ConcurrencyQueue::Single,
+            };
+            let resolved = evaluate_concurrency(&raw, &ctx);
+            prop_assert!(
+                resolved.is_err(),
+                "workflow scope must not resolve {}: {:?}",
+                FORBIDDEN[forbidden_index],
+                resolved
+            );
+            prop_assert_eq!(resolved, evaluate_concurrency(&raw, &alternate));
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_order_tests {
+    use super::*;
+
+    fn pull_request(number: u64, updated_at: &str) -> Value {
+        json!({"number": number, "pull_request": {"number": number, "updated_at": updated_at}})
+    }
+
+    #[test]
+    fn pull_request_events_order_by_updated_at_within_one_pull_request() {
+        let order = |event, payload: &Value| event_order(event, "o/r", payload).unwrap();
+        let early = order("pull_request", &pull_request(7, "2026-01-01T00:00:00Z"));
+        let late = order(
+            "pull_request_target",
+            &pull_request(7, "2026-01-01T00:05:00Z"),
+        );
+        assert!(early.is_older_than(&late));
+        assert!(!late.is_older_than(&early));
+
+        // Another pull request is a different subject: never ordered.
+        let other = order("pull_request", &pull_request(8, "2026-01-01T00:05:00Z"));
+        assert!(!early.is_older_than(&other));
+    }
+
+    #[test]
+    fn same_second_is_not_ordered_and_unordered_events_have_no_key() {
+        let push = |at: i64| {
+            event_order("push", "o/r", &json!({"repository": {"pushed_at": at}})).unwrap()
+        };
+        assert!(!push(100).is_older_than(&push(100)));
+        assert!(push(99).is_older_than(&push(100)));
+        // No GitHub ordering data → arrival order stands.
+        assert!(event_order("push", "o/r", &json!({"repository": {}})).is_none());
+        assert!(event_order("workflow_dispatch", "o/r", &json!({})).is_none());
+    }
+
+    /// Two payloads of the same event, `early` before `late`.
+    fn assert_ordered(event: &str, early: Value, late: Value) {
+        let early = event_order(event, "o/r", &early).unwrap_or_else(|| panic!("{event}: no key"));
+        let late = event_order(event, "o/r", &late).unwrap();
+        assert!(early.is_older_than(&late), "{event}: early must be older");
+        assert!(
+            !late.is_older_than(&early),
+            "{event}: late must not be older"
+        );
+    }
+
+    const T1: &str = "2026-01-01T00:00:00Z";
+    const T2: &str = "2026-01-01T00:05:00Z";
+
+    #[test]
+    fn every_timestamped_event_orders_within_its_subject() {
+        assert_ordered(
+            "pull_request_review",
+            json!({"pull_request": {"number": 7}, "review": {"submitted_at": T1}}),
+            json!({"pull_request": {"number": 7}, "review": {"submitted_at": T2}}),
+        );
+        assert_ordered(
+            "pull_request_review_comment",
+            json!({"pull_request": {"number": 7}, "comment": {"updated_at": T1}}),
+            json!({"pull_request": {"number": 7}, "comment": {"updated_at": T2}}),
+        );
+        assert_ordered(
+            "issue_comment",
+            json!({"issue": {"number": 3}, "comment": {"created_at": T1}}),
+            json!({"issue": {"number": 3}, "comment": {"created_at": T2}}),
+        );
+        assert_ordered(
+            "issues",
+            json!({"issue": {"number": 3, "updated_at": T1}}),
+            json!({"issue": {"number": 3, "updated_at": T2}}),
+        );
+        assert_ordered(
+            "discussion_comment",
+            json!({"discussion": {"number": 4}, "comment": {"updated_at": T1}}),
+            json!({"discussion": {"number": 4}, "comment": {"updated_at": T2}}),
+        );
+        assert_ordered(
+            "milestone",
+            json!({"milestone": {"number": 2, "updated_at": T1}}),
+            json!({"milestone": {"number": 2, "updated_at": T2}}),
+        );
+        // Different deployments to one environment are ordered.
+        assert_ordered(
+            "deployment_status",
+            json!({"deployment": {"id": 1, "environment": "prod"},
+                   "deployment_status": {"environment": "prod", "created_at": T1}}),
+            json!({"deployment": {"id": 2, "environment": "prod"},
+                   "deployment_status": {"environment": "prod", "created_at": T2}}),
+        );
+        assert_ordered(
+            "workflow_run",
+            json!({"workflow_run": {"head_branch": "main", "updated_at": T1}}),
+            json!({"workflow_run": {"head_branch": "main", "updated_at": T2}}),
+        );
+        assert_ordered(
+            "check_suite",
+            json!({"check_suite": {"head_branch": "main", "updated_at": T1}}),
+            json!({"check_suite": {"head_branch": "main", "updated_at": T2}}),
+        );
+        assert_ordered(
+            "check_run",
+            json!({"check_run": {"check_suite": {"head_branch": "main"}, "completed_at": T1}}),
+            json!({"check_run": {"check_suite": {"head_branch": "main"}, "completed_at": T2}}),
+        );
+        assert_ordered(
+            "release",
+            json!({"release": {"published_at": T1}}),
+            json!({"release": {"published_at": T2}}),
+        );
+    }
+
+    #[test]
+    fn pull_request_activity_shares_one_subject_and_other_subjects_never_compare() {
+        let order = |event, payload: Value| event_order(event, "o/r", &payload).unwrap();
+        // A comment on a PR supersedes, and is superseded by, the PR's own events.
+        let comment = order(
+            "issue_comment",
+            json!({"issue": {"number": 7, "pull_request": {}}, "comment": {"created_at": T1}}),
+        );
+        let sync = order("pull_request", pull_request(7, T2));
+        assert!(comment.is_older_than(&sync));
+
+        // A plain issue with the same number is a different subject.
+        let issue_comment = order(
+            "issue_comment",
+            json!({"issue": {"number": 7}, "comment": {"created_at": T1}}),
+        );
+        assert!(!issue_comment.is_older_than(&sync));
+
+        // Other environments and branches are different subjects.
+        let staging = order(
+            "deployment",
+            json!({"deployment": {"environment": "staging", "created_at": T1}}),
+        );
+        let prod = order(
+            "deployment",
+            json!({"deployment": {"environment": "prod", "created_at": T2}}),
+        );
+        assert!(!staging.is_older_than(&prod));
     }
 }

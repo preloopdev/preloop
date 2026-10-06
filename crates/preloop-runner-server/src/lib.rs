@@ -12,6 +12,7 @@ pub mod concurrency;
 pub mod config;
 pub mod credential_store;
 pub mod errors;
+mod event_feed;
 pub mod events;
 pub mod execution_protection;
 pub mod fork_policy;
@@ -27,6 +28,7 @@ pub mod webhook_api;
 pub mod webhook_health;
 pub mod webhook_status;
 pub mod webhook_watchdog;
+pub(crate) use crate::control::backend::ControlBackend;
 pub use errors::ApiError;
 pub mod actions;
 use actions::*;
@@ -34,15 +36,21 @@ pub mod secrets_api;
 use secrets_api::*;
 pub mod execution_protection_api;
 use execution_protection_api::*;
-pub mod reusable_workflows;
-use reusable_workflows::*;
+mod message_template;
 pub mod remote_workflows;
+pub mod reusable_workflows;
 pub mod runs;
+pub mod secret_provider;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_pg;
 use runs::*;
 pub mod runtime_scheduling;
 use runtime_scheduling::*;
+pub mod control;
 pub mod timeline_logs;
 use timeline_logs::*;
+mod live_log_segments;
+pub(crate) use live_log_segments::LiveLogSegments;
 pub mod routes;
 use routes::build_app;
 pub use routes::{app, app_with_test_api};
@@ -86,11 +94,10 @@ use state::*;
 pub use state::{AppState, SharedState};
 pub mod models;
 use models::*;
-pub mod store;
-use store::*;
 pub mod bootstrap;
+pub mod store;
 pub mod store_pg;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[allow(unused_imports)]
 use bootstrap::reap_once;
 pub use bootstrap::{SelfSignedCert, ServerConfig, TlsMode, generate_self_signed_cert, serve};
@@ -108,8 +115,6 @@ pub mod scheduling;
 
 #[cfg(test)]
 mod concurrency_http_properties;
-#[cfg(test)]
-mod concurrency_properties;
 #[cfg(test)]
 mod dispatch_tests;
 /// GitHub-compatible OIDC id-token provider.
@@ -138,8 +143,8 @@ use preloop_gha_parser::eval::build_context;
 use preloop_gha_parser::parse_workflow;
 use preloop_gha_protocol::{
     AnnotationLevel, ExecutionStatus, JobCompletion, JobId, NdjsonEvent, PROTOCOL_VERSION,
-    RegisteredRunner, RunAccepted, RunId, RunnerRegistrationRequest, RunnerSession,
-    RunnerSessionRequest, SessionId, WorkflowSubmission, azdo,
+    RegisteredRunner, RunAccepted, RunId, RunnerRegistrationRequest, RunnerSessionRequest,
+    WorkflowSubmission, azdo,
     crypto::{AgentRsaKeypair, AgentRsaPublicKey, SessionEncryption},
     event_to_ndjson,
 };

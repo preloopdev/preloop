@@ -1,17 +1,17 @@
 //! Actions resolution and download client.
 //!
-//! F022: Implements the `runnerresolve/actions` batch POST endpoint used by
+//! Implements the `runnerresolve/actions` batch POST endpoint used by
 //! the official runner (golden 10 flow 19-20) to resolve `uses:` references
 //! to SHA-pinned tarball URLs before downloading.
 //!
 //! Golden 10 flow 19:
-//!   POST launch.actions.githubusercontent.com/actions/{build}/{orchestrationId}/jobs/{jobId}/runner
-//!   body: { "actions": [{ "action": "actions/checkout", "version": "v4" }] }
-//!   response: { "actions": { "actions/checkout@v4": { "resolved_sha": "...", "tar_url": "..." } } }
+//! POST launch.actions.githubusercontent.com/actions/{build}/{orchestrationId}/jobs/{jobId}/runner
+//! body: { "actions": [{ "action": "actions/checkout", "version": "v4" }] }
+//! response: { "actions": { "actions/checkout@v4": { "resolved_sha": "...", "tar_url": "..." } } }
 //!
 //! Then flow 20: GET codeload.github.com/{owner}/{repo}/tar.gz/{resolved_sha}
 //!
-//! M2: no api.github.com fallback — if the launch endpoint does not resolve
+//! No api.github.com fallback — if the launch endpoint does not resolve
 //! the ref to a SHA-pinned URL, the runner refuses the download.
 
 use anyhow::{Context, Result};
@@ -152,7 +152,7 @@ impl ActionsResolveClient {
             Err(e) => {
                 tracing::warn!(
                     "runnerresolve batch failed; action downloads will fail closed \
-                     (M2: there is no api.github.com fallback): {e:#}"
+                     (there is no api.github.com fallback): {e:#}"
                 );
                 return Ok(HashMap::new());
             }

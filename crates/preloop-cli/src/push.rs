@@ -474,6 +474,11 @@ mod tests {
     fn git(cwd: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .current_dir(cwd)
+            // Test fixtures must not depend on the developer's signing
+            // setup — a broken or locked signing agent (e.g. 1Password)
+            // would otherwise fail every commit fixture.
+            .arg("-c")
+            .arg("commit.gpgsign=false")
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("git {args:?}: {e}"));

@@ -65,7 +65,7 @@ fn default_artifact_file_name() -> String {
     "artifact.bin".to_owned()
 }
 
-/// R1-5: include the job's git ref in the legacy cache namespace so one
+/// Include the job's git ref in the legacy cache namespace so one
 /// branch cannot poison another branch's entries (first write wins on an
 /// exact key+version). The system token keeps the historical
 /// repository-only namespace.
@@ -77,7 +77,7 @@ pub fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<String>)
     }
 }
 
-/// R1-6: refuse a chunk that would push an in-flight upload past
+/// Refuse a chunk that would push an in-flight upload past
 /// `max_bytes`. Split from `cache_upload` so tests can exercise the
 /// boundary with a small limit instead of allocating the production
 /// 512 MiB cap.
@@ -95,7 +95,7 @@ pub fn ensure_cache_chunk_fits(
     Ok(())
 }
 
-/// R1-6: refuse a chunk that would push a job's *aggregate* pending bytes
+/// Refuse a chunk that would push a job's *aggregate* pending bytes
 /// past `max_bytes`. The per-upload cap alone still lets a job hold
 /// `MAX_PENDING_PER_JOB` × 512 MiB; this bounds the job's total. Split out
 /// so tests can exercise the boundary with a small limit instead of
@@ -178,7 +178,7 @@ pub async fn cache_reserve(
     let repository = auth::job_repository_from_headers(&shared.state, &headers).await?;
     let git_ref = auth::job_git_ref_from_headers(&shared.state, &headers).await?;
     let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
-    // R1-10: a stale job token must not reserve new uploads after its job
+    // A stale job token must not reserve new uploads after its job
     // completes. The system bearer manages the lifecycle itself and bypasses;
     // every other caller must present a resolvable job identity — a request
     // without claims cannot be attributed to a live job.
@@ -192,17 +192,17 @@ pub async fn cache_reserve(
     }
     let job_uuid = claims.map(|claims| claims.job_id);
     let job_backend_id = job_uuid.map(|uuid| uuid.to_string()).unwrap_or_default();
-    let mut inner = shared.state.inner.lock().await;
-    // In-lock re-check: the job may have settled between the gate above and
-    // this lock — a settled job must not mint a fresh reservation.
+    // Re-check liveness against the backend: a settled job must not mint a
+    // fresh reservation.
     if let Some(job_uuid) = job_uuid
-        && !auth::job_is_live_locked(&inner, job_uuid)
+        && !auth::job_is_live(&shared.state, job_uuid).await?
     {
         return Err(ApiError::forbidden(
             "job is not live; writes are rejected for completed or unknown jobs",
         ));
     }
-    // R1-6: bound in-flight legacy reservations per job, mirroring the v2
+    let mut inner = shared.state.inner.lock().await;
+    // Bound in-flight legacy reservations per job, mirroring the v2
     // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
     // unbounded reservation state in server RAM.
     if !job_backend_id.is_empty() {
@@ -223,23 +223,20 @@ pub async fn cache_reserve(
         cache_id,
         PendingCache {
             key: request.key,
-            // R1-5: the reservation is bound to the job's git ref, not just
+            // The reservation is bound to the job's git ref, not just
             // the repository, so a branch run cannot squat another branch's
             // key namespace.
             namespace: ref_scoped_namespace(repository, git_ref),
             version: request.version,
             bytes: Vec::new(),
             job_backend_id,
-            // R1-6: stamp the reservation so the TTL sweeper can free it if
+            // Stamp the reservation so the TTL sweeper can free it if
             // the job never commits (previously abandoned reservations held
             // their bytes forever).
             created_unix: crate::memory_caps::now_unix(),
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        tracing::warn!(?error, "failed to persist cache reservation");
-    }
+    drop(inner);
     Ok(Json(CacheReserveResponse { cache_id }))
 }
 
@@ -253,7 +250,7 @@ pub async fn cache_upload(
     let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
     let caller_job_id = claims.as_ref().map(|claims| claims.job_id.to_string());
     let system = auth::system_bearer_authorized(&shared.state, &headers);
-    // R1-10: a stale job token must not keep uploading after its job
+    // A stale job token must not keep uploading after its job
     // completes. The system bearer manages the lifecycle itself and bypasses.
     if !system {
         let Some(claims) = claims else {
@@ -274,7 +271,7 @@ pub async fn cache_upload(
                 "cache reservation belongs to another job",
             ));
         }
-        // R1-6: cap each in-flight upload's running total. Without this
+        // Cap each in-flight upload's running total. Without this
         // check a job could grow server RAM without bound by PATCHing
         // chunks forever (~500 requests/GiB at the 2 MiB default body
         // limit). The check runs before the vector grows so the refusal
@@ -284,7 +281,7 @@ pub async fn cache_upload(
             bytes.len() as u64,
             MAX_CACHE_UPLOAD_BYTES,
         )?;
-        // R1-6: cap the job's *aggregate* pending bytes, not just each
+        // Cap the job's *aggregate* pending bytes, not just each
         // upload — MAX_PENDING_PER_JOB × MAX_CACHE_UPLOAD_BYTES would
         // otherwise let one job hold ~16 GiB in reservations. The sum runs
         // under the same lock as the append, so concurrent chunks cannot
@@ -324,7 +321,7 @@ pub async fn cache_commit(
     let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
     let caller_job_id = claims.as_ref().map(|claims| claims.job_id.to_string());
     let system = auth::system_bearer_authorized(&shared.state, &headers);
-    // R1-10: a stale job token must not commit uploads after its job
+    // A stale job token must not commit uploads after its job
     if !system {
         let Some(claims) = claims else {
             return Err(ApiError::unauthorized(
@@ -349,13 +346,7 @@ pub async fn cache_commit(
             .remove(&cache_id)
             .ok_or_else(|| ApiError::not_found("cache reservation not found"))?
     };
-    let meta = {
-        let inner = shared.state.inner.lock().await;
-        crate::store::build_meta_snapshot(&inner)
-    };
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        tracing::warn!(?error, "failed to persist cache commit");
-    }
+
     if let Some(size) = request.size {
         let actual = pending.bytes.len() as u64;
         if size != actual {
@@ -391,7 +382,7 @@ pub async fn cache_lookup(
     let key = query.key.unwrap_or_default();
     let context = auth::job_cache_context_from_headers(&shared.state, &headers).await?;
     let restore_keys = parse_restore_keys(query.keys.as_deref());
-    // R1-5: a job reads its own ref's namespace, then the PR base branch
+    // A job reads its own ref's namespace, then the PR base branch
     // (pull_request runs), then the repository's real default branch —
     // resolved from the event payload, not assumed to be `main`. Caches on
     // unrelated branches stay invisible. The system token keeps the
@@ -458,7 +449,7 @@ pub async fn artifact_create(
     Path(run_id): Path<RunId>,
     Json(request): Json<ArtifactCreateRequest>,
 ) -> Result<Json<ArtifactRecord>, ApiError> {
-    // R1-10: a stale job token must not create artifacts after its job
+    // A stale job token must not create artifacts after its job
     // completes. The system bearer manages the lifecycle itself and bypasses;
     // the official runner uploads during the run, while its job is live.
     if !auth::system_bearer_authorized(&shared.state, &headers) {
@@ -494,10 +485,7 @@ pub async fn put_artifact(
     };
     let mut inner = shared.state.inner.lock().await;
     inner.artifacts.insert(record.id.clone(), record.clone());
-    let meta = crate::store::build_meta_snapshot(&inner);
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        tracing::warn!(?error, "failed to persist artifact metadata");
-    }
+    drop(inner);
     Ok(Json(record))
 }
 

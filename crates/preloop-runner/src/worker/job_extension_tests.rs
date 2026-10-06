@@ -143,10 +143,9 @@ fn snapshot_rewrite_installs_its_own_extraheader_only() {
 
 #[test]
 fn snapshot_auth_header_is_registered_as_a_mask() {
-    // cubic P1 (job_extension.rs:370): the Basic-encoded snapshot credential
-    // reaches the job environment as GIT_CONFIG_VALUE_2. If it is not
-    // registered with the job's mask list, ACTIONS_STEP_DEBUG (or any step
-    // debug that prints the job env) leaks it.
+    // The Basic-encoded snapshot credential reaches the job environment as
+    // GIT_CONFIG_VALUE_2. If it is not registered with the job's mask list,
+    // ACTIONS_STEP_DEBUG (or any step debug that prints the job env) leaks it.
     let mut job = JobContext::new(
         "j1".into(),
         "Test".into(),
@@ -266,12 +265,11 @@ fn tool_cache_prefers_hosted_dir() {
 
 #[test]
 fn setup_workspace_rejects_workspace_outside_runner_root() {
-    // Reproduction for cubic P0 (job_extension.rs:42): a crafted payload can
-    // name any absolute path as the workspace. On the unfixed code the path
-    // is used verbatim — an existing path is remove_dir_all'd, a missing one
-    // is created outside the runner root. The fixed contract: the workspace
-    // must be strictly inside the runner root; anything else is rejected
-    // before any filesystem mutation.
+    // A crafted payload can name any absolute path as the workspace. Without
+    // the check the path is used verbatim — an existing path is
+    // remove_dir_all'd, a missing one is created outside the runner root. The
+    // contract: the workspace must be strictly inside the runner root;
+    // anything else is rejected before any filesystem mutation.
     let outside = std::env::temp_dir().join(format!(
         "preloop_workspace_escape_probe_{}",
         std::process::id()
@@ -296,9 +294,9 @@ fn setup_workspace_rejects_workspace_outside_runner_root() {
 #[test]
 fn setup_workspace_refuses_to_delete_outside_root() {
     // Data-loss sandbox: a directory outside the runner root holding a
-    // sentinel file is named as the workspace. The unfixed code recursively
-    // deletes it; the fixed code must reject the payload with the sentinel
-    // untouched.
+    // sentinel file is named as the workspace. Without the check the runner
+    // recursively deletes it; the check must reject the payload with the
+    // sentinel untouched.
     let outside = std::env::temp_dir().join(format!(
         "preloop_workspace_delete_probe_{}",
         std::process::id()

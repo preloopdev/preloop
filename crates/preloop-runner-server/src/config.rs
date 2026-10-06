@@ -105,7 +105,7 @@ pub struct GitHubConfig {
     /// policy. Also the credential for the `--via pat` setup path.
     /// Stored inline (legacy); see [`Self::legacy_app_pem`].
     ///
-    /// H3: a static PAT cannot be narrowed per job. When no GitHub App is
+    /// A static PAT cannot be narrowed per job. When no GitHub App is
     /// configured, submission introspects the PAT's classic OAuth scopes and
     /// refuses runs whose declared `permissions:` are narrower than the PAT.
     /// Prefer a GitHub App so installation tokens are minted least-privilege.
@@ -1141,7 +1141,7 @@ pub fn load_config() -> anyhow::Result<ConfigFile> {
 /// it. A reachable backend that fails an individual read is still an error.
 pub fn resolve_credential_references(
     config: &mut ConfigFile,
-    store: &impl CredentialStore,
+    store: &dyn CredentialStore,
 ) -> anyhow::Result<()> {
     let references_present = config.github.app_pem_ref.is_some()
         || config.github.pat_ref.is_some()
@@ -1183,7 +1183,7 @@ pub fn resolve_credential_references(
 }
 
 fn read_credential(
-    store: &impl CredentialStore,
+    store: &dyn CredentialStore,
     reference: &str,
 ) -> anyhow::Result<Option<SecretString>> {
     let reference = CredentialRef::new(reference.to_owned())?;
@@ -1496,11 +1496,16 @@ pub fn load_config_from(path: &Path) -> anyhow::Result<ConfigFile> {
         .with_context(|| format!("validating config {}", path.display()))?;
     validate_execution_protection(&config)
         .with_context(|| format!("validating config {}", path.display()))?;
-    resolve_credential_references(&mut config, &OsCredentialStore)?;
+    let cred_base = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let store = crate::credential_store::store_from_env(&cred_base);
+    resolve_credential_references(&mut config, store.as_ref())?;
     // Unseal stored job secrets; legacy plaintext values pass through and
     // are re-sealed on the next write.
     if let Some(dir) = path.parent() {
-        unseal_config_secrets(&mut config, dir, &OsCredentialStore)
+        unseal_config_secrets(&mut config, dir, store.as_ref())
             .with_context(|| format!("unsealing secrets in config {}", path.display()))?;
     }
     Ok(config)
@@ -2123,7 +2128,7 @@ REPO_OVERLAY = "repo-from-credential"
         assert!(load_credential_from(&bad).is_err());
     }
 
-    // --- H2: config-file secret sealing ---
+    // --- config-file secret sealing ---
 
     /// The file on disk must hold ciphertext, never plaintext secret values.
     #[test]
@@ -2163,12 +2168,12 @@ REPO_OVERLAY = "repo-from-credential"
         );
     }
 
-    /// Pre-fix configs held plaintext. They must keep loading, and the next
+    /// Legacy configs held plaintext. They must keep loading, and the next
     /// write must re-seal them — no silent loss, no plaintext left behind.
     #[test]
     fn legacy_plaintext_secrets_are_read_and_resealed() {
         let dir = tempfile::tempdir().unwrap();
-        // Simulate a pre-fix file: plaintext values, no key ever generated.
+        // Simulate a legacy file: plaintext values, no key ever generated.
         let plain_text = toml::to_string_pretty(&populated_config()).unwrap();
         assert!(!plain_text.contains(SEALED_SECRET_PREFIX));
         // Loading legacy plaintext never touches the key backend.

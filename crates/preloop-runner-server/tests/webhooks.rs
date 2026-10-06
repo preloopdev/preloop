@@ -99,7 +99,7 @@ jobs:
     );
 
     let job_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner
             .runs
             .get(&run_id)
@@ -111,7 +111,7 @@ jobs:
     // workflows gate on `github.event.head_commit.message` and must not see a
     // null that makes property access error out.
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let run = inner.runs.get(&run_id).unwrap();
         let head_commit = &run.github["event"]["head_commit"];
         let id = head_commit["id"].as_str().unwrap();
@@ -155,7 +155,7 @@ async fn submit_rejects_invalid_schedule_cron() {
             "event": "push",
             "repository": "owner/repo",
         }),
-    )
+)
     .await;
     assert_eq!(response.0, StatusCode::BAD_REQUEST);
 
@@ -169,7 +169,7 @@ async fn submit_rejects_invalid_schedule_cron() {
             "event": "push",
             "repository": "owner/repo",
         }),
-    )
+)
     .await;
     assert_eq!(accepted["queued_jobs"], 1);
 }
@@ -367,28 +367,28 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
         "timeoutInMinutes": null
     }]));
     let mut empty_ref = checkout_test_message(json!([{
-        "id": "00000000-0000-0000-0000-000000000014",
-        "name": "empty-ref checkout",
-        "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
-        // An expression that resolved to nothing means "default branch" —
-        // the local snapshot IS the default, so the redirect must apply.
-        "inputs": {"ref": "", "fetch-depth": "1"},
-        "continueOnError": false,
-        "timeoutInMinutes": null
-    }]));
+           "id": "00000000-0000-0000-0000-000000000014",
+           "name": "empty-ref checkout",
+           "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+    // An expression that resolved to nothing means "default branch" —
+    // the local snapshot IS the default, so the redirect must apply.
+           "inputs": {"ref": "", "fetch-depth": "1"},
+           "continueOnError": false,
+           "timeoutInMinutes": null
+       }]));
     let mut expr_ref = checkout_test_message(json!([{
-        "id": "00000000-0000-0000-0000-000000000015",
-        "name": "expression-ref checkout",
-        "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
-        // Template refs are never evaluated server-side, and one that is not
-        // provably the action's declared default selects a target the
-        // workflow controls at runtime. Redirecting it would hijack that
-        // target once the runner evaluates the expression, so it must be
-        // treated as explicitly set.
-        "inputs": {"ref": "${{ inputs.head-sha }}", "fetch-depth": "0"},
-        "continueOnError": false,
-        "timeoutInMinutes": null
-    }]));
+           "id": "00000000-0000-0000-0000-000000000015",
+           "name": "expression-ref checkout",
+           "reference": {"name": "actions/checkout", "version": "v4", "type": "repository"},
+    // Template refs are never evaluated server-side, and one that is not
+    // provably the action's declared default selects a target the
+    // workflow controls at runtime. Redirecting it would hijack that
+    // target once the runner evaluates the expression, so it must be
+    // treated as explicitly set.
+           "inputs": {"ref": "${{ inputs.head-sha }}", "fetch-depth": "0"},
+           "continueOnError": false,
+           "timeoutInMinutes": null
+       }]));
     let original_explicit = message.steps[1].inputs.clone();
     let original_non_checkout = message.steps[2].inputs.clone();
     assert!(message.snapshot.is_none());
@@ -519,10 +519,6 @@ fn redirect_primary_checkout_rewrites_only_default_checkout_inputs() {
 /// A job that sat queued past the pinned token's lifetime must get a fresh
 /// credential at claim, scoped to itself, and unpinned steps must be
 /// untouched.
-
-/// A job that sat queued past the pinned token's lifetime must get a fresh
-/// credential at claim, scoped to itself, and unpinned steps must be
-/// untouched.
 #[tokio::test]
 async fn claim_remints_expired_snapshot_checkout_tokens() {
     let mut message = checkout_test_message(json!([
@@ -549,7 +545,7 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
 
-    let refreshed = crate::broker::re_mint_snapshot_tokens(&mut message, &state);
+    let refreshed = crate::broker::re_mint_snapshot_credentials(&mut message, &state);
     assert_eq!(refreshed, 1);
 
     let token = message.steps[0].inputs.get("token").unwrap();
@@ -579,7 +575,7 @@ async fn claim_remints_expired_snapshot_checkout_tokens() {
     // Without the pinned-step marker nothing is refreshed.
     message.preloop_snapshot_token_steps = None;
     assert_eq!(
-        crate::broker::re_mint_snapshot_tokens(&mut message, &state),
+        crate::broker::re_mint_snapshot_credentials(&mut message, &state),
         0
     );
 }
@@ -600,7 +596,7 @@ async fn claim_remints_snapshot_origin_credential_without_checkout() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     assert_eq!(
-        crate::broker::re_mint_snapshot_tokens(&mut message, &state),
+        crate::broker::re_mint_snapshot_credentials(&mut message, &state),
         0,
         "no checkout input was refreshed"
     );
@@ -625,13 +621,9 @@ async fn claim_remints_snapshot_origin_credential_without_checkout() {
     assert_eq!(claims["sub"], format!("preloop-job-{}", message.job_id));
 }
 
-/// The claim-time re-mint must actually run on the real claim path: a queued
-/// redirected checkout carries the submission-time pinned token, and the job
-/// the runner acquires must carry a freshly minted one.
-
-/// The claim-time re-mint must actually run on the real claim path: a queued
-/// redirected checkout carries the submission-time pinned token, and the job
-/// the runner acquires must carry a freshly minted one.
+/// The claim-time re-mint must actually run on the real claim path: the
+/// stored template carries no checkout token at all (only the pinned step-id
+/// marker), and the job the runner acquires must carry a freshly minted one.
 #[tokio::test]
 async fn claim_remints_snapshot_tokens_on_the_real_claim_path() {
     let temp = tempfile::tempdir().unwrap();
@@ -653,14 +645,12 @@ jobs:
         "owner/repo",
     )
     .await;
-    // The re-mint produces a fresh JWT; within the same second it is
-    // byte-identical to the pinned one, so give the clock room to move.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
 
-    // The pinned submission-time token, as it sits on the queued message.
-    let pinned_token = {
-        let inner = state.inner.lock().await;
-        let queued = inner.queue.front().expect("job should be queued");
+    // The stored template blanks the pinned step's `token` input — nothing
+    // token-shaped persists, only the id marker that drives the re-mint.
+    {
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("job should be queued");
         let checkout = queued
             .message
             .steps
@@ -672,12 +662,12 @@ jobs:
                     .is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout"))
             })
             .expect("queued job should contain the redirected checkout step");
-        checkout.inputs.get("token").cloned().expect("pinned token")
-    };
-    assert!(
-        state.verify_local_jwt_claims(&pinned_token).is_some(),
-        "the queued token must be a valid local JWT"
-    );
+        assert_eq!(
+            checkout.inputs.get("token"),
+            None,
+            "the stored template must not persist a checkout token"
+        );
+    }
 
     let session = request_json(
         &app,
@@ -697,9 +687,9 @@ jobs:
         Method::GET,
         &format!(
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
-        ),
+),
         Value::Null,
-    )
+)
     .await;
     let broker_body: Value =
         serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
@@ -728,30 +718,10 @@ jobs:
         .iter()
         .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
         .expect("the acquired job should contain the checkout step");
-    fn acquired_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
-        step["inputs"]
-            .get(name)
-            .and_then(Value::as_str)
-            .or_else(|| {
-                let found = step["inputs"]["map"].as_array()?.iter().find(|entry| {
-                    entry
-                        .get("Key")
-                        .or_else(|| entry.get("key"))
-                        .and_then(|key| key.get("lit"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|key| key == name)
-                })?;
-                found
-                    .get("Value")
-                    .or_else(|| found.get("value"))
-                    .and_then(|value| value.get("lit"))
-                    .and_then(Value::as_str)
-            })
-    }
-    let claimed_token = acquired_input(checkout, "token").expect("claimed pinned token");
-    assert_ne!(
-        claimed_token, pinned_token,
-        "claim must replace the submission-time token with a fresh one"
+    let claimed_token = delivered_step_input(checkout, "token").expect("claimed pinned token");
+    assert!(
+        !claimed_token.is_empty(),
+        "claim must stamp a fresh token where the template left the slot blank"
     );
     let claims = state
         .verify_local_jwt_claims(claimed_token)
@@ -765,10 +735,6 @@ jobs:
         "the claimed token must not be expired"
     );
 }
-
-/// A retry verdict must carry a freshly minted snapshot credential: the
-/// worker replays the failed step from the message it already holds, whose
-/// pinned token may be long expired.
 
 /// A retry verdict must carry a freshly minted snapshot credential: the
 /// worker replays the failed step from the message it already holds, whose
@@ -789,7 +755,7 @@ async fn retry_verdict_carries_a_fresh_snapshot_token() {
             "repository": "owner/repo",
             "preserve_on_failure": true
         }),
-    )
+)
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
@@ -802,7 +768,7 @@ async fn retry_verdict_carries_a_fresh_snapshot_token() {
     .await;
 
     let (agent_job_id, worker_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let record = inner.job_requests.iter().next().unwrap().1;
         (
             record.agent_job_id,
@@ -835,11 +801,23 @@ async fn retry_verdict_carries_a_fresh_snapshot_token() {
     .await;
     let session_id = opened["session_id"].as_str().unwrap().to_owned();
 
+    let lease = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/debug/sessions/{session_id}/lease"),
+        json!({ "controller": "test" }),
+    )
+    .await;
     request_json(
         &app,
         Method::POST,
-        &format!("/api/v1/debug/sessions/{session_id}/verdict"),
-        json!({ "verdict": "retry", "controller": "test" }),
+        &format!("/api/v1/debug/sessions/{session_id}/operations"),
+        json!({
+            "request_id": "test-retry-1",
+            "expected_version": lease["session_version"],
+            "lease_id": lease["lease_id"],
+            "operation": { "operation": "retry" }
+        }),
     )
     .await;
 
@@ -861,9 +839,288 @@ async fn retry_verdict_carries_a_fresh_snapshot_token() {
     assert_eq!(claims["sub"], format!("preloop-job-{agent_job_id}"));
 }
 
-/// The snapshot surface must reject bad credentials with a Bearer challenge:
-/// a bare 401 makes git fall back to Basic semantics and prompt for a
-/// username no job can answer.
+/// The verdict poll re-mints a replacement snapshot token by reading the
+/// request row through the backend. That read must happen *after* the
+/// node-local `inner` lock is released: on Postgres a reader checkout can wait
+/// on the pool, and holding the global lock across it stalls every other
+/// `inner` user on the node. The handler is polled exactly once, into the
+/// outstanding backend read, and the lock must be free while that read is in
+/// flight. Regression guard for the cutover that held the guard across it.
+#[tokio::test]
+async fn verdict_poll_releases_inner_before_the_backend_read() {
+    let Some((_db, pg_url)) = crate::test_pg::fresh_database().await else {
+        eprintln!("skipping: set PRELOOP_TEST_POSTGRES_URL to a Postgres server");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new_with_store(
+        temp.path().to_path_buf(),
+        crate::config::config_path(),
+        Some(&pg_url),
+    )
+    .await
+    .unwrap();
+
+    // A paused session with a queued retry verdict, built entirely in the
+    // node-local registry: the verdict poll needs no run row, only a session
+    // record and the agent job id that owns it.
+    let (session_id, agent_job_id) = {
+        use preloop_gha_protocol::debug_session::{
+            SessionLeaseRequest, SessionOperation, SessionOperationRequest,
+        };
+        let mut inner = state.inner.lock().await;
+        let request = test_open_request(RunId::new(), JobId("build".to_owned()));
+        let agent_job_id = request.agent_job_id;
+        let session = inner
+            .debug_sessions
+            .open(7, request, std::time::SystemTime::now());
+        let session_id = session.session_id.clone();
+        let lease = inner
+            .debug_sessions
+            .acquire_controller_lease(
+                &session_id,
+                &SessionLeaseRequest {
+                    controller: "test".to_owned(),
+                    capabilities: Vec::new(),
+                },
+            )
+            .expect("lease");
+        inner
+            .debug_sessions
+            .session_operation(
+                &session_id,
+                SessionOperationRequest {
+                    request_id: "t-retry".to_owned(),
+                    expected_version: lease.session_version,
+                    lease_id: lease.lease_id.clone(),
+                    operation: SessionOperation::Retry {
+                        revert: Default::default(),
+                        source_revision: None,
+                    },
+                },
+            )
+            .expect("retry operation");
+        (session_id, agent_job_id)
+    };
+
+    // Poll the handler exactly once: it reaches the backend read and parks
+    // there. While that read is outstanding the node-local lock must not be
+    // held, so a concurrent `inner` user is not stalled behind a slow reader
+    // pool or a blocking query.
+    // `VerdictPollQuery::wait` is crate-private; build the extractor's value
+    // through its `Deserialize` impl instead of the struct literal.
+    let query: VerdictPollQuery =
+        serde_json::from_value(json!({ "wait": 0 })).expect("a wait=0 verdict poll query");
+    let mut fut = Box::pin(poll_verdict(
+        axum::extract::State(state.shared()),
+        axum::Extension(WorkerJob(agent_job_id)),
+        axum::extract::Path(session_id),
+        axum::extract::Query(query),
+    ));
+    assert!(
+        futures::poll!(fut.as_mut()).is_pending(),
+        "the verdict poll must still be awaiting the backend read after one poll"
+    );
+    assert!(
+        state.inner.try_lock().is_ok(),
+        "the node-local lock must be released before the backend read is awaited"
+    );
+}
+
+/// `inputs[name]` of a delivered step, handling the TemplateToken map wire
+/// form (`inputs.map[].Key/Value`) the job message uses.
+fn delivered_step_input<'a>(step: &'a Value, name: &str) -> Option<&'a str> {
+    step["inputs"]
+        .get(name)
+        .and_then(Value::as_str)
+        .or_else(|| {
+            let found = step["inputs"]["map"].as_array()?.iter().find(|entry| {
+                entry
+                    .get("Key")
+                    .or_else(|| entry.get("key"))
+                    .and_then(|key| key.get("lit"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| key == name)
+            })?;
+            found
+                .get("Value")
+                .or_else(|| found.get("value"))
+                .and_then(|value| value.get("lit"))
+                .and_then(Value::as_str)
+        })
+}
+
+/// The decoded body of a distributedtask (AzDO) delivery.
+///
+/// A runner-backed session keys its messages with the AES key derived from
+/// the session id (the create-session response publishes the same key), so
+/// the base64 body only becomes JSON after decryption.
+///
+/// `AppState::session_encryption` is crate-private, so derive the key here
+/// exactly as it does: `derive_session_encryption(&state.local_jwt_key, …)`.
+fn azdo_delivered_body(state: &AppState, message: &Value, session_id: &str) -> Value {
+    let body = BASE64_STANDARD
+        .decode(
+            message["body"]
+                .as_str()
+                .expect("an AzDO delivery must carry a base64 body"),
+        )
+        .expect("the AzDO body must be base64");
+    let iv = BASE64_STANDARD
+        .decode(
+            message["iv"]
+                .as_str()
+                .expect("an AzDO delivery must carry an IV"),
+        )
+        .expect("the AzDO IV must be base64");
+    let plaintext = derive_session_encryption(&state.local_jwt_key, session_id)
+        .decrypt(&body, &iv)
+        .expect("the AzDO body must decrypt with the session key");
+    serde_json::from_slice(&plaintext).unwrap()
+}
+
+/// The AzDO/disttask delivery path renders the stored template directly
+/// (`render_session_message`), where `strip_template` blanked the pinned
+/// checkout `token` input. It must re-mint that credential exactly like the
+/// broker claim path: otherwise `actions/checkout` replays the blank slot,
+/// falls back to `${{ github.token }}`, and the snapshot endpoint refuses a
+/// credential it cannot verify.
+#[tokio::test]
+async fn azdo_session_delivery_remints_the_pinned_snapshot_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+
+    let (runner_id, runner_token) =
+        register_runner_with_token(&app, "azdo-snapshot-remint", &["self-hosted"], None).await;
+    let (status, session) = create_disttask_session(&app, &runner_token, runner_id).await;
+    assert!(status.is_success(), "azdo session: {session}");
+    let session_id = session["sessionId"].as_str().unwrap();
+
+    let delivered = poll_message(&app, &runner_token, session_id).await;
+    let message = azdo_delivered_body(&state, &delivered, session_id);
+    let checkout = message["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the delivered job should contain the checkout step");
+    let token = delivered_step_input(checkout, "token")
+        .expect("an AzDO-delivered job must carry a freshly minted checkout token");
+    let claims = state
+        .verify_local_jwt_claims(token)
+        .expect("the AzDO-delivered token must verify as a local JWT");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        claims["exp"].as_u64().unwrap() > now,
+        "the AzDO-delivered token must not be expired"
+    );
+    assert_eq!(
+        claims["sub"],
+        format!("preloop-job-{}", message["jobId"].as_str().unwrap()),
+        "the re-minted token must be scoped to this job"
+    );
+}
+
+/// The origin-rewrite `Authorization` header is a Basic credential wrapping
+/// the job's runtime token, so the stored template must not persist it — and
+/// every delivery path must rebuild it from a freshly minted token, or a job
+/// queued past the token lifetime fetches its snapshot with an expired
+/// credential.
+#[tokio::test]
+async fn snapshot_origin_rewrite_header_is_reminted_at_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let yaml = r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+"#;
+    submit_yaml(&app, yaml, "owner/repo").await;
+
+    {
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("job should be queued");
+        let rewrite = queued
+            .message
+            .preloop_snapshot_origin_rewrite
+            .as_ref()
+            .expect("a workspace snapshot must pin the forge→snapshot rewrite");
+        assert!(
+            rewrite.auth_header.is_empty(),
+            "the stored template must not persist the runtime token: {}",
+            rewrite.auth_header
+        );
+        assert!(!rewrite.snapshot_url.is_empty() && !rewrite.forge_url.is_empty());
+    }
+
+    let assert_fresh_header = |message: &Value, delivered_by: &str| {
+        let header = message["preloopSnapshotOriginRewrite"]["authHeader"]
+            .as_str()
+            .expect("the delivered message must carry an origin-rewrite header");
+        let token = header
+            .strip_prefix("AUTHORIZATION: basic ")
+            .expect("the header shape the runner consumes");
+        let decoded = BASE64_STANDARD
+            .decode(token)
+            .expect("the header credential must be base64");
+        let decoded = String::from_utf8(decoded).unwrap();
+        let token = decoded
+            .strip_prefix("x-access-token:")
+            .expect("the snapshot credential shape");
+        let claims = state
+            .verify_local_jwt_claims(token)
+            .unwrap_or_else(|| panic!("the {delivered_by} header token must verify"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            claims["exp"].as_u64().unwrap() > now,
+            "the {delivered_by} header token must not be expired"
+        );
+    };
+
+    // Broker acquire.
+    let acquired = acquire_queued_job(&app, "origin-rewrite-broker").await;
+    assert_fresh_header(&acquired, "broker");
+
+    // AzDO/disttask delivery of the same stored template.
+    submit_yaml(&app, yaml, "owner/repo").await;
+    let (runner_id, runner_token) =
+        register_runner_with_token(&app, "origin-rewrite-azdo", &["self-hosted"], None).await;
+    let (status, session) = create_disttask_session(&app, &runner_token, runner_id).await;
+    assert!(status.is_success(), "azdo session: {session}");
+    let session_id = session["sessionId"].as_str().unwrap();
+    let delivered = poll_message(&app, &runner_token, session_id).await;
+    assert_fresh_header(&azdo_delivered_body(&state, &delivered, session_id), "azdo");
+}
 
 /// The snapshot surface must reject bad credentials with a Bearer challenge:
 /// a bare 401 makes git fall back to Basic semantics and prompt for a
@@ -881,11 +1138,11 @@ async fn snapshot_401_advertises_a_bearer_challenge() {
                 .method(Method::GET)
                 .uri(
                     "/snapshots/00000000-0000-0000-0000-000000000001/info/refs?service=git-upload-pack",
-                )
+)
                 .header(header::AUTHORIZATION, "Bearer not-a-real-token")
                 .body(Body::empty())
                 .unwrap(),
-        )
+)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -935,7 +1192,7 @@ jobs:
     // `${{ github.sha }}` from the real remote (custom checkouts) must
     // receive a sha the upstream host can actually resolve, and the
     // snapshot commit exists only in this engine's store.
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let run = inner.runs.get(&run_id).unwrap();
     let context_sha = run.github["sha"].as_str().unwrap().to_owned();
     let snapshot_sha = run.workspace_snapshot.as_ref().unwrap().commit_sha.clone();
@@ -970,9 +1227,9 @@ jobs:
         Method::GET,
         &format!(
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
-        ),
+),
         Value::Null,
-    )
+)
     .await;
     let broker_body: Value = serde_json::from_str(broker_message["body"].as_str().unwrap())
         .expect("broker message body should be JSON");
@@ -1263,18 +1520,17 @@ jobs:
     )
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-    let expected_commit = {
-        let inner = state.inner.lock().await;
-        inner
-            .runs
-            .get(&run_id)
-            .unwrap()
-            .workspace_snapshot
-            .as_ref()
-            .unwrap()
-            .commit_sha
-            .clone()
-    };
+    let expected_commit = state
+        .test_tx()
+        .await
+        .runs
+        .get(&run_id)
+        .expect("run exists")
+        .workspace_snapshot
+        .as_ref()
+        .expect("workspace snapshot")
+        .commit_sha
+        .clone();
 
     let session = request_json(
         &app,
@@ -1343,11 +1599,6 @@ jobs:
 /// commit once and every job in that run checks it out from the engine with its
 /// own Actions runtime token. A token bound to a different run must not reach
 /// those objects.
-
-/// With `checkout_cache.mode = "run-scoped"`, a webhook-shaped run fetches its
-/// commit once and every job in that run checks it out from the engine with its
-/// own Actions runtime token. A token bound to a different run must not reach
-/// those objects.
 #[tokio::test]
 async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
@@ -1402,7 +1653,7 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
                 }
             }
         }),
-    )
+)
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
@@ -1424,9 +1675,9 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
         Method::GET,
         &format!(
             "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
-        ),
+),
         Value::Null,
-    )
+)
     .await;
     let broker_body: Value =
         serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
@@ -1558,10 +1809,6 @@ async fn run_scoped_checkout_cache_serves_the_run_commit_to_its_job_token() {
 /// Uploaded job logs must stay bounded, and pruning must not cost a run its
 /// logs: `get_run_logs` prefers the blob and falls back to the in-memory
 /// blocks, so an evicted plan degrades instead of disappearing.
-
-/// Uploaded job logs must stay bounded, and pruning must not cost a run its
-/// logs: `get_run_logs` prefers the blob and falls back to the in-memory
-/// blocks, so an evicted plan degrades instead of disappearing.
 #[tokio::test]
 async fn replay_results_are_pruned_to_the_retention_window() {
     let temp = tempfile::tempdir().unwrap();
@@ -1668,11 +1915,11 @@ async fn pull_request_submission_uses_head_sha_not_zeros() {
                 }
             }
         }),
-    )
+)
     .await;
     assert_eq!(accepted["queued_jobs"], 1);
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let (_, run_record) = inner.runs.iter().next().unwrap();
     assert_eq!(
         run_record.head_sha, "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
@@ -1707,12 +1954,12 @@ async fn pull_request_submission_uses_short_ref_name_and_job_id() {
                 }
             }
         }),
-    )
+)
     .await;
     assert_eq!(accepted["queued_jobs"], 2);
 
-    let inner = state.inner.lock().await;
-    let queued: Vec<_> = inner.queue.iter().collect();
+    let inner = state.test_tx().await;
+    let queued: Vec<_> = inner.ready().collect();
     assert_eq!(queued.len(), 2);
     let github = &queued[0].message.context_data["github"].to_json();
     assert_eq!(github["ref"], "refs/pull/7/merge");
@@ -1756,7 +2003,7 @@ async fn stolen_identity_cannot_pull_another_machines_job() {
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(inner.pool_pending.len(), 1, "job waits for its machine");
         assert!(inner.job_assignments.is_empty());
     }
@@ -1764,7 +2011,7 @@ async fn stolen_identity_cannot_pull_another_machines_job() {
     let (runner_a, token_a) =
         register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner
                 .job_assignments
@@ -1839,18 +2086,18 @@ async fn failing_provisioning_cannot_starve_a_healthy_runner() {
     // claiming. Age the binding between rounds so every phantom adopts a
     // "stale" pairing exactly as the real churn does.
     for round in 0..3 {
-        {
-            let mut inner = state.inner.lock().await;
-            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-            for key in keys {
-                if let Some(record) = inner.job_assignments.get_mut(&key) {
-                    record.at = std::time::SystemTime::now()
-                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                        - std::time::Duration::from_secs(1);
-                    record.first_at = record.at;
-                }
-            }
-        }
+        state
+            .test_db_mutate(|tx| {
+                let stale = crate::store::now_us()
+                    - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                    - 1_000_000;
+                tx.execute(
+                    "UPDATE job_assignments SET assigned_at = ?1, first_assigned_at = ?1",
+                    [stale],
+                )
+                .unwrap();
+            })
+            .await;
         let token_name = format!("token-phantom-{round}");
         stage_provision_token(&state, &token_name);
         let (phantom_id, _) = register_runner_with_token(
@@ -1865,31 +2112,24 @@ async fn failing_provisioning_cannot_starve_a_healthy_runner() {
             state: state.clone(),
             shutdown: CancellationToken::new(),
         });
-        crate::runner_lifecycle::purge_runner_identity(&shared, phantom_id).await;
+        crate::runner_lifecycle::purge_runner_identity(&shared, phantom_id)
+            .await
+            .expect("phantom purge must succeed in test");
     }
 
     // The established runner must now be able to claim: the job has been
     // bound-and-abandoned for longer than the binding window.
-    {
-        let mut inner = state.inner.lock().await;
-        let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-        for key in keys {
-            if let Some(record) = inner.job_assignments.get_mut(&key) {
-                record.first_at = std::time::SystemTime::now()
-                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                    - std::time::Duration::from_secs(1);
-            }
-        }
-        let pending: Vec<_> = inner.pool_pending.keys().cloned().collect();
-        for key in pending {
-            inner.pool_pending.insert(
-                key,
-                std::time::SystemTime::now()
-                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                    - std::time::Duration::from_secs(1),
-            );
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                - 1_000_000;
+            tx.execute("UPDATE job_assignments SET first_assigned_at = ?1", [stale])
+                .unwrap();
+            tx.execute("UPDATE provision_requests SET requested_at = ?1", [stale])
+                .unwrap();
+        })
+        .await;
 
     let delivered = poll_message(&app, &healthy_token, &healthy_session_id).await;
     assert!(
@@ -1931,17 +2171,15 @@ async fn rebinding_churn_cannot_starve_an_established_runner() {
     // Churn: each new machine adopts the pairing once the previous one's
     // binding looks stale, refreshing `at` every round.
     for round in 0..3 {
-        {
-            let mut inner = state.inner.lock().await;
-            let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-            for key in keys {
-                if let Some(record) = inner.job_assignments.get_mut(&key) {
-                    record.at = std::time::SystemTime::now()
-                        - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                        - std::time::Duration::from_secs(1);
-                }
-            }
-        }
+        state
+            .test_db_mutate(|tx| {
+                let stale = crate::store::now_us()
+                    - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                    - 1_000_000;
+                tx.execute("UPDATE job_assignments SET assigned_at = ?1", [stale])
+                    .unwrap();
+            })
+            .await;
         let token_name = format!("token-churn-{round}");
         stage_provision_token(&state, &token_name);
         register_runner_with_token(
@@ -1955,23 +2193,33 @@ async fn rebinding_churn_cannot_starve_an_established_runner() {
 
     // Every round refreshed `at`, so the binding still looks fresh — but the
     // job has been bound-and-unclaimed since the first round.
-    {
-        let mut inner = state.inner.lock().await;
-        let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-        assert!(!keys.is_empty(), "churn must leave the job bound");
-        for key in keys {
-            if let Some(record) = inner.job_assignments.get_mut(&key) {
+    state
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                - 1_000_000;
+            let fresh = crate::store::now_us();
+            let holders: Vec<Option<i64>> =
+                tx.0.prepare("SELECT runner_id FROM job_assignments")
+                    .unwrap()
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            assert!(!holders.is_empty(), "churn must leave the job bound");
+            for holder in holders {
                 assert!(
-                    record.runner_id != Some(established_id),
+                    holder != Some(established_id),
                     "churned machine, not the established runner, holds the pairing"
                 );
-                record.first_at = std::time::SystemTime::now()
-                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                    - std::time::Duration::from_secs(1);
-                record.at = std::time::SystemTime::now();
             }
-        }
-    }
+            tx.execute(
+                "UPDATE job_assignments SET first_assigned_at = ?1, assigned_at = ?2",
+                [stale, fresh],
+            )
+            .unwrap();
+        })
+        .await;
 
     let delivered = poll_message(&app, &established_token, &established_session_id).await;
     assert!(
@@ -1997,7 +2245,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
     let (runner_a, _) =
         register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
     let key_a = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let key = inner.job_assignments.keys().next().cloned().unwrap();
         assert_eq!(
             inner.job_assignments.get(&key).and_then(|r| r.runner_id),
@@ -2012,7 +2260,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
     let key_b = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let key = inner.pool_pending.keys().next().cloned().unwrap();
         assert!(key.0 != key_a.0, "second submission is a distinct run");
         key
@@ -2021,20 +2269,20 @@ async fn stale_binding_requeues_behind_newer_waits() {
     // Age machine-a's binding past the claim window, then machine-b
     // registers: the stale binding is released, and the earlier wait (job B)
     // is paired — not the dying job re-adopted with priority.
-    {
-        let mut inner = state.inner.lock().await;
-        let keys: Vec<_> = inner.job_assignments.keys().cloned().collect();
-        for key in keys {
-            if let Some(record) = inner.job_assignments.get_mut(&key) {
-                record.at = std::time::SystemTime::now()
-                    - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                    - std::time::Duration::from_secs(1);
-                record.first_at = record.at;
-            }
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64)
+                - 1_000_000;
+            tx.execute(
+                "UPDATE job_assignments SET assigned_at = ?1, first_assigned_at = ?1",
+                [stale],
+            )
+            .unwrap();
+        })
+        .await;
     let key_a_first_at = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner
             .job_assignments
             .get(&key_a)
@@ -2045,7 +2293,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
     let (runner_b, _) =
         register_runner_with_token(&app, "machine-b", &["self-hosted"], Some("token-b")).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner.job_assignments.len(),
             2,
@@ -2073,7 +2321,7 @@ async fn stale_binding_requeues_behind_newer_waits() {
     let (runner_c, _) =
         register_runner_with_token(&app, "machine-c", &["self-hosted"], Some("token-c")).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner.job_assignments.get(&key_a).and_then(|r| r.runner_id),
             Some(runner_c),
@@ -2099,23 +2347,20 @@ async fn stale_pending_mark_is_still_offered_to_a_registering_runner() {
 
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
-    {
-        let mut inner = state.inner.lock().await;
-        let pending: Vec<_> = inner.pool_pending.keys().cloned().collect();
-        for key in pending {
-            inner.pool_pending.insert(
-                key,
-                std::time::SystemTime::now()
-                    - crate::runtime_scheduling::ASSIGNMENT_TTL
-                    - std::time::Duration::from_secs(1),
-            );
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - (crate::runtime_scheduling::ASSIGNMENT_TTL.as_micros() as i64)
+                - 1_000_000;
+            tx.execute("UPDATE provision_requests SET requested_at = ?1", [stale])
+                .unwrap();
+        })
+        .await;
     stage_provision_token(&state, "token-a");
     let (runner_a, _) =
         register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner
                 .job_assignments
@@ -2144,7 +2389,7 @@ async fn queue_time_assignment_prefers_idle_registered_runner() {
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner
                 .job_assignments
@@ -2188,7 +2433,7 @@ async fn provision_pairing_requires_the_token() {
     let (runner_plain, _) =
         register_runner_with_token(&app, "external", &["self-hosted"], None).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(
             inner.job_assignments.is_empty(),
             "no provisioning proof, no pairing"
@@ -2201,7 +2446,7 @@ async fn provision_pairing_requires_the_token() {
     let (_runner_forged, _) =
         register_runner_with_token(&app, "forger", &["self-hosted"], Some("wrong-token")).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert!(inner.job_assignments.is_empty());
     }
 
@@ -2209,7 +2454,7 @@ async fn provision_pairing_requires_the_token() {
     let (runner_a, _) =
         register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         assert_eq!(
             inner
                 .job_assignments
@@ -2230,10 +2475,10 @@ async fn provision_pairing_requires_the_token() {
 async fn strict_mode_refuses_unassigned_dispatch() {
     let temp = tempfile::tempdir().unwrap();
     let state = pool_managed_state(&temp).await;
-    state.inner.lock().await.require_job_assignments = true;
+    // Strict-only engine: assignments required, but no provisioning channel,
+    // so nothing ever pairs.
+    state.test_set_backend_config(false, true);
     let app = app(state.clone(), CancellationToken::new());
-    // Strict-only engine: no provisioning channel, so nothing ever pairs.
-    state.inner.lock().await.pool_assignments_enabled = false;
 
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
@@ -2257,8 +2502,7 @@ async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
     // record must survive so a verified replacement runner can take over.
     let temp = tempfile::tempdir().unwrap();
     let state = pool_managed_state(&temp).await;
-    state.inner.lock().await.require_job_assignments = true;
-    state.inner.lock().await.pool_assignments_enabled = false;
+    state.test_set_backend_config(false, true);
     let app = app(state.clone(), CancellationToken::new());
 
     // A pre-registered idle runner gets the queue-time binding.
@@ -2270,7 +2514,7 @@ async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
     let accepted = submit_simple_run(&app).await;
     assert_eq!(accepted["queued_jobs"], 1);
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let key = inner.job_assignments.keys().next().cloned().unwrap();
         assert_eq!(
             inner.job_assignments.get(&key).and_then(|r| r.runner_id),
@@ -2279,15 +2523,18 @@ async fn strict_non_pool_mode_keeps_a_stale_binding_claimable() {
         );
     }
     // machine-a dies without claiming; the binding goes stale.
-    {
-        let mut inner = state.inner.lock().await;
-        for record in inner.job_assignments.values_mut() {
-            record.at = std::time::SystemTime::now()
-                - crate::runtime_scheduling::CLAIM_BINDING_TTL
-                - std::time::Duration::from_secs(1);
-            record.first_at = record.at;
-        }
-    }
+    state
+        .test_db_mutate(|tx| {
+            let stale = crate::store::now_us()
+                - crate::runtime_scheduling::CLAIM_BINDING_TTL.as_micros() as i64
+                - 1_000_000;
+            tx.execute(
+                "UPDATE job_assignments SET assigned_at = ?1, first_assigned_at = ?1",
+                [stale],
+            )
+            .unwrap();
+        })
+        .await;
 
     // A fresh pool-authorized runner registers (provision token, so the
     // pairing path runs): the stale binding must survive and still let it
@@ -2351,7 +2598,7 @@ async fn session_create_rejects_cross_runner_body() {
     let (status, session) = create_disttask_session(&app, &token_a, runner_a).await;
     assert_eq!(status, StatusCode::CREATED);
     let session_id = session["sessionId"].as_str().unwrap();
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(inner.runner_id_for_session(session_id), Some(runner_a));
 }
 
@@ -2367,7 +2614,7 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
     let (runner_a, _token) =
         register_runner_with_token(&app, "machine-a", &["self-hosted"], Some("token-a")).await;
     let (run_id, job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         inner.job_assignments.keys().next().unwrap().clone()
     };
     let _ = (run_id, job_id);
@@ -2381,28 +2628,31 @@ async fn delete_agent_purges_identity_and_requeues_assignment() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let inner = state.inner.lock().await;
-    assert!(!inner.runner_rsa_public_keys.contains_key(&runner_a));
-    assert!(!inner.runner_public_keys.contains_key(&runner_a));
-    assert!(!inner.runners.contains_key(&runner_a));
-    assert!(inner.runner_client_ids.values().all(|id| *id != runner_a));
+    let tx = state.test_tx().await;
+    assert!(!tx.runners.contains_key(&runner_a));
+    assert!(tx.runner_client_ids.values().all(|id| *id != runner_a));
     assert!(
-        inner
-            .job_assignments
+        tx.job_assignments
             .values()
             .all(|r| r.runner_id != Some(runner_a)),
         "purge drops the dead runner's assignment"
     );
     assert_eq!(
-        inner.pool_pending.len(),
+        tx.pool_pending.len(),
         1,
         "unclaimed job returns to pool-pending for re-provisioning"
     );
-    drop(inner);
+    drop(tx);
+    {
+        let tx = state.test_tx().await;
+        let inner = state.inner.lock().await;
+        assert!(!tx.runner_rsa_public_keys.contains_key(&runner_a));
+        assert!(!inner.runner_public_keys.contains_key(&runner_a));
+    }
 
     // A restart must not resurrect the deleted identity from a stale snapshot.
     let recovered = AppState::new(temp.path().to_path_buf()).await.unwrap();
-    let recovered_inner = recovered.inner.lock().await;
+    let recovered_inner = recovered.test_tx().await;
     assert!(!recovered_inner.runners.contains_key(&runner_a));
     assert!(
         recovered_inner
@@ -2426,7 +2676,7 @@ async fn control_socket_surface_denies_native_and_test_apis() {
         "/api/v1/runs",
         "/api/v1/debug/sessions",
         "/api/v1/debug/sessions/dbg-controller-only",
-        "/api/v1/agent/debug/sessions/dbg-controller-only/events",
+        "/api/v1/debug/sessions/dbg-controller-only/events",
         "/internal/test/jobs/complete",
     ] {
         let response = socket_app
@@ -2447,23 +2697,25 @@ async fn control_socket_surface_denies_native_and_test_apis() {
             "socket must not expose {denied}"
         );
     }
-    let controller_verdict = socket_app
+    let controller_operation = socket_app
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/v1/debug/sessions/dbg-controller-only/verdict")
+                .uri("/api/v1/debug/sessions/dbg-controller-only/operations")
                 .header(header::AUTHORIZATION, "Bearer preloop-system-token")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"verdict":"abort"}"#))
+                .body(Body::from(
+                    r#"{"request_id":"t","expected_version":1,"lease_id":"l","operation":{"operation":"abort"}}"#,
+))
                 .unwrap(),
-        )
+)
         .await
         .unwrap();
     assert_eq!(
-        controller_verdict.status(),
+        controller_operation.status(),
         StatusCode::NOT_FOUND,
-        "the controller verdict API must stay off the guest socket"
+        "the controller operations API must stay off the guest socket"
     );
 
     // The v3 registration-token endpoints mint runner-management JWTs
@@ -2724,7 +2976,7 @@ jobs:
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let requests = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let mut requests = inner
             .job_requests
             .values()
@@ -2810,8 +3062,8 @@ async fn replay_blob_urls_are_minted_only_for_the_callers_own_job() {
     // The runtime token is exported to steps as ACTIONS_RUNTIME_TOKEN, so it
     // is exactly the credential untrusted workflow code holds.
     let runtime_token = state.mint_runtime_token(&plan, &my_job);
-    // R1-10: URL-minting writes require a live job record.
-    r1_10_register_live_job(&state, my_job, &plan).await;
+    // URL-minting writes require a live job record.
+    register_live_job(&state, my_job, &plan).await;
     let mint_url = "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL";
 
     // Minting a signed URL for *another* job's backend ids is refused.
@@ -2907,8 +3159,8 @@ async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
         format!("urn:uuid:{canonical}"),
     ];
     let token = state.mint_runtime_token(&plan, &job);
-    // R1-10: results writes require a live job record.
-    r1_10_register_live_job(&state, job, &plan).await;
+    // Results writes require a live job record.
+    register_live_job(&state, job, &plan).await;
 
     for form in &forms {
         let requests = [

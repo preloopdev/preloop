@@ -268,6 +268,16 @@ impl ApiError {
             kind: ApiErrorKind::BadRequest,
         }
     }
+
+    /// A tenant limit refused the request; the caller may retry once its own
+    /// in-flight work drains.
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            kind: ApiErrorKind::BadRequest,
+        }
+    }
 }
 
 impl From<preloop_gha_parser::ParserError> for ApiError {

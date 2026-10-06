@@ -233,16 +233,18 @@ pub struct WorkflowSubmission {
     /// Workflow dispatch or call inputs.
     #[serde(default)]
     pub inputs: BTreeMap<String, serde_json::Value>,
-    /// Caller-provided secrets.
+    /// Caller-provided secret values. Accepted on the wire only: the engine
+    /// moves them into the SecretProvider's run tier at submit and never
+    /// persists them with the run.
     #[serde(default)]
     pub secrets: SecretMap,
-    /// Names the caller provided before stored-secret merging, so per-job
-    /// environment overlays can keep submission-provided values winning per
-    /// name. Populated server-side after deserialization; skipped on the
-    /// wire and lost if a run's submission is ever rebuilt from persisted
-    /// state (in that case stored environment secrets win by name).
-    #[serde(default, skip)]
-    pub submission_names: BTreeSet<String>,
+    /// Names of the run-tier secrets the submission supplied, recorded by the
+    /// server at submit. Values live only in the SecretProvider's run tier;
+    /// this is the non-secret reference list a re-run uses to tell "the
+    /// submission declared no secrets" from "the run tier can no longer be
+    /// resolved", which must fail loudly rather than run without secrets.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub run_secret_names: BTreeSet<String>,
     /// Local reusable workflow YAML keyed by repository-relative path.
     #[serde(default)]
     pub reusable_workflows: BTreeMap<String, String>,

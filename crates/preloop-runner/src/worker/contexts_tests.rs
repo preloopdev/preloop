@@ -168,7 +168,7 @@ proptest! {
     }
 }
 
-// H1: a multiline initial secret must be masked per line, not just as a
+// A multiline initial secret must be masked per line, not just as a
 // whole value. Log lines are masked individually, so without per-line
 // registration each line of a PEM key would leak verbatim while only the
 // (never emitted) whole value stayed masked.
@@ -622,7 +622,7 @@ fn cancelled_status_reflects_in_context() {
     assert!(preloop_gha_expressions::eval_bool("always()", &expr_ctx).unwrap());
 }
 
-// --- P1 expressions/templates gap coverage ---
+// --- expressions/templates gap coverage ---
 
 #[test]
 fn matrix_context_resolves_in_expressions() {

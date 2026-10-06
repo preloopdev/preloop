@@ -158,7 +158,7 @@ fn runner_volumes(
 }
 
 /// Populate the host-side externals directory, validating the manifest and
-/// binary version (R2) for each runtime instead of merely checking for a file.
+/// binary version for each runtime instead of merely checking for a file.
 ///
 /// Reuses the same shell routine the golden bake uses — now with temp-file
 /// download, SHA256 verification (pinned + SHASUMS), and manifest emission —
@@ -1053,6 +1053,15 @@ const GOLDEN_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// roughly one line every 25 s on a 100 Mbps link: often enough to show
 /// movement, sparse enough not to bury the log.
 const GOLDEN_PROGRESS_INTERVAL: u64 = 256 * 1000 * 1000;
+/// Space retained after the temporary payload lands. The download is renamed
+/// in place, so no second full copy is needed, but the engine still needs room
+/// for filesystem metadata, logs, and the next VM operation.
+const GOLDEN_DOWNLOAD_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+/// Conservative estimate when a custom server omits `Content-Length` or an
+/// OCI manifest omits its descriptor size. The current packed golden is
+/// approximately 9.6 GB.
+const GOLDEN_UNKNOWN_SIZE_ESTIMATE: u64 = 10_000_000_000;
+type AvailableSpace = fn(&Path) -> std::io::Result<u64>;
 
 fn golden_download_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> Option<u8> {
     let total_bytes = total_bytes.filter(|total| *total > 0)?;
@@ -1106,11 +1115,83 @@ fn report_golden_download_progress(source: &str, downloaded_bytes: u64, total_by
     }
 }
 
+/// Free space on the filesystem holding `path`, in bytes.
+#[cfg(unix)]
+fn filesystem_available_space(path: &Path) -> std::io::Result<u64> {
+    let stat = nix::sys::statvfs::statvfs(path).map_err(std::io::Error::from)?;
+    Ok(stat.blocks_available() as u64 * stat.fragment_size() as u64)
+}
+
+/// `statvfs` is Unix-only; the caller logs the error and continues without
+/// the space check.
+#[cfg(not(unix))]
+fn filesystem_available_space(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "free-space checks require a Unix host",
+    ))
+}
+
+fn golden_download_required_bytes(expected_bytes: Option<u64>) -> u64 {
+    expected_bytes
+        .unwrap_or(GOLDEN_UNKNOWN_SIZE_ESTIMATE)
+        .saturating_add(GOLDEN_DOWNLOAD_HEADROOM)
+}
+
+fn ensure_golden_download_space(
+    payload: &Path,
+    expected_bytes: Option<u64>,
+    available_space: AvailableSpace,
+) -> Result<(), OrchestratorError> {
+    let parent = payload
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let required_bytes = golden_download_required_bytes(expected_bytes);
+    let available_bytes = match available_space(parent) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                %error,
+                path = %parent.display(),
+                "Could not determine free space before golden download; continuing"
+            );
+            return Ok(());
+        }
+    };
+    if available_bytes >= required_bytes {
+        return Ok(());
+    }
+
+    warn!(
+        path = %parent.display(),
+        available_mb = megabytes(available_bytes),
+        required_mb = megabytes(required_bytes),
+        "Insufficient disk space for pre-baked golden"
+    );
+    Err(OrchestratorError::GoldenDiskSpace {
+        path: parent.to_path_buf(),
+        available_bytes,
+        required_bytes,
+    })
+}
+
 fn should_download_prebaked_golden(base_image: &str, custom_golden_url: bool) -> bool {
     is_stock_base_image(base_image) || custom_golden_url
 }
 
-async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool {
+async fn download_prebaked_golden(
+    payload: &Path,
+    release_version: &str,
+) -> Result<bool, OrchestratorError> {
+    download_prebaked_golden_with_space(payload, release_version, filesystem_available_space).await
+}
+
+async fn download_prebaked_golden_with_space(
+    payload: &Path,
+    release_version: &str,
+    available_space: AvailableSpace,
+) -> Result<bool, OrchestratorError> {
     // An exported-but-blank `PRELOOP_GOLDEN_URL` must behave like an unset
     // one in both places below: the operator otherwise gets neither the OCI
     // default nor their (empty) override.
@@ -1127,8 +1208,8 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
             .filter(|value| !value.trim().is_empty())
             .or_else(|| default_golden_oci_ref().map(str::to_owned));
         if let Some(reference) = reference {
-            if download_oci_golden(payload, &reference).await {
-                return true;
+            if download_oci_golden(payload, &reference, available_space).await? {
+                return Ok(true);
             }
             info!(reference, "OCI golden unavailable; trying release asset");
         }
@@ -1141,7 +1222,7 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "Could not create golden download client");
-            return false;
+            return Ok(false);
         }
     };
 
@@ -1159,18 +1240,23 @@ async fn download_prebaked_golden(payload: &Path, release_version: &str) -> bool
             target = %payload.display(),
             "Downloading pre-baked golden from release asset (this may take several minutes)"
         );
-        if download_release_asset(&client, &url, payload).await {
-            return true;
+        if download_release_asset(&client, &url, payload, available_space).await? {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Fetch one release asset into `payload`: probe, checksum, transfer, install.
 ///
 /// The transfer resumes from whatever a previous attempt left behind, so a
 /// dropped connection costs the bytes in flight rather than the artifact.
-async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &Path) -> bool {
+async fn download_release_asset(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &Path,
+    available_space: AvailableSpace,
+) -> Result<bool, OrchestratorError> {
     let probe = match client.get(url).send().await {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
@@ -1179,13 +1265,15 @@ async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &P
                 url = %url,
                 "Pre-baked golden release asset unavailable; will build locally"
             );
-            return false;
+            return Ok(false);
         }
         Err(error) => {
             warn!(%error, url = %url, "Pre-baked golden release download failed; will build locally");
-            return false;
+            return Ok(false);
         }
     };
+    let total_bytes = probe.content_length();
+    ensure_golden_download_space(payload, total_bytes, available_space)?;
 
     // Fetch the companion checksum before committing bandwidth to the body.
     // A truncated or corrupted golden only fails much later, when a VM tries
@@ -1232,7 +1320,7 @@ async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &P
         Ok(downloaded_bytes) => downloaded_bytes,
         Err(error) => {
             warn!(url = %url, %error, "Pre-baked golden release download failed; will build locally");
-            return false;
+            return Ok(false);
         }
     };
 
@@ -1246,23 +1334,23 @@ async fn download_release_asset(client: &reqwest::Client, url: &str, payload: &P
                     "golden checksum mismatch; discarding download and building locally"
                 );
                 let _ = tokio::fs::remove_file(&partial).await;
-                return false;
+                return Ok(false);
             }
             Err(error) => {
                 warn!(%error, "could not hash downloaded golden; building locally");
                 let _ = tokio::fs::remove_file(&partial).await;
-                return false;
+                return Ok(false);
             }
         }
     }
 
     if tokio::fs::rename(&partial, payload).await.is_err() {
         let _ = tokio::fs::remove_file(&partial).await;
-        return false;
+        return Ok(false);
     }
     report_golden_download_progress("release", downloaded_bytes, None);
     info!(target = %payload.display(), "Downloaded pre-baked golden microVM image successfully");
-    true
+    Ok(true)
 }
 
 /// Transfer one golden source into `partial`, resuming across attempts.
@@ -1438,10 +1526,14 @@ async fn sha256_file(path: &Path) -> Result<String, String> {
 
 /// Download the packed VM layer from a public OCI artifact without requiring
 /// `oras`, Docker, or any other host-side registry client.
-async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
+async fn download_oci_golden(
+    payload: &Path,
+    reference: &str,
+    available_space: AvailableSpace,
+) -> Result<bool, OrchestratorError> {
     let Ok(oci) = OciReference::parse(reference) else {
         warn!(reference, "invalid OCI golden reference");
-        return false;
+        return Ok(false);
     };
     let client = match reqwest::Client::builder()
         .timeout(GOLDEN_DOWNLOAD_TIMEOUT)
@@ -1450,7 +1542,7 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         Ok(client) => client,
         Err(error) => {
             warn!(%error, "Could not create OCI golden download client");
-            return false;
+            return Ok(false);
         }
     };
     // Accept indexes too: `smolvm pack push` publishes the packed artifact
@@ -1461,12 +1553,12 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         Ok(resolved) => resolved,
         Err(error) => {
             warn!(reference, %error, "OCI golden manifest unavailable");
-            return false;
+            return Ok(false);
         }
     };
     if let Some(error) = &resolved.follow_error {
         warn!(reference, %error, "OCI golden inner manifest unavailable");
-        return false;
+        return Ok(false);
     }
     let manifest = match serde_json::from_value::<OciManifest>(resolved.image) {
         Ok(manifest) => manifest,
@@ -1477,7 +1569,7 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
                 "OCI golden manifest parse failed"
             };
             warn!(reference, %error, message);
-            return false;
+            return Ok(false);
         }
     };
     let Some(layer) = manifest
@@ -1486,9 +1578,10 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
         .find(|layer| is_packed_vm_layer(&layer.media_type))
     else {
         warn!(reference, "OCI golden has no packed VM layer");
-        return false;
+        return Ok(false);
     };
     let layer_size = layer.size;
+    ensure_golden_download_space(payload, layer_size, available_space)?;
     let layer_digest = layer.digest;
     let blob_url = oci.blob_url(&layer_digest);
     info!(
@@ -1546,7 +1639,7 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
                             downloaded_bytes,
                             "Downloaded OCI pre-baked golden microVM image successfully"
                         );
-                        return true;
+                        return Ok(true);
                     }
                 }
                 Ok(actual) => {
@@ -1571,11 +1664,11 @@ async fn download_oci_golden(payload: &Path, reference: &str) -> bool {
             );
         }
     }
-    false
+    Ok(false)
 }
 
 /// First whitespace-separated token of a `sha256sum`-style checksum file
-/// (`<hex>  <filename>`), lowercased. `None` when the file does not parse.
+/// (`<hex> <filename>`), lowercased. `None` when the file does not parse.
 fn parse_sha256_checksum(text: &str) -> Option<String> {
     let token = text.split_whitespace().next()?;
     let token = token.strip_prefix("sha256:").unwrap_or(token);
@@ -2234,7 +2327,7 @@ fn base_install_commands() -> Vec<Vec<String>> {
 /// can carry a `[dockerd] <defunct>` entry from its golden: a name match sees
 /// the zombie, concludes Docker is up, and leaves the runner with no daemon.
 /// A stale `/var/run/docker.pid` naming that same pid blocks startup outright,
-/// and is only removed once `docker info` has failed  so it is stale by
+/// and is only removed once `docker info` has failed so it is stale by
 /// definition.
 ///
 /// The storage driver is probed, never assumed: the golden's daemon auto-selects
@@ -2878,6 +2971,20 @@ pub enum OrchestratorError {
     /// Host filesystem failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The destination filesystem cannot hold the golden plus operating
+    /// headroom. This is fatal rather than a local-build fallback: baking
+    /// requires substantially more space than downloading.
+    #[error(
+        "insufficient disk space for pre-baked golden at {}: {} bytes available, {} bytes required (download plus 2 GiB headroom)",
+        path.display(),
+        available_bytes,
+        required_bytes
+    )]
+    GoldenDiskSpace {
+        path: PathBuf,
+        available_bytes: u64,
+        required_bytes: u64,
+    },
     /// One or more runner slots exited unexpectedly.
     #[error("runner pool stopped unexpectedly: {0}")]
     Pool(String),
@@ -3847,7 +3954,7 @@ impl<P: VmProvider + 'static> RunnerPool<P> {
         if allow_download
             && should_download_prebaked_golden(&self.config.base_image, custom_golden_url)
         {
-            if download_prebaked_golden(&payload, &self.config.release_version).await {
+            if download_prebaked_golden(&payload, &self.config.release_version).await? {
                 return Ok(());
             }
         } else if allow_download {
@@ -6356,6 +6463,12 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
     // the official golden declares USER runner, so `machine exec` lands on
     // runner and setpriv below self-drops to the same uid (no privilege
     // change needed).
+    // `/tmp` lives on the VM's ext4 data disk, not the overlayfs root: the
+    // small tmpfs the guest boots with fills on real test suites, and the
+    // overlay root it used to fall through to does not support
+    // `name_to_handle_at`, so fanotify FID watchers (TypeScript's fswatch,
+    // 126 tests) failed with "operation not supported". GitHub-hosted
+    // runners keep `/tmp` on ext4; the bind mount matches that.
     let provisioning = format!(
         "PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH; \
          getent passwd {user} >/dev/null 2>&1 || useradd -m -u {uid} {user} 2>/dev/null || true; \
@@ -6378,7 +6491,11 @@ fn as_runner_user(config: &RunnerPoolConfig, argv: &[String]) -> Vec<String> {
             [ \"$(stat -f -c %T /tmp 2>/dev/null)\" = tmpfs ]; then \
            umount /tmp 2>/dev/null || mount -o remount,size=75% /tmp 2>/dev/null || true; \
          fi; \
-         mkdir -p /tmp && chmod 1777 /tmp 2>/dev/null || true"
+         mkdir -p /tmp && chmod 1777 /tmp 2>/dev/null || true; \
+         if ! mountpoint -q /tmp 2>/dev/null && mountpoint -q /workspace 2>/dev/null; then \
+           mkdir -p /workspace/.tmp && chmod 1777 /workspace/.tmp && \
+           mount --bind /workspace/.tmp /tmp 2>/dev/null || true; \
+         fi"
     );
     // setpriv requires a groups mode: --init-groups (setgroups) only works
     // as root, so the exec-as-image-user branch (official golden: USER
@@ -7393,7 +7510,7 @@ chmod +x "$dest/bin/node"
     }
 
     /// The always-run ownership reconciliation must not install privilege
-    /// policy — the security review's P1: custom/official images that never
+    /// policy: custom/official images that never
     /// had blanket sudo must not gain it just because a job runs there — and
     /// it must not mask failures the way the account script's `|| true` tail
     /// does.
@@ -9861,11 +9978,47 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
         assert_eq!(std::fs::read(&payload).unwrap(), body);
+        assert!(leftovers(directory.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn insufficient_space_stops_before_creating_a_partial_golden() {
+        let _serialized = GOLDEN_URL.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let payload = directory.path().join("golden.smolmachine");
+        let expected_bytes = 512 * 1024;
+        let url = serve_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {expected_bytes}\r\n\r\n"),
+            Vec::new(),
+        )
+        .await;
+        unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
+
+        let error = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(1024))
+            .await
+            .expect_err("the download must stop when the target filesystem is full");
+
+        unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
+        match error {
+            OrchestratorError::GoldenDiskSpace {
+                path,
+                available_bytes,
+                required_bytes,
+            } => {
+                assert_eq!(path, directory.path());
+                assert_eq!(available_bytes, 1024);
+                assert_eq!(required_bytes, expected_bytes + GOLDEN_DOWNLOAD_HEADROOM);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(!payload.exists());
         assert!(leftovers(directory.path()).is_empty());
     }
 
@@ -9888,7 +10041,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // The caller reads `false` as "build the golden locally", so a partial
@@ -10077,7 +10232,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         assert!(downloaded);
@@ -10100,7 +10257,9 @@ mod golden_download_tests {
         .await;
         unsafe { std::env::set_var("PRELOOP_GOLDEN_URL", &url) };
 
-        let downloaded = download_prebaked_golden(&payload, "9.9.9").await;
+        let downloaded = download_prebaked_golden_with_space(&payload, "9.9.9", |_| Ok(u64::MAX))
+            .await
+            .unwrap();
 
         unsafe { std::env::remove_var("PRELOOP_GOLDEN_URL") };
         // A corrupted artifact must never be published as the payload: the

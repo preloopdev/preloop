@@ -68,7 +68,7 @@ enum CommandKind {
     },
     /// Placeholder for provider-based Runner.Listener integration tests.
     LibkrunPlan,
-    /// H1: Boot local runner, submit workflow, wait for completion, generate verdict JSON.
+    /// Boot local runner, submit workflow, wait for completion, generate verdict JSON.
     #[command(name = "runner-e2e")]
     RunnerE2e {
         /// Path to the runner executable.
@@ -86,7 +86,7 @@ enum CommandKind {
         #[arg(long, default_value_t = 9090)]
         port: u16,
     },
-    /// H2: Generate a flow diff report against the golden scenario captures.
+    /// Generate a flow diff report against the golden scenario captures.
     #[command(name = "runner-diff")]
     RunnerDiff {
         /// Golden scenario name.

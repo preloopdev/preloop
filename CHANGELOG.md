@@ -11,6 +11,11 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Disconnected-runner lease test tracks the actual reaper boundary**:
+  the integration test now brackets the 10-minute dead-session threshold,
+  rather than the 45-minute runner-facing lock, with enough headroom to
+  remain deterministic under CI load.
+
 - **Linux packed-golden runners survive engine restarts again** (#371): the
   orphaned-data-dir sweep treated every unregistered directory under SmolVM's
   `vms/` as a leaked machine, including SmolVM's own shared pack store
@@ -119,62 +124,117 @@ Releases before v0.27.0 predate the changelog.
 
 ### Added
 
-- **`preloop init`, one onboarding command** (`d91e8b3b`): credentials, golden,
-  run mode, and preflight in one step. In a terminal it is a four-step wizard
-  that keeps each stored answer unless you change it; non-interactive runs take
-  the same answers as flags (`--auth`, `--golden`, `--mode`) and never prompt,
-  `--json` emits one object per step, and `--probe --json` reports host
-  capabilities without side effects. `preloop serve` offers it when no golden
-  is configured.
-- **x86_64 packed golden** (`30fa78a3`, `3cbdd212`): the packed golden OCI
-  artifact is selected per host architecture
-  (`ghcr.io/preloopdev/preloop-<arch>-smolvm-golden`), and an x86_64 artifact is
-  now published and pinned, so x86_64 Linux engines download it instead of
-  baking locally. `PRELOOP_GOLDEN_OCI_REF` still overrides the default.
-- **Secrets preflight** (#341): `preloop run` reports `secrets.*` names the
-  workflow reads but the engine has not stored (they would reach steps as empty
-  strings); `--strict-secrets` makes that a failure.
-- **Disk guards** (`d9997a0a`, `31465e90`): golden downloads and builds refuse
-  up front when the volume cannot hold them, job VMs wait for
-  `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB) instead of filling the
-  host, and the pool reconciles orphaned VM data dirs and hypervisors every 10
-  minutes while serving rather than only at startup.
-
-### Changed
-
-- **Golden pack indexes accepted** (`fcff04e4`): `smolvm pack push` artifacts
-  (an OCI index with `application/vnd.smolmachines.smolmachine.v1` layers) now
-  download; the arm64 golden pin moved to the renamed package.
-- **SmolVM 1.18.2** (#356).
-- **Releases no longer bake goldens** (`268d9cc2`): the per-tag bake never
-  succeeded on hosted runners; goldens are baked on architecture-matched hosts
-  and published separately.
+- The control plane now enforces per-namespace state and quotas on both store
+  backends. A `suspended` or `deleted` namespace starts no jobs; a `draining`
+  one finishes its queued jobs. `namespace_limits.max_running_jobs` and
+  `namespace_pool_limits` cap concurrent claims (on Postgres a capped claim
+  locks the limit row, so two nodes cannot both take the last slot); jobs over
+  a cap wait queued and are never bound to an idle warm runner. API and CLI
+  submits need an `active` namespace and are checked against
+  `max_queued_jobs` and `submit_rate_per_minute` (HTTP 429) and
+  `max_jobs_per_run` (HTTP 400). Webhook-driven runs are never refused by a
+  limit or a suspension — GitHub does not redeliver, so they are recorded and
+  wait at claim; only a `deleted` namespace refuses them. Namespaces with no
+  limit rows behave as before.
 
 ### Fixed
 
-- **Run logs and step records survive long enough to debug** (`83eb42f8`): log
-  retention kept only the 64 most recent execution plans (two or three pushes),
-  so `preloop logs` went empty within about 20 minutes; it now keeps 1024.
-- **Detached-HEAD workspaces snapshot correctly** (`fe0be93e`): the object
-  cache never copied a HEAD no branch or tag reaches, then recorded it as
-  current, so every later run fell back to a plain checkout.
-- **`needs`-gated jobs are skipped by `if:` before label checks**
-  (`1fcb835c`): a job whose `if:` was false failed at enqueue on `runs-on`
-  labels no runner had, instead of being skipped as on GitHub. Labels are now
-  validated at promotion for every job that will actually run.
-- **Workless runs release their concurrency group** (`4fb0c092`): a run whose
-  every job was gated off concluded on arrival but held its workflow
-  concurrency slot, parking every later run in the group.
-- **Check runs for runtime-materialized jobs** (#340): deferred matrix legs and
-  reusable-workflow callee jobs now get GitHub check runs.
-- **Runner account provisioned on every fork** (#344): official-image goldens
-  left toolchain directories root-owned, so steps writing rustup components or
-  cargo binaries failed with `EACCES`.
-- **Golden bake writes its provenance manifest** (`5253e445`), and refuses a
-  bake the host lacks space to pack.
-- **`release-runner` workflow dispatches again** (`4d7f47f3`): a split
-  `name`/`uses` step made GitHub reject the file, so published releases would
-  not have built runner bundles.
+- A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
+  provisioning removed the guest's small tmpfs `/tmp`, which left it on the
+  overlayfs root, where `name_to_handle_at` is unsupported: fanotify
+  file-ID watchers failed with "operation not supported" (126 of
+  TypeScript's `internal/fswatch` tests). GitHub-hosted runners keep `/tmp`
+  on ext4.
+
+- With a static PAT and no GitHub App, a job that sat in the queue for more
+  than five minutes after the last submit was dispatched with the local
+  runtime token instead of the PAT, so its checkout failed with "could not
+  read Username for 'https://github.com'". The PAT's verified scopes were only
+  refreshed by submits; acquire now re-verifies them when the cache entry has
+  expired.
+
+- A job attempt whose runner session is gone (closed, purged, or silent past
+  the runner liveness timeout) now fails 10 minutes after its last lease
+  renewal instead of 45. A machine that just died still fails at the
+  3-minute hung-worker window. The lease the runner is told about
+  (`LockedUntil`) is unchanged. The reaper now evaluates lease expiry for
+  every in-flight attempt on each tick, and completed-run memory trimming no
+  longer runs on the event path. Before, a reaper-driven completion could
+  wedge the only reaper task there and leave attempts `in_progress`
+  indefinitely after a node kill.
+
+- With several nodes on one Postgres, a client attached to one node now sees
+  events produced through another node as they happen. Before, `preloop run`
+  on node B did not see a run finish through node A until its stream timed out
+  (5 minutes) and it reconnected. Each node reads the transactional outbox
+  when another node signals (one batched `NOTIFY` per ~15 ms, sent outside the
+  command transactions) and at least once a second, skips its own rows, and
+  drops a state older than one it already delivered. Status events carry the
+  version of the job or run they report: `jobs.version` and `runs.version`
+  count status changes and are bumped by a trigger under the row lock the
+  change already holds. `runs.event_seq` (a counter on the run row that every
+  event took a lock to bump, and that nothing read) and `outbox_events.run_seq`
+  are removed. A status event appended after its row settled on a different
+  final state is not published. The outbox is pruned after
+  `PRELOOP_OUTBOX_RETENTION_SECONDS` (default 3600). **Schema versions are now
+  `4` (Postgres) and `3` (SQLite); an existing control database is refused and
+  must be recreated.**
+
+- Postgres read paths that scanned whole tables on every command now use an
+  index: the latest-attempt lookup and the `jobs` -> `job_requests` cascade
+  (`job_requests_attempts`), the claim and ready-queue reads (`jobs_ready` no
+  longer carries `namespace_id` between the pool key and the priority, which
+  forced a sort of the whole ready queue), and the reaper's per-attempt
+  `timeout-minutes` read (a stored generated column, `job_messages.job_timeout_s`,
+  instead of extracting it from the toasted message template on every tick).
+
+- `PRELOOP_CREDENTIAL_STORE` selects where the engine's own credentials — the
+  system token and the GitHub App/PAT — are kept: `os` (the native
+  keychain/secret-service, default), `file` (`0600` files under
+  `$PRELOOP_HOME/credentials`, for headless hosts and containers where keychain
+  prompts are unacceptable), or `memory` (non-persistent; tests only).
+
+- **`preloop init`** — one command for first-run setup, replacing the split
+  between `preloop setup` and choosing a golden by hand. In a terminal it is a
+  four-step wizard (credentials, golden, run mode, preflight); with stdin or
+  stdout not a TTY it takes the same answers as flags, never prompts, and exits
+  `2` on a missing flag, `3` on a failed preflight (disk, architecture,
+  hypervisor), `4` on a failure to resolve, pull, or build the base image.
+  `preloop init --probe --json` reports host capabilities (arch, free space on
+  the SmolVM data volume, hypervisor, docker, smolvm, existing config,
+  credential state, GHCR reachability) without side effects. The golden choices
+  are the packed official GitHub runner image (the default: drop-in parity,
+  ~60 GB on disk), an OCI reference verified anonymously before it is written,
+  a Dockerfile built here with `docker build`/`docker save` into a local tar
+  (`*.tar` is what smolvm's `--image` branch accepts), and a local
+  `.smolmachine` pack or rootfs directory. The credential step *is*
+  `preloop setup github` and is verified live the way `preloop doctor` does.
+  The choice is recorded in the existing config file as `[golden] base_image`,
+  which `serve` and `server install` read, with `PRELOOP_RUNNER_BASE_IMAGE`
+  still taking precedence; `serve` with no golden configured offers the wizard
+  on a TTY and otherwise prints one hint and proceeds with the official image.
+- Golden disk preflight. A golden download is refused before the transfer
+  starts when the artifact cannot fit on its volume, and a golden build is
+  refused when the SmolVM data volume has less than the builder disk + 20 GiB
+  of pack staging free (the rule the golden workflows already enforce).
+  Unpacking a packed golden warns when the volume cannot hold one golden at
+  its storage ceiling. `PRELOOP_SKIP_DISK_PREFLIGHT=1` proceeds with a
+  warning instead.
+- Runtime VM-state reconciliation. While `serve` runs, the pool sweeps
+  orphaned machine data directories and purges orphaned `_boot-vm`
+  hypervisors every 10 minutes instead of only at startup, so a `machine
+  delete` that fails mid-run no longer leaks its disk until the next engine
+  restart (long-lived engines grew 99 GB → 168 GB of VM state in an
+  afternoon). The mid-flight purge spares any hypervisor whose boot config is
+  still on disk, so a registered machine, a golden fork base, and a create in
+  flight are never touched; `remove_stale_machines` stays startup-only.
+- Job-VM disk reserve. Before a warm or on-demand slot forks or creates a job
+  VM it measures free space on the SmolVM data volume and waits (logging
+  `waiting for disk: … free on …, reserve …`) while it is below
+  `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB, `0` disables) instead of
+  filling the host or failing the job. The wait is not a provisioning
+  failure, so a full host does not trip the repeated-provision-failure alert;
+  an unmeasurable volume warns once and proceeds.
 - **`$/` self-repository actions resolve** (#346): job preparation read the
   workflow identity from `system.github.*` variables (never sent) and from the
   `github` context as plain JSON, but `contextData` is typed on the wire, so
@@ -195,6 +255,46 @@ Releases before v0.27.0 predate the changelog.
   `container: ${{ matrix.build.container }}` decoded to no container, and the
   job ran on the VM instead; evaluation errors now fail setup, and logs report
   presence without serializing credentials or environment.
+
+### Changed
+
+- Control-plane state is database-authoritative. Runs, jobs, runners, sessions,
+  webhook deliveries and logs are mutated through one `ControlBackend` trait,
+  one short transaction per command, instead of an in-memory working set that
+  was snapshotted to the database. SQLite remains the default (single writer,
+  WAL); Postgres implements the same contract so **several engine nodes can
+  share one database** — jobs are claimed with `FOR UPDATE SKIP LOCKED` and
+  nodes wake each other through `LISTEN`/`NOTIFY`. The old `Store` snapshot
+  layer is gone. Cache and artifact reservations remain node-local, so a
+  multi-node deployment must route a job's cache/artifact requests back to the
+  node that reserved them (or run one node per job).
+- The control schema is greenfield v1, created on first use and versioned in
+  `schema_meta`. There is no upgrade path from an older control database:
+  SQLite refuses a pre-`ControlBackend` `preloop.db` and offers only
+  "recreate the database", while Postgres creates a fresh `control` schema and
+  leaves an older `public` layout untouched and unread. Export anything you need
+  and start from a fresh database.
+- The debug controller API moved to a single `/api/v1/debug/sessions/…` surface
+  from the older controller-only namespace, and the standalone verdict POST
+  folded into the same lease-gated, idempotent `/operations` surface as retry
+  and abort. Agents and scripts written against the old namespace must be
+  repointed; the bundled CLI already is.
+- Secret values are never written to the control database: a stored job message
+  carries secret names, and the values are resolved when a runner acquires the
+  job. The builtin secret provider is node-local (its tiers come from this
+  node's config, its run tiers from `<state_dir>/run-secrets/`), so a multi-node
+  deployment needs a shared secret provider.
+- Job messages and AzDO responses now match `actions/runner` v2.337.0: remote
+  action references always emit `repositoryType`, `actionsEnvironment.url` is an
+  explicit `null` when the workflow defines no deployment URL, and `plan.env`
+  is emitted as `environmentVariables` template maps.
+
+### Fixed
+
+- Pre-baked golden downloads now check free space on the destination filesystem
+  before writing the multi-gigabyte payload. An undersized host gets an
+  actionable size error instead of downloading a partial image and falling
+  through to an even larger local bake.
 
 ## [0.33.7] - 2026-09-28
 
@@ -433,7 +533,7 @@ Releases before v0.27.0 predate the changelog.
 - #299 — Align string comparison and case-insensitivity with the official runner
 - #298 — Close remaining masking races
 - #297 — Sign blob tokens as JWTs, enforce owner liveness on bearer writes
-- #296 — r1_12 rematerialization test matches record/head split
+- #296 — rematerialization test matches record/head split
 - #283 — Remove aarch64 golden bake jobs
 - #282 — Bump guest disk template to 200G for golden pack
 - #280 — Bump guest storage to 200G for golden pack

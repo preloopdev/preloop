@@ -24,7 +24,7 @@ CAMPAIGN_HOME="${CONFORMANCE_HOME:-/tmp/preloop-5repos-home}"
 PORT="${CONFORMANCE_PORT:-9197}"
 POLL_SECONDS="${CONFORMANCE_POLL_SECONDS:-10}"
 TIMEOUT_SECONDS="${CONFORMANCE_TIMEOUT_SECONDS:-7200}"
-POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-1}"
+POOL_SIZE="${PRELOOP_RUNNER_POOL_SIZE:-2}"
 HOST_HOME="${HOME:-}"
 SMOLVM_PROCESS_HOME="${CONFORMANCE_SMOLVM_HOME:-$CAMPAIGN_HOME/smolvm-home}"
 if [[ -z "${PRELOOP_SYSTEM_TOKEN:-}" ]]; then
@@ -151,34 +151,44 @@ prepare_golden_home() {
   # crowd out the next golden unpack. The golden artifact itself lives
   # outside this home (~/.config/preloop/vms), so a clean slate is safe.
   rm -rf "$CAMPAIGN_HOME"
+  if [ "${PRELOOP_GOLDEN_SOURCE:-}" = ghcr ]; then
+    # Fresh pull of the digest-pinned golden (GOLDEN_OCI_REF_* in
+    # preloop-orchestrator): no local artifact is linked, so the engine
+    # downloads the packed golden from ghcr into the empty campaign home.
+    echo "=== golden: downloading digest-pinned image from ghcr.io (no local artifact) ==="
+    # Only the stock ubuntu bases trigger the prebaked-golden download
+    # (should_download_prebaked_golden); the runner-images ref is "custom".
+    # It must be the exact digest pin (the engine default): the packed golden
+    # is registered under this base's fingerprint, and hosted labels
+    # (ubuntu-24.04*, ubuntu-latest) resolve to the pin. Any other spelling
+    # (e.g. bare `ubuntu:24.04`) misses that golden, and the pool bakes a
+    # second, stock-Ubuntu golden for those jobs — no cmake, no hostedtoolcache.
+    GOLDEN_BASE_OVERRIDE="$(sed -n 's/^ubuntu_24_04_base = "\(.*\)"$/\1/p' "$ROOT/versions.toml")"
+    [ -n "$GOLDEN_BASE_OVERRIDE" ] || fail "ubuntu_24_04_base pin missing from versions.toml"
+    # A verified ghcr download is kept in $PRELOOP_GOLDEN_CACHE (APFS clone, so
+    # reuse is instant) to avoid re-pulling 9.6 GB on every harness restart.
+    # The downloaded bytes are the same official golden for any stock base, so
+    # clone the cached file to the path the engine computes for this base.
+    local cache="${PRELOOP_GOLDEN_CACHE:-$HOME/golden-cache}" cached target
+    cached="$(compgen -G "$cache/preloop-*" | head -1 || true)"
+    if [ -n "$cached" ]; then
+      target="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$GOLDEN_BASE_OVERRIDE")"
+      mkdir -p "$(dirname "$target")"
+      cp -c "$cached" "$target"
+      echo "=== golden: reusing verified ghcr download $cached as $target ==="
+    fi
+    return 0
+  fi
   [ -f "$OFFICIAL_GOLDEN_ARTIFACT" ] || fail "missing 9GB official golden: $OFFICIAL_GOLDEN_ARTIFACT"
   local bytes expected
   bytes="$(file_size "$OFFICIAL_GOLDEN_ARTIFACT")"
   # Reject the small launcher stub or a partial download.  The packed payload
   # used by this campaign is the ~9GB .smolmachine sidecar.
   [ "$bytes" -ge 8589934592 ] || fail "golden is ${bytes} bytes, not the required ~9GB .smolmachine payload"
-  # The server probes the packed artifact at
-  # <vms>/<stem>-<environment-fingerprint>: artifact_payload() appends the
-  # EnvironmentSpec fingerprint (sha256 of the normalized base/toolchains/
-  # curated/bake JSON) so bake-content changes invalidate stale packs. A
-  # stem-only symlink silently falls through to a base-image pull (tens of
-  # GiB) — replicate the fingerprint computation here (the base is custom,
-  # so nothing is curated and there are no toolchains).
-  fingerprint="$(python3 - "$OFFICIAL_GOLDEN_BASE" <<'INNERPY'
-import hashlib, json, sys
-import platform
-rosetta = platform.system() == "Darwin" and platform.machine() in ("arm64", "aarch64")
-normalized = {
-    "base": sys.argv[1],
-    "toolchains": [],
-    "curated": False,
-    "bake": "",
-    "rosetta_libs": rosetta,
-}
-print(hashlib.sha256(json.dumps(normalized, separators=(",", ":")).encode()).hexdigest())
-INNERPY
-)"
-  expected="$CAMPAIGN_HOME/vms/$OFFICIAL_GOLDEN_NAME-$fingerprint"
+  # Ask the engine for its own payload path — the fingerprint folds in
+  # base/toolchains/bake AND the node-external pins, so duplicating the hash
+  # here drifts. `preloop golden-path` keeps the harness in lockstep.
+  expected="$("$SERVER_BIN" golden-path --home "$CAMPAIGN_HOME" --base-image "$OFFICIAL_GOLDEN_BASE")"
   mkdir -p "$(dirname "$expected")"
   ln -sfn "$OFFICIAL_GOLDEN_ARTIFACT" "$expected"
   [ -f "$expected" ] || fail "failed to expose official golden at $expected"
@@ -219,16 +229,27 @@ start_server() {
   # The base reference is intentionally the same string encoded in the local
   # cache filename.  The CLI then consumes the symlinked 9GB artifact instead
   # of downloading or rebuilding a different golden.
-  if [ -z "${PRELOOP_GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+  # A broad `gh auth token` PAT is refused by the engine whenever a job's
+  # declared `permissions:` are narrower; PRELOOP_SKIP_GH_TOKEN=1 runs tokenless.
+  if [ -z "${PRELOOP_SKIP_GH_TOKEN:-}" ] && [ -z "${PRELOOP_GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
     PRELOOP_GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"
     export PRELOOP_GITHUB_TOKEN
   fi
+  # The lock-refactor campaign must run on the Postgres control backend; an
+  # unset URL silently selects the single-writer SQLite default, which does
+  # not exercise the refactored locking at all.
+  : "${PRELOOP_STORE_URL:?set PRELOOP_STORE_URL=postgres://... (lock-refactor Postgres backend)}"
+  case "$PRELOOP_STORE_URL" in
+    postgres://*|postgresql://*) ;;
+    *) fail "PRELOOP_STORE_URL must be a postgres:// URL, got: ${PRELOOP_STORE_URL%%:*}://" ;;
+  esac
+  export PRELOOP_STORE_URL
   PRELOOP_HOME="$CAMPAIGN_HOME" \
   HOME="$SMOLVM_PROCESS_HOME" \
   SMOLVM_DATA_DIR="${SMOLVM_DATA_DIR:-$CAMPAIGN_HOME/smolvm}" \
   SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$HOST_HOME/.smolvm/agent-rootfs}" \
   SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$HOST_HOME/.smolvm/lib}" \
-  PRELOOP_RUNNER_BASE_IMAGE="$OFFICIAL_GOLDEN_BASE" \
+  PRELOOP_RUNNER_BASE_IMAGE="${GOLDEN_BASE_OVERRIDE:-$OFFICIAL_GOLDEN_BASE}" \
   PRELOOP_RUNNER_BUNDLE="$GUEST_RUNNER_BUNDLE" \
   PRELOOP_RUNNER_NAME_PREFIX="conformance-5repos" \
   PRELOOP_USE_PACKED_GOLDEN=1 \
@@ -433,8 +454,8 @@ main() {
     target_list="$(repo_targets "$repo")" || fail "unknown repository: $repo"
   fi
 
-  prepare_golden_home
   ensure_binaries
+  prepare_golden_home
   mkdir -p "$WORKSPACE_ROOT" "$OUTPUT_ROOT"
   start_server
   for target in $target_list; do

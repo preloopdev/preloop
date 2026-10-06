@@ -119,7 +119,7 @@ async fn results_cache_and_artifact_routes_reject_inconsistent_bearers() {
     .await
     .expect("trusted submission accepted");
     let (matching, subject_job) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, &trusted.run_id.to_string());
         (
             state.mint_runtime_token(&message.plan.plan_id, &message.job_id),
@@ -423,7 +423,7 @@ async fn job_results_token_cannot_update_another_jobs_steps() {
         StatusCode::FORBIDDEN
     );
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert!(
         inner
             .job_steps
@@ -530,8 +530,8 @@ async fn twirp_diag_route_issues_random_blob_url_and_accepts_bearerless_upload()
     let plan_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4();
     let runtime_token = state.mint_runtime_token(&plan_id, &job_id);
-    // R1-10: URL-minting writes require a live job record.
-    r1_10_register_live_job(&state, job_id, &plan_id).await;
+    // URL-minting writes require a live job record.
+    register_live_job(&state, job_id, &plan_id).await;
 
     let response = app
         .clone()
@@ -610,7 +610,7 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
 
-    // R1-2: the blob gate requires a server-signed blob JWT whose `job`
+    // The blob gate requires a server-signed blob JWT whose `job`
     // claim matches the bearer's job on writes.
     let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
     {
@@ -624,8 +624,8 @@ async fn blob_single_shot_streams_to_disk_and_roundtrips() {
             },
         );
     }
-    // R1-10: blob PUTs with a job bearer require a live job record.
-    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    // Blob PUTs with a job bearer require a live job record.
+    register_live_job(&state, job_id, "plan-blob").await;
 
     // A 3 MiB single-shot upload is streamed to a temp file, never buffered
     // whole in memory, and must round-trip byte-for-byte.
@@ -668,11 +668,11 @@ async fn blob_blocklist_commits_are_serialized_and_survive_concurrency() {
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
-    // R1-10: blob PUTs with a job bearer require a live job record.
-    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    // Blob PUTs with a job bearer require a live job record.
+    register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
 
-    // R1-2: the blob gate requires a server-signed blob JWT whose `job`
+    // The blob gate requires a server-signed blob JWT whose `job`
     // claim matches the bearer's job on writes.
     let (blob_jwt, jti) = mint_blob_jwt(&state, "artifact", &job_id.to_string());
     {
@@ -791,8 +791,8 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
-    // R1-10: blob PUTs with a job token require a live job record.
-    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    // Blob PUTs with a job token require a live job record.
+    register_live_job(&state, job_id, "plan-blob").await;
     let auth_header = format!("Bearer {token}");
     let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
     let put_uri = format!("/twirp-blob/cache/{blob_jwt}");
@@ -860,14 +860,14 @@ async fn blob_cache_block_upload_accepts_sdk_sized_blocks() {
 
 #[tokio::test]
 async fn blob_block_upload_still_rejects_blocks_over_cap() {
-    // F5 is preserved: blocks larger than the per-block cap are rejected
+    // Blocks larger than the per-block cap are still rejected
     // with 413 via the early Content-Length check.
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
-    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
     let (blob_jwt, _jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
 
@@ -901,7 +901,7 @@ async fn blob_block_upload_midstream_cap_rejects_without_temp_file() {
     let app = app(state.clone(), CancellationToken::new());
     let job_id = uuid::Uuid::new_v4();
     let token = state.mint_runtime_token("plan-blob", &job_id);
-    r1_10_register_live_job(&state, job_id, "plan-blob").await;
+    register_live_job(&state, job_id, "plan-blob").await;
     let bearer = format!("Bearer {token}");
     let (blob_jwt, jti) = mint_blob_jwt(&state, "cache", &job_id.to_string());
 
@@ -1039,12 +1039,6 @@ async fn runner_server_v1_sensitive_routes_require_bearer() {
 /// serving the credential the runner itself owns: the official runner deletes
 /// its own session on shutdown and deregisters its own agent on clean exit
 /// through these very routes, so the guard cannot be system-token-only.
-
-/// SEC-01. Runner/session/agent administration must reject a job's
-/// `ACTIONS_RUNTIME_TOKEN` (arbitrary workflow code holds it) while still
-/// serving the credential the runner itself owns: the official runner deletes
-/// its own session on shutdown and deregisters its own agent on clean exit
-/// through these very routes, so the guard cannot be system-token-only.
 #[tokio::test]
 async fn admin_deletes_reject_job_tokens_and_confine_runners_to_themselves() {
     let temp = tempfile::tempdir().unwrap();
@@ -1138,7 +1132,7 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
     let owner_run = submit_yaml(&app, workflow, "owner/repo").await;
     let owner_run_id = owner_run["run_id"].as_str().unwrap().to_owned();
     let (owner_plan_id, owner_job_id, owner_token) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, &owner_run_id);
         (
             message.plan.plan_id.clone(),
@@ -1150,7 +1144,7 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
     let foreign_run = submit_yaml(&app, workflow, "owner/repo").await;
     let foreign_run_id = foreign_run["run_id"].as_str().unwrap().to_owned();
     let foreign_token = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, &foreign_run_id);
         state.mint_runtime_token(&message.plan.plan_id, &message.job_id)
     };
@@ -1334,10 +1328,83 @@ async fn artifact_v2_ownership_is_enforced_by_runtime_token_scope() {
     }
 }
 
-/// The system-token split must not swallow job-facing runner traffic. The
-/// distributedtask message DELETE is paired with the GET on the same prefix;
-/// dropping it (as an earlier cut of the split did) 404s every client that
-/// polls messages there, since no other route serves that path.
+/// `PUT …/agents/{id}` is the official runner's in-place name/label
+/// refresh, and it shares its route with the self-only DELETE above. A
+/// runner listen token must therefore only rewrite its own row: labels are
+/// the dispatch predicate, so a peer could otherwise strip a runner's labels
+/// to starve it or add a privileged label to make it claim jobs it was never
+/// provisioned for.
+#[tokio::test]
+async fn update_agent_is_self_only_for_runner_tokens() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "agent-update-a", &["self-hosted"], None).await;
+    let (runner_b, token_b) =
+        register_runner_with_token(&app, "agent-update-b", &["self-hosted"], None).await;
+
+    for uri in [
+        format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}"),
+        format!("/_apis/distributedtask/pools/1/agents/{runner_a}"),
+    ] {
+        assert_eq!(
+            status_with_bearer(
+                &app,
+                &token_b,
+                Method::PUT,
+                &uri,
+                json!({"name": "hijacked", "labels": [{"name": "privileged"}]}),
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not rewrite runner A through {uri}"
+        );
+    }
+
+    // Runner A's row is untouched by the rejected attempts.
+    let inner = state.test_tx().await;
+    let row_a = inner.runners.get(&runner_a).unwrap();
+    assert_eq!(row_a.name, "agent-update-a");
+    assert_eq!(row_a.labels, vec!["self-hosted".to_string()]);
+    drop(inner);
+
+    // Its owner may update itself: that is the runner's normal refresh.
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            &token_a,
+            Method::PUT,
+            &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_a}"),
+            json!({"name": "agent-update-a", "labels": [{"name": "self-hosted"}, {"name": "linux"}]}),
+        )
+        .await,
+        StatusCode::OK,
+        "a runner must be able to update itself"
+    );
+    let inner = state.test_tx().await;
+    let row_a = inner.runners.get(&runner_a).unwrap();
+    assert_eq!(
+        row_a.labels,
+        vec!["self-hosted".to_string(), "linux".to_string()]
+    );
+    drop(inner);
+
+    // The system token keeps unrestricted access (operator flows).
+    assert_eq!(
+        status_with_bearer(
+            &app,
+            "preloop-system-token",
+            Method::PUT,
+            &format!("/runner/server/_apis/distributedtask/pools/1/agents/{runner_b}"),
+            json!({"name": "agent-update-b", "labels": [{"name": "self-hosted"}]}),
+        )
+        .await,
+        StatusCode::OK,
+        "the system token may update any runner"
+    );
+}
 
 /// The system-token split must not swallow job-facing runner traffic. The
 /// distributedtask message DELETE is paired with the GET on the same prefix;
@@ -1398,7 +1465,7 @@ async fn listener_token_lifecycle_calls_require_runtime_token() {
     let session_id = session["sessionId"].as_str().unwrap().to_owned();
 
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let message = queued_message_for(&inner, &run_id);
         (message.plan.plan_id.clone(), message.job_id)
     };
@@ -1810,7 +1877,7 @@ async fn legacy_agent_requests_are_bound_to_runner_identity() {
         azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
     );
     let request_id = {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         *inner.session_active_requests.get(&session_id).unwrap()
     };
 
@@ -1879,7 +1946,7 @@ async fn legacy_agent_requests_are_bound_to_runner_identity() {
             "runner B must not address completed runner A request with {method}"
         );
     }
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     assert_eq!(
         inner.job_requests.get(&request_id).unwrap().result,
         Some(ExecutionStatus::Success)
@@ -1929,6 +1996,72 @@ async fn legacy_provision_token_is_consumed_atomically() {
     );
 }
 
+/// A released attempt is in flight but unowned: boot reconcile hands an
+/// orphaned claim whose run went back to the ready queue to
+/// `release_claimed_request`, which clears the owner and the session
+/// binding. No registered runner may then read or settle it — treating
+/// "never assigned" as owned let any runner forge that attempt's result.
+#[tokio::test]
+async fn released_agent_requests_are_not_settleable_by_other_runners() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (runner_a, token_a) =
+        register_runner_with_token(&app, "released-request-a", &["self-hosted"], None).await;
+    let (_runner_b, token_b) =
+        register_runner_with_token(&app, "released-request-b", &["self-hosted"], None).await;
+    let (session_status, session) = create_disttask_session(&app, &token_a, runner_a).await;
+    assert_eq!(session_status, StatusCode::CREATED);
+    let session_id = session["sessionId"].as_str().unwrap().to_owned();
+
+    let _accepted = submit_simple_run(&app).await;
+    let message = poll_message(&app, &token_a, &session_id).await;
+    assert_eq!(
+        message["messageType"],
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+    );
+    let request_id = {
+        let inner = state.test_tx().await;
+        *inner.session_active_requests.get(&session_id).unwrap()
+    };
+
+    // Mirror `release_claimed_request`: clear the owner and session binding
+    // of the in-flight attempt (the boot-reconcile path).
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute(
+                "UPDATE job_requests SET runner_id = NULL, session_id = NULL, \
+                     started_at = NULL, timeout_triggered = 0 \
+                 WHERE request_id = ?1 AND result IS NULL",
+                [request_id],
+            )
+            .expect("release the claimed request");
+            tx.0.execute("DELETE FROM job_leases WHERE request_id = ?1", [request_id])
+                .expect("drop the released request lease");
+        })
+        .await;
+
+    for (method, body) in [
+        (Method::GET, Value::Null),
+        (Method::POST, Value::Null),
+        (Method::PATCH, json!({"result": "succeeded"})),
+    ] {
+        assert_eq!(
+            request_status_with_bearer(
+                &app,
+                method.clone(),
+                &format!("/runner/server/_apis/v1/AgentRequest/1/{request_id}"),
+                body,
+                &token_b,
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "runner B must not address a released agent request with {method}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     let temp = tempfile::tempdir().unwrap();
@@ -1944,13 +2077,14 @@ async fn oidc_endpoint_mints_rs256_jwt_with_requested_audience() {
     let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
 
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
-        inner
-            .queue
-            .front()
+        let inner = state.test_tx().await;
+        let ids = inner
+            .ready()
+            .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
-            .unwrap()
+            .unwrap();
+        ids
     };
 
     let token = request_json(
@@ -2027,12 +2161,13 @@ async fn results_surfaces_agree_on_alternate_uuid_scope_spelling() {
     .await;
 
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
-        inner
-            .queue
-            .front()
+        let inner = state.test_tx().await;
+        let ids = inner
+            .ready()
+            .next()
             .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
-            .unwrap()
+            .unwrap();
+        ids
     };
     let alternate_scope_token = state
         .local_jwt(json!({
@@ -2115,13 +2250,14 @@ async fn oidc_default_audience_is_owner_url() {
     let _run_id: RunId = resp["run_id"].as_str().unwrap().parse().unwrap();
 
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
-        inner
-            .queue
-            .front()
+        let inner = state.test_tx().await;
+        let ids = inner
+            .ready()
+            .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|j| (j.message.plan.plan_id.clone(), j.message.job_id))
-            .unwrap()
+            .unwrap();
+        ids
     };
 
     let token = request_json(
@@ -2151,13 +2287,14 @@ async fn oidc_forbidden_without_id_token_write() {
     let _resp = request_json(&app, Method::POST, "/api/v1/runs", workflow).await;
 
     let (plan_id, agent_job_id) = {
-        let inner = state.inner.lock().await;
-        inner
-            .queue
-            .front()
+        let inner = state.test_tx().await;
+        let ids = inner
+            .ready()
+            .next()
             .or_else(|| inner.pending_jobs.front())
             .map(|job| (job.message.plan.plan_id.clone(), job.message.job_id))
-            .unwrap()
+            .unwrap();
+        ids
     };
     let runtime_token = state.mint_runtime_token(&plan_id, &agent_job_id);
 
@@ -2329,7 +2466,11 @@ jobs:
         Value::Null,
     )
     .await;
-    assert_eq!(first["messageId"], 1);
+    // Ids are unique, not dense: session_messages starts above 1e6 so a
+    // control message never collides with a broker job ref's request id.
+    let message_id = first["messageId"]
+        .as_i64()
+        .expect("a job assignment must carry a numeric messageId");
 
     let redelivered = request_json(
         &app,
@@ -2345,7 +2486,9 @@ jobs:
         .oneshot(
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/runner/server/_apis/v1/Message/1/1?sessionId=default")
+                .uri(format!(
+                    "/runner/server/_apis/v1/Message/1/{message_id}?sessionId=default"
+                ))
                 .header(header::AUTHORIZATION, "Bearer preloop-system-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -2503,12 +2646,12 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
     )
     .await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
-    {
-        let mut inner = state.inner.lock().await;
-        let run = inner.runs.get_mut(&run_id).unwrap();
-        run.job_check_run_ids
-            .insert(JobId("build".into()), CHECK_RUN_ID);
-    }
+    state
+        .test_db_mutate(|tx| {
+            tx.set_job_check_run(run_id, &JobId("build".into()), CHECK_RUN_ID as i64)
+                .unwrap();
+        })
+        .await;
 
     let cancelled = request_json(
         &app,
@@ -2517,7 +2660,6 @@ async fn cancel_run_completes_github_checks_and_terminal_metadata() {
         Value::Null,
     )
     .await;
-
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(cancelled["conclusion"], "cancelled");
     assert!(
@@ -2586,14 +2728,14 @@ async fn completed_check_uploads_every_annotation_in_batches_of_fifty() {
     let accepted = submit_simple_run(&app).await;
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
     let job_id = JobId("build".to_owned());
+    state
+        .test_db_mutate(|tx| {
+            tx.set_job_check_run(run_id, &job_id, CHECK_RUN_ID as i64)
+                .unwrap();
+        })
+        .await;
     {
         let mut inner = state.inner.lock().await;
-        inner
-            .runs
-            .get_mut(&run_id)
-            .unwrap()
-            .job_check_run_ids
-            .insert(job_id.clone(), CHECK_RUN_ID);
         let events = inner.timeline_events.entry(run_id).or_default();
         for line in 1..=120 {
             events.push(NdjsonEvent::Annotation {
@@ -2698,6 +2840,74 @@ async fn cancel_run_refreshes_runner_pool_queue_metadata() {
     );
 }
 
+/// The disttask (AzDO) claim is exactly when the ready queue shrinks,
+/// so it must refresh the same supervisor gauges the broker claim and the
+/// completion path refresh — otherwise the on-demand pool keeps seeing
+/// phantom queued work and a stale next-job hint.
+#[tokio::test]
+async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    for (runs_on, marker) in [("ubuntu-22.04", "first"), ("ubuntu-24.04", "second")] {
+        request_json(
+            &app,
+            Method::POST,
+            "/api/v1/runs",
+            json!({
+                "workflow_yaml": format!(
+                    "on: push\njobs:\n  build:\n    runs-on: {runs_on}\n    steps:\n      - run: echo {marker}\n"
+                ),
+                "event": "push",
+                "repository": "owner/repo"
+            }),
+        )
+        .await;
+    }
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        2
+    );
+    assert_eq!(
+        *state.next_job_runs_on.read().unwrap(),
+        vec!["ubuntu-22.04"]
+    );
+
+    // The compat `Message` poll is the path a pool runner uses for the
+    // implicit session; the disttask prefix routes through `touch_session`
+    // first and only reaches the AzDO poll for an existing session.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_apis/v1/Message/1?sessionId=default&waitSeconds=0")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let message: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    assert_eq!(
+        message["messageType"],
+        azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
+    );
+
+    assert_eq!(
+        state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "a disttask claim must refresh the pool queue-depth gauge"
+    );
+    assert_eq!(
+        *state.next_job_runs_on.read().unwrap(),
+        vec!["ubuntu-24.04"],
+        "a disttask claim must refresh the pool next-job labels"
+    );
+}
+
 #[tokio::test]
 async fn message_poll_waits_until_work_is_enqueued() {
     let temp = tempfile::tempdir().unwrap();
@@ -2737,7 +2947,139 @@ jobs:
     .await;
 
     let message = poll.await.unwrap();
-    assert_eq!(message["messageId"], 1);
+    assert!(
+        message["messageId"].as_i64().is_some(),
+        "the long poll must return the enqueued message: {message}"
+    );
+    assert_eq!(message["messageType"], "PipelineAgentJobRequest");
+}
+
+/// A control-DB failure on the runner's disttask poll must not be
+/// answered as "nothing to deliver": the runner would long-poll forever
+/// against an outage. The mapped error (5xx) is the honest answer.
+#[tokio::test]
+async fn disttask_poll_surfaces_control_db_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    // The poll's first statement after materializing the implicit compat
+    // session reads `session_messages`; dropping it makes the backend fail.
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE session_messages", [])
+                .expect("drop session_messages");
+        })
+        .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_apis/v1/Message/1?sessionId=default&waitSeconds=0")
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a control-DB outage must not look like an empty poll"
+    );
+}
+
+/// An empty timeline is a legitimate answer, so a failed timeline read
+/// must not be reported as one.
+#[tokio::test]
+async fn timeline_read_surfaces_control_db_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE timeline_records", [])
+                .expect("drop timeline_records");
+        })
+        .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(
+                    "/_apis/v1/plans/plan-x/timelines/00000000-0000-0000-0000-000000000001/records",
+                )
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed timeline read must not be answered as an empty timeline"
+    );
+}
+
+/// A timeline PATCH that the control DB rejects must not answer 200
+/// with `count: 0`: the runner would believe its records were persisted.
+#[tokio::test]
+async fn timeline_patch_surfaces_control_db_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let run = submit_simple_run(&app).await;
+    let _ = run;
+    let timeline_id: String = state
+        .test_db_mutate(|tx| {
+            tx.0.query_row("SELECT timeline_id FROM job_requests LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("a submitted job owns a timeline")
+        })
+        .await;
+    state
+        .test_db_mutate(|tx| {
+            tx.0.execute("DROP TABLE timeline_records", [])
+                .expect("drop timeline_records");
+        })
+        .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!(
+                    "/_apis/v1/plans/plan-x/timelines/{timeline_id}/records"
+                ))
+                .header(header::AUTHORIZATION, "Bearer preloop-system-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "count": 1,
+                        "value": [{
+                            "id": "00000000-0000-0000-0000-0000000000ff",
+                            "name": "build",
+                            "type": "Job",
+                            "state": "inProgress"
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a rejected timeline write must not be reported as a successful empty batch"
+    );
 }
 
 #[tokio::test]
@@ -3036,7 +3378,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let app = app(state.clone(), CancellationToken::new());
 
-    // 1. connectionData
+    // connectionData
     let (s, conn) = try_req(
         &app,
         Method::GET,
@@ -3047,7 +3389,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert!(s.is_success(), "1 connectionData: {}", s);
     assert!(conn["locationServiceData"]["serviceDefinitions"].is_array());
 
-    // 2. OAuth token
+    // OAuth token
     let (s, _) = try_req(
         &app,
         Method::POST,
@@ -3057,7 +3399,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert!(s.is_success(), "2 oauth2: {}", s);
 
-    // 3. Register runner
+    // Register runner
     let (s, reg) = try_req(
         &app,
         Method::POST,
@@ -3068,7 +3410,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert!(s.is_success(), "3 register: {} body={}", s, reg);
     let runner_id = reg["id"].as_i64().unwrap();
 
-    // 4. Create session
+    // Create session
     let (s, sess) = try_req(
         &app,
         Method::POST,
@@ -3079,13 +3421,13 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     assert!(s.is_success(), "4 session: {} body={}", s, sess);
     let session_id = sess["sessionId"].as_str().unwrap().to_owned();
 
-    // 5. Submit a workflow
+    // Submit a workflow
     let (s, accepted) = try_req(&app, Method::POST, "/api/v1/runs",
             json!({"workflow_yaml":"on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hello\n","event":"push","repository":"owner/repo"})).await;
     assert!(s.is_success(), "5 submit: {} body={}", s, accepted);
     let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
 
-    // 6. Poll for messages — the runner uses the AzDO Message endpoint
+    // Poll for messages — the runner uses the AzDO Message endpoint
     let (s, msg) = try_req(
         &app,
         Method::GET,
@@ -3098,13 +3440,13 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert!(s.is_success(), "6 poll: {} body={}", s, msg);
 
-    // 7. Get the job from the run
-    let inner = state.inner.lock().await;
+    // Get the job from the run
+    let inner = state.test_tx().await;
     let run_record = inner.runs.get(&run_id).unwrap();
     let job_id = run_record.jobs.keys().next().unwrap().clone();
     drop(inner);
 
-    // 8. Complete the job
+    // Complete the job
     let (s, _) = try_req(
         &app,
         Method::POST,
@@ -3114,7 +3456,7 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert!(s.is_success(), "8 complete: {}", s);
 
-    // 9. Verify run succeeded
+    // Verify run succeeded
     let (_, final_run) = try_req(
         &app,
         Method::GET,
@@ -3124,11 +3466,6 @@ async fn full_runner_lifecycle_register_session_poll_complete() {
     .await;
     assert_eq!(final_run["status"], "success");
 }
-
-/// The runner prints its `GITHUB_TOKEN Permissions` group from this variable, so
-/// it must state what the job's token actually carries: the restricted default
-/// when the workflow declares nothing (matching the official runner's setup
-/// log), and nothing at all when the workflow withholds everything.
 
 /// The runner prints its `GITHUB_TOKEN Permissions` group from this variable, so
 /// it must state what the job's token actually carries: the restricted default
@@ -3165,8 +3502,8 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
         )
         .await;
 
-        let inner = state.inner.lock().await;
-        let queued = inner.queue.front().expect("job should be queued");
+        let inner = state.test_tx().await;
+        let queued = inner.ready().next().expect("job should be queued");
         assert_eq!(
             queued
                 .message
@@ -3178,13 +3515,6 @@ async fn the_wire_token_permissions_match_the_declared_policy() {
         );
     }
 }
-
-/// GitHub's fork profile is the single effective job-authorization policy for
-/// fork-restricted tiers. A fork PR declaring `checks: write` and
-/// `id-token: write` must come out read-only on the runner-visible wire
-/// variable, read-only in the App installation-token request, with no OIDC
-/// request URL and no OIDC grant — while a trusted push and a
-/// `pull_request_target` keep the declared writes and OIDC untouched.
 
 /// GitHub's fork profile is the single effective job-authorization policy for
 /// fork-restricted tiers. A fork PR declaring `checks: write` and
@@ -3252,7 +3582,7 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
     let target = submit(Some("pull-request-target")).await;
     let target_run_id = target.run_id.to_string();
 
-    let inner = state.inner.lock().await;
+    let inner = state.test_tx().await;
     let fork_message = queued_message_for(&inner, &fork_run_id);
     assert_eq!(
         variable_value(&fork_message, "system.github.token.permissions"),
@@ -3385,13 +3715,6 @@ async fn fork_pr_jobs_are_downgraded_to_read_only_and_oidc_denied() {
 /// authority GitHub's read-only fork profile never allowed. The job keeps the
 /// local runtime token instead — while a trusted job under the same `pat`
 /// policy still receives the PAT.
-
-/// A mint failure for an untrusted fork job must never reach the configured
-/// `PRELOOP_GITHUB_TOKEN` PAT fallback: the PAT is repository-unscoped and
-/// ignores `permissions:`, so handing it to fork PR code would grant
-/// authority GitHub's read-only fork profile never allowed. The job keeps the
-/// local runtime token instead — while a trusted job under the same `pat`
-/// policy still receives the PAT.
 #[tokio::test]
 async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
     use crate::github_app::{GitHubAppCredentials, MintFailurePolicy};
@@ -3443,7 +3766,7 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
     let trusted_run_id = trusted.run_id.to_string();
 
     {
-        let inner = state.inner.lock().await;
+        let inner = state.test_tx().await;
         let fork_message = queued_message_for(&inner, &fork_run_id);
         let fork_request = inner
             .github_token_requests
@@ -3475,12 +3798,6 @@ async fn untrusted_job_mint_failure_never_falls_back_to_the_pat() {
         );
     }
 }
-
-/// The broker claim swaps the build-time token for the minted App token.
-/// Every official runner-visible wire alias must follow coherently —
-/// `system.github.token` (the `${{ github.token }}` variable), `github_token`,
-/// and the `github` context's `token` entry. The runner maps `github_token` to
-/// `${{ secrets.GITHUB_TOKEN }}` locally; the uppercase name is not wire data.
 
 /// The broker claim swaps the build-time token for the minted App token.
 /// Every official runner-visible wire alias must follow coherently —

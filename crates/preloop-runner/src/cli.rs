@@ -250,7 +250,7 @@ mod tests {
         );
     }
 
-    // --- P1 CLI configuration gap coverage ---
+    // --- CLI configuration gap coverage ---
 
     #[test]
     fn parse_configure_replace_flag() {

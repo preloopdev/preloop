@@ -70,9 +70,12 @@ just dogfood    # E2E with real runner
 - **Supply-chain policy isolation.** A PR must not mix policy files
   (`Cargo.lock`, `deny.toml`, `.cargo/audit.toml`, `supply-chain/`,
   `.github/workflows/supply-chain.yml`) with non-policy changes — the
-  supply-chain audit job fails the PR. Adding a dependency (even a
-  dev-dependency) touches `Cargo.lock`; split it into a dedicated PR or
-  vendor the need away.
+  supply-chain audit job fails the PR. The one sanctioned mixed shape is a
+  dedicated dependency PR: exactly `Cargo.lock` plus the root/crate
+  `Cargo.toml` manifests that declare the dependency; the guard accepts that
+  shape and rejects anything else riding along (source, tests, docs, other
+  policy files). Adding a dependency (even a dev-dependency) touches
+  `Cargo.lock`; use that dedicated PR or vendor the need away.
 
 ## Debugging Dogfood (mandatory)
 

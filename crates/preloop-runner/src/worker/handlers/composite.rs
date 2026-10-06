@@ -1,6 +1,6 @@
 //! Composite action handler.
 //!
-//! F024: After running nested steps, evaluates `outputs.<name>.value` expressions
+//! After running nested steps, evaluates `outputs.<name>.value` expressions
 //! against the nested steps context to produce composite action outputs.
 //! Nesting depth is capped at 10 (official limit).
 
@@ -240,7 +240,7 @@ fn run_composite_action_inner<'a>(
             ctx.env.insert(k.clone(), v.clone());
         }
 
-        // Track nested step results for output evaluation (F024)
+        // Track nested step results for output evaluation
         let mut nested_step_results: indexmap::IndexMap<
             String,
             crate::worker::contexts::StepResult,
@@ -449,6 +449,7 @@ fn run_composite_action_inner<'a>(
                                     workspace,
                                     ctx,
                                     cancel_rx.clone(),
+                                    Some(uses),
                                 )
                                 .await
                                 .map(|_| "Success".to_string()),
@@ -516,6 +517,7 @@ fn run_composite_action_inner<'a>(
                                         workspace,
                                         ctx,
                                         cancel_rx.clone(),
+                                        Some(uses),
                                     )
                                     .await
                                     .map(|_| "Success".to_string())
@@ -600,7 +602,7 @@ fn run_composite_action_inner<'a>(
             }
         }
 
-        // F024: Evaluate composite outputs after all steps complete
+        // Evaluate composite outputs after all steps complete
         if let Some(ref outputs) = manifest.outputs {
             let steps_ctx: serde_json::Value = nested_step_results
                 .iter()
@@ -1160,11 +1162,11 @@ mod tests {
         assert!(err.to_string().contains("nesting depth exceeded"));
     }
 
-    // --- P0 composite gap coverage ---
+    // --- composite gap coverage ---
 
     #[tokio::test]
     async fn composite_nested_uses_dispatches_inner_action() {
-        // Create a composite whose step has `uses: ./inner` pointing to another
+        // Create a composite whose step has `uses:./inner` pointing to another
         // composite action.
         let workspace = tempfile::TempDir::new().unwrap();
         let inner_dir = workspace.path().join("inner");

@@ -310,7 +310,7 @@ fn chained_bracket_access_on_from_json() {
 
 #[test]
 fn hashfiles_follow_symlinks_flag() {
-    // F055: hashFiles('--follow-symbolic-links', 'pattern') should parse
+    // hashFiles('--follow-symbolic-links', 'pattern') should parse
     // the flag without treating it as a glob pattern.
     // Without a workspace_dir, hashFiles returns "" regardless, but this
     // confirms the flag parsing doesn't cause errors.
@@ -332,9 +332,9 @@ fn hashfiles_follow_symlinks_flag() {
 
 #[test]
 fn hashfiles_binary_digest_matches_official_algorithm() {
-    // PEXP-01 regression test: verify binary digest concatenation.
+    // Verify binary digest concatenation.
     // Official hashFiles.ts concatenates raw 32-byte SHA-256 digests before hashing.
-    // Pre-fix aksh concatenated hex strings — wrong algorithm, different cache keys.
+    // Concatenating hex strings instead of the raw digests uses the wrong algorithm and produces different cache keys.
     use sha2::{Digest, Sha256};
 
     // Use a unique temp dir under /tmp
@@ -865,7 +865,7 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&workspace);
         assert!(result.is_err(), "unknown hashFiles flags must fail");
     }
-    /// R1-7: absolute patterns are rejected outright, never used as-is —
+    /// Absolute patterns are rejected outright, never used as-is —
     /// otherwise hashFiles('/etc/passwd') is a file-content oracle for
     /// anything the runner can read. Silent remapping would hide intent.
     #[test]
@@ -899,7 +899,7 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// R1-7: `../` traversal in a pattern is rejected outright, not silently
+    /// `../` traversal in a pattern is rejected outright, not silently
     /// skipped — the workflow author must see the failure.
     #[test]
     fn hash_files_dotdot_traversal_rejected() {
@@ -923,7 +923,7 @@ mod official_semantics {
 
         let _ = std::fs::remove_dir_all(&base);
     }
-    /// R1-7: Windows-native traversal and absolute forms are rejected on
+    /// Windows-native traversal and absolute forms are rejected on
     /// Windows, where backslash is a separator and prefixes/roots escape.
     /// (On Unix these are literal filenames and correctly pass the guard.)
     #[cfg(windows)]
@@ -950,7 +950,7 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// R1-7: the traversal budget bounds visited entries, not just retained
+    /// The traversal budget bounds visited entries, not just retained
     /// matches. 100k+ skipped directories would otherwise burn glob work
     /// without ever tripping the 10k retained-file cap.
     #[test]
@@ -1011,7 +1011,7 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// R1-7: hashing more than 100 MiB of input fails with HashFilesTooLarge
+    /// Hashing more than 100 MiB of input fails with HashFilesTooLarge
     /// instead of loading it all into memory.
     #[test]
     fn hash_files_total_byte_cap_rejects_huge_input() {
@@ -1033,7 +1033,7 @@ mod official_semantics {
         );
     }
 
-    /// R1-7: symlinks escaping the workspace are skipped even with
+    /// Symlinks escaping the workspace are skipped even with
     /// --follow-symbolic-links; in-workspace symlinks are only followed
     /// when the flag is passed.
     #[cfg(unix)]
@@ -1077,7 +1077,7 @@ mod official_semantics {
 
         let _ = std::fs::remove_dir_all(&base);
     }
-    /// R1-7/Codex: symlink aliases to the same target hash per matched path
+    /// Symlink aliases to the same target hash per matched path
     /// like official — canonical dedup must not collapse them into one entry.
     #[cfg(unix)]
     #[test]
@@ -1122,7 +1122,7 @@ mod official_semantics {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// R1-7: matching more than the file cap is a clear error, not silent
+    /// Matching more than the file cap is a clear error, not silent
     /// truncation or unbounded hashing.
     #[test]
     fn hash_files_too_many_files_errors() {

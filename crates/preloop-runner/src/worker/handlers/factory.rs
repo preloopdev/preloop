@@ -409,7 +409,7 @@ runs:
         assert!(result.is_err());
     }
 
-    // --- P0 factory gap coverage ---
+    // --- factory gap coverage ---
 
     #[test]
     fn empty_runs_using_returns_error() {

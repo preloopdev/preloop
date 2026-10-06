@@ -919,6 +919,9 @@ pub struct Concurrency {
     /// Raw group string; may contain `${{ }}` — evaluated server-side.
     pub group: String,
     /// Raw `cancel-in-progress` value: "true" / "false" / a `${{ }}` expression.
+    /// Serialized under the wire key so the manual `Deserialize` below reads
+    /// back what `Serialize` writes (it only accepts `cancel-in-progress`).
+    #[serde(rename = "cancel-in-progress")]
     pub cancel_in_progress: Option<String>,
     /// Queue mode.
     pub queue: ConcurrencyQueue,
@@ -1138,4 +1141,32 @@ pub enum ActionRuns {
         #[serde(default)]
         args: Vec<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Concurrency` derives `Serialize` but hand-writes `Deserialize`, which
+    /// reads `cancel-in-progress`. Without the matching rename on Serialize,
+    /// the field silently drops to `None` on every round-trip — a workflow
+    /// with `cancel-in-progress: true` loses the flag after a reload, so the
+    /// gate stops cancelling. Pin the wire-key agreement.
+    #[test]
+    fn concurrency_cancel_in_progress_round_trips() {
+        let c = Concurrency {
+            group: "deploy".to_owned(),
+            cancel_in_progress: Some("true".to_owned()),
+            queue: ConcurrencyQueue::Single,
+        };
+        let value = serde_json::to_value(&c).unwrap();
+        // The wire key must be the kebab-case the manual Deserialize reads.
+        assert_eq!(
+            value.get("cancel-in-progress").and_then(|v| v.as_str()),
+            Some("true"),
+            "Serialize must emit cancel-in-progress, got {value}"
+        );
+        let back: Concurrency = serde_json::from_value(value).unwrap();
+        assert_eq!(back.cancel_in_progress.as_deref(), Some("true"));
+    }
 }

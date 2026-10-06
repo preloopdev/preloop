@@ -8,6 +8,9 @@ use super::factory::ActionManifest;
 use crate::process;
 use crate::worker::execution_context::StepContext;
 
+const FORCE_NODE24: &str = "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24";
+const ALLOW_UNSECURE_NODE: &str = "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION";
+
 /// Pre-`/home/runner` goldens baked node externals at this absolute path.
 /// The upward walk from a new-layout workspace can never reach it, so it
 /// serves as a last-resort search root (probed, never assumed).
@@ -36,6 +39,19 @@ fn runner_root_for_externals(workspace: &Path, legacy_root: &Path) -> std::path:
         .and_then(|p| p.parent())
         .unwrap_or(Path::new("."))
         .to_path_buf()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NodeSelection {
+    version: &'static str,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct MigrationFlag {
+    is_true: bool,
+    from_workflow: bool,
+    from_system: bool,
 }
 
 fn system_node_major(node_path: &str) -> Result<u64> {
@@ -69,6 +85,25 @@ fn required_major_from_version(node_version: &str) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
+fn node_bool(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("$true")
+}
+
+fn migration_flag(
+    name: &str,
+    workflow_env: &std::collections::HashMap<String, String>,
+    system_value: Option<&str>,
+) -> MigrationFlag {
+    let workflow_value = workflow_env.get(name);
+    MigrationFlag {
+        is_true: workflow_value
+            .map(|value| node_bool(value))
+            .unwrap_or_else(|| system_value.is_some_and(node_bool)),
+        from_workflow: workflow_value.is_some(),
+        from_system: system_value.is_some_and(|value| !value.is_empty()),
+    }
+}
+
 #[test]
 fn parses_system_node_major_version() {
     assert_eq!(parse_node_major("v20.19.0\n").unwrap(), 20);
@@ -85,46 +120,76 @@ fn required_major_from_version_extracts_correctly() {
     assert_eq!(required_major_from_version("python3"), None);
 }
 
-/// Resolve the Node.js runtime for an action from its `runs.using` value.
-///
-/// GitHub removed Node 12, 16, and 20 for JavaScript actions on
-/// September 23, 2026, and also deleted the
-/// `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out. Node 22 was never a
-/// supported action runtime. Steps using one of those values fail here with
-/// an actionable error instead of silently running on a wrong runtime.
-/// Anything unrecognized (including an empty value) resolves to Node 24.
+#[allow(clippy::too_many_arguments)]
 fn resolve_node_version(
     runs_using: &str,
+    workflow_env: &std::collections::HashMap<String, String>,
+    system_force_node24: Option<&str>,
+    system_allow_unsecure_node: Option<&str>,
+    use_node24_by_default: bool,
+    require_node24: bool,
     target_os: &str,
     target_arch: &str,
-) -> Result<&'static str> {
-    match runs_using {
-        "node12" | "node16" | "node20" => {
-            let major = &runs_using[4..];
-            anyhow::bail!(
-                "Node.js {major} actions are no longer available: GitHub removed Node.js {major} \
-                 for JavaScript actions on September 23, 2026. Update the action's action.yml to \
-                 `runs.using: node24`."
+) -> NodeSelection {
+    let mut warnings = Vec::new();
+    let mut version = match runs_using {
+        "node20" if require_node24 => "node24",
+        "node20" => {
+            let force_node24 = migration_flag(FORCE_NODE24, workflow_env, system_force_node24);
+            let allow_unsecure = migration_flag(
+                ALLOW_UNSECURE_NODE,
+                workflow_env,
+                system_allow_unsecure_node,
             );
-        }
-        "node22" => {
-            anyhow::bail!(
-                "Node.js 22 is not a supported runtime for JavaScript actions: GitHub never \
-                 shipped a Node 22 runtime, and Node.js 12/16/20 were removed on \
-                 September 23, 2026. Update the action's action.yml to `runs.using: node24`."
-            );
-        }
-        _ => {
-            if target_os == "linux" && target_arch == "arm" {
-                anyhow::bail!(
-                    "Node.js 24 is not available on Linux ARM32, and Node.js 20 (the previous \
-                     fallback) was removed on September 23, 2026. This runner cannot execute \
-                     JavaScript actions on this platform."
-                );
+            let both_from_workflow = force_node24.is_true
+                && allow_unsecure.is_true
+                && force_node24.from_workflow
+                && allow_unsecure.from_workflow;
+            let both_from_system = force_node24.is_true
+                && allow_unsecure.is_true
+                && force_node24.from_system
+                && allow_unsecure.from_system;
+            if both_from_workflow || both_from_system {
+                let source = if both_from_workflow {
+                    "workflow"
+                } else {
+                    "system"
+                };
+                let default_version = if use_node24_by_default {
+                    "node24"
+                } else {
+                    "node20"
+                };
+                warnings.push(format!(
+                    "Both {FORCE_NODE24} and {ALLOW_UNSECURE_NODE} environment variables are set to true in the {source} environment. This is likely a configuration error. Using the default Node version: {default_version}."
+                ));
+                default_version
+            } else if use_node24_by_default {
+                if allow_unsecure.is_true {
+                    "node20"
+                } else {
+                    "node24"
+                }
+            } else if force_node24.is_true {
+                "node24"
+            } else {
+                "node20"
             }
-            Ok("node24")
         }
+        "node24" => "node24",
+        "node22" => "node22",
+        _ => "node20",
+    };
+
+    if version == "node24" && target_os == "linux" && target_arch == "arm" {
+        version = "node20";
+        warnings.push(
+            "Node 24 is not supported on Linux ARM32 platforms. Falling back to Node 20."
+                .to_owned(),
+        );
     }
+
+    NodeSelection { version, warnings }
 }
 
 /// Resolve a Node action's `runs.main` entry point under `action_dir` and
@@ -160,6 +225,18 @@ fn resolve_contained_entry_point(action_dir: &Path, main: &str) -> Result<PathBu
     Ok(entry_point)
 }
 
+/// `GITHUB_ACTION_PATH` mirrors `github.action_path`, which the official
+/// runner sets only inside composite embedded steps: a nested `uses:` action
+/// inherits the parent composite's directory unchanged, so scripts can
+/// `require($GITHUB_ACTION_PATH/sibling-file)` (grafana's
+/// create-github-app-token does exactly this through `actions/github-script`).
+/// `build_env` already merged an inherited value; the action's own directory
+/// is only the default when none exists.
+fn set_action_path_env(env: &mut std::collections::HashMap<String, String>, action_dir: &Path) {
+    env.entry("GITHUB_ACTION_PATH".to_string())
+        .or_insert_with(|| action_dir.to_string_lossy().to_string());
+}
+
 /// Run a Node.js action.
 pub async fn run_node_action(
     manifest: &ActionManifest,
@@ -168,6 +245,7 @@ pub async fn run_node_action(
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    action_name: Option<&str>,
 ) -> Result<()> {
     let main = with
         .get("__preloop_entry")
@@ -177,11 +255,14 @@ pub async fn run_node_action(
 
     let entry_point = resolve_contained_entry_point(action_dir, main)?;
 
-    // Resolve the Node.js runtime. Removed majors (12/16/20) and the
-    // never-supported node22 fail the step here with an actionable error.
+    // Resolve node binary and apply the runner's Node 20 migration policy.
     let runs_using = manifest.runs_using.as_str();
-    let node_version =
-        resolve_node_version(runs_using, std::env::consts::OS, std::env::consts::ARCH)?;
+    if runs_using == "node12" || runs_using == "node16" {
+        tracing::warn!(
+            "Node.js {} actions are deprecated. Action authors should update to use node20 or later.",
+            &runs_using[4..]
+        );
+    }
 
     // Build environment with INPUT_* variables, evaluating any ${{ }} expressions.
     let mut env = ctx.build_env();
@@ -193,6 +274,45 @@ pub async fn run_node_action(
     // The step's own `with:` inputs and manifest defaults are added back
     // below; composite RUN steps are unaffected (script path).
     env.retain(|key, _| !key.starts_with("INPUT_"));
+    let use_node24_by_default = ctx
+        .job
+        .get_variable_bool("actions.runner.usenode24bydefault");
+    let require_node24 = ctx.job.get_variable_bool("actions.runner.requirenode24");
+    let system_force_node24 = std::env::var(FORCE_NODE24).ok();
+    let system_allow_unsecure_node = std::env::var(ALLOW_UNSECURE_NODE).ok();
+    let selection = resolve_node_version(
+        runs_using,
+        &env,
+        system_force_node24.as_deref(),
+        system_allow_unsecure_node.as_deref(),
+        use_node24_by_default,
+        require_node24,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    for warning in &selection.warnings {
+        tracing::warn!("{warning}");
+        ctx.log(&format!("::warning::{warning}"));
+    }
+    let node_version = selection.version;
+    // v2.337.0: Node 20 runtime is deprecated for actions. Emit a one-time
+    // per-job warning via the job log and tracing, without failing the step
+    // or altering the selected Node binary.
+    const NODE20_DEPRECATION_WARNING: &str =
+        "Node 20 actions are deprecated and support ends soon; migrate actions to node24.";
+    if node_version.starts_with("node20") && ctx.job.emit_node20_deprecation_warning() {
+        tracing::warn!("{}", NODE20_DEPRECATION_WARNING);
+        ctx.log(&format!("::warning::{NODE20_DEPRECATION_WARNING}"));
+    }
+    if runs_using == "node20"
+        && let Some(name) = action_name
+    {
+        if node_version == "node24" {
+            ctx.job.record_upgraded_node24_action(name);
+        } else if ctx.job.get_variable_bool("actions.runner.warnonnode20") {
+            ctx.job.record_deprecated_node20_action(name);
+        }
+    }
 
     let expr_ctx_for_inputs = ctx.build_expression_context();
     if let Some(inputs) = with.as_object() {
@@ -229,7 +349,7 @@ pub async fn run_node_action(
         }
     }
 
-    // P1.14: Emit deprecation warnings for inputs with deprecationMessage
+    // Emit deprecation warnings for inputs with deprecationMessage
     if let Some(manifest_inputs) = &manifest.inputs {
         for (key, input_def) in manifest_inputs {
             if let Some(msg) = input_def.get("deprecationMessage").and_then(|v| v.as_str())
@@ -251,11 +371,7 @@ pub async fn run_node_action(
     // the container, and a probe against the runner's own filesystem must not
     // decide whether that path can run.
 
-    // Set GITHUB_ACTION_PATH
-    env.insert(
-        "GITHUB_ACTION_PATH".to_string(),
-        action_dir.to_string_lossy().to_string(),
-    );
+    set_action_path_env(&mut env, action_dir);
 
     // A job container runs every step inside it — the official runner execs
     // node actions through `docker exec` too, using the externals mounted at
@@ -444,124 +560,237 @@ mod tests {
             outputs: None,
         }
     }
-
-    fn resolve(runs_using: &str, target_os: &str, target_arch: &str) -> Result<&'static str> {
-        resolve_node_version(runs_using, target_os, target_arch)
-    }
-
-    #[test]
-    fn removed_node_majors_fail_with_actionable_error() {
-        for runs_using in ["node12", "node16", "node20"] {
-            let err = resolve(runs_using, "linux", "x64").unwrap_err();
-            let major = &runs_using[4..];
-            let message = err.to_string();
-            assert!(
-                message.contains(&format!("Node.js {major} actions are no longer available")),
-                "{runs_using}: unexpected error: {message}"
-            );
-            assert!(
-                message.contains("September 23, 2026"),
-                "{runs_using}: unexpected error: {message}"
-            );
-            assert!(
-                message.contains("runs.using: node24"),
-                "{runs_using}: unexpected error: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn node22_fails_because_it_was_never_supported() {
-        let err = resolve("node22", "linux", "x64").unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("never"), "unexpected error: {message}");
-        assert!(
-            message.contains("September 23, 2026"),
-            "unexpected error: {message}"
-        );
-        assert!(
-            message.contains("runs.using: node24"),
-            "unexpected error: {message}"
-        );
-    }
-
-    #[test]
-    fn node24_resolves_on_supported_platforms() {
-        for (target_os, target_arch) in [
-            ("linux", "x64"),
-            ("linux", "aarch64"),
-            ("darwin", "arm"),
-            ("darwin", "x64"),
-            ("windows", "x64"),
-        ] {
-            let version = resolve("node24", target_os, target_arch).unwrap();
-            assert_eq!(version, "node24", "{target_os}/{target_arch}");
-        }
-    }
-
-    #[test]
-    fn unknown_using_values_fall_back_to_node24() {
-        for runs_using in ["", "node18", "node25", "bun"] {
-            let version = resolve(runs_using, "linux", "x64").unwrap();
-            assert_eq!(version, "node24", "{runs_using:?}");
-        }
-    }
-
-    #[test]
-    fn node24_on_linux_arm32_fails_with_clear_message() {
-        let err = resolve("node24", "linux", "arm").unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("ARM32"), "unexpected error: {message}");
-        assert!(
-            message.contains("September 23, 2026"),
-            "unexpected error: {message}"
-        );
-    }
-
-    /// A node20 action fails the step outright — it is neither silently run
-    /// on Node 20 nor upgraded. The error tells the author exactly what to do.
-    #[tokio::test]
-    async fn node20_action_fails_step_with_removal_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let action_dir = tmp.path().join("action");
-        std::fs::create_dir_all(&action_dir).unwrap();
-        std::fs::write(action_dir.join("index.js"), "console.log('hi')").unwrap();
-
-        let manifest = node_manifest("index.js");
-        assert_eq!(manifest.runs_using, "node20");
-
-        let mut job = crate::worker::contexts::JobContext::new(
-            "job".into(),
-            "job".into(),
-            serde_json::json!({}),
-            serde_json::json!({}),
-        );
-        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step".into());
-        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
-
-        let err = run_node_action(
-            &manifest,
-            &action_dir,
-            &serde_json::json!({}),
-            action_dir.to_str().unwrap(),
-            &mut ctx,
-            cancel_rx,
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        runs_using: &str,
+        workflow: &[(&str, &str)],
+        system_force_node24: Option<&str>,
+        system_allow_unsecure_node: Option<&str>,
+        use_node24_by_default: bool,
+        require_node24: bool,
+        target_os: &str,
+        target_arch: &str,
+    ) -> NodeSelection {
+        let workflow_env = workflow
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        resolve_node_version(
+            runs_using,
+            &workflow_env,
+            system_force_node24,
+            system_allow_unsecure_node,
+            use_node24_by_default,
+            require_node24,
+            target_os,
+            target_arch,
         )
-        .await
-        .unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("no longer available"),
-            "unexpected error: {message}"
+    }
+
+    #[test]
+    fn system_only_force_node24_selects_node24() {
+        let selection = resolve(
+            "node20",
+            &[],
+            Some("true"),
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
         );
-        assert!(
-            message.contains("September 23, 2026"),
-            "unexpected error: {message}"
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn workflow_false_overrides_system_true() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "false")],
+            Some("true"),
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
         );
-        assert!(
-            message.contains("runs.using: node24"),
-            "unexpected error: {message}"
+
+        assert_eq!(selection.version, "node20");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn workflow_true_overrides_system_false() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "true")],
+            Some("false"),
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
         );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn both_workflow_flags_true_use_configured_default_and_warning() {
+        for (use_node24_by_default, expected_version) in [(false, "node20"), (true, "node24")] {
+            let selection = resolve(
+                "node20",
+                &[(FORCE_NODE24, "true"), (ALLOW_UNSECURE_NODE, "true")],
+                None,
+                None,
+                use_node24_by_default,
+                false,
+                "linux",
+                "x64",
+            );
+
+            assert_eq!(selection.version, expected_version);
+            assert_eq!(
+                selection.warnings,
+                vec![format!(
+                    "Both {FORCE_NODE24} and {ALLOW_UNSECURE_NODE} environment variables are set to true in the workflow environment. This is likely a configuration error. Using the default Node version: {expected_version}."
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn both_system_flags_true_use_configured_default_and_warning() {
+        for (use_node24_by_default, expected_version) in [(false, "node20"), (true, "node24")] {
+            let selection = resolve(
+                "node20",
+                &[],
+                Some("true"),
+                Some("true"),
+                use_node24_by_default,
+                false,
+                "linux",
+                "x64",
+            );
+
+            assert_eq!(selection.version, expected_version);
+            assert_eq!(
+                selection.warnings,
+                vec![format!(
+                    "Both {FORCE_NODE24} and {ALLOW_UNSECURE_NODE} environment variables are set to true in the system environment. This is likely a configuration error. Using the default Node version: {expected_version}."
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn flags_from_different_sources_do_not_trigger_conflict_warning() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "true")],
+            None,
+            Some("true"),
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn require_node24_overrides_conflicting_flags_without_warning() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "true"), (ALLOW_UNSECURE_NODE, "true")],
+            Some("true"),
+            Some("true"),
+            false,
+            true,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn dollar_true_is_accepted_for_force_node24() {
+        let selection = resolve(
+            "node20",
+            &[(FORCE_NODE24, "$true")],
+            None,
+            None,
+            false,
+            false,
+            "linux",
+            "x64",
+        );
+
+        assert_eq!(selection.version, "node24");
+        assert!(selection.warnings.is_empty());
+    }
+
+    #[test]
+    fn linux_arm32_downgrades_selected_and_direct_node24() {
+        let cases = [
+            ("selected node24", "node20", &[(FORCE_NODE24, "true")][..]),
+            ("direct node24", "node24", &[][..]),
+        ];
+        for (case, runs_using, workflow) in cases {
+            let selection = resolve(
+                runs_using, workflow, None, None, false, false, "linux", "arm",
+            );
+
+            assert_eq!(selection.version, "node20", "{case}");
+            assert_eq!(
+                selection.warnings,
+                vec![
+                    "Node 24 is not supported on Linux ARM32 platforms. Falling back to Node 20."
+                        .to_owned()
+                ],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn node24_is_preserved_on_linux_aarch64_and_non_linux_arm() {
+        for (target_os, target_arch) in [("linux", "aarch64"), ("darwin", "arm")] {
+            let selection = resolve(
+                "node24",
+                &[],
+                None,
+                None,
+                false,
+                false,
+                target_os,
+                target_arch,
+            );
+
+            assert_eq!(selection.version, "node24");
+            assert!(selection.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_node_versions_migrate_to_node20_and_node22_is_preserved() {
+        for runs_using in ["node12", "node16"] {
+            let selection = resolve(runs_using, &[], None, None, false, false, "linux", "x64");
+
+            assert_eq!(selection.version, "node20", "{runs_using}");
+            assert!(selection.warnings.is_empty(), "{runs_using}");
+        }
+
+        let selection = resolve("node22", &[], None, None, false, false, "linux", "x64");
+        assert_eq!(selection.version, "node22");
+        assert!(selection.warnings.is_empty());
     }
 
     #[tokio::test]
@@ -584,6 +813,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
@@ -612,6 +842,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
@@ -716,11 +947,15 @@ mod tests {
             action_dir.to_str().unwrap(),
             &mut ctx,
             cancel_rx,
+            None,
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("escapes action directory"));
     }
+
+    const NODE20_WARNING_SUBSTR: &str =
+        "Node 20 actions are deprecated and support ends soon; migrate actions to node24.";
 
     #[test]
     fn externals_search_prefers_walk_falls_back_to_legacy() {
@@ -751,6 +986,194 @@ mod tests {
         assert_eq!(
             runner_root_for_externals(&bare, &tmp.path().join("nolegacy")),
             tmp.path().join("bare").join("_work"),
+        );
+    }
+
+    fn setup_externals_with_shim(root: &std::path::Path) {
+        for version in ["node20", "node24"] {
+            let bin_dir = root.join("externals").join(version).join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let node_path = bin_dir.join("node");
+            // Minimal shim that exits 0; handler checks is_file() and executes it.
+            std::fs::write(&node_path, "#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&node_path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&node_path, perms).unwrap();
+            }
+            // Also create windows variant for completeness; handler is cfg-gated at runtime
+            // but the test suite runs on linux/darwin, so the unix shim is what matters.
+            let win_path = root.join("externals").join(version).join("node.exe");
+            if !win_path.exists() {
+                std::fs::write(&win_path, "#!/bin/sh\nexit 0\n").unwrap();
+            }
+        }
+    }
+
+    fn assert_deprecation_warning_count(ctx: &StepContext<'_>, expected: usize) {
+        let log_count = ctx
+            .log_lines
+            .iter()
+            .filter(|line| line.contains(NODE20_WARNING_SUBSTR))
+            .count();
+        let annotation_count = ctx
+            .annotations
+            .iter()
+            .filter(|a| a.message.contains(NODE20_WARNING_SUBSTR))
+            .count();
+        // ::warning:: is parsed into an annotation plus a ##[warning] log line;
+        // both contain the message, so we take the max to avoid double-counting.
+        let total = std::cmp::max(log_count, annotation_count);
+        assert_eq!(
+            total, expected,
+            "expected {expected} deprecation warning(s), log_lines={:?} annotations={:?}",
+            ctx.log_lines, ctx.annotations
+        );
+    }
+
+    #[tokio::test]
+    async fn node20_action_emits_deprecation_warning_once_per_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_externals_with_shim(tmp.path());
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let action_dir = tmp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(action_dir.join("index.js"), "console.log('hello')").unwrap();
+
+        let manifest20 = ActionManifest {
+            name: "test".into(),
+            description: String::new(),
+            runs_using: "node20".into(),
+            runs_main: Some("index.js".into()),
+            runs_pre: None,
+            runs_pre_if: None,
+            runs_post: None,
+            runs_post_if: None,
+            runs_steps: None,
+            runs_image: None,
+            runs_entrypoint: None,
+            runs_args: None,
+            runs_env: None,
+            inputs: None,
+            outputs: None,
+        };
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        // First node20 step should emit the warning.
+        {
+            let mut ctx = StepContext::new(&mut job, "step1".into(), "Step 1".into());
+            let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            run_node_action(
+                &manifest20,
+                &action_dir,
+                &serde_json::json!({}),
+                workspace.to_str().unwrap(),
+                &mut ctx,
+                cancel_rx,
+                Some("actions/checkout@v3"),
+            )
+            .await
+            .expect("first node20 action should succeed");
+            assert_deprecation_warning_count(&ctx, 1);
+            assert!(
+                ctx.job.node20_warning_emitted,
+                "job flag must be set after first warning"
+            );
+        }
+
+        // Second node20 step in the same job must NOT emit again.
+        {
+            let mut ctx = StepContext::new(&mut job, "step2".into(), "Step 2".into());
+            let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            run_node_action(
+                &manifest20,
+                &action_dir,
+                &serde_json::json!({}),
+                workspace.to_str().unwrap(),
+                &mut ctx,
+                cancel_rx,
+                Some("actions/setup-node@v3"),
+            )
+            .await
+            .expect("second node20 action should succeed");
+            assert_deprecation_warning_count(&ctx, 0);
+        }
+        assert!(job.node20_warning_emitted);
+    }
+
+    #[tokio::test]
+    async fn node24_action_emits_no_deprecation_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_externals_with_shim(tmp.path());
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let action_dir = tmp.path().join("action");
+        std::fs::create_dir_all(&action_dir).unwrap();
+        std::fs::write(action_dir.join("index.js"), "console.log('hello')").unwrap();
+
+        let mut manifest24 = node_manifest("index.js");
+        manifest24.runs_using = "node24".into();
+
+        let mut job = crate::worker::contexts::JobContext::new(
+            "job".into(),
+            "job".into(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        );
+        let mut ctx = StepContext::new(&mut job, "step1".into(), "Step 1".into());
+        let (_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        run_node_action(
+            &manifest24,
+            &action_dir,
+            &serde_json::json!({}),
+            workspace.to_str().unwrap(),
+            &mut ctx,
+            cancel_rx,
+            Some("actions/checkout@v4"),
+        )
+        .await
+        .expect("node24 action should succeed");
+        assert_deprecation_warning_count(&ctx, 0);
+        assert!(!ctx.job.node20_warning_emitted);
+    }
+}
+
+#[cfg(test)]
+mod action_path_env_tests {
+    use super::*;
+
+    #[test]
+    fn nested_action_keeps_composite_action_path() {
+        let mut env = std::collections::HashMap::from([(
+            "GITHUB_ACTION_PATH".to_string(),
+            "/work/_actions/grafana/shared-workflows/sha/actions/create-github-app-token"
+                .to_string(),
+        )]);
+        set_action_path_env(
+            &mut env,
+            Path::new("/work/_actions/actions/github-script/sha"),
+        );
+        assert_eq!(
+            env["GITHUB_ACTION_PATH"],
+            "/work/_actions/grafana/shared-workflows/sha/actions/create-github-app-token"
+        );
+    }
+
+    #[test]
+    fn top_level_action_defaults_to_own_dir() {
+        let mut env = std::collections::HashMap::new();
+        set_action_path_env(&mut env, Path::new("/work/_actions/actions/checkout/sha"));
+        assert_eq!(
+            env["GITHUB_ACTION_PATH"],
+            "/work/_actions/actions/checkout/sha"
         );
     }
 }

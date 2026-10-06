@@ -52,52 +52,38 @@ pub async fn oidc_token(
     let requested_job_id = job_id
         .parse::<uuid::Uuid>()
         .map_err(|_| ApiError::not_found("OIDC: plan and job do not match"))?;
-    let inner = shared.state.inner.lock().await;
-    let request_id = inner
-        .plan_requests
-        .get(&plan_id)
-        .copied()
-        .ok_or_else(|| ApiError::not_found("OIDC: plan not found"))?;
-    let request = inner
-        .job_requests
-        .get(&request_id)
-        .ok_or_else(|| ApiError::not_found("OIDC: job request not found"))?;
-    if request.agent_job_id != requested_job_id {
-        return Err(ApiError::not_found("OIDC: plan and job do not match"));
-    }
-    let run_id = request.run_id;
-    let resolved_job_id = request.job_id.clone();
-
-    // Permission enforcement: id-token:write must be granted.
-    let granted = inner
-        .id_token_grants
-        .get(&(run_id, resolved_job_id.clone()))
-        .copied()
-        .unwrap_or(false);
+    // Authoritative lookups (plan binding, job request, id-token grant, OIDC
+    // context, run) come from the backend; the signing keypair and issuer are
+    // node-local.
+    let crate::control::types::OidcGrant {
+        run,
+        job_id: resolved_job_id,
+        granted,
+        context: oidc_context,
+    } = shared
+        .state
+        .backend
+        .oidc_grant(&plan_id, requested_job_id)
+        .await?;
+    let run_id = run.run_id;
     if !granted {
         return Err(ApiError::forbidden(
             "id-token: write permission is required to request an OIDC token",
         ));
     }
 
-    // Get the OIDC signing keypair.
-    let oidc_kp = inner
-        .oidc_keypair
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?
-        .clone();
-
-    let oidc_context = inner
-        .oidc_job_contexts
-        .get(&(run_id, resolved_job_id.clone()))
-        .cloned()
-        .ok_or_else(|| ApiError::internal("OIDC context missing for dispatched job"))?;
+    // Get the OIDC signing keypair (node-local crypto).
+    let (oidc_kp, issuer) = {
+        let inner = shared.state.inner.lock().await;
+        let kp = inner
+            .oidc_keypair
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("OIDC signing keypair not available"))?
+            .clone();
+        (kp, oidc_issuer_url(&inner))
+    };
 
     // Build claims from the run's submission and parser-resolved job context.
-    let run = inner
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found("OIDC: run not found"))?;
     let submission = &run.submission;
     let repository_owner = submission
         .repository
@@ -260,8 +246,6 @@ pub async fn oidc_token(
         .map_err(|error| ApiError::bad_request(format!("system clock before epoch: {error}")))?
         .as_secs();
 
-    let issuer = oidc_issuer_url(&inner);
-    drop(inner);
     let mut claims = oidc::build_claims(&claims_input, &audience, &issuer, now);
     if let Some(check_run_id) = check_run_id {
         claims["check_run_id"] = json!(check_run_id.to_string());

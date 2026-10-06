@@ -27,125 +27,32 @@ pub async fn twirp_workflow_steps_update(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let plan_id = payload["workflow_run_backend_id"].as_str().unwrap_or("");
     let agent_job_id_str = payload["workflow_job_run_backend_id"]
         .as_str()
         .unwrap_or("");
     crate::auth::require_results_job(&identity, plan_id, agent_job_id_str)?;
-    let mut inner = shared.state.inner.lock().await;
-
-    let (Some(plan_uuid), Some(job_uuid)) = (
-        uuid::Uuid::parse_str(plan_id).ok(),
-        uuid::Uuid::parse_str(agent_job_id_str).ok(),
-    ) else {
+    let steps_payload = payload["steps"].as_array().cloned();
+    let plan_uuid = uuid::Uuid::parse_str(plan_id).ok();
+    let job_uuid = uuid::Uuid::parse_str(agent_job_id_str).ok();
+    let (Some(plan_uuid), Some(job_uuid)) = (plan_uuid, job_uuid) else {
         return Ok(Json(json!({"ok": true})));
     };
-    let Some((_, run_id, job_id)) =
-        resolve_callback_job(&inner, &plan_uuid.to_string(), None, Some(job_uuid))
-    else {
-        return Ok(Json(json!({"ok": true})));
-    };
-    let Some(steps) = payload["steps"].as_array().cloned() else {
+    let Some(steps) = steps_payload else {
         return Ok(Json(json!({"ok": true})));
     };
 
-    let job_status = inner
-        .runs
-        .get(&run_id)
-        .and_then(|run| run.jobs.get(&job_id).copied());
-    let observed = chrono::Utc::now();
-    let records = inner.job_steps.entry(job_uuid).or_default();
-
-    for step in &steps {
-        let external_id = step["external_id"].as_str().unwrap_or("");
-        if external_id.is_empty() {
-            // With no identity there is nothing to reconcile against, and
-            // guessing by display name is exactly what merged two distinct
-            // same-named steps and lost one from the run.
-            tracing::warn!(
-                %run_id, job = %job_id.0,
-                "dropping step report with no external_id"
-            );
-            continue;
-        }
-
-        let conclusion_num = step["conclusion"].as_u64().unwrap_or(0);
-        let status_num = step["status"].as_u64().unwrap_or(0);
-        let terminal = status_num == 6;
-        let conclusion = if terminal {
-            match conclusion_num {
-                2 => "success",
-                3 if job_status == Some(ExecutionStatus::Cancelled) => "cancelled",
-                3 => "failure",
-                7 => "skipped",
-                _ => "success",
-            }
-        } else {
-            "in_progress"
-        };
-        // The runner reports the rendered display name ("Run actions/checkout@v4"),
-        // the same string GitHub's UI shows, so it wins over the message's name:
-        // the server leaves that empty for steps without an explicit `name:`.
-        let reported_name = step["name"].as_str().filter(|name| !name.is_empty());
-        let runner_number = step["number"].as_u64().and_then(|n| u32::try_from(n).ok());
-
-        match StepRecord::find_by_id(records, external_id) {
-            Some(pos) => {
-                let record = &mut records[pos];
-                record.conclusion = conclusion.to_owned();
-                record.runner_number = runner_number.or(record.runner_number);
-                if let Some(name) = reported_name {
-                    record.name = name.to_owned();
-                }
-                // First non-terminal sighting is the start signal.
-                if !terminal && record.started_at.is_none() {
-                    record.started_at = Some(observed);
-                }
-                if terminal && record.finished_at.is_none() {
-                    record.finished_at = Some(observed);
-                }
-            }
-            None => records.push(StepRecord {
-                id: external_id.to_owned(),
-                kind: StepKind::Synthetic,
-                workflow_index: None,
-                runner_number,
-                context_name: None,
-                name: reported_name.unwrap_or_default().to_owned(),
-                conclusion: conclusion.to_owned(),
-                // Do not invent `started_at == finished_at`, which forces
-                // duration 0 for a step that completed before any in-progress
-                // update was processed.
-                started_at: (!terminal).then_some(observed),
-                finished_at: terminal.then_some(observed),
-            }),
-        }
-    }
-
-    // Persist the attempt that changed, after releasing the lock: without this
-    // a restart before job completion loses every step conclusion the runner
-    // reported. Best-effort, like the rest of the store — in-memory state is
-    // authoritative and a failed write must not fail the runner's callback.
-    let records = records.clone();
-    // Bumped under the same lock that mutated the manifest, so the write
-    // carries a revision strictly newer than any snapshot taken before it.
-    let revision = {
-        let counter = inner.job_steps_revision.entry(job_uuid).or_insert(0);
-        *counter += 1;
-        *counter
-    };
-    drop(inner);
-    if let Err(error) = shared
+    // Resolve the callback identity and merge each reported step into
+    // `job_steps` in one backend transaction — an indexed write, no working
+    // set. Unresolvable identities are acknowledged and dropped.
+    shared
         .state
-        .store
-        .store_job_steps(run_id, job_uuid, &records, revision)
+        .backend
+        .report_steps(&plan_uuid.to_string(), job_uuid, steps)
         .await
-    {
-        tracing::warn!(?error, %run_id, "failed to persist step records");
-    }
-
+        .map_err(ApiError::from)?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -154,7 +61,7 @@ pub async fn twirp_get_job_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     // The signed URL is the upload credential for `/replay/results/*` — a
     // bearerless route reachable from inside every runner VM. Only mint for
@@ -185,7 +92,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::auth::require_results_job(
         &identity,
@@ -198,7 +105,7 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
     };
     // The bearerless upload token is a server-signed blob JWT: `job` binds it
     // to the owning job so the blob gate can reject writes from any other job
-    // (R1-2) and from this job once it settles (R1-10). `jti` names the
+    // and from this job once it settles. `jti` names the
     // on-disk staging directory. The runner PUTs to this URL without a
     // bearer (Azure SDK compat), so the signature — not a bearer — is the
     // credential here.
@@ -212,17 +119,17 @@ pub async fn twirp_get_job_diag_logs_signed_blob_url(
         }),
         crate::memory_caps::PENDING_UPLOAD_TTL,
     )?;
+    // Re-check liveness against the backend before minting an upload
+    // credential: the job may have settled between the gate and now.
+    if let crate::auth::ResultsIdentity::Job(job) = &identity
+        && !crate::auth::job_is_live(&shared.state, job.job_id).await?
+    {
+        return Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ));
+    }
     {
         let mut inner = shared.state.inner.lock().await;
-        // In-lock re-check: the job may have settled between the gate and
-        // this lock — a settled job must not mint a fresh upload credential.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity
-            && !crate::auth::job_is_live_locked(&inner, job.job_id)
-        {
-            return Err(ApiError::forbidden(
-                "job is not live; writes are rejected for completed or unknown jobs",
-            ));
-        }
         // Per-job cap, same bound as the other pending maps: a live job can
         // otherwise mint unlimited diag URLs for the full TTL. Evict the
         // oldest token for this job rather than rejecting — the runner may
@@ -259,7 +166,7 @@ pub async fn twirp_get_step_logs_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsSignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
@@ -294,7 +201,7 @@ pub async fn twirp_get_step_summary_signed_blob_url(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummarySignedBlobUrlRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
@@ -357,7 +264,7 @@ pub async fn twirp_create_step_summary_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepSummaryMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let job_id = crate::auth::require_canonical_results_job_id(
         &identity,
@@ -378,10 +285,7 @@ pub async fn twirp_create_step_summary_metadata(
             line_count: 0,
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        tracing::warn!(?error, "failed to persist step summary metadata");
-    }
+    drop(inner);
 
     Ok(Json(json!({"ok": true})))
 }
@@ -405,7 +309,7 @@ pub async fn twirp_create_step_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<StepLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let (Some(plan_id), Some(raw_job_id)) = (
         request.workflow_run_backend_id.as_deref(),
@@ -430,10 +334,7 @@ pub async fn twirp_create_step_logs_metadata(
             line_count: line_count_usize,
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        tracing::warn!(?error, "failed to persist step log metadata");
-    }
+    drop(inner);
 
     Ok(Json(json!({"ok": true})))
 }
@@ -455,7 +356,7 @@ pub async fn twirp_create_job_logs_metadata(
     axum::extract::Extension(identity): axum::extract::Extension<crate::auth::ResultsIdentity>,
     Json(request): Json<JobLogsMetadataRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     let Some(raw_job_id) = request.workflow_job_run_backend_id else {
         return Ok(Json(json!({"ok": true})));
@@ -480,10 +381,7 @@ pub async fn twirp_create_job_logs_metadata(
             line_count: line_count_usize,
         },
     );
-    let meta = crate::store::build_meta_snapshot(&inner);
-    if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-        tracing::warn!(?error, "failed to persist job log metadata");
-    }
+    drop(inner);
 
     Ok(Json(json!({"ok": true})))
 }
@@ -498,7 +396,7 @@ pub fn scoped_cache_key(key: &str, scope: Option<&str>, repository: Option<&str>
     )
 }
 
-/// R1-3: bind the cache namespace to the token's job. The repository is
+/// Bind the cache namespace to the token's job. The repository is
 /// resolved server-side from the job → run → submission chain, never from
 /// the request body — a job can only read/write its own repository's cache
 /// namespace, so a compromised job cannot poison another repository's
@@ -517,7 +415,7 @@ async fn resolve_cache_repository(
     }
 }
 
-/// R1-5: bind the cache *write* scope to the token's job. The scope is the
+/// Bind the cache *write* scope to the token's job. The scope is the
 /// job's own git ref from the run submission — never the client-supplied
 /// scope — so a branch run cannot claim `refs/heads/main` and poison the
 /// default branch's cache namespace (first write wins). The system token
@@ -535,7 +433,7 @@ async fn resolve_cache_write_scope(
     }
 }
 
-/// R1-5: scopes a job token may *read*, GitHub-style: its own ref, the PR
+/// Scopes a job token may *read*, GitHub-style: its own ref, the PR
 /// base branch when the run is a pull request, and the repository's real
 /// default branch as fallback (resolved from the event payload, not
 /// assumed to be `main`). Caches written on unrelated branches stay
@@ -825,20 +723,19 @@ pub async fn twirp_cache_v2_create(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let (key, version, _restore, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Create)?;
-    // R1-3: the repository comes from the token's job, never the request body.
+    // The repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
     let client_scope = scopes.first().map(String::as_str);
-    // R1-5: the write scope is the token's job's git ref, never the
+    // The write scope is the token's job's git ref, never the
     // client-supplied scope — a branch run cannot claim `refs/heads/main`
     // and poison the default branch's cache namespace.
     let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
     let storage_key = scoped_cache_key(key.as_str(), scope.as_deref(), Some(repository.as_str()));
-
     if shared
         .state
         .cache
@@ -873,20 +770,18 @@ pub async fn twirp_cache_v2_create(
         .await
         .map_err(|e| ApiError::internal(format!("failed to create cache stage dir: {e}")))?;
     let job_backend_id = job_backend_id_from_bearer(&shared.state, &headers);
+    // Re-check liveness against the backend: a settled job must not mint a
+    // fresh upload credential.
+    if let crate::auth::ResultsIdentity::Job(job) = &identity
+        && !crate::auth::job_is_live(&shared.state, job.job_id).await?
+    {
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        return Err(ApiError::forbidden(
+            "job is not live; writes are rejected for completed or unknown jobs",
+        ));
+    }
     let already_reserved = {
         let mut inner = shared.state.inner.lock().await;
-        // In-lock re-check: the job may have settled between the gate above
-        // and this lock acquisition — a settled job must not mint a fresh
-        // upload credential in that window.
-        if let crate::auth::ResultsIdentity::Job(job) = &identity
-            && !crate::auth::job_is_live_locked(&inner, job.job_id)
-        {
-            drop(inner);
-            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
-            return Err(ApiError::forbidden(
-                "job is not live; writes are rejected for completed or unknown jobs",
-            ));
-        }
         if inner
             .cache_v2_pending
             .values()
@@ -894,7 +789,7 @@ pub async fn twirp_cache_v2_create(
         {
             true
         } else {
-            // F7: a runner is capped at MAX_PENDING_PER_JOB in-flight cache
+            // A runner is capped at MAX_PENDING_PER_JOB in-flight cache
             // uploads. The job comes from the signed token scope, not the
             // request body. A refusal is a plain `ok: false`, the same
             // non-fatal shape actions/cache already handles for a miss.
@@ -935,10 +830,7 @@ pub async fn twirp_cache_v2_create(
                     created_unix: now_unix(),
                 },
             );
-            let meta = crate::store::build_meta_snapshot(&inner);
-            if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-                tracing::warn!(?error, "failed to persist cache v2 reservation");
-            }
+
             false
         }
     };
@@ -992,16 +884,16 @@ pub async fn twirp_cache_v2_finalize(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
-    // R1-10: reject writes from completed/unknown jobs.
+    // Reject writes from completed/unknown jobs.
     crate::auth::require_live_results_job(&shared.state, &identity).await?;
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let t0 = std::time::Instant::now();
     let (key, version, _restore, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::Finalize)?;
-    // R1-3: the repository comes from the token's job, never the request body.
+    // The repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
     let client_scope = scopes.first().map(String::as_str);
-    // R1-5: the write scope is the token's job's git ref, never the
+    // The write scope is the token's job's git ref, never the
     // client-supplied scope — a branch run cannot claim `refs/heads/main`
     // and poison the default branch's cache namespace.
     let scope = resolve_cache_write_scope(&shared.state, &headers, client_scope).await?;
@@ -1085,10 +977,6 @@ pub async fn twirp_cache_v2_finalize(
     {
         let mut inner = shared.state.inner.lock().await;
         inner.cache_v2_pending.remove(&token);
-        let meta = crate::store::build_meta_snapshot(&inner);
-        if let Err(error) = shared.state.store.store_meta_only(&meta).await {
-            tracing::warn!(?error, "failed to persist cache v2 finalization");
-        }
     }
 
     // Clean up staging directory.
@@ -1132,15 +1020,14 @@ pub async fn twirp_cache_v2_get_dl_url(
     let t0 = std::time::Instant::now();
     let (key, version, restore_keys, scopes, client_repository) =
         cache_request_fields(&headers, &body, CacheRequestKind::GetDownloadUrl)?;
-    // R1-3: the repository comes from the token's job, never the request body.
+    // The repository comes from the token's job, never the request body.
     let repository = resolve_cache_repository(&shared.state, &headers, client_repository).await?;
-    // R1-5: a job token may only read its own ref's scope, plus the default
+    // A job token may only read its own ref's scope, plus the default
     // branch as fallback (GitHub semantics). Unrelated branches' caches stay
     // invisible even if the client lists them first. The system token keeps
     // the client-supplied scopes; with none supplied, the unscoped default
     // is tried once.
     let primary_scopes = resolve_cache_read_scopes(&shared.state, &headers, &scopes).await?;
-
     let mut hit: Option<(preloop_cache::CacheEntry, Vec<u8>)> = None;
     let mut lookup_ms: u128 = 0;
     for primary in &primary_scopes {
@@ -1201,7 +1088,7 @@ pub async fn twirp_cache_v2_get_dl_url(
         inner
             .cache_v2_dl_tokens
             .insert(dl_jti.clone(), (entry.key.clone(), entry.version.clone()));
-        // F7: bound the minted-token map; the oldest tokens are evicted
+        // Bound the minted-token map; the oldest tokens are evicted
         // first. A token that a runner has not yet fetched still works, so a
         // real workflow's few concurrent downloads are never affected.
         inner.cache_v2_dl_tokens_order.push_back(dl_jti.clone());
@@ -1277,8 +1164,8 @@ mod cache_pb_tests {
     #[test]
     fn pb_golden_sccache_create_fixture_decodes() {
         // Correct fixture: bytes generated with prost using official field
-        // numbers (metadata=1, key=2, version=3). This is the failing pre-fix
-        // exchange: hand-rolled flat key=1 decoder cannot parse it, prost does.
+        // numbers (metadata=1, key=2, version=3). A hand-rolled flat key=1
+        // decoder cannot parse it; prost does.
         let (key, version, restore, scopes, repository) =
             pb_cache_request(SCCACHE_CREATE_FIXTURE, CacheRequestKind::Create).unwrap();
         assert_eq!(key, ".sccache_check");
@@ -1390,7 +1277,7 @@ mod cache_pb_tests {
         );
     }
 
-    // ── R1-5 regression tests: cache namespace is bound to the job's git
+    // ── regression tests: cache namespace is bound to the job's git
     // ref, so one branch cannot poison another branch's cache entries. ──
 
     fn bearer_headers(token: &str) -> axum::http::HeaderMap {
@@ -1409,75 +1296,150 @@ mod cache_pb_tests {
             .unwrap()
     }
 
-    async fn bind_job_to_repository(state: &AppState, job_id: uuid::Uuid, repository: &str) {
+    /// Monotonic fixture run numbers: the schema enforces
+    /// `UNIQUE (namespace, repository, workflow_path, run_number, run_attempt)`,
+    /// so two seeds inside one test must not reuse a number.
+    static NEXT_SEEDED_RUN_NUMBER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+
+    /// Seed a live run carrying one job attempt bound to `job_id`, through
+    /// the control backend — the authoritative writer, with no in-memory
+    /// mirror to insert into. The request's `agent_job_id` is
+    /// what the job → run → submission lookups key on, and the submitted run
+    /// record supplies the submission the cache scoping reads back.
+    async fn seed_job_attempt(
+        state: &AppState,
+        job_id: uuid::Uuid,
+        request_id: i64,
+        submission: WorkflowSubmission,
+    ) {
         let run_id = RunId::new();
-        let request_id = 1;
-        let mut inner = state.inner.lock().await;
-        inner.agent_job_requests.insert(job_id, request_id);
-        inner.job_requests.insert(
-            request_id,
-            TaskAgentJobRequestRecord {
-                request_id,
-                run_id,
-                job_id: JobId("build".to_owned()),
-                agent_job_id: job_id,
-                plan_id: job_id.to_string(),
-                plan_type: "plan".to_owned(),
-                timeline_id: uuid::Uuid::new_v4(),
-                result: None,
-                locked_until: String::new(),
-                owner_runner_id: None,
-                started_at: None,
-                last_renewed_at: None,
-                timeout_triggered: false,
-                claimed_at: None,
-                debug_token_issued: false,
-            },
-        );
-        let submission = WorkflowSubmission {
-            repository: repository.to_owned(),
-            ..Default::default()
-        };
-        inner.runs.insert(
+        let nanos = crate::models::now_unix_nanos();
+        let record = RunRecord {
             run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: None,
-                run_name: None,
-                submission: Arc::new(submission),
-                jobs: BTreeMap::new(),
-                status: ExecutionStatus::InProgress,
-                job_outputs: BTreeMap::new(),
-                job_base_ids: BTreeMap::new(),
-                job_needs: BTreeMap::new(),
-                caller_plans: BTreeMap::new(),
-                job_names: BTreeMap::new(),
-                github: serde_json::Value::Null,
-                head_sha: String::new(),
-                workflow_ref: String::new(),
-                workspace_snapshot: None,
-                job_fail_fast: BTreeMap::new(),
-                job_continue_on_error: BTreeMap::new(),
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls: BTreeMap::new(),
-                jobs_list: Vec::new(),
-                created_at: chrono::Utc::now(),
-                started_at: None,
-                completed_at: None,
-                run_number: 1,
-                run_attempt: 1,
-                workflow_path_str: String::new(),
-                event: "push".to_owned(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing: None,
-                fork_approval_pending: false,
-                fork_approval_requested_at_unix_nanos: None,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
+            webhook_delivery_id: None,
+            run_name: None,
+            submission: Arc::new(submission),
+            jobs: BTreeMap::new(),
+            status: ExecutionStatus::InProgress,
+            job_outputs: BTreeMap::new(),
+            job_base_ids: BTreeMap::new(),
+            job_needs: BTreeMap::new(),
+            caller_plans: BTreeMap::new(),
+            job_names: BTreeMap::new(),
+            github: serde_json::Value::Null,
+            head_sha: String::new(),
+            workflow_ref: String::new(),
+            workspace_snapshot: None,
+            job_fail_fast: BTreeMap::new(),
+            job_continue_on_error: BTreeMap::new(),
+            job_check_run_ids: BTreeMap::new(),
+            reports_check_runs: false,
+            reusable_calls: BTreeMap::new(),
+            jobs_list: Vec::new(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            run_number: NEXT_SEEDED_RUN_NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            run_attempt: 1,
+            workflow_path_str: String::new(),
+            event: "push".to_owned(),
+            conclusion: None,
+            push_state: None,
+            snapshot_timing: None,
+            fork_approval_pending: false,
+            fork_approval_requested_at_unix_nanos: None,
+            fork_approved_at_unix_nanos: None,
+            fork_approval_note: None,
+        };
+        let job_id_owned = JobId("build".to_owned());
+        let queued = QueuedJob {
+            run_id,
+            job_id: job_id_owned.clone(),
+            base_id: "build".to_owned(),
+            created_at_unix_nanos: nanos,
+            dependencies_ready_at_unix_nanos: Some(nanos),
+            concurrency_wait_started_at_unix_nanos: None,
+            concurrency_acquired_at_unix_nanos: None,
+            enqueued_at_unix_nanos: nanos,
+            needs: Vec::new(),
+            if_condition: None,
+            condition_context: preloop_gha_expressions::Context::default(),
+            max_parallel: None,
+            runs_on: vec!["self-hosted".to_owned()],
+            runner_group: None,
+            environment: None,
+            message: serde_json::from_value(serde_json::json!({
+                "jobId": job_id,
+                "requestId": request_id,
+                "plan": {"planId": job_id.to_string(), "planType": "build", "version": 1, "artifactUri": "", "artifactLocation": ""},
+                "timeline": {"id": uuid::Uuid::new_v4(), "changeId": 0, "location": null},
+                "jobName": "build",
+                "lockedUntil": "",
+                "resources": {"endpoints": []},
+                "steps": [],
+                "snapshot": null
+            }))
+            .unwrap(),
+            concurrency: None,
+            matrix: BTreeMap::new(),
+            deferred_matrix: None,
+            reusable_call: None,
+            environment_gate: None,
+        };
+        // The row's correlation id is allocated by the backend; only the
+        // `agent_job_id` → run mapping matters for job-token resolution.
+        let request = TaskAgentJobRequestRecord {
+            request_id,
+            run_id,
+            job_id: job_id_owned,
+            agent_job_id: job_id,
+            plan_id: job_id.to_string(),
+            plan_type: "plan".to_owned(),
+            timeline_id: uuid::Uuid::new_v4(),
+            result: None,
+            locked_until: String::new(),
+            owner_runner_id: None,
+            started_at: None,
+            last_renewed_at: None,
+            timeout_triggered: false,
+            claimed_at: None,
+            debug_token_issued: false,
+        };
+        state
+            .backend
+            .submit_run(crate::control::types::SubmitRun {
+                namespace: "default".to_owned(),
+                record,
+                jobs: vec![crate::control::types::SubmitJob {
+                    queued,
+                    request: Some(request),
+                    token_request: None,
+                    id_token_granted: false,
+                    oidc_context: None,
+                    step_manifest: Vec::new(),
+                    initially_skipped: false,
+                }],
+                workflow_concurrency: None,
+                empty_concurrency_group: false,
+                check_hostable: false,
+            })
+            .await
+            .expect("seed submit_run");
+    }
+
+    /// Bind a job token to a live run in `repository`.
+    async fn bind_job_to_repository(state: &AppState, job_id: uuid::Uuid, repository: &str) {
+        seed_job_attempt(
+            state,
+            job_id,
+            1,
+            WorkflowSubmission {
+                repository: repository.to_owned(),
+                ..Default::default()
             },
-        );
+        )
+        .await;
     }
 
     /// Bind a job token to a live run whose submission carries `repository`
@@ -1512,79 +1474,23 @@ mod cache_pb_tests {
         git_ref: &str,
         payload: serde_json::Value,
     ) {
-        let run_id = RunId::new();
-        let mut inner = state.inner.lock().await;
-        inner.agent_job_requests.insert(job_id, request_id);
-        inner.job_requests.insert(
+        seed_job_attempt(
+            state,
+            job_id,
             request_id,
-            TaskAgentJobRequestRecord {
-                request_id,
-                run_id,
-                job_id: JobId("build".to_owned()),
-                agent_job_id: job_id,
-                plan_id: job_id.to_string(),
-                plan_type: "plan".to_owned(),
-                timeline_id: uuid::Uuid::new_v4(),
-                result: None,
-                locked_until: String::new(),
-                owner_runner_id: None,
-                started_at: None,
-                last_renewed_at: None,
-                timeout_triggered: false,
-                claimed_at: None,
-                debug_token_issued: false,
+            WorkflowSubmission {
+                repository: repository.to_owned(),
+                git_ref: git_ref.to_owned(),
+                payload,
+                ..Default::default()
             },
-        );
-        inner.runs.insert(
-            run_id,
-            RunRecord {
-                run_id,
-                webhook_delivery_id: None,
-                run_name: None,
-                submission: Arc::new(WorkflowSubmission {
-                    repository: repository.to_owned(),
-                    git_ref: git_ref.to_owned(),
-                    payload,
-                    ..Default::default()
-                }),
-                jobs: BTreeMap::new(),
-                status: ExecutionStatus::InProgress,
-                job_outputs: BTreeMap::new(),
-                job_base_ids: BTreeMap::new(),
-                job_needs: BTreeMap::new(),
-                caller_plans: BTreeMap::new(),
-                job_names: BTreeMap::new(),
-                github: serde_json::Value::Null,
-                head_sha: String::new(),
-                workflow_ref: String::new(),
-                workspace_snapshot: None,
-                job_fail_fast: BTreeMap::new(),
-                job_continue_on_error: BTreeMap::new(),
-                job_check_run_ids: BTreeMap::new(),
-                reports_check_runs: false,
-                reusable_calls: BTreeMap::new(),
-                jobs_list: Vec::new(),
-                created_at: chrono::Utc::now(),
-                started_at: None,
-                completed_at: None,
-                run_number: 1,
-                run_attempt: 1,
-                workflow_path_str: String::new(),
-                event: "push".to_owned(),
-                conclusion: None,
-                push_state: None,
-                snapshot_timing: None,
-                fork_approval_pending: false,
-                fork_approval_requested_at_unix_nanos: None,
-                fork_approved_at_unix_nanos: None,
-                fork_approval_note: None,
-            },
-        );
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn cache_write_scope_binds_to_job_ref_not_client_scope() {
-        // R1-5: the write scope comes from the token's job's git ref. A
+        // The write scope comes from the token's job's git ref. A
         // feature-branch job claiming `refs/heads/main` must still land in
         // its own ref's namespace — otherwise it could poison the default
         // branch's cache (first write wins).
@@ -1627,7 +1533,7 @@ mod cache_pb_tests {
 
     #[tokio::test]
     async fn cache_read_scopes_allow_own_ref_and_default_branch_only() {
-        // R1-5: a job may read its own ref's scope plus the default branch
+        // A job may read its own ref's scope plus the default branch
         // fallback (GitHub semantics). Unrelated branches stay invisible even
         // when the client lists them first.
         let temp = tempfile::tempdir().unwrap();
@@ -1745,7 +1651,7 @@ mod cache_pb_tests {
 
     #[test]
     fn legacy_cache_namespace_includes_git_ref() {
-        // R1-5: the legacy artifactcache namespace binds repository + ref.
+        // The legacy artifactcache namespace binds repository + ref.
         assert_eq!(
             crate::cache_artifacts::ref_scoped_namespace(
                 Some("owner/repo".to_owned()),
@@ -1766,7 +1672,7 @@ mod cache_pb_tests {
     }
     #[tokio::test]
     async fn cache_repository_binds_to_job_not_request_body() {
-        // R1-3: the cache namespace binds to the token's job. A spoofed
+        // The cache namespace binds to the token's job. A spoofed
         // `repository` in the request body must not move the caller into
         // another repository's namespace.
         let temp = tempfile::tempdir().unwrap();

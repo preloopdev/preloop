@@ -1,0 +1,102 @@
+name: control-plane
+permissions:
+  contents: read
+
+# Control-plane database tests: every command against both backends.
+# SQLite runs in-process; Postgres runs as one server in the job and each
+# test creates (and drops) its own database on it, so tests stay isolated
+# and parallel. Race tests use two backends on one database.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/preloop-runner-server/**"
+      - "docs/control-schema.sql"
+      - ".github/workflows/control-plane.yml"
+  workflow_dispatch:
+
+jobs:
+  control-tests:
+    name: control ${{ matrix.postgres }}
+    runs-on: [self-hosted, preloop-cpane]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "17", "18"]
+    env:
+      CARGO_BUILD_JOBS: "6"
+      RUSTFLAGS: "-A warnings -C link-arg=-fuse-ld=lld"
+      PRELOOP_TEST_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          lfs: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: "1.97"
+      - name: Install lld and PostgreSQL ${{ matrix.postgres }}
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lld curl ca-certificates gnupg
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}"
+      - name: Start PostgreSQL (trust auth on loopback)
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: |
+          conf="/etc/postgresql/${PG_MAJOR}/main"
+          echo "host all all 127.0.0.1/32 trust" | sudo tee "$conf/pg_hba.conf"
+          echo "local all all trust" | sudo tee -a "$conf/pg_hba.conf"
+          echo "max_connections = 400" | sudo tee -a "$conf/postgresql.conf"
+          sudo pg_ctlcluster "${PG_MAJOR}" main restart
+          for _ in $(seq 1 30); do
+            psql "$PRELOOP_TEST_POSTGRES_URL" -Atc 'select 1' && exit 0
+            sleep 1
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked --version 0.9.144
+      - name: Verify control filter matches at least one test
+        run: |
+          # dtolnay/rust-toolchain exports CARGO_TERM_COLOR=always, which
+          # nextest honors even when piped: every line then begins with an
+          # ANSI escape and the anchored grep below matched nothing ("zero
+          # tests" on all three jobs). --color never makes the output
+          # parseable regardless of the ambient environment.
+          #
+          # The list exit status is checked on its own so a real failure of
+          # `nextest list` is reported as such instead of as a zero count.
+          if ! cargo nextest list --color never -p preloop-runner-server -E 'test(/^control::/)' > "$RUNNER_TEMP/control-list.txt"; then
+            echo "ERROR: cargo nextest list exited non-zero" >&2
+            exit 1
+          fi
+          count=$(grep -c '^preloop-runner-server control::' "$RUNNER_TEMP/control-list.txt" || true)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: nextest filter 'test(/^control::/)' matched zero tests in preloop-runner-server" >&2
+            exit 1
+          fi
+          echo "control: $count test(s) found"
+      - name: Control tests (SQLite + PostgreSQL)
+        # --no-tests=fail also fails the run itself (exit 4) if the filter
+        # ever selects nothing, independent of list output format.
+        run: cargo nextest run --locked --no-tests=fail -p preloop-runner-server -E 'test(/^control::/)'
+      - name: Target schema applies cleanly
+        run: psql "$PRELOOP_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 -q -f docs/control-schema.sql
+      - name: No leaked per-test databases
+        run: |
+          leaked=$(psql "$PRELOOP_TEST_POSTGRES_URL" -Atc "select count(*) from pg_database where datname like 'preloop_t_%'")
+          test "$leaked" -eq 0 || { echo "leaked $leaked test databases" >&2; exit 1; }

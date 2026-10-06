@@ -42,7 +42,7 @@ fn archive_sha256_hex(bytes: &[u8]) -> String {
 
 /// Response header attesting the engine-observed SHA-256 of the action
 /// tarball being served. Lets the runner verify downloaded bytes even
-/// when the resolve-time pin was Unpinned (P2): the digest is computed
+/// when the resolve-time pin was Unpinned: the digest is computed
 /// by the engine over the exact bytes it serves, never by a job VM.
 pub const ACTION_ARCHIVE_SHA256_HEADER: &str = "x-preloop-action-archive-sha256";
 
@@ -117,7 +117,7 @@ fn ensure_action_archive_pin(
 /// Build the tarball download response, attesting the engine-observed
 /// archive digest in [`ACTION_ARCHIVE_SHA256_HEADER`] whenever one is
 /// known. The runner verifies the bytes it receives against this
-/// attestation even when its resolve-time pin was Unpinned (P2): a
+/// attestation even when its resolve-time pin was Unpinned: a
 /// poisoned local cache is evicted and the fresh download is checked
 /// before extraction. A missing digest (old pre-feature cache entry)
 /// simply omits the header — it never fails the download.
@@ -700,7 +700,7 @@ pub async fn runnerresolve_action(
 ) -> Option<(String, serde_json::Value)> {
     let (key, name, git_ref, resolved_sha_opt, tar_url) =
         resolve_action_download(state, action, version_override).await?;
-    // M2: never echo the mutable ref back as `resolved_sha`. A caller that trusts the
+    // Never echo the mutable ref back as `resolved_sha`. A caller that trusts the
     // field would treat `v4` as a pinned commit. Omitting it makes the unresolved case
     // explicit on the wire, and the runner refuses the download instead of fetching
     // the mutable ref.
