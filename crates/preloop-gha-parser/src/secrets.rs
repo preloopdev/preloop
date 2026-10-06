@@ -95,7 +95,11 @@ pub fn collect_secret_requirements(jobs: &[JobPlan]) -> SecretRequirements {
 /// message fill — `env`, `if`, container/services (credentials read
 /// secrets), step `name`/`env`/`with`/`run`/`if`/`working-directory`/`shell`,
 /// `environment.url`, job `outputs`, the concurrency strings, and reusable
-/// `secrets:` map expressions (the caller's reads). `defaults` carry
+/// `secrets:` map expressions (the caller's reads). A step with a
+/// non-Docker `uses:` marks the job dynamic: composite inner steps evaluate
+/// against the job's `secrets` context, and remote (or local) action bodies
+/// cannot be inspected at submit time, so the job keeps the full scope
+/// rather than silently starving the composite. `defaults` carry
 /// TemplateTokens for `shell`/`working-directory`, contexts the schema
 /// already excludes `secrets` from.
 pub fn collect_job_secret_reads(job: &JobPlan) -> preloop_gha_expressions::SecretReads {
@@ -150,6 +154,18 @@ fn collect_reads_from_step(step: &StepPlan, reads: &mut preloop_gha_expressions:
     }
     for value in step.working_directory.iter().chain(step.shell.iter()) {
         collect_reads_from_text(value, reads);
+    }
+    // A step running an action may execute composite inner steps against the
+    // job's `secrets` context. Remote action bodies cannot be inspected at
+    // submit time, so any non-Docker `uses:` marks the job dynamic (fail
+    // closed: the full scope is injected) rather than risking a silent empty
+    // secret inside the composite. Docker actions have no composite steps.
+    // Local composites (`./path`) are equally uninspectable here — the
+    // collector has no workspace — so they fail closed the same way.
+    if let Some(uses) = step.uses.as_deref()
+        && !uses.starts_with("docker://")
+    {
+        reads.dynamic = true;
     }
 }
 

@@ -2418,8 +2418,11 @@ pub(crate) fn build_job_artifacts(
     // Engine-provided tokens (`secrets.GITHUB_TOKEN`) are minted per claim,
     // never through `spec.names`.
     //
-    // Context properties match case-insensitively (`secrets.foo` reads the
-    // `FOO` secret), so the filter compares uppercased names.
+    // The name filter compares uppercased names as a deliberate superset:
+    // the evaluator does exact-case property lookup, so uppercasing never
+    // under-injects a referenced name (a differently-cased reference still
+    // matches the stored name here; whether it resolves at runtime is the
+    // evaluator's exact-case concern).
     let reads = preloop_gha_parser::collect_job_secret_reads(job);
     let spec_names: BTreeSet<String> = if reads.dynamic {
         merged_names.clone()
