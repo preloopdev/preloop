@@ -3803,7 +3803,7 @@ jobs:
         );
         fixture.drain().await;
 
-        let inner = fixture.state.inner.lock().await;
+        let inner = fixture.state.test_tx().await;
         let run = inner.runs.values().next().unwrap();
         assert_eq!(
             run.submission.dispatch_inputs.get("reuse"),
@@ -4751,12 +4751,17 @@ jobs:
 
         let (_temp, shared, run_id) = mint_fixture(true, None).await;
         let job_id = JobId("build".to_owned());
-        {
-            let mut inner = shared.state.inner.lock().await;
-            let run = inner.runs.get_mut(&run_id).unwrap();
-            run.jobs.insert(job_id.clone(), ExecutionStatus::Skipped);
-            run.job_check_run_ids.insert(job_id.clone(), 7);
-        }
+        shared
+            .state
+            .test_db_mutate(|db| {
+                db.execute(
+                    "UPDATE jobs SET status = 'skipped', check_run_id = ?3 \
+                     WHERE run_id = ?1 AND job_id = ?2",
+                    rusqlite::params![run_id.0.to_string(), job_id.0, 7i64],
+                )
+            })
+            .await
+            .unwrap();
         let _api_url = crate::state::TestEnvVar::set(
             "PRELOOP_GITHUB_API_URL",
             format!("http://127.0.0.1:{port}"),
