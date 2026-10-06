@@ -34,6 +34,16 @@ Releases before v0.27.0 predate the changelog.
   its own stub. The action-resolution test now pins the behavior
   `#351` introduced: the PAT follows the *configured* GitHub origin, and never
   follows a request to an unconfigured origin.
+- **`github.ref_protected` reports the real branch, not a constant**: the
+  webhook, dispatch and scheduler adapters now resolve branch protection
+  (rulesets included) through the forge API and carry it into the runner's
+  `GITHUB_REF_PROTECTED` environment variable and the OIDC `ref_protected`
+  claim. Previously every run reported `false`, so a protected-branch push
+  looked unprotected to tools that key on it — kache, for one, publishes
+  remote cache entries only from protected-branch pushes, which left its
+  remote cache unwritten and every later lookup a miss. Non-branch refs
+  (tags, `refs/pull/*`) stay `false` and are never looked up; an unresolved
+  lookup falls back to `false`, the unprivileged answer.
 
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
@@ -120,6 +130,24 @@ Releases before v0.27.0 predate the changelog.
 - **Empty broker polls are no longer read as messages**: a `200` with a
   `null` body was treated as a message with id 0 and type `unknown`. It is
   now an empty poll, as in the official listener.
+
+### Changed
+
+- **Control-plane CI stops installing lld and PostgreSQL with apt**: the
+  three `control` jobs now link against the runner image's own `ld.lld-18`
+  (the unversioned name `-fuse-ld=lld` resolves is all that was missing) and
+  run PostgreSQL from a container —
+  `mirror.gcr.io/library/postgres:<major>`, `--network host`, trust auth on
+  loopback, `max_connections=400` for the two-node race tests. Both
+  `apt-get update` passes and the pgdg repository are gone; the container is
+  ready in seconds instead of the ~1 minute the install and cluster start
+  took.
+
+- **Read-only kache jobs skip the remote push**: kache publishes only from
+  protected-branch pushes, so a pull-request job's post step listed the whole
+  bucket (tens of thousands of keys) and uploaded nothing — about 25 seconds
+  per job. `save-cache` is now tied to `github.event_name == 'push'` in all
+  four kache steps.
 
 ## [0.33.9] - 2026-10-02
 

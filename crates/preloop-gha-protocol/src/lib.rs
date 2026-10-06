@@ -317,6 +317,11 @@ pub struct WorkflowSubmission {
     /// Explicit base ref for the run (populates `github.base_ref`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// GitHub's `github.ref_protected`: whether branch protection rules or
+    /// rulesets apply to `git_ref`. Resolved by the forge adapter at intake;
+    /// `false` for tags, pull-request refs and anything unresolvable.
+    #[serde(default)]
+    pub ref_protected: bool,
     /// Keep the failed job VM alive after the job ends for `preloop shell`.
     #[serde(default)]
     pub preserve_on_failure: bool,

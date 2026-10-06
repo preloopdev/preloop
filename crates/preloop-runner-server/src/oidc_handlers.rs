@@ -227,6 +227,7 @@ pub async fn oidc_token(
         run_attempt: run.run_attempt.to_string(),
         head_ref,
         base_ref,
+        ref_protected: submission.ref_protected,
         environment: oidc_context.environment,
         repository_visibility,
         repository_id,

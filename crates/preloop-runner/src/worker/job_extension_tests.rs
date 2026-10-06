@@ -415,6 +415,40 @@ fn inject_github_env_sets_core_vars() {
 }
 
 #[test]
+fn inject_github_env_stringifies_boolean_ref_protected() {
+    // The server sends `ref_protected` as a JSON boolean (GitHub's own
+    // context data is typed); the env var must read `true`/`false`, the
+    // shape the official runner writes for BooleanContextData.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    let msg = serde_json::json!({
+        "contextData": {
+            "github": { "ref": "refs/heads/main", "ref_protected": true }
+        }
+    });
+    inject_github_env(&mut job, &msg);
+    assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "true");
+
+    let mut job = JobContext::new(
+        "j2".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    let msg = serde_json::json!({
+        "contextData": {
+            "github": { "ref": "refs/heads/main", "ref_protected": false }
+        }
+    });
+    inject_github_env(&mut job, &msg);
+    assert_eq!(job.env.get("GITHUB_REF_PROTECTED").unwrap(), "false");
+}
+
+#[test]
 fn build_step_list_parses_script_reference() {
     let steps = vec![serde_json::json!({
         "id": "step1",

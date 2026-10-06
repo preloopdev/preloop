@@ -1542,17 +1542,7 @@ pub async fn resolve_ref_sha(
         return Ok(None);
     }
     let api_base = github_api_base();
-    let token = if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await
-    {
-        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
-        Some(
-            crate::github_app::get_or_mint_token_at(&api_base, &app, repository, &permissions)
-                .await?,
-        )
-    } else {
-        std::env::var("PRELOOP_GITHUB_TOKEN").ok()
-    };
-    let Some(token) = token else {
+    let Some(token) = contents_read_token(shared, repository, &api_base).await? else {
         return Ok(None);
     };
     let commit_ref = git_ref
@@ -1576,6 +1566,88 @@ pub async fn resolve_ref_sha(
     }
     let commit: Value = response.json().await?;
     Ok(commit.get("sha").and_then(Value::as_str).map(str::to_owned))
+}
+
+/// The credential [`resolve_ref_sha`] and [`resolve_ref_protected`] query
+/// GitHub with: an App-minted `contents: read` installation token for the
+/// repository, else the static PAT. `None` when neither exists.
+async fn contents_read_token(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    api_base: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(app) = crate::github_app::select_app_for_repo(shared, repository).await {
+        let permissions = BTreeMap::from([("contents".to_owned(), "read".to_owned())]);
+        return Ok(Some(
+            crate::github_app::get_or_mint_token_at(api_base, &app, repository, &permissions)
+                .await?,
+        ));
+    }
+    Ok(std::env::var("PRELOOP_GITHUB_TOKEN").ok())
+}
+
+/// GitHub's `github.ref_protected` for `git_ref`: whether branch protection
+/// rules or rulesets apply to it. Only `refs/heads/*` can be protected; tags,
+/// pull-request refs, a local workspace, and any lookup that fails resolve
+/// to `false`. That is the unprivileged answer — consumers grant more to a
+/// protected ref (cache writers publish only from one, OIDC trust policies
+/// key on the claim) — so an unknown ref must never read as protected.
+pub async fn resolve_ref_protected(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    git_ref: &str,
+) -> bool {
+    let Some(branch) = git_ref.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    if shared.state.local_workspace.is_some() {
+        return false;
+    }
+    match fetch_branch_protected(shared, repository, branch).await {
+        Ok(protected) => protected,
+        Err(error) => {
+            warn!(
+                repository,
+                branch,
+                ?error,
+                "could not resolve branch protection; reporting github.ref_protected = false"
+            );
+            false
+        }
+    }
+}
+
+async fn fetch_branch_protected(
+    shared: &Arc<SharedState>,
+    repository: &str,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    let api_base = github_api_base();
+    let Some(token) = contents_read_token(shared, repository, &api_base).await? else {
+        return Ok(false);
+    };
+    let response = crate::github_breaker::send_observed(
+        &shared.state.github_breaker,
+        crate::shared_http::CLIENT
+            .clone()
+            .get(format!("{api_base}/repos/{repository}/branches/{branch}"))
+            .header("User-Agent", "preloop")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json"),
+    )
+    .await?;
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !status.is_success() {
+        anyhow::bail!("GitHub returned {status} for branch {branch:?}");
+    }
+    let branch: Value = response.json().await?;
+    Ok(branch
+        .get("protected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false))
 }
 
 async fn get_pr_changed_files(
@@ -2962,6 +3034,12 @@ async fn process_delivery_payload_with_lease(
             }
         }
 
+        // GitHub's `github.ref_protected` for this event's ref. Resolved once
+        // per effective event, not per workflow: every workflow one event
+        // fans out to sees the same ref.
+        let ref_protected =
+            resolve_ref_protected(shared, &repo_full_name, &effective.git_ref).await;
+
         for (filename, content) in workflows {
             if lease_lost.is_cancelled() {
                 return WebhookOutcome::Success;
@@ -3103,6 +3181,7 @@ async fn process_delivery_payload_with_lease(
                     .clone()
                     .or_else(|| Some(resolved_sha.clone())),
                 filter_branch,
+                ref_protected,
                 dispatch_inputs: BTreeMap::new(),
                 dispatch_inputs_stringified: BTreeMap::new(),
                 selected_jobs: vec![],
@@ -5684,6 +5763,53 @@ jobs:
             delay > std::time::Duration::from_secs(1_700),
             "a spent budget waits for the advertised reset, got {delay:?}"
         );
+    /// `github.ref_protected` comes from the forge: branch protection (or a
+    /// ruleset) answers `protected`, a branch GitHub does not know answers
+    /// false, and non-branch refs are never looked up at all.
+    #[tokio::test]
+    async fn ref_protected_reads_branch_protection_from_the_forge() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let stub = axum::Router::new().route(
+            "/repos/owner/repo/branches/:branch",
+            axum::routing::get({
+                let seen = seen.clone();
+                move |axum::extract::Path(branch): axum::extract::Path<String>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().push(branch.clone());
+                        if branch == "main" {
+                            axum::Json(serde_json::json!({"name": "main", "protected": true}))
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"message": "Branch not found"})),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+        let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
+        let _token =
+            crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "branch-protection-token");
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let shared = state.shared();
+
+        assert!(resolve_ref_protected(&shared, "owner/repo", "refs/heads/main").await);
+        assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/heads/feature").await);
+        // Tags and pull-request refs cannot be protected; no lookup is made.
+        assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/tags/v1.0.0").await);
+        assert!(!resolve_ref_protected(&shared, "owner/repo", "refs/pull/7/merge").await);
+        assert_eq!(seen.lock().len(), 2, "only branch refs are looked up");
     }
 
     #[test]

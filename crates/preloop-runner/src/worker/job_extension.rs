@@ -1123,11 +1123,16 @@ fn str_from_json(val: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// Read a `github` context field in its env-var string form. GitHub's context
+/// data is typed: strings pass through and booleans stringify as `true`/
+/// `false` (`Runner.Worker/GitHubContext.cs` writes `BooleanContextData` that
+/// way), which are the only shapes the server emits for these keys.
 fn str_from_json_or(val: &serde_json::Value, key: &str, default: &str) -> String {
-    val.get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or(default)
-        .to_string()
+    match val.get(key) {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(serde_json::Value::Bool(value)) => value.to_string(),
+        _ => default.to_string(),
+    }
 }
 
 fn runner_os() -> &'static str {

@@ -534,6 +534,7 @@ Every item below broke a real workflow step and was fixed in preloop:
 | Composite inner remote actions were never staged | job-start preparation only stages the message's own steps; `ruby/setup-ruby@v1` inside mastodon's local `setup-ruby` composite resolved to a missing `_actions` dir and silently did nothing | the composite downloads nested remote actions on demand, cached under `_actions/` |
 | Composite inner-step failures were swallowed | the inner loop broke on failure but the composite returned `Ok(())`, so setup-ruby "passed" without installing Ruby | the composite propagates the inner failure |
 | Composite inner-action `with:` values ignored inner-step outputs | `path: ${{ steps.<id>.outputs.dir }}` evaluated without the composite's nested step results → "" → cache "Input required: path" | inner `with:` values evaluate against the composite context (inputs + nested step outputs) |
+| `github.ref_protected` was hardcoded `false` | tools that key on branch protection saw every push as unprotected — kache publishes remote cache entries only from protected-branch pushes, so its remote stayed unwritten and every later lookup missed | the webhook, dispatch and scheduler adapters resolve branch protection (rulesets included) through the GitHub API and carry it into `GITHUB_REF_PROTECTED` and the OIDC `ref_protected` claim |
 
 ### 1c.2 Environmental findings
 

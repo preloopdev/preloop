@@ -1234,7 +1234,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         "api_url": shared.state.github_urls.api_url,
         "graphql_url": shared.state.github_urls.graphql_url,
         "ref_name": ref_name,
-        "ref_protected": false,
+        "ref_protected": submission.ref_protected,
         "ref_type": ref_type,
         "secret_source": "Actions",
         "event": submission.payload,
