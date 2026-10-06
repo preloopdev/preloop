@@ -69,7 +69,6 @@ fn promote_ready_jobs_tx(
         outcome.promoted += scheduling.promoted;
         outcome.failed += scheduling.failed.len();
     }
-    outcome.queue_depth = jobs::ready_count(tx)?;
     outcome.next_runs_on = jobs::next_ready_labels(tx)?;
     Ok(outcome)
 }

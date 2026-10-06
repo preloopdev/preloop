@@ -2812,6 +2812,9 @@ async fn cancel_run_refreshes_runner_pool_queue_metadata() {
         }),
     )
     .await;
+    // Queue depth is sampled by the 5s sampler, not updated per operation;
+    // run one tick inline (the test harness spawns no sampler task).
+    state.test_sample_state_once().await;
     assert_eq!(
         *state.next_job_runs_on.read().unwrap(),
         vec!["ubuntu-22.04"]
@@ -2828,6 +2831,7 @@ async fn cancel_run_refreshes_runner_pool_queue_metadata() {
         Value::Null,
     )
     .await;
+    state.test_sample_state_once().await;
 
     assert_eq!(cancelled["conclusion"], "cancelled");
     assert_eq!(
@@ -2864,6 +2868,9 @@ async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
         )
         .await;
     }
+    // Queue depth is sampled by the 5s sampler, not updated per operation;
+    // run one tick inline (the test harness spawns no sampler task).
+    state.test_sample_state_once().await;
     assert_eq!(
         state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
         2
@@ -2895,6 +2902,7 @@ async fn disttask_claim_refreshes_runner_pool_queue_metadata() {
         message["messageType"],
         azdo::message_type::PIPELINE_AGENT_JOB_REQUEST
     );
+    state.test_sample_state_once().await;
 
     assert_eq!(
         state.queue_depth.load(std::sync::atomic::Ordering::Acquire),
