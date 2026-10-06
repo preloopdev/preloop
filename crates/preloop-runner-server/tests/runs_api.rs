@@ -2238,7 +2238,7 @@ async fn environment_secrets_override_repo_and_global_per_job() {
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\njobs:\n  prod:\n    runs-on: ubuntu-latest\n    environment: prod\n    steps:\n      - run: echo hi\n  plain:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_yaml": "on: push\njobs:\n  prod:\n    runs-on: ubuntu-latest\n    environment: prod\n    env:\n      SHARED: ${{ secrets.SHARED }}\n      ENV_ONLY: ${{ secrets.ENV_ONLY }}\n      TIERED: ${{ secrets.TIERED }}\n      REPO_GLOBAL: ${{ secrets.REPO_GLOBAL }}\n    steps:\n      - run: echo hi\n  plain:\n    runs-on: ubuntu-latest\n    env:\n      SHARED: ${{ secrets.SHARED }}\n      REPO_GLOBAL: ${{ secrets.REPO_GLOBAL }}\n      TIERED: ${{ secrets.TIERED }}\n    steps:\n      - run: echo hi\n",
             "event": "push",
             "payload": {"ref": "refs/heads/main", "commits": []},
             "repository": "owner/repo",
@@ -3044,21 +3044,34 @@ async fn remote_workflow_content_is_fetched_at_resolved_sha() {
     );
 }
 
+/// The static PAT follows the engine to the *configured* GitHub origin, and
+/// the URL scheme is not part of that boundary: an engine pointed at a
+/// plain-http emulator (`gh-simulate` local mode) needs the credential too,
+/// or the anonymous API budget (60/hr) runs out in minutes. The other half of
+/// the contract — an origin the operator did *not* configure never receives
+/// the PAT — is pinned by `pat_targets_configured_github_regardless_of_scheme`
+/// in `actions.rs`, where the request URL is neither derived from nor compared
+/// against the same value.
 #[tokio::test]
-async fn resolve_ref_to_sha_omits_pat_over_http() {
+async fn resolve_ref_to_sha_sends_pat_to_the_configured_origin_over_http() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _token = crate::state::TestEnvVar::set("PRELOOP_GITHUB_TOKEN", "secret-pat");
 
     let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let seen_auth = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let recorder = seen_auth.clone();
     let mock = axum::Router::new().route(
         "/repos/:owner/:repo/commits/:git_ref",
-        axum::routing::get(|headers: axum::http::HeaderMap| async move {
-            assert!(
-                !headers.contains_key(axum::http::header::AUTHORIZATION),
-                "PAT must never be transmitted over plain unencrypted HTTP"
-            );
-            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        axum::routing::get(move |headers: axum::http::HeaderMap| {
+            let recorder = recorder.clone();
+            async move {
+                *recorder.lock() = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+            }
         }),
     );
     tokio::spawn(async move {
@@ -3082,6 +3095,11 @@ async fn resolve_ref_to_sha_omits_pat_over_http() {
     assert_eq!(
         response["actions"]["actions/checkout@v4"]["resolvedSha"],
         "abc123def456abc123def456abc123def456abc1"
+    );
+    assert_eq!(
+        seen_auth.lock().as_deref(),
+        Some("Bearer secret-pat"),
+        "the configured GitHub origin must receive the PAT, plain-http emulator included"
     );
 }
 

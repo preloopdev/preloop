@@ -1105,7 +1105,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\npermissions:\n  checks: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            "workflow_yaml": "on: push\npermissions:\n  checks: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      REPO_TOKEN: ${{ secrets.REPO_TOKEN }}\n    steps:\n      - run: echo hi\n",
             "event": "push",
             "repository": "owner/repo",
         }),

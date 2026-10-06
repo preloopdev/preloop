@@ -11,6 +11,19 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Server integration tests no longer fail on a leaked static PAT**:
+  `cargo test` shares one process environment across a whole test binary, so
+  a `PRELOOP_GITHUB_TOKEN` set by a neighbouring test — or injected into the
+  job VM — could turn an unrelated submit into a live 401 and a
+  `403 refusing to embed an invalid PAT`. Test-support builds now treat the
+  default GitHub API base as unverifiable and never introspect it over the
+  network: the PAT is withheld and the run proceeds on the job-scoped runtime
+  token, while a test that wants a verdict points `PRELOOP_GITHUB_API_URL` at
+  its own stub. The action-resolution test now pins the behavior
+  `#351` introduced: the PAT follows the *configured* GitHub origin regardless
+  of scheme (plain-http emulators included), and never follows a request to an
+  unconfigured origin.
+
 - **Disconnected-runner lease test tracks the actual reaper boundary**:
   the integration test now brackets the 10-minute dead-session threshold,
   rather than the 45-minute runner-facing lock, with enough headroom to
@@ -133,6 +146,18 @@ Releases before v0.27.0 predate the changelog.
   limit or a suspension — GitHub does not redeliver, so they are recorded and
   wait at claim; only a `deleted` namespace refuses them. Namespaces with no
   limit rows behave as before.
+
+### Changed
+
+- **Job messages now carry only the secrets the job references.**
+  `build_job_artifacts` used to stamp every name `SecretProvider::resolve()`
+  returned for the job's scope into `spec.names`, so each job's `secrets`
+  context (and `toJSON(secrets)`) contained the whole stored set. The spec
+  now carries the referenced subset, collected statically from the expanded
+  plan (`preloop_gha_parser::collect_job_secret_reads`); reads that cannot
+  be enumerated — `secrets[expr]` indexing, `*` object filters, a bare
+  `secrets` argument, an expression that fails to parse — keep the full
+  scope. Secret masking still covers the entire scope server-side.
 
 ### Fixed
 

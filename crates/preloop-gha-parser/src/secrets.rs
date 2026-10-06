@@ -1,10 +1,13 @@
 //! Secret names a workflow tree reads from the engine's secret store.
 //!
-//! `preloop run` and the submission path use this to tell an operator which
-//! secrets a workflow expects *before* the run reaches a step that reads an
-//! empty value. The engine never reads GitHub's secret store — values are
-//! write-only there — so a name that is referenced but unset has to be seeded
-//! with `preloop secret set`.
+//! `preloop run` and the submission path use [`collect_secret_requirements`]
+//! to tell an operator which secrets a workflow expects *before* the run
+//! reaches a step that reads an empty value. The engine never reads GitHub's
+//! secret store — values are write-only there — so a name that is referenced
+//! but unset has to be seeded with `preloop secret set`. The strict
+//! [`collect_job_secret_reads`] variant additionally flags jobs whose reads
+//! cannot be enumerated (dynamic indexing, object filters), which the
+//! server's injection scoping treats as "the whole scope".
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,26 +66,7 @@ impl SecretRequirements {
 pub fn collect_secret_requirements(jobs: &[JobPlan]) -> SecretRequirements {
     let mut requirements = SecretRequirements::default();
     for job in jobs {
-        let mut names = BTreeSet::new();
-        for value in job.env.values() {
-            collect_from_text(value, &mut names);
-        }
-        if let Some(condition) = &job.if_condition {
-            collect_from_condition(condition, &mut names);
-        }
-        for value in job.container.iter().chain(job.services.iter()) {
-            collect_from_json(value, &mut names);
-        }
-        // A reusable call maps callee secret names to caller expressions; the
-        // expressions are the caller's references.
-        for expression in job.secrets_map.values() {
-            collect_from_text(expression, &mut names);
-        }
-        for step in &job.steps {
-            collect_from_step(step, &mut names);
-        }
-        names.retain(|name| !is_engine_provided(name));
-
+        let reads = collect_job_secret_reads(job);
         if job.secrets_inherit {
             requirements.inherits.insert(job.id.0.clone());
         }
@@ -91,78 +75,153 @@ pub fn collect_secret_requirements(jobs: &[JobPlan]) -> SecretRequirements {
                 .by_environment
                 .entry(environment)
                 .or_default()
-                .extend(names.iter().cloned());
+                .extend(reads.names.iter().cloned());
         }
-        requirements.names.extend(names);
+        requirements.names.extend(reads.names);
     }
     requirements
 }
 
-fn collect_from_step(step: &StepPlan, names: &mut BTreeSet<String>) {
-    if let Some(run) = &step.run {
-        collect_from_text(run, names);
+/// Every stored secret one expanded job may read, for injection scoping.
+///
+/// This is the strict variant of the preflight walk: the name set is the
+/// same literal-reference collection, but `dynamic` marks the job as
+/// reading an unprovable name set — `secrets[matrix.pick]`, a `*` object
+/// filter, a bare `secrets` argument, or an expression that fails to parse.
+/// A consumer narrowing secret delivery must inject the full scope for such
+/// a job rather than trusting `names`.
+///
+/// Coverage: every field whose `${{ }}` is evaluated on the runner or at
+/// message fill — `env`, `if`, container/services (credentials read
+/// secrets), step `name`/`env`/`with`/`run`/`if`/`working-directory`/`shell`,
+/// `environment.url`, job `outputs`, the concurrency strings, and reusable
+/// `secrets:` map expressions (the caller's reads). A step with a
+/// non-Docker `uses:` marks the job dynamic: composite inner steps evaluate
+/// against the job's `secrets` context, and remote (or local) action bodies
+/// cannot be inspected at submit time, so the job keeps the full scope
+/// rather than silently starving the composite. `defaults` carry
+/// TemplateTokens for `shell`/`working-directory`, contexts the schema
+/// already excludes `secrets` from.
+pub fn collect_job_secret_reads(job: &JobPlan) -> preloop_gha_expressions::SecretReads {
+    let mut reads = preloop_gha_expressions::SecretReads::default();
+    for value in job.env.values() {
+        collect_reads_from_text(value, &mut reads);
+    }
+    if let Some(condition) = &job.if_condition {
+        collect_reads_from_condition(condition, &mut reads);
+    }
+    for value in job.container.iter().chain(job.services.iter()) {
+        collect_reads_from_json(value, &mut reads);
+    }
+    if let Some(environment) = &job.environment {
+        collect_reads_from_json(environment, &mut reads);
+    }
+    // A reusable call maps callee secret names to caller expressions; the
+    // expressions are the caller's references.
+    for expression in job.secrets_map.values() {
+        collect_reads_from_text(expression, &mut reads);
+    }
+    for expression in job.job_outputs.values() {
+        collect_reads_from_text(expression, &mut reads);
+    }
+    for value in job
+        .concurrency_group
+        .iter()
+        .chain(job.concurrency_cancel_in_progress.iter())
+        .chain(std::iter::once(&job.name))
+    {
+        collect_reads_from_text(value, &mut reads);
+    }
+    for step in &job.steps {
+        collect_reads_from_step(step, &mut reads);
+    }
+    reads.names.retain(|name| !is_engine_provided(name));
+    reads
+}
+
+fn collect_reads_from_step(step: &StepPlan, reads: &mut preloop_gha_expressions::SecretReads) {
+    for text in step.name.iter().chain(step.run.iter()) {
+        collect_reads_from_text(text, reads);
     }
     for value in step.env.values() {
-        collect_from_text(value, names);
+        collect_reads_from_text(value, reads);
     }
     for value in step.with.values() {
-        collect_from_json(value, names);
+        collect_reads_from_json(value, reads);
     }
     if let Some(condition) = &step.if_condition {
-        collect_from_condition(condition, names);
+        collect_reads_from_condition(condition, reads);
     }
     for value in step.working_directory.iter().chain(step.shell.iter()) {
-        collect_from_text(value, names);
+        collect_reads_from_text(value, reads);
+    }
+    // A step running an action may execute composite inner steps against the
+    // job's `secrets` context. Remote action bodies cannot be inspected at
+    // submit time, so any non-Docker `uses:` marks the job dynamic (fail
+    // closed: the full scope is injected) rather than risking a silent empty
+    // secret inside the composite. Docker actions have no composite steps.
+    // Local composites (`./path`) are equally uninspectable here — the
+    // collector has no workspace — so they fail closed the same way.
+    if let Some(uses) = step.uses.as_deref()
+        && !uses.starts_with("docker://")
+    {
+        reads.dynamic = true;
     }
 }
 
 /// Scan every `${{ … }}` span in a field that also carries literal text.
-fn collect_from_text(text: &str, names: &mut BTreeSet<String>) {
+fn collect_reads_from_text(text: &str, reads: &mut preloop_gha_expressions::SecretReads) {
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
         let after = &rest[start + 3..];
         let Some(end) = after.find("}}") else {
             break;
         };
-        collect_from_expression(&after[..end], names);
+        collect_reads_from_expression(&after[..end], reads);
         rest = &after[end + 2..];
     }
 }
 
 /// An `if:` value is an expression with or without the `${{ }}` markers.
-fn collect_from_condition(condition: &str, names: &mut BTreeSet<String>) {
+fn collect_reads_from_condition(condition: &str, reads: &mut preloop_gha_expressions::SecretReads) {
     if condition.contains("${{") {
-        collect_from_text(condition, names);
+        collect_reads_from_text(condition, reads);
     } else {
-        collect_from_expression(condition, names);
+        collect_reads_from_expression(condition, reads);
     }
 }
 
-fn collect_from_json(value: &Value, names: &mut BTreeSet<String>) {
+fn collect_reads_from_json(value: &Value, reads: &mut preloop_gha_expressions::SecretReads) {
     match value {
-        Value::String(text) => collect_from_text(text, names),
+        Value::String(text) => collect_reads_from_text(text, reads),
         Value::Array(items) => {
             for item in items {
-                collect_from_json(item, names);
+                collect_reads_from_json(item, reads);
             }
         }
         Value::Object(map) => {
             for item in map.values() {
-                collect_from_json(item, names);
+                collect_reads_from_json(item, reads);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-/// A malformed expression is the submission path's problem to report, not
-/// this preflight's: it contributes no names rather than failing the run here.
-fn collect_from_expression(expression: &str, names: &mut BTreeSet<String>) {
-    let Ok(properties) = preloop_gha_expressions::collect_context_properties(expression) else {
-        return;
-    };
-    if let Some(referenced) = properties.get("secrets") {
-        names.extend(referenced.iter().cloned());
+/// An expression that fails to parse is treated as dynamic: for injection
+/// scoping, failing closed (whole scope) beats silently dropping a real
+/// reference. Callers after names only (the preflight) ignore `dynamic` and
+/// get the same literal-name set as before.
+fn collect_reads_from_expression(
+    expression: &str,
+    reads: &mut preloop_gha_expressions::SecretReads,
+) {
+    match preloop_gha_expressions::collect_secret_reads(expression) {
+        Ok(found) => {
+            reads.names.extend(found.names);
+            reads.dynamic |= found.dynamic;
+        }
+        Err(_) => reads.dynamic = true,
     }
 }
 
