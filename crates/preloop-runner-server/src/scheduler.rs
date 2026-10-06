@@ -391,9 +391,9 @@ impl Scheduler {
         if let Some(hb) = &heartbeat {
             hb.beat();
         }
-        let (Ok(repository), Ok(token)) = (
-            std::env::var("PRELOOP_GITHUB_REPOSITORY"),
-            std::env::var("PRELOOP_GITHUB_TOKEN"),
+        let (Some(repository), Some(token)) = (
+            env_or_test("PRELOOP_GITHUB_REPOSITORY"),
+            env_or_test("PRELOOP_GITHUB_TOKEN"),
         ) else {
             warn!(
                 "scheduler: remote startup scan requires PRELOOP_GITHUB_REPOSITORY and PRELOOP_GITHUB_TOKEN"
@@ -401,8 +401,9 @@ impl Scheduler {
             return;
         };
         let client = crate::shared_http::CLIENT.clone();
+        let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
         let metadata = match client
-            .get(format!("https://api.github.com/repos/{repository}"))
+            .get(format!("{api_base}/repos/{repository}"))
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {token}"))
             .header("Accept", "application/vnd.github+json")
@@ -436,7 +437,7 @@ impl Scheduler {
             .to_owned();
         let sha = match client
             .get(format!(
-                "https://api.github.com/repos/{repository}/commits/{default_branch}"
+                "{api_base}/repos/{repository}/commits/{default_branch}"
             ))
             .header("User-Agent", "preloop")
             .header("Authorization", format!("Bearer {token}"))
@@ -459,10 +460,15 @@ impl Scheduler {
         if let Some(hb) = &heartbeat {
             hb.beat();
         }
-        let workflows = match crate::github::fetch_workflows(
+        // The configured `github_urls.api_url` (env or config file) is the
+        // base here too — `fetch_workflows` would re-read only the env var
+        // and fall back to api.github.com for a config-file-only GHES
+        // install, splitting schedule startup across two different forges.
+        let workflows = match crate::github::fetch_workflows_at(
             &shared,
             &repository,
             &format!("refs/heads/{default_branch}"),
+            api_base,
         )
         .await
         {
@@ -807,6 +813,55 @@ async fn cron_loop(
             })
             .await;
     }
+}
+
+/// `std::env::var` with a test-only thread-local override. Edition 2024 makes
+/// `std::env::set_var` unsafe and the workspace denies `unsafe`, so tests
+/// redirect reads rather than write the process environment.
+fn env_or_test(name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
+        // Blank override reads as unset, matching the empty-value filters the
+        // production callers apply.
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run `body` with `vars` visible to `env_or_test` on this thread only.
+/// Replaces `std::env::set_var`; the override survives `await` points because
+/// `#[tokio::test]` drives the whole future on one thread.
+#[cfg(test)]
+async fn with_test_env<T>(
+    vars: &[(&'static str, Option<String>)],
+    body: impl Future<Output = T>,
+) -> T {
+    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
+    TEST_ENV.with(|cell| {
+        let mut map = cell.borrow_mut();
+        for (name, value) in vars {
+            match value {
+                Some(value) => {
+                    map.insert(*name, value.clone());
+                }
+                None => {
+                    map.insert(*name, String::new());
+                }
+            }
+        }
+    });
+    let result = body.await;
+    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
+    result
 }
 
 // ── unit tests ────────────────────────────────────────────────────────────────
@@ -1157,5 +1212,94 @@ jobs:
             let sched = github_to_cron(expr);
             prop_assert!(sched.is_err(), "Expected Err for {expr:?}, got {sched:?}");
         }
+    }
+
+    /// A GHES install that supplies its API URL through the config file (not
+    /// `PRELOOP_GITHUB_API_URL`) must have `scan_remote` list workflows
+    /// against that same base. Before the fix the listing call went through
+    /// `fetch_workflows`, which re-read only the env var and fell back to
+    /// api.github.com — so metadata and commit lookups reached the mock but
+    /// the workflow inventory 404'd against the real GitHub. Pointing
+    /// `github_urls.api_url` at the stub and asserting a schedule registers
+    /// fails under the old code (the fetch errors and `scan_remote` returns
+    /// early with an empty job map).
+    #[tokio::test]
+    async fn scan_remote_lists_workflows_against_configured_api_url() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        let download_url = format!("{api_base}/raw/cron.yml");
+        let stub = Router::new()
+            .route(
+                "/repos/o/r",
+                get(|| async {
+                    Json(serde_json::json!({"default_branch": "main"}))
+                }),
+            )
+            .route(
+                "/repos/o/r/commits/main",
+                get(|| async {
+                    Json(serde_json::json!({"sha": "f".repeat(40)}))
+                }),
+            )
+            .route(
+                "/repos/o/r/contents/.github/workflows",
+                get(move |headers: HeaderMap| {
+                    let download_url = download_url.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer test-token")
+                        );
+                        Json(serde_json::json!([{
+                            "name": "cron.yml",
+                            "type": "file",
+                            "download_url": download_url
+                        }]))
+                    }
+                }),
+            )
+            .route(
+                "/raw/cron.yml",
+                get(|| async {
+                    "on:\n  schedule:\n    - cron: '0 0 1 1 *'\njobs:\n  build:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n"
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = crate::state::AppState::new(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state.github_urls.api_url = api_base;
+        state.github_pat = Some(preloop_gha_protocol::SecretString::new(
+            "test-token".to_owned(),
+        ));
+        let shared = state.shared();
+
+        let scheduler = Scheduler::new();
+        with_test_env(
+            &[
+                ("PRELOOP_GITHUB_REPOSITORY", Some("o/r".to_owned())),
+                ("PRELOOP_GITHUB_TOKEN", Some("test-token".to_owned())),
+            ],
+            scheduler.scan_remote(shared, None),
+        )
+        .await;
+
+        let jobs = scheduler.jobs.lock().await;
+        let keys: Vec<&(String, String)> = jobs.keys().collect();
+        assert!(
+            jobs.contains_key(&(
+                ".github/workflows/cron.yml".to_owned(),
+                "0 0 1 1 *".to_owned()
+            )),
+            "scan_remote must install the schedule listed by the configured API; got {keys:?}"
+        );
     }
 }

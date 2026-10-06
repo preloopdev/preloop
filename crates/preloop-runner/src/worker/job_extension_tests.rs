@@ -176,6 +176,54 @@ fn snapshot_auth_header_is_registered_as_a_mask() {
 }
 
 #[test]
+fn snapshot_origin_rewrite_routes_git_scheme_repository_url_to_the_snapshot() {
+    // `github.repositoryUrl` is `git://`-schemed; the https insteadOf prefixes
+    // never match it, so a step cloning `git clone $repositoryUrl` would reach
+    // the real forge's git endpoint and miss every commit that exists only in
+    // the local workspace snapshot.
+    let mut job = JobContext::new(
+        "j1".into(),
+        "Test".into(),
+        serde_json::json!({}),
+        serde_json::json!({ "github": { "repository": "openclaw/openclaw" } }),
+    );
+    let msg = serde_json::json!({
+        "contextData": { "github": { "repository": "openclaw/openclaw" } },
+        "preloopSnapshotOriginRewrite": {
+            "snapshotUrl": "http://127.0.0.1:9091/snapshots/run-1",
+            "forgeUrl": "https://github.com/openclaw/openclaw",
+            "gitForgeUrl": "git://github.com/openclaw/openclaw",
+            "authHeader": "AUTHORIZATION: basic dG9rZW4="
+        }
+    });
+
+    inject_github_env(&mut job, &msg);
+
+    assert_eq!(
+        job.env.get("GIT_CONFIG_COUNT").map(String::as_str),
+        Some("5")
+    );
+    let key = "url.http://127.0.0.1:9091/snapshots/run-1.insteadOf";
+    assert_eq!(
+        job.env.get("GIT_CONFIG_KEY_2").map(String::as_str),
+        Some(key)
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_2").map(String::as_str),
+        Some("git://github.com/openclaw/openclaw.git")
+    );
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_3").map(String::as_str),
+        Some("git://github.com/openclaw/openclaw/")
+    );
+    // The extraheader entry shifts after the two git:// insteadOf pairs.
+    assert_eq!(
+        job.env.get("GIT_CONFIG_VALUE_4").map(String::as_str),
+        Some("AUTHORIZATION: basic dG9rZW4=")
+    );
+}
+
+#[test]
 fn setup_workspace_clears_stale_repository() {
     // A previous job left a checked-out repo in the workspace (the failure
     // mode behind "remote origin already exists" on long-lived runners).

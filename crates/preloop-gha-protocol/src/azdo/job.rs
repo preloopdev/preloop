@@ -312,6 +312,13 @@ pub struct SnapshotOriginRewrite {
     pub snapshot_url: String,
     /// The forge URL to redirect, e.g. `https://github.com/owner/repo`.
     pub forge_url: String,
+    /// The `git://`-schemed form of `forge_url` — the value
+    /// `github.repositoryUrl` advertises — so a step cloning it is redirected
+    /// to the snapshot instead of reaching the forge over the git protocol.
+    /// Optional: messages serialized before this field existed carry only the
+    /// `https://` prefixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_forge_url: Option<String>,
     /// Value for `http.<snapshot>.extraheader`. The snapshot requires a token
     /// even for reads, while the forge serves public repos anonymously — so a
     /// redirected fetch that carried no credentials would prompt for a
