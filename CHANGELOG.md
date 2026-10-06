@@ -11,6 +11,11 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- **Disconnected-runner lease test tracks the actual reaper boundary**:
+  the integration test now brackets the 10-minute dead-session threshold,
+  rather than the 45-minute runner-facing lock, with enough headroom to
+  remain deterministic under CI load.
+
 - **Scheduled golden refreshes no longer launch an impossible hosted bake**:
   the apt-index freshness workflow now opens one idempotent draft PR asking for
   a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are
