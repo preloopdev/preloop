@@ -1906,10 +1906,8 @@ async fn lfs_batch_response(
 /// purpose: blobs stream straight to disk and can be large; the per-object
 /// byte cap, not the clock, is the backstop.
 static LFS_FORGE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-    reqwest::Client::builder()
+    crate::shared_http::github_client_builder()
         .timeout(std::time::Duration::from_secs(300))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent("preloop-runner-server")
         .build()
         .expect("LFS forge client builds")
 });

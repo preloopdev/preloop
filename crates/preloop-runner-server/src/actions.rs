@@ -375,8 +375,7 @@ pub async fn download_action_tarball(
         repo, git_ref, github_url, "Downloading action to server cache"
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent("preloop-runner-server")
+    let client = crate::shared_http::github_client_builder()
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build reqwest client: {e}")))?;
 
