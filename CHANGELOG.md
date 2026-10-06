@@ -396,6 +396,24 @@ Releases before v0.27.0 predate the changelog.
 
 ### Fixed
 
+- `preloop store import-legacy` no longer refuses a legacy store whose only
+  "active" work is stale. A claimed-but-unfinished attempt whose job (per the
+  run record) or whole run is already terminal is imported settled as
+  history — the job's terminal result (or `cancelled` when the job recorded
+  none), `finished_at` set, no runner/session binding, no `job_leases` row,
+  never `ready`/`claimed` — and the settlement is counted in the report
+  (`N stale claim(s) on already-finished jobs were settled as history`).
+  Session bindings that point only at such attempts are dropped the same way,
+  and runtime concurrency gates whose holder runs are terminal or already
+  evicted (a stopped legacy process can never release them) are released as
+  history with their counts reported. Claims and gates on non-terminal runs
+  still refuse by default, and `--active=requeue` / `--active=cancel` are
+  unchanged. A finished attempt no longer writes a `job_leases` row: a lease
+  is live scheduling state, not history. Legacy unscoped log metadata
+  (`job:<agent_job_id>`, `step:<step_id>`, written before Results identifiers
+  were canonicalized) is now attributed to the attempt it names instead of
+  being reported as unmapped.
+
 - A job's `/tmp` is now backed by the VM's ext4 data disk. Runner
   provisioning removed the guest's small tmpfs `/tmp`, which left it on the
   overlayfs root, where `name_to_handle_at` is unsupported: fanotify

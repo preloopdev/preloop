@@ -580,11 +580,17 @@ sqlite:///var/lib/preloop/control.db`, or move it over `preloop.db` after
 keeping a backup.
 
 Work that was in flight when the old server stopped is refused by default:
-claimed attempts, session bindings, and live concurrency gates are listed and
-the import aborts. Let the old server drain, or choose explicitly:
-`--active=requeue` releases the claims and requeues the jobs,
-`--active=cancel` settles them as cancelled; both record what they released
-in the report. The legacy event log is carried into the outbox and the
+claimed attempts on unfinished jobs, session bindings to them, and live
+concurrency gates are listed and the import aborts. A claim whose job and run
+are already terminal is stale history, not live work: the attempt is imported
+settled — terminal result, `finished_at`, no runner/session binding, no lease,
+never `ready`/`claimed` — and the settlement is counted in the report.
+Concurrency gates whose holder runs are terminal or were already evicted are
+released as history the same way (a stopped legacy process can never release
+them); gates held by an unfinished run still refuse. Let the old server drain,
+or choose explicitly: `--active=requeue` releases the claims and requeues the
+jobs, `--active=cancel` settles them as cancelled; both record what they
+released in the report. The legacy event log is carried into the outbox and the
 finalized artifact registry (v1 `meta.artifacts` records and
 `artifact_v2_registry.json`) into `artifacts`, and buffered timeline events
 into the outbox. Anything the importer does not carry into a table is written

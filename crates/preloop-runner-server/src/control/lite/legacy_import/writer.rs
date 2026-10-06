@@ -121,12 +121,159 @@ fn unclaimed(snapshot: &LegacyRequestSnapshot) -> bool {
         && snapshot.locked_until.is_empty()
 }
 
+/// Every run the source still holds, mapped to whether it is terminal in the
+/// target. A run the source no longer holds at all is absent (evicted).
+fn run_terminal_map(source: &SourceData) -> BTreeMap<&str, bool> {
+    source
+        .runs
+        .iter()
+        .map(|run| (run.run_id.as_str(), run_state(&run.record).0 == "completed"))
+        .collect()
+}
+
+/// Whether a run id can never be resumed: absent from the source (evicted) or
+/// already terminal in the target.
+fn run_is_history(run_id: &str, run_terminal: &BTreeMap<&str, bool>) -> bool {
+    run_terminal.get(run_id).copied().unwrap_or(true)
+}
+
+/// Claimed-but-unfinished attempts that are history, not live work, keyed by
+/// request id with the terminal result they settle to.
+///
+/// A claim is stale when the attempt's job already reached a terminal status
+/// in the run record, or when the whole run is terminal in the target — a
+/// finished run cannot still own live work. The runner that held such a claim
+/// stopped with the legacy process, so the attempt is imported settled (the
+/// job's terminal status, or `cancelled` when the job status carries no
+/// outcome), never as a claim. Genuinely in-flight attempts — unfinished
+/// claims on non-terminal jobs of non-terminal runs — are not in this map and
+/// keep the `--active` policy.
+pub(crate) fn stale_claims(source: &SourceData) -> BTreeMap<i64, ExecutionStatus> {
+    let run_terminal = run_terminal_map(source);
+    let mut job_status: BTreeMap<(&str, &str), ExecutionStatus> = BTreeMap::new();
+    for run in &source.runs {
+        for (job_id, status) in &run.record.jobs {
+            job_status.insert((run.run_id.as_str(), job_id.0.as_str()), *status);
+        }
+    }
+    let mut settled = BTreeMap::new();
+    for attempt in &source.attempts {
+        if attempt.snapshot.result.is_some() || unclaimed(&attempt.snapshot) {
+            continue;
+        }
+        let result = match job_status.get(&(attempt.run_id.as_str(), attempt.job_id.as_str())) {
+            Some(status) if terminal(*status) => *status,
+            _ if run_is_history(attempt.run_id.as_str(), &run_terminal) => {
+                // The job never recorded an outcome, so the attempt cannot
+                // claim one either: it settles as cancelled, the same
+                // terminal result the explicit `--active=cancel` policy
+                // writes for a claim the legacy process abandoned.
+                ExecutionStatus::Cancelled
+            }
+            _ => continue,
+        };
+        settled.insert(attempt.request_id, result);
+    }
+    settled
+}
+
+/// Concurrency gate rows in the runtime snapshot, counted by the snapshot key
+/// they live under. Every gate family is run-scoped (`Holder::{Run,Job,JobSet}`
+/// all name a run; `JobSetId` is `{run_id, …}`; `run_concurrency` and
+/// `holder_keys` are keyed by run id), so a gate is history exactly when all of
+/// its holder runs can never resume.
+#[derive(Default)]
+struct GateState {
+    /// Gates whose holder runs are all terminal or evicted.
+    stale: BTreeMap<&'static str, u64>,
+    /// Gates with at least one genuinely unfinished holder run.
+    live: BTreeMap<&'static str, u64>,
+}
+
+const GATE_FAMILIES: &[&str] = &[
+    "concurrency_groups",
+    "jobset_admissions",
+    "run_concurrency",
+    "holder_keys",
+];
+
+fn gate_state(source: &SourceData) -> GateState {
+    let run_terminal = run_terminal_map(source);
+    let mut state = GateState::default();
+    for key in GATE_FAMILIES {
+        let Some(rows) = source.meta.get(*key).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for row in rows {
+            // A shape this importer cannot attribute is live, never silently
+            // released: the operator keeps the `--active` decision for it.
+            let stale = gate_run_ids(key, row)
+                .is_some_and(|runs| runs.iter().all(|run| run_is_history(run, &run_terminal)));
+            let counts = if stale {
+                &mut state.stale
+            } else {
+                &mut state.live
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    state
+}
+
+/// The run ids one gate row names, or `None` when its shape is not understood
+/// (the row is then treated as live).
+fn gate_run_ids(key: &str, row: &serde_json::Value) -> Option<Vec<String>> {
+    match key {
+        "run_concurrency" | "holder_keys" => Some(vec![row.get(0)?.as_str()?.to_owned()]),
+        "jobset_admissions" => Some(vec![row.get(0)?.get("run_id")?.as_str()?.to_owned()]),
+        "concurrency_groups" => {
+            let group = row.get(1)?.as_object()?;
+            let mut runs = Vec::new();
+            for slot in ["running", "pending"] {
+                match group.get(slot) {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(serde_json::Value::Array(pending)) => {
+                        for holder in pending {
+                            runs.push(holder_run_id(holder)?);
+                        }
+                    }
+                    Some(holder) => runs.push(holder_run_id(holder)?),
+                }
+            }
+            Some(runs)
+        }
+        _ => None,
+    }
+}
+
+/// The run id a serialized `concurrency::Holder` names. `Holder::Run`
+/// serializes as a bare run-id string; `Holder::Job` / `Holder::JobSet` carry
+/// a `run_id` field (directly, or under the enum's variant tag).
+fn holder_run_id(holder: &serde_json::Value) -> Option<String> {
+    match holder {
+        serde_json::Value::String(run) => Some(run.clone()),
+        serde_json::Value::Object(map) => {
+            if let Some(run) = map.get("run_id").and_then(serde_json::Value::as_str) {
+                return Some(run.to_owned());
+            }
+            map.values().find_map(holder_run_id)
+        }
+        _ => None,
+    }
+}
+
 /// Find work that must not be imported silently: claimed-but-unfinished
 /// attempts, session bindings to them, and live concurrency gate state.
+/// Stale claims (see [`stale_claims`]) are history and are not listed; the
+/// writer reports their settlement.
 pub(crate) fn audit_active(source: &SourceData) -> Vec<ActiveItem> {
+    let settled = stale_claims(source);
     let mut items = Vec::new();
     for attempt in &source.attempts {
-        if attempt.snapshot.result.is_none() && !unclaimed(&attempt.snapshot) {
+        if attempt.snapshot.result.is_none()
+            && !unclaimed(&attempt.snapshot)
+            && !settled.contains_key(&attempt.request_id)
+        {
             items.push(ActiveItem {
                 kind: "claimed-attempt".to_owned(),
                 id: attempt.request_id.to_string(),
@@ -141,35 +288,28 @@ pub(crate) fn audit_active(source: &SourceData) -> Vec<ActiveItem> {
         }
     }
     for (session, request) in &source.session_active {
+        if settled.contains_key(request) {
+            continue;
+        }
         items.push(ActiveItem {
             kind: "session-binding".to_owned(),
             id: request.to_string(),
             detail: format!("session {session} holds request {request}"),
         });
     }
-    let gate_state: Vec<String> = [
-        "concurrency_groups",
-        "jobset_admissions",
-        "run_concurrency",
-        "holder_keys",
-    ]
-    .iter()
-    .filter_map(|key| {
-        source
-            .meta
-            .get(*key)
-            .and_then(|value| value.as_array())
-            .filter(|rows| !rows.is_empty())
-            .map(|rows| format!("{key}={}", rows.len()))
-    })
-    .collect();
-    if !gate_state.is_empty() {
+    let gates = gate_state(source);
+    if !gates.live.is_empty() {
+        let live: Vec<String> = gates
+            .live
+            .iter()
+            .map(|(key, rows)| format!("{key}={rows}"))
+            .collect();
         items.push(ActiveItem {
             kind: "concurrency-state".to_owned(),
             id: "meta".to_owned(),
             detail: format!(
                 "live concurrency gates in the runtime snapshot ({})",
-                gate_state.join(", ")
+                live.join(", ")
             ),
         });
     }
@@ -530,6 +670,18 @@ pub(crate) fn write_import(
     let mut notes: Vec<String> = Vec::new();
     let namespace = "default";
 
+    // Claims on already-finished work are history, not live work: the attempt
+    // settles with a terminal result instead of gating the import (see
+    // [`stale_claims`]). Counted and reported below, never silently.
+    let stale = stale_claims(source);
+    let stale_bindings = source
+        .session_active
+        .iter()
+        .filter(|(_, request)| stale.contains_key(request))
+        .count() as u64;
+    let stale_gates = gate_state(source).stale;
+    let mut stale_settled = 0_u64;
+
     let runs = std::mem::take(&mut source.runs);
     let jobs = std::mem::take(&mut source.jobs);
     let attempts = std::mem::take(&mut source.attempts);
@@ -742,9 +894,11 @@ pub(crate) fn write_import(
             let attempts_for_job = attempts_by_job
                 .remove(&(run.run_id.clone(), job_id.clone()))
                 .unwrap_or_default();
-            let active_claim = attempts_for_job
-                .iter()
-                .find(|attempt| attempt.snapshot.result.is_none() && !unclaimed(&attempt.snapshot));
+            let active_claim = attempts_for_job.iter().find(|attempt| {
+                attempt.snapshot.result.is_none()
+                    && !unclaimed(&attempt.snapshot)
+                    && !stale.contains_key(&attempt.request_id)
+            });
             let drain_cancel = policy == ActivePolicy::Cancel && active_claim.is_some();
             let job_status = if drain_cancel && !terminal(status) {
                 ExecutionStatus::Cancelled
@@ -923,8 +1077,13 @@ pub(crate) fn write_import(
 
             // ── Attempts of this job ────────────────────────────────────
             for attempt in &attempts_for_job {
+                let stale_result = stale.get(&attempt.request_id).copied();
+                if stale_result.is_some() {
+                    stale_settled += 1;
+                }
                 if attempt.snapshot.result.is_none()
                     && !unclaimed(&attempt.snapshot)
+                    && stale_result.is_none()
                     && policy != ActivePolicy::Refuse
                 {
                     match policy {
@@ -935,14 +1094,16 @@ pub(crate) fn write_import(
                 }
                 let cancelled = drain_cancel
                     && attempt.snapshot.result.is_none()
-                    && !unclaimed(&attempt.snapshot);
-                let result = if cancelled {
+                    && !unclaimed(&attempt.snapshot)
+                    && stale_result.is_none();
+                let result = stale_result.or(if cancelled {
                     Some(ExecutionStatus::Cancelled)
                 } else {
                     attempt.snapshot.result
-                };
+                });
                 let claimed = !unclaimed(&attempt.snapshot)
                     && !cancelled
+                    && stale_result.is_none()
                     && policy != ActivePolicy::Requeue;
                 let session = session_of_request.get(&attempt.request_id);
                 let claimed_at_us = attempt
@@ -985,7 +1146,11 @@ pub(crate) fn write_import(
                 )
                 .with_context(|| format!("insert attempt {}", attempt.request_id))?;
                 imported.job_requests += 1;
-                if claimed {
+                // `job_leases` is live scheduling state, not history: only an
+                // unfinished attempt still owned by a runner gets a lease. A
+                // finished (or settled) attempt keeps its owner on the request
+                // row, but a lease row would present closed work as held.
+                if claimed && result.is_none() {
                     let expires_at = if attempt.snapshot.locked_until.is_empty() {
                         crate::store::now_us()
                     } else {
@@ -1091,6 +1256,33 @@ pub(crate) fn write_import(
         notes.push(format!(
             "{settled_claims} claimed attempts were settled as cancelled by the explicit \
              --active=cancel policy"
+        ));
+    }
+    if stale_settled > 0 {
+        notes.push(format!(
+            "{stale_settled} stale claim(s) on already-finished jobs were settled as history: \
+             each attempt carries its job's terminal status (or cancelled when the job recorded \
+             none), a finished_at timestamp, and no runner/session binding or lease — no \
+             --active override was needed"
+        ));
+    }
+    if stale_bindings > 0 {
+        notes.push(format!(
+            "{stale_bindings} legacy session binding(s) pointed only at settled stale claims and \
+             were dropped as history, not live work"
+        ));
+    }
+    if !stale_gates.is_empty() {
+        let total: u64 = stale_gates.values().sum();
+        let families: Vec<String> = stale_gates
+            .iter()
+            .map(|(key, rows)| format!("{key}={rows}"))
+            .collect();
+        notes.push(format!(
+            "{total} stale concurrency gate(s) held by finished or evicted runs were released \
+             as history ({}); the legacy process is stopped, so no holder can ever release them \
+             and nothing that resumes could collide",
+            families.join(", ")
         ));
     }
 
@@ -2241,11 +2433,29 @@ fn import_logs(
             plan_by_agent.insert(agent, run_id);
         }
     }
+    // Unscoped legacy metadata: before Results identifiers were canonicalized,
+    // the metadata key fell back to `{kind}:{resource}` when the ingest had no
+    // plan/job scope (see `results_metadata_key` in the pre-cutover runtime).
+    // `job:<agent_job_id>` and `step:<step_id>` still name an attempt the
+    // source may hold, so those identities are resolved here; anything else
+    // names no imported attempt.
+    let mut step_agents: BTreeMap<String, String> = BTreeMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT step_id, agent_job_id FROM job_steps")?;
+        for row in stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (step, agent) = row?;
+            step_agents.insert(step, agent);
+        }
+    }
     let mut next_log_id: BTreeMap<String, i64> = BTreeMap::new();
     let mut unmapped = 0_u64;
     let mut pruned = 0_u64;
     for (key, (byte_count, _line_count, updated_at_us, chunks)) in merged {
-        let Some(plan) = legacy_log_plan(&key) else {
+        let Some(plan) =
+            legacy_log_plan(&key).or_else(|| unscoped_log_plan(&key, &plan_by_agent, &step_agents))
+        else {
             unmapped += 1;
             continue;
         };
@@ -2293,7 +2503,9 @@ fn import_logs(
         skipped.push(SkippedFamily {
             family: "log files (unmapped)".to_owned(),
             rows: unmapped,
-            reason: "legacy log keys name no imported attempt".to_owned(),
+            reason: "legacy log keys name no imported attempt (scoped keys whose plan is gone, \
+                     or unscoped keys whose agent/step the source no longer holds)"
+                .to_owned(),
         });
     }
     if pruned > 0 {
@@ -2315,6 +2527,29 @@ fn legacy_log_plan(key: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Attribute a legacy metadata key written without plan/job scope:
+/// `job:<agent_job_id>` and `step:<step_id>` name an attempt directly (the
+/// pre-canonicalization `results_metadata_key` fallback), so they resolve when
+/// the source still holds that attempt or step.
+fn unscoped_log_plan(
+    key: &str,
+    plan_by_agent: &BTreeMap<String, String>,
+    step_agents: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(agent) = key.strip_prefix("job:")
+        && plan_by_agent.contains_key(agent)
+    {
+        return Some(agent.to_owned());
+    }
+    if let Some(step) = key.strip_prefix("step:")
+        && let Some(agent) = step_agents.get(step)
+        && plan_by_agent.contains_key(agent)
+    {
+        return Some(agent.clone());
+    }
+    None
 }
 
 /// Mirror `LiveLogSegments::publish` into the sidecar staging area:
@@ -2397,16 +2632,20 @@ fn skipped_families(
     source: &SourceData,
     policy: ActivePolicy,
 ) -> Vec<(&'static str, u64, &'static str)> {
-    let count = |key: &str| meta_count(&source.meta, key);
-    let gate_count = count("concurrency_groups") + count("jobset_admissions");
     let mut families: Vec<(&'static str, u64, &'static str)> = vec![];
-    if gate_count > 0 {
-        let reason = if policy == ActivePolicy::Refuse {
-            "live concurrency gates; refused (rerun with --active=requeue|cancel to release them)"
-        } else {
-            "live concurrency gates released by the explicit --active policy"
+    let gates = gate_state(source);
+    let total: u64 = gates.stale.values().sum::<u64>() + gates.live.values().sum::<u64>();
+    if total > 0 {
+        let reason = match policy {
+            ActivePolicy::Refuse if gates.live.is_empty() => {
+                "stale concurrency gates held by finished or evicted runs; released as history"
+            }
+            ActivePolicy::Refuse => {
+                "live concurrency gates; refused (rerun with --active=requeue|cancel to release them)"
+            }
+            _ => "concurrency gates released by the explicit --active policy",
         };
-        families.push(("meta.concurrency_gates", gate_count, reason));
+        families.push(("meta.concurrency_gates", total, reason));
     }
     families
 }

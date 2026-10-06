@@ -73,6 +73,18 @@ pub struct LegacyFixtureSpec {
     pub user_version: i64,
     /// Include the run with a claimed-but-unfinished attempt.
     pub include_active_claim: bool,
+    /// Include a claimed-but-unfinished attempt on an already-terminal run and
+    /// job (the legacy server stopped before the attempt's result was
+    /// recorded): stale history that the default import must settle, not
+    /// refuse.
+    pub include_stale_claim: bool,
+    /// Include a concurrency gate held by a genuinely unfinished run: live
+    /// work that still refuses by default.
+    pub include_live_gate: bool,
+    /// Include legacy unscoped log metadata (`job:<agent_job_id>`,
+    /// `step:<step_id>`) as written before Results identifiers were
+    /// canonicalized.
+    pub include_unscoped_log_keys: bool,
     /// The secret value submitted with the successful run.
     pub secret_value: String,
     /// Add a metadata key this importer does not know (refusal test).
@@ -86,6 +98,9 @@ impl Default for LegacyFixtureSpec {
         Self {
             user_version: 11,
             include_active_claim: true,
+            include_stale_claim: false,
+            include_live_gate: false,
+            include_unscoped_log_keys: false,
             secret_value: "hunter2-canary-value".to_owned(),
             unknown_meta_key: false,
             include_inflight_frame: false,
@@ -99,10 +114,15 @@ pub struct LegacyFixture {
     pub run_ok: String,
     pub run_queued: String,
     pub run_active: String,
+    pub run_stale: String,
     pub agent_build: String,
     pub agent_active: String,
+    pub agent_archive: String,
+    pub agent_test: String,
     pub request_build: i64,
     pub request_active: i64,
+    pub request_stale: i64,
+    pub session_stale: String,
     pub secret_name: String,
     pub secret_value: String,
     pub log_bytes: Vec<u8>,
@@ -115,20 +135,25 @@ pub struct LegacyFixture {
 const RUN_OK: &str = "11111111-1111-4111-8111-111111111111";
 const RUN_QUEUED: &str = "22222222-2222-4222-8222-222222222222";
 const RUN_ACTIVE: &str = "33333333-3333-4333-8333-333333333333";
+const RUN_STALE: &str = "44444444-4444-4444-8444-444444444444";
 const AGENT_BUILD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const AGENT_TEST: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const AGENT_LINT: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const AGENT_DEPLOY: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const AGENT_RELEASE: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const AGENT_ARCHIVE: &str = "abababab-abab-4bab-8bab-abababababab";
+const STEP_TEST: &str = "22222222-0000-0000-0000-000000000001";
 const REQUEST_BUILD: i64 = 1;
 const REQUEST_TEST: i64 = 2;
 const REQUEST_LINT: i64 = 3;
 const REQUEST_DEPLOY: i64 = 4;
 const REQUEST_RELEASE: i64 = 5;
+const REQUEST_STALE: i64 = 6;
 const RUNNER_CLOSED: i64 = 6;
 const RUNNER_OPEN: i64 = 7;
 const SESSION_CLOSED: &str = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
 const SESSION_OPEN: &str = "1e1e1e1e-1e1e-4e1e-8e1e-1e1e1e1e1e1e";
+const SESSION_STALE: &str = "2d2d2d2d-2d2d-4d2d-8d2d-2d2d2d2d2d2d";
 const CHECK_RUN_ID: u64 = 4242;
 const BASE_US: i64 = 1_700_000_000_000_000;
 const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
@@ -157,10 +182,15 @@ pub fn write_legacy_fixture(
         run_ok: RUN_OK.to_owned(),
         run_queued: RUN_QUEUED.to_owned(),
         run_active: RUN_ACTIVE.to_owned(),
+        run_stale: RUN_STALE.to_owned(),
         agent_build: AGENT_BUILD.to_owned(),
         agent_active: AGENT_RELEASE.to_owned(),
+        agent_archive: AGENT_ARCHIVE.to_owned(),
+        agent_test: AGENT_TEST.to_owned(),
         request_build: REQUEST_BUILD,
         request_active: REQUEST_RELEASE,
+        request_stale: REQUEST_STALE,
+        session_stale: SESSION_STALE.to_owned(),
         secret_name: "CANARY".to_owned(),
         secret_value: spec.secret_value.clone(),
         log_bytes: b"line one\nline two\n".to_vec(),
@@ -175,7 +205,7 @@ pub fn write_legacy_fixture(
     insert_attempts(&tx, &cipher, spec)?;
     insert_steps(&tx, &cipher, spec)?;
     insert_logs(&tx, &fixture)?;
-    insert_runners(&tx)?;
+    insert_runners(&tx, spec)?;
     insert_webhooks(&tx, &cipher)?;
     insert_control_events(&tx, spec)?;
     insert_job_request_message(&tx, spec)?;
@@ -437,6 +467,28 @@ fn insert_runs(
         }];
         active.started_at = chrono::DateTime::from_timestamp_micros(BASE_US + 120_000_000);
         insert_run(tx, cipher, &active)?;
+    }
+
+    // ── Terminal run whose attempt never recorded a result: the legacy
+    //    server stopped mid-job, the run record settled the job (cancel
+    //    sweep), and the claim is now stale history.
+    if spec.include_stale_claim {
+        let mut stale = base_record(RUN_STALE, 4, ExecutionStatus::Cancelled);
+        stale.jobs = BTreeMap::from([(JobId("archive".to_owned()), ExecutionStatus::Cancelled)]);
+        stale.job_names = BTreeMap::from([(JobId("archive".to_owned()), "archive".to_owned())]);
+        stale.job_base_ids = BTreeMap::from([(JobId("archive".to_owned()), "archive".to_owned())]);
+        stale.job_needs = BTreeMap::from([(JobId("archive".to_owned()), Vec::new())]);
+        stale.jobs_list = vec![JobDetail {
+            job_id: "archive".to_owned(),
+            name: "archive".to_owned(),
+            conclusion: "cancelled".to_owned(),
+            steps: Vec::new(),
+            annotations: Vec::new(),
+        }];
+        stale.started_at = chrono::DateTime::from_timestamp_micros(BASE_US + 135_000_000);
+        stale.completed_at = chrono::DateTime::from_timestamp_micros(BASE_US + 200_000_000);
+        stale.conclusion = Some("cancelled".to_owned());
+        insert_run(tx, cipher, &stale)?;
     }
     Ok(())
 }
@@ -722,6 +774,30 @@ fn insert_attempts(
             params![SESSION_OPEN, REQUEST_RELEASE],
         )?;
     }
+    // A claimed-but-unfinished attempt whose run and job are already
+    // terminal: stale history. No legacy `jobs` row survives for the job
+    // (the legacy store deletes rows once a job leaves the queue), matching
+    // the real store.
+    if spec.include_stale_claim {
+        insert_attempt(
+            tx,
+            cipher,
+            &request_snapshot(
+                RUN_STALE,
+                "archive",
+                AGENT_ARCHIVE,
+                REQUEST_STALE,
+                None,
+                Some((BASE_US + 140_000_000, RUNNER_OPEN)),
+                &iso_us(BASE_US + 3_600_000_000),
+            ),
+            "active",
+        )?;
+        tx.execute(
+            "INSERT INTO session_active_requests(session_id, active_request_id) VALUES (?1, ?2)",
+            params![SESSION_STALE, REQUEST_STALE],
+        )?;
+    }
     Ok(())
 }
 
@@ -799,7 +875,7 @@ fn insert_steps(
         cipher,
         RUN_OK,
         AGENT_TEST,
-        "22222222-0000-0000-0000-000000000001",
+        STEP_TEST,
         "workflow",
         Some(0),
         Some(2),
@@ -857,7 +933,7 @@ fn insert_logs(tx: &rusqlite::Transaction<'_>, fixture: &LegacyFixture) -> anyho
     Ok(())
 }
 
-fn insert_runners(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+fn insert_runners(tx: &rusqlite::Transaction<'_>, spec: &LegacyFixtureSpec) -> anyhow::Result<()> {
     let keypair = preloop_gha_protocol::crypto::AgentRsaKeypair::generate()
         .map_err(|error| anyhow::anyhow!("generate fixture rsa key: {error}"))?;
     let rsa_xml = keypair.public_key().to_xml_string();
@@ -909,6 +985,21 @@ fn insert_runners(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
             BASE_US + 130_000_000
         ],
     )?;
+    // The session whose only bound request is the stale attempt (see
+    // `insert_attempts`): open, like the session that held the claim.
+    if spec.include_stale_claim {
+        tx.execute(
+            "INSERT INTO runner_sessions(session_id, runner_id, protocol, client_id, \
+                 session_key_blob, session_iv, session_tag, created_at_us, last_seen_at_us, closed_at_us) \
+             VALUES (?1, ?2, 'broker', NULL, NULL, NULL, NULL, ?3, ?4, NULL)",
+            params![
+                SESSION_STALE,
+                RUNNER_OPEN,
+                BASE_US + 130_000_000,
+                BASE_US + 140_000_000
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1026,6 +1117,44 @@ fn insert_meta(
         "job_assignments": [[RUN_QUEUED, "lint", RUNNER_OPEN, (BASE_US + 1) * 1000, (BASE_US + 1) * 1000]],
         "pool_pending": []
     });
+    if spec.include_stale_claim {
+        // Leaked runtime gate state: one gate held by the finished stale run,
+        // one for a run the legacy store already evicted. The stopped legacy
+        // process can never release either.
+        meta["run_concurrency"] = serde_json::json!([[
+            RUN_STALE,
+            {"group": "ci-${{ github.ref }}", "cancel_in_progress": null, "queue": "single"}
+        ]]);
+        meta["holder_keys"] = serde_json::json!([[
+            "99999999-9999-4999-8999-999999999999",
+            [[REPOSITORY, "ci-refs/heads/main"]]
+        ]]);
+    }
+    if spec.include_live_gate {
+        // A gate held by the still-unfinished queued run: live work.
+        meta["run_concurrency"] = serde_json::json!([[
+            RUN_QUEUED,
+            {"group": "ci-${{ github.ref }}", "cancel_in_progress": null, "queue": "single"}
+        ]]);
+    }
+    if spec.include_unscoped_log_keys
+        && let Some(entries) = meta
+            .get_mut("log_metadata")
+            .and_then(|value| value.as_array_mut())
+    {
+        // Legacy unscoped metadata: `job:<agent_job_id>` and
+        // `step:<step_id>` (written before Results identifiers were
+        // canonicalized). No chunk rows survive, like an aged store whose
+        // bytes were pruned.
+        entries.push(serde_json::json!([
+            format!("job:{AGENT_TEST}"),
+            {"byte_count": 1024, "line_count": 12}
+        ]));
+        entries.push(serde_json::json!([
+            format!("step:{STEP_TEST}"),
+            {"byte_count": 512, "line_count": 6}
+        ]));
+    }
     if spec.unknown_meta_key {
         if let Some(object) = meta.as_object_mut() {
             object.insert("mystery_state".to_owned(), serde_json::json!([1, 2, 3]));

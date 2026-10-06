@@ -395,7 +395,7 @@ control backend replaced) into a fresh control database. See
 | `--target <CONTROL_DB>` | Control database to create; must not exist |
 | `--state-dir <DIR>` | Server state dir the target will live in (secret tiers, log segments). Defaults to the target's directory |
 | `--key <FILE>` | Cluster key file (32 bytes). Defaults to `PRELOOP_HMAC_KEY`, then `<state-dir>/hmac-key.bin` |
-| `--active <POLICY>` | In-flight work: `refuse` (default), `requeue`, or `cancel` |
+| `--active <POLICY>` | In-flight work on unfinished jobs: `refuse` (default), `requeue`, or `cancel`. Claims on already-terminal jobs are settled as history without an override |
 | `--json` | Print the machine-readable report |
 
 ## `preloop update [OPTIONS]`

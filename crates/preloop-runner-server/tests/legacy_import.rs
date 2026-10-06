@@ -373,6 +373,67 @@ fn claimed_attempt_refuses_until_an_explicit_drain_policy() {
 }
 
 #[test]
+fn stale_claims_on_finished_jobs_import_without_an_override() {
+    let spec = LegacyFixtureSpec {
+        include_active_claim: false,
+        include_stale_claim: true,
+        ..Default::default()
+    };
+    let imported = import(&spec, ActivePolicy::Refuse, KEY).unwrap();
+    assert_eq!(imported.report.imported.runs, 3);
+    assert_eq!(imported.report.imported.job_requests, 5);
+    assert!(
+        imported
+            .report
+            .notes
+            .iter()
+            .any(|note| note.contains("1 stale claim")),
+        "{:?}",
+        imported.report.notes
+    );
+    assert!(
+        imported
+            .report
+            .notes
+            .iter()
+            .any(|note| note.contains("2 stale concurrency gate")),
+        "{:?}",
+        imported.report.notes
+    );
+
+    let conn = open(&imported.target);
+    // The attempt is settled history: the job's terminal result, a finished
+    // timestamp, no owner and no session.
+    assert_eq!(
+        scalar_text(
+            &conn,
+            "SELECT result FROM job_requests WHERE request_id = 6"
+        ),
+        "cancelled"
+    );
+    assert_eq!(
+        scalar_i64(
+            &conn,
+            "SELECT runner_id IS NULL AND session_id IS NULL \
+                    AND finished_at IS NOT NULL AND claimed_at = 0 \
+             FROM job_requests WHERE request_id = 6"
+        ),
+        1
+    );
+    assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM job_leases"), 0);
+    // The finished job is history, never dispatchable again.
+    assert_eq!(
+        scalar_text(
+            &conn,
+            "SELECT status || '/' || queue_state || '/' || COALESCE(claimed_by_runner_id, -1) \
+             FROM jobs WHERE run_id = '44444444-4444-4444-8444-444444444444' \
+               AND job_id = 'archive'"
+        ),
+        "cancelled/none/-1"
+    );
+}
+
+#[test]
 fn unrecognized_source_version_is_refused() {
     let spec = LegacyFixtureSpec {
         user_version: 5,
