@@ -764,6 +764,18 @@ async fn release_webhook_run_reservation(shared: &Arc<SharedState>, key: (String
     inner.webhook_run_reservations.remove(&key);
     drop(inner);
     shared.state.message_notify.notify_waiters();
+    shared.state.sampler_notify.notify_waiters();
+}
+
+/// The host (and optional port) of the configured forge, for `git://`-schemed
+/// context values like `github.repositoryUrl`. Falls back to the raw value when
+/// it carries no scheme, and trims any trailing slash.
+fn forge_git_host(server_url: &str) -> &str {
+    let host = server_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(server_url);
+    host.trim_end_matches('/').split('/').next().unwrap_or(host)
 }
 
 /// Submit a run originating from one durable webhook delivery.
@@ -800,23 +812,23 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
     let remote_ms = t_parse.elapsed().as_secs_f64() * 1000.0;
     if submission.event == "workflow_dispatch" {
         workflow.apply_workflow_dispatch_inputs(&mut submission.payload)?;
-        if submission.dispatch_inputs.is_empty() {
-            submission.dispatch_inputs = submission
-                .payload
-                .get("inputs")
-                .and_then(serde_json::Value::as_object)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-        }
-        if submission.dispatch_inputs_stringified.is_empty() {
-            submission.dispatch_inputs_stringified = submission
-                .dispatch_inputs
-                .iter()
-                .map(|(name, value)| (name.clone(), value_to_input_string(value)))
-                .collect();
-        }
+        // GitHub's webhook payload stringifies every workflow_dispatch input,
+        // including booleans (`"false"`). Rebuild the typed context from the
+        // validated payload unconditionally: preserving the raw non-empty map
+        // would make `"false"` truthy in job conditions.
+        submission.dispatch_inputs = submission
+            .payload
+            .get("inputs")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        submission.dispatch_inputs_stringified = submission
+            .dispatch_inputs
+            .iter()
+            .map(|(name, value)| (name.clone(), value_to_input_string(value)))
+            .collect();
         if let Some(object) = submission.payload.as_object_mut() {
             let inputs_value = if submission.dispatch_inputs_stringified.is_empty() {
                 serde_json::Value::Null
@@ -1178,13 +1190,17 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         )
     };
 
+    // `github.repositoryUrl` is a `git://` URL upstream, so keep the scheme but
+    // point its host at the configured forge rather than a hardcoded github.com
+    // (a redirected engine would otherwise advertise the wrong checkout URL).
+    let forge_host = forge_git_host(&shared.state.github_urls.server_url);
     let mut github = json!({
         "ref": github_ref,
         "sha": sha,
         "repository": submission.repository,
         "repository_owner": repository_owner,
         "repository_owner_id": "0",
-        "repositoryUrl": format!("git://github.com/{}.git", submission.repository),
+        "repositoryUrl": format!("git://{forge_host}/{}.git", submission.repository),
         "run_id": run_id.to_string(),
         "run_number": "1",
         "retention_days": shared.state.retention_days.to_string(),
@@ -1899,12 +1915,9 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         let tx_ms = t_tx.elapsed().as_secs_f64() * 1000.0;
         let t_tail = std::time::Instant::now();
 
-        // Post-commit: refresh the node-local gauges that wake the runner
-        // supervisor, then fan out the events the outcome carries.
-        shared
-            .state
-            .queue_depth
-            .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
+        // Post-commit: refresh the node-local labels the runner supervisor
+        // reads, then fan out the events the outcome carries. The ready-queue
+        // depth itself now comes from the 5s sampler snapshot.
         *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
 
         if let Some(existing) = outcome.existing {
@@ -1939,6 +1952,7 @@ async fn submit_run_inner_with_webhook_delivery_unreserved(
         if outcome.queued_jobs > 0 || expansion.promoted > 0 {
             crate::state::wake_waiters(
                 &shared.state.message_notify,
+                &shared.state.sampler_notify,
                 outcome.queued_jobs + expansion.promoted,
                 false,
             );
@@ -2493,13 +2507,25 @@ pub(crate) fn build_job_artifacts(
         if let (Some(repository), crate::snapshots::SnapshotSource::LocalWorkspace) =
             (repository, snapshot.source)
         {
-            use base64::Engine as _;
             let credentials = base64::engine::general_purpose::STANDARD
                 .encode(format!("x-access-token:{runtime_token}"));
+            // The `git://` URL the job advertises as `github.repositoryUrl`:
+            // a step cloning it bypasses the snapshot unless its own
+            // insteadOf prefix is registered — the `https://` rewrite below
+            // does not match the git scheme.
+            let git_forge_url = normalized_github
+                .get("repositoryUrl")
+                .and_then(|value| value.as_str())
+                .and_then(|url| url.strip_suffix(".git"))
+                .map(str::to_owned);
             agent_msg.preloop_snapshot_origin_rewrite =
                 Some(preloop_gha_protocol::azdo::SnapshotOriginRewrite {
                     snapshot_url: format!("{base_url}/{}", snapshot.repository),
-                    forge_url: format!("https://github.com/{repository}"),
+                    forge_url: format!(
+                        "{}/{repository}",
+                        shared.state.github_urls.server_url.trim_end_matches('/')
+                    ),
+                    git_forge_url,
                     auth_header: format!("AUTHORIZATION: basic {credentials}"),
                 });
         }
@@ -3388,7 +3414,6 @@ pub async fn cancel_run(
         cancellations: cancellation_count,
         record,
         cancelled_jobs,
-        queue_depth,
         next_runs_on,
         ..
     } = shared
@@ -3402,13 +3427,10 @@ pub async fn cancel_run(
             "run not found".to_owned(),
         ))
     })?;
-    shared
-        .state
-        .queue_depth
-        .store(queue_depth, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = next_runs_on;
     if cancellation_count > 0 {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
     shared
         .state
@@ -3481,13 +3503,10 @@ pub async fn approve_job(
         })
         .await
         .map_err(ApiError::from)?;
-    shared
-        .state
-        .queue_depth
-        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
     match outcome.result {
         crate::control::types::EnvironmentApprovalResult::AlreadyTerminal => {
@@ -3498,6 +3517,7 @@ pub async fn approve_job(
         )),
         crate::control::types::EnvironmentApprovalResult::Expired => {
             shared.state.message_notify.notify_waiters();
+            shared.state.sampler_notify.notify_waiters();
             Err(ApiError::conflict(
                 "approval window expired; the job was failed closed",
             ))
@@ -3647,6 +3667,7 @@ pub async fn approve_fork(
             crate::fork_policy::sweep_expired_fork_approvals(&shared, now_unix_nanos).await;
         if !expired.is_empty() {
             shared.state.message_notify.notify_waiters();
+            shared.state.sampler_notify.notify_waiters();
         }
         return Err(ApiError::conflict(
             "approval window expired; the run was failed closed",
@@ -3676,13 +3697,10 @@ pub async fn approve_fork(
         .promote_ready_jobs(Some(run_id), &shared.state.environment_rules)
         .await
         .map_err(ApiError::from)?;
-    shared
-        .state
-        .queue_depth
-        .store(outcome.queue_depth, std::sync::atomic::Ordering::Release);
     *shared.state.next_job_runs_on.write().unwrap() = outcome.next_runs_on;
     if outcome.promoted > 0 {
         shared.state.message_notify.notify_waiters();
+        shared.state.sampler_notify.notify_waiters();
     }
     // The expiry sweep may have won the run's terminal transition between the
     // guard read and the write (it clears the hold in its own transaction).
@@ -3886,6 +3904,14 @@ mod tests {
         // "Run tests with system wide configuration").
         assert!(!orchestration_id("p", "j", None).contains(' '));
         assert!(!orchestration_id("p", "j", Some(1)).contains(' '));
+    }
+
+    #[test]
+    fn forge_git_host_derives_host_from_server_url() {
+        assert_eq!(forge_git_host("https://github.com"), "github.com");
+        assert_eq!(forge_git_host("https://github.com/"), "github.com");
+        assert_eq!(forge_git_host("http://127.0.0.1:9090"), "127.0.0.1:9090");
+        assert_eq!(forge_git_host("ghes.example.com"), "ghes.example.com");
     }
 
     #[tokio::test]

@@ -80,11 +80,11 @@ fn format_stdout_line(timestamp: &str, line: &str, prefix: bool) -> String {
     }
 }
 
-/// Maximum bytes retained for a newline-free partial output line.
+/// R1-12: maximum bytes retained for a newline-free partial output line.
 /// A step printing 64 MiB without a `\n` (progress bars, binary dumps)
 /// would otherwise be retained 1:1 in memory for the whole step.
 const MAX_LINE_BUFFER_BYTES: usize = 1024 * 1024;
-/// Maximum bytes of a single completed output line passed through
+/// R1-12: maximum bytes of a single completed output line passed through
 /// masking/logging. Longer lines are truncated with a marker instead of
 /// being copied whole several times over.
 const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
@@ -93,7 +93,7 @@ const MAX_LOG_LINE_BYTES: usize = 1024 * 1024;
 /// so scans never need more than the head.
 pub(crate) const LOG_HEAD_SCAN_BYTES: u64 = 1024 * 1024;
 
-/// Truncate an overlong completed log line, keeping the head so the
+/// R1-12: truncate an overlong completed log line, keeping the head so the
 /// start of the output stays visible.
 fn truncate_log_line(line: &str) -> std::borrow::Cow<'_, str> {
     if line.len() <= MAX_LOG_LINE_BYTES {
@@ -144,7 +144,7 @@ pub struct StepContext<'a> {
     pub log_file: Arc<Mutex<BufWriter<std::fs::File>>>,
     /// Line buffer for accumulating partial lines from process output chunks.
     line_buffer: Arc<Mutex<Vec<u8>>>,
-    /// Set when the partial-line buffer overflowed its cap and the
+    /// R1-12: set when the partial-line buffer overflowed its cap and the
     /// head was dropped; surfaced as a truncation warning on the next flush.
     line_buffer_truncated: bool,
     /// Whether to also accumulate log lines in memory (for tests).
@@ -255,12 +255,12 @@ impl<'a> StepContext<'a> {
             let line_bytes: Vec<u8> = buf.drain(..=newline_pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
             let masked = self.job.mask_secrets(&line);
-            // Cap absurd single lines after the masking pass, so the
+            // R1-12: cap absurd single lines after the masking pass, so the
             // copies masking makes stay bounded too.
             complete_lines.push(truncate_log_line(&masked).into_owned());
         }
 
-        // Bound only the unterminated tail. Newline-free output (a
+        // R1-12: bound only the unterminated tail. Newline-free output (a
         // step dumping megabytes without `\n`) would otherwise be retained
         // 1:1 in memory for the whole step. Keep the tail so a later newline
         // still terminates the line; the dropped head is reported below.
@@ -281,7 +281,7 @@ impl<'a> StepContext<'a> {
         }
         drop(buf);
 
-        // Surface a swallowed head instead of silently dropping output.
+        // R1-12: surface a swallowed head instead of silently dropping output.
         if self.line_buffer_truncated {
             self.line_buffer_truncated = false;
             self.log(
@@ -308,7 +308,7 @@ impl<'a> StepContext<'a> {
     pub fn flush_line_buffer(&mut self) {
         let mut buf = self.line_buffer.lock();
         if buf.is_empty() {
-            // The buffer may have overflowed and been capped while no
+            // R1-12: the buffer may have overflowed and been capped while no
             // newline ever arrived; still surface the truncation warning.
             let truncated = self.line_buffer_truncated;
             self.line_buffer_truncated = false;
@@ -441,7 +441,7 @@ impl<'a> StepContext<'a> {
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
 
-        // Feed through job-level problem matchers to produce annotations
+        // P1.6: Feed through job-level problem matchers to produce annotations
         let matched_annotations = self.job.matchers.match_line(
             &masked,
             &workspace,
@@ -572,23 +572,23 @@ impl<'a> StepContext<'a> {
             // ("add Git 2.18 or higher to the PATH") and shell-outs inside
             // git (submodule foreach → git-sh-setup → uname) fail the same
             // way.
+            // A PATH the workflow set (job or step `env:`) is used verbatim,
+            // as on GitHub-hosted runners; the shims below only fill in the
+            // worker-derived default.
+            let explicit_path = env.contains_key("PATH");
             ensure_path(&mut env, std::env::var("PATH").ok().as_deref());
             // Rust toolchains installed by the orchestrator run as the
             // unprivileged runner user. Keep their shims visible to every
             // subsequent step without relying on a profile file
             // (`bash --noprofile --norc` is the official invocation).
-            let cargo_bin = "/home/runner/.cargo/bin";
-            if std::path::Path::new(cargo_bin).is_dir() {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                if !path.split(':').any(|entry| entry == cargo_bin) {
-                    env.insert("PATH".to_owned(), format!("{cargo_bin}:{path}"));
-                }
-            }
-            let go_bin = "/home/runner/go/bin";
-            if std::path::Path::new(go_bin).is_dir() {
-                let path = env.get("PATH").cloned().unwrap_or_default();
-                if !path.split(':').any(|entry| entry == go_bin) {
-                    env.insert("PATH".to_owned(), format!("{go_bin}:{path}"));
+            if !explicit_path {
+                for tool_bin in ["/home/runner/.cargo/bin", "/home/runner/go/bin"] {
+                    if std::path::Path::new(tool_bin).is_dir() {
+                        let path = env.get("PATH").cloned().unwrap_or_default();
+                        if !path.split(':').any(|entry| entry == tool_bin) {
+                            env.insert("PATH".to_owned(), format!("{tool_bin}:{path}"));
+                        }
+                    }
                 }
             }
             // GitHub-hosted parity: hosted runners run steps as a dedicated
@@ -1051,7 +1051,7 @@ mod tests {
         ctx.log("token is secret-value here");
         assert!(ctx.log_lines[0].ends_with("token is *** here"));
     }
-    /// A secret straddling the line-truncation cut must still be masked.
+    /// P1: a secret straddling the line-truncation cut must still be masked.
     /// Masking runs on the complete line before truncation; truncating first
     /// would match against the survivor and log an unredacted fragment.
     #[test]
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn multiline_secret_retroactive_masking_preserves_line_checkpoints() {
-        // A cross-line secret value printed before
+        // Codex review on #298: a cross-line secret value printed before
         // `::add-mask::` registers it occupies two physical records.
         // Retroactive masking must redact it without collapsing those
         // records, or a debug-retry checkpoint captured at the attempt
@@ -1322,17 +1322,17 @@ mod tests {
 
         let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
 
-        // Unsafe repository telemetry check
+        // 1. Unsafe repository telemetry check
         ctx.log("fatal: unsafe repository ('/github/workspace' is owned by someone else)");
         assert_eq!(ctx.telemetry_errors.len(), 1);
         assert!(ctx.telemetry_errors[0].contains("fatal: unsafe repository"));
 
-        // Composite action marker stripping check
+        // 2. Composite action marker stripping check
         ctx.log("Some text ##[start-action display=fake;id=fake] more text");
         let last_log = ctx.log_lines.last().unwrap();
         assert!(last_log.contains("##[\\start-action"));
 
-        // Problem matcher check
+        // 3. Problem matcher check
         ctx.log("ERROR: compilation failed");
         assert_eq!(ctx.annotations.len(), 1);
         assert_eq!(ctx.annotations[0].message, "compilation failed");

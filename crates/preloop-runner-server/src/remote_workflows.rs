@@ -71,8 +71,7 @@ pub async fn resolve_remote_workflows(
                 continue;
             }
             let client = client.get_or_insert(
-                reqwest::Client::builder()
-                    .user_agent("preloop-runner-server")
+                crate::shared_http::github_client_builder()
                     .build()
                     .map_err(|error| ApiError::internal(format!("build GitHub client: {error}")))?,
             );

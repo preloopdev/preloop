@@ -3694,11 +3694,10 @@ async fn runner_lease_expiration_disconnect_reaper() {
         *inner.job_requests.keys().next().unwrap()
     };
 
-    // Exercise the just-before-boundary case without sleeping. The session
-    // must be dead here: a *live* session with a stale lease is the hung-
-    // worker case (reaped at HUNG_WORKER_LEASE_SECONDS), not the disconnect
-    // boundary this test isolates. Age the session past liveness so only the
-    // lease clock decides.
+    // Exercise both sides of the disconnected-session lease boundary without
+    // sleeping. A *live* session with a stale lease is the hung-worker case
+    // (reaped at HUNG_WORKER_LEASE_SECONDS), not the disconnect boundary.
+    // Leave headroom for the reaper on loaded CI hosts.
     let liveness = state.test_tx().await.runner_liveness_timeout;
     state
         .test_db_mutate(|tx| {
@@ -3708,7 +3707,7 @@ async fn runner_lease_expiration_disconnect_reaper() {
             tx.set_lease_renewed(
                 request_id,
                 1,
-                now - (JOB_LEASE_SECONDS as i64 - 1) * 1_000_000,
+                now - (DEAD_SESSION_LEASE_SECONDS as i64 - 30) * 1_000_000,
                 now + JOB_LEASE_SECONDS as i64 * 1_000_000,
             )
             .unwrap();
@@ -3730,13 +3729,13 @@ async fn runner_lease_expiration_disconnect_reaper() {
         );
     }
 
-    // Move just beyond the same production lease boundary and reap.
+    // Move past the disconnected-session boundary and reap.
     state
         .test_db_mutate(|tx| {
             tx.set_lease_renewed(
                 request_id,
                 1,
-                crate::store::now_us() - (JOB_LEASE_SECONDS as i64 + 1) * 1_000_000,
+                crate::store::now_us() - (DEAD_SESSION_LEASE_SECONDS as i64 + 30) * 1_000_000,
                 crate::store::now_us() - 1_000_000,
             )
             .unwrap();

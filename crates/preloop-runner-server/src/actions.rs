@@ -167,6 +167,30 @@ fn sha_entry_fresh(sha: &Option<String>, at: std::time::Instant) -> bool {
     at.elapsed() < ttl
 }
 
+/// Whether `url` targets the configured GitHub host — any of the
+/// `github_urls` endpoints — compared by host and effective port, and
+/// deliberately ignoring the scheme.
+///
+/// The static PAT must follow the engine when it is redirected to a
+/// plain-http GitHub emulator (gh-simulate local mode, `http://127.0.0.1:…`),
+/// yet must never leak to an unrelated origin. A scheme check gets the first
+/// case wrong; an origin check gets both right.
+fn url_targets_configured_github(url: &str, urls: &GitHubUrls) -> bool {
+    let Ok(target) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    [&urls.api_url, &urls.server_url, &urls.graphql_url]
+        .iter()
+        .filter_map(|configured| reqwest::Url::parse(configured).ok())
+        .any(|configured| {
+            configured.host_str() == Some(target_host)
+                && configured.port_or_known_default() == target.port_or_known_default()
+        })
+}
+
 /// Resolve an action ref (branch, tag, or short SHA) to the commit SHA GitHub
 /// would pin for the job. Cached briefly in memory so a matrix fan-out
 /// resolves each `uses:` once per window. Returns `None` on any failure
@@ -198,7 +222,7 @@ async fn resolve_ref_to_sha(
     let url = format!("{api_base}/repos/{enc_owner}/{enc_repo}/commits/{enc_git_ref}");
     let mut request = crate::shared_http::CLIENT.get(&url);
     if let Some(pat) = state.static_github_pat()
-        && url.starts_with("https://")
+        && url_targets_configured_github(&url, &state.github_urls)
     {
         request = request.bearer_auth(pat);
     }
@@ -351,8 +375,7 @@ pub async fn download_action_tarball(
         repo, git_ref, github_url, "Downloading action to server cache"
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent("preloop-runner-server")
+    let client = crate::shared_http::github_client_builder()
         .build()
         .map_err(|e| ApiError::internal(format!("failed to build reqwest client: {e}")))?;
 
@@ -365,7 +388,7 @@ pub async fn download_action_tarball(
     // repos (a GitHub App installation token is scoped to the App's repos).
     let mut request = client.get(&github_url);
     if let Some(pat) = shared.state.static_github_pat()
-        && github_url.starts_with("https://")
+        && url_targets_configured_github(&github_url, &shared.state.github_urls)
     {
         request = request.bearer_auth(pat);
     }
@@ -764,6 +787,46 @@ mod tests {
     async fn test_state() -> AppState {
         let temp = tempfile::tempdir().unwrap();
         AppState::new(temp.path().to_path_buf()).await.unwrap()
+    }
+
+    /// The static PAT follows the engine onto a configured plain-http
+    /// GitHub emulator, but never to an unrelated host (or a lookalike).
+    #[test]
+    fn pat_targets_configured_github_regardless_of_scheme() {
+        let sim = GitHubUrls {
+            server_url: "http://127.0.0.1:8888".to_string(),
+            api_url: "http://127.0.0.1:8888".to_string(),
+            graphql_url: "http://127.0.0.1:8888".to_string(),
+        };
+        assert!(url_targets_configured_github(
+            "http://127.0.0.1:8888/repos/o/r/tarball/main",
+            &sim
+        ));
+        assert!(!url_targets_configured_github(
+            "http://127.0.0.1:9999/repos/o/r/tarball/main",
+            &sim
+        ));
+        assert!(!url_targets_configured_github(
+            "https://evil.example.com/repos/o/r/tarball/main",
+            &sim
+        ));
+
+        // Real github.com: still attaches over https, and a different host
+        // (even a lookalike) does not.
+        let real = GitHubUrls {
+            server_url: "https://github.com".to_string(),
+            api_url: "https://api.github.com".to_string(),
+            graphql_url: "https://api.github.com".to_string(),
+        };
+        assert!(url_targets_configured_github(
+            "https://api.github.com/repos/o/r/commits/main",
+            &real
+        ));
+        assert!(!url_targets_configured_github(
+            "https://github.com.evil.example/repos/o/r/commits/main",
+            &real
+        ));
+        assert!(!url_targets_configured_github("not a url", &real));
     }
 
     /// `archive_sha256_hex` is the lowercase hex SHA-256 of the bytes —

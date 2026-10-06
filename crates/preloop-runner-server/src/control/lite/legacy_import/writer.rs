@@ -14,8 +14,8 @@
 //! scanned for the run's secret values before it is stored.
 
 use super::legacy::{
-    LegacyAttempt, LegacyLogFile, LegacyQueuedJob, LegacyRequestSnapshot, LegacyRun, LegacyRunner,
-    LegacySession, LegacyStep, LegacyWebhookDelivery, LegacyWebhookRedelivery,
+    LegacyAttempt, LegacyHeader, LegacyLogFile, LegacyQueuedJob, LegacyRequestSnapshot, LegacyRun,
+    LegacyRunner, LegacySession, LegacyStep, LegacyWebhookDelivery, LegacyWebhookRedelivery,
     LegacyWebhookWatchdog,
 };
 use super::report::{ActivePolicy, ImportedRows, SkippedFamily};
@@ -418,16 +418,20 @@ impl Sidecars {
     /// existing destination). On any failure the files already published in
     /// this call are removed again.
     pub(crate) fn publish(&mut self, cipher: &Envelope) -> anyhow::Result<()> {
-        for file in &self.files {
-            if let Some(parent) = file.final_path.parent() {
-                std::fs::create_dir_all(parent)
+        for index in 0..self.files.len() {
+            if let Some(parent) = self.files[index].final_path.parent() {
+                let parent = parent.to_path_buf();
+                std::fs::create_dir_all(&parent)
                     .with_context(|| format!("create sidecar dir {}", parent.display()))?;
             }
-            match std::fs::hard_link(&file.staged, &file.final_path) {
-                Ok(()) => self.published.push(file.final_path.clone()),
+            match std::fs::hard_link(&self.files[index].staged, &self.files[index].final_path) {
+                Ok(()) => self.published.push(self.files[index].final_path.clone()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let bytes = std::fs::read(&file.staged)?;
-                    if sidecar_equal(&file.final_path, &bytes, file.kind, cipher)? {
+                    let staged = self.files[index].staged.clone();
+                    let final_path = self.files[index].final_path.clone();
+                    let kind = self.files[index].kind;
+                    let bytes = std::fs::read(&staged)?;
+                    if sidecar_equal(&final_path, &bytes, kind, cipher)? {
                         // Equivalent leftover from an earlier attempt: adopt.
                         continue;
                     }
@@ -435,16 +439,18 @@ impl Sidecars {
                     bail!(
                         "sidecar destination {} appeared during the import with different \
                          content; the import was rolled back",
-                        file.final_path.display()
+                        final_path.display()
                     );
                 }
                 Err(error) => {
+                    let staged = self.files[index].staged.clone();
+                    let final_path = self.files[index].final_path.clone();
                     self.rollback();
                     return Err(error).with_context(|| {
                         format!(
                             "publish sidecar {} -> {}",
-                            file.staged.display(),
-                            file.final_path.display()
+                            staged.display(),
+                            final_path.display()
                         )
                     });
                 }
@@ -575,8 +581,11 @@ pub(crate) fn write_import(
             reason: "steps of attempts the legacy store no longer holds (evicted runs)".to_owned(),
         });
     }
-    let session_of_request: BTreeMap<i64, String> =
-        source.session_active.iter().cloned().collect();
+    let session_of_request: BTreeMap<i64, String> = source
+        .session_active
+        .iter()
+        .map(|(session_id, request_id)| (*request_id, session_id.clone()))
+        .collect();
     let mut extra_needs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for (run_id, job_id, depends_on) in dependencies {
         extra_needs
@@ -676,7 +685,7 @@ pub(crate) fn write_import(
             .remove(&run.run_id)
             .unwrap_or_default()
             .into_iter()
-            .map(|job| (job.job_id.0.clone(), job))
+            .map(|job| (job.job.job_id.0.clone(), job))
             .collect();
         let mut job_ids: Vec<String> = record.jobs.keys().map(|id| id.0.clone()).collect();
         for (id, payload) in &payloads {
@@ -1744,6 +1753,7 @@ pub(crate) fn write_import(
         &mut imported,
         &mut skipped,
         &mut notes,
+        cipher,
     )?;
 
     // ── Sequences ───────────────────────────────────────────────────────
@@ -2079,6 +2089,7 @@ fn import_logs(
     imported: &mut ImportedRows,
     skipped: &mut Vec<SkippedFamily>,
     notes: &mut Vec<String>,
+    cipher: &Envelope,
 ) -> anyhow::Result<()> {
     // Merge the table rows with the runtime snapshot's metadata map: an entry
     // can exist in either (chunk pruning vs. row rewrite timing).

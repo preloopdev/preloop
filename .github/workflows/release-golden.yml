@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$TARGET_TAG" ]; then
-            TARGET_TAG="$(gh release view --json tagName --jq .tagName)"
+            TARGET_TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
           fi
           mkdir -p dist
           gh release download "$PREVIOUS_TAG" \

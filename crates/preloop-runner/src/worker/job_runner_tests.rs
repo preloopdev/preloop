@@ -179,6 +179,28 @@ fn action_resolution_key_excludes_subpath() {
 }
 
 #[test]
+fn actions_probe_off_switch_parses_official_boolean_vocabulary() {
+    // Unset/blank keeps the official probes on (default behavior unchanged).
+    assert!(!actions_probes_disabled(None));
+    assert!(!actions_probes_disabled(Some("")));
+    assert!(!actions_probes_disabled(Some("   ")));
+    // Truthy set from official `StringUtil.ConvertToBoolean`, case-insensitive.
+    for truthy in ["1", "true", "TRUE", "True", "$true", "  $True "] {
+        assert!(
+            actions_probes_disabled(Some(truthy)),
+            "{truthy:?} should disable the probes"
+        );
+    }
+    // Anything else leaves them on.
+    for falsy in ["0", "false", "no", "on", "2"] {
+        assert!(
+            !actions_probes_disabled(Some(falsy)),
+            "{falsy:?} should keep the probes on"
+        );
+    }
+}
+
+#[test]
 fn renew_backoff_stays_within_official_bands() {
     // Official JobDispatcher.RenewJobRequestAsync: random 5–15 s for the
     // first five consecutive errors, random 15–30 s afterwards.

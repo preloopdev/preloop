@@ -16,6 +16,16 @@ use serde_json::Value;
 /// Event adapter.
 pub struct Adapter;
 
+const SKIP_PRELOOP_MARKER: &str = "[skip preloop]";
+
+fn skips_preloop(payload: &Value) -> bool {
+    payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("title"))
+        .and_then(Value::as_str)
+        .is_some_and(|title| title.to_ascii_lowercase().contains(SKIP_PRELOOP_MARKER))
+}
+
 /// Extract the pull request number from the payload.
 fn pr_number(payload: &Value) -> Option<u64> {
     payload.get("number").and_then(|v| v.as_u64()).or_else(|| {
@@ -87,6 +97,9 @@ impl EventAdapter for Adapter {
     }
 
     fn project(&self, payload: &Value) -> Vec<EffectiveEvent> {
+        if skips_preloop(payload) {
+            return vec![];
+        }
         let number = match pr_number(payload) {
             Some(n) => n,
             None => return vec![],
@@ -244,5 +257,21 @@ mod tests {
         let events = Adapter.project(&payload);
         let pr = events.iter().find(|e| e.event == "pull_request").unwrap();
         assert_eq!(pr.trust_tier, Some(TrustTier::UntrustedForkPullRequest));
+    }
+
+    #[test]
+    fn skip_preloop_title_suppresses_pr_events() {
+        let payload = serde_json::json!({
+            "action": "opened",
+            "number": 51,
+            "pull_request": {
+                "number": 51,
+                "title": "chore: operator reminder [SKIP PRELOOP]",
+                "base": { "ref": "main", "sha": "base-sha" },
+                "head": { "ref": "reminder", "sha": "head-sha", "repo": { "fork": false } },
+                "merge_commit_sha": "merge-sha"
+            }
+        });
+        assert!(Adapter.project(&payload).is_empty());
     }
 }

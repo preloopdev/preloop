@@ -43,8 +43,6 @@ pub(crate) struct PromoteOutcome {
     pub(crate) promoted: usize,
     /// Jobs failed closed by a denied or expired environment gate.
     pub(crate) failed: usize,
-    /// Global ready-queue depth after the pass.
-    pub(crate) queue_depth: usize,
     /// `runs-on` labels of the ready-queue front after the pass.
     pub(crate) next_runs_on: Vec<String>,
 }

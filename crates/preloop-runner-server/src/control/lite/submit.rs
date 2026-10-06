@@ -199,7 +199,6 @@ fn submit_run_tx(
                 held: false,
                 rejected: None,
                 existing: Some(Box::new(existing)),
-                queue_depth: jobs::ready_count(tx)?,
                 next_runs_on: jobs::next_ready_labels(tx)?,
                 events: Vec::new(),
             });
@@ -221,7 +220,6 @@ fn submit_run_tx(
             held: false,
             rejected: Some(ExecutionStatus::Failure),
             existing: None,
-            queue_depth: jobs::ready_count(tx)?,
             next_runs_on: jobs::next_ready_labels(tx)?,
             events: Vec::new(),
         });
@@ -434,7 +432,6 @@ fn submit_run_tx(
                     held: false,
                     rejected: Some(ExecutionStatus::Cancelled),
                     existing: None,
-                    queue_depth: jobs::ready_count(tx)?,
                     next_runs_on: jobs::next_ready_labels(tx)?,
                     events: Vec::new(),
                 });
@@ -830,7 +827,6 @@ fn submit_run_tx(
         held,
         rejected: None,
         existing: None,
-        queue_depth: jobs::ready_count(tx)?,
         next_runs_on: jobs::next_ready_labels(tx)?,
         events,
     })

@@ -8,6 +8,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+
+### Fixed
+
+- **Disconnected-runner lease test tracks the actual reaper boundary**:
+  the integration test now brackets the 10-minute dead-session threshold,
+  rather than the 45-minute runner-facing lock, with enough headroom to
+  remain deterministic under CI load.
+
+- **Scheduled golden refreshes no longer launch an impossible hosted bake**:
+  the apt-index freshness workflow now opens one idempotent draft PR asking for
+  a manual host-side rebuild. Webhook `workflow_dispatch` boolean inputs are
+  coerced before job conditions, so GitHub's string `"false"` no longer runs a
+  truthy-gated job; the reuse path also resolves the target release without
+  requiring a checkout.
+
+- **Skipped checks now settle instead of remaining queued**: GitHub may return
+  `404 Not Found` when an immediate completion PATCH races replication of a
+  newly created check run. Preloop retries that narrow case, allowing
+  submit-time `if:` skips to report `completed/skipped`. Automated golden
+  reminder PRs now carry `[skip ci]` and `[skip preloop]` markers so the draft
+  notification does not consume GitHub or Preloop runners.
+
+- **Packed goldens on Apple Silicon bake again**: the Rosetta multiarch step
+  spliced an apt-scoping fragment that ended in a newline, so the composed
+  guest script had a line starting with `;` and every fresh packed-golden
+  bake failed with `sh: 15: Syntax error: ";" unexpected`. The pool then fell
+  back to direct per-runner creation from the plain Ubuntu base, so jobs ran
+  without the official runner image's tools (`cmake`,
+  `/opt/hostedtoolcache`). Regressed in 0.33.8; a test now parses the full
+  composed script.
+
+- **Runners register on images that run as a non-root user**: the official
+  runner image declares `USER runner`, so the pool runs `preloop-runner
+  configure` through `sudo`, whose `env_reset` dropped the injected
+  `PRELOOP_RUNNER_TOKEN`. Every pooled runner failed provisioning with
+  `--token <TOKEN> not provided`. The command now runs under
+  `sudo --preserve-env`.
+
+- **A workflow-set `PATH` is used verbatim**: when a job or step set
+  `env: PATH`, the runner still prepended `/home/runner/.cargo/bin` and
+  `/home/runner/go/bin` whenever those directories existed (as they do on
+  the official runner image). GitHub-hosted runners leave an explicit `PATH`
+  alone; the toolchain shims now only extend the default.
+
+- **Runner no longer drops the job handed out at job completion**: when a
+  job finished, `preloop-runner` aborted its in-flight `status=Busy` broker
+  poll, the same pattern as actions/runner#4728. On github.com the service
+  hands the next job out on that poll, so the job was lost and later cancelled
+  as "not acquired by Runner". The poll now stays open across job completion
+  and the new status goes out on the next poll. To match, the server ends a
+  Busy poll within one second once the session's job has finished, rather than
+  holding it for the full 50 seconds, so the following Online poll claims the
+  next job without delay. The server still never dispatches a job on a Busy
+  poll.
+- **Broker poll client timeout outlasts the server's long poll**: the runner
+  gave up on `GET /message` after 50 s, the same length as the broker's
+  long-poll window. A job claimed in the final moments of that window was
+  written to a request the runner had already abandoned. The poll timeout is
+  now 100 s, matching the official runner's default `SendTimeout`.
+- **Empty broker polls are no longer read as messages**: a `200` with a
+  `null` body was treated as a message with id 0 and type `unknown`. It is
+  now an empty poll, as in the official listener.
+
+## [0.33.9] - 2026-10-02
+
+### Changed
+
+- **Standalone runner release builds target Linux and macOS.** Windows users
+  can run the Linux runner under WSL2; the native Windows matrix leg and its
+  release assets are no longer built. On a co-hosted Preloop engine, set
+  `PRELOOP_GITHUB_SKIP_WORKFLOWS=release-runner.yml` to let GitHub Actions
+  alone own that release workflow and avoid duplicate checks.
+- **Golden smolvm updated to 1.19.0** (`a6072aae`): the verified-release
+  golden pin tracks upstream; `smolvm_min_version` remains the runtime floor.
+
+### Fixed
+
+- **Ubuntu 22.04 environment goldens on Apple Silicon.** Rosetta multiarch
+  setup assumed Ubuntu 24.04's `ubuntu.sources`; the pinned 22.04 rootfs uses
+  `/etc/apt/sources.list`. Both layouts now scope native apt sources to arm64
+  before adding amd64 repositories, so 22.04 jobs can provision runners
+  instead of looping on a missing-file error. The bake additionally uses a
+  status-preserving sudo wrapper, so a refused passwordless sudo or a failed
+  apt step fails the bake instead of producing a golden without the amd64
+  loader.
+
+## [0.33.8] - 2026-10-02
+
 ### Added
 
 - **`preloop store import-legacy` imports a released v11 `preloop.db` into a

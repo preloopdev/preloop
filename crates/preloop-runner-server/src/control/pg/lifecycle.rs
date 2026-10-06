@@ -42,31 +42,6 @@ async fn token_request_for(
         .transpose()
 }
 
-/// `queue_depth`/`next_runs_on` gauges for command outcomes.
-async fn queue_gauges(
-    client: &tokio_postgres::Client,
-) -> Result<(usize, Vec<String>), ControlError> {
-    let rows = client
-        .query(
-            "SELECT runs_on::text FROM jobs WHERE queue_state='ready' \
-             ORDER BY priority DESC, run_order, job_order LIMIT 64",
-            &[],
-        )
-        .await
-        .map_err(db)?;
-    let depth = client
-        .query_one("SELECT count(*) FROM jobs WHERE queue_state='ready'", &[])
-        .await
-        .map_err(db)?
-        .get::<_, i64>(0) as usize;
-    let front = rows
-        .first()
-        .map(|row| from_json::<Vec<String>>(row.get::<_, String>(0).as_str()))
-        .transpose()?
-        .unwrap_or_default();
-    Ok((depth, front))
-}
-
 impl PgBackend {
     // ── Sessions ─────────────────────────────────────────────────────
 
@@ -1750,7 +1725,6 @@ impl PgBackend {
         let promote = self.promote_ready_jobs(Some(run_id), &rules).await?;
         Ok(EnvironmentApprovalOutcome {
             result,
-            queue_depth: promote.queue_depth,
             next_runs_on: promote.next_runs_on,
             promoted: promote.promoted,
         })
