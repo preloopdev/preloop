@@ -4026,3 +4026,63 @@ jobs:
     );
     assert!(!reads.dynamic);
 }
+
+#[test]
+fn job_secret_reads_mark_dynamic_for_action_uses() {
+    // A step running an action may execute composite inner steps against the
+    // job's `secrets` context. Remote action bodies cannot be inspected at
+    // submit time, so the job fails closed (full scope) instead of risking
+    // a silent empty secret inside the composite.
+    let jobs = expand_secret_workflow(
+        r#"
+name: uses
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "${{ secrets.REAL }}"
+"#,
+    );
+    let reads = collect_job_secret_reads(&jobs[0]);
+    assert!(reads.dynamic, "remote uses: must fail closed");
+    assert_eq!(
+        reads.names,
+        std::collections::BTreeSet::from(["REAL".to_owned()])
+    );
+
+    // Local composites are equally uninspectable without a workspace.
+    let jobs = expand_secret_workflow(
+        r#"
+name: uses-local
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./my-composite
+"#,
+    );
+    assert!(collect_job_secret_reads(&jobs[0]).dynamic);
+
+    // Docker actions have no composite steps: no dynamic marking.
+    let jobs = expand_secret_workflow(
+        r#"
+name: uses-docker
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker://alpine:3.19
+      - run: echo "${{ secrets.REAL }}"
+"#,
+    );
+    let reads = collect_job_secret_reads(&jobs[0]);
+    assert!(!reads.dynamic, "docker:// has no composite steps");
+    assert_eq!(
+        reads.names,
+        std::collections::BTreeSet::from(["REAL".to_owned()])
+    );
+}

@@ -937,9 +937,15 @@ actually references (`preloop_gha_parser::collect_job_secret_reads` walks
 names and reusable `secrets:` maps; `secrets[expr]` indexing, `*` object
 filters, and bare `secrets` arguments are unprovable, so those jobs keep
 the full scope). Effects: `${{ secrets.UNDECLARED }}` still evaluates to
-`""` like an unset secret, but `toJSON(secrets)` / `secrets.*` enumerate
-fewer keys than on GitHub — observable, and accepted: the unreferenced set
-was the dump surface. Server-side masking still covers the whole scope
+`""` like an unset secret when the job never references it — that is the
+deliberate divergence from GitHub, which would have delivered the value.
+`toJSON(secrets)` / `secrets.*` are dynamic reads (a bare `secrets` object
+or wildcard), so those jobs keep the full in-scope set and enumerate the
+same keys as on GitHub; only direct literal references to unreferenced
+names observe fewer keys. Steps running a non-Docker action (`uses:`) also
+keep the full scope: composite inner steps evaluate against the job's
+`secrets` context and action bodies cannot be inspected at submit time.
+Server-side masking still covers the whole scope
 (submit-time masker seed plus `FillOutcome.masked`), so an unreferenced
 value that reaches a log through a literal is still redacted. Reusable
 callees are unchanged: `secrets: inherit` keeps the caller's whole scope,
