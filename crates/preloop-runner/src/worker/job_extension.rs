@@ -500,6 +500,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
     if let Some(rewrite) = msg.get("preloopSnapshotOriginRewrite") {
         let snapshot_url = rewrite.get("snapshotUrl").and_then(|value| value.as_str());
         let forge_url = rewrite.get("forgeUrl").and_then(|value| value.as_str());
+        let git_forge_url = rewrite.get("gitForgeUrl").and_then(|value| value.as_str());
         let auth_header = rewrite.get("authHeader").and_then(|value| value.as_str());
         if let (Some(snapshot_url), Some(forge_url), Some(auth_header)) =
             (snapshot_url, forge_url, auth_header)
@@ -514,25 +515,34 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
             let insteadof = format!("url.{snapshot_url}.insteadOf");
-            let entries = [
+            let mut entries = vec![
                 (insteadof.clone(), format!("{forge_url}.git")),
-                (insteadof, format!("{forge_url}/")),
-                // The snapshot authenticates every read; the forge does not
-                // for public repos. A redirected fetch with no credentials
-                // prompts for a username and dies with prompts disabled.
-                (
-                    format!("http.{snapshot_url}.extraheader"),
-                    auth_header.to_owned(),
-                ),
+                (insteadof.clone(), format!("{forge_url}/")),
             ];
-            for (offset, (key, value)) in entries.into_iter().enumerate() {
+            // `github.repositoryUrl` is `git://`-schemed, which the https
+            // prefixes above never match; a step cloning it would reach the
+            // real forge's git endpoint and bypass the snapshot.
+            if let Some(git_forge_url) = git_forge_url {
+                entries.push((insteadof.clone(), format!("{git_forge_url}.git")));
+                entries.push((insteadof, format!("{git_forge_url}/")));
+            }
+            // The snapshot authenticates every read; the forge does not
+            // for public repos. A redirected fetch with no credentials
+            // prompts for a username and dies with prompts disabled.
+            entries.push((
+                format!("http.{snapshot_url}.extraheader"),
+                auth_header.to_owned(),
+            ));
+            for (offset, (key, value)) in entries.iter().enumerate() {
                 let index = base + offset;
-                job.env.insert(format!("GIT_CONFIG_KEY_{index}"), key);
-                job.env.insert(format!("GIT_CONFIG_VALUE_{index}"), value);
+                job.env
+                    .insert(format!("GIT_CONFIG_KEY_{index}"), key.clone());
+                job.env
+                    .insert(format!("GIT_CONFIG_VALUE_{index}"), value.clone());
             }
             job.env.insert(
                 "GIT_CONFIG_COUNT".to_owned(),
-                (base + entries_len()).to_string(),
+                (base + entries.len()).to_string(),
             );
             // The Basic-encoded snapshot credential rides in the job
             // environment; register it with the mask list like the runtime
@@ -549,12 +559,6 @@ fn is_internal_job_variable(key: &str) -> bool {
     lower.starts_with("system.")
         || lower.starts_with("distributedtask.")
         || lower.starts_with("actions_")
-}
-
-/// Number of git config entries [`inject_github_env`] appends for a snapshot
-/// origin rewrite.
-const fn entries_len() -> usize {
-    3
 }
 
 /// Decode an Azure DevOps typed-dictionary value.
