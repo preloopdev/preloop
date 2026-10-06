@@ -493,6 +493,23 @@ async fn pat_oauth_scopes(pat: &str) -> PatScopeOutcome {
     {
         return PatScopeOutcome::Known(scopes.clone());
     }
+    // Test-support builds stay off the network unless a test pointed the
+    // GitHub API at its own stub: `cargo test` shares one process environment
+    // across the whole binary, so a PAT set by a neighbouring test (or
+    // injected into the job VM) would otherwise turn an unrelated submit into
+    // a live 401 and a `403 refusing to embed an invalid PAT`. Unverifiable
+    // scopes are already a handled outcome — the PAT is withheld and the run
+    // proceeds on the job-scoped runtime token — so tests that need a verdict
+    // set `PRELOOP_GITHUB_API_URL` at their own stub, which this guard leaves
+    // alone.
+    #[cfg(any(test, feature = "test-support"))]
+    if std::env::var_os("PRELOOP_GITHUB_API_URL").is_none() {
+        return PatScopeOutcome::Unverifiable {
+            reason: "test-support: PAT scope introspection is disabled for the default GitHub API \
+                     base; point PRELOOP_GITHUB_API_URL at a stub to exercise it"
+                .to_owned(),
+        };
+    }
     let url = format!("{}/", crate::github::github_api_base());
     let response = match crate::shared_http::CLIENT
         .get(&url)
