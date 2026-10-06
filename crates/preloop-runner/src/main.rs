@@ -122,7 +122,13 @@ async fn resolve_remote_workflows(
     let client = reqwest::Client::builder()
         .user_agent("preloop-runner")
         .build()?;
-    let token = std::env::var("PRELOOP_GITHUB_TOKEN").ok();
+    let token = env_or_test("PRELOOP_GITHUB_TOKEN");
+    // Honour the engine's `PRELOOP_GITHUB_API_URL` override so `lint` against a
+    // redirected forge resolves reusable workflows from it, not api.github.com.
+    let api_base = env_or_test("PRELOOP_GITHUB_API_URL")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_owned());
+    let api_base = api_base.trim_end_matches('/');
     let mut queue = vec![(root_yaml.to_owned(), 0usize)];
     let mut visited = std::collections::BTreeSet::new();
     while let Some((yaml, depth)) = queue.pop() {
@@ -145,7 +151,7 @@ async fn resolve_remote_workflows(
             }
             let mut request = client
                 .get(format!(
-                    "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
+                    "{api_base}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}"
                 ))
                 .header(reqwest::header::ACCEPT, "application/vnd.github.raw+json");
             if let Some(token) = token.as_deref() {
@@ -169,4 +175,123 @@ fn parse_remote_reference(reference: &str) -> Option<(&str, &str, &str, &str)> {
         return None;
     }
     Some((owner, repo, path, git_ref))
+}
+
+/// `std::env::var` with a test-only thread-local override. Edition 2024 makes
+/// `std::env::set_var` unsafe and the workspace denies `unsafe`, so tests
+/// redirect reads rather than write the process environment.
+fn env_or_test(name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_ENV.with(|cell| cell.borrow().get(name).cloned()) {
+        // Blank override reads as unset, matching the empty-value filters the
+        // production callers apply.
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Run `body` with `vars` visible to `env_or_test` on this thread only.
+/// Replaces `std::env::set_var`; the override survives `await` points because
+/// `#[tokio::test]` drives the whole future on one thread.
+#[cfg(test)]
+async fn with_test_env<T>(
+    vars: &[(&'static str, Option<String>)],
+    body: impl Future<Output = T>,
+) -> T {
+    let saved = TEST_ENV.with(|cell| cell.borrow().clone());
+    TEST_ENV.with(|cell| {
+        let mut map = cell.borrow_mut();
+        for (name, value) in vars {
+            match value {
+                Some(value) => {
+                    map.insert(*name, value.clone());
+                }
+                None => {
+                    map.insert(*name, String::new());
+                }
+            }
+        }
+    });
+    let result = body.await;
+    TEST_ENV.with(|cell| *cell.borrow_mut() = saved);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serve exactly one HTTP request, capture its request line, and reply
+    /// with `body`. A hand-rolled listener keeps `resolve_remote_workflows`
+    /// on a real reqwest round-trip without a mock-server dependency.
+    async fn serve_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.github.raw+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (base, handle)
+    }
+
+    /// `PRELOOP_GITHUB_API_URL` must steer remote `uses:` resolution at the
+    /// override, not api.github.com. A reusable workflow reachable only on
+    /// the mock resolves under the override — the same call would
+    /// `error_for_status` a 404 from the real API.
+    #[tokio::test]
+    async fn resolve_remote_workflows_honours_api_url_override() {
+        const WORKFLOW: &str = "on: workflow_call\njobs:\n  inner:\n    runs-on: self-hosted\n    steps:\n      - run: echo hi\n";
+        let (api_base, server) = serve_once(WORKFLOW).await;
+
+        let root =
+            "on: push\njobs:\n  call:\n    uses: octo/hello/.github/workflows/reusable.yml@main\n";
+        let workflows = with_test_env(
+            &[
+                ("PRELOOP_GITHUB_API_URL", Some(api_base)),
+                ("PRELOOP_GITHUB_TOKEN", None),
+            ],
+            resolve_remote_workflows(BTreeMap::new(), root),
+        )
+        .await
+        .unwrap();
+
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(
+                "GET /repos/octo/hello/contents/.github/workflows/reusable.yml?ref=main "
+            ),
+            "expected the contents endpoint on the mock, got: {}",
+            request.lines().next().unwrap_or("")
+        );
+        assert_eq!(
+            workflows["octo/hello/.github/workflows/reusable.yml@main"],
+            WORKFLOW
+        );
+    }
 }
