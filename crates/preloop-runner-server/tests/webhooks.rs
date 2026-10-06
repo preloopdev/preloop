@@ -590,6 +590,7 @@ async fn claim_remints_snapshot_origin_credential_without_checkout() {
         Some(preloop_gha_protocol::azdo::SnapshotOriginRewrite {
             snapshot_url: "http://engine/snapshots/run".into(),
             forge_url: "https://github.com/owner/repo".into(),
+            git_forge_url: None,
             auth_header: "AUTHORIZATION: basic expired-token".into(),
         });
 
