@@ -3044,7 +3044,7 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
         Method::POST,
         "/api/v1/runs",
         json!({
-            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n",
+            "workflow_yaml": "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"false\"\n        env:\n          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}\n",
             "event": "push",
             "repository": "owner/repo",
             "preserve_on_failure": true,
@@ -3055,7 +3055,9 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
 
     // The stored message is a secret-free template: `NPM_TOKEN` arrives only
     // as a *name* in `preloopSecretSpec`, never as a value — so the debug
-    // credential is structurally absent, not merely filtered.
+    // credential is structurally absent, not merely filtered. The step has to
+    // reference the name for it to be in scope: the spec carries referenced
+    // names only.
     let wire = {
         let inner = state.test_tx().await;
         let queued = inner.ready().next().expect("job should be queued");
