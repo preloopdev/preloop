@@ -19,6 +19,19 @@ Releases before v0.27.0 predate the changelog.
   and the direct-create fallback re-extracted the whole golden (~90 GB) per
   runner. The sweep now only removes 16-hex machine data dirs.
 
+- **A create in flight keeps its data dir through the orphan sweep** (#371):
+  SmolVM creates a machine's data directory before it publishes the registry
+  row, and a packed create extracts for minutes — longer than the sweep's
+  120 s grace — so a sweep tick could delete the live, still unregistered
+  directory, and the same tick's `_boot-vm` purge then killed the create
+  (`smolvm create failed with exit code -1`). `machine create` and `machine
+  pack` hold the lifecycle lock for their whole run; the sweep now holds the
+  read side across its registry snapshot and filesystem scan and waits for a
+  create in flight. `machine fork` stays concurrent by design (its clone
+  directory is created fresh, so the grace window covers it until its
+  registry row lands), and a directory left behind by a create whose engine
+  died is still reclaimed after a restart.
+
 - **The official golden unpacks without `SMOLVM_PACK_MAX_EXTRACT_BYTES`**
   (#371): SmolVM caps extraction at 128 GiB of declared size, which the
   golden's sparse disks exceed. Preloop now passes a 512 GiB ceiling to SmolVM
