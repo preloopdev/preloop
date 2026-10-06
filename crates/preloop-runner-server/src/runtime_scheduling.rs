@@ -730,12 +730,9 @@ pub async fn drain_expansions(shared: &Arc<SharedState>) -> SchedulingOutcome {
             }
         }
 
-        // Refresh node-local scheduling mirrors from committed state.
+        // Refresh the node-local next-job labels from committed state. The
+        // ready-queue depth itself now comes from the 5s sampler snapshot.
         if let Ok(stats) = shared.state.backend.queue_stats().await {
-            shared
-                .state
-                .queue_depth
-                .store(stats.ready, std::sync::atomic::Ordering::Release);
             *shared.state.next_job_runs_on.write().unwrap() = stats.next_runs_on;
         }
     }

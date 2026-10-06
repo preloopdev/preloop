@@ -619,9 +619,20 @@ pub(super) async fn retire_node_requests(
     node_id: &JobId,
     retirement: Retirement,
 ) -> Result<Vec<String>, ControlError> {
+    // Settling is first-result-wins, so an already-settled request is a pure
+    // no-op: don't even select it. (`complete_job` settles the attempt before
+    // the sweep retires the node; without this the settle statements run a
+    // second time and match zero rows.) Purge keeps the unfiltered select —
+    // it replaces the node's rows wholesale.
+    let pending_only = matches!(retirement, Retirement::Settle(_));
     let select = format!(
-        "{} WHERE q.run_id = $1::text::uuid AND q.job_id = $2 FOR UPDATE OF q",
-        lookups::REQUEST_SELECT
+        "{} WHERE q.run_id = $1::text::uuid AND q.job_id = $2{} FOR UPDATE OF q",
+        lookups::REQUEST_SELECT,
+        if pending_only {
+            " AND q.result IS NULL"
+        } else {
+            ""
+        },
     );
     let rows = tx
         .query(&select, &[&run_id.0.to_string(), &node_id.0])
@@ -2425,7 +2436,7 @@ impl PgBackend {
             return Err(ControlError::NotFound(format!("run {run_id}")));
         }
         let cancellations = cancel_run_tx(self, &tx, run_id, reason.as_deref()).await?;
-        let (cancelled_jobs, queue_depth, next_runs_on, pending_cancels) =
+        let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
             .load_graph(&tx, run_id)
@@ -2435,10 +2446,9 @@ impl PgBackend {
         Ok(CancelOutcome {
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
-            queue_nonempty: queue_depth > 0 || pending_cancels,
+            queue_nonempty: queue_nonempty || pending_cancels,
             record,
             cancelled_jobs,
-            queue_depth,
             next_runs_on,
         })
     }
@@ -2455,7 +2465,7 @@ impl PgBackend {
         let tx = client.transaction().await.map_err(db)?;
         PgBackend::lock_run(&tx, run_id).await?;
         let cancellations = cancel_job_tx(self, &tx, run_id, job_id, None).await?;
-        let (cancelled_jobs, queue_depth, next_runs_on, pending_cancels) =
+        let (cancelled_jobs, queue_nonempty, next_runs_on, pending_cancels) =
             cancel_outcome_gauges(&tx, run_id).await?;
         let record = self
             .load_graph(&tx, run_id)
@@ -2465,10 +2475,9 @@ impl PgBackend {
         Ok(CancelOutcome {
             cancellations,
             run_status: record.as_ref().map(|record| record.status),
-            queue_nonempty: queue_depth > 0 || pending_cancels,
+            queue_nonempty: queue_nonempty || pending_cancels,
             record,
             cancelled_jobs,
-            queue_depth,
             next_runs_on,
         })
     }
@@ -2480,7 +2489,7 @@ impl PgBackend {
 async fn cancel_outcome_gauges(
     tx: &Transaction<'_>,
     run_id: RunId,
-) -> Result<(Vec<JobId>, usize, Vec<String>, bool), ControlError> {
+) -> Result<(Vec<JobId>, bool, Vec<String>, bool), ControlError> {
     let cancelled_jobs = tx
         .query(
             "SELECT job_id FROM jobs WHERE run_id=$1::text::uuid \
@@ -2492,12 +2501,14 @@ async fn cancel_outcome_gauges(
         .iter()
         .map(|row| JobId(row.get::<_, String>(0)))
         .collect();
-    let queue_depth: usize = tx
-        .query_one("SELECT count(*) FROM jobs WHERE queue_state='ready'", &[])
+    let queue_nonempty: bool = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE queue_state='ready')",
+            &[],
+        )
         .await
         .map_err(db)?
-        .get::<_, i64>(0)
-        .max(0) as usize;
+        .get(0);
     let next_runs_on: Vec<String> = tx
         .query_opt(
             "SELECT runs_on::text FROM jobs WHERE queue_state='ready' \
@@ -2517,7 +2528,12 @@ async fn cancel_outcome_gauges(
         .await
         .map_err(db)?
         .get(0);
-    Ok((cancelled_jobs, queue_depth, next_runs_on, pending_cancels))
+    Ok((
+        cancelled_jobs,
+        queue_nonempty,
+        next_runs_on,
+        pending_cancels,
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3954,7 +3970,6 @@ impl PgBackend {
                 held: false,
                 rejected: Some(ExecutionStatus::Failure),
                 existing: None,
-                queue_depth: self.queue_depth().await?,
                 next_runs_on: Vec::new(),
                 events: Vec::new(),
             });
@@ -4238,7 +4253,6 @@ impl PgBackend {
                         held: false,
                         rejected: Some(ExecutionStatus::Cancelled),
                         existing: None,
-                        queue_depth: self.queue_depth().await?,
                         next_runs_on: self.ready_front_labels().await?,
                         events: Vec::new(),
                     });
@@ -4532,7 +4546,6 @@ impl PgBackend {
             concluded,
             held,
             rejected: None,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
             existing: None,
             events,
@@ -4573,21 +4586,6 @@ impl PgBackend {
         Ok(platforms)
     }
 
-    /// Ready-queue depth (the node-local gauge the runner supervisor reads).
-    pub(super) async fn queue_depth(&self) -> Result<usize, ControlError> {
-        Self::queue_depth_on(&*self.reader().await?).await
-    }
-
-    /// [`Self::queue_depth`] on a caller's connection or open transaction.
-    pub(super) async fn queue_depth_on(client: &impl GenericClient) -> Result<usize, ControlError> {
-        let count = client
-            .query_one("SELECT count(*) FROM jobs WHERE queue_state = 'ready'", &[])
-            .await
-            .map_err(db)?
-            .get::<_, i64>(0);
-        Ok(count.max(0) as usize)
-    }
-
     /// `runs-on` labels of the ready-queue front, for `next_job_runs_on`.
     pub(super) async fn ready_front_labels(&self) -> Result<Vec<String>, ControlError> {
         Self::ready_front_labels_on(&*self.reader().await?).await
@@ -4622,7 +4620,6 @@ impl PgBackend {
             concluded: Vec::new(),
             held: existing.status == ExecutionStatus::Pending,
             rejected: None,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
             existing: Some(Box::new(existing)),
             events: Vec::new(),
@@ -4646,11 +4643,11 @@ impl PgBackend {
     /// The session's row (mapped id), or `None` when it is unknown/expired.
     pub(super) async fn session_ref(
         &self,
-        tx: &Transaction<'_>,
+        client: &impl GenericClient,
         session_id: &str,
     ) -> Result<Option<SessionRef>, ControlError> {
         let uuid = logic::session_uuid(session_id).to_string();
-        Ok(tx
+        Ok(client
             .query_opt(
                 "SELECT runner_id, protocol FROM runner_sessions WHERE session_id = $1::text::uuid",
                 &[&uuid],
@@ -4686,10 +4683,10 @@ impl PgBackend {
     /// The oldest unacknowledged message of a session (redelivery-first).
     pub(super) async fn oldest_session_message(
         &self,
-        tx: &Transaction<'_>,
+        client: &impl GenericClient,
         session_uuid: &str,
     ) -> Result<Option<SessionMessage>, ControlError> {
-        Ok(tx
+        Ok(client
             .query_opt(
                 "SELECT m.message_id, m.message_type, m.request_id, m.body::text, \
                  s.runner_id IS NULL \
@@ -4715,7 +4712,7 @@ impl PgBackend {
     /// The session's live request, when it holds one.
     pub(super) async fn session_active_request(
         &self,
-        tx: &Transaction<'_>,
+        client: &impl GenericClient,
         session_uuid: &str,
     ) -> Result<Option<TaskAgentJobRequestRecord>, ControlError> {
         let select = format!(
@@ -4723,7 +4720,11 @@ impl PgBackend {
              ORDER BY q.request_id DESC LIMIT 1",
             lookups::REQUEST_SELECT
         );
-        match tx.query_opt(&select, &[&session_uuid]).await.map_err(db)? {
+        match client
+            .query_opt(&select, &[&session_uuid])
+            .await
+            .map_err(db)?
+        {
             Some(row) => Ok(Some(lookups::request_from_row(&row)?)),
             None => Ok(None),
         }
@@ -4775,10 +4776,10 @@ impl PgBackend {
     /// A pending (undelivered) cancellation for the attempt, if any.
     async fn pending_cancellation(
         &self,
-        tx: &Transaction<'_>,
+        client: &impl GenericClient,
         request_id: i64,
     ) -> Result<Option<u64>, ControlError> {
-        Ok(tx
+        Ok(client
             .query_opt(
                 "SELECT request_id FROM job_cancellations \
                  WHERE request_id = $1 AND delivered_at IS NULL LIMIT 1",
@@ -5154,11 +5155,93 @@ impl PgBackend {
         .transpose()
     }
 
+    /// `poll_session` probe: the read-only pre-check, run on the reader pool.
+    ///
+    /// An idle poll — no session message, no active request, no pending
+    /// cancellation, no ready work — is the common case for long-polling
+    /// runners, and answering it here keeps thousands of them off the writer
+    /// pool entirely. Anything that needs a write (delivering a cancellation,
+    /// claiming a job) returns `None` and the caller runs the full writer
+    /// transaction, which re-checks everything under its locks: a probe hit
+    /// that loses a race just comes back `Empty`, exactly as before.
+    async fn probe_poll(
+        &self,
+        client: &impl GenericClient,
+        poll: &PollRequest,
+    ) -> Result<Option<PollOutcome>, ControlError> {
+        // Ownership is revalidated inside the claim transaction too: the
+        // handler caches the runner across a long poll, and a liveness sweep
+        // can purge the session while it waits.
+        let Some(session) = self.session_ref(client, &poll.session_id).await? else {
+            return Err(ControlError::Forbidden(
+                "session has no runner owner".to_owned(),
+            ));
+        };
+        if poll.verified_runner_id.is_some() && poll.verified_runner_id != session.runner_id {
+            return Err(ControlError::Forbidden(
+                "session belongs to another runner".to_owned(),
+            ));
+        }
+        if let Some(message) = self
+            .oldest_session_message(client, &session.session_uuid)
+            .await?
+        {
+            return Ok(Some(PollOutcome::Inflight(azdo::TaskAgentMessage {
+                message_id: message.message_id,
+                message_type: message.message_type.clone(),
+                body: message.runner_body(),
+                iv: None,
+            })));
+        }
+        if let Some(request) = self
+            .session_active_request(client, &session.session_uuid)
+            .await?
+        {
+            if self
+                .pending_cancellation(client, request.request_id)
+                .await?
+                .is_some()
+            {
+                // The writer delivers the cancellation below.
+                return Ok(None);
+            }
+            let runner_id = session.runner_id.unwrap_or(0);
+            return Ok(Some(PollOutcome::ActiveRequest { request, runner_id }));
+        }
+        if poll.busy {
+            return Ok(Some(PollOutcome::Empty));
+        }
+        let ready = client
+            .query_opt(
+                "SELECT 1 FROM jobs WHERE queue_state = 'ready' LIMIT 1",
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .is_some();
+        if ready {
+            // The writer runs the claim below.
+            return Ok(None);
+        }
+        Ok(Some(PollOutcome::Empty))
+    }
+
     /// `poll_session`: redelivery, cancellation, active request, then a claim.
     pub(super) async fn poll_session(
         &self,
         poll: PollRequest,
     ) -> Result<PollOutcome, ControlError> {
+        // Fast path first: idle polls never take a writer. The probe reads
+        // from this node's own pool — the claim-enabling probe (and every
+        // state read that can promote to a write) must NEVER route to a
+        // read replica: a replica's snapshot lags the writer's commits, so
+        // it could answer "empty" for a claim the writer just made, or
+        // claimable for one another node already took. Read your writes.
+        let reader = self.reader().await?;
+        if let Some(outcome) = self.probe_poll(&*reader, &poll).await? {
+            return Ok(outcome);
+        }
+        drop(reader);
         let mut client = self.writer().await?;
         let tx = client.transaction().await.map_err(db)?;
         // Ownership is revalidated inside the claim transaction: the handler
@@ -5295,7 +5378,6 @@ impl PgBackend {
             queued,
             request,
             runner_id,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
         })))
     }
@@ -5615,7 +5697,6 @@ impl PgBackend {
             scheduling,
             live_log_key: applied.live_log_key,
             queue_nonempty,
-            queue_depth: self.queue_depth().await?,
             replayed: applied.replayed,
         })
     }
@@ -5702,11 +5783,11 @@ impl PgBackend {
         }
         sweep.sweep().await?;
         let scheduling = std::mem::take(&mut sweep.outcome);
-        let (queue_len, next_runs_on) = (
-            Self::queue_depth_on(&tx).await?,
-            Self::ready_front_labels_on(&tx).await?,
-        );
-        let queue_nonempty = queue_len > 0;
+        // Cheap existence check: the handler only needs to know whether to
+        // wake pollers, not the exact depth (the supervisor reads that from
+        // the 5s sampler snapshot).
+        let queue_nonempty = Self::work_pending_on(&tx).await?;
+        let next_runs_on = Self::ready_front_labels_on(&tx).await?;
         sweep.flush().await?;
         tx.commit().await.map_err(db)?;
         Ok(SettleJobOutcome::Settled(Box::new(JobSettled {
@@ -5716,7 +5797,6 @@ impl PgBackend {
             queue_nonempty,
             newly_terminal_success: applied.newly_terminal_success,
             live_log_key: applied.live_log_key,
-            queue_len,
             next_runs_on,
         })))
     }
@@ -5982,7 +6062,6 @@ impl PgBackend {
             message,
             run_id,
             job_id,
-            queue_depth: self.queue_depth().await?,
             next_runs_on: self.ready_front_labels().await?,
         })
     }
@@ -6470,7 +6549,6 @@ impl PgBackend {
             }
             sweep.flush().await?;
         }
-        outcome.queue_depth = Self::queue_depth_on(&tx).await?;
         outcome.next_runs_on = Self::ready_front_labels_on(&tx).await?;
         tx.commit().await.map_err(db)?;
         Ok(outcome)
